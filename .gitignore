@@ -34,9 +34,6 @@ dist/
 .DS_Store
 Thumbs.db
 
-# Presentation files (all files/dirs containing "ppt")
-*ppt*
-
 # Temp / debug scratch files
 tmp_*
 *.tmp
@@ -53,9 +50,3 @@ debug*.py
 briefdesk/plugins/benchmark/reports/
 briefdesk/plugins/benchmark/.tmp/
 briefdesk/plugins/benchmark/cases/*.fromweb.json
-
-# Deprecated
-experiments/
-
-# slidep PPT 编译依赖目录（BRIEFDESK-未来杯答辩项目）
-/assets/

@@ -1,7 +1,5 @@
 # 简报台
 
- **C**ampus **I**ntelligent **R**eal-time **E**vent **A**ggregator & **M**onitor
-
 > 本地运行的网页应用，通过可插拔消息源（默认 WeFlow 监听微信群，另支持 qqflow-server 监听 QQ 群）获取群消息，AI 自动分类筛选有价值的信息并结构化展示。
 
 ## 功能
@@ -132,7 +130,6 @@ briefdesk/
 ├── main.py                 # 入口 shim，转发至 briefdesk/main.py（DB → 插件装配（含源注册/去重缓存预热）→ HTTP 服务器 → 插件激活 + 源监听启动 → 首轮回填）
 ├── .env.example            # 环境配置模板（复制为 .env 后填写）
 ├── .env                    # 密钥配置（本地生成，不入库）
-├── benchmark/              # 实验基准（case 样例 + runner + 报告生成，见 benchmark/README.md）
 ├── briefdesk/
 │   ├── __main__.py         # python -m briefdesk 入口
 │   ├── config.py           # pydantic Settings 读 .env（.env 与默认 DB 路径以项目根目录为基准）
@@ -162,7 +159,8 @@ briefdesk/
 │       ├── dedup/              # 语义去重阶段插件（plugin.py 槽位 dedup / engine.py DedupEngine）
 │       ├── merge/              # 同话题合并阶段插件（plugin.py 槽位 post_insert / engine.py 判官）
 │       ├── calendar/           # 日历 Web 插件（plugin.py + router.py + db.py：/api/calendar；ui/ 含完整前端）
-│       └── reminders/          # 提醒 Web 插件（plugin.py + router.py：提醒设置 + 到期轮询；ui/ 含完整前端）
+│       ├── reminders/          # 提醒 Web 插件（plugin.py + router.py：提醒设置 + 到期轮询；ui/ 含完整前端）
+│       └── benchmark/           # 实验基准（case 样例 + runner + 报告生成，见 benchmark/README.md）
 ├── ui/
 │   ├── index.html          # 桌面端页面
 │   ├── app.js              # 前端逻辑

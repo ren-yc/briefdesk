@@ -15,7 +15,7 @@ from briefdesk.config import config
 
 # uvicorn 相关 logger：默认被 uvicorn 的 LOGGING_CONFIG 挂上自己的 formatter
 # （无时间戳）且 propagate=False，输出到 stderr。统一改为传播到根 logger，
-# 由本模块的 _CampusFormatter 输出（时间戳 + 模块名 + 彩色级别）。
+# 由本模块的 _BriefFormatter 输出（时间戳 + 模块名 + 彩色级别）。
 _UVICORN_LOGGERS = ("uvicorn", "uvicorn.error", "uvicorn.access", "uvicorn.asgi")
 
 # ANSI 颜色码
@@ -57,7 +57,7 @@ def _status_text(status_code: int) -> str:
     return f"{color}{text}{_RESET}" if color else text
 
 
-class _CampusFormatter(logging.Formatter):
+class _BriefFormatter(logging.Formatter):
     """uvicorn 兼容的格式化器：彩色 LEVEL:       message（级别名补齐 10 字符）。
 
     对 uvicorn.access 记录额外还原 HTTP 状态短语（uvicorn AccessFormatter 的
@@ -117,7 +117,7 @@ def setup_logging(level: int | None = None) -> None:
     if not any(isinstance(h, logging.StreamHandler) for h in root.handlers):
         handler = logging.StreamHandler(sys.stdout)
         handler.setFormatter(
-            _CampusFormatter(
+            _BriefFormatter(
                 "%(asctime)s %(levelprefix)s %(name)s: %(message)s",
                 datefmt="%H:%M:%S",
             )

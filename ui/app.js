@@ -3747,7 +3747,7 @@ async function runSettingsOps(ops) {
 // 类别启用/停用已由后端持久化（categories.enabled），localStorage 只存刷新间隔
 function loadSettings() {
   try {
-    const saved = JSON.parse(localStorage.getItem("campus-hub-settings") || "{}");
+    const saved = JSON.parse(localStorage.getItem("briefdesk-settings") || "{}");
     refreshIntervalSec = Math.max(30, parseInt(saved.refreshInterval, 10) || 300);
   } catch { /* ignore */ }
   $refreshInterval.value = refreshIntervalSec;
@@ -3760,7 +3760,7 @@ function loadSettings() {
 function saveSettings() {
   refreshIntervalSec = Math.max(30, parseInt($refreshInterval.value) || 300);
   $refreshInterval.value = refreshIntervalSec;
-  localStorage.setItem("campus-hub-settings", JSON.stringify({
+  localStorage.setItem("briefdesk-settings", JSON.stringify({
     refreshInterval: refreshIntervalSec,
   }));
 }
