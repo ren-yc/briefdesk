@@ -1,0 +1,12 @@
+/* benchmark 插件前端样式：基准区块复用核心设置面板样式
+ * （settings-section / settings-outline-btn / settings-hint / about-sources），
+ * 此处仅补充插件专属细节。
+ */
+#benchmark-settings-section .settings-outline-btn:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+#bench-status a {
+  color: var(--accent, #2563eb);
+  text-decoration: underline;
+}

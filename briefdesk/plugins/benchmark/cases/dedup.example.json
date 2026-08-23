@@ -1,0 +1,93 @@
+{
+  "feature": "dedup",
+  "description": "示例：语义去重基准（全部虚构数据）。items 为去重缓存中的历史卡片，query 为新消息。",
+  "cases": [
+    {
+      "id": "dd-001",
+      "note": "措辞不同但实质相同 → 同一件事（same=true）",
+      "items": [
+        {
+          "msg_id": "i1",
+          "content": "摄影社招新面试，周三下午3点，体育馆",
+          "sender_name": "李娜",
+          "sender_id": "u1",
+          "session_id": "s1",
+          "group_name": "社团招新群",
+          "timestamp": "2026-04-01 10:00",
+          "source": "bench",
+          "title": "摄影社招新面试"
+        }
+      ],
+      "query": {
+        "msg_id": "q1",
+        "content": "摄影社周三下午三点在体育馆招新",
+        "sender_name": "刘洋",
+        "sender_id": "u2",
+        "session_id": "s1",
+        "group_name": "社团招新群",
+        "timestamp": "2026-04-02 09:30",
+        "source": "bench",
+        "title": "摄影社周三下午三点在体育馆招新"
+      },
+      "expected": {"same": true}
+    },
+    {
+      "id": "dd-002",
+      "note": "两个不同社团的招新 → 不是同一件事（same=false）",
+      "items": [
+        {
+          "msg_id": "i1",
+          "content": "位育摄影社招新，欢迎加入",
+          "sender_name": "张伟",
+          "sender_id": "u1",
+          "session_id": "s1",
+          "group_name": "社团招新群",
+          "timestamp": "2026-04-01 10:00",
+          "source": "bench",
+          "title": "位育摄影社招新"
+        }
+      ],
+      "query": {
+        "msg_id": "q1",
+        "content": "南洋模范摄影社招新面试",
+        "sender_name": "王强",
+        "sender_id": "u2",
+        "session_id": "s1",
+        "group_name": "社团招新群",
+        "timestamp": "2026-04-02 09:30",
+        "source": "bench",
+        "title": "南洋模范摄影社招新"
+      },
+      "expected": {"same": false}
+    },
+    {
+      "id": "dd-003",
+      "note": "完全不同话题（字符重叠过低时预筛直接跳过 AI，判定仍应为 false）",
+      "items": [
+        {
+          "msg_id": "i1",
+          "content": "出二手自行车，八成新，150元",
+          "sender_name": "赵敏",
+          "sender_id": "u1",
+          "session_id": "s1",
+          "group_name": "二手交易群",
+          "timestamp": "2026-04-01 10:00",
+          "source": "bench",
+          "title": "出二手自行车"
+        }
+      ],
+      "query": {
+        "msg_id": "q1",
+        "content": "求购考研数学复习全书，价格可议",
+        "sender_name": "陈晨",
+        "sender_id": "u2",
+        "session_id": "s1",
+        "group_name": "二手交易群",
+        "timestamp": "2026-04-02 09:30",
+        "source": "bench",
+        "title": "求购考研数学复习全书"
+      },
+      "expected": {"same": false}
+    }
+  ]
+}

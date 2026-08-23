@@ -1,0 +1,57 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "briefdesk"
+version = "0.1.0"
+description = "简报台 - BRIEFDESK"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.34",
+    "httpx>=0.28",
+    "aiosqlite>=0.20",
+    "pydantic>=2.10",
+    "pydantic-settings>=2.7",
+    "openai>=1.58",
+    "python-dotenv>=1.0",
+    "Pillow>=10.0",
+    "numpy>=1.26",
+    "json-repair>=0.63",
+    "python-multipart>=0.0.9",
+]
+
+[project.scripts]
+briefdesk = "briefdesk.main:main"
+
+[project.entry-points."briefdesk.plugins"]
+weflow = "briefdesk.plugins.weflow.plugin:plugin"
+qqflow = "briefdesk.plugins.qqflow.plugin:plugin"
+ai_provider = "briefdesk.plugins.ai_provider.plugin:plugin"
+ocr = "briefdesk.plugins.ocr.plugin:plugin"
+classify = "briefdesk.plugins.classify.plugin:plugin"
+dedup = "briefdesk.plugins.dedup.plugin:plugin"
+merge = "briefdesk.plugins.merge.plugin:plugin"
+calendar = "briefdesk.plugins.calendar.plugin:plugin"
+reminders = "briefdesk.plugins.reminders.plugin:plugin"
+benchmark = "briefdesk.plugins.benchmark.plugin:plugin"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["briefdesk", "briefdesk.*"]
+
+[project.optional-dependencies]
+# OCR 阶段插件（briefdesk.plugins.ocr）的运行时依赖：不安装时 OCR 插件
+# 自禁用（PluginDisabledError），其余功能不受影响
+ocr = [
+    "rapidocr>=3.9",
+    "onnxruntime>=1.17",
+]
+dev = [
+    "pytest>=8.3",
+    "pytest-asyncio>=0.24",
+    "ruff>=0.9",
+    "mypy>=1.11",
+    "pip-tools>=7.4",
+]

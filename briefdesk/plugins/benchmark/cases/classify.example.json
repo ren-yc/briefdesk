@@ -1,0 +1,124 @@
+{
+  "feature": "classify",
+  "description": "示例：分类基准（全部虚构数据）。复制为 classify.json 后按需修改。",
+  "cases": [
+    {
+      "id": "cls-001",
+      "note": "同一时段 5 条消息：4 条应分类 + 1 条闲聊（不应输出分类结果）",
+      "messages": [
+        {
+          "msg_id": "m1",
+          "content": "校园十佳歌手大赛来啦！报名截止4月15日，初赛定于4月20日晚7点，决赛5月1日礼堂举行。请大家踊跃报名！",
+          "sender_name": "张伟",
+          "sender_id": "u1",
+          "session_id": "s1",
+          "group_name": "学生会通知群",
+          "timestamp": "2026-04-05 14:30",
+          "source": "bench"
+        },
+        {
+          "msg_id": "m2",
+          "content": "摄影社明天下午3点面试，地点在体育馆门口集合。",
+          "sender_name": "李娜",
+          "sender_id": "u2",
+          "session_id": "s2",
+          "group_name": "社团招新群",
+          "timestamp": "2026-04-05 15:00",
+          "source": "bench"
+        },
+        {
+          "msg_id": "m3",
+          "content": "高数期中考试定于4月28日上午9点，地点三教201，请带好学生证。",
+          "sender_name": "王强",
+          "sender_id": "u3",
+          "session_id": "s3",
+          "group_name": "班级学习群",
+          "timestamp": "2026-04-06 09:12",
+          "source": "bench"
+        },
+        {
+          "msg_id": "m4",
+          "content": "出二手自行车，八成新，价格150元，有意私聊。",
+          "sender_name": "赵敏",
+          "sender_id": "u4",
+          "session_id": "s4",
+          "group_name": "二手交易群",
+          "timestamp": "2026-04-06 18:40",
+          "source": "bench"
+        },
+        {
+          "msg_id": "m5",
+          "content": "今天食堂的饭真好吃！",
+          "sender_name": "陈晨",
+          "sender_id": "u5",
+          "session_id": "s5",
+          "group_name": "闲聊群",
+          "timestamp": "2026-04-06 19:02",
+          "source": "bench"
+        }
+      ],
+      "expected": [
+        {
+          "index": 0,
+          "category": "活动通知",
+          "subject": "校园十佳歌手大赛",
+          "start": "2026-04-20 19:00",
+          "end": "2026-04-15",
+          "times": [{"type": "start", "time": "2026-05-01", "label": "决赛"}]
+        },
+        {"index": 1, "category": "社团招新", "subject": "摄影社", "start": "2026-04-06 15:00"},
+        {"index": 2, "category": "学术", "subject": "高数期中考试", "start": "2026-04-28 09:00"},
+        {"index": 3, "category": "交易", "subject": "二手自行车"}
+      ]
+    },
+    {
+      "id": "cls-002",
+      "note": "单条消息多个截止时间点（主字段取最早，其余进 extra_times）+ 模糊提问不应分类",
+      "messages": [
+        {
+          "msg_id": "m1",
+          "content": "部门工作提醒：三份材料分别于7月31日、8月15日、9月1日截止，请各位按时提交。",
+          "sender_name": "孙悦",
+          "sender_id": "u1",
+          "session_id": "s1",
+          "group_name": "学生会宣传部",
+          "timestamp": "2026-07-20 10:00",
+          "source": "bench"
+        },
+        {
+          "msg_id": "m2",
+          "content": "字节跳动2026届实习生招聘启动，岗位：后端开发，简历投递截止8月30日。",
+          "sender_name": "周杰",
+          "sender_id": "u2",
+          "session_id": "s2",
+          "group_name": "就业信息群",
+          "timestamp": "2026-07-21 16:20",
+          "source": "bench"
+        },
+        {
+          "msg_id": "m3",
+          "content": "有没有人知道图书馆几点关门？",
+          "sender_name": "吴昊",
+          "sender_id": "u3",
+          "session_id": "s3",
+          "group_name": "闲聊群",
+          "timestamp": "2026-07-21 20:15",
+          "source": "bench"
+        }
+      ],
+      "expected": [
+        {
+          "index": 0,
+          "category": "活动通知",
+          "subject": "部门工作提醒",
+          "end": "2026-07-31",
+          "times": [
+            {"type": "end", "time": "2026-08-15", "label": "材料二"},
+            {"type": "end", "time": "2026-09-01", "label": "材料三"}
+          ]
+        },
+        {"index": 1, "category": "实习", "subject": "字节跳动实习生招聘", "end": "2026-08-30"}
+      ]
+    }
+  ]
+}

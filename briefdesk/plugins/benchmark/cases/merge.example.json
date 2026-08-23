@@ -1,0 +1,87 @@
+{
+  "feature": "merge",
+  "description": "示例：同话题片段合并判定基准（全部虚构数据）。head 先出现、tail 后出现。",
+  "cases": [
+    {
+      "id": "mg-001",
+      "note": "同一笔团购的连续补充片段 → 应合并",
+      "head": {
+        "msg_id": "h1",
+        "content": "塔卡沙a6方格40页团购",
+        "sender_name": "孙悦",
+        "sender_id": "u1",
+        "session_id": "s1",
+        "group_name": "拼单群",
+        "timestamp": "2026-04-01 10:00",
+        "source": "bench",
+        "title": "塔卡沙a6方格40页团购"
+      },
+      "tail": {
+        "msg_id": "t1",
+        "content": "5本小红书现拍，45，按照你买的数量算钱",
+        "sender_name": "孙悦",
+        "sender_id": "u1",
+        "session_id": "s1",
+        "group_name": "拼单群",
+        "timestamp": "2026-04-01 10:05",
+        "source": "bench",
+        "title": "5本小红书现拍45元"
+      },
+      "expected": {"merge": true}
+    },
+    {
+      "id": "mg-002",
+      "note": "同一群内两个无关话题 → 不应合并",
+      "head": {
+        "msg_id": "h1",
+        "content": "出二手自行车，八成新，150元",
+        "sender_name": "赵敏",
+        "sender_id": "u1",
+        "session_id": "s1",
+        "group_name": "二手交易群",
+        "timestamp": "2026-04-01 10:00",
+        "source": "bench",
+        "title": "出二手自行车"
+      },
+      "tail": {
+        "msg_id": "t1",
+        "content": "收考研数学复习全书，价格可议",
+        "sender_name": "陈晨",
+        "sender_id": "u2",
+        "session_id": "s1",
+        "group_name": "二手交易群",
+        "timestamp": "2026-04-01 10:05",
+        "source": "bench",
+        "title": "收考研数学复习全书"
+      },
+      "expected": {"merge": false}
+    },
+    {
+      "id": "mg-003",
+      "note": "活动报名主帖 + 补充截止信息 → 应合并",
+      "head": {
+        "msg_id": "h1",
+        "content": "校园十佳歌手大赛开始报名啦！",
+        "sender_name": "张伟",
+        "sender_id": "u1",
+        "session_id": "s1",
+        "group_name": "学生会通知群",
+        "timestamp": "2026-04-05 14:30",
+        "source": "bench",
+        "title": "校园十佳歌手大赛报名"
+      },
+      "tail": {
+        "msg_id": "t1",
+        "content": "补充：报名截止4月15日，别错过",
+        "sender_name": "张伟",
+        "sender_id": "u1",
+        "session_id": "s1",
+        "group_name": "学生会通知群",
+        "timestamp": "2026-04-05 14:35",
+        "source": "bench",
+        "title": "十佳歌手大赛报名截止补充"
+      },
+      "expected": {"merge": true}
+    }
+  ]
+}

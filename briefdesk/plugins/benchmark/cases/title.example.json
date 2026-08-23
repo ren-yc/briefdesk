@@ -1,0 +1,60 @@
+{
+  "feature": "title",
+  "description": "示例：合并后标题重拟基准（全部虚构数据）。expected.title 为精确匹配（可选），expected.keywords 为包含匹配（可选），至少提供一种。",
+  "cases": [
+    {
+      "id": "tt-001",
+      "note": "团购合并后重拟标题（物品名 + 数量/价格）",
+      "message": {
+        "msg_id": "t1",
+        "content": "5本小红书现拍，45，按照你买的数量算钱\n运费aa",
+        "sender_name": "孙悦",
+        "sender_id": "u1",
+        "session_id": "s1",
+        "group_name": "拼单群",
+        "timestamp": "2026-04-01 10:05",
+        "source": "bench",
+        "title": "塔卡沙a6方格40页团购"
+      },
+      "old_title": "塔卡沙a6方格40页团购",
+      "key_info": "塔卡沙, a6方格, 40页, 团购",
+      "expected": {"title": "塔卡沙a6方格40页团购（5本45元）", "keywords": ["塔卡沙", "团购"]}
+    },
+    {
+      "id": "tt-002",
+      "note": "招新合并后重拟标题（主体 + 性质）",
+      "message": {
+        "msg_id": "t1",
+        "content": "摄影社周三下午三点在体育馆招新，面试带一寸照片",
+        "sender_name": "李娜",
+        "sender_id": "u1",
+        "session_id": "s1",
+        "group_name": "社团招新群",
+        "timestamp": "2026-04-02 09:30",
+        "source": "bench",
+        "title": "摄影社招新面试"
+      },
+      "old_title": "摄影社招新面试",
+      "key_info": "摄影社, 招新, 面试",
+      "expected": {"keywords": ["摄影社", "招新"]}
+    },
+    {
+      "id": "tt-003",
+      "note": "活动报名截止标题（主体 + 截止性质）",
+      "message": {
+        "msg_id": "t1",
+        "content": "校园十佳歌手大赛报名截止4月15日，初赛4月20日",
+        "sender_name": "张伟",
+        "sender_id": "u1",
+        "session_id": "s1",
+        "group_name": "学生会通知群",
+        "timestamp": "2026-04-05 14:30",
+        "source": "bench",
+        "title": "校园十佳歌手大赛报名"
+      },
+      "old_title": "校园十佳歌手大赛报名",
+      "key_info": "十佳歌手, 报名, 截止",
+      "expected": {"title": "校园十佳歌手大赛报名截止", "keywords": ["十佳歌手", "截止"]}
+    }
+  ]
+}

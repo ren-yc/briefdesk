@@ -1,0 +1,110 @@
+"""内置消息源插件测试（weflow / qqflow）。"""
+
+import unittest
+from types import SimpleNamespace
+from typing import Any
+from unittest.mock import AsyncMock, patch
+
+from briefdesk.config import Settings
+from briefdesk.plugin.base import PluginContext, PluginDisabledError
+from briefdesk.plugins.qqflow.plugin import QqFlowPlugin
+from briefdesk.plugins.weflow.plugin import WeFlowPlugin
+
+
+def _ctx() -> tuple[PluginContext, list]:
+    registered: list = []
+
+    async def publish_event(event: str, payload: Any) -> None:
+        return None
+
+    def subscribe_event(event: str, handler: Any) -> None:
+        return None
+
+    ctx = PluginContext(
+        config=Settings(
+            plugins=["*"], plugins_disabled=[], plugins_required=[], plugin_path=""
+        ),
+        publish_event=publish_event,
+        subscribe_event=subscribe_event,
+        register_source=registered.append,
+        register_stage=lambda stage: None,
+    )
+    return ctx, registered
+
+
+class WeFlowPluginTest(unittest.IsolatedAsyncioTestCase):
+    async def test_setup_registers_runtime(self):
+        ctx, registered = _ctx()
+        fake_runtime = SimpleNamespace(name="weflow")
+        plugin = WeFlowPlugin()
+        with patch(
+            "briefdesk.plugins.weflow.runtime.WeFlowSource", return_value=fake_runtime
+        ):
+            await plugin.setup(ctx)
+        self.assertEqual(registered, [fake_runtime])
+
+    async def test_teardown_closes_runtime(self):
+        ctx, _ = _ctx()
+        close_spy = AsyncMock()
+        fake_runtime = SimpleNamespace(name="weflow", close=close_spy)
+        plugin = WeFlowPlugin()
+        with patch(
+            "briefdesk.plugins.weflow.runtime.WeFlowSource", return_value=fake_runtime
+        ):
+            await plugin.setup(ctx)
+        await plugin.teardown()
+        close_spy.assert_awaited_once()
+
+    async def test_teardown_without_setup_noop(self):
+        await WeFlowPlugin().teardown()
+
+
+class QqFlowPluginTest(unittest.IsolatedAsyncioTestCase):
+    async def test_missing_required_config_self_disables(self):
+        ctx, _ = _ctx()
+        fake_settings = SimpleNamespace(api_token="", qq="", key="")
+        plugin = QqFlowPlugin()
+        with patch(
+            "briefdesk.plugins.qqflow.config.QqFlowSettings", return_value=fake_settings
+        ), self.assertRaises(PluginDisabledError) as cm:
+            await plugin.setup(ctx)
+        self.assertIn("QQFLOW_API_TOKEN", str(cm.exception))
+
+    async def test_partial_config_names_missing_fields(self):
+        ctx, _ = _ctx()
+        fake_settings = SimpleNamespace(api_token="t", qq="", key="k" * 16)
+        plugin = QqFlowPlugin()
+        with patch(
+            "briefdesk.plugins.qqflow.config.QqFlowSettings", return_value=fake_settings
+        ), self.assertRaises(PluginDisabledError) as cm:
+            await plugin.setup(ctx)
+        self.assertIn("QQFLOW_QQ", str(cm.exception))
+        self.assertNotIn("QQFLOW_API_TOKEN", str(cm.exception))
+
+    async def test_config_present_registers_runtime(self):
+        ctx, registered = _ctx()
+        fake_settings = SimpleNamespace(api_token="t", qq="123", key="k" * 16)
+        fake_runtime = SimpleNamespace(name="qqflow")
+        plugin = QqFlowPlugin()
+        with patch(
+            "briefdesk.plugins.qqflow.config.QqFlowSettings", return_value=fake_settings
+        ), patch(
+            "briefdesk.plugins.qqflow.runtime.QqFlowSource", return_value=fake_runtime
+        ):
+            await plugin.setup(ctx)
+        self.assertEqual(registered, [fake_runtime])
+
+    async def test_teardown_closes_runtime(self):
+        ctx, _ = _ctx()
+        close_spy = AsyncMock()
+        fake_settings = SimpleNamespace(api_token="t", qq="123", key="k" * 16)
+        fake_runtime = SimpleNamespace(name="qqflow", close=close_spy)
+        plugin = QqFlowPlugin()
+        with patch(
+            "briefdesk.plugins.qqflow.config.QqFlowSettings", return_value=fake_settings
+        ), patch(
+            "briefdesk.plugins.qqflow.runtime.QqFlowSource", return_value=fake_runtime
+        ):
+            await plugin.setup(ctx)
+        await plugin.teardown()
+        close_spy.assert_awaited_once()

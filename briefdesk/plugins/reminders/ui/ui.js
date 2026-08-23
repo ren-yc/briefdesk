@@ -1,0 +1,238 @@
+/* reminders 插件前端（P5）：提醒功能的完整前端随插件包分发。
+ *
+ * 核心只提供通用加载器与行内扩展钩子（app.js 的 registerItemRowExtension）：
+ * - 本文件注入后自行构建卡片「提醒」按钮/菜单（挂到核心 renderItemRow 与
+ *   renderCard 的动作区）、设置弹窗「通知」面板的自动提醒控件、到期轮询定时器；
+ * - 复用的核心全局工具：esc / escAttr / showToast / currentItems / parseLocalTime /
+ *   isDateOnly / nextUpcomingTime / toLocalInput / syncBodyScrollLock /
+ *   exitPluginViews / $memoLink 等。
+ */
+(function () {
+  "use strict";
+  const PLUGIN = "reminders";
+
+  // ── 状态 ──
+  let autoRemindOffset = "off";       // 自动提醒：off | 30m | 1h | 1d
+  let remindTimer = null;             // 提醒检查定时器
+  let notifiedReminders = new Set();  // 本次会话已通知的提醒卡片 id（防重）
+
+  // ── 设置弹窗「通知」面板：自动提醒控件（核心留 data-plugin-slot 注入点）──
+  function buildSettingsControl() {
+    const slot = document.querySelector('[data-plugin-slot="settings-notify"]');
+    if (!slot) return;
+    slot.innerHTML =
+      '<label>自动提醒（加入备忘录时按卡片时间设置）</label>'
+      + '<select id="auto-remind" class="settings-select" aria-label="自动提醒">'
+      + '<option value="off">关闭</option>'
+      + '<option value="30m">截止/开始前 30 分钟</option>'
+      + '<option value="1h">截止/开始前 1 小时</option>'
+      + '<option value="1d">截止/开始前 1 天</option>'
+      + "</select>"
+      + '<p class="text-muted settings-hint">提醒在本应用运行期间生效；关闭期间错过的提醒不补发。</p>';
+    const $autoRemind = document.getElementById("auto-remind");
+    if ($autoRemind) {
+      autoRemindOffset = localStorage.getItem("briefdesk.autoRemind") || "off";
+      $autoRemind.value = autoRemindOffset;
+      $autoRemind.addEventListener("change", () => {
+        autoRemindOffset = $autoRemind.value;
+        localStorage.setItem("briefdesk.autoRemind", autoRemindOffset);
+      });
+    }
+  }
+
+  // ── 卡片行内「提醒」按钮与菜单 ──
+  // datetime-local 要求日期+时刻：date-only 值补默认 09:00
+  function remindInputValue(s) {
+    if (!s) return "";
+    const t = s.trim();
+    if (/^\d{4}-\d{2}-\d{2}$/.test(t)) return t + "T09:00";
+    return t.replace(" ", "T");
+  }
+
+  function renderButton(item) {
+    return '<button class="btn-remind' + (item.remind_at ? " active" : "") + '" title="设置提醒"><img src="/图标/9-媒体/闹钟.svg" class="icon-sm" alt="">提醒</button>';
+  }
+
+  function renderMenu(item) {
+    const dv = item.remind_at ? remindInputValue(item.remind_at)
+      : remindInputValue(nextUpcomingTime(item) || item.end || item.start || "");
+    return [
+      '<div class="card-remind-menu hidden">',
+      '<div class="remind-menu-head">提醒时间' + (item.remind_at ? "（已设）" : "") + "</div>",
+      '<input type="datetime-local" class="remind-input" value="' + escAttr(dv) + '">',
+      '<div class="remind-menu-actions">',
+      '<button class="remind-save">保存</button>',
+      item.remind_at ? '<button class="remind-clear">清除提醒</button>' : "",
+      '<button class="remind-cancel">取消</button>',
+      "</div>",
+      "</div>",
+    ].join("");
+  }
+
+  async function setReminderApi(id, atOrNull, { silent = false } = {}) {
+    try {
+      const res = await fetch("/api/items/" + encodeURIComponent(id) + "/reminder", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ at: atOrNull }),
+      });
+      if (!res.ok) throw new Error("HTTP " + res.status);
+      const data = await res.json();
+      const it = currentItems.find(x => String(x.id) === id);
+      if (it) it.remind_at = data.remind_at || null;
+      document.querySelectorAll(".card-remind-menu").forEach(m => m.classList.add("hidden"));
+      document.querySelectorAll('[data-id="' + CSS.escape(id) + '"] .btn-remind').forEach(b => {
+        b.classList.toggle("active", !!data.remind_at);
+      });
+      if (!silent) {
+        showToast(data.remind_at ? "提醒已设置" : "提醒已清除", { type: "success", duration: 2000 });
+      }
+      return true;
+    } catch (err) {
+      console.error("Reminder error:", err);
+      if (!silent) showToast("提醒设置失败，请重试", { type: "error", duration: 4000 });
+      return false;
+    }
+  }
+
+  // 行内动作处理（经核心 handleRowAction 委派；返回 true = 已消费）
+  function handle(e, ctx) {
+    const btn = e.target.closest("button");
+    if (!btn) return false;
+    const row = ctx.rowOf(btn);
+    const id = row ? row.dataset.id : "";
+    if (btn.classList.contains("btn-remind")) {
+      if (!row) return true;
+      const menu = row.querySelector(".card-remind-menu");
+      if (!menu) return true;
+      const wasHidden = menu.classList.contains("hidden");
+      document.querySelectorAll(".card-remind-menu").forEach(m => m.classList.add("hidden"));
+      document.querySelectorAll(".card-recat-menu").forEach(m => m.classList.add("hidden"));
+      menu.classList.toggle("hidden", !wasHidden);
+      return true;
+    }
+    if (btn.classList.contains("remind-save")) {
+      const menu = btn.closest(".card-remind-menu");
+      const input = menu && menu.querySelector(".remind-input");
+      if (!row || !input || !input.value) {
+        showToast("请选择提醒时间", { type: "error", duration: 3000 });
+        return true;
+      }
+      setReminderApi(id, input.value);
+      return true;
+    }
+    if (btn.classList.contains("remind-clear")) {
+      if (!row) return true;
+      setReminderApi(id, null);
+      return true;
+    }
+    if (btn.classList.contains("remind-cancel")) {
+      const menu = btn.closest(".card-remind-menu");
+      if (menu) menu.classList.add("hidden");
+      return true;
+    }
+    return false;
+  }
+
+  // 点击其它区域关闭菜单（核心文档级点击委托；按钮/菜单内部不关）
+  function closeMenus(e) {
+    if (!e.target.closest(".btn-remind") && !e.target.closest(".card-remind-menu")) {
+      document.querySelectorAll(".card-remind-menu").forEach(m => m.classList.add("hidden"));
+    }
+  }
+
+  // 自动提醒：加入备忘录且开启自动提醒、卡片带具体时刻且尚未设提醒
+  async function maybeAutoRemind(id, opts) {
+    if (autoRemindOffset === "off") return;
+    const it = currentItems.find(x => String(x.id) === id);
+    // 部分截止卡片：主截止已过时改用下一个未过且带时刻的时间点作提醒基准
+    const base = it && (nextUpcomingTime(it, { needTime: true }) || it.end || it.start);
+    // A：仅日期无具体时刻 → 不自动提醒（卡片仍进日历，用户可手动设置提醒）
+    // B：时刻已过去 → 不自动提醒（避免回填老活动立即触发过期提醒）
+    if (it && base && !it.remind_at && !isDateOnly(base)) {
+      const baseAt = parseLocalTime(base);
+      const offsets = { "30m": 30 * 60000, "1h": 3600000, "1d": 86400000 };
+      if (baseAt && baseAt.getTime() > Date.now()) {
+        const at = new Date(baseAt.getTime() - (offsets[autoRemindOffset] || 0));
+        if (!isNaN(at.getTime())) {
+          const ok = await setReminderApi(id, toLocalInput(at), { silent: true });
+          if (ok) showToast("已自动设置提醒", { type: "info", duration: 3000 });
+        }
+      }
+    }
+  }
+
+  // ── 到期轮询：与列表加载状态解耦（任意分类/页面的提醒都能触发）──
+  function startReminderTimer() {
+    if (remindTimer) clearInterval(remindTimer);
+    remindTimer = setInterval(checkDueReminders, 30000);
+    setTimeout(checkDueReminders, 10000); // 首屏加载后先查一轮
+  }
+
+  async function checkDueReminders() {
+    let due = [];
+    try {
+      const res = await fetch("/api/reminders/due");
+      if (!res.ok) return;
+      due = (await res.json()).items || [];
+    } catch { /* 忽略 */ }
+    const now = new Date();
+    for (const it of due) {
+      if (notifiedReminders.has(String(it.id))) continue;
+      const at = parseLocalTime(it.remind_at);
+      if (!at || at.getTime() > now.getTime()) continue;
+      // 先清后通知：多标签页同时到点时，只有抢到清除权的那个负责通知
+      try {
+        const res = await fetch("/api/items/" + encodeURIComponent(it.id) + "/reminder", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ at: null }),
+        });
+        if (!res.ok) continue;
+        notifiedReminders.add(String(it.id));
+        const cur = currentItems.find(x => String(x.id) === it.id);
+        if (cur) cur.remind_at = null;
+        const body = it.category ? it.category + " · " + (it.title || "") : (it.title || "");
+        if (document.hidden) {
+          if ("Notification" in window && Notification.permission === "granted") {
+            try {
+              const n = new Notification("提醒：" + (it.title || "校园信息"), { body: body.slice(0, 120), tag: "briefdesk-reminder-" + it.id });
+              n.onclick = () => { window.focus(); n.close(); };
+            } catch { /* 忽略 */ }
+          }
+        } else {
+          showToast("提醒：" + (it.title || "校园信息"), {
+            type: "info",
+            duration: 8000,
+            actionLabel: "查看",
+            actionFn: () => { exitPluginViews(); $memoLink.click(); },
+          });
+        }
+        document.querySelectorAll('[data-id="' + CSS.escape(String(it.id)) + '"] .btn-remind').forEach(b => {
+          b.classList.toggle("active", false);
+        });
+      } catch { /* 忽略 */ }
+    }
+  }
+
+  // ── 入口：核心加载器注入本脚本后调用 ──
+  function init(api) {
+    if (!api || typeof api.isLoaded !== "function" || !api.isLoaded(PLUGIN)) return;
+    buildSettingsControl();
+    registerItemRowExtension({
+      name: PLUGIN,
+      renderButton: renderButton,
+      renderMenu: renderMenu,
+      handle: handle,
+      closeMenus: closeMenus,
+      onVerify: (id, value, opts) => {
+        // 核心 verifyItem 成功后委派：加入备忘录（主列表）时尝试自动提醒
+        if (value === 1 && !(opts && opts.overlay)) maybeAutoRemind(id, opts);
+      },
+    });
+    startReminderTimer();
+  }
+
+  window.briefdeskPlugins = window.briefdeskPlugins || {};
+  window.briefdeskPlugins.reminders = { init: init };
+})();

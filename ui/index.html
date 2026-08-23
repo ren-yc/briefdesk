@@ -1,0 +1,416 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>简报台</title>
+  <!-- 默认 favicon（网格图标）；JS 启动后按随机主题色动态替换 -->
+  <link rel="icon" type="image/svg+xml" href="/图标/8-界面/网格.svg">
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <div id="app">
+    <header class="top-bar">
+      <h1>简报台 (BRIEFDESK)</h1>
+      <div class="top-bar-right">
+        <button id="sync-btn" class="sync-btn" title="手动触发一次消息同步">
+          <img src="/图标/8-界面/刷新.svg" class="icon" alt="">同步消息
+        </button>
+        <a href="#" id="settings-link-top" class="top-settings-link">
+          <img src="/图标/8-界面/设置.svg" class="icon" alt="">设置
+        </a>
+        <div id="status-indicator" class="status offline" title="点击查看运行状态详情" role="button" tabindex="0">
+          <span id="status-text">等待首次同步...</span>
+        </div>
+        <div id="status-popover" class="status-popover hidden"></div>
+      </div>
+    </header>
+    <div class="main-layout">
+      <aside class="sidebar">
+        <div class="sidebar-search">
+          <img src="/图标/8-界面/搜索.svg" class="icon-sm" alt="">
+          <input type="text" id="item-search" placeholder="搜索卡片..." autocomplete="off">
+          <button id="item-search-clear" class="search-clear hidden" title="清除">
+            <img src="/图标/8-界面/叉号.svg" class="icon-sm" alt="">
+          </button>
+          <!-- 搜索历史下拉（作为 .sidebar-search 子元素，绝对定位锚定更可靠） -->
+          <div id="search-history-dropdown" class="search-history-dropdown hidden"></div>
+        </div>
+        <!-- 搜索过滤条（与输入框同区，激活搜索时显示） -->
+        <div id="filter-bar" class="filter-bar hidden"></div>
+        <nav id="category-nav"></nav>
+        <!-- 备忘录/已忽略：固定位于左侧栏最下部 -->
+        <div class="nav-special">
+          <a href="#" id="subs-link" class="cat-link" data-category="全部" title="查看订阅关键词命中的卡片">
+            <span class="cat-link-main"><img src="/图标/8-界面/提醒用户.svg" class="icon-sm cat-icon" alt="">订阅<span class="cat-count" id="subs-count">0</span></span>
+          </a>
+          <a href="#" id="memo-link" class="cat-link" data-category="全部" data-verified="memo" title="已加入备忘录的卡片">
+            <span class="cat-link-main"><img src="/图标/8-界面/保存.svg" class="icon-sm cat-icon" alt="">备忘录<span class="cat-count">0</span></span>
+          </a>
+          <a href="#" id="ignored-link" class="cat-link" data-category="全部" data-verified="ignored" title="已忽略的卡片">
+            <span class="cat-link-main"><img src="/图标/8-界面/禁止.svg" class="icon-sm cat-icon" alt="">已忽略<span class="cat-count">0</span></span>
+          </a>
+        </div>
+      </aside>
+      <main id="content">
+        <!-- 内容视图工具条：列表显示模式与计数，固定位于内容区顶部，不受下方空态/骨架屏影响 -->
+        <div class="list-toolbar">
+          <div id="collapse-toggle" class="seg" role="tablist" aria-label="列表显示模式">
+            <div class="seg-pill" aria-hidden="true"></div>
+            <button class="seg-btn active" data-mode="collapsed" role="tab" aria-selected="true" title="同主体卡片合并展示">合并</button>
+            <button class="seg-btn" data-mode="expanded" role="tab" aria-selected="false" title="平铺展示全部卡片">平铺</button>
+          </div>
+          <button id="batch-toggle" class="batch-toggle-btn" type="button" title="勾选多张卡片统一处理">
+            <img src="/图标/8-界面/对勾.svg" class="icon-sm" alt="">批量操作
+          </button>
+          <button id="hide-expired-toggle" class="batch-toggle-btn" type="button" title="隐藏截止时间已过的卡片">
+            <img src="/图标/9-媒体/时间.svg" class="icon-sm" alt="">隐藏已截止
+          </button>
+          <button id="kb-help-btn" class="batch-toggle-btn" type="button" title="键盘快捷键（按 ? 也可打开）">快捷键指南</button>
+          <span id="list-count" class="list-count"></span>
+          <span id="blocked-hint" class="blocked-hint hidden" title="可在 设置 → 关键词订阅 的降噪黑名单中管理"></span>
+        </div>
+        <!-- 错误/警告横幅：同步失败、阶段缺失等状态提示（数据来自 /api/status） -->
+        <div id="error-banner" class="error-banner hidden" role="alert"></div>
+        <div id="loading-state" class="skeleton-container">
+          <div class="skeleton-card"></div>
+          <div class="skeleton-card"></div>
+          <div class="skeleton-card"></div>
+        </div>
+        <div id="empty-state" class="empty-state hidden">
+          <p>暂无信息，等待新消息中...</p>
+        </div>
+        <div id="filtered-empty-state" class="empty-state hidden">
+          <p>该分类下暂无信息</p>
+          <a href="#" class="reset-filter-link">查看全部</a>
+        </div>
+        <div id="items-container"></div>
+        <div id="load-more-wrap"></div>
+      </main>
+    </div>
+  </div>
+
+  <div id="settings-modal" class="modal hidden">
+    <div class="modal-content settings-modal-content">
+      <h2>设置</h2>
+      <div class="settings-layout">
+        <nav class="settings-menu" id="settings-menu" aria-label="设置分组">
+          <button type="button" class="settings-menu-item active" data-panel="general">常规</button>
+          <button type="button" class="settings-menu-item" data-panel="notify">通知</button>
+          <button type="button" class="settings-menu-item" data-panel="subs">关键词订阅</button>
+          <button type="button" class="settings-menu-item" data-panel="categories">信息分类</button>
+          <button type="button" class="settings-menu-item" data-panel="sessions">群聊筛选</button>
+          <button type="button" class="settings-menu-item" data-panel="plugins">插件</button>
+          <button type="button" class="settings-menu-item" data-panel="about">关于</button>
+        </nav>
+        <div class="settings-panels">
+
+          <section class="settings-panel" data-panel="general">
+            <h3 class="settings-section">常规</h3>
+            <label>外观模式</label>
+            <div id="theme-toggle" class="session-type-filter" role="group" aria-label="外观模式">
+              <button type="button" class="filter-chip" data-mode="light">浅色</button>
+              <button type="button" class="filter-chip" data-mode="dark">深色</button>
+              <button type="button" class="filter-chip" data-mode="system">跟随系统</button>
+            </div>
+            <p class="text-muted settings-hint">选择后立即生效，并保存在本浏览器。</p>
+            <label>前端刷新间隔（秒）</label>
+            <input type="number" id="refresh-interval" min="30" value="300">
+            <p class="text-muted settings-hint">新消息到达会实时推送，此间隔仅作为兜底轮询。</p>
+          </section>
+
+          <section class="settings-panel hidden" data-panel="notify">
+            <h3 class="settings-section">通知</h3>
+            <label>桌面通知（页面在后台时提醒）</label>
+            <select id="notify-mode" class="settings-select" aria-label="桌面通知模式">
+              <option value="off">关闭</option>
+              <option value="all">所有新信息</option>
+              <option value="keywords">仅关键词命中</option>
+            </select>
+            <p class="text-muted settings-hint">浏览器可能要求授权通知权限；关键词订阅见「关键词订阅」分组。</p>
+            <!-- 插件设置槽（reminders 插件注入「自动提醒」控件） -->
+            <div data-plugin-slot="settings-notify"></div>
+          </section>
+
+          <section class="settings-panel hidden" data-panel="subs">
+            <h3 class="settings-section">关键词订阅</h3>
+            <label>命中关键词的卡片会高亮标记（空格分隔多个关键词，任一命中即算）</label>
+            <div id="subs-list" class="subs-list"></div>
+            <button id="subs-add" style="margin:4px 0 8px;font-size:13px;padding:4px 10px;display:inline-flex;align-items:center;gap:4px;background:var(--surface);border:1px solid var(--border);border-radius:6px;color:var(--text-2);cursor:pointer">+ 添加订阅</button>
+            <div id="subs-add-form" class="cat-edit-form hidden">
+              <input type="text" id="subs-add-kw" placeholder="关键词，空格分隔（如：大创 内推 志愿）">
+              <div class="cat-edit-actions">
+                <button id="subs-add-save">确认</button>
+                <button id="subs-add-cancel">取消</button>
+              </div>
+            </div>
+
+            <h3 class="settings-section" style="margin-top:18px">黑名单关键词</h3>
+            <label>命中关键词的卡片在列表中隐藏（优先级高于订阅；仅本地生效，不影响已存数据）</label>
+            <div id="block-list" class="subs-list"></div>
+            <button id="block-add" style="margin:4px 0 8px;font-size:13px;padding:4px 10px;display:inline-flex;align-items:center;gap:4px;background:var(--surface);border:1px solid var(--border);border-radius:6px;color:var(--text-2);cursor:pointer">+ 添加黑名单关键词</button>
+            <div id="block-add-form" class="cat-edit-form hidden">
+              <input type="text" id="block-add-kw" placeholder="关键词，空格分隔（如：代写 广告 拼团）">
+              <div class="cat-edit-actions">
+                <button id="block-add-save">确认</button>
+                <button id="block-add-cancel">取消</button>
+              </div>
+            </div>
+          </section>
+
+          <section class="settings-panel hidden" data-panel="categories">
+            <h3 class="settings-section">信息分类</h3>
+            <label>勾选启用，AI 分类与显示均生效（修改将在保存后生效）</label>
+            <p class="cat-hint" role="note">类别之间请尽量互斥、减少交集：若两类存在交集（如「学术」与「活动通知」都可能涉及讲座），建议在类别描述中写明排除项，否则 AI 分类易产生混淆，影响分类准确率。</p>
+            <div id="category-toggles">
+              <p class="text-muted">加载中...</p>
+            </div>
+            <button id="category-add" style="margin:4px 0 8px;font-size:13px;padding:4px 10px;display:inline-flex;align-items:center;gap:4px;background:var(--surface);border:1px solid var(--border);border-radius:6px;color:var(--text-2);cursor:pointer">+ 添加类别</button>
+            <div id="cat-add-form" class="cat-edit-form hidden">
+              <input type="text" id="cat-add-name" placeholder="类别名称（≤20 字）" maxlength="20">
+              <textarea id="cat-add-prompt" placeholder="类别提示词：描述该类别的信息特征，供 AI 分类参考（≤50 字）" maxlength="50" rows="3"></textarea>
+              <div class="cat-palette" id="cat-add-palette"></div>
+              <div class="cat-edit-actions">
+                <button id="cat-add-save">确认</button>
+                <button id="cat-add-cancel">取消</button>
+              </div>
+            </div>
+          </section>
+
+          <section class="settings-panel hidden" data-panel="sessions">
+            <h3 class="settings-section">群聊筛选</h3>
+            <label>仅拉取已启用的群聊（修改将在保存后生效）</label>
+            <button id="session-refresh" style="margin:4px 0 8px;font-size:13px;padding:4px 10px;display:inline-flex;align-items:center;gap:4px;background:var(--surface);border:1px solid var(--border);border-radius:6px;color:var(--text-2);cursor:pointer">
+              <img id="session-refresh-icon" src="/图标/8-界面/刷新.svg" class="icon-sm" alt=""> <span id="session-refresh-text">发现新群聊</span>
+            </button>
+            <label>消息类型</label>
+            <div id="session-type-filter" class="session-type-filter" role="group" aria-label="按类型筛选群聊（可多选）">
+              <button type="button" class="filter-chip active" data-type="all">全部</button>
+              <button type="button" class="filter-chip" data-type="group">群聊</button>
+              <button type="button" class="filter-chip" data-type="private">私聊</button>
+              <button type="button" class="filter-chip" data-type="official">公众号</button>
+            </div>
+            <div id="session-source-group" class="hidden">
+              <label>消息来源</label>
+              <div id="session-source-filter" class="session-type-filter" role="group" aria-label="按消息源筛选群聊（可多选）"></div>
+            </div>
+            <label>按时间过滤</label>
+            <div class="session-time-filter">
+              <select id="session-time-preset" class="session-time-control">
+                <option value="all">全部（不过滤）</option>
+                <option value="6">6 小时内活跃</option>
+                <option value="12">12 小时内活跃</option>
+                <option value="24">24 小时内活跃</option>
+                <option value="48">48 小时内活跃</option>
+                <option value="72">72 小时内活跃</option>
+                <option value="168">7 天内活跃</option>
+                <option value="custom">自定义</option>
+              </select>
+              <input type="number" id="session-time-custom" class="session-time-control" min="0" step="1" placeholder="小时">
+            </div>
+            <div class="sidebar-search session-search">
+              <img src="/图标/8-界面/搜索.svg" class="icon-sm" alt="">
+              <input type="text" id="session-search" placeholder="搜索群聊名称..." autocomplete="off">
+            </div>
+            <div id="session-list" class="session-list">
+              <p class="text-muted">加载中...</p>
+            </div>
+          </section>
+
+          <section class="settings-panel hidden" data-panel="plugins">
+            <h3 class="settings-section">插件</h3>
+            <p class="text-muted settings-hint">本体只保留核心，扩展能力以插件挂载；插件的前端（入口/视图）随插件包分发，未加载插件的功能入口不出现（如日历/提醒）。</p>
+            <div id="plugins-list" class="plugins-list"><p class="text-muted">加载中...</p></div>
+          </section>
+
+          <section class="settings-panel hidden" data-panel="about">
+            <h3 class="settings-section">关于</h3>
+            <p class="text-muted settings-about-name"><strong>简报台 (BRIEFDESK)</strong></p>
+            <p class="text-muted settings-hint">实时监听已启用的群聊消息，经 AI 分类与语义去重后，整理为结构化的校园信息卡片（活动、招新、学术、交易、实习等）。</p>
+            <label>启用消息源</label>
+            <div id="about-sources" class="about-sources"><p class="text-muted">加载中...</p></div>
+            <p class="text-muted settings-hint">数据保存在本地 SQLite 文件；修改 .env / 配置后需重启应用生效；新消息实时推送，列表刷新间隔仅作兜底轮询。</p>
+
+            <h3 class="settings-section" style="margin-top:18px">数据导出</h3>
+            <p class="text-muted settings-hint">导出当前筛选的卡片（CSV），或人工分类修正样本（JSONL，供模型微调）。内容已脱敏。</p>
+            <div class="about-sources" style="display:flex;gap:8px;flex-wrap:wrap">
+              <button id="export-items-btn" class="settings-outline-btn">导出卡片 CSV</button>
+              <button id="export-recat-btn" class="settings-outline-btn">导出修正样本 JSONL</button>
+            </div>
+
+            <h3 class="settings-section" style="margin-top:18px">数据备份 / 恢复</h3>
+            <p class="text-muted settings-hint">下载当前数据库备份；恢复需上传备份文件，校验通过后<strong>重启应用生效</strong>（将替换当前全部数据）。</p>
+            <div class="about-sources" style="display:flex;gap:8px;flex-wrap:wrap">
+              <button id="backup-download" class="settings-outline-btn">下载备份</button>
+              <button id="restore-upload" class="settings-outline-btn">从备份恢复</button>
+              <input type="file" id="restore-file" accept=".sqlite,.db,application/octet-stream" class="hidden">
+            </div>
+          </section>
+
+        </div>
+      </div>
+      <div class="modal-actions settings-actions">
+        <button id="settings-save">保存</button>
+        <button id="settings-close">取消</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 同主体卡片浮层 -->
+  <div id="group-overlay" class="modal hidden" role="dialog" aria-label="同主体卡片">
+    <div class="modal-content group-overlay-content">
+      <div class="group-overlay-head">
+        <h2 id="group-overlay-title"></h2>
+        <button id="group-overlay-close" title="关闭 (Esc)">×</button>
+      </div>
+      <div id="group-overlay-list"></div>
+    </div>
+  </div>
+
+  <!-- 主体时间线浮层 -->
+  <div id="subject-timeline-modal" class="modal hidden" role="dialog" aria-label="主体时间线">
+    <div class="modal-content timeline-content">
+      <div class="group-overlay-head">
+        <h2 id="timeline-title"></h2>
+        <button id="timeline-close" title="关闭 (Esc)">×</button>
+      </div>
+      <div id="timeline-list"></div>
+      <div id="timeline-load-more-wrap"></div>
+    </div>
+  </div>
+
+  <!-- 批量操作悬浮条 -->
+  <div id="batch-bar" class="batch-bar hidden" role="toolbar" aria-label="批量操作">
+    <span id="batch-count" class="batch-count">已选 0 条</span>
+    <button id="batch-select-all" type="button">全选当前</button>
+    <span class="batch-sep"></span>
+    <button id="batch-memo" type="button">加入备忘录</button>
+    <button id="batch-ignore" type="button">忽略</button>
+    <button id="batch-unverify" type="button">恢复未处理</button>
+    <button id="batch-delete" type="button" class="batch-danger">删除</button>
+    <button id="batch-exit" type="button">退出</button>
+  </div>
+
+  <!-- 批量删除确认 -->
+  <div id="batch-confirm-modal" class="modal hidden" role="dialog" aria-label="确认删除">
+    <div class="modal-content batch-confirm-content">
+      <h2>删除所选卡片？</h2>
+      <p class="text-muted">将删除 <strong id="batch-confirm-n"></strong> 张卡片及其原文记录。<br>删除后无法恢复；相似内容的新消息可能重新出现。</p>
+      <div class="modal-actions">
+        <button id="batch-confirm-delete" style="background:var(--danger);color:var(--on-accent);border-color:var(--danger)">确认删除</button>
+        <button id="batch-confirm-cancel">取消</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 图片放大查看 -->
+  <div id="lightbox" class="lightbox hidden" role="dialog" aria-label="图片预览">
+    <button id="lightbox-close" class="lightbox-btn lightbox-close" title="关闭 (Esc)">
+      <img src="/图标/8-界面/叉号.svg" alt="关闭">
+    </button>
+    <button id="lightbox-prev" class="lightbox-btn lightbox-nav lightbox-prev" title="上一张 (←)">
+      <img src="/图标/9-媒体/上一个.svg" alt="上一张">
+    </button>
+    <img id="lightbox-img" alt="放大图片">
+    <button id="lightbox-next" class="lightbox-btn lightbox-nav lightbox-next" title="下一张 (→)">
+      <img src="/图标/9-媒体/下一个.svg" alt="下一张">
+    </button>
+    <div id="lightbox-counter" class="lightbox-counter"></div>
+  </div>
+
+  <!-- 全局提示 -->
+  <div id="toast-container" class="toast-container" aria-live="polite"></div>
+
+  <!-- 首次使用向导 -->
+  <div id="onboard-modal" class="modal hidden" role="dialog" aria-label="首次使用向导">
+    <div class="modal-content onboard-content">
+      <div class="group-overlay-head">
+        <h2>欢迎使用 BRIEFDESK</h2>
+        <button id="onboard-skip" class="onboard-skip" title="跳过（Esc）">跳过</button>
+      </div>
+      <div id="onboard-step-1" class="onboard-step">
+        <p class="onboard-desc">本应用会监控群聊消息，由 AI 自动分类整理成校园信息卡片。先检查运行环境：</p>
+        <div id="onboard-env" class="onboard-env"><p class="text-muted">检查中...</p></div>
+        <div class="modal-actions">
+          <button id="onboard-1-next" class="onboard-primary">下一步：选择要监控的群聊</button>
+        </div>
+      </div>
+      <div id="onboard-step-2" class="onboard-step hidden">
+        <p class="onboard-desc">勾选要监控的群聊（群聊默认勾选，私聊 / 公众号默认不勾）。保存后即可开始拉取消息。</p>
+        <!-- 会话筛选：与设置「群聊筛选」同一规则（类型/来源/时间/搜索叠加），独立状态 -->
+        <div id="onboard-filter-bar" class="onboard-filter-bar">
+          <div class="sidebar-search">
+            <img src="/图标/8-界面/搜索.svg" class="icon-sm" alt="">
+            <input type="text" id="onboard-session-search" placeholder="搜索会话..." autocomplete="off">
+          </div>
+          <div id="onboard-type-filter" class="session-type-filter" role="group" aria-label="按类型筛选会话（可多选）">
+            <button type="button" class="filter-chip active" data-type="all">全部</button>
+            <button type="button" class="filter-chip" data-type="group">群聊</button>
+            <button type="button" class="filter-chip" data-type="private">私聊</button>
+            <button type="button" class="filter-chip" data-type="official">公众号</button>
+          </div>
+          <div id="onboard-source-group" class="hidden">
+            <div id="onboard-source-filter" class="session-type-filter" role="group" aria-label="按消息源筛选会话（可多选）"></div>
+          </div>
+          <div class="session-time-filter">
+            <select id="onboard-time-preset" class="session-time-control">
+              <option value="all">全部（不过滤）</option>
+              <option value="6">6 小时内活跃</option>
+              <option value="12">12 小时内活跃</option>
+              <option value="24">24 小时内活跃</option>
+              <option value="48">48 小时内活跃</option>
+              <option value="72">72 小时内活跃</option>
+              <option value="168">7 天内活跃</option>
+              <option value="custom">自定义</option>
+            </select>
+            <input type="number" id="onboard-time-custom" class="session-time-control" min="0" step="1" placeholder="小时">
+          </div>
+        </div>
+        <div id="onboard-sessions" class="onboard-sessions"><p class="text-muted">加载中...</p></div>
+        <div class="modal-actions">
+          <button id="onboard-2-back">上一步</button>
+          <button id="onboard-2-next" class="onboard-primary">保存并继续</button>
+        </div>
+      </div>
+      <div id="onboard-step-3" class="onboard-step hidden">
+        <p class="onboard-desc">将按 <code>BACKFILL_HOURS</code>（默认 24 小时）回填一次已启用群聊的历史消息，之后实时监听增量。</p>
+        <div class="modal-actions">
+          <button id="onboard-3-back">上一步</button>
+          <button id="onboard-3-start" class="onboard-primary">开始同步</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 键盘快捷键帮助 -->
+  <div id="kb-help-modal" class="modal hidden" role="dialog" aria-label="键盘快捷键">
+    <div class="modal-content kb-help-content">
+      <div class="group-overlay-head">
+        <h2>键盘快捷键</h2>
+        <button id="kb-help-close" title="关闭 (Esc)">×</button>
+      </div>
+      <div class="kb-help-grid">
+        <div><kbd>j</kbd><kbd>k</kbd><span>上 / 下移动焦点卡片</span></div>
+        <div><kbd>m</kbd><span>加入 / 移出备忘录（焦点卡片）</span></div>
+        <div><kbd>i</kbd><span>忽略 / 取消忽略（焦点卡片）</span></div>
+        <div><kbd>u</kbd><span>撤销上一步操作</span></div>
+        <div><kbd>c</kbd><span>复制焦点卡片标题与关键信息</span></div>
+        <div><kbd>Enter</kbd><span>展开 / 收起焦点卡片原文引用</span></div>
+        <div><kbd>/</kbd><span>聚焦搜索框</span></div>
+        <div><kbd>?</kbd><span>打开本帮助</span></div>
+        <div><kbd>Esc</kbd><span>关闭浮层 / 弹窗 / 菜单</span></div>
+        <div><kbd>←</kbd><kbd>→</kbd><span>灯箱中切换图片</span></div>
+      </div>
+      <p class="text-muted">快捷键仅在未输入文本时生效；鼠标操作全部保留。</p>
+    </div>
+  </div>
+
+  <!-- 新消息浮条 -->
+  <div id="new-items-bar" class="new-items-bar hidden" role="status">
+    <span id="new-items-bar-text">有 0 条新信息</span>
+    <button id="new-items-bar-btn">查看</button>
+  </div>
+
+  <script src="/app.js"></script>
+</body>
+</html>

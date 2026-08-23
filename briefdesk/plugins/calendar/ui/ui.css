@@ -1,0 +1,89 @@
+/* calendar 插件前端样式（P5）：日历视图样式随插件包分发，经
+ * /plugin-assets/calendar/ui.css 由核心加载器注入。依赖核心 style.css 的
+ * CSS 变量（--surface/--border/--accent/--text 等）与 .modal 基础样式。 */
+
+/* ── 日历视图 ── */
+#calendar-view.hidden { display: none; }
+body.calendar-mode #items-container,
+body.calendar-mode .list-toolbar,
+body.calendar-mode #load-more-wrap,
+body.calendar-mode .empty-state,
+body.calendar-mode #loading-state { display: none !important; }
+.sync-btn.active { background: var(--accent); color: var(--on-accent); border-color: var(--accent); }
+.cal-head {
+  display: flex; align-items: center; gap: 8px; margin-bottom: 12px;
+}
+.cal-title { font-size: 15px; font-weight: 650; color: var(--text); flex: 1; }
+.cal-head button {
+  border: 1px solid var(--border); background: var(--surface); color: var(--text-2);
+  font-size: 13px; padding: 4px 12px; border-radius: var(--radius-sm); cursor: pointer; font-family: inherit;
+}
+.cal-head button:hover { background: var(--bg); color: var(--text); }
+.cal-head .cal-memo-toggle {
+  transition: background .15s, color .15s, border-color .15s;
+}
+.cal-head .cal-memo-toggle.active {
+  background: var(--accent); color: var(--on-accent); border-color: var(--accent);
+}
+.cal-head .cal-memo-toggle.active:hover { background: var(--accent-hover); color: var(--on-accent); }
+.cal-head .cal-nav { font-size: 15px; padding: 4px 10px; }
+.cal-exit { margin-left: auto; }
+.cal-weekdays, .cal-grid { display: grid; grid-template-columns: repeat(7, 1fr); gap: 4px; }
+.cal-weekdays span {
+  text-align: center; font-size: 12px; font-weight: 600; color: var(--text-3); padding: 4px 0;
+}
+.cal-cell {
+  min-height: 92px; border: 1px solid var(--border); border-radius: var(--radius-sm);
+  background: var(--surface); padding: 4px; overflow: hidden;
+  display: flex; flex-direction: column; gap: 3px;
+}
+.cal-cell.out { opacity: .45; }
+.cal-cell.today { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent) inset; }
+.cal-daynum { font-size: 11px; font-weight: 600; color: var(--text-3); }
+.cal-cell.today .cal-daynum { color: var(--accent); }
+.cal-chips { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.cal-chip {
+  border: none; text-align: left; cursor: pointer; font-family: inherit;
+  font-size: 12px; line-height: 1.4; color: var(--cat, var(--cat-default));
+  background: color-mix(in srgb, var(--cat, var(--cat-default)) 10%, var(--surface));
+  border-left: 3px solid var(--cat, var(--cat-default));
+  border-radius: 3px; padding: 3px 6px;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.cal-chip:hover { filter: brightness(.95); }
+.cal-chip.expired { opacity: .5; text-decoration: line-through; }
+.cal-more {
+  font-size: 11px; color: var(--text-3); padding: 1px 6px; text-align: left;
+  border: none; background: none; cursor: pointer; font-family: inherit; border-radius: 4px;
+}
+.cal-more:hover { color: var(--accent); background: var(--accent-lt); text-decoration: underline; }
+
+/* 筛选切换动画：chip 错落浮现（仅 .cal-filter-anim 期间播放，翻月/进入不打扰） */
+.cal-filter-anim .cal-chip,
+.cal-filter-anim .cal-more {
+  animation: calChipIn .3s cubic-bezier(.22,1,.36,1) both;
+  animation-delay: calc(var(--rise-i, 0) * 22ms);
+}
+@keyframes calChipIn {
+  from { opacity: 0; transform: translateY(5px); }
+  to   { opacity: 1; transform: none; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .cal-filter-anim .cal-chip, .cal-filter-anim .cal-more { animation: none; }
+}
+
+/* ── 日历详情 / 当日事件浮层 ── */
+.detail-content { width: 520px; }
+.cal-detail-row { margin-bottom: 0; }
+#cal-day-list {
+  display: flex; flex-direction: column; gap: 6px;
+  max-height: 60vh; overflow-y: auto;
+}
+#cal-day-list .cal-chip {
+  font-size: 12px; padding: 6px 10px;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+
+/* 浮层叠放：同为 z-index:100 时按 DOM 序后进者在上——
+   详情浮层须盖过"更多"页；时间线（核心，z-index:120）须盖过详情 */
+#calendar-detail-modal { z-index: 110; }

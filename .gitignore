@@ -1,0 +1,61 @@
+# Python bytecode
+__pycache__/
+*.pyc
+*.pyo
+
+# Test / lint / type-check caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+pytest-cache-files-*/
+
+# Virtual environment
+.venv/
+venv/
+
+# Dependencies
+*.egg-info/
+dist/
+
+# Database
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+
+# Environment secrets
+.env
+.env.*.local
+
+# IDE
+.idea/
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Presentation files (all files/dirs containing "ppt")
+*ppt*
+
+# Temp / debug scratch files
+tmp_*
+*.tmp
+*.bak
+*_stub*.js
+debug*.py
+*.log
+.npm-check-cache/
+
+# WorkBuddy agent workspace
+.workbuddy/
+
+# Benchmark run artifacts（fromweb 为网页导出用例，含真实聊天内容，禁止入库）
+briefdesk/plugins/benchmark/reports/
+briefdesk/plugins/benchmark/.tmp/
+briefdesk/plugins/benchmark/cases/*.fromweb.json
+
+# Deprecated
+experiments/
+
+# slidep PPT 编译依赖目录（BRIEFDESK-未来杯答辩项目）
+/assets/
