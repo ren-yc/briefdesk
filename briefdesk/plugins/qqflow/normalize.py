@@ -5,9 +5,10 @@ qqflow-server v1 差异：
   [image] / localType=3）在 mediaId 可获取时放行，image_urls 挂 mediaId 供
   OCR 与前端代理展示；语音/视频（[voice]/[video]/localType 4/5）无下游
   消费方，维持过滤
-- SSE 事件自带 media 对象、无媒体回查需求 → normalize_sse 为纯同步函数
-  （weflow 的 async 是媒体回查的产物）；SSE 无 mediaId 字段，存储键按上游
-  MediaInfo::compute_key 规则从 media 对象推导（见 _media_key）
+- SSE 事件自带 media 对象（无路径元数据视图，上游不下发 localPath）与
+  mediaId 字段（仅当索引注册了可读取的本地缓存时携带，与 REST 同规则）
+  → normalize_sse 为纯同步函数（weflow 的 async 是媒体回查的产物），
+  image_urls 直接取事件 mediaId，无推导/回查需求
 - msg_id 统一用 rowid：SSE rawid（字符串）与 REST localId（数字转 str）同值
 """
 
@@ -38,8 +39,6 @@ _QQ_UID_ONLY_RE = re.compile(r"^u_[A-Za-z0-9_-]{16,64}$")
 # 该属性对，规则零误伤；localType=3 的图片消息 content 为 [image] 不受影响。
 _QQ_RICH_XML_RE = re.compile(r'm_fileName\s*=\s*"[^"]+"\s+m_resid\s*=\s*"[^"]+"')
 
-_HEX_CHARS = "0123456789abcdefABCDEF"
-
 
 def is_self_message(msg: QqFlowMessage, self_uid: str) -> bool:
     """判定消息是否本账号自己发送（IGNORE_SELF 识别谓词）。
@@ -53,27 +52,6 @@ def is_self_message(msg: QqFlowMessage, self_uid: str) -> bool:
     return bool(self_uid) and (msg.get("senderUsername") or "") == self_uid
 
 
-def _media_key(media: dict) -> str | None:
-    """从 media 对象推导媒体存储键，镜像上游 MediaInfo::compute_key。
-
-    优先级：md5（小写）→ fileName 中 32 位 hex 文件名（小写）→ uuid（原样）。
-    上游 REST 消息的 mediaId 即此键；SSE 事件不携带 mediaId（key 字段被
-    serde skip），必须在此重算——推导有偏差则 /api/v1/media/{id} 必 404。
-    """
-    md5 = media.get("md5") or ""
-    if md5:
-        return md5.lower()
-    name = (media.get("fileName") or "").strip()
-    if "." in name:
-        stem = name.rsplit(".", 1)[0].strip()
-        if len(stem) == 32 and all(c in _HEX_CHARS for c in stem):
-            return stem.lower()
-    uuid = media.get("uuid") or ""
-    if uuid:
-        return uuid
-    return None
-
-
 # ── Normalize SSE → InternalMessage ──
 
 
@@ -84,18 +62,12 @@ def normalize_sse(event: QqFlowEvent) -> InternalMessage:
     # 控制字符/纯空白脏数据，净化后为空才回退到会话 id / "未知"。
     sender_name = clean_display_name(event.get("sourceName")) or "未知"
     image_urls: list[str] = []
-    # 图片消息：media 对象自带本地缓存路径时推导存储键，供 OCR 与前端代理展示
+    # 图片消息：事件自带的 mediaId（上游仅在该媒体可读取时携带，与 REST 同
+    # 规则），挂 image_urls 供 OCR 与前端代理展示；缺失即无字节可取
     if event.get("content", "").strip() == _IMAGE_PLACEHOLDER:
-        media = event.get("media")
-        if isinstance(media, dict) and media.get("localPath"):
-            key = _media_key(media)
-            if key:
-                image_urls.append(key)
-            else:
-                logger.debug(
-                    "SSE rawid=%s: media 对象无法推导存储键，图片跳过",
-                    event.get("rawid"),
-                )
+        media_id = event.get("mediaId")
+        if media_id:
+            image_urls.append(media_id)
     normalized = InternalMessage(
         msg_id=event["rawid"],
         content=event.get("content", ""),
@@ -162,14 +134,18 @@ def pre_filter_sse(event: QqFlowEvent) -> bool:
             event.get("rawid"),
         )
         return False
-    # 图片消息：media 对象带本地缓存路径（上游媒体注册的充要条件之一）时放行，
-    # 交由 normalize_sse 推导存储键；无 localPath → /api/v1/media/{id} 必 404，
-    # 且占位符无信息价值，维持过滤。[voice]/[video] 不匹配精确占位符，照旧拒绝
+    # 图片消息：事件携带 mediaId（上游仅当索引注册了可读取的本地缓存时提供，
+    # 与 REST messages.mediaId 同一规则，出现即保证可取）时放行，交由
+    # normalize_sse 挂 image_urls 供 OCR；无 mediaId → /api/v1/media/{id} 必
+    # 404，且占位符无信息价值，维持过滤。[voice]/[video] 不匹配精确占位符，
+    # 照旧拒绝
     if c.strip() == _IMAGE_PLACEHOLDER:
-        media = event.get("media")
-        if isinstance(media, dict) and bool(media.get("localPath")):
+        if event.get("mediaId"):
             return True
-        logger.debug("丢弃 SSE rawid=%s: 图片无本地缓存路径（localPath 缺失）", event.get("rawid"))
+        logger.debug(
+            "丢弃 SSE rawid=%s: 图片无 mediaId（服务端未注册可读取的本地缓存）",
+            event.get("rawid"),
+        )
         return False
     if len(c.strip()) < 5:
         logger.debug("丢弃 SSE rawid=%s: 内容过短", event.get("rawid"))

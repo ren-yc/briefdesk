@@ -43,7 +43,10 @@ class QqFlowEvent(TypedDict):
     sourceName: str  # 发送者昵称；缺失时省略
     content: str
     timestamp: int  # 秒级 Unix
-    media: dict | None  # 图片/语音/视频的结构化媒体元数据；缺失时省略
+    media: dict | None  # 图片/语音/视频的结构化媒体元数据（无路径视图，上游
+    # 推送不下发 localPath）；缺失时省略
+    mediaId: str | None  # 媒体获取键（md5 hex 或 uuid），仅当索引注册了可读取
+    # 的本地缓存时提供（与 REST messages.mediaId 同一规则）；缺失时省略
 
 
 class QqFlowSession(TypedDict):

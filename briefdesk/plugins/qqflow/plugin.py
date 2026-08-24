@@ -16,7 +16,7 @@ class QqFlowPlugin(SourcePlugin):
     """qqflow 源插件（显式实现 SourcePlugin；入口见模块底部 `plugin` 实例）。"""
 
     name = "qqflow"
-    version = "1.0.0"
+    version = "1.0.1"
     dependencies: tuple[str, ...] = ()
 
     def __init__(self) -> None:

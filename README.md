@@ -160,7 +160,7 @@ briefdesk/
 │       ├── merge/              # 同话题合并阶段插件（plugin.py 槽位 post_insert / engine.py 判官）
 │       ├── calendar/           # 日历 Web 插件（plugin.py + router.py + db.py：/api/calendar；ui/ 含完整前端）
 │       ├── reminders/          # 提醒 Web 插件（plugin.py + router.py：提醒设置 + 到期轮询；ui/ 含完整前端）
-│       └── benchmark/           # 实验基准（case 样例 + runner + 报告生成，见 benchmark/README.md）
+│       └── benchmark/           # 实验基准（case 样例 + runner + 报告生成，见 benchmark/README.md；默认禁用，PLUGINS 显式列名启用）
 ├── ui/
 │   ├── index.html          # 桌面端页面
 │   ├── app.js              # 前端逻辑
@@ -183,6 +183,9 @@ briefdesk/
   `briefdesk.plugins.*`
 - 消息源为内置插件（weflow/qqflow），启用走 `PLUGINS` / `PLUGINS_DISABLED`
   （不再使用 SOURCES）
+- 声明 `default_disabled = True` 的插件（如实验性 benchmark）默认不随
+  `PLUGINS=["*"]` 加载，需显式列名（`PLUGINS=["*", "benchmark"]`）才启用；
+  `PLUGINS_DISABLED` 仍为最高优先级
 - 管道阶段化：OCR / AI 分类 / 语义去重 / 同话题合并各是一个阶段插件
   （`briefdesk/plugins/{ocr,classify,dedup,merge}/`，槽位
   enrich → classify → dedup → post_insert），`briefdesk/pipeline.py` 只做

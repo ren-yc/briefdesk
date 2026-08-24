@@ -24,6 +24,7 @@ class FakePlugin:
         *,
         version: str = "1.0.0",
         dependencies: tuple[str, ...] = (),
+        default_disabled: bool = False,
         calls: list | None = None,
         setup_disabled: str | None = None,
         setup_error: Exception | None = None,
@@ -32,6 +33,7 @@ class FakePlugin:
         self.name = name
         self.version = version
         self.dependencies = dependencies
+        self.default_disabled = default_disabled
         self.calls = calls if calls is not None else []
         self.setup_disabled = setup_disabled
         self.setup_error = setup_error
@@ -164,6 +166,45 @@ class FilterTest(_ManagerTestBase):
             make_settings(plugins=["*"], plugins_disabled=["a"])
         )
         manager.register(FakePlugin("a", calls=calls))
+        manager.register(FakePlugin("b", calls=calls))
+        await manager.setup_all(make_ctx())
+        self.assertEqual(manager.loaded, ["b"])
+
+    async def test_default_disabled_excluded_unless_explicit(self):
+        """声明 default_disabled 的插件：PLUGINS=["*"] 默认不加载，显式列名才启用。"""
+        calls: list = []
+        manager = PluginManager(make_settings())
+        manager.register(FakePlugin("bench", default_disabled=True, calls=calls))
+        manager.register(FakePlugin("b", calls=calls))
+        await manager.setup_all(make_ctx())
+        self.assertEqual(manager.loaded, ["b"])
+        rec = manager.records()["bench"]
+        self.assertEqual(rec.status, "disabled")
+        self.assertIn("默认禁用", rec.reason)  # /api/plugins 可见原因
+
+    async def test_default_disabled_explicit_with_wildcard(self):
+        calls: list = []
+        manager = PluginManager(make_settings(plugins=["*", "bench"]))
+        manager.register(FakePlugin("bench", default_disabled=True, calls=calls))
+        manager.register(FakePlugin("b", calls=calls))
+        await manager.setup_all(make_ctx())
+        self.assertEqual(manager.loaded, ["bench", "b"])
+        self.assertEqual(manager.records()["bench"].status, "loaded")
+
+    async def test_default_disabled_explicit_allowlist(self):
+        calls: list = []
+        manager = PluginManager(make_settings(plugins=["bench"]))
+        manager.register(FakePlugin("bench", default_disabled=True, calls=calls))
+        await manager.setup_all(make_ctx())
+        self.assertEqual(manager.loaded, ["bench"])
+
+    async def test_explicit_disable_overrides_default_disabled(self):
+        """PLUGINS_DISABLED 优先级最高：即便显式列名也被禁用。"""
+        calls: list = []
+        manager = PluginManager(
+            make_settings(plugins=["*", "bench"], plugins_disabled=["bench"])
+        )
+        manager.register(FakePlugin("bench", default_disabled=True, calls=calls))
         manager.register(FakePlugin("b", calls=calls))
         await manager.setup_all(make_ctx())
         self.assertEqual(manager.loaded, ["b"])

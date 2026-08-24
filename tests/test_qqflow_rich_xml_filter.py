@@ -65,10 +65,17 @@ class SseRichXmlFilterTest(unittest.TestCase):
     def test_filters_rich_xml_fragment(self):
         self.assertFalse(pre_filter_sse(self._event(_RICH_XML_FRAGMENT)))
 
-    def test_keeps_image_placeholder_with_local_path(self):
+    def test_keeps_image_placeholder_with_media_id(self):
         event = self._event("[image]")
-        event["media"] = {"localPath": "C:\\tmp\\a.png", "md5": "abc123"}
+        event["mediaId"] = "9f2a1c2d3e4f5a6b7c8d9e0f1a2b3c4d"
         self.assertTrue(pre_filter_sse(event))
+
+    def test_filters_image_placeholder_without_media_id(self):
+        # media 对象仍在但无 mediaId：服务端未注册可读取的本地缓存，
+        # /api/v1/media/{id} 必 404 → 占位符无信息价值，维持过滤（与 REST 同规则）
+        event = self._event("[image]")
+        event["media"] = {"md5": "9f2a1c2d3e4f5a6b7c8d9e0f1a2b3c4d"}
+        self.assertFalse(pre_filter_sse(event))
 
     def test_keeps_plain_text(self):
         self.assertTrue(pre_filter_sse(self._event("hello world")))

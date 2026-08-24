@@ -145,6 +145,7 @@ GET /api/v1/push/messages
 - KeepAlive 每 15 秒发送 `ping`
 - 订阅端落后于广播缓冲（1024 条）时会重新收到 `sync` 事件对齐
 - 建议接收端按 `event + rawid` 去重
+- **媒体路径不出现在推送里**：`media` 对象为无路径元数据视图（`localPath` 永不下发——QQ 缓存路径多为本机失效路径且无下游可用性）；媒体字节一律经 `GET /api/v1/media/{id}` 获取，键取 `mediaId`（仅当服务端已注册可读取的本地缓存时携带，与 messages 的 `mediaId` 同一规则，见 §3/§3.1）
 
 ### 事件字段
 
@@ -159,7 +160,8 @@ GET /api/v1/push/messages
 | `groupName` | 会话显示名（群聊：群备注 > 改名消息群名 > 群信息库群名 > 群号；私聊：备注 > 对方昵称（会话名） > 档案昵称 > UID）；仅 `message.new` / `message.revoke` 携带，缺失时省略该字段 |
 | `content` | 消息内容 |
 | `timestamp` | 消息时间，秒级 Unix 时间戳 |
-| `media` | 仅图片/语音/视频消息：媒体元数据对象（与 messages 的 `media` 同形状），缺失时省略 |
+| `media` | 仅图片/语音/视频消息：媒体元数据对象（`uuid`/`md5`/`fileName`/`size`/`width`/`height`/`urls`，**不含 `localPath`**——推送不携带任何本地路径），缺失时省略 |
+| `mediaId` | 仅 `message.new`：媒体获取键（md5 hex 或 uuid），用于 `GET /api/v1/media/{id}` 直取字节；**仅当索引注册了可读取的本地缓存路径时提供**（与 REST `messages.mediaId` 同规则），否则省略——出现即保证可取，绝不 404 承诺 |
 | `lastRowidGroup` / `lastRowidC2c` | 仅 `sync` 事件：群/私聊表当前水位线（rowid 最大值） |
 
 ### 示例

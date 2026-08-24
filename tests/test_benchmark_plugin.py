@@ -19,6 +19,7 @@ import briefdesk.db as briefdesk_db
 from briefdesk.config import Settings, config
 from briefdesk.db import init_schema, insert_item
 from briefdesk.plugin.base import PluginContext
+from briefdesk.plugin.manager import PluginManager
 from briefdesk.plugins.benchmark import recorder as bench_recorder
 from briefdesk.plugins.benchmark import router as bench_router
 from briefdesk.plugins.benchmark import store as bench_store
@@ -37,6 +38,80 @@ from briefdesk.types import (
 
 async def _noop_async(event, payload):
     return None
+
+
+class _EmptyEPS(list):
+    """空 entry point 列表桩：隔离本机已安装插件的发现（manager 只调 .select）。"""
+
+    def select(self, *, group=None, name=None):
+        return [e for e in self if e.group == group]
+
+
+def _bare_ctx() -> PluginContext:
+    """最小装配上下文：所有注册端口 noop（默认即静默丢弃）。"""
+    return PluginContext(
+        config=Settings(
+            plugins=["*"], plugins_disabled=[], plugins_required=[], plugin_path=""
+        ),
+        publish_event=_noop_async,
+        subscribe_event=lambda e, h: None,
+        register_source=lambda r: None,
+        register_stage=lambda s: None,
+    )
+
+
+class _AiProviderStub:
+    """ai_provider 依赖桩：benchmark 声明依赖它，装配测试需先注册后才能加载。"""
+
+    name = "ai_provider"
+    version = "0"
+    dependencies: tuple[str, ...] = ()
+
+    async def setup(self, ctx: PluginContext) -> None: ...
+
+    async def activate(self, ctx: PluginContext) -> None: ...
+
+    async def teardown(self) -> None: ...
+
+
+class DefaultDisabledTest(unittest.IsolatedAsyncioTestCase):
+    """默认禁用：默认配置（PLUGINS=["*"]）下 PluginManager 不装配 benchmark，
+    显式列名才启用。"""
+
+    async def asyncSetUp(self):
+        self._eps_patch = patch(
+            "importlib.metadata.entry_points", return_value=_EmptyEPS([])
+        )
+        self._eps_patch.start()
+        self.addCleanup(self._eps_patch.stop)
+
+    async def test_not_loaded_by_default(self):
+        manager = PluginManager(
+            Settings(
+                plugins=["*"], plugins_disabled=[], plugins_required=[], plugin_path=""
+            )
+        )
+        manager.register(BenchmarkPlugin())
+        await manager.setup_all(_bare_ctx())
+        self.assertEqual(manager.loaded, [])
+        rec = manager.records()["benchmark"]
+        self.assertEqual(rec.status, "disabled")
+        self.assertIn("默认禁用", rec.reason)  # /api/plugins 可见原因
+
+    async def test_loaded_when_explicit(self):
+        manager = PluginManager(
+            Settings(
+                plugins=["*", "benchmark"],
+                plugins_disabled=[],
+                plugins_required=[],
+                plugin_path="",
+            )
+        )
+        manager.register(_AiProviderStub())  # benchmark 声明依赖 ai_provider
+        manager.register(BenchmarkPlugin())
+        await manager.setup_all(_bare_ctx())
+        self.assertIn("benchmark", manager.loaded)
+        self.assertEqual(manager.records()["benchmark"].status, "loaded")
 
 
 class PluginSetupTest(unittest.IsolatedAsyncioTestCase):

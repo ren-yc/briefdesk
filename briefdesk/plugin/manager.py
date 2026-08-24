@@ -100,17 +100,36 @@ class PluginManager:
     # ── 装配 ──
 
     def enabled_names(self) -> list[str]:
-        """按 PLUGINS / PLUGINS_DISABLED 过滤后的插件名（保持发现顺序）。"""
+        """按 PLUGINS / PLUGINS_DISABLED / 默认禁用名单过滤后的插件名（保持发现顺序）。
+
+        默认禁用语义：声明 `default_disabled = True` 的插件（如实验性 benchmark）
+        仅在 PLUGINS 中显式列名时启用——`PLUGINS=["*"]` 的"启用全部"不包含它，
+        显式名称优先于通配；PLUGINS_DISABLED 仍为最高优先级，无论是否显式列名。
+        """
         names = list(self._records)
         allow = self._settings.plugins
+        explicit = set(allow)
         if "*" not in allow:
             for name in allow:
                 if name not in self._records:
                     logger.warning("PLUGINS 含未知插件名: %s", name)
-            allowed = set(allow)
-            names = [n for n in names if n in allowed]
+            names = [n for n in names if n in explicit]
         blocked = set(self._settings.plugins_disabled)
-        return [n for n in names if n not in blocked]
+        enabled = []
+        for name in names:
+            if name in blocked:
+                continue
+            rec = self._records[name]
+            if (
+                getattr(rec.plugin, "default_disabled", False)
+                and name not in explicit
+            ):
+                self._mark(
+                    name, "disabled", "默认禁用：在 PLUGINS 中显式列出即可启用"
+                )
+                continue
+            enabled.append(name)
+        return enabled
 
     def setup_order(self) -> list[str]:
         """启用插件按依赖拓扑排序（Kahn，稳定：同级保持发现顺序）。

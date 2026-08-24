@@ -168,6 +168,39 @@ class NormalizeSseDisplayNameTest(unittest.TestCase):
         self.assertEqual(msg.group_name, "10001")
 
 
+class NormalizeSseMediaTest(unittest.TestCase):
+    """SSE 图片消息的 image_urls 提取（mediaId 判据，与 REST 同规则）。"""
+
+    def _event(self, content: str = "[image]", **extra: object) -> dict:
+        return {
+            "event": "message.new",
+            "rawid": "1",
+            "sessionId": "10001",
+            "sessionType": "group",
+            "sourceName": "张三",
+            "content": content,
+            "timestamp": 123,
+            **extra,
+        }
+
+    def test_image_with_media_id_sets_image_urls(self):
+        msg = normalize_sse(
+            self._event(mediaId="9f2a1c2d3e4f5a6b7c8d9e0f1a2b3c4d")
+        )
+        self.assertEqual(msg.image_urls, ["9f2a1c2d3e4f5a6b7c8d9e0f1a2b3c4d"])
+
+    def test_image_without_media_id_leaves_image_urls_empty(self):
+        # 上游推送的 media 为无路径视图，媒体是否可取只看 mediaId；
+        # 缺失时无字节可取，image_urls 保持空（消息经 pre_filter 丢弃）
+        msg = normalize_sse(self._event(media={"uuid": "R020-x"}))
+        self.assertEqual(msg.image_urls, [])
+
+    def test_text_with_media_id_ignored(self):
+        # mediaId 仅对图片占位符生效；带真实文本的消息不受影响
+        msg = normalize_sse(self._event(content="hello world", mediaId="abc"))
+        self.assertEqual(msg.image_urls, [])
+
+
 class PrefilterSenderTest(unittest.TestCase):
     """空发送者消息（含纯 UID/显示名内容的系统事件）应在入口被过滤。"""
 
@@ -227,7 +260,7 @@ class PrefilterSenderTest(unittest.TestCase):
             "sessionType": "group",
             "sourceName": "",
             "content": "[image]",
-            "media": {"localPath": "C:\\tmp\\a.png"},
+            "mediaId": "9f2a1c2d3e4f5a6b7c8d9e0f1a2b3c4d",
             "timestamp": 123,
         }
         self.assertFalse(pre_filter_sse(event))
