@@ -10,10 +10,16 @@ entry point 组 briefdesk.plugins，启用走 PLUGINS/PLUGINS_DISABLED）。
 轮询拉取等源特有的控制流留在各插件包内。
 """
 
-from collections.abc import Callable, Coroutine
+import asyncio
+import logging
+from collections.abc import Awaitable, Callable, Coroutine
 from typing import Any, Literal, Protocol
 
+import httpx
+
 from briefdesk.types import InternalMessage, PollResult, SessionInfo
+
+logger = logging.getLogger(__name__)
 
 # 连接状态取值(消息源内部维护,如实时连接建立/断开时更新)
 type ConnectionStatus = Literal["online", "reconnecting", "offline"]
@@ -23,6 +29,47 @@ type BatchHandler = Callable[[list[InternalMessage]], Coroutine[Any, Any, None]]
 
 # 应用层提供的已处理查询端口:输入候选 msg_ids,返回其中已处理的子集
 type ProcessedQuery = Callable[[list[str]], Coroutine[Any, Any, set[str]]]
+
+async def with_connect_retry[T](
+    request_fn: Callable[[], Awaitable[T]],
+    *,
+    attempts: int = 3,
+    base_delay: float = 0.5,
+) -> T:
+    """对连接类失败（httpx.ConnectError / ConnectTimeout）做短退避重试。
+
+    目的：覆盖上游（qqflow-server / WeFlow）TCP 暂未监听的启动竞态与
+    运行期瞬断——SSE 有自带退避重连，REST 侧此前零重试，一次拒连即
+    冒泡到 poll_cycle 写 lastError。重试只在连接阶段失败时发生：
+    - 不重试 HTTP 状态错误（4xx/5xx 由调用方语义处理；
+      qqflow 503 就绪门控走 QqFlowNotReadyError，语义保持不变）；
+    - 不用于 SSE 流（stream_events 已有监听器级退避重连）；
+    - 每次重试新建请求调用（request_fn 无参工厂），天然重放。
+    耗尽后原样上抛最后一次异常（错误对象与堆栈保留，
+    poll_cycle 的 lastError 行为不变）。
+    """
+    if attempts < 1:
+        raise ValueError("attempts must be >= 1")
+    delay = base_delay
+    last_error: httpx.TransportError | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return await request_fn()
+        except (httpx.ConnectError, httpx.ConnectTimeout) as e:
+            last_error = e
+            if attempt < attempts:
+                logger.debug(
+                    "连接失败（第 %d/%d 次），%.1fs 后重试: %s",
+                    attempt,
+                    attempts,
+                    delay,
+                    e,
+                )
+                await asyncio.sleep(delay)
+                delay *= 2
+    # 耗尽（attempts >= 1 保证循环至少执行一次）：上抛最后一次连接异常
+    assert last_error is not None
+    raise last_error
 
 
 class SourceError(Exception):

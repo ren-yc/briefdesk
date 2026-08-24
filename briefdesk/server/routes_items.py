@@ -455,7 +455,8 @@ async def api_stream():
                 if shutdown_event.is_set():
                     break
                 if get_task in done and not get_task.cancelled():
-                    yield f"event: items_updated\ndata: {get_task.result()}\n\n"
+                    name, data = get_task.result()
+                    yield f"event: {name}\ndata: {data}\n\n"
                 else:
                     # 心跳，保持连接活跃
                     yield "event: ping\ndata: {}\n\n"

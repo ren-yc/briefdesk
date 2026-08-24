@@ -10,6 +10,7 @@ relativeSync 均由前端按 msg_time/lastSync 自行计算，本模块只下发
 时间数据（items 的 msg_time/created_at、lastSync）。
 """
 
+from datetime import UTC, datetime
 from typing import TypedDict
 
 from briefdesk.sources_base import RealtimeListener, SourceClient
@@ -47,6 +48,82 @@ _app_status: AppStatus = {
 
 _listeners: dict[str, RealtimeListener] = {}
 _source_clients: dict[str, SourceClient] = {}
+
+
+# ── 消息同步进度（新增消息数）──
+#
+# 只统计"进入处理管道的新消息"（原始消息条数，非去重/合并后的卡片数），
+# 覆盖增量查询与 SSE 推送两条路径——两者都汇入 pipeline 入口/出口埋点：
+#   入口 note_sync_batch_start：计入本次突发累计（new_count）与进行中（pending）
+#   出口 note_sync_batch_done  ：每批完成递减 pending、累加 processed
+# 突发边界：pending 由 0 变非 0 开启新突发（重置 new/processed），归 0 时置
+# done 标志，供前端展示"✓ 已同步 N 条新消息"后短暂淡出。
+#
+# 并发安全：单事件循环内本模块各计数函数为同步调用（内部无 await），
+# 读-改-写天然原子、不会与其他协程交错；pipeline 在 await 边界之间只做
+# 单一函数调用，无需额外加锁。
+
+
+class SyncProgress(TypedDict):
+    """消息同步进度快照（/api/status 与 sync_progress SSE 事件共用）。"""
+
+    startedAt: str  # 本次突发开始时间（ISO）；无突发时为空串
+    newCount: int  # 本次突发累计新增消息数（原始消息，含处理中）
+    pendingCount: int  # 仍在处理中（含刚进入管道的实时消息）
+    processedCount: int  # 已达终态（入库/判重/闲聊/失败）
+    done: bool  # pending 归 0，突发收尾
+
+
+_sync_progress: SyncProgress = {
+    "startedAt": "",
+    "newCount": 0,
+    "pendingCount": 0,
+    "processedCount": 0,
+    "done": False,
+}
+
+
+def get_sync_progress() -> dict:
+    """同步进度快照（返回拷贝，避免调用方改动内部状态）。"""
+    return dict(_sync_progress)
+
+
+def note_sync_batch_start(count: int) -> dict:
+    """管道入口：新增 count 条消息进入处理（含处理中的实时消息）。
+
+    上一突发完成后再次有消息到达时开启新突发：重置累计计数字段。
+    """
+    if _sync_progress["pendingCount"] == 0:
+        _sync_progress["startedAt"] = datetime.now(UTC).isoformat()
+        _sync_progress["newCount"] = 0
+        _sync_progress["processedCount"] = 0
+        _sync_progress["done"] = False
+    _sync_progress["newCount"] += count
+    _sync_progress["pendingCount"] += count
+    return dict(_sync_progress)
+
+
+def note_sync_batch_done(count: int) -> dict:
+    """管道出口：count 条消息完成处理（入库/判重/闲聊/失败均属终态）。
+
+    pending 归 0 时置 done 标志，供前端展示"已同步"后自动淡出。
+    """
+    _sync_progress["pendingCount"] = max(
+        0, _sync_progress["pendingCount"] - count
+    )
+    _sync_progress["processedCount"] += count
+    if _sync_progress["pendingCount"] == 0:
+        _sync_progress["done"] = True
+    return dict(_sync_progress)
+
+
+def reset_sync_progress() -> None:
+    """清空同步进度（测试隔离用）。"""
+    _sync_progress["startedAt"] = ""
+    _sync_progress["newCount"] = 0
+    _sync_progress["pendingCount"] = 0
+    _sync_progress["processedCount"] = 0
+    _sync_progress["done"] = False
 
 
 def set_listener(name: str, listener: RealtimeListener) -> None:
@@ -87,4 +164,5 @@ def get_status_info() -> dict:
         "lastError": _app_status["lastError"] or None,
         "lastWarning": _app_status["lastWarning"] or None,
         "syncing": _app_status["syncing"],
+        "syncProgress": get_sync_progress(),
     }

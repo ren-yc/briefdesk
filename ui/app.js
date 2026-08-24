@@ -108,6 +108,7 @@ const $loadingState = document.getElementById("loading-state");
 const $emptyState = document.getElementById("empty-state");
 const $filteredEmptyState = document.getElementById("filtered-empty-state");
 const $statusText = document.getElementById("status-text");
+const $statusProgress = document.getElementById("status-progress");
 const $statusIndicator = document.getElementById("status-indicator");
 const $settingsModal = document.getElementById("settings-modal");
 const $settingsMenu = document.getElementById("settings-menu");
@@ -1021,6 +1022,7 @@ function setupEvents() {
     const { fail } = await saveOnboardSessions();
     btn.disabled = false; btn.textContent = "保存并继续";
     if (fail) showToast("部分会话保存失败，可稍后在设置中重试", { type: "error", duration: 5000 });
+    fillOnboardBackfill(); // step3 回填窗口显示当前 BACKFILL_HOURS（config）
     showOnboardStep(3);
   });
   if ($onb3Back) $onb3Back.addEventListener("click", () => showOnboardStep(2));
@@ -1513,6 +1515,11 @@ function connectRealtimeStream() {
     }, 200);
   });
 
+  // 同步进度：新增消息数（含处理中的实时消息）；突发收尾短暂展示后淡出
+  stream.addEventListener("sync_progress", (ev) => {
+    try { renderSyncProgress(JSON.parse(ev.data || "{}")); } catch { /* 忽略 */ }
+  });
+
   stream.addEventListener("error", () => {
     if (stream) {
       stream.close();
@@ -1537,6 +1544,7 @@ function applySidebarData(data) {
   if (typeof data.totalCount === "number") viewCounts.total = data.totalCount;
   if (typeof data.groupCount === "number") viewCounts.groups = data.groupCount;
   updateStatus(data.status);
+  restoreSyncProgress(data.status && data.status.syncProgress);
   renderNav(data.categories, data.ignoredCount, data.memoCount);
 }
 
@@ -1882,6 +1890,9 @@ function closeKbHelp() {
 }
 
 // ── 首次使用向导：环境检查 → 启用群聊 → 触发同步（三步，可跳过）──
+// step3 的 BACKFILL_HOURS 当前值复用 GET /api/sessions 的 backfillHours 字段
+// （renderOnboardSessions 拉取时缓存；缺失时由 fillOnboardBackfill 补拉）
+let onboardBackfillHours = null;
 function markOnboarded() {
   try { localStorage.setItem("briefdesk.onboarded", "1"); } catch { }
 }
@@ -1946,9 +1957,30 @@ async function renderOnboardEnv() {
     : '<span class="onboard-chip onboard-warn">未启用任何消息源</span>';
   const warn = status.lastError || status.lastWarning;
   const warnHtml = warn
-    ? `<div class="onboard-warn">⚠ ${esc(warn)}<br>常见原因：.env 中 AI_API_KEY / WEFLOW_API_TOKEN 缺失或消息源未启动。</div>`
+    ? `<div class="onboard-warn">⚠ ${esc(warn)}<br>常见原因：.env 中的必填配置不完整（AI 或消息源的 Token / Key），或消息源未启动；修改配置后需重启应用。</div>`
     : "";
   el.innerHTML = '<div class="onboard-env-row"><span class="onboard-label">消息源</span>' + srcHtml + '</div>' + warnHtml;
+}
+
+// step3 回填窗口说明：显示 BACKFILL_HOURS 当前值（复用 /api/sessions 的
+// backfillHours 字段——与设置「群聊筛选」默认时间过滤同一通道）
+function fillOnboardBackfill() {
+  const el = document.getElementById("onboard-backfill-val");
+  if (!el) return;
+  const render = (hours) => {
+    el.textContent = hours === -1 ? "全部历史" : hours + " 小时";
+  };
+  if (onboardBackfillHours !== null) {
+    render(onboardBackfillHours);
+    return;
+  }
+  // 会话接口尚未拉取成功：异步补拉一次再填（失败保持省略号占位）
+  fetch("/api/sessions").then(r => (r.ok ? r.json() : null)).then(d => {
+    if (d && typeof d.backfillHours === "number" && Number.isFinite(d.backfillHours)) {
+      onboardBackfillHours = d.backfillHours;
+      render(d.backfillHours);
+    }
+  }).catch(() => {});
 }
 
 async function renderOnboardSessions() {
@@ -1960,6 +1992,11 @@ async function renderOnboardSessions() {
     const res = await fetch("/api/sessions");
     if (res.ok) data = await res.json();
   } catch { /* 保持 null */ }
+  // 会话接口携带配置值：缓存 backfillHours 供 step3 展示（复用同一通道）
+  onboardBackfillHours =
+    data && typeof data.backfillHours === "number" && Number.isFinite(data.backfillHours)
+      ? data.backfillHours
+      : null;
   const sessions = Array.isArray(data && data.sessions) ? data.sessions : [];
   // 进入 step2 重置筛选状态（与设置每次打开重置类型筛选一致）
   onboardTypes.clear();
@@ -2163,7 +2200,7 @@ async function renderEmptyStateGuide() {
       '<button type="button" class="empty-guide-btn" id="empty-refresh-sessions">去「群聊筛选」发现会话</button>';
   } else if (!enabled) {
     $emptyState.innerHTML =
-      '<p>已发现 ' + sessions.length + ' 个会话，但尚未启用任何群聊，消息不会被拉取。</p>' +
+      '<p>已发现 ' + sessions.length + ' 个会话，但尚未启用任何会话，消息不会被拉取。</p>' +
       '<button type="button" class="empty-guide-btn" id="empty-open-settings">去设置启用群聊</button>';
   } else {
     $emptyState.innerHTML =
@@ -2521,6 +2558,55 @@ function confirmNewItems() {
   newItemIds.clear();
   document.querySelectorAll(".card-new").forEach(el => el.classList.remove("card-new"));
   $newItemsBar.classList.add("hidden");
+}
+
+// ── 同步进度（新增消息数，含处理中；并入状态指示器胶囊） ──
+// 数据源：sync_progress SSE 事件（实时权威）+ /api/status/.syncProgress 快照
+// （页面刷新时机突发中途恢复）。处理中：胶囊仅显示「＋N 条新消息 · 处理中 M」
+// （源状态文本隐藏、连接圆点保留）；收尾：「✓ 已同步 N 条」约 3s 后恢复
+// 「源状态 · 上次同步」。updateStatus 在进度非空闲时不覆盖进度文本。
+const SYNC_PROGRESS_DISMISS_MS = 3000;
+let syncProgressDismissTimer = null;
+let syncProgressPhase = "idle"; // "idle" | "active" | "done"
+let lastStatusInfo = null;
+
+function renderSyncProgress(p) {
+  if (!p || typeof p.newCount !== "number" || typeof p.pendingCount !== "number") return;
+  if (syncProgressDismissTimer) { clearTimeout(syncProgressDismissTimer); syncProgressDismissTimer = null; }
+  if (p.pendingCount > 0) {
+    syncProgressPhase = "active";
+    $statusText.classList.add("hidden");
+    $statusProgress.classList.remove("hidden");
+    $statusProgress.innerHTML =
+      '<span class="sp-dot" aria-hidden="true"></span>＋' + p.newCount
+      + " 条新消息 · 处理中 " + p.pendingCount;
+    return;
+  }
+  // 突发收尾（pending 归 0）：短暂展示"已同步 N 条"后恢复源状态文案
+  if (p.done && p.newCount > 0) {
+    syncProgressPhase = "done";
+    $statusText.classList.add("hidden");
+    $statusProgress.classList.remove("hidden");
+    $statusProgress.textContent = "✓ 已同步 " + p.newCount + " 条新消息";
+    syncProgressDismissTimer = setTimeout(restoreStatusTextAfterProgress, SYNC_PROGRESS_DISMISS_MS);
+  }
+}
+
+function restoreStatusTextAfterProgress() {
+  syncProgressPhase = "idle";
+  $statusProgress.classList.add("hidden");
+  $statusProgress.innerHTML = "";
+  $statusText.classList.remove("hidden");
+  // 用最近一次状态重渲染源状态文案（进度期间 updateStatus 只缓存未渲染）
+  if (lastStatusInfo) updateStatus(lastStatusInfo);
+}
+
+function restoreSyncProgress(sp) {
+  // 仅当进度区当前未显示且确有处理中消息时恢复（页面刷新中途突发）；
+  // 实时事件正在驱动时不覆盖，避免 plain 刷新复活过期"已同步"态
+  if (!sp || typeof sp.pendingCount !== "number" || sp.pendingCount <= 0) return;
+  if (!$statusProgress.classList.contains("hidden")) return;
+  renderSyncProgress(sp);
 }
 
 // ── 日期分组 ──
@@ -3164,9 +3250,18 @@ function _statusParts(status) {
 
 function updateStatus(status) {
   // 记录同步状态：保存设置时据此决定立即应用或延迟到同步完成后
+  lastStatusInfo = status;
   isSyncing = !!status.syncing;
   const { overall, parts } = _statusParts(status);
   $statusIndicator.className = `status ${overall}`;
+  if (syncProgressPhase !== "idle") {
+    // 同步进度展示中：不覆盖进度文本（源状态文案等收尾后由
+    // restoreStatusTextAfterProgress 用 lastStatusInfo 重渲染）；
+    // 按钮态照常维护，圆点颜色仍反映连接状态
+    setSyncButton(status.syncing || manualSyncWait);
+    return;
+  }
+  $statusText.classList.remove("hidden");
   if (status.syncing) {
     // 同步中不隐藏源在线状态：各源状态照常显示，末尾追加"正在同步"
     $statusText.innerHTML = (parts.length ? parts.join(" · ") : "未连接")

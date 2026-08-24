@@ -1,9 +1,14 @@
-"""进程内实时事件分发（后端任务 -> 前端 SSE）。"""
+"""进程内实时事件分发（后端任务 -> 前端 SSE）。
+
+订阅队列项为 (事件名, data JSON 字符串) 二元组：api_stream 依事件名生成
+`event: <name>` 的 SSE 帧，从而支持 items_updated（列表刷新）与
+sync_progress（同步进度事件）两类事件。
+"""
 
 import asyncio
 import json
 
-_subscribers: set[asyncio.Queue[str]] = set()
+_subscribers: set[asyncio.Queue[tuple[str, str]]] = set()
 _subscribers_lock = asyncio.Lock()
 
 # 服务关闭事件：置位后所有 /api/stream 流主动结束。
@@ -26,23 +31,33 @@ def signal_shutdown() -> None:
         _shutdown_event.set()
 
 
-async def subscribe() -> asyncio.Queue[str]:
-    q: asyncio.Queue[str] = asyncio.Queue(maxsize=32)
+async def subscribe() -> asyncio.Queue[tuple[str, str]]:
+    q: asyncio.Queue[tuple[str, str]] = asyncio.Queue(maxsize=32)
     async with _subscribers_lock:
         _subscribers.add(q)
     return q
 
 
-async def unsubscribe(q: asyncio.Queue[str]) -> None:
+async def unsubscribe(q: asyncio.Queue[tuple[str, str]]) -> None:
     async with _subscribers_lock:
         _subscribers.discard(q)
 
 
-async def publish_items_updated(payload: dict | None = None) -> None:
+async def _publish(name: str, payload: dict | None = None) -> None:
     data = json.dumps(payload or {}, ensure_ascii=False)
     async with _subscribers_lock:
         subscribers = list(_subscribers)
     for q in subscribers:
         if q.full():
             continue
-        q.put_nowait(data)
+        q.put_nowait((name, data))
+
+
+async def publish_items_updated(payload: dict | None = None) -> None:
+    """新入库卡片/同步完成等列表变化事件（原名与签名保持，兼容现有调用）。"""
+    await _publish("items_updated", payload)
+
+
+async def publish_sync_progress(payload: dict | None = None) -> None:
+    """同步进度事件：携带 SyncProgress 快照，驱动前端状态胶囊的进度展示。"""
+    await _publish("sync_progress", payload)

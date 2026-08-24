@@ -27,10 +27,15 @@ from briefdesk.db import (
 )
 from briefdesk.db import storage_lock as _storage_lock
 from briefdesk.logger import fmt_dur
-from briefdesk.realtime import publish_items_updated
+from briefdesk.realtime import publish_items_updated, publish_sync_progress
 from briefdesk.sources_base import SourceClient
 from briefdesk.stages import get_context, get_stages
-from briefdesk.status import set_status
+from briefdesk.status import (
+    get_sync_progress,
+    note_sync_batch_done,
+    note_sync_batch_start,
+    set_status,
+)
 from briefdesk.types import BatchContext, InternalMessage
 
 logger = logging.getLogger(__name__)
@@ -220,6 +225,12 @@ async def process_all_batches(
         )
         return False
 
+    # 同步进度：入口计数进入处理的消息（含处理中的实时消息），每批完成后
+    # 递减；事件携带快照驱动前端状态指示器的同步进度展示。早退路径
+    # （无类别/阶段缺失）不计数——消息未在推进，避免"永不完成"。
+    note_sync_batch_start(len(messages))
+    await publish_sync_progress(get_sync_progress())
+
     async def _run_front(
         batch_index: int, batch: list[InternalMessage]
     ) -> tuple[int, BatchContext]:
@@ -241,6 +252,7 @@ async def process_all_batches(
     total_skipped = 0
     total_merged = 0
     total_failed = 0
+    completed_in_batch = 0
 
     try:
         for completed in asyncio.as_completed(classify_tasks):
@@ -271,6 +283,12 @@ async def process_all_batches(
             total_skipped += bctx.skipped
             total_merged += bctx.merged
             total_failed += len(failed_set)
+            completed_in_batch += len(bctx.messages)
+
+            # 同步进度：本批完成处理（入库/判重/闲聊/失败均达终态），递减
+            # pending；归零时快照带 done 标志，前端据此展示"已同步"后淡出
+            note_sync_batch_done(len(bctx.messages))
+            await publish_sync_progress(get_sync_progress())
 
             logger.debug(
                 "批 #%d: %d 条 → 入库 %d, 重复 %d, 跳过 %d, 合并 %d, 失败 %d (%s)",
@@ -300,6 +318,12 @@ async def process_all_batches(
         for t in classify_tasks:
             if not t.done():
                 t.cancel()
+        # 异常/取消路径兜底：清掉尚未完成批次的 pending，避免进度指示器卡死
+        # （正常完成时 completed_in_batch == len(messages），此分支不触发）
+        remaining = len(messages) - completed_in_batch
+        if remaining > 0:
+            note_sync_batch_done(remaining)
+            await publish_sync_progress(get_sync_progress())
 
     logger.info(f"分类完成 ({int((time_module.time() - classify_start) * 1000)}ms)")
     logger.info(

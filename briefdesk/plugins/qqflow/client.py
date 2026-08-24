@@ -21,7 +21,13 @@ import httpx
 
 from briefdesk.logger import fmt_dur
 from briefdesk.masking import clean_display_name
-from briefdesk.sources_base import ConnectionStatus, MediaError, SourceClient, SourceError
+from briefdesk.sources_base import (
+    ConnectionStatus,
+    MediaError,
+    SourceClient,
+    SourceError,
+    with_connect_retry,
+)
 
 # ── qqflow-server API 数据类型 ──
 
@@ -203,7 +209,9 @@ class QqFlowClient(SourceClient):
         """
         client = self._get_client()
         start = time_module.perf_counter()
-        resp = await client.get(path, params=params, headers=self._auth_headers())
+        resp = await with_connect_retry(
+            lambda: client.get(path, params=params, headers=self._auth_headers())
+        )
         logger.debug(
             "GET %s%s → %s (%s)",
             path,
@@ -233,7 +241,7 @@ class QqFlowClient(SourceClient):
     async def fetch_health(self) -> dict[str, Any]:
         """健康检查（免鉴权）。"""
         client = self._get_client()
-        resp = await client.get("/health")
+        resp = await with_connect_retry(lambda: client.get("/health"))
         if not resp.is_success:
             raise RuntimeError(
                 f"QqFlow API error: {resp.status_code} on /health — {resp.text[:200]}"
@@ -247,10 +255,12 @@ class QqFlowClient(SourceClient):
         already_ready / in_progress
         """
         client = self._get_client()
-        resp = await client.post(
-            "/api/v1/accounts",
-            json={"qq": qq, "key": key, "db_path": db_path},
-            headers=self._auth_headers(),
+        resp = await with_connect_retry(
+            lambda: client.post(
+                "/api/v1/accounts",
+                json={"qq": qq, "key": key, "db_path": db_path},
+                headers=self._auth_headers(),
+            )
         )
         if not resp.is_success:
             raise RuntimeError(

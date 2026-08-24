@@ -21,6 +21,7 @@
         </a>
         <div id="status-indicator" class="status offline" title="点击查看运行状态详情" role="button" tabindex="0">
           <span id="status-text">等待首次同步...</span>
+          <span id="status-progress" class="status-progress hidden"></span>
         </div>
         <div id="status-popover" class="status-popover hidden"></div>
       </div>
@@ -329,7 +330,7 @@
         <button id="onboard-skip" class="onboard-skip" title="跳过（Esc）">跳过</button>
       </div>
       <div id="onboard-step-1" class="onboard-step">
-        <p class="onboard-desc">本应用会监控群聊消息，由 AI 自动分类整理成校园信息卡片。先检查运行环境：</p>
+        <p class="onboard-desc">本应用会监控会话消息，由 AI 自动分类整理成信息卡片。先检查运行环境：</p>
         <div id="onboard-env" class="onboard-env"><p class="text-muted">检查中...</p></div>
         <div class="modal-actions">
           <button id="onboard-1-next" class="onboard-primary">下一步：选择要监控的群聊</button>
@@ -373,7 +374,7 @@
         </div>
       </div>
       <div id="onboard-step-3" class="onboard-step hidden">
-        <p class="onboard-desc">将按 <code>BACKFILL_HOURS</code>（默认 24 小时）回填一次已启用群聊的历史消息，之后实时监听增量。</p>
+        <p class="onboard-desc">将按 <code>BACKFILL_HOURS</code>（当前 <span id="onboard-backfill-val">…</span>）回填一次已启用会话的历史消息，之后实时监听增量。</p>
         <div class="modal-actions">
           <button id="onboard-3-back">上一步</button>
           <button id="onboard-3-start" class="onboard-primary">开始同步</button>

@@ -22,7 +22,12 @@ import httpx
 
 from briefdesk.logger import fmt_dur
 from briefdesk.masking import clean_display_name
-from briefdesk.sources_base import ConnectionStatus, MediaError, SourceClient
+from briefdesk.sources_base import (
+    ConnectionStatus,
+    MediaError,
+    SourceClient,
+    with_connect_retry,
+)
 
 # ── WeFlow API 数据类型 ──
 
@@ -193,7 +198,9 @@ class WeFlowClient(SourceClient):
         """
         client = self._get_client()
         start = time_module.perf_counter()
-        resp = await client.get(path, params=params, headers=self._auth_headers())
+        resp = await with_connect_retry(
+            lambda: client.get(path, params=params, headers=self._auth_headers())
+        )
         logger.debug(
             "GET %s%s → %s (%s)",
             path,
@@ -218,8 +225,10 @@ class WeFlowClient(SourceClient):
                 logger.debug("GET %s 返回空列表，500ms 后重试一次", path)
                 await asyncio.sleep(0.5)
                 start = time_module.perf_counter()
-                resp = await client.get(
-                    path, params=params, headers=self._auth_headers()
+                resp = await with_connect_retry(
+                    lambda: client.get(
+                        path, params=params, headers=self._auth_headers()
+                    )
                 )
                 logger.debug(
                     "GET %s (重试) → %s (%s)",

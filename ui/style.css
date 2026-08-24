@@ -922,6 +922,20 @@ body.modal-open { overflow: hidden; }
 }
 @media (prefers-reduced-motion: reduce) { .new-items-bar { animation: none; } }
 
+/* ── 同步进度（新增消息数，含处理中；并入状态指示器胶囊） ── */
+.status-progress {
+  display: inline-flex; align-items: center; gap: 5px;
+  max-width: 300px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  vertical-align: middle;
+}
+.status-progress .sp-dot {
+  width: 7px; height: 7px; border-radius: 50%;
+  background: currentColor; flex-shrink: 0;
+  animation: spDotPulse 1.2s ease-in-out infinite;
+}
+@keyframes spDotPulse { 0%,100% { opacity: .4; } 50% { opacity: 1; } }
+@media (prefers-reduced-motion: reduce) { .status-progress .sp-dot { animation: none; } }
+
 /* ── 日期分组分隔条 ── */
 .day-divider {
   display: flex; align-items: center; gap: 12px;
