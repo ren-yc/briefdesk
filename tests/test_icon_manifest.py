@@ -3,7 +3,9 @@
 约定（见 ui/icons/README.md 与 ui/icon-manifest.txt）：
 - ``ui/icons/*.svg`` 文件集合必须与清单完全一致（多、少都算失败）；
 - 代码中引用的 ``/icons/<name>.svg`` 必须已登记且文件真实存在；
-- 旧中文图标库路径 ``/图标/`` 不得回流。
+- 旧中文图标库路径 ``/图标/`` 不得回流；
+- 插件前端内联 ``<svg>`` 形态：必须跟随主题色（``currentColor``）、
+  不得携带 ``on*`` 事件属性或 ``<script>``（见「插件图标通道」约定）。
 
 扫描范围：核心前端（index.html / app.js / style.css）与全部插件前端
 （briefdesk/plugins/*/ui/*.js）——插件引用核心图标路径，一并约束。
@@ -28,6 +30,11 @@ _ICON_REF = re.compile(r"/icons/[\w.-]+\.svg")
 # 与 ui/app.js 的 _SVG_CONTENT_RE 保持一致：可选前置 XML 注释 + <svg> 根标签。
 # 不满足该格式的文件会被内联管线静默拒绝（退回 <img> 形态，深色模式恒黑）
 _SVG_CONTENT = re.compile(r"^\s*(?:<!--[\s\S]*?-->\s*)*<svg[\s>]")
+
+# 插件前端（briefdesk/plugins/*/ui/*.js）：内联 <svg> 形态守卫
+_PLUGIN_SOURCES = sorted((REPO / "briefdesk" / "plugins").glob("*/ui/*.js"))
+_INLINE_SVG = re.compile(r"<svg[\s>].*?</svg>", re.DOTALL)
+_INLINE_SVG_EVENT_ATTR = re.compile(r"\son\w+\s*=", re.IGNORECASE)
 
 
 def _manifest_paths() -> set[str]:
@@ -85,3 +92,29 @@ def test_no_legacy_icon_path_references() -> None:
     for src in _SOURCES:
         text = src.read_text(encoding="utf-8")
         assert "/图标/" not in text, f"残留旧图标路径引用: {src}"
+
+
+def test_plugin_inline_svg_follows_theme_and_stays_safe() -> None:
+    """插件前端的厂商内联 <svg> 必须跟随主题色且不带事件处理器/脚本。
+
+    约定（ui/icons/README.md「插件图标通道」）：插件图标二选一——复用核心
+    ``/icons/<name>.svg``（引用由上面的守卫自动覆盖），或在插件 ui.js 内联
+    Lucide SVG（``stroke``/``fill="currentColor"``，颜色随 CSS 继承）。
+    内联形态不得硬编码颜色（深色模式恒黑），不得携带 ``on*`` 事件属性或
+    ``<script>``（与核心内联管线同等的安全习惯边界）。
+    """
+    assert _PLUGIN_SOURCES, "未发现插件前端文件（路径变更须同步本测试）"
+    for src in _PLUGIN_SOURCES:
+        text = src.read_text(encoding="utf-8")
+        for match in _INLINE_SVG.finditer(text):
+            chunk = match.group(0)
+            assert "currentColor" in chunk, (
+                f"{src.name}: 内联 SVG 未用 currentColor（深色模式恒黑）: "
+                f"{chunk[:100]!r}"
+            )
+            assert not _INLINE_SVG_EVENT_ATTR.search(chunk), (
+                f"{src.name}: 内联 SVG 携带 on* 事件属性: {chunk[:100]!r}"
+            )
+            assert "<script" not in chunk, (
+                f"{src.name}: 内联 SVG 携带 <script>: {chunk[:100]!r}"
+            )

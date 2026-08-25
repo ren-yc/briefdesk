@@ -1,5 +1,7 @@
 # ui/icons 图标清单（单一事实来源）
 # 来源：Lucide (https://lucide.dev) vendored 子集，ISC 许可，见 ./icons/README.md
+# 当前钉定来源版本：lucide-static v1.34.0（由 scripts/fetch_icons.py 维护；
+#   `python scripts/fetch_icons.py check` 可校验本清单全部图标在该版本可用）
 # 约定：本清单必须与 ui/icons/*.svg 文件集合完全一致；
 #       代码中引用的 /icons/<name>.svg 必须全部登记在册。
 #       由 tests/test_icon_manifest.py 双向守卫，新增图标须先登记。
