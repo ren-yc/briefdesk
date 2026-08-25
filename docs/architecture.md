@@ -173,6 +173,7 @@ All via `.env` file. Required: `AI_API_KEY`; `WEFLOW_API_TOKEN` when the `weflow
 - 密钥环不可用（无桌面会话 / 无 Secret Service / 未安装 keyring）或 `BRIEFDESK_KEYRING=0` 时**静默回退**环境变量 → `.env` → 默认值（读路径永不阻断启动）；`.env` 与既有使用方式完全兼容，已配置密钥无需迁移；
 - 密钥**绝不回写 `.env` 明文**；CLI `get` 默认只显示「是否配置 + 长度」，`--reveal` 才打印明文；
 - **Gotcha（pydantic-settings 合并语义）**：各 source 的输出键必须一致——Env 源按**字段别名**输出（`AI_API_KEY`），自定义源若按字段名输出（`ai_api_key`）会出现同字段双键，传给 pydantic 时**别名键总是胜出**，与 source 顺序无关，导致 keyring 层被环境变量静默覆盖。`KeyringSource._key_for_field` 按别名输出键规避此陷阱（守卫测试：`tests/test_secrets_store.py` 的优先级链用例）。
+- **预提交密钥扫描**：`scripts/secret_scan.py` 只扫描 staged 新增行中的密钥形态（`sk-`/`AKIA`/PEM 私钥块/本项目密钥环境变量非空赋值），命中即拒绝提交；经 `scripts/install-hooks.ps1` 安装为 pre-commit 钩子（守卫测试：`tests/test_secret_scan.py`）。
 
 ## 设计要点与陷阱
 

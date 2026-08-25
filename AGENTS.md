@@ -28,6 +28,9 @@ python -m pytest tests/
 
 # 提交前完整检查
 git diff --check
+
+# 可选：安装 pre-commit 密钥扫描钩子（staged 新增内容自动扫描，推荐）
+powershell -ExecutionPolicy Bypass -File scripts/install-hooks.ps1
 ```
 
 ## AI 协作规范（所有开发助手必须遵守）
