@@ -21,7 +21,7 @@ briefdesk                  # pyproject console script
 pip install ruff && ruff check briefdesk/ tests/
 
 # Type check (mypy)
-pip install mypy && mypy briefdesk/
+pip install mypy && mypy briefdesk/ tests/
 
 # Test (pytest, tests/ 目录)
 python -m pytest tests/
@@ -35,7 +35,7 @@ git diff --check
 ### 提交前质量门禁
 
 - Lint: `python -m ruff check briefdesk/ tests/`
-- 类型检查: `python -m mypy briefdesk/`
+- 类型检查: `python -m mypy briefdesk/ tests/`（tests/ 为签名级检查；函数体深检因测试桩惯用法噪音大暂缓，配置理由见 pyproject `[tool.mypy]` 注释）
 - 测试: `python -m pytest tests/`
 - 空白/冲突检查: `git diff --check`
 - 新增功能必须补充或更新对应测试
@@ -73,7 +73,7 @@ git diff --check
 ### 完成条件（提交前逐项确认）
 
 - [ ] `python -m ruff check briefdesk/ tests/` 通过
-- [ ] `python -m mypy briefdesk/` 通过
+- [ ] `python -m mypy briefdesk/ tests/` 通过
 - [ ] `python -m pytest tests/` 通过
 - [ ] `git diff --check` 通过
 - [ ] `git status --short` 中没有临时文件、缓存、数据库、本地 env 文件

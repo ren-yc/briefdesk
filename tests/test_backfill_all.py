@@ -48,7 +48,7 @@ class _WeFlowPagedClient:
 
     def __init__(self, messages: list[dict]):
         self._messages = messages
-        self.calls: list[tuple[str, str, int]] = []
+        self.calls: list[tuple[str, int | None, int]] = []
 
     async def fetch_contacts(self) -> dict[str, str]:
         return {"u": "用户"}

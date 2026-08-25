@@ -21,8 +21,9 @@ def _ctx() -> tuple[PluginContext, list]:
         return None
 
     ctx = PluginContext(
+        # 用环境变量名（alias）构造：pydantic mypy 插件对带 alias 字段按别名生成签名
         config=Settings(
-            plugins=["*"], plugins_disabled=[], plugins_required=[], plugin_path=""
+            PLUGINS=["*"], PLUGINS_DISABLED=[], PLUGINS_REQUIRED=[], PLUGIN_PATH=""
         ),
         publish_event=publish_event,
         subscribe_event=subscribe_event,

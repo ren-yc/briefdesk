@@ -7,14 +7,19 @@ import shutil
 import tempfile
 import unittest
 import uuid
+from typing import Any, cast
 from unittest.mock import AsyncMock, patch
 
 import aiosqlite
 
 from briefdesk.config import config
 from briefdesk.db import (
+    ItemInput,
+    ItemRow,
     RawMsgInput,
+    ReminderRow,
     SchemaMismatchError,
+    SessionRow,
     _escape_like,
     apply_pending_restore,
     backup_db_to,
@@ -650,8 +655,8 @@ class ReminderAndCalendarTest(unittest.IsolatedAsyncioTestCase):
         await self.db.close()
 
     @staticmethod
-    def _item(**overrides) -> dict:
-        base = {
+    def _item(**overrides: Any) -> ItemInput:
+        base: dict[str, Any] = {
             "category": "活动通知",
             "title": "测试卡片",
             "key_info": "k",
@@ -667,7 +672,7 @@ class ReminderAndCalendarTest(unittest.IsolatedAsyncioTestCase):
             "content_hash": "h",
         }
         base.update(overrides)
-        return base
+        return cast(ItemInput, base)
 
     async def _insert(self, **overrides) -> str:
         # 默认给每条卡片唯一 source_msg_id：insert_item 以 (source, source_msg_id)
@@ -677,11 +682,11 @@ class ReminderAndCalendarTest(unittest.IsolatedAsyncioTestCase):
         with patch("briefdesk.db.get_db", new=AsyncMock(return_value=self.db)):
             return await insert_item(self._item(**overrides))
 
-    async def _due(self, now_local: str) -> list[dict]:
+    async def _due(self, now_local: str) -> list[ReminderRow]:
         with patch("briefdesk.db.get_db", new=AsyncMock(return_value=self.db)):
             return await get_due_reminders(now_local)
 
-    async def _calendar(self, date_from: str, date_to_excl: str) -> list[dict]:
+    async def _calendar(self, date_from: str, date_to_excl: str) -> list[ItemRow]:
         # 日历查询随 calendar 插件分发：patch 插件模块内的 get_db 引用
         with patch("briefdesk.plugins.calendar.db.get_db", new=AsyncMock(return_value=self.db)):
             return await get_calendar_items(date_from, date_to_excl)
@@ -788,7 +793,7 @@ class SubjectTimelineNormalizationTest(unittest.IsolatedAsyncioTestCase):
         await self.db.close()
 
     @staticmethod
-    def _item(subject: str, msg_id: str, msg_time: int) -> dict:
+    def _item(subject: str, msg_id: str, msg_time: int) -> ItemInput:
         return {
             "category": "活动通知",
             "title": "卡片",
@@ -846,7 +851,7 @@ class GetGroupCountTest(unittest.IsolatedAsyncioTestCase):
         await self.db.close()
 
     @staticmethod
-    def _item(subject, msg_id, category="活动通知", is_verified=0, title="标题") -> dict:
+    def _item(subject, msg_id, category="活动通知", is_verified=0, title="标题") -> ItemInput:
         return {
             "category": category,
             "title": title,
@@ -929,7 +934,7 @@ class UpsertSessionTest(unittest.IsolatedAsyncioTestCase):
         with patch("briefdesk.db.get_db", new=AsyncMock(return_value=self.db)):
             await upsert_session(*args, **kwargs)
 
-    async def _all(self) -> list[dict]:
+    async def _all(self) -> list[SessionRow]:
         with patch("briefdesk.db.get_db", new=AsyncMock(return_value=self.db)):
             return await get_all_sessions()
 

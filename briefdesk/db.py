@@ -235,6 +235,7 @@ class SessionRow(TypedDict):
     enabled: int
     last_seen: str | None
     last_active: int | None  # 会话内最后一条消息时间（秒级 epoch；NULL = 未知）
+    last_poll_ts: int | None  # 按会话增量轮询水位（NULL = 待回填）
 
 
 class CategoryCount(TypedDict):

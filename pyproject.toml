@@ -55,3 +55,15 @@ dev = [
     "mypy>=1.11",
     "pip-tools>=7.4",
 ]
+
+[tool.mypy]
+# pydantic 插件：参与模型构造签名的生成（注意：对带 alias 的字段按别名
+# 生成 kwargs，populate_by_name 不被插件识别——测试里以别名构造 Settings）
+plugins = ["pydantic.mypy"]
+
+# tests/ 纳入门禁的范围是「签名级」检查（函数注解、import、模块级语句）：
+# 实测开启 check_untyped_defs 后全量函数体检查会在测试套件上产生约 200 个
+# 桩惯用法噪音（假客户端传入具名类型参数、部分字段 TypedDict 夹具、
+# fetchone() 可空值直接索引等），修齐需先给测试引入共享夹具与 Protocol 桩，
+# 属独立重构；briefdesk/ 维持默认严格度不变。
+# 若后续要深化，从此处放开并按错误码逐类收敛。
