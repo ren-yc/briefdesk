@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>简报台</title>
   <!-- 默认 favicon（网格图标）；JS 启动后按随机主题色动态替换 -->
-  <link rel="icon" type="image/svg+xml" href="/图标/8-界面/网格.svg">
+  <link rel="icon" type="image/svg+xml" href="/icons/layout-grid.svg">
   <link rel="stylesheet" href="/style.css">
 </head>
 <body>
@@ -14,10 +14,10 @@
       <h1>简报台 (BRIEFDESK)</h1>
       <div class="top-bar-right">
         <button id="sync-btn" class="sync-btn" title="手动触发一次消息同步">
-          <img src="/图标/8-界面/刷新.svg" class="icon" alt="">同步消息
+          <img src="/icons/refresh-cw.svg" class="icon" alt="">同步消息
         </button>
         <a href="#" id="settings-link-top" class="top-settings-link">
-          <img src="/图标/8-界面/设置.svg" class="icon" alt="">设置
+          <img src="/icons/settings.svg" class="icon" alt="">设置
         </a>
         <div id="status-indicator" class="status offline" title="点击查看运行状态详情" role="button" tabindex="0">
           <span id="status-text">等待首次同步...</span>
@@ -29,10 +29,10 @@
     <div class="main-layout">
       <aside class="sidebar">
         <div class="sidebar-search">
-          <img src="/图标/8-界面/搜索.svg" class="icon-sm" alt="">
+          <img src="/icons/search.svg" class="icon-sm" alt="">
           <input type="text" id="item-search" placeholder="搜索卡片..." autocomplete="off">
           <button id="item-search-clear" class="search-clear hidden" title="清除">
-            <img src="/图标/8-界面/叉号.svg" class="icon-sm" alt="">
+            <img src="/icons/x.svg" class="icon-sm" alt="">
           </button>
           <!-- 搜索历史下拉（作为 .sidebar-search 子元素，绝对定位锚定更可靠） -->
           <div id="search-history-dropdown" class="search-history-dropdown hidden"></div>
@@ -43,13 +43,13 @@
         <!-- 备忘录/已忽略：固定位于左侧栏最下部 -->
         <div class="nav-special">
           <a href="#" id="subs-link" class="cat-link" data-category="全部" title="查看订阅关键词命中的卡片">
-            <span class="cat-link-main"><img src="/图标/8-界面/提醒用户.svg" class="icon-sm cat-icon" alt="">订阅<span class="cat-count" id="subs-count">0</span></span>
+            <span class="cat-link-main"><img src="/icons/bell-plus.svg" class="icon-sm cat-icon" alt="">订阅<span class="cat-count" id="subs-count">0</span></span>
           </a>
           <a href="#" id="memo-link" class="cat-link" data-category="全部" data-verified="memo" title="已加入备忘录的卡片">
-            <span class="cat-link-main"><img src="/图标/8-界面/保存.svg" class="icon-sm cat-icon" alt="">备忘录<span class="cat-count">0</span></span>
+            <span class="cat-link-main"><img src="/icons/bookmark-check.svg" class="icon-sm cat-icon" alt="">备忘录<span class="cat-count">0</span></span>
           </a>
           <a href="#" id="ignored-link" class="cat-link" data-category="全部" data-verified="ignored" title="已忽略的卡片">
-            <span class="cat-link-main"><img src="/图标/8-界面/禁止.svg" class="icon-sm cat-icon" alt="">已忽略<span class="cat-count">0</span></span>
+            <span class="cat-link-main"><img src="/icons/ban.svg" class="icon-sm cat-icon" alt="">已忽略<span class="cat-count">0</span></span>
           </a>
         </div>
       </aside>
@@ -62,10 +62,10 @@
             <button class="seg-btn" data-mode="expanded" role="tab" aria-selected="false" title="平铺展示全部卡片">平铺</button>
           </div>
           <button id="batch-toggle" class="batch-toggle-btn" type="button" title="勾选多张卡片统一处理">
-            <img src="/图标/8-界面/对勾.svg" class="icon-sm" alt="">批量操作
+            <img src="/icons/check.svg" class="icon-sm" alt="">批量操作
           </button>
           <button id="hide-expired-toggle" class="batch-toggle-btn" type="button" title="隐藏截止时间已过的卡片">
-            <img src="/图标/9-媒体/时间.svg" class="icon-sm" alt="">隐藏已截止
+            <img src="/icons/clock.svg" class="icon-sm" alt="">隐藏已截止
           </button>
           <button id="kb-help-btn" class="batch-toggle-btn" type="button" title="键盘快捷键（按 ? 也可打开）">快捷键指南</button>
           <span id="list-count" class="list-count"></span>
@@ -182,7 +182,7 @@
             <h3 class="settings-section">群聊筛选</h3>
             <label>仅拉取已启用的群聊（修改将在保存后生效）</label>
             <button id="session-refresh" style="margin:4px 0 8px;font-size:13px;padding:4px 10px;display:inline-flex;align-items:center;gap:4px;background:var(--surface);border:1px solid var(--border);border-radius:6px;color:var(--text-2);cursor:pointer">
-              <img id="session-refresh-icon" src="/图标/8-界面/刷新.svg" class="icon-sm" alt=""> <span id="session-refresh-text">发现新群聊</span>
+              <img id="session-refresh-icon" src="/icons/refresh-cw.svg" class="icon-sm" alt=""> <span id="session-refresh-text">发现新群聊</span>
             </button>
             <label>消息类型</label>
             <div id="session-type-filter" class="session-type-filter" role="group" aria-label="按类型筛选群聊（可多选）">
@@ -210,7 +210,7 @@
               <input type="number" id="session-time-custom" class="session-time-control" min="0" step="1" placeholder="小时">
             </div>
             <div class="sidebar-search session-search">
-              <img src="/图标/8-界面/搜索.svg" class="icon-sm" alt="">
+              <img src="/icons/search.svg" class="icon-sm" alt="">
               <input type="text" id="session-search" placeholder="搜索群聊名称..." autocomplete="off">
             </div>
             <div id="session-list" class="session-list">
@@ -307,14 +307,14 @@
   <!-- 图片放大查看 -->
   <div id="lightbox" class="lightbox hidden" role="dialog" aria-label="图片预览">
     <button id="lightbox-close" class="lightbox-btn lightbox-close" title="关闭 (Esc)">
-      <img src="/图标/8-界面/叉号.svg" alt="关闭">
+      <img src="/icons/x.svg" alt="关闭">
     </button>
     <button id="lightbox-prev" class="lightbox-btn lightbox-nav lightbox-prev" title="上一张 (←)">
-      <img src="/图标/9-媒体/上一个.svg" alt="上一张">
+      <img src="/icons/skip-back.svg" alt="上一张">
     </button>
     <img id="lightbox-img" alt="放大图片">
     <button id="lightbox-next" class="lightbox-btn lightbox-nav lightbox-next" title="下一张 (→)">
-      <img src="/图标/9-媒体/下一个.svg" alt="下一张">
+      <img src="/icons/skip-forward.svg" alt="下一张">
     </button>
     <div id="lightbox-counter" class="lightbox-counter"></div>
   </div>
@@ -341,7 +341,7 @@
         <!-- 会话筛选：与设置「群聊筛选」同一规则（类型/来源/时间/搜索叠加），独立状态 -->
         <div id="onboard-filter-bar" class="onboard-filter-bar">
           <div class="sidebar-search">
-            <img src="/图标/8-界面/搜索.svg" class="icon-sm" alt="">
+            <img src="/icons/search.svg" class="icon-sm" alt="">
             <input type="text" id="onboard-session-search" placeholder="搜索会话..." autocomplete="off">
           </div>
           <div id="onboard-type-filter" class="session-type-filter" role="group" aria-label="按类型筛选会话（可多选）">

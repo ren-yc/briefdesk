@@ -181,7 +181,7 @@ SQLite file: `briefdesk.sqlite` (configurable via `DB_PATH` in `.env`). Key tabl
 
 ### Frontend
 
-Vanilla JS SPA in `ui/` (`index.html`, `app.js`, `style.css`, `图标/`). No build step, no framework. Key behaviors:
+Vanilla JS SPA in `ui/` (`index.html`, `app.js`, `style.css`, `icons/`). No build step, no framework. Key behaviors:
 - Category sidebar with counts + 备忘录 (memo) / 已忽略 (ignored) views (from `/api/items`)
 - Item cards with three-state verification: 加入备忘录 (1) / 忽略 (-1) / 未处理 (0)
 - Expandable quote section (fetches context via `/api/context`)
@@ -191,6 +191,7 @@ Vanilla JS SPA in `ui/` (`index.html`, `app.js`, `style.css`, `图标/`). No bui
 - 多时间点卡片：`parseExtraTimes` 解析 `extra_times`，`timeBadgeHtml` 在主徽章后逐点渲染补充徽章（「截止 8月15日·部门宣传视频」）；卡片头部 `flex-wrap` 换行防多徽章被裁剪；**部分截止状态**：主截止已过但仍有未过期时间点（`allTimePoints`/`nextUpcomingTime` 判定）→ `timeBadgeInfo` 返回「部分截止」（`partial` 类，琥珀色、`expired=false`，不置灰、不被「隐藏已截止」过滤），提醒菜单默认值与自动提醒基准也改用下一个未过期时间点；日历 `calDaySet` 把主时间与 extra_times 的每个日期都计入格子与当日浮层（同卡多日出现），`dayTimeEntry`/`timeExpired` 让每个格子按**该日对应的时间点**渲染时间标签与过期样式（而非整卡主字段）
 - 主列表固定每页 100 张卡片；类别/状态/搜索/来源群/时间范围/“隐藏已截止”均由 `/api/items` 统一过滤，头部“共 n 条/组”使用完整查询总数，“加载更多”沿服务端 `nextOffset` 追加下一页并复用当前 `filterNow`。定时刷新与 SSE 刷新会从第一页重拉当前已加载页数，保留用户的分页深度；卡片状态操作后也按该深度刷新，使卡片与条/组数收敛；侧边栏计数不随主列表局部筛选变化
 - Real-time updates via `EventSource("/api/stream")` SSE channel (plus poll-based auto-refresh, settings persisted to `localStorage`)
+- **图标库**：使用 [Lucide](https://lucide.dev)（ISC 许可）的 vendored 子集，位于 `ui/icons/`（英文 kebab-case 扁平命名，经 `/icons/<name>.svg` 引用；旧中文图标库 `ui/图标/` 已整体移除，历史版本在 git 中可回溯）。单一事实来源为 `ui/icon-manifest.txt`，`tests/test_icon_manifest.py` 双向守卫：代码引用 ⊆ 清单且文件存在、`ui/icons/` 文件集合 == 清单集合、旧路径 `/图标/` 不得回流。**新增图标流程**：拷贝单个 Lucide SVG 到 `ui/icons/` → manifest 登记 → 代码引用（动态渲染的图标须加入 `app.js` 的 `preloadSvgIcons` 预取集合或 `_CAT_ICONS`/`_CAT_PALETTE`/`_STATUS_ICONS` 映射）→ 守卫测试通过。禁止引入第二图标库或整库拷贝；许可归属与流程见 `ui/icons/README.md`。图标由 JS fetch 后内联（`currentColor` 随 CSS color 着色），favicon 由 `layout-grid.svg` 加随机主题色动态生成
 
 ### Configuration
 

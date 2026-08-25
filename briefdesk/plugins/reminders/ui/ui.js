@@ -50,7 +50,7 @@
   }
 
   function renderButton(item) {
-    return '<button class="btn-remind' + (item.remind_at ? " active" : "") + '" title="设置提醒"><img src="/图标/9-媒体/闹钟.svg" class="icon-sm" alt="">提醒</button>';
+    return '<button class="btn-remind' + (item.remind_at ? " active" : "") + '" title="设置提醒"><img src="/icons/alarm-clock.svg" class="icon-sm" alt="">提醒</button>';
   }
 
   function renderMenu(item) {

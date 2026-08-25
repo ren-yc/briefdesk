@@ -222,6 +222,11 @@ document.addEventListener("DOMContentLoaded", () => {
 // 因此把图标 fetch 后内联进 DOM（<span> 包裹），颜色由 CSS color 统一控制。
 const _svgCache = new Map();
 
+// SVG 内容校验：接受可选的前置 XML 注释（lucide-static 文件自带 license 注释）后跟
+// <svg> 根标签；仍拒绝 <!DOCTYPE html>/<html> 开头的 SPA fallback 误返回。
+// 校验失败的文件会静默退回 <img> 形态，currentColor 无法继承页面颜色（深色模式恒黑）
+const _SVG_CONTENT_RE = /^\s*(?:<!--[\s\S]*?-->\s*)*<svg[\s>]/;
+
 // 预取 UI 用到的全部图标，使后续渲染内联命中缓存（同步替换，不闪黑）
 function preloadSvgIcons() {
   const paths = new Set();
@@ -232,17 +237,17 @@ function preloadSvgIcons() {
   Object.values(_CAT_ICONS).forEach((p) => p && paths.add(p));
   _CAT_PALETTE.forEach((c) => paths.add(c.icon));
   Object.values(_STATUS_ICONS).forEach((p) => paths.add(p));
-  paths.add("/图标/8-界面/箭头上.svg");
-  paths.add("/图标/8-界面/箭头下.svg");
-  paths.add("/图标/10-编辑/复制.svg");   // 卡片"复制"按钮（动态渲染）
-  paths.add("/图标/8-界面/更改.svg");    // 卡片"修正分类"按钮（动态渲染）
-  paths.add("/图标/9-媒体/闹钟.svg");    // 卡片"提醒"按钮（动态渲染）
+  paths.add("/icons/chevron-up.svg");
+  paths.add("/icons/chevron-down.svg");
+  paths.add("/icons/copy.svg");   // 卡片"复制"按钮（动态渲染）
+  paths.add("/icons/arrow-left-right.svg");    // 卡片"修正分类"按钮（动态渲染）
+  paths.add("/icons/alarm-clock.svg");    // 卡片"提醒"按钮（动态渲染）
   for (const src of paths) {
     if (_svgCache.has(src)) continue;
     fetch(src)
       .then((res) => (res.ok ? res.text() : null))
       .then((t) => {
-        if (t && t.trim().startsWith("<svg")) _svgCache.set(src, t);
+        if (t && _SVG_CONTENT_RE.test(t)) _svgCache.set(src, t);
       })
       .catch(() => { });
   }
@@ -264,7 +269,7 @@ async function _loadInlineSvg(img, src) {
       if (!res.ok) return;
       svgText = await res.text();
       // SPA fallback 对不存在的路径会返回 index.html，防御性跳过
-      if (!svgText.trim().startsWith("<svg")) return;
+      if (!_SVG_CONTENT_RE.test(svgText)) return;
       _svgCache.set(src, svgText);
     }
     if (!img.isConnected) return; // 等待期间该节点已被替换/移除
@@ -738,8 +743,8 @@ function setupEvents() {
       const isOpen = !quote.classList.contains("open");
       quote.classList.toggle("open");
       toggle.innerHTML = isOpen
-        ? '<img src="/图标/8-界面/箭头上.svg" class="icon-sm" alt="">原文引用'
-        : '<img src="/图标/8-界面/箭头下.svg" class="icon-sm" alt="">原文引用';
+        ? '<img src="/icons/chevron-up.svg" class="icon-sm" alt="">原文引用'
+        : '<img src="/icons/chevron-down.svg" class="icon-sm" alt="">原文引用';
 
       // 展开状态记入视图状态，视图切换后恢复
       if (isOpen) currentExpandedIds.add(card.dataset.id);
@@ -1726,12 +1731,12 @@ async function fetchData() {
 
 // ── Render Nav ──
 const _CAT_ICONS = {
-  "全部": "/图标/8-界面/网格.svg",
-  "活动通知": "/图标/9-媒体/日历.svg",
-  "社团招新": "/图标/8-界面/用户组.svg",
-  "学术": "/图标/2-物品/书.svg",
-  "交易": "/图标/8-界面/更改.svg",
-  "实习": "/图标/9-媒体/时间.svg",
+  "全部": "/icons/layout-grid.svg",
+  "活动通知": "/icons/calendar.svg",
+  "社团招新": "/icons/users.svg",
+  "学术": "/icons/book.svg",
+  "交易": "/icons/arrow-left-right.svg",
+  "实习": "/icons/clock.svg",
 };
 
 function renderNav(categories, ignoredCount, memoCount) {
@@ -1751,10 +1756,10 @@ function renderNav(categories, ignoredCount, memoCount) {
   $nav.innerHTML = html;
 
   if (memoCount !== undefined) {
-    $memoLink.innerHTML = `<span class="cat-link-main"><img src="/图标/8-界面/保存.svg" class="icon-sm cat-icon" alt="">备忘录<span class="cat-count">${memoCount}</span></span>`;
+    $memoLink.innerHTML = `<span class="cat-link-main"><img src="/icons/bookmark-check.svg" class="icon-sm cat-icon" alt="">备忘录<span class="cat-count">${memoCount}</span></span>`;
   }
   if (ignoredCount !== undefined) {
-    $ignoredLink.innerHTML = `<span class="cat-link-main"><img src="/图标/8-界面/禁止.svg" class="icon-sm cat-icon" alt="">已忽略<span class="cat-count">${ignoredCount}</span></span>`;
+    $ignoredLink.innerHTML = `<span class="cat-link-main"><img src="/icons/ban.svg" class="icon-sm cat-icon" alt="">已忽略<span class="cat-count">${ignoredCount}</span></span>`;
   }
 }
 
@@ -2314,7 +2319,7 @@ function applyExpandedState() {
     const toggle = card.querySelector(".card-quote-toggle");
     if (quote && !quote.classList.contains("open")) {
       quote.classList.add("open");
-      if (toggle) toggle.innerHTML = '<img src="/图标/8-界面/箭头上.svg" class="icon-sm" alt="">原文引用';
+      if (toggle) toggle.innerHTML = '<img src="/icons/chevron-up.svg" class="icon-sm" alt="">原文引用';
       const ctxDiv = card.querySelector(".card-quote-context");
       if (ctxDiv && ctxDiv.classList.contains("hidden")) {
         ctxDiv.classList.remove("hidden");
@@ -2690,7 +2695,7 @@ function renderCollapsedGroup(group) {
       <button class="group-more-btn group-head" data-subject="${escAttr(group.subject)}" data-cat="${escAttr(group.category)}" title="${batchMode ? "选择 / 取消选择该主体全部卡片（" + n + " 张）" : "查看该主体全部卡片"}">
         <span class="group-subject subject-link" data-subject="${escAttr(group.subject)}" title="查看该主体全部记录">${esc(group.subject)}</span>
         <span class="group-count">${n} 条</span>
-        <span class="group-more">${batchMode ? "选择整组" : "查看全部"}<img src="/图标/8-界面/箭头右.svg" class="icon-sm chev" alt=""></span>
+        <span class="group-more">${batchMode ? "选择整组" : "查看全部"}<img src="/icons/chevron-right.svg" class="icon-sm chev" alt=""></span>
       </button>
       ${renderCard(rep, group.key)}
     </div>`;
@@ -2842,7 +2847,7 @@ function renderItemRow(item, { cls = "", showSubject = false, showSubscribed = f
         ${showSubject && item.subject ? `<button class="subject-chip subject-link" data-subject="${escAttr(item.subject)}" title="查看该主体全部记录">${esc(item.subject)}</button>` : ""}
         ${showSubscribed && subscribed ? '<span class="subs-badge" title="命中订阅关键词">已订阅</span>' : ""}
         <span class="ov-time">${esc(itemRelativeTime(item))}</span>
-        <button class="btn-copy btn-copy-icon" title="复制标题与关键信息" aria-label="复制标题与关键信息"><img src="/图标/10-编辑/复制.svg" class="icon-sm" alt="复制"></button>
+        <button class="btn-copy btn-copy-icon" title="复制标题与关键信息" aria-label="复制标题与关键信息"><img src="/icons/copy.svg" class="icon-sm" alt="复制"></button>
       </div>
       <div class="ov-title">${highlight(item.title)}</div>
       ${meta.length ? `<div class="ov-meta">${meta.join(" · ")}</div>` : ""}
@@ -3041,12 +3046,12 @@ function renderCard(item, groupKey = "") {
         ${item.subject && !groupKey ? `<button class="subject-chip subject-link" data-subject="${escAttr(item.subject)}" title="查看该主体全部记录">${esc(item.subject)}</button>` : ""}
         ${subscribed ? '<span class="subs-badge" title="命中订阅关键词">已订阅</span>' : ""}
         <span class="card-time"${msgTime ? ` data-tooltip="${escAttr(msgTime)}"` : ""}>${esc(itemRelativeTime(item))}</span>
-        <button class="btn-copy btn-copy-icon" title="复制标题与关键信息" aria-label="复制标题与关键信息"><img src="/图标/10-编辑/复制.svg" class="icon-sm" alt="复制"></button>
+        <button class="btn-copy btn-copy-icon" title="复制标题与关键信息" aria-label="复制标题与关键信息"><img src="/icons/copy.svg" class="icon-sm" alt="复制"></button>
       </div>
       <div class="card-title">${highlight(item.title)}</div>
       ${metaParts.length ? `<div class="card-meta">${metaParts.join(" · ")}</div>` : ""}
       ${imagesHtml}
-      <div class="card-quote-toggle"><img src="/图标/8-界面/箭头下.svg" class="icon-sm" alt="">${hasQuote ? "原文引用" : "查看上下文"}</div>
+      <div class="card-quote-toggle"><img src="/icons/chevron-down.svg" class="icon-sm" alt="">${hasQuote ? "原文引用" : "查看上下文"}</div>
       <div class="card-quote">
         <div class="card-quote-main">
           <div class="quote-meta">${esc(item.sender_name || "未知")} · ${msgTime} · ${sourceGroupChips(item.source_group)}</div>
@@ -3226,10 +3231,10 @@ async function verifyItem(id, value, cardEl, { refresh = false, overlay = false 
 
 // ── Status ──
 const _STATUS_ICONS = {
-  online: "/图标/8-界面/对勾.svg",
-  reconnecting: "/图标/8-界面/刷新.svg",
-  offline: "/图标/8-界面/叉号.svg",
-  syncing: "/图标/12-杂项/加载中圆环.svg",
+  online: "/icons/check.svg",
+  reconnecting: "/icons/refresh-cw.svg",
+  offline: "/icons/x.svg",
+  syncing: "/icons/loader-circle.svg",
 };
 const _STATUS_LABELS = { online: "在线", reconnecting: "重连中", offline: "离线" };
 
@@ -3561,19 +3566,19 @@ function updateSessionSourceChips() {
 // ── Categories ──
 
 // 预设色板（颜色 + 图标组合）：默认五类沿用原颜色与图标（视觉不变）；
-// 补充色块从 /图标/ 目录挑选语义合理的通用图标；默认灰配通用"文件"图标
+// 补充色块从 ui/icons/ 目录挑选语义合理的通用图标；默认灰配通用"文件"图标
 const _CAT_PALETTE = [
-  { color: "#2563EB", icon: "/图标/9-媒体/日历.svg" },
-  { color: "#7C3AED", icon: "/图标/8-界面/用户组.svg" },
-  { color: "#059669", icon: "/图标/2-物品/书.svg" },
-  { color: "#D97706", icon: "/图标/8-界面/更改.svg" },
-  { color: "#DB2777", icon: "/图标/9-媒体/时间.svg" },
-  { color: "#0EA5E9", icon: "/图标/8-界面/信息.svg" },
-  { color: "#F59E0B", icon: "/图标/9-媒体/标签.svg" },
-  { color: "#10B981", icon: "/图标/9-媒体/文档.svg" },
-  { color: "#EF4444", icon: "/图标/9-媒体/通知.svg" },
-  { color: "#8B5CF6", icon: "/图标/9-媒体/书签.svg" },
-  { color: "#6B7280", icon: "/图标/9-媒体/文件.svg" },
+  { color: "#2563EB", icon: "/icons/calendar.svg" },
+  { color: "#7C3AED", icon: "/icons/users.svg" },
+  { color: "#059669", icon: "/icons/book.svg" },
+  { color: "#D97706", icon: "/icons/arrow-left-right.svg" },
+  { color: "#DB2777", icon: "/icons/clock.svg" },
+  { color: "#0EA5E9", icon: "/icons/info.svg" },
+  { color: "#F59E0B", icon: "/icons/tag.svg" },
+  { color: "#10B981", icon: "/icons/file-text.svg" },
+  { color: "#EF4444", icon: "/icons/bell.svg" },
+  { color: "#8B5CF6", icon: "/icons/bookmark.svg" },
+  { color: "#6B7280", icon: "/icons/file.svg" },
 ];
 const _CAT_PALETTE_DEFAULT_COLOR = "#6B7280";
 
@@ -4280,8 +4285,8 @@ function setSyncButton(busy) {
   $syncBtn.dataset.state = want;
   $syncBtn.disabled = busy;
   $syncBtn.innerHTML = busy
-    ? '<img src="/图标/12-杂项/加载中圆环.svg" class="icon icon-spin" alt="">同步中...'
-    : '<img src="/图标/8-界面/刷新.svg" class="icon" alt="">同步消息';
+    ? '<img src="/icons/loader-circle.svg" class="icon icon-spin" alt="">同步中...'
+    : '<img src="/icons/refresh-cw.svg" class="icon" alt="">同步消息';
 }
 
 // ── Helpers ──
@@ -4324,9 +4329,9 @@ function initTheme() {
 }
 
 // ── 网页图标（favicon）：素材库图标 + 随机主题色 ──
-// 直接使用 ui/图标/ 素材库的 SVG（fill="currentColor"），加载后把填充色
+// 直接使用 ui/icons/ 的 Lucide SVG（stroke="currentColor"），加载后把颜色
 // 替换为随机主题色并以内联 data URI 呈现；加载失败保留默认 favicon。
-const _FAVICON_ICON = "/图标/8-界面/网格.svg";
+const _FAVICON_ICON = "/icons/layout-grid.svg";
 const _FAVICON_COLORS = [
   "#2563EB", "#7C3AED", "#059669", "#D97706", "#DB2777",
   "#0EA5E9", "#F59E0B", "#10B981", "#EF4444", "#8B5CF6", "#1B5E41",
@@ -4338,7 +4343,7 @@ async function applyRandomFavicon() {
     const res = await fetch(_FAVICON_ICON);
     if (!res.ok) return;
     let svg = await res.text();
-    if (!svg.trim().startsWith("<svg")) return; // SPA fallback 防御
+    if (!_SVG_CONTENT_RE.test(svg)) return; // SPA fallback 防御
     // 素材库图标统一 fill="currentColor"：替换为随机主题色；
     // 无 fill 属性时兜底注入内联 style
     if (svg.includes('fill="currentColor"')) {

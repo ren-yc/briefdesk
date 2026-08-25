@@ -165,7 +165,7 @@ briefdesk/
 │   ├── index.html          # 桌面端页面
 │   ├── app.js              # 前端逻辑
 │   ├── style.css           # 样式
-│   └── 图标/                 # 图标资源（SVG）
+│   └── icons/              # 图标资源（Lucide SVG 子集，见 ui/icons/README.md）
 └── tests/
 ```
 

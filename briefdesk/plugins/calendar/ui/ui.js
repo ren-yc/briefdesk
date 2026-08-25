@@ -37,7 +37,7 @@
     $calendarBtn.className = "sync-btn";
     $calendarBtn.title = "日历视图（查看带时间的活动/截止安排）";
     $calendarBtn.innerHTML =
-      '<img src="/图标/9-媒体/日历.svg" class="icon" alt="">日历';
+      '<img src="/icons/calendar.svg" class="icon" alt="">日历';
     const $syncBtn = document.getElementById("sync-btn");
     if ($syncBtn) $syncBtn.parentNode.insertBefore($calendarBtn, $syncBtn);
 

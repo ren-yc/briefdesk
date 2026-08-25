@@ -37,7 +37,7 @@
 }
 
 /* ── Icons ── */
-/* 图标由 JS 内联为 <span> 包裹的 SVG（fill="currentColor"），颜色跟随 color */
+/* 图标由 JS 内联为 <span> 包裹的 SVG（Lucide stroke="currentColor"），颜色跟随 color */
 .icon, .icon-sm, .icon-lg {
   color: inherit;
   display: inline-block;
@@ -534,7 +534,7 @@ body.modal-open { overflow: hidden; }
 }
 .cat-swatch:hover { transform: scale(1.12); }
 .cat-swatch.selected { border-color: var(--text); box-shadow: 0 0 0 2px var(--surface); }
-/* 色块内图标：内联后为 span>svg（fill=currentColor），白色在彩色底上清晰，
+/* 色块内图标：内联后为 span>svg（currentColor），白色在彩色底上清晰，
    尺寸与 icon-sm（14px）一致，色块 flex 居中保证与文字同高对齐 */
 .cat-swatch-icon { width: 14px; height: 14px; color: #fff; pointer-events: none; }
 
