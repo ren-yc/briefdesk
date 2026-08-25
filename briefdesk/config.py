@@ -2,7 +2,7 @@
 
 from pathlib import Path
 
-from pydantic import Field
+from pydantic import Field, SecretStr
 from pydantic_settings import BaseSettings
 
 # 项目根目录（briefdesk/config.py 上溯两级）：.env 与默认 DB 路径均以此为基准，
@@ -27,7 +27,7 @@ class Settings(BaseSettings):
     """开发期插件目录：目录下每个 *.py 文件暴露 `plugin` 实例即被
     PluginManager 加载（免打包）；留空 = 不扫描。"""
 
-    ai_api_key: str = Field(default="", alias="AI_API_KEY")
+    ai_api_key: SecretStr = Field(default=SecretStr(""), alias="AI_API_KEY")
     ai_api_base: str = Field(default="https://api.deepseek.com", alias="AI_API_BASE")
     ai_model: str = Field(default="deepseek-v4-flash", alias="AI_MODEL")
     ai_max_concurrency: int = Field(default=0, alias="AI_MAX_CONCURRENCY", ge=0)
@@ -72,7 +72,7 @@ class Settings(BaseSettings):
     embed_api_base: str = Field(default="", alias="EMBED_API_BASE")
     """嵌入向量去重（可选）：EMBED_API_BASE 留空则整体禁用，回退到字符重叠预过滤。"""
     embed_model: str = Field(default="", alias="EMBED_MODEL")
-    embed_api_key: str = Field(default="", alias="EMBED_API_KEY")
+    embed_api_key: SecretStr = Field(default=SecretStr(""), alias="EMBED_API_KEY")
     embed_batch_size: int = Field(default=20, alias="EMBED_BATCH_SIZE", gt=0)
     dedup_embed_threshold: float = Field(
         default=0.80, alias="DEDUP_EMBED_THRESHOLD", ge=0, le=1

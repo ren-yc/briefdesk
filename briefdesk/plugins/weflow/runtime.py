@@ -37,10 +37,11 @@ class WeFlowSource(SourceRuntime[WeFlowClient]):
     ):
         # 统一实例化一次源专属配置（reconnect 参数注入监听器）
         self._settings = WeFlowSettings()
-        # 未显式传入时读取 weflow 专属配置（WEFLOW_API_BASE / WEFLOW_API_TOKEN）
+        # 未显式传入时读取 weflow 专属配置（WEFLOW_API_BASE / WEFLOW_API_TOKEN）；
+        # 密钥在「配置 → 客户端」边界解包为明文 str，客户端不感知 SecretStr
         if base_url is None or api_token is None:
             base_url = base_url or self._settings.api_base
-            api_token = api_token or self._settings.api_token
+            api_token = api_token or self._settings.api_token.get_secret_value()
         # 具体类型而非 SourceClient：poll/WeFlowSseClient 需要 WeFlowClient 能力；
         # 结构上仍满足 SourceClient 协议，可传给 pipeline/server
         self.client = WeFlowClient(

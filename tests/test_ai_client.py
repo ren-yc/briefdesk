@@ -4,6 +4,8 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
+from pydantic import SecretStr
+
 from briefdesk.config import config
 from briefdesk.plugins.ai_provider.engine import chat
 
@@ -33,7 +35,7 @@ class ChatThinkingSwitchTest(unittest.IsolatedAsyncioTestCase):
         client, create = _fake_client()
         with patch("briefdesk.plugins.ai_provider.engine.get_ai_client", return_value=client), patch.object(
             config, "ai_disable_thinking", False
-        ), patch.object(config, "ai_api_key", "deepseek"), patch.object(
+        ), patch.object(config, "ai_api_key", SecretStr("deepseek")), patch.object(
             config, "ai_model", "qwen3.5"
         ):
             await chat([], temperature=0.1, max_tokens=64)
@@ -48,7 +50,7 @@ class ChatThinkingSwitchTest(unittest.IsolatedAsyncioTestCase):
         client, create = _fake_client()
         with patch("briefdesk.plugins.ai_provider.engine.get_ai_client", return_value=client), patch.object(
             config, "ai_disable_thinking", True
-        ), patch.object(config, "ai_api_key", "deepseek"), patch.object(
+        ), patch.object(config, "ai_api_key", SecretStr("deepseek")), patch.object(
             config, "ai_model", "qwen3.5"
         ):
             await chat([], temperature=0.1, max_tokens=64)
@@ -67,7 +69,7 @@ class ChatJsonObjectTest(unittest.IsolatedAsyncioTestCase):
         client, create = _fake_client()
         with patch("briefdesk.plugins.ai_provider.engine.get_ai_client", return_value=client), patch.object(
             config, "ai_disable_thinking", disable_thinking
-        ), patch.object(config, "ai_api_key", api_key), patch.object(
+        ), patch.object(config, "ai_api_key", SecretStr(api_key)), patch.object(
             config, "ai_model", model
         ):
             await chat([], temperature=0.1, max_tokens=64)

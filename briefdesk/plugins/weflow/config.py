@@ -4,13 +4,13 @@
 环境变量名保持 WEFLOW_API_BASE / WEFLOW_API_TOKEN 不变,.env 无需修改。
 """
 
-from pydantic import Field
+from pydantic import Field, SecretStr
 from pydantic_settings import BaseSettings
 
 
 class WeFlowSettings(BaseSettings):
     api_base: str = "http://127.0.0.1:5031"
-    api_token: str = ""
+    api_token: SecretStr = SecretStr("")
     sse_reconnect_initial_ms: int = Field(
         default=1000,
         ge=0,  # env: WEFLOW_SSE_RECONNECT_INITIAL_MS

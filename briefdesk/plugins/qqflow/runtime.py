@@ -40,10 +40,11 @@ class QqFlowSource(SourceRuntime[QqFlowClient]):
     ):
         # 统一实例化一次源专属配置（reconnect 参数注入监听器）
         self._settings = QqFlowSettings()
-        # 未显式传入时读取 qqflow 专属配置（QQFLOW_API_BASE / QQFLOW_API_TOKEN）
+        # 未显式传入时读取 qqflow 专属配置（QQFLOW_API_BASE / QQFLOW_API_TOKEN）；
+        # 密钥在「配置 → 客户端」边界解包为明文 str，客户端不感知 SecretStr
         if base_url is None or api_token is None:
             base_url = base_url or self._settings.api_base
-            api_token = api_token or self._settings.api_token
+            api_token = api_token or self._settings.api_token.get_secret_value()
         if not api_token:
             logger.warning(
                 "QQFLOW_API_TOKEN 为空：请从 qqflow-server 的 token 文件读取 "
@@ -55,7 +56,7 @@ class QqFlowSource(SourceRuntime[QqFlowClient]):
             base_url=base_url,
             api_token=api_token,
             qq=self._settings.qq,
-            key=self._settings.key,
+            key=self._settings.key.get_secret_value(),
             db_path=self._settings.db_path,
         )
         self.listener: RealtimeListener | None = None

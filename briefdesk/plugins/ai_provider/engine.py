@@ -27,7 +27,7 @@ def get_ai_client() -> AsyncOpenAI:
     global _client
     if _client is None:
         _client = AsyncOpenAI(
-            api_key=config.ai_api_key,
+            api_key=config.ai_api_key.get_secret_value(),
             base_url=config.ai_api_base,
         )
     return _client
@@ -55,7 +55,7 @@ def _use_json_object() -> bool:
     下游解析不再面对叙述性文本/裸数组等跑偏形态。
     模型名用包含匹配，兼容带前缀的 vendor 命名（如 deepseek/deepseek-v4-flash）。
     """
-    if config.ai_api_key == "ollama":
+    if config.ai_api_key.get_secret_value() == "ollama":
         return True
     return "deepseek-v4-flash" in config.ai_model or "deepseek-v4-pro" in config.ai_model
 
@@ -122,7 +122,7 @@ def embed_api_base() -> str:
 
 def embed_api_key() -> str:
     """嵌入 API Key，未单独配置时回退到 AI_API_KEY。"""
-    return config.embed_api_key or config.ai_api_key
+    return (config.embed_api_key or config.ai_api_key).get_secret_value()
 
 
 def embed_model_name() -> str:

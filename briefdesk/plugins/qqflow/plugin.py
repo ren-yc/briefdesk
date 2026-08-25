@@ -31,9 +31,9 @@ class QqFlowPlugin(SourcePlugin):
         # QQFLOW_DB_PATH 允许为空：上游 qqflow-server 在 db_path 为空时
         # 自动回退到平台默认位置（Windows: Documents\Tencent Files 等）
         required = (
-            ("QQFLOW_API_TOKEN", settings.api_token),
+            ("QQFLOW_API_TOKEN", settings.api_token.get_secret_value()),
             ("QQFLOW_QQ", settings.qq),
-            ("QQFLOW_KEY", settings.key),
+            ("QQFLOW_KEY", settings.key.get_secret_value()),
         )
         missing = [name for name, value in required if not value]
         if missing:

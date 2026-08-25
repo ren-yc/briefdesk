@@ -5,6 +5,8 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, patch
 
+from pydantic import SecretStr
+
 from briefdesk.config import Settings
 from briefdesk.plugin.base import PluginContext, PluginDisabledError
 from briefdesk.plugins.qqflow.plugin import QqFlowPlugin
@@ -63,7 +65,7 @@ class WeFlowPluginTest(unittest.IsolatedAsyncioTestCase):
 class QqFlowPluginTest(unittest.IsolatedAsyncioTestCase):
     async def test_missing_required_config_self_disables(self):
         ctx, _ = _ctx()
-        fake_settings = SimpleNamespace(api_token="", qq="", key="")
+        fake_settings = SimpleNamespace(api_token=SecretStr(""), qq="", key=SecretStr(""))
         plugin = QqFlowPlugin()
         with patch(
             "briefdesk.plugins.qqflow.config.QqFlowSettings", return_value=fake_settings
@@ -73,7 +75,9 @@ class QqFlowPluginTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_partial_config_names_missing_fields(self):
         ctx, _ = _ctx()
-        fake_settings = SimpleNamespace(api_token="t", qq="", key="k" * 16)
+        fake_settings = SimpleNamespace(
+            api_token=SecretStr("t"), qq="", key=SecretStr("k" * 16)
+        )
         plugin = QqFlowPlugin()
         with patch(
             "briefdesk.plugins.qqflow.config.QqFlowSettings", return_value=fake_settings
@@ -84,7 +88,9 @@ class QqFlowPluginTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_config_present_registers_runtime(self):
         ctx, registered = _ctx()
-        fake_settings = SimpleNamespace(api_token="t", qq="123", key="k" * 16)
+        fake_settings = SimpleNamespace(
+            api_token=SecretStr("t"), qq="123", key=SecretStr("k" * 16)
+        )
         fake_runtime = SimpleNamespace(name="qqflow")
         plugin = QqFlowPlugin()
         with patch(
@@ -98,7 +104,9 @@ class QqFlowPluginTest(unittest.IsolatedAsyncioTestCase):
     async def test_teardown_closes_runtime(self):
         ctx, _ = _ctx()
         close_spy = AsyncMock()
-        fake_settings = SimpleNamespace(api_token="t", qq="123", key="k" * 16)
+        fake_settings = SimpleNamespace(
+            api_token=SecretStr("t"), qq="123", key=SecretStr("k" * 16)
+        )
         fake_runtime = SimpleNamespace(name="qqflow", close=close_spy)
         plugin = QqFlowPlugin()
         with patch(

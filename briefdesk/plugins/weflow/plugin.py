@@ -33,7 +33,7 @@ class WeFlowPlugin(SourcePlugin):
         from briefdesk.plugins.weflow import runtime as weflow_runtime
 
         settings = weflow_config.WeFlowSettings()
-        if not settings.api_token:
+        if not settings.api_token.get_secret_value():
             logger.warning(
                 "[weflow] WEFLOW_API_TOKEN 未配置：实时监听与历史回填将在调用期失败。"
                 "请在 .env 中填入 WeFlow HTTP API 访问令牌后重启。"
