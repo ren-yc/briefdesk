@@ -3,12 +3,22 @@
 from pathlib import Path
 
 from pydantic import Field, SecretStr
-from pydantic_settings import BaseSettings
+from pydantic_settings import BaseSettings, PydanticBaseSettingsSource
+
+from briefdesk.secrets_store import KeyringSource
 
 # 项目根目录（briefdesk/config.py 上溯两级）：.env 与默认 DB 路径均以此为基准，
 # 保证从任意工作目录启动（python main.py / python -m briefdesk / briefdesk）读到同一份配置，
 # 避免 console script 在其它目录运行时静默丢失 .env 或把数据库建到错误位置。
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+
+# 密钥解析链（keyring > 环境变量 > .env > 默认值）：
+# 系统密钥环由 CLI `briefdesk secrets set` 写入，见 briefdesk/secrets_store.py
+_KEYRING_FIELDS = {
+    "ai_api_key": "AI_API_KEY",
+    "embed_api_key": "EMBED_API_KEY",
+}
 
 
 class Settings(BaseSettings):
@@ -107,6 +117,24 @@ class Settings(BaseSettings):
         "populate_by_name": True,
         "extra": "ignore",
     }
+
+    @classmethod
+    def settings_customise_sources(
+        cls,
+        settings_cls: type[BaseSettings],
+        init_settings: PydanticBaseSettingsSource,
+        env_settings: PydanticBaseSettingsSource,
+        dotenv_settings: PydanticBaseSettingsSource,
+        file_secret_settings: PydanticBaseSettingsSource,
+    ) -> tuple[PydanticBaseSettingsSource, ...]:
+        """来源优先级：init 参数 > 系统密钥环 > 环境变量 > .env > 默认值。"""
+        return (
+            init_settings,
+            KeyringSource(settings_cls, _KEYRING_FIELDS),
+            env_settings,
+            dotenv_settings,
+            file_secret_settings,
+        )
 
 
 config = Settings()

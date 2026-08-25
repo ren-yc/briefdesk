@@ -165,6 +165,15 @@ All via `.env` file. Required: `AI_API_KEY`; `WEFLOW_API_TOKEN` when the `weflow
 | `MERGE_WINDOW_MINUTES` | `10` | 会话内同话题片段合并窗口（分钟）：新卡与同会话同类别、msg_time 相差不超过该值的未核实卡进入 AI 合并判定；`0` = 禁用合并 |
 | `MERGE_MAX_CANDIDATES` | `3` | 每张新卡最多送合并判官判定的候选头卡数 |
 
+### 密钥解析链（keyring）
+
+密钥型配置按优先级解析：**系统密钥环 > 环境变量 > .env > 默认值**（实现：`briefdesk/secrets_store.py`；`KeyringSource` 经 `settings_customise_sources` 挂在 app 级与 weflow/qqflow 三个 Settings 上，位于 env 源之前）。
+
+- 系统密钥环经 `keyring` 库（Windows=凭据管理器/DPAPI，随用户账号加密；macOS=钥匙串；Linux=Secret Service），由 CLI `briefdesk secrets set|get|rm|list` 管理（白名单 `SECRET_NAMES`），写入后**重启生效**（配置在启动时快照）；
+- 密钥环不可用（无桌面会话 / 无 Secret Service / 未安装 keyring）或 `BRIEFDESK_KEYRING=0` 时**静默回退**环境变量 → `.env` → 默认值（读路径永不阻断启动）；`.env` 与既有使用方式完全兼容，已配置密钥无需迁移；
+- 密钥**绝不回写 `.env` 明文**；CLI `get` 默认只显示「是否配置 + 长度」，`--reveal` 才打印明文；
+- **Gotcha（pydantic-settings 合并语义）**：各 source 的输出键必须一致——Env 源按**字段别名**输出（`AI_API_KEY`），自定义源若按字段名输出（`ai_api_key`）会出现同字段双键，传给 pydantic 时**别名键总是胜出**，与 source 顺序无关，导致 keyring 层被环境变量静默覆盖。`KeyringSource._key_for_field` 按别名输出键规避此陷阱（守卫测试：`tests/test_secrets_store.py` 的优先级链用例）。
+
 ## 设计要点与陷阱
 
 ### 运行时与优雅关闭

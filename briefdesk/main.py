@@ -8,6 +8,7 @@ briefdesk/plugin/manager.py —— 消息源为内置插件（weflow/qqflow）�
 import asyncio
 import logging
 import signal
+import sys
 import time as time_module
 from collections.abc import Callable
 
@@ -288,7 +289,12 @@ async def _run() -> None:
 
 
 def main() -> None:
-    """启动顺序：数据库 → HTTP 服务器 → 信息源连接（实时监听 + 回填）。"""
+    """入口：`briefdesk secrets` 子命令或启动本地服务。"""
+    if len(sys.argv) >= 2 and sys.argv[1] == "secrets":
+        from briefdesk.secrets_cli import secrets_cli_main
+
+        raise SystemExit(secrets_cli_main(sys.argv[2:]))
+
     setup_logging()
     loop = asyncio.new_event_loop()
     try:

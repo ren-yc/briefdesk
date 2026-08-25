@@ -6,7 +6,15 @@ QqFlowPlugin.setup 抛 PluginDisabledError 自禁用（见 briefdesk/plugins/qqf
 """
 
 from pydantic import Field, SecretStr
-from pydantic_settings import BaseSettings
+from pydantic_settings import BaseSettings, PydanticBaseSettingsSource
+
+from briefdesk.secrets_store import KeyringSource
+
+# 密钥解析链（keyring > 环境变量 > .env > 默认值），见 briefdesk/secrets_store.py
+_KEYRING_FIELDS = {
+    "api_token": "QQFLOW_API_TOKEN",
+    "key": "QQFLOW_KEY",
+}
 
 
 class QqFlowSettings(BaseSettings):
@@ -33,3 +41,21 @@ class QqFlowSettings(BaseSettings):
         # 同一 .env 里还有 app 级与其它源的字段，忽略未知项
         "extra": "ignore",
     }
+
+    @classmethod
+    def settings_customise_sources(
+        cls,
+        settings_cls: type[BaseSettings],
+        init_settings: PydanticBaseSettingsSource,
+        env_settings: PydanticBaseSettingsSource,
+        dotenv_settings: PydanticBaseSettingsSource,
+        file_secret_settings: PydanticBaseSettingsSource,
+    ) -> tuple[PydanticBaseSettingsSource, ...]:
+        """来源优先级：init 参数 > 系统密钥环 > 环境变量 > .env > 默认值。"""
+        return (
+            init_settings,
+            KeyringSource(settings_cls, _KEYRING_FIELDS),
+            env_settings,
+            dotenv_settings,
+            file_secret_settings,
+        )

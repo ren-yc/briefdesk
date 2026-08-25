@@ -20,6 +20,9 @@ dependencies = [
     "numpy>=1.26",
     "json-repair>=0.63",
     "python-multipart>=0.0.9",
+    # 系统密钥环（Windows=凭据管理器/DPAPI）：密钥型配置的第一解析层，
+    # 见 briefdesk/secrets_store.py；无桌面会话时自动回退环境变量/.env
+    "keyring>=24",
 ]
 
 [project.scripts]
