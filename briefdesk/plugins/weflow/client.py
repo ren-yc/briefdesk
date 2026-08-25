@@ -497,7 +497,10 @@ class WeFlowClient(SourceClient):
         async with httpx.AsyncClient(timeout=httpx.Timeout(None)) as sse_client:
             try:
                 # 同样用 URL join 构建 SSE 地址，避免 _base_url 带路径/查询时拼坏；
-                # WeFlow 文档推荐 SSE 长连接用 ?access_token= 查询参数，与 Bearer 头同时携带
+                # WeFlow 文档推荐 SSE 长连接用 ?access_token= 查询参数（与 Bearer 头
+                # 同时携带）。该令牌会出现在请求 URL 中：本进程侧由 uvicorn access
+                # log 的查询参数掩码（logger.redact_query_string）兜底，httpx 调试
+                # 日志已压制在 WARNING 之下，不输出 URL
                 url = str(httpx.URL(self._base_url).join("/api/v1/push/messages"))
                 params = {"access_token": self._api_token} if self._api_token else None
                 async with sse_client.stream(

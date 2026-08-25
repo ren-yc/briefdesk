@@ -195,6 +195,7 @@ All via `.env` file. Required: `AI_API_KEY`; `WEFLOW_API_TOKEN` when the `weflow
 
 - 数据库路径统一经 `config.db_path` 读取（`db.get_db()` 直读；`experiments/dedup_compare.py` 等实验脚本通过给 `config.db_path` 赋值指向临时库）
 - 日志体系：格式/级别/uvicorn 统一见 `briefdesk/logger.py` 行；`uvicorn.Config(log_config=None)` 必须与 `setup_logging()` 的 uvicorn logger 清理配合，否则启动阶段 dictConfig 会重新挂回 uvicorn 自带 handler（无时间戳、propagate=False）
+- **访问日志脱敏**：uvicorn.access 请求行重建前经 `logger.redact_query_string` 按参数名掩码疑似密钥查询参数（`access_token`/`token`/`api_key`/`apikey`/`key`/`secret`/`auth` → `***`）。weflow SSE 长连接按上游文档以 `?access_token=` 携带令牌（与 Bearer 头同时携带），本进程侧由该掩码兜底；httpx 调试日志已压制 WARNING 之下，不输出请求 URL。守卫测试：`tests/test_log_redaction.py`
 
 ### 启动期上游连接竞态
 

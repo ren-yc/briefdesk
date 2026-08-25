@@ -8,6 +8,7 @@ INFO）：DEBUG 开启逐条细节（每条事件、每次请求、每条过滤�
 
 import http
 import logging
+import re
 import sys
 from typing import Any, cast
 
@@ -46,6 +47,22 @@ _STATUS_CODE_COLORS = {
 }
 
 
+# 访问日志需要掩码的疑似密钥查询参数键：令牌/密钥经 URL 查询参数传递时
+# （如 weflow SSE 的 ?access_token=）会出现在 uvicorn access log 请求行中。
+_QUERY_SECRET_PARAM_RE = re.compile(
+    r"([?&](?:access_token|token|api[_-]?key|apikey|key|secret|auth)=)[^&\s]*"
+)
+
+
+def redact_query_string(path: str) -> str:
+    """掩码 URL 查询字符串中的疑似密钥参数值（?access_token=xxx → ?access_token=***）。
+
+    按参数键名判定而非按值匹配：无需知道密钥具体内容，命中即掩码，
+    因此对任意长度/形态的令牌都生效，且不会误伤正常查询参数。
+    """
+    return _QUERY_SECRET_PARAM_RE.sub(r"\1***", path)
+
+
 def _status_text(status_code: int) -> str:
     """状态码 + HTTP 状态短语（如 "200 OK"），按百位分组着色。"""
     try:
@@ -81,6 +98,8 @@ class _BriefFormatter(logging.Formatter):
             except (TypeError, ValueError):
                 pass
             else:
+                # 请求行重建前先掩码查询参数中的疑似密钥，防止令牌落入访问日志
+                full_path = redact_query_string(str(full_path))
                 record.message = (
                     f'{client_addr} - "{method} {full_path} HTTP/{http_version}" '
                     f"{_status_text(int(cast(Any, status_code)))}"
