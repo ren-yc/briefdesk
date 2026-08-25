@@ -213,34 +213,9 @@ briefdesk/
 
 ## 架构
 
-```
-WeFlow :5031                           qqflow-server :5032
-  ├─ SSE /api/v1/push/messages           ├─ SSE /api/v1/push/messages
-  └─ REST /api/v1/messages               └─ REST /api/v1/messages
-                                         └─ REST /api/v1/media/{id}（图片字节）
-              │                                        │
-              └────────────────┬───────────────────────┘
-                               ↓
-          briefdesk/plugins/weflow|qqflow/（sse.py 实时 / poller.py 回填 /
-          normalize.py 归一化为 InternalMessage）
-                               ↓
-          pipeline 入口统一过滤（normalize 预滤 + IGNORE_SELF 自消息 /
-          启用会话 / 已处理 / OCR 未启用时纯占位符图片屏蔽）
-                               ↓
-          OCR 增强（weflow mediaUrl / qqflow mediaId → 源客户端下载字节 → 识别）
-                               ↓
-          briefdesk/plugins/classify/engine.py → AI (并行分批)
-                               ↓
-          briefdesk/plugins/dedup/engine.py → AI 语义判重
-                               ↓
-          briefdesk/plugins/merge/engine.py → 会话内同话题片段合并（post_insert）
-                               ↓
-          briefdesk/db.py → SQLite 入库
-                               ↓
-          briefdesk/server/ → FastAPI :3000
-                               ↓
-          ui/ → 桌面端网页
-```
+简报台采用「核心骨架 + 插件」架构：可插拔消息源（weflow / qqflow）产出归一化消息，经 pipeline 入口统一过滤后进入阶段插件流水线（OCR 增强 → AI 分类 → 语义去重 → 同话题合并），结果写入 SQLite，由 FastAPI 服务端经 SSE 实时推送到原生 JS 前端；本体只保留存储、管道骨架、HTTP 与状态总线等核心。
+
+完整的数据流图、模块职责、插件框架、数据库 Schema、配置项与设计陷阱详见 [docs/architecture.md](docs/architecture.md)。
 
 ## 技术栈
 
