@@ -14,6 +14,7 @@ from briefdesk.server import middleware  # noqa: F401 — 导入即注册中间�
 from briefdesk.server import web_plugins  # noqa: F401 — 导入即注册插件路由
 from briefdesk.server import routes_items  # noqa: F401 — 导入即注册核心路由
 from briefdesk.server import routes_categories  # noqa: F401 — 导入即注册类别路由
+from briefdesk.server import routes_settings_env  # noqa: F401 — 导入即注册启动配置路由
 from briefdesk.server import media  # noqa: F401 — 导入即注册媒体代理
 from briefdesk.server import static  # noqa: F401 — 导入即挂载 SPA
 

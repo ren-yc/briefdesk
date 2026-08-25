@@ -434,6 +434,7 @@ function setupEvents() {
     loadCategories();
     loadAboutSources();
     loadPlugins();
+    loadEnvConfig();
     setTimeout(() => $refreshInterval.focus(), 0);
   }
 
@@ -651,6 +652,26 @@ function setupEvents() {
   });
 
   $settingsClose.addEventListener("click", closeSettingsModal);
+
+  // 「启动配置」面板：暂存/恢复默认/密钥读写（委托在面板容器上）
+  const $envItems = document.getElementById("env-items");
+  const $envSecrets = document.getElementById("env-secrets");
+  const $envSave = document.getElementById("env-save");
+  if ($envItems) {
+    $envItems.addEventListener("click", (e) => {
+      const restore = e.target.closest("[data-env-restore]");
+      if (restore) restoreEnvKey(restore.dataset.envRestore);
+    });
+  }
+  if ($envSecrets) {
+    $envSecrets.addEventListener("click", (e) => {
+      const setBtn = e.target.closest("[data-sec-set]");
+      if (setBtn) { setEnvSecret(setBtn.dataset.secSet); return; }
+      const clearBtn = e.target.closest("[data-sec-clear]");
+      if (clearBtn) clearEnvSecret(clearBtn.dataset.secClear);
+    });
+  }
+  if ($envSave) $envSave.addEventListener("click", saveEnvConfig);
 
   $settingsModal.addEventListener("click", (e) => {
     if (e.target === $settingsModal) closeSettingsModal();
@@ -3865,6 +3886,214 @@ function saveSettings() {
   }));
 }
 
+// ── 启动配置（.env 暂存）──
+// 数据来自 GET /api/settings/env；「暂存更改」只写暂存文件（重启应用才生效），
+// 密钥走系统钥匙串（POST/DELETE /api/settings/secrets），服务端不回传明文。
+let envData = null;
+
+async function loadEnvConfig() {
+  try {
+    const res = await fetch("/api/settings/env");
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    envData = await res.json();
+  } catch {
+    envData = null;
+  }
+  renderEnvConfig();
+}
+
+function _envBadges(item) {
+  const badges = [];
+  if (item.staged !== null && item.source === "override") {
+    badges.push('<span class="env-badge env-badge-staged">已暂存 · 重启生效</span>');
+  }
+  if (item.source === "env") {
+    badges.push('<span class="env-badge env-badge-env">环境变量优先</span>');
+  }
+  return badges.join("");
+}
+
+function _envControl(item) {
+  const key = item.key;
+  const cur = item.current;
+  if (item.type === "boolean") {
+    return '<label class="env-chip"><input type="checkbox" data-env-key="' + key + '"'
+      + (cur ? " checked" : "") + "><span>启用</span></label>";
+  }
+  if (item.type === "select") {
+    return '<select class="settings-select" data-env-key="' + key + '">'
+      + item.options.map(o => '<option value="' + escAttr(o) + '"'
+        + (String(cur) === o ? " selected" : "") + ">" + esc(o) + "</option>").join("")
+      + "</select>";
+  }
+  if (item.type === "multi") {
+    // 选项 = 已发现插件 ∪ 当前值（保证既有值不回丢）
+    const current = Array.isArray(cur) ? cur : [];
+    const opts = current.slice();
+    for (const name of (envData.pluginOptions || [])) {
+      if (!opts.includes(name)) opts.push(name);
+    }
+    if (!opts.includes("*")) opts.unshift("*");
+    return '<div class="env-multi" data-env-key="' + key + '">'
+      + opts.map(o => '<label class="env-chip"><input type="checkbox" value="' + escAttr(o) + '"'
+        + (current.includes(o) ? " checked" : "") + "><span>" + esc(o) + "</span></label>").join("")
+      + "</div>";
+  }
+  if (item.type === "number") {
+    return '<input type="number" class="env-input" data-env-key="' + key + '"'
+      + (item.min !== undefined ? ' min="' + item.min + '"' : "")
+      + (item.max !== undefined ? ' max="' + item.max + '"' : "")
+      + (item.step !== undefined ? ' step="' + item.step + '"' : "")
+      + ' value="' + escAttr(String(cur)) + '">';
+  }
+  return '<input type="text" class="env-input" data-env-key="' + key + '" value="' + escAttr(String(cur)) + '">';
+}
+
+function renderEnvConfig() {
+  const $path = document.getElementById("env-file-path");
+  const $items = document.getElementById("env-items");
+  const $secrets = document.getElementById("env-secrets");
+  const $save = document.getElementById("env-save");
+  if (!envData) {
+    if ($items) $items.innerHTML = '<p class="text-muted">加载失败，请刷新页面重试</p>';
+    if ($save) $save.disabled = true;
+    return;
+  }
+  if ($path) $path.textContent = "暂存文件：" + envData.filePath;
+  if ($items) {
+    $items.innerHTML = envData.items.map(item => {
+      const restore = item.staged !== null
+        ? '<button type="button" class="env-restore" data-env-restore="' + item.key + '">恢复默认</button>'
+        : "";
+      return '<div class="env-row" data-env-key="' + item.key + '">'
+        + '<div class="env-row-head"><label class="env-label">' + esc(item.label) + "</label>"
+        + _envBadges(item) + "</div>"
+        + _envControl(item)
+        + (item.hint ? '<p class="text-muted settings-hint">' + esc(item.hint) + "</p>" : "")
+        + restore
+        + "</div>";
+    }).join("");
+  }
+  if ($secrets) {
+    $secrets.innerHTML = (envData.secrets || []).map(s => {
+      const state = s.configured
+        ? '<span class="env-badge env-badge-ok">已配置（钥匙串）</span>'
+        : '<span class="env-badge">未配置</span>';
+      const input = s.configured ? "" : '<div class="env-secret-input">'
+        + '<input type="password" class="env-input" data-sec-input="' + escAttr(s.name) + '" placeholder="输入 ' + esc(s.label) + '" autocomplete="off"> '
+        + '<button type="button" class="settings-outline-btn" data-sec-set="' + escAttr(s.name) + '">保存</button></div>';
+      const clear = s.configured
+        ? '<button type="button" class="env-restore" data-sec-clear="' + escAttr(s.name) + '">清除</button>'
+        : "";
+      return '<div class="env-row"><div class="env-row-head">'
+        + '<label class="env-label">' + esc(s.label) + "</label>" + state + "</div>"
+        + input + clear + "</div>";
+    }).join("") || '<p class="text-muted">无</p>';
+  }
+}
+
+function _collectEnvChanges() {
+  const changes = {};
+  const $items = document.getElementById("env-items");
+  for (const item of envData.items) {
+    const key = item.key;
+    const el = $items.querySelector('[data-env-key="' + key + '"]');
+    if (!el) continue;
+    let newVal;
+    let oldVal;
+    if (item.type === "boolean") {
+      newVal = el.checked;
+      oldVal = !!item.current;
+    } else if (item.type === "multi") {
+      newVal = [...el.querySelectorAll("input:checked")].map(c => c.value);
+      oldVal = Array.isArray(item.current) ? item.current.slice().sort() : [];
+      newVal = newVal.slice().sort();
+      if (JSON.stringify(newVal) === JSON.stringify(oldVal)) continue;
+      changes[key] = JSON.stringify(newVal);
+      continue;
+    } else {
+      newVal = el.value;
+      oldVal = String(item.current);
+      if (!newVal || newVal === oldVal) continue;
+    }
+    if (item.type === "boolean") changes[key] = newVal ? "true" : "false";
+    else changes[key] = String(newVal);
+  }
+  return changes;
+}
+
+async function saveEnvConfig() {
+  if (!envData) return;
+  const changes = _collectEnvChanges();
+  if (!Object.keys(changes).length) {
+    showToast("没有需要暂存的更改", { type: "info", duration: 2500 });
+    return;
+  }
+  const warnItem = envData.items.find(i => i.warn && changes[i.key] !== undefined);
+  if (warnItem && !confirm(warnItem.label + "：" + warnItem.warn + "。确定暂存？")) return;
+  try {
+    const res = await fetch("/api/settings/env", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ items: changes }),
+    });
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    showToast("已暂存，重启应用后生效", { type: "success", duration: 4000 });
+    await loadEnvConfig();
+  } catch (err) {
+    console.error("Save env config error:", err);
+    showToast("暂存失败，请检查输入后重试", { type: "error", duration: 6000 });
+  }
+}
+
+async function restoreEnvKey(key) {
+  try {
+    const res = await fetch("/api/settings/env", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ items: { [key]: null } }),
+    });
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    showToast(key + " 已恢复默认（重启生效）", { type: "success", duration: 3000 });
+    await loadEnvConfig();
+  } catch {
+    showToast("操作失败，请重试", { type: "error", duration: 4000 });
+  }
+}
+
+async function setEnvSecret(name) {
+  const input = document.querySelector('[data-sec-input="' + name + '"]');
+  const value = input ? input.value.trim() : "";
+  if (!value) {
+    showToast("请输入密钥值", { type: "error", duration: 3000 });
+    return;
+  }
+  try {
+    const res = await fetch("/api/settings/secrets", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name, value }),
+    });
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    showToast(name + " 已写入钥匙串（重启生效）", { type: "success", duration: 4000 });
+    await loadEnvConfig();
+  } catch (err) {
+    console.error("Set secret error:", err);
+    showToast("密钥写入失败", { type: "error", duration: 5000 });
+  }
+}
+
+async function clearEnvSecret(name) {
+  try {
+    const res = await fetch("/api/settings/secrets/" + encodeURIComponent(name), { method: "DELETE" });
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    showToast(name + " 已从钥匙串清除", { type: "success", duration: 3000 });
+    await loadEnvConfig();
+  } catch {
+    showToast("清除失败，请重试", { type: "error", duration: 4000 });
+  }
+}
+
 // ── Toast ──
 function showToast(message, { type = "info", duration = 3500, actionLabel = "", actionFn = null } = {}) {
   const el = document.createElement("div");
@@ -4153,6 +4382,9 @@ function setSettingsPanel(name) {
   $settingsModal.querySelectorAll(".settings-panel").forEach(p => {
     p.classList.toggle("hidden", p.dataset.panel !== name);
   });
+  // 「启动配置」面板有自己的「暂存更改」按钮（写暂存文件、重启生效），
+  // 与底部全局「保存」（刷新间隔 + 类别/会话草稿）语义不同——隐藏避免误操作
+  document.querySelector(".settings-actions")?.classList.toggle("hidden", name === "env");
 }
 
 async function loadAboutSources() {

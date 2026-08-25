@@ -6,6 +6,7 @@ from pydantic import Field, SecretStr
 from pydantic_settings import BaseSettings, PydanticBaseSettingsSource
 
 from briefdesk.secrets_store import KeyringSource
+from briefdesk.settings_env import get_settings_file
 
 # 项目根目录（briefdesk/config.py 上溯两级）：.env 与默认 DB 路径均以此为基准，
 # 保证从任意工作目录启动（python main.py / python -m briefdesk / briefdesk）读到同一份配置，
@@ -112,7 +113,7 @@ class Settings(BaseSettings):
     """日志级别（DEBUG / INFO / WARNING / ERROR / CRITICAL），由 logger.py 读取。"""
 
     model_config = {
-        "env_file": PROJECT_ROOT / ".env",
+        "env_file": [PROJECT_ROOT / ".env", get_settings_file()],
         "env_file_encoding": "utf-8",
         "populate_by_name": True,
         "extra": "ignore",

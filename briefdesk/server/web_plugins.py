@@ -27,11 +27,16 @@ def set_plugins_info_callback(cb: Callable[[], list[dict]]) -> None:
     _plugins_info_callback = cb
 
 
+def get_plugins_info() -> list[dict]:
+    """读取插件装配摘要（未注入回调时返回空列表）。"""
+    cb = _plugins_info_callback
+    return cb() if cb is not None else []
+
+
 @app.get("/api/plugins")
 async def api_plugins():
     """插件发现/装配摘要（名称/版本/状态/原因），前端据此渲染插件区。"""
-    cb = _plugins_info_callback
-    return {"plugins": cb() if cb is not None else []}
+    return {"plugins": get_plugins_info()}
 
 
 _plugin_assets: dict[str, str] = {}

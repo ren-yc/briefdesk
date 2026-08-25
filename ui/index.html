@@ -102,6 +102,7 @@
           <button type="button" class="settings-menu-item" data-panel="categories">信息分类</button>
           <button type="button" class="settings-menu-item" data-panel="sessions">群聊筛选</button>
           <button type="button" class="settings-menu-item" data-panel="plugins">插件</button>
+          <button type="button" class="settings-menu-item" data-panel="env">启动配置</button>
           <button type="button" class="settings-menu-item" data-panel="about">关于</button>
         </nav>
         <div class="settings-panels">
@@ -222,6 +223,17 @@
             <h3 class="settings-section">插件</h3>
             <p class="text-muted settings-hint">本体只保留核心，扩展能力以插件挂载；插件的前端（入口/视图）随插件包分发，未加载插件的功能入口不出现（如日历/提醒）。</p>
             <div id="plugins-list" class="plugins-list"><p class="text-muted">加载中...</p></div>
+          </section>
+
+          <section class="settings-panel hidden" data-panel="env">
+            <h3 class="settings-section">启动配置（.env 暂存）</h3>
+            <p class="text-muted settings-hint">修改将暂存到本机配置文件，<strong>重启应用后生效</strong>；密钥走系统钥匙串（见下方），不写入文件。环境变量级配置优先于暂存值。</p>
+            <p class="text-muted settings-hint" id="env-file-path"></p>
+            <button id="env-save" class="settings-outline-btn" style="margin-top:6px">暂存更改</button>
+            <div id="env-items"></div>
+            <h3 class="settings-section" style="margin-top:18px">密钥（系统钥匙串）</h3>
+            <p class="text-muted settings-hint">写入后<strong>重启应用生效</strong>；密钥只存系统钥匙串，服务端不会回传明文。</p>
+            <div id="env-secrets"></div>
           </section>
 
           <section class="settings-panel hidden" data-panel="about">

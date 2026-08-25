@@ -8,6 +8,7 @@ from pydantic import Field, SecretStr
 from pydantic_settings import BaseSettings, PydanticBaseSettingsSource
 
 from briefdesk.secrets_store import KeyringSource
+from briefdesk.settings_env import PROJECT_ROOT, get_settings_file
 
 # 密钥解析链（keyring > 环境变量 > .env > 默认值），见 briefdesk/secrets_store.py
 _KEYRING_FIELDS = {"api_token": "WEFLOW_API_TOKEN"}
@@ -27,7 +28,7 @@ class WeFlowSettings(BaseSettings):
 
     model_config = {
         "env_prefix": "WEFLOW_",  # api_base → WEFLOW_API_BASE
-        "env_file": ".env",
+        "env_file": [PROJECT_ROOT / ".env", get_settings_file()],
         "env_file_encoding": "utf-8",
         # 同一 .env 里还有 app 级与其它源的字段，忽略未知项
         "extra": "ignore",
