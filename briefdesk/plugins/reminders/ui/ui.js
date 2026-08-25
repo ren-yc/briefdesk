@@ -1,4 +1,4 @@
-/* reminders 插件前端（P5）：提醒功能的完整前端随插件包分发。
+/* reminders 插件前端：提醒功能的完整前端随插件包分发。
  *
  * 核心只提供通用加载器与行内扩展钩子（app.js 的 registerItemRowExtension）：
  * - 本文件注入后自行构建卡片「提醒」按钮/菜单（挂到核心 renderItemRow 与

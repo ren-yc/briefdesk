@@ -1,27 +1,8 @@
 """语义去重引擎 — 多级候选预筛 → AI 判重。
 
-判定管线（按顺序）：
-1. image_urls 精确短路（P6-1）：图片路径集合完全一致的记录直接判重，零 AI；
-   **仅限 `_IMAGE_SHORTCUT_SOURCES` 内的源**（当前仅 weflow：该源图片消息
-   无混合文本，同图必同文；qqflow 存在图片+文字混合消息，同图可能不同文，
-   不得短路——查询与缓存条目双方都须为限定源才参与）；
-2. 原文哈希精确短路（合并 P6-2 原文短路 + P1-1 哈希短路）：source_quote
-   （原文）非空且非纯占位符时对其取 content_hash（sha256 前 16 位），与缓存
-   条目哈希一致的直接判重，零 AI——同一条原文被上游重复投递（msg_id 不同）
-   时，AI 概括的标题不稳定会令余弦/单候选判定失效，原文是确定性证据；
-   哈希等价于逐字节全等比较，但 O(1) 且不要求缓存条目常驻原文；
-3. 候选选取：嵌入余弦 Top-K（EMBED_API_BASE 配置后启用，以 fallback 阈值召回）
-   或字符重叠单候选（余弦零候选时兜底，阈值 config.dedup_similarity_threshold）；
-4. 门禁分级：normal（≥ DEDUP_EMBED_THRESHOLD）走 strong 短路/多数票；
-   weak（[fallback, threshold)）仅在无 normal 候选时全员判 SAME 才判重；
-5. 同文本短路（P0-1）：score ≥ DEDUP_STRONG_THRESHOLD 候选 AI 判 SAME 即直接
-   判重，判 DIFFERENT 只剔除该候选；
-6. 其余候选并行送 LLM 判定后取多数票（>K/2），消除单次 LLM 判定的随机噪声
-   （实验发现：串行「任一候选 same 即命中」会把噪声放大成误判——如
-   「位育摄影社招新 vs 南洋模范摄影社招新」这类相似但不同的信息）；
-7. 无候选路径打 WARNING 诊断（含 cosine/overlap top-1 差距），避免静默漏判。
-
-本模块是 dedup 阶段插件的引擎实现；DedupResult 契约类型定义在
+判定管线总览（image_urls 短路 → 原文哈希短路 → 余弦/重叠候选选取 → 门禁
+分级 → 同文本短路 → 加权多数票 → 无候选诊断）见 docs/architecture.md
+「核心模块」；每步的就地依据见对应方法内注释。DedupResult 契约类型定义在
 briefdesk/types.py。模块级单例与包装函数保留（实验脚本兼容，见文件尾）。
 """
 
@@ -243,9 +224,9 @@ class DedupEngine(DedupService):
         source: str = "",
         source_quote: str = "",
     ) -> None:
-        """同步内存追加（不再自行调嵌入 API）。
+        """同步内存追加（嵌入由调用方预计算，本方法不调嵌入 API）。
 
-        embedding 由调用方在锁外预计算后传入；非空且嵌入缓存就绪时
+        embedding 非空且嵌入缓存就绪时
         登记待落库向量，由 flush_pending_embeddings 批量持久化。
         未传入/嵌入失败时该条 embedding 为 None，不参与余弦候选
         （重启后由缓存加载补齐）。
@@ -448,7 +429,7 @@ class DedupEngine(DedupService):
         source_quote 参与原文哈希精确短路（非空且非纯占位符原文，哈希全等时生效）。"""
         await self.ensure_cache()
 
-        # ── 图片精确短路（P6-1）：同属限定源的 image_urls 集合完全一致 → 判重，零 AI ──
+        # ── 图片精确短路：同属限定源的 image_urls 集合完全一致 → 判重，零 AI ──
         # 同图重发（如同一海报在不同时刻再发一次）是确定性重复证据：图片消息原文
         # 为占位符（[图片] 等），原文哈希短路对其显式跳过、余弦可能擦边未召回、
         # 单候选 AI 判定不稳定，而图片路径（上游内容寻址）在重发场景逐字节一致。
@@ -473,7 +454,7 @@ class DedupEngine(DedupService):
                         candidate=self._snapshot(it),
                     )
 
-        # ── 原文哈希精确短路（合并 P6-2 原文短路 + P1-1 哈希短路）：仅对原文取哈希 ──
+        # ── 原文哈希精确短路：仅对原文取哈希 ──
         # 同一条原文被上游重复投递（msg_id 不同但内容相同，processed 按 msg_id
         # 去重拦不住）时，AI 概括的标题不稳定会让余弦擦边（非 99%+ 不进 strong）、
         # 单候选 AI 判定不稳定——原文（上游原文）是确定性重复证据。仅原文非空且
@@ -548,8 +529,8 @@ class DedupEngine(DedupService):
                 logger.info("缓存无嵌入向量，回退到字符重叠预过滤")
 
         if not candidates:
-            # ① 字符重叠兜底：余弦门禁拒绝（如玉言 cosine 0.75 < 0.80 但标题
-            # 逐字相同）或嵌入整体不可用时，取全局最高重叠单候选兜回
+            # ① 字符重叠兜底：余弦门禁拒绝（如余弦略低于阈值但标题逐字相同）
+            # 或嵌入整体不可用时，取全局最高重叠单候选兜回
             overlap_cand = self._best_overlap_candidate(title)
             if (
                 overlap_cand is not None
@@ -625,7 +606,7 @@ class DedupEngine(DedupService):
                 candidate=self._snapshot(candidates[0][0]),
             )
 
-        # 同文本短路（P0-1）：score ≥ dedup_strong_threshold 的候选几乎必然同文本
+        # 同文本短路：score ≥ dedup_strong_threshold 的候选几乎必然同文本
         # （同标题跨群重复），AI 判 SAME 即直接判重，不参与多数票——避免被其余
         # 高相似但不同话题的候选（如"羽毛球社招新" vs "篮球社招新" 80%）稀释成
         # 平票而漏判。候选按相似度降序，首个即最高分。
@@ -658,8 +639,9 @@ class DedupEngine(DedupService):
                 )
 
         # 并行判定全部候选，加权多数票（⑦）：票权 = 候选相似度，高相似候选的
-        # 判定更可信——SAME 权重和 > 总权重一半才命中，抑制低置信票的干扰；
-        # 等权时退化为原 >K/2 规则，单候选退化为一次判定（与原有行为一致）。
+        # 判定更可信——SAME 权重和 > 总权重一半才命中，抑制低置信票的干扰
+        # （实验：串行「任一候选 same 即命中」会把相似但不同信息的噪声放大成
+        # 误判）；等权时退化为原 >K/2 规则，单候选退化为一次判定。
         verdicts = await asyncio.gather(
             *[self._ask_ai(cand, title, source_quote) for cand, _ in candidates]
         )

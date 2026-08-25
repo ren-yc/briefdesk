@@ -1,4 +1,4 @@
-/* calendar 插件前端（P5）：日历视图的完整前端随插件包分发。
+/* calendar 插件前端：日历视图的完整前端随插件包分发。
  *
  * 核心只提供通用加载器与视图钩子（app.js 的 registerPluginView）：
  * - 本文件注入后自行创建日历按钮 / 视图容器 / 两个浮层（DOM 不入核心 index.html）；
@@ -376,7 +376,7 @@
     });
   }
 
-  // ── 核心视图钩子（P5）：hash 路由 / fetchData / Esc / 侧边栏数据联动 ──
+  // ── 核心视图钩子：hash 路由 / fetchData / Esc / 侧边栏数据联动 ──
   function registerViewHook() {
     registerPluginView({
       name: PLUGIN,

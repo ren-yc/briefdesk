@@ -1,4 +1,4 @@
-"""AI 供应商插件（P4 起）— 把 OpenAI 兼容 chat + 嵌入能力注册到核心端口。
+"""AI 供应商插件 — 把 OpenAI 兼容 chat + 嵌入能力注册到核心端口。
 
 setup 构造 Provider 并注册：ctx.ai（服务端口）与 briefdesk.ai_ports（引擎
 端口函数转发目标）；teardown 清除注册（幂等）。引擎模块（classify/dedup/

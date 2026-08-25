@@ -54,7 +54,7 @@ async def _poll_all(sources: list[SourceRuntime]) -> None:
 
 
 async def _refresh_all(sources: list[SourceRuntime]) -> None:
-    """并行刷新全部消息源会话；结果统一落库（源不再写库）。
+    """并行刷新全部消息源会话；结果统一落库（源不写库）。
 
     单个源刷新失败不影响其它源的会话结果落库。
     """

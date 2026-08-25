@@ -33,9 +33,8 @@ storage_lock = asyncio.Lock()
 
 logger = logging.getLogger(__name__)
 
-# 默认分类类别（名称, 描述, 颜色）。描述即各类别默认 prompt——曾逐字取自
-# 旧 classify.py SYSTEM_PROMPT，现已按「自包含」规范重写（见下）；
-# 颜色与旧 ui/style.css 中硬编码的类别色一致，保证视觉无变化。
+# 默认分类类别（名称, 描述, 颜色）。描述即各类别的默认 prompt；
+# 颜色与前端类别色板一致，保证视觉无变化。
 # 注意：描述为「自包含」写法——排除句只描述本类不收的消息特征，
 # 不得引用其它类别名（类别设定是动态的，其它类可能不在当前列表中）。
 DEFAULT_CATEGORIES: list[tuple[str, str, str]] = [

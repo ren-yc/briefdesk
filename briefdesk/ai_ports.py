@@ -1,11 +1,11 @@
-"""AI 供应商端口（P4 起）— ai_provider 插件在 setup 阶段注册实例，
+"""AI 供应商端口 — ai_provider 插件在 setup 阶段注册实例，
 引擎（classify/dedup/merge）经本模块端口函数调用，核心不依赖具体供应商实现。
 
 - chat / embed_texts / is_embedding_enabled / embed_model_name：转发到
   已注册的 AIProvider 实例（未注册时 chat/embed 抛 RuntimeError 明示
   配置错误，启用性检查安全返回 False）；
 - loads_json / top_k_similar：供应商无关的纯工具（JSON 修复解析、
-  余弦 Top-K 候选选择），原属 ai/client.py 与 ai/embed.py，随 P4 收归核心。
+  余弦 Top-K 候选选择）。
 
 模块级单例（与 stages/realtime 同风格）；测试用 set_ai(None) 复位。
 """

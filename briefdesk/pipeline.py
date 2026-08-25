@@ -1,8 +1,8 @@
-"""消息处理管道骨架 — 入口过滤/落库 + 阶段链编排（P3 起）。
+"""消息处理管道骨架 — 入口过滤/落库 + 阶段链编排。
 
 具体阶段（OCR 增强 / AI 分类 / 语义去重 / 同话题合并）由 StagePlugin
 实现，经 PluginContext.register_stage 注册到 briefdesk.stages；本模块只做
-编排，不再 import 任何具体 AI/OCR 实现：
+编排，不 import 任何具体 AI/OCR 实现：
 
   盖章 → 过滤（自消息/启用会话/纯占位符图片（OCR 未启用）/已处理）→ raw 落库 → 切批
   → 并行：enrich + classify（锁外）
@@ -113,7 +113,7 @@ async def process_all_batches(
     for m in messages:
         m.source = source
 
-    # ── 入口统一过滤 + raw 落库（替代源内实现；源不再触碰 DB）──
+    # ── 入口统一过滤 + raw 落库（替代源内实现；源不触碰 DB）──
     # 顺序：自己发送（IGNORE_SELF）→ 纯占位符图片（OCR 未启用）→ 启用会话
     # → 已处理 → raw 批量落库，均无锁。空启用集 → 全滤（保持原监听器语义）；
     # INSERT OR IGNORE 幂等。

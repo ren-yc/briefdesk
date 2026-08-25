@@ -1,12 +1,7 @@
 """PluginManager — 插件发现（entry points + PLUGIN_PATH）、装配与生命周期编排。
 
-装配顺序与 main 的启动顺序约束对齐（P1 先落地语义，P2 起接入 main）：
-- setup：DB 就绪后、HTTP 服务启动前（去重缓存预热等重活放这里）；
-- activate：HTTP 服务就绪后（注册路由、启动消息源监听等副作用放这里）；
-- teardown：按 setup 成功顺序逆序执行（幂等）。
-
-故障隔离：单插件 setup/activate 失败 → 该插件 failed + 日志，其余照常；
-名字在 PLUGINS_REQUIRED 的插件失败 → 抛 PluginError（致命，启动中止）。
+setup/activate/teardown 的顺序约束（对齐 main 启动顺序）、PLUGINS 过滤
+规则与失败隔离语义详见 docs/architecture.md「插件框架」。
 """
 
 import importlib.metadata

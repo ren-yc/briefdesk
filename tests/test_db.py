@@ -1395,7 +1395,7 @@ class BackupRestoreTest(unittest.IsolatedAsyncioTestCase):
 
 
 class RestoreEmptyDbRejectedTest(unittest.IsolatedAsyncioTestCase):
-    """P0-2：空库（无应用表）不可通过恢复校验，防空库覆盖正式数据。"""
+    """空库（无应用表）不可通过恢复校验，防止空库覆盖正式数据。"""
 
     async def test_empty_db_rejected(self):
         with tempfile.NamedTemporaryFile(suffix=".sqlite", delete=False) as f:
@@ -1454,7 +1454,7 @@ class GetItemTextsTest(unittest.IsolatedAsyncioTestCase):
 
 
 class MergeVectorCleanupTest(unittest.IsolatedAsyncioTestCase):
-    """P1-4：合并回写（update_item_merged）后旧向量被删除，防重启语义漂移。"""
+    """合并回写（update_item_merged）后旧向量被删除，防重启语义漂移。"""
 
     async def asyncSetUp(self):
         # 主连接与 embed 连接需共享同一数据库（:memory: 每连接独立，删除不可见）

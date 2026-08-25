@@ -1,24 +1,10 @@
-"""插件抽象层 — Plugin 最小契约、PluginContext 与加载约定。
+"""插件抽象层 — Plugin 最小契约、PluginContext 与各能力协议。
 
-依赖方向（由 tests/test_no_core_imports_plugins.py 强制）：
-- 实现层（briefdesk/plugins/*，P2 起）可 import 核心与 briefdesk/plugin/*；
-- 核心与 briefdesk/plugin/* 永不静态 import briefdesk.plugins.*
-  （manager 只经 entry points / PLUGIN_PATH 动态发现）。
-
-加载约定（entry point 组名 PLUGIN_GROUP = "briefdesk.plugins"）：
-- 打包插件：发行包声明 [project.entry-points."briefdesk.plugins"]，
-  值指向模块（模块暴露 `plugin` 实例）或直接指向实例；
-- 开发期插件：PLUGIN_PATH 目录下每个 *.py 文件暴露 `plugin` 实例。
-
-生命周期（PluginManager 编排，顺序固定）：
-- setup(ctx)：HTTP 服务启动前（DB 就绪后）——读配置、预热资源、订阅事件；
-- activate(ctx)：服务器就绪后——注册路由/消息源、启动副作用；
-- teardown()：按 setup 逆序执行（幂等）。
-
-能力协议（SourcePlugin / StagePlugin / AIProviderPlugin / WebPlugin）
-随 P2–P5 各阶段在本模块追加；当前已落 Plugin 最小契约、
-SourcePlugin（P2，消息源插件）、StagePlugin / DedupService（P3，管道阶段）、
-AIProvider（P4，AI 供应商）与 WebPlugin（P5，Web 扩展）。
+依赖方向（由 tests/test_no_core_imports_plugins.py 强制）：实现层
+briefdesk/plugins/* 可 import 核心与 briefdesk/plugin/*；核心与
+briefdesk/plugin/* 永不静态 import briefdesk.plugins.*。
+发现/加载约定、装配生命周期与各能力协议的完整约定见
+docs/architecture.md「插件框架」。
 **实现方式约定：内置插件类显式继承对应能力协议**（mypy 据此强制
 实现完整性），第三方插件亦可鸭子实现（manager 只做结构校验）。
 """
@@ -64,7 +50,7 @@ class Plugin(Protocol):
 
 
 class SourcePlugin(Plugin, Protocol):
-    """消息源插件能力协议（P2 起）；实现类显式继承本协议。
+    """消息源插件能力协议；实现类显式继承本协议。
 
     setup 阶段构造 SourceRuntime 并经 ctx.register_source 注册；
     teardown 负责关闭该 runtime（幂等）。activate 通常无副作用：
@@ -73,7 +59,7 @@ class SourcePlugin(Plugin, Protocol):
 
 
 class StagePlugin(Plugin, Protocol):
-    """管道阶段插件能力协议（P3 起）：单槽位、可多实例（同槽按 priority 升序）；
+    """管道阶段插件能力协议：单槽位、可多实例（同槽按 priority 升序）；
     实现类显式继承本协议。
 
     run(batch, ctx) 由 pipeline 骨架在对应槽位调用；dedup 阶段额外实现
@@ -88,7 +74,7 @@ class StagePlugin(Plugin, Protocol):
 
 
 class DedupService(Protocol):
-    """去重服务端口（P3 起）；引擎类显式实现本协议。
+    """去重服务端口；引擎类显式实现本协议。
 
     dedup 插件在 setup 阶段把 DedupEngine 注册到 ctx.dedup；pipeline 骨架
     不直接使用，merge 阶段与事件清理经此端口同步去重缓存，核心不依赖
@@ -141,7 +127,7 @@ class ChatResponse(Protocol):
 
 
 class AIProvider(Protocol):
-    """AI 供应商能力端口（P4 起）；ai_provider 插件 setup 注册到 ctx.ai。
+    """AI 供应商能力端口；ai_provider 插件 setup 注册到 ctx.ai。
 
     chat 返回供应商响应对象（须满足 ChatResponse 形状）；嵌入能力由
     is_embedding_enabled 门控（EMBED_API_BASE 留空禁用）。
@@ -164,7 +150,7 @@ def _noop_register(*args: Any, **kwargs: Any) -> None:
 
 
 class WebPlugin(Plugin, Protocol):
-    """Web 扩展插件能力协议（P5 起）；实现类显式继承本协议。
+    """Web 扩展插件能力协议；实现类显式继承本协议。
 
     router()：返回挂载到应用根路径的 APIRouter（路径前缀由插件自定，
     如 /api/calendar）；setup 阶段经 ctx.register_router 注册。
@@ -180,10 +166,10 @@ class WebPlugin(Plugin, Protocol):
 class PluginContext:
     """核心注入给插件的服务端口（插件不得 import 核心内部实现）。
 
-    P2 起含 register_source（源插件注册 SourceRuntime）；P3 起含
-    register_stage（阶段插件注册）与 dedup（去重服务端口）；P4 起含
-    ai（AI 供应商端口）；P5 起含 register_router / register_plugin_assets
-    （Web 插件注册路由与静态资源，未注入时静默丢弃）。
+    端口一览：register_source（源插件注册 SourceRuntime）、register_stage
+    （阶段插件注册）、dedup（去重服务端口）、ai（AI 供应商端口）、
+    register_router / register_plugin_assets（Web 插件注册路由与静态资源；
+    可选端口默认 noop，未注入时静默丢弃）。
     """
 
     config: Settings
@@ -192,6 +178,6 @@ class PluginContext:
     register_source: Callable[[SourceRuntime], None]
     register_stage: Callable[[StagePlugin], None]
     dedup: DedupService | None = None
-    ai: AIProvider | None = None  # P4 起：AI 供应商（ai_provider 插件 setup 赋值）
+    ai: AIProvider | None = None  # AI 供应商（ai_provider 插件 setup 赋值）
     register_router: Callable[[APIRouter], None] = _noop_register
     register_plugin_assets: Callable[[str, str], None] = _noop_register

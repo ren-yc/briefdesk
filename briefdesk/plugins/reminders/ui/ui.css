@@ -1,4 +1,4 @@
-/* reminders 插件前端样式（P5）：提醒菜单样式随插件包分发，经
+/* reminders 插件前端样式：提醒菜单样式随插件包分发，经
  * /plugin-assets/reminders/ui.css 由核心加载器注入。依赖核心 style.css 的
  * CSS 变量（--surface/--border/--text 等）与行内按钮基础样式。 */
 

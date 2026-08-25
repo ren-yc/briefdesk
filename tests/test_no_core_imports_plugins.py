@@ -1,9 +1,8 @@
 """依赖方向守卫：核心不得静态 import 插件实现（briefdesk.plugins.*）。
 
-插件实现层（briefdesk/plugins/*，P2 起）可自由依赖核心与 briefdesk/plugin/*；
-反之则禁止，否则「本体只保留最核心功能」的边界会被悄悄打破。
-briefdesk/plugins/ 目录 P2 才出现，本守卫从 P1 起就生效：
-核心侧任何模块 import briefdesk.plugins.* 即失败。
+插件实现层（briefdesk/plugins/*）可自由依赖核心与 briefdesk/plugin/*；
+反之则禁止，否则「本体只保留最核心功能」的边界会被悄悄打破：
+核心侧任何模块静态 import briefdesk.plugins.* 即失败。
 """
 
 import ast

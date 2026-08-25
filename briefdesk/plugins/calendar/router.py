@@ -1,4 +1,4 @@
-"""日历视图路由（calendar WebPlugin，P5 起从核心 server 迁出）。"""
+"""日历视图路由（calendar WebPlugin）。"""
 
 import re
 from datetime import datetime, timedelta

@@ -1,4 +1,4 @@
-"""日历 Web 插件（P5 起）— 日历视图路由从核心 server 迁出。"""
+"""日历 Web 插件 — 提供 /api/calendar 视图路由与前端资源。"""
 
 from briefdesk.plugins.calendar.plugin import CalendarPlugin, plugin
 

@@ -14,7 +14,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 class Settings(BaseSettings):
     plugins: list[str] = Field(default=["*"], alias="PLUGINS")
     """启用的插件名列表（JSON 数组；"*" = 全部发现的插件）。
-    消息源启用的唯一开关：weflow/qqflow 等源插件由本开关控制（不再使用 SOURCES）。"""
+    消息源启用的唯一开关：weflow/qqflow 等源插件由本开关控制。"""
 
     plugins_disabled: list[str] = Field(default=[], alias="PLUGINS_DISABLED")
     """明确禁用的插件名列表（JSON 数组），优先于 PLUGINS。"""
@@ -87,8 +87,8 @@ class Settings(BaseSettings):
         default=0.65, alias="DEDUP_EMBED_FALLBACK_THRESHOLD", ge=0, le=1
     )
     """低置信复核阈值：余弦候选相似度落在 [fallback, DEDUP_EMBED_THRESHOLD)
-    区间且无正常候选时，全员判 SAME 才判重（弱候选复核通道）——修复中段
-    相似度真实重复被门禁静默丢弃（如玉言事故 cosine 0.75 < 0.80）。"""
+    区间且无正常候选时，全员判 SAME 才判重（弱候选复核通道）——覆盖中段
+    相似度、低于门禁但确实重复的情形。"""
 
     merge_window_minutes: int = Field(default=10, alias="MERGE_WINDOW_MINUTES", ge=0)
     """会话内同话题片段合并（同一话题多条消息→一张卡）：窗口内、同会话同类别

@@ -3933,7 +3933,7 @@ async function undoVerify(u) {
   }
 }
 
-// ── 插件视图钩子（P5）：核心视图路由的可扩展点 ──
+// ── 插件视图钩子：核心视图路由的可扩展点 ──
 // 插件（如 calendar）注册视图后，核心的 hash 路由 / fetchData / Esc / 侧边栏
 // 数据联动自动委派；视图前端（DOM/样式/交互）全部由插件包提供（ui/ui.js）。
 // 视图对象约定：
@@ -3964,7 +3964,7 @@ function consumePluginRefresh() {
   return false;
 }
 
-// ── 插件行内扩展（P5）：卡片行动作区按钮由插件注册 ──
+// ── 插件行内扩展：卡片行动作区按钮由插件注册 ──
 // 插件（如 reminders）注册后，renderItemRow / renderCard 会在动作区末尾渲染
 // 其按钮（renderButton）与行末菜单（renderMenu），handleRowAction 先委派插件
 // 处理（handle 返回 true = 已消费），文档级点击关闭行内菜单时一并通知
@@ -4070,7 +4070,7 @@ function initViewFromHash() {
   syncHash("replace");
 }
 
-// ── 相对时间（前端计算，P5 起后端不再附加）──
+// ── 相对时间（前端计算）──
 function relativeTimeStr(pastTs, nowTs) {
   const diff = Math.floor(nowTs - pastTs);
   if (diff < 60) return "刚刚";

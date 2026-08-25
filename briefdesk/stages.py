@@ -1,4 +1,4 @@
-"""管道阶段注册表与装配期上下文（P3 起）。
+"""管道阶段注册表与装配期上下文。
 
 StagePlugin 经 PluginContext.register_stage 注册（main 把端口接到本模块），
 pipeline 骨架运行时按槽位读取；装配期 PluginContext 由 main 在 setup_all

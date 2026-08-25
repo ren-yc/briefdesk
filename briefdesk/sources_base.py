@@ -1,4 +1,4 @@
-"""消息源抽象（核心契约模块，P2 起无 sources 包）— 客户端能力契约、监听器契约与已装配源单元。
+"""消息源抽象（核心契约模块）— 客户端能力契约、监听器契约与已装配源单元。
 
 `SourceClient` 是 pipeline / server 依赖的最小客户端契约：新消息源
 实现本协议（name、connection_status、download_media、close）即可被

@@ -150,11 +150,11 @@ class EmbeddingTextTest(unittest.TestCase):
 
 
 class CheckDedupShortCircuitTest(unittest.IsolatedAsyncioTestCase):
-    """check_dedup 短路回归：同文本短路（P0-1）与原文哈希精确短路（合并 P1-1/P6-2）。
+    """check_dedup 短路回归：同文本短路与原文哈希精确短路。
 
-    事故背景：同标题（余弦 100%）的 SAME 票被高相似但不同话题的干扰候选
+    回归背景：同标题（余弦 100%）的 SAME 票被高相似但不同话题的干扰候选
     （如"篮球社招新" vs "羽毛球社招新" 80%）稀释，多数票（>K/2）不达标
-    导致真重复漏判入库。修复 = 两重短路：原文哈希精确命中零 AI 判定；
+    导致真重复漏判入库。对策 = 两重短路：原文哈希精确命中零 AI 判定；
     score ≥ dedup_strong_threshold（0.99）候选 AI 判 SAME 即直接判重。
     """
 
@@ -272,8 +272,8 @@ class CheckDedupShortCircuitTest(unittest.IsolatedAsyncioTestCase):
         merge_mock.assert_not_awaited()
 
     async def test_strong_same_short_circuits_majority(self):
-        """P0-1 事故回归：同标题 100% SAME + 干扰 80% DIFFERENT。
-        修复前多数票 1/2 漏判；修复后 strong 短路直接判重。"""
+        """回归：同标题 100% SAME + 干扰 80% DIFFERENT。
+        多数票 1/2 会漏判；strong 短路应直接判重。"""
         engine = self._engine(
             [
                 ("a1", "篮球社招新", "内容甲"),
@@ -381,9 +381,9 @@ class ParseImagesTest(unittest.TestCase):
 
 
 class ImageUrlShortCircuitTest(unittest.IsolatedAsyncioTestCase):
-    """图片精确短路（P6-1）：限定源内 image_urls 集合完全一致 → 零 AI 直接判重。
+    """图片精确短路：限定源内 image_urls 集合完全一致 → 零 AI 直接判重。
 
-    事故背景：同一张海报图片重发（OCR 原文逐字相同、image_urls 完全一致），
+    回归背景：同一张海报图片重发（OCR 原文逐字相同、image_urls 完全一致），
     分类 AI 对两次处理产出不同标题（"模政社团招新" vs "模拟政协招新"）→
     content_hash 失效、余弦 0.65 擦边未召回、单候选 AI 判定恰好判错 →
     重复卡入库。图片路径（上游内容寻址）在重发场景是确定性证据，直接短路。
@@ -608,7 +608,7 @@ class DedupTieredCandidateTest(unittest.IsolatedAsyncioTestCase):
     """门禁分级与兜底回归：弱候选低置信复核（②）、重叠兜底（①）、
     strong 剔除收窄（④）与无候选诊断（⑥）。
 
-    事故背景：玉言辩论社两条招新消息 bge-m3 余弦 0.7528 < 0.80 门禁，
+    回归背景：两条同题招新消息嵌入余弦 0.7528 < 0.80 门禁，
     唯一真实候选被预筛静默丢弃 → 重复卡入库且无任何日志。
     """
 
@@ -652,7 +652,7 @@ class DedupTieredCandidateTest(unittest.IsolatedAsyncioTestCase):
         return fake_chat
 
     async def test_weak_candidate_unanimous_same_hits(self):
-        """玉言场景（②）：余弦 0.75（weak 区间 [0.65, 0.80)）全员判 SAME → 判重合并。"""
+        """weak 区间场景（②）：余弦 0.75（[0.65, 0.80)）全员判 SAME → 判重合并。"""
         engine = self._engine([("w1", "玉言辩论社招新", "位育玉言辩论社招新啦")])
         with (
             patch(
@@ -729,7 +729,7 @@ class DedupTieredCandidateTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(chat_mock.await_count, 2)  # 仅 normal 候选被判定
 
     async def test_overlap_fallback_after_cosine_zero_hits(self):
-        """玉言场景（①）：余弦零候选（全部 < 0.65）→ 重叠兜底：标题逐字相同
+        """重叠兜底场景（①）：余弦零候选（全部 < 0.65）→ 标题逐字相同
         overlap 1.0 → strong 短路（≥0.99）→ AI 判 SAME → 判重。"""
         engine = self._engine([("o1", "玉言辩论社招新", "位育玉言辩论社招新啦")])
         with (
@@ -963,11 +963,11 @@ class WeightedMajorityTest(unittest.IsolatedAsyncioTestCase):
 
 
 class QuoteShortcutTest(unittest.IsolatedAsyncioTestCase):
-    """原文哈希精确短路（合并 P6-2 原文短路 + P1-1 哈希短路）。
+    """原文哈希精确短路（原文逐字节等价与哈希等价两类判定合一）。
 
-    事故背景：同一条原文被上游重复投递（msg_id 不同但内容逐字节相同）时，
+    回归背景：同一条原文被上游重复投递（msg_id 不同但内容逐字节相同）时，
     AI 概括的标题不稳定令余弦擦边（非 99%+）、单候选 AI 判定误判 DIFFERENT
-    → 重复卡入库。修复 = 原文（source_quote）哈希全等直接判重，零 AI；
+    → 重复卡入库。对策 = 原文（source_quote）哈希全等直接判重，零 AI；
     纯占位符原文（[图片] 等）不参与（交给 image_urls 源限定短路），防
     同文异图误判。
     """

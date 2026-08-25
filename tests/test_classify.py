@@ -110,7 +110,7 @@ class ParseResponseTest(unittest.TestCase):
         self.assertEqual(times, [])
 
     def test_non_string_category_kept_for_retry(self):
-        # P1-5：AI 幻觉把 category 输出为 dict/list 等不可哈希类型时，
+        # AI 幻觉把 category 输出为 dict/list 等不可哈希类型时，
         # 不能抛 TypeError 拖垮整批——按未知类别同路径保留待重试
         results, retry, times = _parse_response(
             '{"task":"classify","data":[{"index":0,"category":{"name":"活动通知"}},'
@@ -123,8 +123,8 @@ class ParseResponseTest(unittest.TestCase):
         self.assertEqual(times, [])
 
     def test_subject_never_read_from_classify(self):
-        # P1-6：subject 已平移到 summarize 阶段，classify 响应即使带 subject
-        # 字段也忽略（单一来源），避免 summarize 失败时残留旧值入库
+        # subject 由 summarize 阶段提取（单一来源）：classify 响应即使带
+        # subject 字段也忽略，避免 summarize 失败时残留旧值入库
         results, _retry, _times = _parse_response(
             '{"task":"classify","data":[{"index":0,"category":"活动通知","subject":"编程社"}]}',
             self.ALLOWED,

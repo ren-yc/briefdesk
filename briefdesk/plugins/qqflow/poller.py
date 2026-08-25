@@ -51,7 +51,7 @@ async def poll(
 
         Args:
             client: QqFlowClient 实例
-            enabled_sessions: 应用层传入的已启用会话列表（源不再访问 DB）
+            enabled_sessions: 应用层传入的已启用会话列表（源不访问 DB）
             is_processed: 应用层提供的已处理查询，用于剔除已处理消息
             window_start_by_session: 应用层按会话计算的增量窗口下界
                 （session_id → 秒级时间戳，含边界）；值为 None 的会话按

@@ -1,7 +1,7 @@
 """同步服务 — 触发一次全源轮询同步（fire-and-forget）。
 
-从 server.py 独立出来：main 启动与 /api/sync 路由共用本服务，
-server 只保留路由调用，不再兼任应用编排。
+main 启动与 /api/sync 路由共用本服务：server 只保留路由调用，
+应用编排收在本模块。
 """
 
 import asyncio

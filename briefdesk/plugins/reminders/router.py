@@ -1,4 +1,4 @@
-"""提醒路由（reminders WebPlugin，P5 起从核心 server 迁出）。"""
+"""提醒路由（reminders WebPlugin）。"""
 
 import re
 import time

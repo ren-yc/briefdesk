@@ -273,8 +273,8 @@ def normalize_rest(
 ) -> list[InternalMessage]:
     """REST 消息 → InternalMessage 列表（普通消息 1 条，文章卡片拆条）。
 
-    文章卡片解析失败（无 title）时返回空列表（维持旧版丢弃语义：
-    REST 路径下 localType≠1 的非常规消息不进入管道）。
+    文章卡片解析失败（无 title）时返回空列表：REST 路径下 localType≠1
+    的非常规消息不进入管道（丢弃语义）。
     """
     wxid = msg.get("senderUsername") or ""
     # IGNORE_SELF 判定：微信 DB 的 isSend 原义 0=收到 / 1=自己发送

@@ -1,4 +1,4 @@
-"""跨模块共享的基础类型（含管道跨插件契约，P3 起）。"""
+"""跨模块共享的基础类型（含管道跨插件契约）。"""
 
 from __future__ import annotations
 
@@ -97,7 +97,7 @@ class PollResult:
     session_count: int = 0
 
 
-# ── 管道跨插件契约（P3 起：由各阶段插件实现/消费，定义在核心）──
+# ── 管道跨插件契约（由各阶段插件实现/消费，定义在核心）──
 
 
 @dataclass
@@ -226,7 +226,7 @@ class MergeCheck:
 
 @dataclass
 class BatchContext:
-    """单批消息在管道阶段链间的共享状态（P3 起）。
+    """单批消息在管道阶段链间的共享状态。
 
     messages 可被 enrich 阶段改写（如 OCR 替换 content）；client 供
     enrich 阶段下载媒体；outcomes/rows/inserted 由各阶段按序填充。

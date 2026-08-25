@@ -1,4 +1,4 @@
-"""日历 Web 插件（P5 起）— 提供 /api/calendar 视图路由与前端资源。
+"""日历 Web 插件 — 提供 /api/calendar 视图路由与前端资源。
 
 前端资源（ui/ui.js，经 /plugin-assets/calendar/ui.js 提供）由核心前端
 加载器动态注入：日历入口（#calendar-btn）的可见性由插件自己控制。

@@ -1,4 +1,4 @@
-"""pipeline 骨架与阶段插件测试（P3 起）：不触发真实 AI，DB 用内存库/桩。"""
+"""pipeline 骨架与阶段插件测试：不触发真实 AI，DB 用内存库/桩。"""
 
 import unittest
 from types import SimpleNamespace
@@ -389,7 +389,7 @@ class MissingStageGuardTest(_StageTestBase):
 
 
 class ProcessAllBatchesReturnTest(_StageTestBase):
-    """P0-1：process_all_batches 返回标志——早退（未落 raw）返回 False，
+    """process_all_batches 返回标志——早退（未落 raw）返回 False，
     调用方（poll_cycle）据此跳过水位推进，防消息永久丢失。"""
 
     async def _run(self, categories, install_stages=None):

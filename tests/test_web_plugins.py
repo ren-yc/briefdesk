@@ -1,4 +1,4 @@
-"""Web 插件扩展测试（P5）：/api/plugins 元数据、plugin-assets 静态资源、WebPlugin 装配。"""
+"""Web 插件扩展测试：/api/plugins 元数据、plugin-assets 静态资源、WebPlugin 装配。"""
 
 import tempfile
 import unittest
@@ -135,7 +135,7 @@ class WebPluginSetupTest(unittest.IsolatedAsyncioTestCase):
 
 
 class CalendarAssetsTest(unittest.TestCase):
-    """日历插件前端资源经 /plugin-assets/calendar/ 由核心提供（P5）。"""
+    """日历插件前端资源经 /plugin-assets/calendar/ 由核心提供。"""
 
     def test_calendar_ui_js_served(self):
         cal = CalendarPlugin()
@@ -168,7 +168,7 @@ class CalendarAssetsTest(unittest.TestCase):
 
 
 class RemindersAssetsTest(unittest.TestCase):
-    """提醒插件前端资源经 /plugin-assets/reminders/ 由核心提供（P5）。"""
+    """提醒插件前端资源经 /plugin-assets/reminders/ 由核心提供。"""
 
     def test_reminders_ui_js_served(self):
         rem = RemindersPlugin()
@@ -201,7 +201,7 @@ class RemindersAssetsTest(unittest.TestCase):
 
 
 class CoreFrontendBoundaryTest(unittest.TestCase):
-    """前端边界守卫（P5）：插件前端全部随插件包分发，核心 ui/ 不再残留。"""
+    """前端边界守卫：插件前端全部随插件包分发，核心 ui/ 零插件残留。"""
 
     CORE_FILES: ClassVar[dict[str, list[str]]] = {
         "index.html": [

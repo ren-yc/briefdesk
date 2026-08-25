@@ -1,19 +1,7 @@
 # ruff: noqa: I001 — 子模块导入顺序即组装顺序（web_plugins 必须先于 static 的 SPA mount）
-"""FastAPI HTTP 服务子包（P5 起由单文件拆分为按职责分组的模块）。
-
-`briefdesk/server/`：
-- `app.py`              FastAPI 应用实例（子模块共享，避免循环导入）
-- `middleware.py`       本地访问守卫（Host 白名单 + 同源校验 + CSP 头）
-- `web_plugins.py`      Web 插件注入点（/api/plugins、/plugin-assets、include_plugin_router）
-- `routes_items.py`     核心数据路由（items/verify/sessions/sync/context/status/stream…）
-- `routes_categories.py` 类别管理路由
-- `media.py`            媒体代理（/api/media）
-- `static.py`           SPA 静态托管（含 / 与兜底 mount）
-- `callbacks.py`        共享回调注册（会话刷新）
-
-组装顺序：创建 app → 依次导入子模块（装饰器在导入时绑定路由/中间件/
-静态 mount）→ re-export 公共符号；`import briefdesk.server as srv` 的既有
-用法（main/tests）保持不变。
+"""FastAPI HTTP 服务子包。组装顺序即下方导入顺序；子模块清单与完整路由见
+docs/architecture.md「核心模块」。`import briefdesk.server as srv` 的既有
+用法（main/tests）经 re-export 保持不变。
 """
 
 from briefdesk.server.app import app as app

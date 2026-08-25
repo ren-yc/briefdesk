@@ -1,8 +1,8 @@
-"""日历视图数据访问（calendar WebPlugin 专属，P5 起随插件包分发）。
+"""日历视图数据访问（calendar WebPlugin 专属）。
 
 日历查询同时覆盖 extra_times（主字段命中 OR extra_times 非空取回后按区间
 过滤）；extra_times 是 JSON 文本无法走索引，本地库规模下按「非空」取回后
-内存过滤可接受。核心 db.py 不再含任何日历专属查询。
+内存过滤可接受。核心 db.py 不含日历专属查询。
 """
 
 import json

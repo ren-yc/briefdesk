@@ -387,7 +387,7 @@ class SessionWindowComputationTest(unittest.IsolatedAsyncioTestCase):
 
 
 class PollCycleWatermarkTest(unittest.IsolatedAsyncioTestCase):
-    """P0-1：run_poll_cycle 仅在管道正常完成时推进会话水位；
+    """run_poll_cycle 仅在管道正常完成时推进会话水位；
     管道早退（无启用类别/阶段缺失）时跳过推进，防消息永久丢失。"""
 
     def _source(self) -> Mock:

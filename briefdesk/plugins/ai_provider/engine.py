@@ -1,8 +1,8 @@
 """OpenAI 兼容 AI 供应商引擎 — chat（共享客户端 / thinking 与 JSON 开关 / 并发预算）与嵌入。
 
-P4 起由 ai_provider 插件持有本引擎；引擎模块（classify/dedup/merge）不再
-直接 import 本模块，统一经 core 的 briefdesk.ai_ports 端口函数调用。
-loads_json / top_k_similar 为供应商无关工具，已收归 briefdesk.ai_ports，
+由 ai_provider 插件持有本引擎；引擎模块（classify/dedup/merge）不直接
+import 本模块，统一经 core 的 briefdesk.ai_ports 端口函数调用。
+loads_json / top_k_similar 为供应商无关工具，定义收归 briefdesk.ai_ports，
 此处 re-export 供实验脚本与测试路径兼容。
 """
 

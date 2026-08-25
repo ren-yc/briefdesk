@@ -271,13 +271,12 @@ def _slice_json_root(text: str) -> str:
 def _parse_response(
     content: str, allowed: set[str], count: int
 ) -> tuple[list[ClassifyResult], list[int], list[int]]:
-    """解析 AI 分类 JSON（sysb 紧凑格式，P1 起支持显式 include 判定）。
+    """解析 AI 分类 JSON（sysb 紧凑格式，支持显式 include 判定）。
 
     返回 `(results, retry_indexes, time_indexes)`：
     - results：include=true 且类别合法的分类结果（include=false 的行直接跳过，
       不产生 result、不校验 category——排除行的 category 可能为空/脏值，
-      校验会误报未知类别拖累整批；该条由调用方按"未选中"路径标记 processed，
-      与旧版"AI 不输出即排除"语义一致）；
+      校验会误报未知类别拖累整批；该条由调用方按"未选中"路径标记 processed）；
     - retry_indexes：include=true 但类别未知的消息 index，调用方应将这些消息
       保留待下轮重试，但不阻塞同批次其它正常消息入库；
     - time_indexes：include=true 且分类标记 time=true 的消息 index（含明确时间），
@@ -413,7 +412,7 @@ def _build_summary_user_message(
 ) -> str:
     """构建概括 user 消息：每条一行，含 index/类别/内容（截断）。
 
-    subject 由本阶段从内容中提取，不再依赖 classify 输出（分类只筛与归类）。
+    subject 由本阶段从内容中提取，不依赖 classify 输出（分类只筛与归类）。
     """
     parts: list[str] = []
     for r in results:

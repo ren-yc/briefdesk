@@ -4,7 +4,7 @@
 - 文件数据集（CLI / 示例）：schema.load_dataset_file + parse_cases；
 - 网页导出用例（Web）：cases/<feature>.fromweb.json，load_web_cases 加载。
 
-执行与旧版 runner 完全同路径：classify_batch / DedupEngine.check_dedup /
+执行与生产同引擎路径：classify_batch / DedupEngine.check_dedup /
 judge_merge / summarize_title，经 briefdesk.ai_ports 端口调用真实供应商；
 运行环境见 providers.bench_environment（补丁式临时库，不动应用连接）。
 """
@@ -261,7 +261,7 @@ async def run_benchmark_cases(
     dataset_label 标识用例来源（Web 运行为 cases/*.fromweb.json；
     CLI 传各数据集文件路径），写入报告供溯源。
     progress（可选）：每条用例 settle 后回调一次（成功/失败都算），
-    CLI 据此输出评估进度；不传时行为与旧版完全一致。
+    CLI 据此输出评估进度；缺省无进度输出。
     """
     started = time.monotonic()
     async with bench_environment(categories=category_defs):
