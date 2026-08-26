@@ -162,6 +162,13 @@ async def embed_texts(texts: list[str]) -> list[list[float]]:
                 resp = await _create(chunk)
         # 按 index 排序保证与输入同序（防御性）
         ordered = sorted(resp.data, key=lambda d: d.index)
+        if len(ordered) != len(chunk):
+            # 数量不符即整批失败（调用方 preembed_batch 已有整批回退路径）：
+            # 少返时后续文本向量整体错位，错位一旦 upsert 进 item_embeddings
+            # （按 item_id 持久化）将永久污染余弦通道且重启不自愈
+            raise ValueError(
+                f"嵌入返回数量不符：请求 {len(chunk)} 条，实际 {len(ordered)} 条"
+            )
         results.extend(d.embedding for d in ordered)
     return results
 

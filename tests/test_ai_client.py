@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, patch
 from pydantic import SecretStr
 
 from briefdesk.config import config
-from briefdesk.plugins.ai_provider.engine import chat
+from briefdesk.plugins.ai_provider.engine import chat, embed_texts
 
 
 def _fake_client():
@@ -105,6 +105,47 @@ class ChatJsonObjectTest(unittest.IsolatedAsyncioTestCase):
             api_key="deepseek", model="qwen3.5", disable_thinking=False
         )
         self.assertNotIn("response_format", kwargs)
+
+
+class EmbedBatchCountTest(unittest.IsolatedAsyncioTestCase):
+    """P2 修复：embed_texts 每 chunk 校验返回向量数量——供应商少返即抛错，
+    绝不产生错位结果（错位向量会持久化进 item_embeddings，永久污染余弦通道）。"""
+
+    def _client(self, data):
+        create = AsyncMock(return_value=SimpleNamespace(data=data))
+        client = SimpleNamespace(embeddings=SimpleNamespace(create=create))
+        return client, create
+
+    def _patches(self, client):
+        return (
+            patch(
+                "briefdesk.plugins.ai_provider.engine.get_embed_client",
+                return_value=client,
+            ),
+            patch.object(config, "embed_batch_size", 10),
+            patch.object(config, "ai_max_concurrency", 0),
+        )
+
+    async def test_short_return_raises_value_error(self):
+        # 请求 2 条实返 1 条：必须抛 ValueError（调用方已有整批回退路径）
+        client, create = self._client([SimpleNamespace(index=0, embedding=[0.1])])
+        p_client, p_batch, p_sem = self._patches(client)
+        with p_client, p_batch, p_sem, self.assertRaises(ValueError):
+            await embed_texts(["a", "b"])
+        self.assertEqual(len(create.call_args.kwargs["input"]), 2)
+
+    async def test_full_return_keeps_input_order(self):
+        # 数量一致时按 index 排序还原输入顺序（既有防御性排序不受影响）
+        client, _ = self._client(
+            [
+                SimpleNamespace(index=1, embedding=[0.2]),
+                SimpleNamespace(index=0, embedding=[0.1]),
+            ]
+        )
+        p_client, p_batch, p_sem = self._patches(client)
+        with p_client, p_batch, p_sem:
+            got = await embed_texts(["a", "b"])
+        self.assertEqual(got, [[0.1], [0.2]])
 
 
 if __name__ == "__main__":
