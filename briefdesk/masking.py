@@ -61,26 +61,39 @@ _SEP_RUN_RE = re.compile(
 )
 
 
+def _classify_digit_count(n: int) -> str | None:
+    """去分隔符后的纯数字位数 → 占位符；非已知 PII 形态返回 None。"""
+    if n == 11:
+        return PHONE_PLACEHOLDER
+    if n == 15:
+        return ID_PLACEHOLDER
+    if 16 <= n <= 19:
+        return BANKCARD_PLACEHOLDER
+    return None
+
+
 def _sep_run_repl(match: re.Match[str]) -> str:
     run = match.group()
-    digits: list[str] = []
-    seps: set[str] = set()
-    for ch in run:
-        if ch.isdigit():
-            digits.append(ch)
-        else:
-            seps.add(ch)
-    if len(seps) > 1:
-        # 混合分隔符（如日期区间被串成长串）按普通文本保留，防误伤
-        return run
-    count = len(digits)
-    if count == 11:
-        return PHONE_PLACEHOLDER
-    if count == 15:
-        return ID_PLACEHOLDER
-    if 16 <= count <= 19:
-        return BANKCARD_PLACEHOLDER
-    return run
+    seps = {c for c in run if not c.isdigit()}
+    # 单一分隔符形态（含空格连写）：整段去分隔符后按长度分类——
+    # 「138 0013 8000」「6222 0202 …」等合法写法依赖此路径
+    if len(seps) <= 1:
+        placeholder = _classify_digit_count(sum(c.isdigit() for c in run))
+        return placeholder if placeholder else run
+    # 混合分隔符（如「日期␣空格␣分隔符手机号」）：按空白切分后逐段独立判定
+    # ——空格几乎总是语义边界，跨空格拼接无判定意义。此前混合即整段放弃，
+    # 段内真 PII 漏脱敏（审查 A1）；段内仍混排分隔符时保留原文（保险丝）。
+    out: list[str] = []
+    for chunk in re.split(r"[ －　]+", run):
+        if not chunk:
+            continue
+        chunk_seps = {c for c in chunk if not c.isdigit()}
+        if len(chunk_seps) > 1:
+            out.append(chunk)
+            continue
+        placeholder = _classify_digit_count(sum(c.isdigit() for c in chunk))
+        out.append(placeholder if placeholder else chunk)
+    return "".join(out)
 
 
 def mask_content(text: str | None) -> str:

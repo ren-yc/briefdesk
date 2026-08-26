@@ -113,5 +113,27 @@ class NormalizeSubjectTest(unittest.TestCase):
         self.assertEqual(normalize_subject(once), once)
 
 
+
+
+class SeparatorRunEdgeTest(unittest.TestCase):
+    """二次扫描边界（审查 A1）：日期与分隔符手机号同段时空格/连字符混排，
+    旧实现整段放弃导致段内真手机号漏脱敏；现按空白切分逐段独立分类。"""
+
+    def test_date_and_separated_phone_same_run(self):
+        raw = "截止2024-01-15报名138-0013-8000"
+        out = mask_content(raw)
+        self.assertIn("[PHONE]", out)
+        self.assertNotIn("138-0013-8000", out)
+        self.assertNotIn("13800138000", out.replace("-", "").replace("[PHONE]", ""))
+        self.assertIn("2024-01-15", out)  # 日期段不受牵连
+
+    def test_fullwidth_digits_with_separator(self):
+        self.assertEqual(mask_content("联系１３８－００１３－８０００"), "联系[PHONE]")
+
+    def test_non_pii_segments_untouched(self):
+        raw = "房间301-302，会期2024-01-15到01-20"
+        self.assertEqual(mask_content(raw), raw)
+
+
 if __name__ == "__main__":
     unittest.main()
