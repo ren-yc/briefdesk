@@ -14,6 +14,7 @@
 """
 
 import asyncio
+import os
 import unittest
 from unittest.mock import AsyncMock, patch
 
@@ -74,16 +75,31 @@ class QqFlowFetchSessionsLimitTest(unittest.IsolatedAsyncioTestCase):
 
 
 class SseReadTimeoutTest(unittest.TestCase):
-    """【2·P1】两源 SSE 读超时：config 字段默认值 + 客户端 Timeout 构造。"""
+    """【2·P1】两源 SSE 读超时：config 字段默认值 + 客户端 Timeout 构造。
+
+    默认值断言与进程环境隔离：patch.dict 下 pop 两个 READ_TIMEOUT 环境变量
+    并以 `_env_file=None` 跳过 .env，只验证字段默认值；客户端级换算改为
+    显式传参验证（不隐式依赖进程环境/.env 的当前值）。
+    """
 
     def test_weflow_config_default(self):
-        self.assertEqual(WeFlowSettings().sse_read_timeout_ms, 300000)
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("WEFLOW_SSE_READ_TIMEOUT_MS", None)
+            os.environ.pop("QQFLOW_SSE_READ_TIMEOUT_MS", None)
+            settings = WeFlowSettings(_env_file=None)
+        self.assertEqual(settings.sse_read_timeout_ms, 300000)
 
     def test_qqflow_config_default(self):
-        self.assertEqual(QqFlowSettings().sse_read_timeout_ms, 60000)
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("WEFLOW_SSE_READ_TIMEOUT_MS", None)
+            os.environ.pop("QQFLOW_SSE_READ_TIMEOUT_MS", None)
+            settings = QqFlowSettings(_env_file=None)
+        self.assertEqual(settings.sse_read_timeout_ms, 60000)
 
     def test_weflow_client_builds_timeout_with_read(self):
-        client = WeFlowClient("http://127.0.0.1:5031", "tok")
+        client = WeFlowClient(
+            "http://127.0.0.1:5031", "tok", sse_read_timeout_ms=300000
+        )
         t = client.sse_timeout()
         self.assertEqual(t.read, 300.0)
         self.assertEqual(t.connect, 10.0)
@@ -96,7 +112,11 @@ class SseReadTimeoutTest(unittest.TestCase):
 
     def test_qqflow_client_builds_timeout_with_read(self):
         client = QqFlowClient(
-            "http://127.0.0.1:5032", "tok", qq="1", key="k", sse_read_timeout_ms=60000
+            "http://127.0.0.1:5032",
+            "tok",
+            qq="1",
+            key="k",
+            sse_read_timeout_ms=60000,
         )
         t = client.sse_timeout()
         self.assertEqual(t.read, 60.0)

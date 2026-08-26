@@ -134,6 +134,11 @@ class SeparatorRunEdgeTest(unittest.TestCase):
         raw = "房间301-302，会期2024-01-15到01-20"
         self.assertEqual(mask_content(raw), raw)
 
+    def test_fullwidth_mixed_with_space_segment(self):
+        # 全角连字符 + 全角空格混排：空白切段后各段独立判定
+        out = mask_content("１３８－００１３－８０００　找我")
+        self.assertIn("[PHONE]", out)
+
 
 if __name__ == "__main__":
     unittest.main()

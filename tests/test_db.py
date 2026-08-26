@@ -51,6 +51,7 @@ from briefdesk.db import (
     load_embeddings,
     mark_message_processed,
     merge_source_group,
+    purge_expired_ignored,
     set_item_reminder,
     toggle_session,
     update_category,
@@ -1784,7 +1785,10 @@ class DeleteItemsRollbackTest(_InMemoryDbTest):
     因此异常路径 rollback 后连接必须回到无事务状态。
 
     注：本机 SQLite >=3.32 变量上限默认 250000，无法靠超长 id 列表触发
-    "too many SQL variables"，故用故障注入让第三步 DELETE 抛错。
+    "too many SQL variables"，故用故障注入让多步写的某一步抛错。
+
+    覆盖 delete_items 之外的三条多步写链路：purge_expired_ignored、
+    update_category（改名 + items 同步）、delete_category（purge 级联）。
     """
 
     async def test_failed_multi_step_delete_leaves_no_open_transaction(self):
@@ -1827,6 +1831,117 @@ class DeleteItemsRollbackTest(_InMemoryDbTest):
         self.assertEqual((await cur.fetchone())["cnt"], 1)
         cur = await self.db.execute("SELECT COUNT(*) AS cnt FROM raw_messages")
         self.assertEqual((await cur.fetchone())["cnt"], 1)
+
+    # ── 故障注入扩展：db.execute 第 N 步抛 RuntimeError ──
+
+    def _fail_execute_on(self, needle: str):
+        """返回 patcher：SQL 含 needle 的 db.execute 调用注入 RuntimeError。
+
+        与 _cursor 注入互补——update_category 等函数的中间步不走 _cursor。
+        """
+        orig_execute = self.db.execute
+
+        async def failing_execute(sql, params=()):
+            if needle in sql:
+                raise RuntimeError(f"injected: {needle} failed")
+            return await orig_execute(sql, params)
+
+        return patch.object(self.db, "execute", new=failing_execute)
+
+    async def test_purge_expired_ignored_failure_rolls_back(self):
+        """purge 第 2 步（删 raw_messages）失败 → 异常上抛，三表均未部分写入。"""
+        p1, p2 = self._patch_db()
+        with p1, p2:
+            item_id = await insert_item(self._item("活动通知"))
+            await upsert_embeddings([(item_id, "embed-model", [0.1, 0.2])])
+            await bulk_insert_raw_messages(
+                [
+                    {
+                        "source": "weflow",
+                        "msg_id": "m1",
+                        "session_id": "s1",
+                        "group_name": "群A",
+                        "sender_id": "u1",
+                        "sender_name": "发送者",
+                        "content": "原文",
+                        "timestamp": 100,
+                    }
+                ]
+            )
+            # 目标行置为已忽略且过期（verified_at 远早于 cutoff）
+            await self.db.execute(
+                "UPDATE items SET is_verified = -1, verified_at = ? WHERE id = ?",
+                ("2000-01-01T00:00:00+00:00", item_id),
+            )
+            await self.db.commit()
+            with (
+                self._fail_execute_on("DELETE FROM raw_messages"),
+                self.assertRaises(RuntimeError),
+            ):
+                await purge_expired_ignored(24)
+        self.assertFalse(
+            self.db.in_transaction, "purge 失败后必须 rollback，不得残留悬挂事务"
+        )
+        for table in ("items", "raw_messages", "item_embeddings"):
+            cur = await self.db.execute(f"SELECT COUNT(*) AS cnt FROM {table}")
+            self.assertEqual((await cur.fetchone())["cnt"], 1, table)
+
+    async def test_update_category_failure_rolls_back_rename_sync(self):
+        """改名第 2 步（items 同步）失败 → 异常上抛，类别名与卡片均保持旧值。"""
+        p1, p2 = self._patch_db()
+        with p1, p2:
+            cat = await insert_category("旧类", "提示词", "#111111")
+            await insert_item(self._item("旧类"))
+            with (
+                self._fail_execute_on("UPDATE items SET category"),
+                self.assertRaises(RuntimeError),
+            ):
+                await update_category(cat["id"], name="新类")
+        self.assertFalse(
+            self.db.in_transaction, "改名失败后必须 rollback，不得残留悬挂事务"
+        )
+        cur = await self.db.execute("SELECT name FROM categories WHERE id = ?", (cat["id"],))
+        self.assertEqual((await cur.fetchone())["name"], "旧类")
+        cur = await self.db.execute(
+            "SELECT COUNT(*) AS cnt FROM items WHERE category = '旧类'"
+        )
+        self.assertEqual((await cur.fetchone())["cnt"], 1)
+
+    async def test_delete_category_failure_rolls_back_cascade(self):
+        """级联删除在 items 删除步失败 → 异常上抛，categories 行仍在、items 未删。"""
+        p1, p2 = self._patch_db()
+        with p1, p2:
+            cat = await insert_category("级联回滚类", "提示词", "#333333")
+            await insert_item(self._item("级联回滚类"))
+            await bulk_insert_raw_messages(
+                [
+                    {
+                        "source": "weflow",
+                        "msg_id": "m1",
+                        "session_id": "s1",
+                        "group_name": "群A",
+                        "sender_id": "u1",
+                        "sender_name": "发送者",
+                        "content": "原文",
+                        "timestamp": 100,
+                    }
+                ]
+            )
+            with (
+                self._fail_execute_on("DELETE FROM items WHERE id IN"),
+                self.assertRaises(RuntimeError),
+            ):
+                await delete_category(cat["id"], purge_items=True)
+        self.assertFalse(
+            self.db.in_transaction, "级联删除失败后必须 rollback，不得残留悬挂事务"
+        )
+        cur = await self.db.execute(
+            "SELECT COUNT(*) AS cnt FROM categories WHERE id = ?", (cat["id"],)
+        )
+        self.assertEqual((await cur.fetchone())["cnt"], 1, "类别行必须仍在")
+        for table in ("items", "raw_messages"):
+            cur = await self.db.execute(f"SELECT COUNT(*) AS cnt FROM {table}")
+            self.assertEqual((await cur.fetchone())["cnt"], 1, table)
 
 
 class AreMessagesProcessedChunkTest(unittest.IsolatedAsyncioTestCase):

@@ -190,7 +190,6 @@ class PluginManager:
                 # 装配失败先 best-effort 回收副作用再标 failed。回收范围以插件
                 # teardown 自身实现为准：内置插件的资源获取严格先于各类注册，
                 # 无可达残留路径；第三方插件需自行保证 teardown 覆盖其注册行为。
-                # PluginDisabledError 自禁用发生在获取资源之前，不走此路径。
                 await self._best_effort_teardown(name, plugin)
                 self._mark(name, "failed", f"setup 失败: {e!r}")
                 logger.exception("插件 %s setup 失败", name)

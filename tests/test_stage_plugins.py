@@ -292,6 +292,10 @@ class PluginManagerRollbackTest(unittest.IsolatedAsyncioTestCase):
         rec = manager.records()["boom"]
         self.assertEqual(rec.status, "failed")
         self.assertIn("activate 失败", rec.reason)
+        # 幂等叠加契约：该插件仍在 _load_order，关闭期 teardown_all 会按幂等
+        # 契约再调一次 → teardown 总调用次数 == 2（best-effort 回收 + 收尾）
+        await manager.teardown_all()
+        self.assertEqual(boom.events.count("teardown"), 2)
 
 
 class PluginDisabledNoTeardownTest(unittest.IsolatedAsyncioTestCase):
