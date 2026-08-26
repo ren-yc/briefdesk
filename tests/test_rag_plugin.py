@@ -684,6 +684,23 @@ class RagAskTest(_MemoryEngineBase):
             await self.engine.ask("周六6点开会有通知")
 
 
+    async def test_evidence_chars_setting_truncates_prompt(self):
+        # RAG_EVIDENCE_CHARS 传入证据构造：超长消息在 prompt 内被截断并标注
+        from briefdesk.plugins.rag.config import RagSettings as RS
+
+        self.engine.settings = RS(evidence_chars=50)
+        long_content = "长消息内容" * 149 + "独特结尾句"  # 750 字符
+        await self._index([_msg("m9", long_content)])
+        self.provider.chat = AsyncMock(return_value=_chat_response("答案 [1]。"))
+        result = await self.engine.ask("长消息内容")
+        self.assertFalse(result.refused)
+        messages = self.provider.chat.call_args.args[0]
+        ev = messages[1]["content"].split("证据：\n")[1]
+        self.assertTrue(ev.endswith("…"))
+        self.assertIn(long_content[:50], ev)
+        self.assertNotIn("独特结尾句", ev)
+
+
 class PromptFlattenTest(unittest.TestCase):
     """证据块压平换行：多行原文无法伪造新的「[n] 发送者:」证据行。"""
 
@@ -730,6 +747,48 @@ class PromptFlattenTest(unittest.TestCase):
         self.assertIn("对话历史：", user)
         self.assertIn("xx活动周六吗", user)
         self.assertIn("周六6点 [1]。", user)
+
+
+    def test_evidence_truncated_over_cap(self):
+        from datetime import datetime
+
+        from briefdesk.plugins.rag.db import ChunkRow
+        from briefdesk.plugins.rag.engine import Hit
+        from briefdesk.plugins.rag.prompts import build_answer_prompt
+
+        long_content = "长消息内容" * 149 + "独特结尾句"  # 750 字符，默认上限 600
+        chunk = ChunkRow(
+            source="weflow", msg_id="m1", session_id="s1", group_name="测试群",
+            sender_name="小明", msg_time=1700000000, content=long_content,
+        )
+        messages = build_answer_prompt(
+            datetime(2026, 1, 1, 12, 0), "问题？",
+            [Hit(chunk=chunk, cos=1.0, rrf=1.0, has_fts=False)],
+        )
+        ev = messages[1]["content"].split("证据：\n")[1]
+        self.assertTrue(ev.endswith("…"))
+        self.assertIn(long_content[:600], ev)
+        self.assertNotIn("独特结尾句", ev)
+
+    def test_evidence_not_truncated_within_cap(self):
+        from datetime import datetime
+
+        from briefdesk.plugins.rag.db import ChunkRow
+        from briefdesk.plugins.rag.engine import Hit
+        from briefdesk.plugins.rag.prompts import build_answer_prompt
+
+        content = "短" * 600  # 恰在上限内：不截断不加标记
+        chunk = ChunkRow(
+            source="weflow", msg_id="m1", session_id="s1", group_name="测试群",
+            sender_name="小明", msg_time=1700000000, content=content,
+        )
+        messages = build_answer_prompt(
+            datetime(2026, 1, 1, 12, 0), "问题？",
+            [Hit(chunk=chunk, cos=1.0, rrf=1.0, has_fts=False)],
+        )
+        ev = messages[1]["content"].split("证据：\n")[1]
+        self.assertNotIn("…", ev)
+        self.assertIn(content, ev)
 
 
 class RagRouterTest(unittest.IsolatedAsyncioTestCase):

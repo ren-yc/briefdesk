@@ -113,6 +113,7 @@ class RagEngine:
         self._matrix: np.ndarray | None = None
         self._matrix_keys: list[tuple[str, str]] = []
         self._matrix_chunks: list[ChunkRow] = []
+        self._matrix_sessions: list[tuple[str, str]] = []
         self._refresh_lock = asyncio.Lock()
         # 嵌入降级自愈：before_run 成功前最多踢一次回填，防供应商宕机刷踢
         self._kicked_since_embed_ok = False
@@ -144,8 +145,8 @@ class RagEngine:
     @staticmethod
     async def _allowed_sessions(
         db: aiosqlite.Connection, group_only: bool, session_id: str | None
-    ) -> set[str] | None:
-        """当前可检索会话集合；None 表示无会话约束（group_only 关且未收窄）。
+    ) -> set[tuple[str, str]]:
+        """当前可检索会话集合（恒非 None；group_only 关且未收窄时含全部启用会话）。
 
         启用状态每次查询现取——停用会话即时失效，不依赖索引期快照。
         返回 (source, session_id) 元组集合（跨源撞名安全），恒非 None。
@@ -555,7 +556,8 @@ class RagEngine:
         if not hits:
             return AskResult(refused=True, answer="没有在群聊记录里找到相关消息。")
         messages = build_answer_prompt(
-            datetime.now(), question.strip(), hits, history or []
+            datetime.now(), question.strip(), hits, history or [],
+            self.settings.evidence_chars,
         )
         resp = await ai_ports.chat(messages, temperature=0.2, max_tokens=1024)
         content = ""
