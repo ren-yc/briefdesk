@@ -59,8 +59,8 @@ _SAFE_IMAGE_TYPES = frozenset(
 )
 
 
-def _resolve_content_type(path: str, content: bytes) -> str:
-    """按魔数嗅探放行安全位图类型；其余一律降级字节流下载。
+def _resolve_content_type(content: bytes) -> str:
+    """仅按内容魔数嗅探放行安全位图类型；其余一律降级字节流下载。
 
     扩展名完全不可信（来自不可信聊天媒体路径）：伪装成 .png/.jpg 的
     SVG/HTML 文本没有位图魔数，必须降级为 attachment 下载，防其在平台
@@ -93,7 +93,7 @@ async def api_media_proxy(source: str, path: str):
     except MediaError as e:
         raise HTTPException(404, f"Media unavailable: {e}") from e
 
-    content_type = _resolve_content_type(path, content)
+    content_type = _resolve_content_type(content)
     headers: dict[str, str] = {}
     if content_type == "application/octet-stream":
         # 非位图一律强制下载而非内联渲染：文件名取 path 基名，引号做无害化

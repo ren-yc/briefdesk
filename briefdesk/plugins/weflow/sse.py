@@ -142,10 +142,8 @@ class WeFlowSseClient(RealtimeListener[WeFlowClient]):
             self._stats_task.cancel()
         if self._task:
             self._task.cancel()
-        # 冲刷批缓冲残余消息并等待 in-flight 批处理收尾；RealtimeListener 协议
-        # 的 stop 为同步方法，冲刷以受跟踪的后台任务执行，aclose() 可等待其完成。
-        # 注意：runtime.close() 随后会关 HTTP 客户端，在 runtime 接入 aclose 前，
-        # in-flight 批内的媒体下载可能因客户端已关而 MediaError（仅日志、可恢复）
+        # 冲刷残余缓冲并等待 in-flight 批收尾；RealtimeListener 协议的 stop
+        # 为同步方法，故以后台任务执行，aclose() 供 runtime 在关客户端前等待
         if self._drain_task is None:
             self._drain_task = asyncio.create_task(self._final_drain())
 

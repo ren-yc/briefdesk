@@ -43,12 +43,17 @@ logger = logging.getLogger(__name__)
 # benchmark 门闸：置位后 process_all_batches 直接返回 False（批次保留待回填），
 # 不触 DB/AI；benchmark 插件跑基线时用它冻结实时管道。
 _processing_paused = False
+# 暂停门闸的首次 INFO 已落日志标志：暂停期间后续批次降级 DEBUG，防刷屏；
+# 恢复时复位，保证下一轮暂停仍有一条 INFO。
+_paused_logged_once = False
 
 
 def set_processing_paused(paused: bool) -> None:
     """暂停/恢复消息管道处理（benchmark 契约，签名固定）。"""
-    global _processing_paused
+    global _processing_paused, _paused_logged_once
     _processing_paused = paused
+    if not paused:
+        _paused_logged_once = False
 
 
 def _split_batches(
@@ -104,8 +109,13 @@ async def process_all_batches(
     """
     # benchmark 暂停门闸：优先于一切处理（含空批快速路径），
     # 返回 False 让 poll_cycle 跳过水位推进，消息留给回填窗口恢复。
+    # 首批 INFO 提示进入暂停态，其后每批只留 DEBUG 轨迹防刷屏。
+    global _paused_logged_once
     if _processing_paused:
-        logger.info(
+        if not _paused_logged_once:
+            _paused_logged_once = True
+            logger.info("[pipeline] 处理已暂停（benchmark），后续批次静默保留待回填")
+        logger.debug(
             "[pipeline] 处理已暂停（benchmark），本批 %d 条保留待回填",
             len(messages),
         )

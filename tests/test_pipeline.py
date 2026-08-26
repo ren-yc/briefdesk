@@ -9,7 +9,11 @@ import aiosqlite
 from briefdesk import stages
 from briefdesk.config import config
 from briefdesk.db import init_schema
-from briefdesk.pipeline import _split_batches, process_all_batches
+from briefdesk.pipeline import (
+    _split_batches,
+    process_all_batches,
+    set_processing_paused,
+)
 from briefdesk.plugin.base import PluginContext
 from briefdesk.plugins.dedup.engine import build_item_input
 from briefdesk.plugins.dedup.plugin import DedupPlugin
@@ -1141,16 +1145,9 @@ class ProcessingPausedGateTest(unittest.IsolatedAsyncioTestCase):
     恢复后行为复原。"""
 
     def tearDown(self):
-        try:
-            from briefdesk.pipeline import set_processing_paused
-        except ImportError:
-            return
         set_processing_paused(False)
 
     async def test_paused_returns_false_and_stays_paused(self):
-        # 局部导入：实现前该符号不存在，仅本用例 RED 而非整文件收集失败
-        from briefdesk.pipeline import set_processing_paused
-
         set_processing_paused(True)
         # 空批在未暂停时本应返回 True；暂停门闸优先，且状态不被消费（连续两次均 False）
         ok1 = await process_all_batches([], _pipeline_client(), origin="test")
@@ -1159,8 +1156,6 @@ class ProcessingPausedGateTest(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(ok2, "暂停中不应被空批调用自动恢复")
 
     async def test_resume_restores_true_for_empty_batch(self):
-        from briefdesk.pipeline import set_processing_paused
-
         set_processing_paused(False)
         ok = await process_all_batches([], _pipeline_client(), origin="test")
         self.assertTrue(ok, "恢复后空批应回到默认快速路径")

@@ -103,6 +103,8 @@ class RealtimeListener[S: SourceClient](Protocol):
     """实时消息监听器契约 — 插件包内的监听器实现。
 
     仅约束生命周期与会话缓存刷新,事件解析等源特有细节留在实现内部。
+
+    实现可另提供 `async aclose()`：等待关停冲刷（残余缓冲 + in-flight 批任务）收尾；SourceRuntime.close 经 getattr 探测调用，缺失则跳过（可选扩展钩子，不入协议方法集）。
     """
 
     def start(self) -> None:

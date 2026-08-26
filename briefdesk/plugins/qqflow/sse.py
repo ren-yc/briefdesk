@@ -118,13 +118,12 @@ class QqFlowSseClient(RealtimeListener[QqFlowClient]):
         self._seen: set[tuple[str, str]] = set()
         self._seen_order: deque[tuple[str, str]] = deque()
         # 监听统计（周期/停止时上报）：事件总数、预过滤丢弃数、去重命中数、
-        # IGNORE_SELF 回查判定的自消息数；sync/ping 控制事件单独计数、
-        # 不进 INFO 统计行（保持「无消息静默」语义）
+        # IGNORE_SELF 回查判定的自消息数；sync/ping 控制事件不进统计
+        # （保持「无消息静默」语义）
         self._stats_events = 0
         self._stats_filtered = 0
         self._stats_deduped = 0
         self._stats_self = 0
-        self._stats_control = 0
         self._stats_task: asyncio.Task | None = None
         # stop() 启动的收尾冲刷任务（协议要求 stop 为同步方法，故后台执行）
         self._drain_task: asyncio.Task | None = None
@@ -148,11 +147,8 @@ class QqFlowSseClient(RealtimeListener[QqFlowClient]):
             self._stats_task.cancel()
         if self._task:
             self._task.cancel()
-        # 冲刷批缓冲残余消息并等待 in-flight 批处理收尾；RealtimeListener 协议
-        # 的 stop 为同步方法，冲刷以受跟踪的后台任务执行，aclose() 可等待其完成。
-        # 注意：runtime.close() 随后会关 HTTP 客户端，在 runtime 接入 aclose 前，
-        # in-flight 批内的 IGNORE_SELF 回查/媒体下载可能因客户端已关而失败
-        # （fail-open/仅日志，可恢复）
+        # 冲刷残余缓冲并等待 in-flight 批收尾；RealtimeListener 协议的 stop
+        # 为同步方法，故以后台任务执行，aclose() 供 runtime 在关客户端前等待
         if self._drain_task is None:
             self._drain_task = asyncio.create_task(self._final_drain())
 
@@ -226,11 +222,11 @@ class QqFlowSseClient(RealtimeListener[QqFlowClient]):
             await self._handle_event(event)
 
     async def _handle_event(self, event: QqFlowEvent) -> None:
-        # sync（水位对齐）/ping（KeepAlive）是控制事件而非消息：不计入
-        # 事件数与预过滤丢弃数，否则每 15s 心跳会让「无消息静默」统计失效
+        # 控制事件不计入消息事件/预过滤统计（无消息静默语义），亦无需计数：
+        # sync（水位对齐）/ping（KeepAlive）直接跳过，否则每 15s 心跳会
+        # 让「无消息静默」统计失效
         etype = event.get("event", "")
         if etype in ("sync", "ping"):
-            self._stats_control += 1
             return
         self._stats_events += 1
         if not pre_filter_sse(event):
