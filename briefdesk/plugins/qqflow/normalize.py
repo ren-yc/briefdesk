@@ -106,6 +106,11 @@ def pre_filter_sse(event: QqFlowEvent) -> bool:
             event.get("event"),
         )
         return False
+    if not event.get("rawid"):
+        # 无 rawid 无法生成 msg_id/标记 processed——就地丢弃，防去重键
+        # ("message.new","") 碰撞误吞后续正常事件（审查 A5）
+        logger.debug("丢弃 SSE: message.new 缺 rawid")
+        return False
     # 任意发送者为空的消息均丢弃：上游可能把入群/名片等系统事件编码成
     # “无发送者 + 内容为显示名”的形式，这类消息没有可展示/可分类的信息价值。
     if not clean_display_name(event.get("sourceName")):

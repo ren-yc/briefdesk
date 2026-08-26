@@ -245,6 +245,11 @@ def pre_filter_sse(event: WeFlowEvent) -> bool:
     if event.get("event") != "message.new":
         logger.debug("丢弃 SSE rawid=%s: 事件类型 %s", event.get("rawid"), event.get("event"))
         return False
+    if not event.get("rawid"):
+        # 无 rawid 无法生成 msg_id/标记 processed，放行只会在去重缓存
+        # ("message.new","") 与回填之间反复投递——就地丢弃（审查 A5）
+        logger.debug("丢弃 SSE: message.new 缺 rawid")
+        return False
     c: str = event.get("content", "")
     if not c or c == "[消息]":
         logger.debug("丢弃 SSE rawid=%s: 空内容/[消息]", event.get("rawid"))

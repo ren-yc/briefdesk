@@ -412,5 +412,43 @@ class RuntimeCloseOrderingTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(received), 1)
 
 
+
+
+class SseRawidGuardTest(unittest.TestCase):
+    """message.new 缺 rawid 的就地拦截（审查 A5）。
+
+    rawid/serverId 是 msg_id 与 processed 标记的根基：缺失消息放行只会在
+    去重键 ("message.new","") 碰撞与回填间反复投递，必须在 pre_filter 拦下。"""
+
+    def test_weflow_message_new_without_rawid_dropped(self):
+        from briefdesk.plugins.weflow.normalize import pre_filter_sse
+
+        ev = {"event": "message.new", "content": "正常内容长度超过五字"}
+        self.assertFalse(pre_filter_sse(ev))
+
+    def test_weflow_with_rawid_still_passes_shape(self):
+        from briefdesk.plugins.weflow.normalize import pre_filter_sse
+
+        ev = {"event": "message.new", "rawid": "r1", "content": "正常内容长度超过五字"}
+        self.assertTrue(pre_filter_sse(ev))
+
+    def test_qqflow_message_new_without_rawid_dropped(self):
+        from briefdesk.plugins.qqflow.normalize import pre_filter_sse
+
+        ev = {"event": "message.new", "sourceName": "张三", "content": "这条内容长度肯定满足过滤阈值"}
+        self.assertFalse(pre_filter_sse(ev))
+
+    def test_qqflow_with_rawid_still_passes_shape(self):
+        from briefdesk.plugins.qqflow.normalize import pre_filter_sse
+
+        ev = {
+            "event": "message.new",
+            "rawid": "r1",
+            "sourceName": "张三",
+            "content": "这条内容长度肯定满足过滤阈值",
+        }
+        self.assertTrue(pre_filter_sse(ev))
+
+
 if __name__ == "__main__":
     unittest.main()
