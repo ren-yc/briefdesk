@@ -143,6 +143,24 @@ def _export_attachment(content: str, media_type: str, filename: str) -> Response
     )
 
 
+# 公式注入前缀：Excel/LibreOffice 会把以此开头的单元格当公式执行（CSV injection）
+_CSV_FORMULA_PREFIXES = ("=", "+", "-", "@", "\t")
+
+
+def _csv_cell(value: object) -> object:
+    """CSV 导出单元格净化：字符串以公式前缀开头时前置一个半角单引号。
+
+    仅导出层转义、不改库内数据；聊天内容完全不可信，公式样式的单元格
+    在电子表格软件里会被当公式执行。dict/list 维持既有 JSON 序列化行为，
+    其余非字符串类型原样交给 csv.writer。
+    """
+    if isinstance(value, (dict, list)):
+        return json.dumps(value, ensure_ascii=False)
+    if isinstance(value, str) and value.startswith(_CSV_FORMULA_PREFIXES):
+        return "'" + value
+    return value
+
+
 @app.get("/api/export/items")
 async def api_export_items(
     category: str = Query(None),
@@ -180,11 +198,7 @@ async def api_export_items(
             offset=offset,
         )
         for r in page["items"]:
-            w.writerow(
-                r.get(c, "") if not isinstance(r.get(c), (dict, list))
-                else json.dumps(r.get(c), ensure_ascii=False)
-                for c in _ITEM_EXPORT_COLS
-            )
+            w.writerow(_csv_cell(r.get(c, "")) for c in _ITEM_EXPORT_COLS)
         if not page["has_more"] or not page["items"]:
             break
         offset = page["next_offset"]
@@ -210,7 +224,15 @@ async def api_export_recat_samples(fmt: str = Query("jsonl", alias="format")):
         w = csv.writer(out)
         w.writerow(["item_id", "source", "source_msg_id", "category_before", "category_after", "content", "created_at"])
         for s in samples:
-            w.writerow([s["item_id"], s["source"], s["source_msg_id"], s["category_before"], s["category_after"], s["content"], s["created_at"]])
+            w.writerow(
+                [
+                    _csv_cell(s[c])
+                    for c in (
+                        "item_id", "source", "source_msg_id",
+                        "category_before", "category_after", "content", "created_at",
+                    )
+                ]
+            )
         return _export_attachment(
             out.getvalue(),
             "text/csv; charset=utf-8",
@@ -303,8 +325,15 @@ async def api_verify(item_id: str, body: dict):
     verified = body.get("verified")
     if verified not in (0, 1, -1):
         raise HTTPException(400, "verified must be 0, 1, or -1")
-    if not await update_item_verify(item_id, verified):
-        raise HTTPException(404, "Item not found")
+    # 与 pipeline 共用存储锁：单连接隐式事务下，锁外 commit 会把管道
+    # 未完成的多步写一并提交（部分写入提前可见）
+    async with storage_lock:
+        if not await update_item_verify(item_id, verified):
+            raise HTTPException(404, "Item not found")
+        if verified == -1:
+            # 忽略后卡片退出去重缓存的预热口径（is_verified >= 0）：
+            # 同步清缓存，否则被忽略卡仍参与判重，相似新消息被永久跳过
+            await event_bus.publish(EVENT_ITEMS_DELETED, [item_id])
     cat_counts = await get_category_counts()
     all_count = await get_all_category_count()
     ignored_count = await get_ignored_count()
@@ -356,7 +385,15 @@ async def api_items_batch(body: dict):
             await event_bus.publish(EVENT_ITEMS_DELETED, ids)
     else:
         verified = {"memo": 1, "ignore": -1, "unverify": 0}[action]
-        affected = await update_items_verify(ids, verified)
+        # 非 delete 分支同样持存储锁：写库与 pipeline 串行化，
+        # 防止单连接隐式事务被并发 commit 交叉提交
+        async with storage_lock:
+            affected = await update_items_verify(ids, verified)
+            if action == "ignore":
+                # 忽略后卡片退出 is_verified >= 0 口径：同步清去重内存
+                # 缓存，否则被忽略卡继续参与判重、相似新消息不再显示
+                # （直到重启重预热），与 delete 的清缓存语义对齐
+                await event_bus.publish(EVENT_ITEMS_DELETED, ids)
     return {"success": True, "affected": affected}
 
 
@@ -372,7 +409,10 @@ async def api_sessions():
 
 @app.post("/api/sessions/{source}/{session_id}/toggle")
 async def api_toggle_session(source: str, session_id: str):
-    updated = await toggle_session(source, session_id)
+    # 与 pipeline 共用存储锁：toggle 是「翻转 enabled → 清水位」两步写，
+    # 单连接隐式事务下锁外 commit 可能被并发写交叉提交
+    async with storage_lock:
+        updated = await toggle_session(source, session_id)
     if updated is None:
         raise HTTPException(404, "Session not found")
     listener = get_listener(source)
