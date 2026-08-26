@@ -9,6 +9,7 @@
 (function () {
   "use strict";
   const PLUGIN = "rag";
+  const VIEW = "ask"; // hash 字面量视图 id（核心 parseHash 按插件 matches 识别）
 
   // ── 状态 ──
   let askMode = false;   // 视图开关
@@ -172,9 +173,9 @@
   function registerViewHook() {
     registerPluginView({
       name: PLUGIN,
-      matches: (v) => !!v && v.view === PLUGIN,
+      matches: (v) => !!v && v.view === VIEW,
       hash: (v) => {
-        if (v && v.view === PLUGIN) enterAskMode();
+        if (v && v.view === VIEW) enterAskMode();
         else exitAskMode();
       },
       isActive: () => askMode,
@@ -198,7 +199,7 @@
     inlineSvgIcons(); // 内联按钮图标（与核心图标一致）
     // F5 刷新 #ask：加载器注入晚于核心 hash 初始化，此处自查补进入
     const v = parseHash();
-    if (v && v.view === PLUGIN) enterAskMode();
+    if (v && v.view === VIEW) enterAskMode();
   }
 
   window.briefdeskPlugins = window.briefdeskPlugins || {};

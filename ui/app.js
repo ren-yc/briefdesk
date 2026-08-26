@@ -4240,7 +4240,12 @@ function parseHash() {
   if (!h) return null;
   if (h === "memo") return { category: "全部", verified: "memo", q: "" };
   if (h === "ignored") return { category: "全部", verified: "ignored", q: "" };
-  if (h === "calendar") return { view: "calendar" }; // 插件视图字面量（calendar 等）
+  if (h === "calendar") return { view: "calendar" }; // 插件视图字面量（兼容预装配期解析）
+  // 通用插件视图：任何已注册插件的 matches 命中即视为该插件视图字面量
+  // （calendar/rag/… 均走此路径，避免核心为每个插件硬编码 hash）
+  for (const _pv of pluginViews) {
+    if (_pv.matches && _pv.matches({ view: h })) return { view: h };
+  }
   if (h.startsWith("subject=")) return { subject: h.slice(8) };
   if (h.startsWith("cat=")) return { category: h.slice(4), verified: "unverified", q: "" };
   if (h.startsWith("q=")) return { category: "全部", verified: "unverified", q: h.slice(2) };
