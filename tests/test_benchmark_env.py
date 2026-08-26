@@ -70,5 +70,47 @@ class BenchmarkEnvCleanupScopeTest(unittest.IsolatedAsyncioTestCase):
                 sentinel.unlink()
 
 
+
+
+class ProviderResourceAcquisitionFailureTest(unittest.IsolatedAsyncioTestCase):
+    """连接创建失败也必须回收已获取资源与本次子目录（审查 A3）。
+
+    旧实现把 _new_connection/pragma 放在 try 之外：第二个连接失败会泄漏
+    第一个连接并残留 run_dir。现资源获取纳入 try，finally 判空防护。"""
+
+    async def test_second_connection_failure_cleans_up(self):
+        class FakeConn:
+            def __init__(self):
+                self.closed = False
+
+            async def close(self):
+                self.closed = True
+
+        fake = FakeConn()
+        calls = {"n": 0}
+
+        async def flaky_new_connection(_path):
+            calls["n"] += 1
+            if calls["n"] >= 2:
+                raise RuntimeError("disk full")
+            return fake
+
+        root = providers._TMP_ROOT
+        before = set(root.glob("bench-*"))
+        with (
+            patch.object(providers, "_new_connection", new=flaky_new_connection),
+            self.assertRaises(RuntimeError),
+        ):
+            async with providers.bench_environment():
+                pass  # 不可达：进入即失败
+        # 已获取的 main_conn 被关闭；本次子目录被清理（其余目录不动）
+        self.assertTrue(fake.closed)
+        self.assertEqual(set(root.glob("bench-*")), before)
+        # 失败发生在暂停置位之前，管道标志不得被置位
+        from briefdesk import pipeline as _pipeline
+
+        self.assertFalse(_pipeline._processing_paused)
+
+
 if __name__ == "__main__":
     unittest.main()

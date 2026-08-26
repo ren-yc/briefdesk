@@ -71,14 +71,18 @@ async def bench_environment(
     old_get_db = briefdesk_db.get_db
     old_get_embed_db = briefdesk_db.get_embed_db
     run_dir = _TMP_ROOT / f"bench-{uuid.uuid4().hex[:8]}"
-    run_dir.mkdir(parents=True, exist_ok=True)
     db_path = str(run_dir / "bench.sqlite")
-    main_conn = await _new_connection(db_path)
-    embed_conn = await _new_connection(db_path)
-    for pragma in ("PRAGMA journal_mode = WAL", "PRAGMA busy_timeout = 5000"):
-        cursor = await embed_conn.execute(pragma)
-        await cursor.close()
+    # 连接变量先置 None：创建/初始化失败时 finally 才能区分「无需关闭」与
+    # 「需关闭」，避免半程状态泄漏连接与本次子目录（审查 A3）
+    main_conn: aiosqlite.Connection | None = None
+    embed_conn: aiosqlite.Connection | None = None
     try:
+        run_dir.mkdir(parents=True, exist_ok=True)
+        main_conn = await _new_connection(db_path)
+        embed_conn = await _new_connection(db_path)
+        for pragma in ("PRAGMA journal_mode = WAL", "PRAGMA busy_timeout = 5000"):
+            cursor = await embed_conn.execute(pragma)
+            await cursor.close()
         # 打补丁前先暂停生产管道：暂停期间 process_all_batches 直接返回，
         # 实时消息不入库也不标 processed，延后到下轮回填自然恢复。
         # 置于 try 内保证任何后续失败都走 finally 的复位与子目录清理。
@@ -104,6 +108,8 @@ async def bench_environment(
         briefdesk_db.get_db = old_get_db  # type: ignore[assignment]
         briefdesk_db.get_embed_db = old_get_embed_db  # type: ignore[assignment]
         ai_ports.set_ai(old_ai)
-        await embed_conn.close()
-        await main_conn.close()
+        if embed_conn is not None:
+            await embed_conn.close()
+        if main_conn is not None:
+            await main_conn.close()
         await asyncio.to_thread(shutil.rmtree, run_dir, ignore_errors=True)
