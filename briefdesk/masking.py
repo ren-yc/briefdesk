@@ -4,6 +4,7 @@
   （含分隔符写法 138-0013-8000 与全角数字；详见 _SEP_RUN_RE 注释）
 - clean_display_name：去除显示名中的 C0 控制字符与首尾空白
 - normalize_subject：主体名 NFKC + 空白折叠/首尾 + 小写归一（供时间线跨写法聚合）
+- PLACEHOLDER_ONLY_RE：纯附件占位符判定（pipeline 入口过滤与 dedup 原文短路共用）
 
 模块化设计：纯函数、只依赖标准库 re/unicodedata，被 types.py（构造即
 脱敏/净化）、pipeline.py（OCR 合并/入库）与 db.py（主体时间线查询）调用。
@@ -129,3 +130,12 @@ def normalize_subject(name: str | None) -> str:
     s = unicodedata.normalize("NFKC", name)
     s = _SPACE_RE.sub(" ", s).strip()
     return s.lower()
+
+
+# ── 纯附件占位符判定（单源）──
+# 整条内容仅由方括号片段构成：[图片]/[image]/[语音]/[视频]… 及多片段拼接
+# "[图片][图片]"（重复形），与源侧 normalize 的占位符判定语义一致。
+# 消费方：pipeline 入口过滤（OCR 未启用时屏蔽纯占位符带图消息，不标
+# processed、可经回填窗口恢复）；dedup 原文哈希短路的排除项（占位符原文
+# 可对应不同图，防 qqflow 同文异图误判 SAME）。
+PLACEHOLDER_ONLY_RE = re.compile(r"^(?:\s*\[[^\]]+\])+\s*$")

@@ -14,7 +14,6 @@ import asyncio
 import hashlib
 import json
 import logging
-import re
 from dataclasses import dataclass
 
 from briefdesk.ai_ports import (
@@ -33,7 +32,7 @@ from briefdesk.db import (
     merge_source_group,
     upsert_embeddings,
 )
-from briefdesk.masking import normalize_subject
+from briefdesk.masking import PLACEHOLDER_ONLY_RE, normalize_subject
 from briefdesk.plugin.base import DedupService
 from briefdesk.types import (
     ClassifyResult,
@@ -49,12 +48,6 @@ logger = logging.getLogger(__name__)
 # qqflow 实测存在图片+文字混合消息（同图可配不同文字），同图不等同于重复，
 # 不得参与短路。查询与缓存条目双方都须属于本集合才命中。
 _IMAGE_SHORTCUT_SOURCES = frozenset({"weflow"})
-
-# 纯占位符原文（[图片]/[image]/[语音]/[视频]…，含多片段拼接的 "[图片][图片]"
-# 重复形，与 pipeline 入口过滤语义一致）：不参与 source_quote 精确短路——
-# 占位符原文可对应不同图片（qqflow 同文异图消息经 source_quote 哈希短路的
-# 误判路径），此类消息交由 image_urls 短路（源限定）处理，避免同文异图误判。
-_PLACEHOLDER_ONLY_RE = re.compile(r"^(?:\s*\[[^\]]+\])+\s*$")
 
 
 @dataclass
@@ -467,14 +460,10 @@ class DedupEngine(DedupService):
         await self.ensure_cache()
 
         # ── 图片精确短路：同属限定源的 image_urls 集合完全一致 → 判重，零 AI ──
-        # 同图重发（如同一海报在不同时刻再发一次）是确定性重复证据：图片消息原文
-        # 为占位符（[图片] 等），原文哈希短路对其显式跳过、余弦可能擦边未召回、
-        # 单候选 AI 判定不稳定，而图片路径（上游内容寻址）在重发场景逐字节一致。
-        # 仅当双方都有图时参与，集合相等而非子集：防止多图卡片共享某张装饰图被
-        # 误判为同一卡片。
-        # 源限定：qqflow 实测存在图片+文字混合消息（同图可配不同文字），同图
-        # 不等同于重复，不得短路；仅 weflow（图片消息无混合文本，同图必同文）
-        # 参与。查询 source 非限定源或与缓存条目源不一致 → 整段跳过。
+        # 同图重发是确定性重复证据：图片消息原文为占位符（哈希短路对其显式跳过）、
+        # 余弦可能擦边未召回、单候选 AI 判定不稳定，而图片路径（上游内容寻址）
+        # 在重发场景逐字节一致。仅当双方都有图时参与，集合相等而非子集，
+        # 防多图卡片共享装饰图误判。源限定理由见 _IMAGE_SHORTCUT_SOURCES 处注释。
         q_images = _norm_images(image_urls)
         if q_images and source in _IMAGE_SHORTCUT_SOURCES:
             for it in self._cache:
@@ -492,12 +481,11 @@ class DedupEngine(DedupService):
                     )
 
         # ── 原文哈希精确短路：仅对原文取哈希 ──
-        # 同一条原文被上游重复投递（msg_id 不同但内容相同，processed 按 msg_id
-        # 去重拦不住）时，AI 概括的标题不稳定会让余弦擦边（非 99%+ 不进 strong）、
-        # 单候选 AI 判定不稳定——原文（上游原文）是确定性重复证据。仅原文非空且
-        # 非纯占位符（[图片] 等，交由 image_urls 短路处理）时参与；哈希全等等价
-        # 于逐字节全等，不误伤相似但不同文。
-        if source_quote and not _PLACEHOLDER_ONLY_RE.match(source_quote):
+        # 同一条原文被上游重复投递（processed 按 msg_id 拦不住）时是确定性重复
+        # 证据：AI 概括的标题不稳定会让余弦擦边、单候选 AI 判定不稳定。哈希全等
+        # 等价于逐字节全等，不误伤相似但不同文。占位符原文排除的理由见
+        # masking.PLACEHOLDER_ONLY_RE 处注释。
+        if source_quote and not PLACEHOLDER_ONLY_RE.match(source_quote):
             q_hash = self._content_hash(source_quote)
             for it in self._cache:
                 if it.content_hash and it.content_hash == q_hash:

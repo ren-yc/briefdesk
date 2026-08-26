@@ -29,22 +29,13 @@ class _SpaStaticFiles(StaticFiles):
         try:
             return await super().get_response(path, scope)
         except StarletteHTTPException:
-            # 必须捕 starlette 基类：StaticFiles raise 的是
-            # starlette.exceptions.HTTPException，fastapi.HTTPException 是其
-            # 子类，isinstance(父类实例, 子类) 恒 False——此前 except 永远
-            # 不匹配，SPA fallback 实际从未生效（hash 路由掩盖了这点）
-            # starlette>=1.3 在 Windows 上会给 mount 传入反斜杠形式的 path
-            # （"api\x"），先归一化再判断，防止未知 /api/* 被回退成首页
-            normalized = path.replace("\\", "/")
-            # 未知 /api/* 保持 404 JSON，不伪装成 SPA 首页
+            # 必须捕 starlette 基类：StaticFiles raise 的是 starlette.exceptions.HTTPException，
+            # fastapi.HTTPException 是其子类——此前 except 恒不匹配，fallback 从未生效
+            normalized = path.replace("\\", "/")  # starlette>=1.3 Windows 会传反斜杠 path
             if normalized == "api" or normalized.startswith("api/"):
-                raise
-            # 带扩展名的资源请求（.js/.css/图片…）404 即 404：回退 index.html
-            # 会以 200 + text/html 应答脚本/样式请求，触发浏览器严格 MIME
-            # 检查告警并掩盖真实错误；SPA hash 路由不会发到服务器，
-            # 无扩展名路径才回退首页
+                raise  # 未知 /api/* 保持 404 JSON，不伪装成 SPA 首页
             if os.path.splitext(normalized)[1]:
-                raise
+                raise  # 带扩展名的资源 404 即 404：200+text/html 应答脚本会触发严格 MIME 告警
             return FileResponse(os.path.join(_UI_DIR, "index.html"))
 
 

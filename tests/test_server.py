@@ -462,6 +462,18 @@ class MediaContentTypeTest(unittest.TestCase):
             resp.headers.get("content-disposition", "").startswith("attachment;")
         )
 
+    def test_nonascii_basename_attachment_uses_rfc5987(self):
+        # 中文基名：Content-Disposition 头值仅限 latin-1，裸非 ASCII 会令
+        # 响应阶段直接 UnicodeEncodeError——必须走 RFC 5987 filename*=UTF-8''
+        # 扩展并配 ASCII 回退（审查必修项回归）
+        self.fake.payload = b"<svg xmlns='http://www.w3.org/2000/svg'/>"
+        resp = self._get("chat@room/报告/会议纪要.html")
+        self.assertEqual(resp.status_code, 200)
+        cd = resp.headers["content-disposition"]
+        self.assertTrue(cd.startswith("attachment;"))
+        self.assertIn("filename*=UTF-8''", cd)
+        self.assertNotIn("会", cd)  # 裸非 ASCII 不得进入头值
+
     def test_html_served_as_octet_stream_with_attachment(self):
         self.fake.payload = b"<html><body>phishing</body></html>"
         resp = self._get("chat@room/files/page.html")

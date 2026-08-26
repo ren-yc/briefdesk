@@ -9,7 +9,7 @@ get_embed_db 两个模块级入口临时替换为指向临时库的连接（引�
 补丁是进程级的——运行期间其它协程的 DB 调用也会落到临时库。为杜绝生产
 数据误入临时库，进入环境即经 `pipeline.set_processing_paused(True)` 暂停
 生产处理管道：实时消息在基准期间延后到下一轮回填窗口处理（不丢失，水位
-不受影响）；退出 finally **先复位管道标志、再还原 DB 补丁**。
+不受影响）。
 
 临时库落在本次运行专属的 uuid 子目录（`_TMP_ROOT/bench-<hex>/`），退出只
 删除该子目录——共享的 .tmp 根目录内其它内容（如并行 CLI 运行的目录）不受
@@ -62,8 +62,7 @@ async def bench_environment(
 ) -> AsyncIterator[None]:
     """进入基准环境：暂停生产管道 + 临时库（补丁 get_db/get_embed_db）+ AI。
 
-    退出时按顺序恢复：管道标志 → briefdesk.db 补丁 → ai_ports → 连接 → 删除本次
-    子目录。不动 config.db_path、不关闭应用已有的数据库连接。
+    退出恢复顺序见 finally 内注释；不动 config.db_path、不关闭应用已有的数据库连接。
     """
     import briefdesk.db as briefdesk_db
     from briefdesk import pipeline

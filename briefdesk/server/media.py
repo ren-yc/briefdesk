@@ -4,6 +4,8 @@
 下载字节后转发；路径安全校验与图片魔数嗅探也在此。
 """
 
+from urllib.parse import quote
+
 from fastapi import HTTPException
 from fastapi.responses import Response
 
@@ -94,8 +96,14 @@ async def api_media_proxy(source: str, path: str):
     content_type = _resolve_content_type(path, content)
     headers: dict[str, str] = {}
     if content_type == "application/octet-stream":
-        # 非位图一律强制下载而非内联渲染：文件名取 path 基名，
-        # 引号做无害化替换防 Content-Disposition 格式破坏
+        # 非位图一律强制下载而非内联渲染：文件名取 path 基名，引号做无害化
+        # 替换防 Content-Disposition 格式破坏。header 值仅限 latin-1——中文等
+        # 非 ASCII 基名必须走 RFC 5987 的 filename*=UTF-8'' 扩展并配 ASCII
+        # 回退，否则响应阶段即 UnicodeEncodeError（整条下载路径 500）
         filename = path.rsplit("/", 1)[-1].replace('"', "_")
-        headers["Content-Disposition"] = f'attachment; filename="{filename}"'
+        ascii_fallback = filename.encode("ascii", "replace").decode()
+        headers["Content-Disposition"] = (
+            f'attachment; filename="{ascii_fallback}"; '
+            f"filename*=UTF-8''{quote(filename)}"
+        )
     return Response(content=content, media_type=content_type, headers=headers)

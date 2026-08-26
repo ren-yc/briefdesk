@@ -303,11 +303,9 @@ async def _run() -> None:
         await server_task
     finally:
         shutdown_start = time_module.perf_counter()
-        # 清理顺序：停 HTTP 服务任务（异常路径下仍在运行，先取消防清理期间继续
-        # 接请求/收批）→ 取消并等待初始同步任务终结（cancel() 只是请求，不同步
-        # 等待它会与插件关闭、DB 关闭并发交错，产生 closed-client/connection 噪音）
-        # → 插件逆序关闭（消息源监听 + 客户端）→ 关闭数据库连接（停掉 aiosqlite
-        # 非 daemon worker 线程，否则解释器退出 join 挂死）→ 残留任务兜底。
+        # 清理顺序即下方语句序：server → initial_sync → 插件逆序 → DB → 残留兜底。
+        # cancel 不同步等待、aiosqlite 非 daemon 线程等陷阱见 docs/architecture.md
+        # 「运行时与优雅关闭」小节。
         await _reap_task(server_task)
         await _reap_task(initial_sync_task)
         await manager.teardown_all()
