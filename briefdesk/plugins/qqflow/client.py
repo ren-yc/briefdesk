@@ -27,6 +27,7 @@ from briefdesk.sources_base import (
     MediaError,
     SourceClient,
     SourceError,
+    make_sse_timeout,
     with_connect_retry,
 )
 
@@ -182,18 +183,7 @@ class QqFlowClient(SourceClient):
         self.connection_status = "offline"
 
     def sse_timeout(self) -> httpx.Timeout:
-        """SSE 长连接超时：连接 10s、读超时可配置、写/连接池不限。
-
-        ReadTimeout 是 httpx.RequestError 的子类，会被 stream_events 的
-        既有 except 捕获置 offline 并正常结束生成器，由监听器的退避重连
-        循环接管——这是半开连接自愈的关键路径。
-        """
-        return httpx.Timeout(
-            connect=10.0,
-            read=self._sse_read_timeout_s,
-            write=None,
-            pool=None,
-        )
+        return make_sse_timeout(self._sse_read_timeout_s)
 
     @property
     def self_uid(self) -> str:
