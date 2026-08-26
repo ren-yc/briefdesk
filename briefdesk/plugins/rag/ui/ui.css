@@ -198,3 +198,38 @@ body.rag-open .main-layout {
   opacity: .5;
   cursor: not-allowed;
 }
+
+/* ── 进入动画：右侧栏滑入（透明度 + 右移 20px）与布局放宽联动（关闭即时收起） ── */
+/* 曲线与核心浮层 overlayIn 同款 cubic-bezier(.22,1,.36,1) */
+.main-layout {
+  transition: max-width .26s ease;
+}
+
+#rag-drawer:not(.hidden) {
+  animation: ragDrawerIn .26s cubic-bezier(.22, 1, .36, 1) both;
+}
+
+@keyframes ragDrawerIn {
+  from {
+    opacity: 0;
+    transform: translateX(20px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+/* 滑入瞬间右缘可能探出视口（容器与视口边距 16px < 20px），防闪横滚条 */
+body.rag-open {
+  overflow-x: hidden;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  #rag-drawer:not(.hidden) {
+    animation: none;
+  }
+  .main-layout {
+    transition: none;
+  }
+}
