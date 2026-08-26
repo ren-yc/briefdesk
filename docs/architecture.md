@@ -6,7 +6,7 @@
 
 ## 定位
 
-简报台（Brief Desk）is a local web app that monitors group chat messages via pluggable message sources (default: WeFlow HTTP API), classifies them with AI, deduplicates across groups, optionally OCRs attached images, and displays structured, deduplicated information briefs (default categories: 活动通知、社团招新、学术、交易、实习；可在设置中自定义). Multiple sources can run concurrently (each source is a plugin, enabled via `PLUGINS` config).
+简报台（Brief Desk）is a local web app that monitors group chat messages via pluggable message sources (default: WeFlow HTTP API), classifies them with AI, deduplicates across groups, optionally OCRs attached images, and displays structured, deduplicated information briefs (factory default categories: 13 — 活动通知/社团招新/学术/交易/实习 默认启用，另有 失物招领/求助互助/组队拼团/兼职家教/免费福利/房屋租售/志愿公益/奖助申报 出厂停用；空库播种全量，存量库由 `_backfill_default_categories` 按 `PRAGMA user_version` 门控一次性补齐缺失项（不改写已有行）；均可在设置中自定义). Multiple sources can run concurrently (each source is a plugin, enabled via `PLUGINS` config).
 
 ## 总览与数据流
 
