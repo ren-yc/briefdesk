@@ -1,8 +1,9 @@
-/* rag 插件前端：右侧「问一问」聊天侧边栏。
+/* rag 插件前端：右侧「问一问」聊天侧边栏（布局内第三列，打开才显示）。
  *
  * 架构决定：不注册插件视图（registerPluginView），不触碰头部按钮区——
- * 日历按钮/视图系统保持原样；本面板是纯状态抽屉：侧边栏 nav-special 入口
- * 点击开合，Esc 关闭，会话历史保存在内存中。
+ * 日历按钮/视图系统保持原样；本面板是打开时才出现的右侧栏（挂在
+ * .main-layout 第三列，推开列表而非覆盖）：侧边栏 nav-special 入口点击
+ * 开合，Esc 关闭，会话历史保存在内存中。
  * 复用核心全局：esc / escAttr / fetchContext / inlineSvgIcons。
  */
 (function () {
@@ -57,7 +58,8 @@
       + 'placeholder="例如：那个活动的报名截止时间是什么时候？" autocomplete="off"/>'
       + '<button id="rag-send" type="button">发送</button>'
       + "</div>";
-    document.body.appendChild($drawer);
+    const $layout = document.querySelector(".main-layout");
+    ($layout || document.body).appendChild($drawer);
 
     // ── 引用原文上下文浮层（复用核心 fetchContext）──
     $ctxModal = document.createElement("div");
@@ -115,12 +117,14 @@
     open = true;
     $navLink.classList.add("active");
     $drawer.classList.remove("hidden");
+    document.body.classList.add("rag-open");
     $input.focus();
   }
   function closeDrawer() {
     open = false;
     $navLink.classList.remove("active");
     $drawer.classList.add("hidden");
+    document.body.classList.remove("rag-open");
   }
 
   function clearChat() {

@@ -4,23 +4,36 @@
 
 /* ── 侧边栏入口：基础与 active 态均由核心 .cat-link 提供（--cat 缺省回退 --accent） ── */
 
-/* ── 抽屉外壳 ── */
+/* ── 抽屉外壳：布局内右侧栏（打开才显示，推开列表而非覆盖） ── */
+/* 与左侧 .sidebar 同款行为：sticky 于顶部栏下沿、视口高度内滚动 */
 #rag-drawer {
-  position: fixed;
-  top: 0;
-  right: 0;
-  bottom: 0;
-  width: min(420px, 92vw);
+  width: min(420px, 36vw);
+  flex: 0 0 auto;
   display: flex;
   flex-direction: column;
   background: var(--surface);
   border-left: 1px solid var(--border);
-  box-shadow: -8px 0 24px rgba(0, 0, 0, 0.10);
-  z-index: 900;
+  position: sticky;
+  top: 52px;
+  max-height: calc(100vh - 52px);
 }
 
 #rag-drawer.hidden {
   display: none;
+}
+
+/* 展开时放宽布局容器（默认 1060px 放不下 200+420 两栏），列表保持可用宽度 */
+body.rag-open .main-layout {
+  max-width: min(1500px, calc(100vw - 32px));
+}
+
+/* 窄屏回退为覆盖式侧边栏，避免列表被挤出可用空间 */
+@media (max-width: 980px) {
+  body.rag-open .main-layout { max-width: 1060px; }
+  #rag-drawer {
+    position: fixed; top: 0; right: 0; bottom: 0; z-index: 900;
+    max-height: none; width: min(420px, 92vw);
+  }
 }
 
 /* ── 头部 ── */
