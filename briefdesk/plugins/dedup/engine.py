@@ -661,30 +661,38 @@ class DedupEngine(DedupService):
         strong = [c for c in candidates if c[1] >= config.dedup_strong_threshold]
         if strong:
             strong_cand, strong_score = strong[0]
-            verdict = await self._ask_ai(strong_cand, title, source_quote)
-            logger.info(
-                f'  [strong] "{strong_cand.title}" ({metric}: {strong_score * 100:.0f}%): '
-                f'{"SAME" if verdict else "DIFFERENT"}'
-            )
-            if verdict:
+            try:
+                verdict = await self._ask_ai(strong_cand, title, source_quote)
+            except Exception as e:  # noqa: BLE001 — S1 容错：短路判定失败降级参与多数票
+                logger.warning(
+                    f'  [strong] "{strong_cand.title}" 判定失败（{e}），'
+                    "该候选保留参与后续多数票"
+                )
+                verdict = None
+            if verdict is not None:
                 logger.info(
-                    f'SAME → merging source "{source_group}" into {strong_cand.id}'
+                    f'  [strong] "{strong_cand.title}" ({metric}: {strong_score * 100:.0f}%): '
+                    f'{"SAME" if verdict else "DIFFERENT"}'
                 )
-                await merge_source_group(strong_cand.id, source_group)
-                return DedupResult(
-                    is_duplicate=True,
-                    similar_to_id=strong_cand.id,
-                    candidate=self._snapshot(strong_cand),
-                )
-            # 强候选判 DIFFERENT（同文本但内容不同，罕见）：只剔除已判定的
-            # 该候选（④），其余 ≥threshold 候选保留参与多数票——避免连带
-            # 作废其它可能判 SAME 的同文本候选
-            candidates.remove((strong_cand, strong_score))
-            if not candidates:
-                return DedupResult(
-                    is_duplicate=False,
-                    candidate=self._snapshot(strong_cand),
-                )
+                if verdict:
+                    logger.info(
+                        f'SAME → merging source "{source_group}" into {strong_cand.id}'
+                    )
+                    await merge_source_group(strong_cand.id, source_group)
+                    return DedupResult(
+                        is_duplicate=True,
+                        similar_to_id=strong_cand.id,
+                        candidate=self._snapshot(strong_cand),
+                    )
+                # 强候选判 DIFFERENT（同文本但内容不同，罕见）：只剔除已判定的
+                # 该候选（④），其余 ≥threshold 候选保留参与多数票——避免连带
+                # 作废其它可能判 SAME 的同文本候选
+                candidates.remove((strong_cand, strong_score))
+                if not candidates:
+                    return DedupResult(
+                        is_duplicate=False,
+                        candidate=self._snapshot(strong_cand),
+                    )
 
         # 并行判定全部候选，加权多数票（⑦）：票权 = 候选相似度，高相似候选的
         # 判定更可信——SAME 权重和 > 总权重一半才命中，抑制低置信票的干扰

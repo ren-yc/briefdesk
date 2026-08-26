@@ -134,7 +134,6 @@ _ITEM_EXPORT_COLS = [
     "msg_time", "start", "end", "extra_times", "article_url", "source_quote", "is_verified",
 ]
 
-
 def _export_attachment(content: str, media_type: str, filename: str) -> Response:
     return Response(
         content=content,
@@ -143,8 +142,9 @@ def _export_attachment(content: str, media_type: str, filename: str) -> Response
     )
 
 
-# 公式注入前缀：Excel/LibreOffice 会把以此开头的单元格当公式执行（CSV injection）
-_CSV_FORMULA_PREFIXES = ("=", "+", "-", "@", "\t")
+# 公式注入前缀：Excel/LibreOffice 会把以此开头的单元格当公式执行（CSV injection；
+# 审计 #9 补充：\r 开头同样可能被表格应用解释，一并纳入）
+_CSV_FORMULA_PREFIXES = ("=", "+", "-", "@", "\t", "\r")
 
 
 def _csv_cell(value: object) -> object:

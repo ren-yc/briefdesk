@@ -1,0 +1,42 @@
+# 质量门禁：与 AGENTS.md「提交前质量门禁」保持一致
+# 触发：push 到 master / 一切 PR
+# 说明：
+# - 运行环境选 windows-latest，与开发环境一致（keyring 在无桌面会话的
+#   Linux runner 上行为不同，避免平台差异噪音）
+# - 不安装 [ocr] 扩展：rapidocr/onnxruntime 体积大且非必需，
+#   OCR 插件在依赖缺失时自动禁用（PluginDisabledError），测试已覆盖该路径
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+jobs:
+  quality-gates:
+    name: 质量门禁（ruff / mypy / pytest）
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: 安装依赖（editable + dev）
+        run: pip install -e ".[dev]"
+
+      - name: Lint（ruff）
+        run: python -m ruff check briefdesk/ tests/
+
+      - name: 类型检查（mypy）
+        run: python -m mypy briefdesk/ tests/
+
+      - name: 测试（pytest）
+        run: python -m pytest tests/

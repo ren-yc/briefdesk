@@ -396,6 +396,10 @@ async def get_db() -> aiosqlite.Connection:
                 await cursor.close()
                 cursor = await conn.execute("PRAGMA foreign_keys = ON")
                 await cursor.close()
+                # 与向量连接对称（审计 B-1）：embed 连接持写锁落向量期间，
+                # 主连接的写操作短暂等待而非立即抛 "database is locked"
+                cursor = await conn.execute("PRAGMA busy_timeout = 5000")
+                await cursor.close()
                 await conn.commit()
                 try:
                     await validate_schema(conn)

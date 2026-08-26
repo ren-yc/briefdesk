@@ -54,5 +54,12 @@ class AccessLogFormatterTest(unittest.TestCase):
         self.assertIn("/api/items?talker=wxid_123&limit=20", out)
 
 
+    def test_masks_secret_params_case_insensitive(self) -> None:
+        # 大小写变体键名同样必须掩码（审计 #11：原实现仅匹配小写）
+        out = redact_query_string("/api/x?Token=tok-1&APIKey=key-2&AccessToken=acc-3")
+        for secret in ("tok-1", "key-2", "acc-3"):
+            self.assertNotIn(secret, out)
+
+
 if __name__ == "__main__":
     unittest.main()

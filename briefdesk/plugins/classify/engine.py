@@ -52,8 +52,8 @@ def _strip_qr_noise(text: str) -> str:
 _PROMPT_TEMPLATE = """你是校园信息筛选器。从群聊消息中挑出"面向全群、对象模糊、信息完整、可被他人使用"的消息，其余一律排除。
 
 保留：面向全群（对象模糊）且含具体信息（时间、地点、价格、报名/参与方式、联系方式）的消息；个人发起但面向全群的同样保留（二手、组队、求助、寻物招领）。
-排除：定向对话/回复（@某人、回复上一条、两人约见面、互问近况）、仅提问、寒暄、吐槽、表情包、个人经历；只提"讲座""比赛""招新""二手"等词但没有具体信息的同样排除。
-对象模糊性（强制维度）：有明确说话对象的消息一律排除，即使含时间/地点等细节。典型信号——直接对"你"说话（如"你9.15才可以回家"）、第一人称邀约（如"来找我拿零食""来我这儿"）、点名或@某人。判别技巧：消息能否被群内任意陌生成员直接使用？能→保留；只对某个人/某几个有意义的→排除。
+排除：定向对话/回复（@某个具体的人且内容只与其私人事务相关、回复上一条、两人约见面、互问近况）、仅提问、寒暄、吐槽、表情包、个人经历；只提"讲座""比赛""招新""二手"等词但没有具体信息的同样排除。注意：@所有人/@全体成员/@全体 是面向全群的广播信号，此类消息按正常规则判定，不因 @ 符号排除。
+对象模糊性（强制维度）：有明确说话对象的消息一律排除，即使含时间/地点等细节。典型信号——直接对"你"说话（如"你9.15才可以回家"）、第一人称邀约（如"来找我拿零食""来我这儿"）、点名或@某个具体的人（@所有人/@全体成员除外）。判别技巧：消息能否被群内任意陌生成员直接使用？能→保留；只对某个人/某几个有意义的→排除。
 不确定就排除。
 
 类别：
@@ -144,11 +144,22 @@ _MAX_BATCH_CHARS = 40000  # 整批 user 消息字符总量上限（防御性兜�
 _BATCH_DELIMITER = "=" * 3  # 数据边界标记：框定群聊消息数据区（提示词注入缓解）
 
 
-def _build_user_message(groups: list[dict]) -> str:
-    """构建分类 user 消息：数据用边界标记框定，单条/总量按字符截断。"""
+def _build_user_message_ex(groups: list[dict]) -> tuple[str, list[int]]:
+    """构建分类 user 消息：数据用边界标记框定，单条按字符截断、总量按行预算。
+
+    超出 _MAX_BATCH_CHARS 的消息**整条剔除**（而非字符串中段截断），并把
+    被剔除的消息 index 随元组返回——调用方必须将其并入 outcome.failed
+    走回填重试。此前实现做中段截断，被截掉的消息既不出现在 AI 输入也
+    不进 failed，会被 _mark_skipped 当闲聊标记 processed（静默丢失）。
+    """
     parts: list[str] = []
+    total = 0
+    truncated: list[int] = []
     for gi, group in enumerate(groups):
-        lines = [f"群 {gi}: {group['groupName']}"]
+        header = f"群 {gi}: {group['groupName']}"
+        lines: list[str] = [header]
+        group_cost = len(header)
+        kept_any = False
         for msg in group["messages"]:
             text = msg["content"].replace("\n", " ").replace("\r", " ")
             # QR 有效期提示清洗只作用于 OCR 文本（[OCR] 前缀）；普通文本不筛，避免误伤
@@ -158,15 +169,27 @@ def _build_user_message(groups: list[dict]) -> str:
             if len(clean) > _MAX_MSG_CHARS:
                 clean = clean[:_MAX_MSG_CHARS] + "…[已截断]"
             anchor = f" [{msg['sentAt']}]" if msg.get("sentAt") else ""
-            lines.append(f"{msg['index']}: {msg['senderName']}{anchor}: {clean}")
-        parts.append("\n".join(lines))
+            line = f"{msg['index']}: {msg['senderName']}{anchor}: {clean}"
+            cost = len(line) + 1  # 含换行
+            if total + group_cost + cost > _MAX_BATCH_CHARS:
+                truncated.append(msg["index"])
+                continue
+            lines.append(line)
+            group_cost += cost
+            kept_any = True
+        if kept_any:
+            parts.append("\n".join(lines))
+            total += group_cost + 2  # 组间空行
     body = "\n\n".join(parts)
-    if len(body) > _MAX_BATCH_CHARS:
-        body = body[:_MAX_BATCH_CHARS] + "\n…[输入总量已截断]"
     return (
         f"{_BATCH_DELIMITER}\n群聊消息开始\n{_BATCH_DELIMITER}\n"
         f"{body}\n{_BATCH_DELIMITER}\n群聊消息结束\n{_BATCH_DELIMITER}"
-    )
+    ), truncated
+
+
+def _build_user_message(groups: list[dict]) -> str:
+    """兼容包装：仅返回消息文本（测试与既有调用使用）。"""
+    return _build_user_message_ex(groups)[0]
 
 
 # 允许两种格式：带时刻 "YYYY-MM-DD HH:MM" 或仅日期 "YYYY-MM-DD"（日历/徽章可只按天展示）
@@ -706,7 +729,7 @@ async def _classify_once(
     depth: int,
 ) -> ClassifyOutcome:
     groups = _group_messages(messages)
-    user_message = _build_user_message(groups)
+    user_message, budget_dropped = _build_user_message_ex(groups)
 
     logger.info(f"Sending {len(messages)} msgs in {len(groups)} groups to AI...")
 
@@ -756,6 +779,17 @@ async def _classify_once(
         results = [replace(r, msg_index=r.msg_index + offset) for r in results]
         retry_indexes = [i + offset for i in retry_indexes]
         time_indexes = [i + offset for i in time_indexes]
+    if budget_dropped:
+        # S2 防静默丢失：被预算剔除的消息未送分类，必须并入 failed 由
+        # 回填重试——否则会被 _mark_skipped 当闲聊标记 processed
+        logger.warning(
+            "分类输入超出单批字符预算（%d），%d 条消息整条剔除待回填"
+            "（建议调小批大小）: %s",
+            _MAX_BATCH_CHARS,
+            len(budget_dropped),
+            budget_dropped,
+        )
+        retry_indexes = sorted(set(retry_indexes) | {offset + i for i in budget_dropped})
     logger.info(f"Got {len(results)} relevant, {len(retry_indexes)} retry")
     return ClassifyOutcome(results, retry_indexes, time_indexes)
 

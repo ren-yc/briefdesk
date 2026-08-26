@@ -1166,5 +1166,51 @@ class ProcessingPausedGateTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(ok, "恢复后空批应回到默认快速路径")
 
 
+class ProcessAllBatchesAllFailedReturnTest(_StageTestBase):
+    """零产出（全部分类失败）→ 返回 False：调用方不推进水位，
+    失败消息由"最早未处理消息钉窗"在后续轮次找回（审计 #1）。"""
+
+    async def test_all_failed_returns_false(self):
+        db = await aiosqlite.connect(":memory:")
+        db.row_factory = aiosqlite.Row
+        await init_schema(db)
+        try:
+            _install_dedup_stage(_dedup_engine_mock())
+            _install_merge_stage()
+            stages.register_stage(_classify_stage(_outcome_fn([], [0])))
+            with patch(
+                "briefdesk.pipeline.get_enabled_sessions",
+                new=AsyncMock(return_value=[{"session_id": "s"}]),
+            ), patch(
+                "briefdesk.pipeline.get_enabled_categories",
+                new=AsyncMock(return_value=[{"name": "x"}]),
+            ), patch(
+                "briefdesk.pipeline.are_messages_processed",
+                new=AsyncMock(return_value=set()),
+            ), patch(
+                "briefdesk.pipeline.bulk_insert_raw_messages", new=AsyncMock()
+            ), patch(
+                "briefdesk.pipeline.publish_items_updated", new=AsyncMock()
+            ), patch(
+                "briefdesk.pipeline.mark_message_processed", new=AsyncMock()
+            ), patch(
+                "briefdesk.plugins.dedup.plugin.insert_item",
+                new=AsyncMock(return_value="fake-id"),
+            ), patch(
+                "briefdesk.plugins.dedup.plugin.mark_message_processed", new=AsyncMock()
+            ), patch(
+                "briefdesk.db.get_db", new=AsyncMock(return_value=db)
+            ):
+                ok = await process_all_batches(
+                    [_pipeline_msg("m1")],
+                    _pipeline_client(),
+                    batch_size=10,
+                    origin="test",
+                )
+        finally:
+            await db.close()
+        self.assertFalse(ok)
+
+
 if __name__ == "__main__":
     unittest.main()
