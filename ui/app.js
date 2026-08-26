@@ -3600,6 +3600,15 @@ const _CAT_PALETTE = [
   { color: "#EF4444", icon: "/icons/bell.svg" },
   { color: "#8B5CF6", icon: "/icons/bookmark.svg" },
   { color: "#6B7280", icon: "/icons/file.svg" },
+  // 默认十三类的后八类：失物招领/求助互助/组队拼团/兼职家教/免费福利/房屋租售/志愿公益/奖助申报
+  { color: "#DC2626", icon: "/icons/search.svg" },
+  { color: "#EA580C", icon: "/icons/info.svg" },
+  { color: "#0891B2", icon: "/icons/users.svg" },
+  { color: "#CA8A04", icon: "/icons/tag.svg" },
+  { color: "#16A34A", icon: "/icons/check.svg" },
+  { color: "#9333EA", icon: "/icons/layout-grid.svg" },
+  { color: "#0D9488", icon: "/icons/bell-plus.svg" },
+  { color: "#BE185D", icon: "/icons/file-text.svg" },
 ];
 const _CAT_PALETTE_DEFAULT_COLOR = "#6B7280";
 
