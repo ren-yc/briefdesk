@@ -21,6 +21,7 @@ import httpx
 
 from briefdesk.logger import fmt_dur
 from briefdesk.masking import clean_display_name
+from briefdesk.plugins.qqflow.config import QqFlowSettings
 from briefdesk.sources_base import (
     ConnectionStatus,
     MediaError,
@@ -89,7 +90,7 @@ class QqFlowMessage(TypedDict):
     serverId: str  # seq 字符串（与 rowid 无关，不使用）
     localType: int  # 0文本 / 1其他 / 3图片 / 4语音 / 5视频 / 6撤回 / 7系统
     createTime: int  # 秒级 Unix
-    isSend: int  # v1 恒 0，方向不可推导
+    isSend: int  # 方向（上游 40013 列）：1=本人发送；QQ 版本缺列或值非 1/2 时恒 0
     senderUsername: str  # 发送者 UID
     content: str  # 解析后文本（媒体消息为 [image] 等占位符）
     rawContent: str
@@ -134,6 +135,11 @@ _MAX_MEDIA_BYTES = 20 * 1024 * 1024
 # 账号引导的良性状态：已受理/引导中，视为可记忆，索引期内不重复注册
 _BENIGN_STATES = ("accepted", "in_progress", "already_ready")
 
+# 按消息回查 REST（IGNORE_SELF 方向判定）的单页条数：倒序响应下目标消息
+# 之后 120s 窗口内的新消息会把它挤出首页，50 条在刷屏场景不够，
+# 放宽到 200（审查报告【5·P2】）
+_LOOKUP_LIMIT = 200
+
 
 class QqFlowNotReadyError(SourceError):
     """qqflow-server 正在建立索引（503 就绪门控），业务接口暂不可用（瞬态）。
@@ -155,17 +161,39 @@ class QqFlowClient(SourceClient):
         qq: str = "",
         key: str = "",
         db_path: str = "",
+        *,
+        sse_read_timeout_ms: int | None = None,
     ) -> None:
         self._base_url = base_url.rstrip("/")
         self._api_token = api_token
         self._qq = qq
         self._key = key
         self._db_path = db_path
+        # SSE 读超时（毫秒）：缺省读 QQFLOW_SSE_READ_TIMEOUT_MS。
+        # 上游每 15s 发 KeepAlive；半开连接下若无读超时，stream_events 的
+        # aiter_lines 会永久阻塞，重连循环永远得不到控制权（监听静默死亡）
+        if sse_read_timeout_ms is None:
+            sse_read_timeout_ms = QqFlowSettings().sse_read_timeout_ms
+        self._sse_read_timeout_s = sse_read_timeout_ms / 1000
         self._client: httpx.AsyncClient | None = None
         self._ready_checked = False
         # 串行化健康检查 + 引导注册（SSE 强制重检与轮询检查并发竞争时避免重复注册）
         self._ready_lock = asyncio.Lock()
         self.connection_status = "offline"
+
+    def sse_timeout(self) -> httpx.Timeout:
+        """SSE 长连接超时：连接 10s、读超时可配置、写/连接池不限。
+
+        ReadTimeout 是 httpx.RequestError 的子类，会被 stream_events 的
+        既有 except 捕获置 offline 并正常结束生成器，由监听器的退避重连
+        循环接管——这是半开连接自愈的关键路径。
+        """
+        return httpx.Timeout(
+            connect=10.0,
+            read=self._sse_read_timeout_s,
+            write=None,
+            pool=None,
+        )
 
     @property
     def self_uid(self) -> str:
@@ -311,11 +339,14 @@ class QqFlowClient(SourceClient):
                 self._db_path or "<默认>",
             )
             state = await self.register_account(self._qq, self._key, self._db_path)
-            self._ready_checked = True
             if state in _BENIGN_STATES:
+                self._ready_checked = True
                 logger.info(f"qqflow 账号引导中: {state}")
             else:
-                logger.warning(f"qqflow 账号引导被拒: {state}")
+                # 被拒态（invalid_key/invalid_db_path/unknown_qq 等）不记忆化：
+                # 保持未检查标志让下一轮 poll 的 ensure_ready 再次尝试注册；
+                # 否则零账号部署下没有业务 503 兜底复位标志，引导失败后永不自愈
+                logger.warning(f"qqflow 账号引导被拒: {state}（下轮重试）")
 
     # ── REST API ──
 
@@ -376,8 +407,15 @@ class QqFlowClient(SourceClient):
         return members
 
     async def fetch_sessions(self) -> list[QqFlowSession]:
-        """获取所有会话列表。"""
-        data: QqFlowSessionsResponse = await self._get("/api/v1/sessions")
+        """获取所有会话列表。
+
+        显式传大 limit：上游默认 limit=100 且按最后消息时间倒序
+        （qqflow-server-api.md §4），不传参只会发现最近活跃的 100 个会话，
+        更早的会话将永远无法被发现/启用/轮询——与 weflow 同接口的修复对齐。
+        """
+        data: QqFlowSessionsResponse = await self._get(
+            "/api/v1/sessions", params={"limit": 10000}
+        )
         return data["sessions"]
 
     async def fetch_messages(
@@ -415,9 +453,13 @@ class QqFlowClient(SourceClient):
         回查方向信息；用 timestamp 缩小查询范围（向前 120s），在返回的
         消息中匹配 localId == rawid。回查失败/未命中返回 None，由调用方
         fail-open 放行。503 走 QqFlowNotReadyError 瞬态语义。
+        刷屏场景下目标消息可能被窗口内更新的消息挤出首页，limit 放宽到
+        _LOOKUP_LIMIT（200）。
         """
         try:
-            resp = await self.fetch_messages(talker, start=max(0, ts - 120), limit=50)
+            resp = await self.fetch_messages(
+                talker, start=max(0, ts - 120), limit=_LOOKUP_LIMIT
+            )
         except Exception as e:
             # 调用方（SSE 监听器）fail-open 处理并记 WARNING，此处仅 DEBUG 免双重日志
             logger.debug(f"回查消息失败: {e}")
@@ -434,6 +476,11 @@ class QqFlowClient(SourceClient):
 
     # ── SSE 流 ──
 
+    def _push_url(self) -> str:
+        """SSE 推送地址（RFC 3986 join）：base_url 误带路径/查询串时不会拼坏，
+        与 weflow client 及本类 _build_media_url 的拼接策略一致。"""
+        return str(httpx.URL(self._base_url).join("/api/v1/push/messages"))
+
     async def stream_events(self) -> AsyncIterator[QqFlowEvent]:
         """SSE 实时消息流 — 异步迭代器，持续产出解析后的 JSON 事件。
 
@@ -449,12 +496,13 @@ class QqFlowClient(SourceClient):
         logger.debug("SSE 连接中...")
         self.connection_status = "reconnecting"
 
-        # SSE 需要独立的客户端（无限超时）
-        async with httpx.AsyncClient(timeout=httpx.Timeout(None)) as sse_client:
+        # SSE 需要独立的客户端：写/池不限，但保留可配置的读超时
+        # （上游 15s ping，默认 60s = 4 个心跳周期）以自愈半开连接
+        async with httpx.AsyncClient(timeout=self.sse_timeout()) as sse_client:
             try:
                 async with sse_client.stream(
                     "GET",
-                    f"{self._base_url}/api/v1/push/messages",
+                    self._push_url(),
                     headers={
                         **self._auth_headers(),
                         "Accept": "text/event-stream",

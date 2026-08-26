@@ -25,6 +25,13 @@ class WeFlowSettings(BaseSettings):
         default=60000,
         gt=0,  # env: WEFLOW_SSE_RECONNECT_MAX_MS
     )
+    # SSE 读超时（毫秒）：该时长内未收到任何数据即判定连接失效、断开重连。
+    # WeFlow 无心跳机制，默认 5 分钟；半开连接（对端假死/断网无 FIN）下
+    # 若无读超时，SSE 读循环会永久阻塞、监听静默死亡（审查报告【2·P1】）
+    sse_read_timeout_ms: int = Field(
+        default=300000,
+        gt=0,  # env: WEFLOW_SSE_READ_TIMEOUT_MS
+    )
 
     model_config = {
         "env_prefix": "WEFLOW_",  # api_base → WEFLOW_API_BASE

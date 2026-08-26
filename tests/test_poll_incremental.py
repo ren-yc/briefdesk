@@ -24,6 +24,7 @@ from briefdesk.db import (
     mark_message_processed,
     update_session_last_polls,
 )
+from briefdesk.plugins.qqflow.client import QqFlowNotReadyError
 from briefdesk.plugins.qqflow.poller import poll as qq_poll
 from briefdesk.plugins.weflow.poller import poll as we_poll
 from briefdesk.poll_cycle import _compute_session_windows, run_poll_cycle
@@ -396,7 +397,10 @@ class PollCycleWatermarkTest(unittest.IsolatedAsyncioTestCase):
         source.client = Mock()
         source.fetch_history = AsyncMock(
             return_value=SimpleNamespace(
-                contacts=[], sessions=[], messages=[_weflow_msg("m1", 100)]
+                contacts=[],
+                sessions=[],
+                messages=[_weflow_msg("m1", 100)],
+                failed_sessions=set(),
             )
         )
         return source
@@ -436,3 +440,86 @@ class PollCycleWatermarkTest(unittest.IsolatedAsyncioTestCase):
     async def test_success_advances_watermark(self):
         upd = await self._run(pipeline_ok=True)
         upd.assert_awaited_once()  # 正常完成：推进水位
+
+
+class PollCyclePartialFailureTest(unittest.IsolatedAsyncioTestCase):
+    """P0：源侧静默跳过的会话（PollResult.failed_sessions）不推进水位。
+
+    qqflow 索引期 503 等瞬态失败若照常推进会话水位，被跳会话窗口内的消息
+    既未落 raw 也未标 processed，钉窗机制看不到它们 → 永久漏拉。
+    """
+
+    async def _run(self, failed_sessions):
+        source = Mock()
+        source.name = "qqflow"
+        source.client = Mock()
+        source.fetch_history = AsyncMock(
+            return_value=SimpleNamespace(
+                contacts=[],
+                sessions=[],
+                messages=[_weflow_msg("m1", 100)],
+                failed_sessions=failed_sessions,
+            )
+        )
+        with patch(
+            "briefdesk.poll_cycle.get_enabled_sessions",
+            new=AsyncMock(
+                return_value=[
+                    {
+                        "source": "qqflow",
+                        "session_id": sid,
+                        "name": sid,
+                        "is_group": 1,
+                        "is_official": 0,
+                    }
+                    for sid in ("g1", "g2")
+                ]
+            ),
+        ), patch(
+            "briefdesk.poll_cycle._compute_session_windows",
+            new=AsyncMock(return_value={"g1": 0, "g2": 0}),
+        ), patch(
+            "briefdesk.poll_cycle.process_all_batches",
+            new=AsyncMock(return_value=True),
+        ), patch(
+            "briefdesk.poll_cycle.update_session_last_polls",
+            new=AsyncMock(),
+        ) as upd:
+            await run_poll_cycle(source)
+        return upd
+
+    async def test_partial_failed_advances_only_success(self):
+        # g2 拉取失败（如索引期 503 静默跳过）→ 仅 g1 推进水位
+        upd = await self._run({"g2"})
+        upd.assert_awaited_once()
+        advanced = [sid for sid, _ts in upd.await_args.args[1]]
+        self.assertEqual(advanced, ["g1"], "仅成功拉取的会话推进水位")
+
+    async def test_all_failed_skips_watermark(self):
+        # 全部启用会话失败 → 完全不调用 update_session_last_polls
+        upd = await self._run({"g1", "g2"})
+        upd.assert_not_awaited()
+
+
+class QqFlowNotReadyFailureTest(unittest.IsolatedAsyncioTestCase):
+    """P0：qqflow poller 在 503 静默跳过时把对应会话记入 failed_sessions。"""
+
+    async def test_discovery_notready_marks_all_enabled_failed(self):
+        # 发现阶段 503 早退：全部传入的启用会话视为未成功拉取
+        client = _QqFlowClient([])
+        client.fetch_sessions = AsyncMock(side_effect=QqFlowNotReadyError("indexing"))
+        result = await qq_poll(client, _enabled("qqflow", "g1", "g2"), _no_processed)
+        self.assertEqual(result.failed_sessions, {"g1", "g2"})
+
+    async def test_session_fetch_notready_marks_session_failed(self):
+        # 单会话翻页期 503：仅该会话记入 failed_sessions
+        client = _QqFlowClient([])
+        client.fetch_messages = AsyncMock(side_effect=QqFlowNotReadyError("indexing"))
+        result = await qq_poll(client, _enabled("qqflow", "g1"), _no_processed)
+        self.assertEqual(result.failed_sessions, {"g1"})
+
+    async def test_success_has_empty_failed_sessions(self):
+        now = int(time.time())
+        client = _QqFlowClient([_qqflow_msg(1, now - 10)])
+        result = await qq_poll(client, _enabled("qqflow", "g1"), _no_processed)
+        self.assertEqual(result.failed_sessions, set())

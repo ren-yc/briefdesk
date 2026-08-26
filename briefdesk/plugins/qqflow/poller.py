@@ -121,6 +121,9 @@ async def poll(
         ]
     except QqFlowNotReadyError:
         logger.info("qqflow-server 正在建立索引（503），本轮轮询跳过")
+        # 发现阶段即不可用：全部传入的启用会话都视为未成功拉取，
+        # 应用层（poll_cycle）据此跳过它们的水位推进，防窗口消息永久漏拉
+        result.failed_sessions = {s.session_id for s in enabled_sessions}
         return result
 
     result.session_count = len(enabled_sessions)
@@ -277,8 +280,10 @@ async def poll(
             total_self += session_self
 
         except QqFlowNotReadyError:
-            # 索引期偶发 503：静默跳过该会话，保留已收集部分
+            # 索引期偶发 503：静默跳过该会话，保留已收集部分；记入
+            # failed_sessions 让应用层跳过该会话的水位推进（防永久漏拉）
             not_ready_skips += 1
+            result.failed_sessions.add(session_id)
             logger.info(
                 f"  [{session_idx}/{len(enabled_sessions)}] {label}: "
                 "qqflow-server 索引期 503，跳过"

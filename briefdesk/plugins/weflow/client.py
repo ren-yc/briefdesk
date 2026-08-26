@@ -22,6 +22,7 @@ import httpx
 
 from briefdesk.logger import fmt_dur
 from briefdesk.masking import clean_display_name
+from briefdesk.plugins.weflow.config import WeFlowSettings
 from briefdesk.sources_base import (
     ConnectionStatus,
     MediaError,
@@ -147,6 +148,11 @@ logger = logging.getLogger(__name__)
 # 媒体下载大小上限：防止异常/恶意上游返回超大文件造成内存放大
 _MAX_MEDIA_BYTES = 20 * 1024 * 1024
 
+# 按消息回查 REST（SSE 图片 mediaUrl / 文章卡片原始 XML）的单页条数：
+# 倒序响应下目标消息之后 120s 窗口内的新消息会把它挤出首页，
+# 50 条在刷屏场景不够，放宽到 200（审查报告【5·P2】）
+_LOOKUP_LIMIT = 200
+
 
 class WeFlowClient(SourceClient):
     """封装所有 WeFlow API HTTP 通信。"""
@@ -154,11 +160,37 @@ class WeFlowClient(SourceClient):
     name = "weflow"  # 源标识，SourceClient 契约成员
     connection_status: ConnectionStatus = "offline"
 
-    def __init__(self, base_url: str, api_token: str) -> None:
+    def __init__(
+        self,
+        base_url: str,
+        api_token: str,
+        *,
+        sse_read_timeout_ms: int | None = None,
+    ) -> None:
         self._base_url = base_url.rstrip("/")
         self._api_token = api_token
+        # SSE 读超时（毫秒）：缺省读 WEFLOW_SSE_READ_TIMEOUT_MS。
+        # 半开连接（对端假死/断网无 FIN）下若无读超时，stream_events 的
+        # aiter_lines 会永久阻塞，重连循环永远得不到控制权（监听静默死亡）
+        if sse_read_timeout_ms is None:
+            sse_read_timeout_ms = WeFlowSettings().sse_read_timeout_ms
+        self._sse_read_timeout_s = sse_read_timeout_ms / 1000
         self._client: httpx.AsyncClient | None = None
         self.connection_status = "offline"
+
+    def sse_timeout(self) -> httpx.Timeout:
+        """SSE 长连接超时：连接 10s、读超时可配置、写/连接池不限。
+
+        ReadTimeout 是 httpx.RequestError 的子类，会被 stream_events 的
+        既有 except 捕获置 offline 并正常结束生成器，由监听器的退避重连
+        循环接管——这是半开连接自愈的关键路径。
+        """
+        return httpx.Timeout(
+            connect=10.0,
+            read=self._sse_read_timeout_s,
+            write=None,
+            pool=None,
+        )
 
     # ── 内部 ──
 
@@ -211,9 +243,10 @@ class WeFlowClient(SourceClient):
         if not resp.is_success:
             if not_found_ok and resp.status_code == 404:
                 return None
-            body = await resp.aread()
+            # resp.text 按响应声明解码并容错，避免非 UTF-8 错误体让
+            # UnicodeDecodeError 掩盖原始 API 错误（与 qqflow 对齐）
             raise RuntimeError(
-                f"WeFlow API error: {resp.status_code} on {path} — {body.decode()[:200]}"
+                f"WeFlow API error: {resp.status_code} on {path} — {resp.text[:200]}"
             )
         data = resp.json()
 
@@ -246,15 +279,20 @@ class WeFlowClient(SourceClient):
     ) -> WeFlowMessage | None:
         """按 serverId 回查 REST 获取消息原始对象。
 
-        用 timestamp 缩小查询范围（前后各 120s），在返回的消息中匹配
-        serverId == rawid。media 控制是否携带媒体导出参数——注意 WeFlow
-        在 media=True 时会把文章卡片 XML 渲染成占位符（如 "[视频号] 标题"），
-        需要原始 XML 时必须用 media=False 回查。
+        用 timestamp 缩小查询范围（start=ts-120 起，客户端再按 ±120s 过滤），
+        在返回的消息中匹配 serverId == rawid。media 控制是否携带媒体导出参数
+        ——注意 WeFlow 在 media=True 时会把文章卡片 XML 渲染成占位符
+        （如 "[视频号] 标题"），需要原始 XML 时必须用 media=False 回查。
+        回查显式 retry_on_empty=False：miss 是常见路径，不应在监听/回填
+        热路径上为空结果白付 500ms 重试（审查报告【7·P2】）。
         """
         start_ts = int((datetime.fromtimestamp(ts, tz=UTC) - timedelta(seconds=120)).timestamp())
 
         try:
-            resp = await self.fetch_messages(talker, start_ts, limit=50, media=media)
+            resp = await self.fetch_messages(
+                talker, start_ts, limit=_LOOKUP_LIMIT, media=media,
+                retry_on_empty=False,
+            )
         except Exception as e:
             logger.error(f"回查消息失败: {e}")
             raise
@@ -458,6 +496,7 @@ class WeFlowClient(SourceClient):
         limit: int = 500,
         offset: int = 0,
         media: bool = False,
+        retry_on_empty: bool = True,
     ) -> WeFlowMessagesResponse:
         """获取指定会话的历史消息（返回完整信封，含 hasMore）。
 
@@ -470,6 +509,8 @@ class WeFlowClient(SourceClient):
             limit: 单页返回条数
             offset: 分页偏移
             media: 是否导出媒体（图片等），为 True 时附加 media=1&image=1
+            retry_on_empty: 空结果是否 500ms 后重试一次（回查链路应传 False；
+                轮询首页保留默认 True 以维持既有「刚入库查不到」竞态兜底）
         """
         qs = f"talker={talker}&limit={limit}&offset={offset}"
         if start_ts is not None:
@@ -477,7 +518,7 @@ class WeFlowClient(SourceClient):
         if media:
             qs += "&media=1&image=1"
         data: WeFlowMessagesResponse = await self._get(
-            f"/api/v1/messages?{qs}", retry_on_empty=True
+            f"/api/v1/messages?{qs}", retry_on_empty=retry_on_empty
         )
         return data
 
@@ -493,8 +534,8 @@ class WeFlowClient(SourceClient):
         logger.debug("SSE 连接中...")
         self.connection_status = "reconnecting"
 
-        # SSE 需要独立的客户端（无限超时）
-        async with httpx.AsyncClient(timeout=httpx.Timeout(None)) as sse_client:
+        # SSE 需要独立的客户端：写/池不限，但保留可配置的读超时以自愈半开连接
+        async with httpx.AsyncClient(timeout=self.sse_timeout()) as sse_client:
             try:
                 # 同样用 URL join 构建 SSE 地址，避免 _base_url 带路径/查询时拼坏；
                 # WeFlow 文档推荐 SSE 长连接用 ?access_token= 查询参数（与 Bearer 头

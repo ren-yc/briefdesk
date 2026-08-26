@@ -41,6 +41,8 @@ class BatchBuffer:
         self._on_flush = on_flush
         self._timer: asyncio.Task | None = None
         self._started_at: float | None = None
+        # in-flight 批处理任务跟踪：stop 后等待其收尾，避免关停竞态丢批
+        self._inflight: set[asyncio.Task] = set()
 
     def add(self, msg: InternalMessage) -> None:
         if not self._buffer:
@@ -63,7 +65,9 @@ class BatchBuffer:
             batch = self._buffer[:]
             self._buffer.clear()
             self._log_flush(batch)
-            asyncio.create_task(self._safe_flush(batch))
+            task = asyncio.create_task(self._safe_flush(batch))
+            self._inflight.add(task)
+            task.add_done_callback(self._inflight.discard)
 
     async def _safe_flush(self, batch: list[InternalMessage]) -> None:
         """fire-and-forget 安全包装：批处理异常记日志，不产生
@@ -75,6 +79,7 @@ class BatchBuffer:
             logger.exception("批处理失败（%d 条，下轮回填重试）", len(batch))
 
     async def flush(self) -> None:
+        """冲刷缓冲区残余消息并等待 in-flight 批处理收尾（stop 后由 drain 任务调用）。"""
         if self._timer:
             self._timer.cancel()
             self._timer = None
@@ -83,6 +88,9 @@ class BatchBuffer:
             self._buffer.clear()
             self._log_flush(batch)
             await self._on_flush(batch)
+        pending = [t for t in self._inflight if not t.done()]
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
 
     def _log_flush(self, batch: list[InternalMessage]) -> None:
         wait = time_module.perf_counter() - (self._started_at or time_module.perf_counter())
@@ -110,12 +118,16 @@ class QqFlowSseClient(RealtimeListener[QqFlowClient]):
         self._seen: set[tuple[str, str]] = set()
         self._seen_order: deque[tuple[str, str]] = deque()
         # 监听统计（周期/停止时上报）：事件总数、预过滤丢弃数、去重命中数、
-        # IGNORE_SELF 回查判定的自消息数
+        # IGNORE_SELF 回查判定的自消息数；sync/ping 控制事件单独计数、
+        # 不进 INFO 统计行（保持「无消息静默」语义）
         self._stats_events = 0
         self._stats_filtered = 0
         self._stats_deduped = 0
         self._stats_self = 0
+        self._stats_control = 0
         self._stats_task: asyncio.Task | None = None
+        # stop() 启动的收尾冲刷任务（协议要求 stop 为同步方法，故后台执行）
+        self._drain_task: asyncio.Task | None = None
 
     def invalidate_session_cache(self) -> None:
         # 启用会话过滤已收敛到 pipeline 入口（每批实时查询），无缓存可失效；
@@ -136,6 +148,24 @@ class QqFlowSseClient(RealtimeListener[QqFlowClient]):
             self._stats_task.cancel()
         if self._task:
             self._task.cancel()
+        # 冲刷批缓冲残余消息并等待 in-flight 批处理收尾；RealtimeListener 协议
+        # 的 stop 为同步方法，冲刷以受跟踪的后台任务执行，aclose() 可等待其完成。
+        # 注意：runtime.close() 随后会关 HTTP 客户端，在 runtime 接入 aclose 前，
+        # in-flight 批内的 IGNORE_SELF 回查/媒体下载可能因客户端已关而失败
+        # （fail-open/仅日志，可恢复）
+        if self._drain_task is None:
+            self._drain_task = asyncio.create_task(self._final_drain())
+
+    async def _final_drain(self) -> None:
+        try:
+            await self._batch_buffer.flush()
+        except Exception:
+            logger.exception("停止冲刷批缓冲失败（未标记 processed 的消息由回填恢复）")
+
+    async def aclose(self) -> None:
+        """等待 stop() 启动的收尾冲刷完成（幂等；runtime 关客户端前调用可消除竞态）。"""
+        if self._drain_task is not None:
+            await asyncio.gather(self._drain_task, return_exceptions=True)
 
     async def _stats_loop(self) -> None:
         """周期上报监听统计（INFO，默认 60s 一次，无事件时静默）。"""
@@ -196,6 +226,12 @@ class QqFlowSseClient(RealtimeListener[QqFlowClient]):
             await self._handle_event(event)
 
     async def _handle_event(self, event: QqFlowEvent) -> None:
+        # sync（水位对齐）/ping（KeepAlive）是控制事件而非消息：不计入
+        # 事件数与预过滤丢弃数，否则每 15s 心跳会让「无消息静默」统计失效
+        etype = event.get("event", "")
+        if etype in ("sync", "ping"):
+            self._stats_control += 1
+            return
         self._stats_events += 1
         if not pre_filter_sse(event):
             self._stats_filtered += 1
