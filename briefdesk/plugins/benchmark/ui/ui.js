@@ -27,7 +27,7 @@
     const sec = document.createElement("section");
     sec.id = "benchmark-settings-section";
     sec.innerHTML =
-      '<h3 class="settings-section" style="margin-top:18px">基准测试</h3>'
+      '<h3 class="settings-section settings-subsection">基准测试</h3>'
       + '<p class="text-muted settings-hint">把当前筛选的卡片导出为四类基准用例'
       + '（期望 = 卡片当前状态：分类/标题/关键词；去重与合并按共存状态配对；'
       + '已忽略的卡片作为分类噪声样本——AI 误分类的闲聊，模型不应输出分类结果），'
@@ -35,7 +35,7 @@
       + '（含判重/合并命中的正向用例），逐功能覆盖写入插件目录'
       + ' cases/*.fromweb.json，不写数据库。用例数与列表规模成正比，'
       + '请先用筛选控制规模。运行会真实调用 AI，期间请勿触发同步。</p>'
-      + '<div class="about-sources" style="display:flex;gap:8px;flex-wrap:wrap">'
+      + '<div class="about-sources settings-btn-row">'
       + '<button id="bench-import-btn" class="settings-outline-btn">导出当前列表为基准用例</button>'
       + '<button id="bench-record-btn" class="settings-outline-btn">记录处理过程</button>'
       + '<button id="bench-export-recorded-btn" class="settings-outline-btn">导出处理记录</button>'

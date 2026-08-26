@@ -23,7 +23,7 @@
   const history = [];      // 会话内对话历史 [{role, content}]
 
   function buildDom() {
-    // ── 侧边栏入口（与订阅/备忘录同级，挂在 nav-special 顶部）──
+    // ── 侧边栏入口（工具类固定排在视图类之后，nav-special 底部）──
     $navLink = document.createElement("a");
     $navLink.id = "rag-nav-link";
     $navLink.href = "#";
@@ -31,9 +31,9 @@
     $navLink.title = "问一问（向群聊记录提问，带原文引用）";
     $navLink.innerHTML =
       '<span class="cat-link-main"><img src="' + ICON + '" class="icon-sm cat-icon" alt="">问一问</span>';
-    const $memo = document.getElementById("memo-link");
-    if ($memo && $memo.parentNode) {
-      $memo.parentNode.insertBefore($navLink, $memo);
+    const $ignored = document.getElementById("ignored-link");
+    if ($ignored && $ignored.parentNode) {
+      $ignored.parentNode.insertBefore($navLink, $ignored.nextSibling);
     } else {
       const $aside = document.querySelector("aside.sidebar");
       if ($aside) $aside.appendChild($navLink);

@@ -30,16 +30,18 @@
   let $calDayTitle = null;
   let $calDayList = null;
 
-  // ── DOM 构建：按钮插到同步按钮前；视图容器进 main；浮层挂 body ──
+  // ── DOM 构建：入口移到侧边栏「订阅」前（与订阅/备忘录/已忽略同组：
+  // 同类——主内容区视图切换——集中在 nav-special）；视图容器进 main；浮层挂 body ──
   function buildDom() {
-    $calendarBtn = document.createElement("button");
+    $calendarBtn = document.createElement("a");
     $calendarBtn.id = "calendar-btn";
-    $calendarBtn.className = "sync-btn";
+    $calendarBtn.href = "#";
+    $calendarBtn.className = "cat-link";
     $calendarBtn.title = "日历视图（查看带时间的活动/截止安排）";
     $calendarBtn.innerHTML =
-      '<img src="/icons/calendar.svg" class="icon" alt="">日历';
-    const $syncBtn = document.getElementById("sync-btn");
-    if ($syncBtn) $syncBtn.parentNode.insertBefore($calendarBtn, $syncBtn);
+      '<span class="cat-link-main"><img src="/icons/calendar.svg" class="icon-sm cat-icon" alt="">日历</span>';
+    const $subs = document.getElementById("subs-link");
+    if ($subs && $subs.parentNode) $subs.parentNode.insertBefore($calendarBtn, $subs);
 
     $calendarView = document.createElement("div");
     $calendarView.id = "calendar-view";
@@ -278,7 +280,8 @@
 
   // ── 事件绑定 ──
   function bindEvents() {
-    $calendarBtn.addEventListener("click", () => {
+    $calendarBtn.addEventListener("click", (e) => {
+      e.preventDefault();
       if (calendarMode) exitCalendarMode(); else enterCalendarMode();
     });
     $calendarView.addEventListener("click", (e) => {

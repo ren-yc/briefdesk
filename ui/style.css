@@ -1385,6 +1385,16 @@ body.modal-open { overflow: hidden; }
   border: 1px solid var(--border); border-radius: var(--radius-sm); cursor: pointer;
 }
 .settings-outline-btn:hover { background: var(--bg); color: var(--text); }
+/* ── 设置页通用小元素：次级小节标题 / 按钮行 / 行内添加按钮 ── */
+.settings-subsection { margin-top: 18px; }
+.settings-btn-row { gap: 8px; }
+.settings-add-btn {
+  margin: 4px 0 8px; font-size: 13px; padding: 4px 10px;
+  display: inline-flex; align-items: center; gap: 4px;
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: var(--radius-sm); color: var(--text-2); cursor: pointer; font-family: inherit;
+}
+.settings-add-btn:hover { background: var(--bg); color: var(--text); }
 
 /* ── 首次使用向导 ── */
 .onboard-content {
