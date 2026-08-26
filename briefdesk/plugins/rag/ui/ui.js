@@ -45,7 +45,6 @@
     $drawer.id = "rag-drawer";
     $drawer.setAttribute("role", "complementary");
     $drawer.setAttribute("aria-label", "问一问聊天");
-    $drawer.classList.add("hidden");
     $drawer.innerHTML =
       '<div class="rag-drawer-head">'
       + '<h2 class="rag-drawer-title">问一问</h2>'
@@ -116,14 +115,12 @@
   function openDrawer() {
     open = true;
     $navLink.classList.add("active");
-    $drawer.classList.remove("hidden");
     document.body.classList.add("rag-open");
     $input.focus();
   }
   function closeDrawer() {
     open = false;
     $navLink.classList.remove("active");
-    $drawer.classList.add("hidden");
     document.body.classList.remove("rag-open");
   }
 
