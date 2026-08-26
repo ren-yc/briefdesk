@@ -2,7 +2,7 @@
 
 import unittest
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 from briefdesk.plugins.dedup.engine import (
     JUDGE_PROMPT,
@@ -142,6 +142,22 @@ class RemoveItemsTest(unittest.TestCase):
         self.assertTrue(all(it.id != "del" for it in engine._cache))
         self.assertTrue(all(row[0] != "del" for row in engine._pending_embeds))
         self.assertTrue(any(it.id == "keep" for it in engine._cache))
+
+    def test_remove_unknown_ids_is_harmless_noop(self):
+        """路由层 ignore 改发 EVENT_ITEMS_DELETED 后，处理器会对不在缓存的 id
+        触发 remove_items：缺失 id 必须幂等无害（不抛错、不动现有条目）。"""
+        engine = DedupEngine()
+        engine._embed_cache_ok = True
+        engine.add_to_cache("keep", "keep title", [0.1], source_quote="keep desc")
+        before_cache = list(engine._cache)
+        before_pending = list(engine._pending_embeds)
+
+        engine.remove_items(["ghost-a", "ghost-b"])  # 不抛错
+        engine.remove_items([])  # 空列表 no-op
+
+        self.assertEqual(engine._cache, before_cache)
+        self.assertEqual(engine._pending_embeds, before_pending)
+        self.assertEqual(len(engine._cache), 1)
 
 
 class EmbeddingTextTest(unittest.TestCase):
@@ -1071,6 +1087,184 @@ class QuoteShortcutTest(unittest.IsolatedAsyncioTestCase):
             result = await engine.check_dedup("其它标题", "群")
         self.assertFalse(result.is_duplicate)
         merge_mock.assert_not_awaited()
+
+
+class LockEmbedFallbackTest(unittest.IsolatedAsyncioTestCase):
+    """P1 修复回归：q_emb 缺失（preembed 失败/未预嵌）时判重绝不触发远程嵌入。
+
+    check_dedup 运行于 pipeline 存储锁内：此前 q_emb=None 且嵌入就绪会逐条
+    await embed_texts——嵌入端点挂起时以"行数 × SDK 超时"放大锁持有时间。
+    修复后一律降级字符重叠通道，零嵌入调用。"""
+
+    def _engine(self, items):
+        engine = DedupEngine()
+        engine._cache_loaded = True
+        engine._embed_cache_ok = True  # 嵌入功能可用，但本条查询没有预计算向量
+        engine._cache = [
+            CachedItem(id=i, title=t, source_quote=d, embedding=[0.1, 0.2])
+            for i, t, d in items
+        ]
+        return engine
+
+    @staticmethod
+    def _resp(same):
+        return SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content='{"same": true}' if same else '{"same": false}'
+                    ),
+                    finish_reason="stop",
+                )
+            ]
+        )
+
+    async def test_missing_q_emb_never_calls_embed_overlap_channel_hits(self):
+        """无预嵌向量 → 零 embed 调用、零余弦调用；标题逐字相同经 overlap 兜底
+        进 strong 短路判定，行为与有向量时一致。"""
+        engine = self._engine([("o1", "玉言辩论社招新", "位育玉言辩论社招新啦")])
+        embed_mock = AsyncMock(return_value=[[0.5, 0.6]])
+        topk_mock = Mock(side_effect=AssertionError("余弦通道不应被触发"))
+        with (
+            patch("briefdesk.plugins.dedup.engine.embed_texts", new=embed_mock),
+            patch("briefdesk.plugins.dedup.engine.top_k_similar", new=topk_mock),
+            patch(
+                "briefdesk.plugins.dedup.engine.chat",
+                new=AsyncMock(return_value=self._resp(True)),
+            ),
+            patch(
+                "briefdesk.plugins.dedup.engine.merge_source_group", new=AsyncMock()
+            ) as merge_mock,
+        ):
+            result = await engine.check_dedup("玉言辩论社招新", "新生2群")
+        embed_mock.assert_not_awaited()
+        topk_mock.assert_not_called()
+        self.assertTrue(result.is_duplicate)
+        self.assertEqual(result.similar_to_id, "o1")
+        merge_mock.assert_awaited_once_with("o1", "新生2群")
+
+    async def test_missing_q_emb_no_candidate_returns_clean(self):
+        """无预嵌向量且重叠无候选 → 正常返回不判重，仍零嵌入/AI 调用。"""
+        engine = self._engine([("x1", "篮球社招新", "欢迎加入篮球社")])
+        embed_mock = AsyncMock()
+        chat_mock = AsyncMock()
+        with (
+            patch("briefdesk.plugins.dedup.engine.embed_texts", new=embed_mock),
+            patch("briefdesk.plugins.dedup.engine.chat", new=chat_mock),
+            patch(
+                "briefdesk.plugins.dedup.engine.merge_source_group", new=AsyncMock()
+            ),
+        ):
+            result = await engine.check_dedup("完全无关的话题", "新生2群")
+        embed_mock.assert_not_awaited()
+        chat_mock.assert_not_awaited()
+        self.assertFalse(result.is_duplicate)
+
+
+class CandidateErrorIsolationTest(unittest.IsolatedAsyncioTestCase):
+    """单候选 AI 异常不中止整批（P2 低成本修复）：gather 改
+    return_exceptions=True，异常候选按 DIFFERENT 计票（票权 0、总权重不变，
+    加权多数票语义对其余候选保持不变）并打 WARNING。"""
+
+    def _engine(self, items):
+        engine = DedupEngine()
+        engine._cache_loaded = True
+        engine._cache = [
+            CachedItem(id=i, title=t, source_quote=d, embedding=[0.1, 0.2])
+            for i, t, d in items
+        ]
+        return engine
+
+    @staticmethod
+    def _resp(same):
+        return SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content='{"same": true}' if same else '{"same": false}'
+                    ),
+                    finish_reason="stop",
+                )
+            ]
+        )
+
+    @staticmethod
+    def _chat_by_desc(outcome_by_desc):
+        async def fake_chat(messages, **kwargs):
+            user = messages[1]["content"]
+            block_a = user.split("消息B：")[0]
+            desc = block_a.split("内容：", 1)[1].strip()
+            outcome = outcome_by_desc[desc]
+            if isinstance(outcome, Exception):
+                raise outcome
+            return CandidateErrorIsolationTest._resp(bool(outcome))
+
+        return fake_chat
+
+    async def test_vote_survives_single_candidate_error(self):
+        """三候选一票异常：按 DIFFERENT 计票 → 0.85 < 半数 1.275 不判重（不抛错）。"""
+        engine = self._engine(
+            [
+                ("n1", "篮球社招新", "内容甲"),
+                ("n2", "羽毛球社招新", "内容乙"),
+                ("n3", "排球社招新", "内容丙"),
+            ]
+        )
+        outcomes = {
+            "内容甲": True,
+            "内容乙": RuntimeError("判重 API 瞬时故障"),
+            "内容丙": False,
+        }
+        with (
+            patch(
+                "briefdesk.plugins.dedup.engine.top_k_similar",
+                return_value=[(0, 0.85), (1, 0.85), (2, 0.85)],
+            ),
+            patch(
+                "briefdesk.plugins.dedup.engine.chat",
+                new=AsyncMock(side_effect=self._chat_by_desc(outcomes)),
+            ),
+            patch(
+                "briefdesk.plugins.dedup.engine.merge_source_group", new=AsyncMock()
+            ) as merge_mock,
+            self.assertLogs("briefdesk.plugins.dedup.engine", level="WARNING") as logs,
+        ):
+            result = await engine.check_dedup("篮球社招新", "新生2群", q_emb=[0.5, 0.6])
+        self.assertFalse(result.is_duplicate)
+        merge_mock.assert_not_awaited()
+        self.assertTrue(any("按 DIFFERENT" in line for line in logs.output))
+
+    async def test_error_candidate_zero_weight_others_can_still_hit(self):
+        """异常票权重 0 但其余两 SAME 票照常投票：1.7 > 半数 1.275 → 命中 n1。"""
+        engine = self._engine(
+            [
+                ("n1", "篮球社招新", "内容甲"),
+                ("n2", "羽毛球社招新", "内容乙"),
+                ("n3", "排球社招新", "内容丙"),
+            ]
+        )
+        outcomes = {
+            "内容甲": True,
+            "内容乙": RuntimeError("判重 API 瞬时故障"),
+            "内容丙": True,
+        }
+        with (
+            patch(
+                "briefdesk.plugins.dedup.engine.top_k_similar",
+                return_value=[(0, 0.85), (1, 0.85), (2, 0.85)],
+            ),
+            patch(
+                "briefdesk.plugins.dedup.engine.chat",
+                new=AsyncMock(side_effect=self._chat_by_desc(outcomes)),
+            ),
+            patch(
+                "briefdesk.plugins.dedup.engine.merge_source_group", new=AsyncMock()
+            ) as merge_mock,
+        ):
+            result = await engine.check_dedup("篮球社招新", "新生2群", q_emb=[0.5, 0.6])
+        self.assertTrue(result.is_duplicate)
+        self.assertEqual(result.similar_to_id, "n1")
+        merge_mock.assert_awaited_once_with("n1", "新生2群")
 
 
 if __name__ == "__main__":

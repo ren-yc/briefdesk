@@ -4,6 +4,9 @@
 分级 → 同文本短路 → 加权多数票 → 无候选诊断）见 docs/architecture.md
 「核心模块」；每步的就地依据见对应方法内注释。DedupResult 契约类型定义在
 briefdesk/types.py。模块级单例与包装函数保留（实验脚本兼容，见文件尾）。
+
+加权多数票容错：单候选请求异常按 DIFFERENT 计票（权重 0）并打 WARNING，
+不中止整批。
 """
 
 import asyncio
@@ -46,10 +49,11 @@ logger = logging.getLogger(__name__)
 # 不得参与短路。查询与缓存条目双方都须属于本集合才命中。
 _IMAGE_SHORTCUT_SOURCES = frozenset({"weflow"})
 
-# 纯占位符原文（[图片]/[image]/[语音]/[视频]…，与 pipeline 入口过滤语义一致）：
-# 不参与 source_quote 精确短路——占位符原文可对应不同图片（qqflow 同图不同文
-# 场景），此类消息交由 image_urls 短路（源限定）处理，避免同文异图误判。
-_PLACEHOLDER_ONLY_RE = re.compile(r"^\s*\[[^\]]+\]\s*$")
+# 纯占位符原文（[图片]/[image]/[语音]/[视频]…，含多片段拼接的 "[图片][图片]"
+# 重复形，与 pipeline 入口过滤语义一致）：不参与 source_quote 精确短路——
+# 占位符原文可对应不同图片（qqflow 同文异图消息经 source_quote 哈希短路的
+# 误判路径），此类消息交由 image_urls 短路（源限定）处理，避免同文异图误判。
+_PLACEHOLDER_ONLY_RE = re.compile(r"^(?:\s*\[[^\]]+\])+\s*$")
 
 
 @dataclass
@@ -162,8 +166,10 @@ class DedupEngine(DedupService):
     async def ensure_cache(self) -> None:
         """公开预热入口：全量加载历史条目（含嵌入向量），幂等、并发安全。
 
-        启动时调用一次，把耗时的全量嵌入放在管道/存储锁之外；
-        首次 check_dedup 也会经由本方法（等 _warm_lock，避免与预热并发）。
+        启动时调用一次，把耗时的全量嵌入放在管道/存储锁之外；首次 check_dedup
+        也会经由本方法（等 _warm_lock，避免与预热并发）。懒加载兜底仅限进程
+        首个批次的一次性场景（正常路径由 dedup 插件 setup 在服务/源启动前
+        预热）；存储锁内禁止远程嵌入。
         """
         if self._cache_loaded:
             return
@@ -366,6 +372,30 @@ class DedupEngine(DedupService):
         same = data.get("same")
         return same if isinstance(same, bool) else None
 
+    @staticmethod
+    def _flatten_verdicts(
+        candidates: list[tuple[CachedItem, float]],
+        raw_verdicts: list[bool | BaseException],
+    ) -> list[bool]:
+        """gather(return_exceptions=True) 结果整形：异常候选按 DIFFERENT 计票。
+
+        单候选瞬时 API 故障只作废该候选的票（SAME 权重记 0、总权重不变，
+        加权多数票语义对其余候选保持不变），并打 WARNING——不中止整批判定、
+        不把整批消息打回下轮回填。
+        """
+        out: list[bool] = []
+        for (cand, _score), res in zip(candidates, raw_verdicts):
+            if isinstance(res, BaseException):
+                logger.warning(
+                    '候选 "%s" 判重请求异常，按 DIFFERENT 计票: %r',
+                    cand.title,
+                    res,
+                )
+                out.append(False)
+            else:
+                out.append(bool(res))
+        return out
+
     async def _ask_ai(self, a: CachedItem, b_title: str, b_quote: str) -> bool:
         for attempt in (1, 2):
             try:
@@ -424,9 +454,15 @@ class DedupEngine(DedupService):
         source_quote: str = "",
     ) -> DedupResult:
         """判重检查。q_emb 由调用方在锁外预计算（批内一次 API 调用）；
-        None 且嵌入就绪时自行嵌入（回退路径）。image_urls 参与图片精确短路，
-        仅当查询与缓存条目同属 _IMAGE_SHORTCUT_SOURCES（当前仅 weflow）时生效；
-        source_quote 参与原文哈希精确短路（非空且非纯占位符原文，哈希全等时生效）。"""
+        None 时不再锁内补嵌（P1 修复），直接降级字符重叠通道。image_urls 参与
+        图片精确短路，仅当查询与缓存条目同属 _IMAGE_SHORTCUT_SOURCES
+        （当前仅 weflow）时生效；source_quote 参与原文哈希精确短路
+        （非空且非纯占位符原文，哈希全等时生效）。"""
+        # 懒加载兜底（文档化取舍）：正常路径缓存已在 dedup 插件 setup
+        # （HTTP 服务与源启动前）预热完毕；若走到此处首次加载，
+        # _ensure_cache 的全量历史读取与缺失向量远程嵌入会在调用方持有的存储
+        # 锁内执行——仅允许发生在"进程首个批次"的一次性场景，生产由插件
+        # setup 预热规避，勿在此新增其它远程调用。
         await self.ensure_cache()
 
         # ── 图片精确短路：同属限定源的 image_urls 集合完全一致 → 判重，零 AI ──
@@ -476,11 +512,16 @@ class DedupEngine(DedupService):
         # ── 候选选择：嵌入余弦 Top-K（启用且加载成功）或字符重叠单候选（回退/兜底）──
         # 余弦以 fallback 阈值召回（含弱候选区间 [fallback, threshold)），
         # normal/weak 分层在判定前拆分；字符重叠在余弦零候选时兜底。
+        # P1 修复：check_dedup 运行于 pipeline 存储锁内，此处严禁远程嵌入——
+        # q_emb 缺失（批内 preembed_batch 失败或调用方未预嵌）一律降级字符重叠
+        # 通道，绝不在此 await embed_texts（否则嵌入端点挂起会以"行数 × SDK
+        # 超时"串行放大锁持有时间，阻塞管道与卡片删除路由）。
         if q_emb is None and self._embed_cache_ok:
-            try:
-                q_emb = (await embed_texts([_embedding_text(title, source_quote)]))[0]
-            except Exception:
-                logger.warning("本次嵌入失败，回退到字符重叠预过滤", exc_info=True)
+            logger.debug(
+                '判重 "%s" 无预计算向量（批内预嵌失败/未预嵌），'
+                "降级字符重叠通道（锁内禁远程嵌入）",
+                title,
+            )
 
         candidates: list[tuple[CachedItem, float]] = []
         metric = "overlap"
@@ -584,8 +625,15 @@ class DedupEngine(DedupService):
 
         # 弱候选低置信复核（②）：全部候选一致判 SAME 才命中
         if weak_mode:
-            verdicts = await asyncio.gather(
-                *[self._ask_ai(cand, title, source_quote) for cand, _ in candidates]
+            verdicts = self._flatten_verdicts(
+                candidates,
+                await asyncio.gather(
+                    *[
+                        self._ask_ai(cand, title, source_quote)
+                        for cand, _ in candidates
+                    ],
+                    return_exceptions=True,
+                ),
             )
             for (cand, _score), same in zip(candidates, verdicts):
                 logger.info(f'  [weak] "{cand.title}": {"SAME" if same else "DIFFERENT"}')
@@ -642,8 +690,15 @@ class DedupEngine(DedupService):
         # 判定更可信——SAME 权重和 > 总权重一半才命中，抑制低置信票的干扰
         # （实验：串行「任一候选 same 即命中」会把相似但不同信息的噪声放大成
         # 误判）；等权时退化为原 >K/2 规则，单候选退化为一次判定。
-        verdicts = await asyncio.gather(
-            *[self._ask_ai(cand, title, source_quote) for cand, _ in candidates]
+        verdicts = self._flatten_verdicts(
+            candidates,
+            await asyncio.gather(
+                *[
+                    self._ask_ai(cand, title, source_quote)
+                    for cand, _ in candidates
+                ],
+                return_exceptions=True,
+            ),
         )
         for (cand, _score), same in zip(candidates, verdicts):
             logger.info(f'  "{cand.title}": {"SAME" if same else "DIFFERENT"}')
