@@ -40,6 +40,38 @@ class MaskContentTest(unittest.TestCase):
         once = mask_content("电话13800138000 邮箱 a@b.com")
         self.assertEqual(mask_content(once), once)
 
+    # ── 分隔符形态手机号 / 一代身份证 / 全角数字（P2 脱敏绕过修复）──
+
+    def test_phone_with_dashes(self):
+        self.assertEqual(mask_content("联系138-0013-8000谢谢"), "联系[PHONE]谢谢")
+
+    def test_phone_with_spaces(self):
+        self.assertEqual(mask_content("138 0013 8000 找我"), "[PHONE] 找我")
+
+    def test_fullwidth_digits_phone(self):
+        out = mask_content("电话１３８００１３８０００")
+        self.assertIn(PHONE_PLACEHOLDER, out)
+        self.assertNotIn("１３８００１３８０００", out)
+
+    def test_legacy_15_digit_id_card(self):
+        out = mask_content("一代证110105491231002号")
+        self.assertIn(ID_PLACEHOLDER, out)
+        self.assertNotIn("110105491231002", out)
+
+    def test_bankcard_with_spaces(self):
+        out = mask_content("卡号 6222 0202 0000 0000 000 收款")
+        self.assertIn(BANKCARD_PLACEHOLDER, out)
+        self.assertNotIn("6222", out)
+
+    def test_dates_and_room_numbers_untouched(self):
+        # 分隔符容错不得误伤短数字串：日期、房间号等去分隔符后长度不足 11 位
+        text = "2024-01-15 前到 301-302 室"
+        self.assertEqual(mask_content(text), text)
+
+    def test_separator_form_idempotent(self):
+        once = mask_content("138-0013-8000")
+        self.assertEqual(mask_content(once), once)
+
 
 class CleanDisplayNameTest(unittest.TestCase):
     def test_control_chars_removed(self):

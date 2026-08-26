@@ -55,7 +55,6 @@ ocr = [
 ]
 dev = [
     "pytest>=8.3",
-    "pytest-asyncio>=0.24",
     "ruff>=0.9",
     "mypy>=1.11",
     "pip-tools>=7.4",

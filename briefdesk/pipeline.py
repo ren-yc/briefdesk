@@ -40,12 +40,23 @@ from briefdesk.types import BatchContext, InternalMessage
 
 logger = logging.getLogger(__name__)
 
-# 纯附件占位符消息（整条内容为单个方括号片段）：[图片]/[image]/[语音]/[视频]…
-# 与源侧 normalize 的占位符判定语义一致（qqflow 的通用方括号模式；weflow
-# 的 [图片] 亦匹配）。OCR 未启用（enrich 槽位为空）时，这类带图消息无信息
-# 价值，入口直接屏蔽（不落 raw/不进分类/不标记 processed）；图片+文字
-# 混合消息（content 非占位符）不受影响，文字照常处理。
-_PLACEHOLDER_ONLY_RE = re.compile(r"^\s*\[[^\]]+\]\s*$")
+# 纯附件占位符消息（整条内容仅由方括号片段构成）：[图片]/[image]/[语音]/[视频]…
+# 以及多片段拼接的 "[图片][图片]"（重复形）。与源侧 normalize 的占位符判定语义
+# 一致（qqflow 的通用方括号模式；weflow 的 [图片] 亦匹配）。OCR 未启用
+# （enrich 槽位为空）时，这类带图消息无信息价值，入口直接屏蔽（不落 raw/
+# 不进分类/不标记 processed）；图片+文字混合消息（content 非纯占位符）
+# 不受影响，文字照常处理。
+_PLACEHOLDER_ONLY_RE = re.compile(r"^(?:\s*\[[^\]]+\])+\s*$")
+
+# benchmark 门闸：置位后 process_all_batches 直接返回 False（批次保留待回填），
+# 不触 DB/AI；benchmark 插件跑基线时用它冻结实时管道。
+_processing_paused = False
+
+
+def set_processing_paused(paused: bool) -> None:
+    """暂停/恢复消息管道处理（benchmark 契约，签名固定）。"""
+    global _processing_paused
+    _processing_paused = paused
 
 
 def _split_batches(
@@ -98,6 +109,15 @@ async def process_all_batches(
                 config.realtime_batch_max_count，保持原有行为。
             origin: 处理路径标识（"realtime" / "backfill"），仅用于日志
     """
+    # benchmark 暂停门闸：优先于一切处理（含空批快速路径），
+    # 返回 False 让 poll_cycle 跳过水位推进，消息留给回填窗口恢复。
+    if _processing_paused:
+        logger.info(
+            "[pipeline] 处理已暂停（benchmark），本批 %d 条保留待回填",
+            len(messages),
+        )
+        return False
+
     if not messages:
         return True
 

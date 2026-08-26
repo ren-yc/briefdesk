@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import os
 import shutil
+import sqlite3
 import tempfile
 import unittest
 import uuid
@@ -22,9 +23,11 @@ from briefdesk.db import (
     SessionRow,
     _escape_like,
     apply_pending_restore,
+    are_messages_processed,
     backup_db_to,
     bulk_insert_raw_messages,
     close_db,
+    delete_category,
     delete_items,
     get_all_item_texts,
     get_all_sessions,
@@ -42,6 +45,7 @@ from briefdesk.db import (
     get_session_last_polls,
     get_subject_count,
     init_schema,
+    insert_category,
     insert_item,
     item_is_expired,
     load_embeddings,
@@ -49,6 +53,7 @@ from briefdesk.db import (
     merge_source_group,
     set_item_reminder,
     toggle_session,
+    update_category,
     update_item_category,
     update_item_merged,
     update_item_verify,
@@ -1676,6 +1681,224 @@ class EmbeddingsDbTest(unittest.IsolatedAsyncioTestCase):
         await close_db()
         # 关闭后按需重建新连接，数据仍在（同一库文件）
         self.assertEqual((await load_embeddings("m"))["a"], [1.0])
+
+
+# ── 审查修复回归测试（内存库，不触碰应用数据库文件）──
+
+
+class _InMemoryDbTest(unittest.IsolatedAsyncioTestCase):
+    """公共基座：内存库 + get_db/get_embed_db 打桩到该连接。"""
+
+    async def asyncSetUp(self):
+        self.db = await aiosqlite.connect(":memory:")
+        self.db.row_factory = aiosqlite.Row
+        await init_schema(self.db)
+
+    async def asyncTearDown(self):
+        await self.db.close()
+
+    def _patch_db(self):
+        return (
+            patch("briefdesk.db.get_db", new=AsyncMock(return_value=self.db)),
+            patch("briefdesk.db.get_embed_db", new=AsyncMock(return_value=self.db)),
+        )
+
+    @staticmethod
+    def _item(category: str, source_msg_id: str = "m1") -> dict:
+        return {
+            "category": category,
+            "title": "测试卡片",
+            "key_info": "k",
+            "sender_name": "发送者",
+            "source_quote": "quote",
+            "source_group": "群A",
+            "subject": "主体",
+            "source": "weflow",
+            "source_msg_id": source_msg_id,
+            "session_id": "s1",
+            "msg_time": 100,
+            "is_verified": 0,
+            "content_hash": "h",
+        }
+
+
+class CategoryRenameSyncTest(_InMemoryDbTest):
+    """审查修复 #1 回归保护：类别改名必须在同一事务内同步 items.category。"""
+
+    async def test_rename_updates_items_category_in_same_transaction(self):
+        p1, p2 = self._patch_db()
+        with p1, p2:
+            cat = await insert_category("旧类", "提示词", "#111111")
+            await insert_item(self._item("旧类"))
+            updated = await update_category(cat["id"], name="新类")
+        self.assertIsNotNone(updated)
+        self.assertEqual(updated["name"], "新类")
+        cur = await self.db.execute(
+            "SELECT COUNT(*) AS cnt FROM items WHERE category = '新类'"
+        )
+        self.assertEqual((await cur.fetchone())["cnt"], 1)
+        cur = await self.db.execute(
+            "SELECT COUNT(*) AS cnt FROM items WHERE category = '旧类'"
+        )
+        self.assertEqual((await cur.fetchone())["cnt"], 0)
+
+
+class DeleteCategoryPurgeCascadeTest(_InMemoryDbTest):
+    """审查修复 #1 回归保护：purge 级联删三表且 processed_messages 保留。"""
+
+    async def test_purge_deletes_items_raw_embeddings_keeps_processed(self):
+        p1, p2 = self._patch_db()
+        with p1, p2:
+            cat = await insert_category("审查级联类", "提示词", "#222222")
+            item_id = await insert_item(self._item("审查级联类"))
+            await bulk_insert_raw_messages(
+                [
+                    {
+                        "source": "weflow",
+                        "msg_id": "m1",
+                        "session_id": "s1",
+                        "group_name": "群A",
+                        "sender_id": "u1",
+                        "sender_name": "发送者",
+                        "content": "原文",
+                        "timestamp": 100,
+                    }
+                ]
+            )
+            await mark_message_processed("weflow", "m1")
+            await upsert_embeddings([(item_id, "embed-model", [0.1, 0.2])])
+            row, deleted_ids = await delete_category(cat["id"], purge_items=True)
+        self.assertIsNotNone(row)
+        self.assertEqual(deleted_ids, [item_id])
+        for table in ("items", "raw_messages", "item_embeddings"):
+            cur = await self.db.execute(f"SELECT COUNT(*) AS cnt FROM {table}")
+            self.assertEqual((await cur.fetchone())["cnt"], 0, table)
+        cur = await self.db.execute("SELECT COUNT(*) AS cnt FROM processed_messages")
+        self.assertEqual((await cur.fetchone())["cnt"], 1)
+
+
+class DeleteItemsRollbackTest(_InMemoryDbTest):
+    """审查修复 #1a：多步写异常路径必须 rollback，不留悬挂事务。
+
+    悬挂事务会被下一个不相干写操作的 commit 收尾提交（部分写入提前可见），
+    因此异常路径 rollback 后连接必须回到无事务状态。
+
+    注：本机 SQLite >=3.32 变量上限默认 250000，无法靠超长 id 列表触发
+    "too many SQL variables"，故用故障注入让第三步 DELETE 抛错。
+    """
+
+    async def test_failed_multi_step_delete_leaves_no_open_transaction(self):
+        import briefdesk.db as db_mod
+
+        orig_cursor = db_mod._cursor
+
+        def failing_cursor(db, sql, params=()):
+            if sql.startswith("DELETE FROM items WHERE id IN"):
+                raise sqlite3.OperationalError("injected: final delete failed")
+            return orig_cursor(db, sql, params)
+
+        # 先放两张可命中的卡与原文，前两步 DELETE 真实生效、事务已开
+        with patch("briefdesk.db.get_db", new=AsyncMock(return_value=self.db)):
+            item_id = await insert_item(self._item("活动通知"))
+            await bulk_insert_raw_messages(
+                [
+                    {
+                        "source": "weflow",
+                        "msg_id": "m1",
+                        "session_id": "s1",
+                        "group_name": "群A",
+                        "sender_id": "u1",
+                        "sender_name": "发送者",
+                        "content": "原文",
+                        "timestamp": 100,
+                    }
+                ]
+            )
+            with (
+                patch.object(db_mod, "_cursor", new=failing_cursor),
+                self.assertRaises(sqlite3.OperationalError),
+            ):
+                await delete_items([item_id])
+        self.assertFalse(
+            self.db.in_transaction, "多步写失败后必须 rollback，不得残留悬挂事务"
+        )
+        # 回滚后数据完好：items/raw_messages 行仍在，连接可用
+        cur = await self.db.execute("SELECT COUNT(*) AS cnt FROM items")
+        self.assertEqual((await cur.fetchone())["cnt"], 1)
+        cur = await self.db.execute("SELECT COUNT(*) AS cnt FROM raw_messages")
+        self.assertEqual((await cur.fetchone())["cnt"], 1)
+
+
+class AreMessagesProcessedChunkTest(unittest.IsolatedAsyncioTestCase):
+    """审查修复 #6：are_messages_processed 按 900 条分块防 SQLite 变量上限。
+
+    本机 SQLite 3.51 变量上限为 32766（>=3.32），1100 个 id 单次查询不会崩，
+    崩溃路径的 RED 无法在本机复现；故直接对分块行为做参数化断言。
+    """
+
+    async def test_chunks_queries_to_900_ids_max(self):
+        calls: list[tuple] = []
+
+        async def fake_fetchall(db, sql, params=()):
+            calls.append(params)
+            return [{"msg_id": p} for p in params[1:]]
+
+        ids = [f"m{i}" for i in range(1100)]
+        with patch("briefdesk.db.get_db", new=AsyncMock()), patch(
+            "briefdesk.db._fetchall", new=fake_fetchall
+        ):
+            got = await are_messages_processed("weflow", ids)
+
+        self.assertEqual(got, set(ids))
+        self.assertEqual(len(calls), 2)  # ceil(1100/900) = 2 次
+        for params in calls:
+            self.assertLessEqual(len(params) - 1, 900)
+
+    async def test_small_batch_single_query_unchanged(self):
+        calls: list[tuple] = []
+
+        async def fake_fetchall(db, sql, params=()):
+            calls.append(params)
+            return [{"msg_id": p} for p in params[1:]]
+
+        ids = ["a", "b"]
+        with patch("briefdesk.db.get_db", new=AsyncMock()), patch(
+            "briefdesk.db._fetchall", new=fake_fetchall
+        ):
+            got = await are_messages_processed("weflow", ids)
+
+        self.assertEqual(got, {"a", "b"})
+        self.assertEqual(len(calls), 1)
+
+
+class AreMessagesProcessedLargeSetTest(_InMemoryDbTest):
+    """审查修复 #6 端到端：1100 个 id 全部已处理 → 返回全集（首跑即绿的保护性测试）。"""
+
+    async def test_1100_processed_ids_all_found(self):
+        with patch("briefdesk.db.get_db", new=AsyncMock(return_value=self.db)):
+            for i in range(1100):
+                await mark_message_processed("weflow", f"m{i}")
+            got = await are_messages_processed("weflow", [f"m{i}" for i in range(1100)])
+        self.assertEqual(len(got), 1100)
+
+
+class SetItemReminderClearMutexTest(_InMemoryDbTest):
+    """审查修复 #7：清除提醒仅在已有提醒时命中——rowcount 才能当多标签页互斥判据。"""
+
+    async def test_clear_when_no_reminder_returns_false(self):
+        with patch("briefdesk.db.get_db", new=AsyncMock(return_value=self.db)):
+            item_id = await insert_item(self._item("活动通知"))
+            changed = await set_item_reminder(item_id, None)
+        self.assertFalse(changed, "无提醒时清除不应命中（否则多标签页互斥失效）")
+
+    async def test_clear_existing_then_second_clear_false(self):
+        with patch("briefdesk.db.get_db", new=AsyncMock(return_value=self.db)):
+            item_id = await insert_item(self._item("活动通知"))
+            self.assertTrue(await set_item_reminder(item_id, "2026-08-15 10:00"))
+            first_clear = await set_item_reminder(item_id, None)
+            second_clear = await set_item_reminder(item_id, None)
+        self.assertTrue(first_clear)
+        self.assertFalse(second_clear, "第二次清除不得命中（已被第一个标签页清掉）")
 
 
 if __name__ == "__main__":
