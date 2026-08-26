@@ -666,6 +666,18 @@ class RagAskTest(_MemoryEngineBase):
         self.assertEqual(result.citations, [])
         self.provider.chat.assert_not_awaited()
 
+    async def test_json_contract_answer(self):
+        # deepseek 系 json_object 输出：JSON 契约解析优先
+        self.provider.chat = AsyncMock(
+            return_value=_chat_response(
+                '{"answer": "活动在周六6点举行 [1]。", "citations": [1]}'
+            )
+        )
+        result = await self.engine.ask("周六6点开会有通知")
+        self.assertFalse(result.refused)
+        self.assertEqual(result.answer, "活动在周六6点举行 [1]。")
+        self.assertEqual([c["msg_id"] for c in result.citations], ["m1"])
+
     async def test_chat_failure_propagates(self):
         self.provider.chat = AsyncMock(side_effect=RuntimeError("ai down"))
         with self.assertRaises(RuntimeError):

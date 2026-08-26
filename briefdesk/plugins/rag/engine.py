@@ -561,14 +561,31 @@ class RagEngine:
         content = ""
         if getattr(resp, "choices", None):
             content = (resp.choices[0].message.content or "").strip()
-        cited = {
-            int(m.group(1))
-            for m in self._CITE_RE.finditer(content)
-            if 1 <= int(m.group(1)) <= len(hits)
-        }
+        # 双态解析：deepseek 系强制 json_object 输出 → 优先 JSON 契约；
+        # 其它供应商纯文本 → 回退 [n] 正则（兼容两路）
+        answer = content
+        cited: set[int] = set()
+        parsed = ai_ports.loads_json(content)
+        if isinstance(parsed, dict) and isinstance(parsed.get("answer"), str):
+            answer = parsed["answer"].strip()
+            nums = parsed.get("citations")
+            if isinstance(nums, list):
+                for n in nums:
+                    try:
+                        v = int(n)
+                    except (TypeError, ValueError):
+                        continue
+                    if 1 <= v <= len(hits):
+                        cited.add(v)
+        if not cited:
+            cited = {
+                int(m.group(1))
+                for m in self._CITE_RE.finditer(content)
+                if 1 <= int(m.group(1)) <= len(hits)
+            }
         nums = sorted(cited) if cited else list(range(1, len(hits) + 1))
         citations = [self._citation(n, hits[n - 1]) for n in nums]
-        return AskResult(refused=False, answer=content, citations=citations)
+        return AskResult(refused=False, answer=answer, citations=citations)
 
 
 _instance: RagEngine | None = None
