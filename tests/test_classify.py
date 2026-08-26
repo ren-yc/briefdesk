@@ -1163,7 +1163,7 @@ class ClassifyBatchTruncationFailedTest(unittest.IsolatedAsyncioTestCase):
         n = 60  # 单条被截到 ~810 字符/行，60 条必触顶 40000 预算
         messages = [
             InternalMessage(
-                msg_id=("m%d" % i),
+                msg_id=(f"m{i}"),
                 content=("首条" if i == 0 else "长" * 1000),
                 sender_name="张三",
                 sender_id="u1",

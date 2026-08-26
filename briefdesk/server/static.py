@@ -7,9 +7,9 @@
 
 import os
 
-from fastapi import HTTPException
 from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from briefdesk.server.app import app
 
@@ -28,10 +28,14 @@ class _SpaStaticFiles(StaticFiles):
     async def get_response(self, path: str, scope) -> Response:
         try:
             return await super().get_response(path, scope)
-        except HTTPException:
-            # 未知 /api/* 保持 404 JSON，不伪装成 SPA 首页
-            if path == "api" or path.startswith("api/"):
-                raise
+        except StarletteHTTPException:
+            # 必须捕 starlette 基类：StaticFiles raise 的是 starlette.exceptions.HTTPException，
+            # fastapi.HTTPException 是其子类——此前 except 恒不匹配，fallback 从未生效
+            normalized = path.replace("\\", "/")  # starlette>=1.3 Windows 会传反斜杠 path
+            if normalized == "api" or normalized.startswith("api/"):
+                raise  # 未知 /api/* 保持 404 JSON，不伪装成 SPA 首页
+            if os.path.splitext(normalized)[1]:
+                raise  # 带扩展名的资源 404 即 404：200+text/html 应答脚本会触发严格 MIME 告警
             return FileResponse(os.path.join(_UI_DIR, "index.html"))
 
 

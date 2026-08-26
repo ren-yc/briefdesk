@@ -47,13 +47,21 @@ def register_plugin_assets(name: str, directory: str) -> None:
     _plugin_assets[name] = directory
 
 
+_included_router_ids: set[int] = set()
+
+
 def include_plugin_router(router: APIRouter) -> None:
     """挂载 Web 插件路由：展开 APIRoute 并插到静态 SPA mount 之前。
 
     新版 Starlette 的 include_router 生成惰性 _IncludedRouter（path 为空、
     挂在 routes 尾部），会被 SPA 兜底 mount 截胡——这里直接展开路由并
     前移到 mount 之前（main 装配与测试共用）。
+    同一 router 重复调用幂等跳过：按 id() 记录（APIRouter 定义了 __eq__
+    不可哈希、无法用 WeakSet；router 均为插件模块级长生命周期实例）。
     """
+    key = id(router)
+    if key in _included_router_ids:
+        return
     moved = list(router.routes)
     idx = len(app.routes)
     for i, r in enumerate(app.routes):
@@ -61,6 +69,7 @@ def include_plugin_router(router: APIRouter) -> None:
             idx = i
             break
     app.routes[idx:idx] = moved
+    _included_router_ids.add(key)
 
 
 @app.get("/plugin-assets/{name}/{path:path}")

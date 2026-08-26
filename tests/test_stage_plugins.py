@@ -8,7 +8,8 @@ from unittest.mock import AsyncMock, Mock, patch
 from briefdesk import ai_ports, stages
 from briefdesk.config import Settings
 from briefdesk.events import EVENT_ITEMS_DELETED
-from briefdesk.plugin.base import PluginContext
+from briefdesk.plugin.base import PluginContext, PluginError
+from briefdesk.plugin.manager import PluginManager
 from briefdesk.plugins.ai_provider.plugin import AiProviderPlugin
 from briefdesk.plugins.classify.plugin import ClassifyPlugin
 from briefdesk.plugins.dedup.plugin import DedupPlugin
@@ -212,3 +213,148 @@ class AiProviderPluginTest(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(RuntimeError):
             await ai_ports.chat([], temperature=0.1, max_tokens=8)
         self.assertFalse(ai_ports.is_embedding_enabled())  # 启用性检查安全返回 False
+
+
+class _NoEntryPoints(list):
+    """空 entry point 列表桩（manager 只调用 .select(group=...)）。"""
+
+    def select(self, *, group=None, name=None):
+        return []
+
+
+def _mgr_settings(*, required=None):
+    return Settings(
+        plugins=["boom", "dep"],
+        plugins_disabled=[],
+        plugins_required=list(required or []),
+        plugin_path="",
+    )
+
+
+class PluginManagerRollbackTest(unittest.IsolatedAsyncioTestCase):
+    """P2 修复：setup/activate 非 PluginDisabledError 失败时 best-effort 调一次
+    plugin.teardown() 回收半装配副作用再标 failed；依赖方照常 disabled 降级、
+    REQUIRED 名单失败仍致命（PluginError 中止装配）。"""
+
+    class _Boom:
+        """setup/activate 可注入失败的假插件（记录生命周期事件序）。"""
+
+        def __init__(self, fail_in="setup"):
+            self.name = "boom"
+            self.version = "0.0.1"
+            self.dependencies = ()
+            self.fail_in = fail_in
+            self.events = []
+
+        async def setup(self, ctx):
+            self.events.append("setup")
+            if self.fail_in == "setup":
+                raise RuntimeError("setup 半途爆炸")
+
+        async def activate(self, ctx):
+            self.events.append("activate")
+            if self.fail_in == "activate":
+                raise RuntimeError("activate 爆炸")
+
+        async def teardown(self):
+            self.events.append("teardown")
+
+    class _Dep:
+        name = "dep"
+        version = "0.0.1"
+        dependencies = ("boom",)
+
+        async def setup(self, ctx): ...
+        async def activate(self, ctx): ...
+        async def teardown(self): ...
+
+    def setUp(self):
+        self._eps_patcher = patch(
+            "importlib.metadata.entry_points", return_value=_NoEntryPoints([])
+        )
+        self._eps_patcher.start()
+
+    def tearDown(self):
+        self._eps_patcher.stop()
+
+    async def test_setup_failure_triggers_teardown_and_dependent_disabled(self):
+        boom = self._Boom(fail_in="setup")
+        manager = PluginManager(_mgr_settings())
+        manager.register(boom)
+        manager.register(self._Dep())
+        ctx, _ = _ctx()
+        await manager.setup_all(ctx)
+        # 半装配副作用被回收：teardown 恰好一次（在标 failed 之前）
+        self.assertEqual(boom.events, ["setup", "teardown"])
+        self.assertEqual(manager.records()["boom"].status, "failed")
+        # 后续依赖插件仍降级 disabled，不被波及为 fatal
+        rec = manager.records()["dep"]
+        self.assertEqual(rec.status, "disabled")
+        self.assertIn("依赖未就绪", rec.reason)
+
+    async def test_required_setup_failure_fatal_after_teardown(self):
+        boom = self._Boom(fail_in="setup")
+        manager = PluginManager(_mgr_settings(required=["boom"]))
+        manager.register(boom)
+        ctx, _ = _ctx()
+        with self.assertRaises(PluginError):
+            await manager.setup_all(ctx)
+        # REQUIRED 致命路径同样先回收副作用
+        self.assertIn("teardown", boom.events)
+
+    async def test_activate_failure_best_effort_teardown(self):
+        boom = self._Boom(fail_in="activate")
+        manager = PluginManager(_mgr_settings())
+        manager.register(boom)
+        ctx, _ = _ctx()
+        await manager.setup_all(ctx)
+        await manager.activate_all(ctx)
+        self.assertEqual(boom.events, ["setup", "activate", "teardown"])
+        rec = manager.records()["boom"]
+        self.assertEqual(rec.status, "failed")
+        self.assertIn("activate 失败", rec.reason)
+        # 幂等叠加契约：该插件仍在 _load_order，关闭期 teardown_all 会按幂等
+        # 契约再调一次 → teardown 总调用次数 == 2（best-effort 回收 + 收尾）
+        await manager.teardown_all()
+        self.assertEqual(boom.events.count("teardown"), 2)
+
+
+class PluginDisabledNoTeardownTest(unittest.IsolatedAsyncioTestCase):
+    """PluginDisabledError 自禁用发生在获取资源之前，不走 teardown 回收。"""
+
+    def setUp(self):
+        self._eps_patcher = patch(
+            "importlib.metadata.entry_points", return_value=_NoEntryPoints([])
+        )
+        self._eps_patcher.start()
+
+    def tearDown(self):
+        self._eps_patcher.stop()
+
+    async def test_self_disable_skips_rollback_teardown(self):
+        calls = []
+
+        class P:
+            name = "p"
+            version = "0.1"
+            dependencies = ()
+
+            async def setup(self, ctx):
+                calls.append("setup")
+                from briefdesk.plugin.base import PluginDisabledError
+
+                raise PluginDisabledError("缺少必填配置")
+
+            async def activate(self, ctx): ...
+            async def teardown(self):
+                calls.append("teardown")
+
+        settings = Settings(
+            plugins=["p"], plugins_disabled=[], plugins_required=[], plugin_path=""
+        )
+        manager = PluginManager(settings)
+        manager.register(P())
+        ctx, _ = _ctx()
+        await manager.setup_all(ctx)
+        self.assertEqual(calls, ["setup"])  # 无 teardown 回收
+        self.assertEqual(manager.records()["p"].status, "disabled")

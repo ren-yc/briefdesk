@@ -37,7 +37,8 @@ from briefdesk.types import ContactInfo, PollResult, SessionInfo
 logger = logging.getLogger(__name__)
 
 # 翻页守卫：单页条数 × 页数上限，防异常状态下的无界循环
-# （所有窗口模式共用；与 qqflow poller 一致，全量上限更高）
+# （本文件所有窗口模式统一用 _MAX_PAGES；注意与 qqflow poller 不同：
+#   qqflow 常规模式单会话仅 100 页，仅 BACKFILL_HOURS=-1 全量放宽到 2000 页）
 _PAGE_LIMIT = 500
 _MAX_PAGES = 2000
 

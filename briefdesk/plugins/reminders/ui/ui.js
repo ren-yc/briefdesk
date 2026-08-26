@@ -71,6 +71,14 @@
 
   async function setReminderApi(id, atOrNull, { silent = false } = {}) {
     try {
+      // 首次设提醒前同步申请桌面通知权限（页面后台时的到期提醒依赖它）：
+      // Firefox 要求权限弹窗绑定 user activation，放到 await fetch 之后
+      // 激活态可能已被消费而静默不弹（审查 A4）。仅 default 态请求；点击
+      // 菜单已是强意图信号，设置失败多弹一次可接受。拒绝/失败静默降级——
+      // 前台 toast 提醒始终可用。
+      if ("Notification" in window && Notification.permission === "default") {
+        try { Notification.requestPermission().catch(() => { }); } catch { /* 忽略 */ }
+      }
       const res = await fetch("/api/items/" + encodeURIComponent(id) + "/reminder", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -162,6 +170,28 @@
     }
   }
 
+  // 到期提醒「查看」跳转：备忘录卡 → 备忘录视图；其余卡（未处理等，提醒
+  // 可设在任意卡片上）→ 主列表全部视图后定位并高亮该卡片
+  function locateDueItem(it) {
+    exitPluginViews();
+    if (it.is_verified === 1) {
+      $memoLink.click();
+      return;
+    }
+    const navAll = document.querySelector('.cat-link[data-category="全部"][data-verified="unverified"]');
+    if (navAll) navAll.click();
+    setTimeout(() => {
+      const card = document.querySelector('.item-card[data-id="' + CSS.escape(String(it.id)) + '"]');
+      if (!card) {
+        showToast("该卡片不在当前列表首页，可在搜索框输入标题查找", { type: "info", duration: 5000 });
+        return;
+      }
+      card.scrollIntoView({ block: "center", behavior: "smooth" });
+      card.classList.add("card-new");
+      setTimeout(() => card.classList.remove("card-new"), 4000);
+    }, 600);
+  }
+
   // ── 到期轮询：与列表加载状态解耦（任意分类/页面的提醒都能触发）──
   function startReminderTimer() {
     if (remindTimer) clearInterval(remindTimer);
@@ -205,7 +235,7 @@
             type: "info",
             duration: 8000,
             actionLabel: "查看",
-            actionFn: () => { exitPluginViews(); $memoLink.click(); },
+            actionFn: () => locateDueItem(it),
           });
         }
         document.querySelectorAll('[data-id="' + CSS.escape(String(it.id)) + '"] .btn-remind').forEach(b => {

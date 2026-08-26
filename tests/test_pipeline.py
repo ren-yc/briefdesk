@@ -9,7 +9,11 @@ import aiosqlite
 from briefdesk import stages
 from briefdesk.config import config
 from briefdesk.db import init_schema
-from briefdesk.pipeline import _split_batches, process_all_batches
+from briefdesk.pipeline import (
+    _split_batches,
+    process_all_batches,
+    set_processing_paused,
+)
 from briefdesk.plugin.base import PluginContext
 from briefdesk.plugins.dedup.engine import build_item_input
 from briefdesk.plugins.dedup.plugin import DedupPlugin
@@ -773,6 +777,47 @@ class ImageFilterWhenNoEnrichTest(_StageTestBase):
         self.assertEqual(seen, [["m1", "m2"]], "图片+文字混合消息照常处理")
         self.assertEqual(raw_rows, ["m1", "m2"])
 
+    async def test_multi_placeholder_image_filtered_without_enrich(self):
+        # "[图片][图片]" 多片段占位拼接同样视为纯占位符图片消息（正则重复形）
+        seen = []
+
+        async def classify(messages):
+            seen.append([m.msg_id for m in messages])
+            return ClassifyOutcome([], [])
+
+        raw_rows = []
+        await self._run(
+            [
+                self._img_msg("m1", content="[图片][图片]"),
+                _pipeline_msg("m2", session_id="s1"),
+            ],
+            classify,
+            raw_rows,
+        )
+        self.assertEqual(seen, [["m2"]], "多片段占位图片消息不进分类")
+        self.assertEqual(raw_rows, ["m2"], "多片段占位图片消息不落 raw")
+
+    async def test_mixed_placeholder_text_kept_without_enrich(self):
+        # "[图片] 说明文字" 混合消息不受屏蔽（文字仍有信息价值）
+        seen = []
+
+        async def classify(messages):
+            seen.append([m.msg_id for m in messages])
+            return ClassifyOutcome([], [])
+
+        raw_rows = []
+        with patch.object(config, "realtime_batch_max_count", 10):
+            await self._run(
+                [
+                    self._img_msg("m1", content="[图片] 这是说明"),
+                    _pipeline_msg("m2", session_id="s1"),
+                ],
+                classify,
+                raw_rows,
+            )
+        self.assertEqual(seen, [["m1", "m2"]], "占位符+文字混合消息照常处理")
+        self.assertEqual(raw_rows, ["m1", "m2"])
+
     async def test_placeholder_image_kept_with_enrich(self):
         # OCR 启用（enrich 槽位非空）时纯占位符图片消息不屏蔽：交由 OCR 阶段识别
         seen = []
@@ -1151,6 +1196,28 @@ class ConversationMergeStageTest(unittest.IsolatedAsyncioTestCase):
             merged, judge_mock = await self._store(msg, result, True)
         self.assertEqual(merged, 0)
         judge_mock.assert_not_called()
+
+
+class ProcessingPausedGateTest(unittest.IsolatedAsyncioTestCase):
+    """benchmark 门闸（契约 E）：set_processing_paused(True) 后
+    process_all_batches 直接返回 False，不触 DB/AI，批次保留待回填；
+    恢复后行为复原。"""
+
+    def tearDown(self):
+        set_processing_paused(False)
+
+    async def test_paused_returns_false_and_stays_paused(self):
+        set_processing_paused(True)
+        # 空批在未暂停时本应返回 True；暂停门闸优先，且状态不被消费（连续两次均 False）
+        ok1 = await process_all_batches([], _pipeline_client(), origin="test")
+        ok2 = await process_all_batches([], _pipeline_client(), origin="test")
+        self.assertFalse(ok1)
+        self.assertFalse(ok2, "暂停中不应被空批调用自动恢复")
+
+    async def test_resume_restores_true_for_empty_batch(self):
+        set_processing_paused(False)
+        ok = await process_all_batches([], _pipeline_client(), origin="test")
+        self.assertTrue(ok, "恢复后空批应回到默认快速路径")
 
 
 class ProcessAllBatchesAllFailedReturnTest(_StageTestBase):

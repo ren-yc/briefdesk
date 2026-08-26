@@ -116,9 +116,21 @@ class QqFlowSource(SourceRuntime[QqFlowClient]):
         self.listener.start()
 
     async def close(self) -> None:
-        """停止监听并关闭客户端（幂等）。"""
+        """停止监听并关闭客户端（幂等）。
+
+        顺序：stop（取消连接/统计任务并启动收尾冲刷）→ aclose（等待缓冲
+        残余消息冲刷与 in-flight 批处理完成）→ 关 HTTP 客户端。aclose 先于
+        client.close()，消除关停竞态：in-flight 批内的 IGNORE_SELF 回查/
+        媒体下载不再撞上已关闭的客户端。
+        """
         if self.listener is not None:
             self.listener.stop()
+            # RealtimeListener 协议只约束同步 stop()；aclose 是本仓库监听器
+            # 的扩展收尾钩子，经 getattr 防御调用以保持对协议鸭子实现兼容
+            # （缺失时退回旧语义：冲刷任务在后台自行完成）
+            drain = getattr(self.listener, "aclose", None)
+            if drain is not None:
+                await drain()
             self.listener = None
         await self.client.close()
         logger.info("[qqflow] 已关闭")

@@ -4,7 +4,7 @@
 下载字节后转发；路径安全校验与图片魔数嗅探也在此。
 """
 
-import mimetypes
+from urllib.parse import quote
 
 from fastapi import HTTPException
 from fastapi.responses import Response
@@ -41,7 +41,7 @@ _IMAGE_MAGIC: tuple[tuple[bytes, str], ...] = (
 )
 
 
-def _sniff_content_type(content: bytes, fallback: str) -> str:
+def _sniff_content_type(content: bytes, fallback: str = "") -> str:
     """按魔数嗅探图片类型；识别失败返回 fallback。"""
     if content.startswith(b"RIFF") and content[8:12] == b"WEBP":
         return "image/webp"
@@ -49,6 +49,29 @@ def _sniff_content_type(content: bytes, fallback: str) -> str:
         if content.startswith(magic):
             return ctype
     return fallback
+
+
+# 允许内联展示的安全位图类型（与魔数嗅探集合一致）。
+# SVG/HTML 等可承载脚本的类型一律不在此列：聊天媒体内容完全不可信，
+# 以 image/svg+xml 或 text/html 在平台同源下渲染即打开 XSS 面。
+_SAFE_IMAGE_TYPES = frozenset(
+    {"image/png", "image/jpeg", "image/gif", "image/webp", "image/bmp"}
+)
+
+
+def _resolve_content_type(content: bytes) -> str:
+    """仅按内容魔数嗅探放行安全位图类型；其余一律降级字节流下载。
+
+    扩展名完全不可信（来自不可信聊天媒体路径）：伪装成 .png/.jpg 的
+    SVG/HTML 文本没有位图魔数，必须降级为 attachment 下载，防其在平台
+    同源下被渲染为文档（XSS 面）。真实聊天图片（png/jpeg/gif/webp/bmp）
+    均带标准魔数，嗅探即可覆盖；无魔数的合法图片会被强制下载而非内联，
+    属可接受的安全取舍。
+    """
+    sniffed = _sniff_content_type(content)
+    if sniffed in _SAFE_IMAGE_TYPES:
+        return sniffed
+    return "application/octet-stream"
 
 
 @app.get("/api/media/{source}/{path:path}")
@@ -70,7 +93,17 @@ async def api_media_proxy(source: str, path: str):
     except MediaError as e:
         raise HTTPException(404, f"Media unavailable: {e}") from e
 
-    content_type = mimetypes.guess_type(path)[0] or _sniff_content_type(
-        content, "application/octet-stream"
-    )
-    return Response(content=content, media_type=content_type)
+    content_type = _resolve_content_type(content)
+    headers: dict[str, str] = {}
+    if content_type == "application/octet-stream":
+        # 非位图一律强制下载而非内联渲染：文件名取 path 基名，引号做无害化
+        # 替换防 Content-Disposition 格式破坏。header 值仅限 latin-1——中文等
+        # 非 ASCII 基名必须走 RFC 5987 的 filename*=UTF-8'' 扩展并配 ASCII
+        # 回退，否则响应阶段即 UnicodeEncodeError（整条下载路径 500）
+        filename = path.rsplit("/", 1)[-1].replace('"', "_")
+        ascii_fallback = filename.encode("ascii", "replace").decode()
+        headers["Content-Disposition"] = (
+            f'attachment; filename="{ascii_fallback}"; '
+            f"filename*=UTF-8''{quote(filename)}"
+        )
+    return Response(content=content, media_type=content_type, headers=headers)

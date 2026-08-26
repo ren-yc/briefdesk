@@ -1175,11 +1175,12 @@ async def delete_items(ids: list[str], *, keep_raw_messages: bool = False) -> in
             tuple(ids),
         ) as cursor:
             deleted = cursor.rowcount
-        await db.commit()
     except Exception:
-        # 审计 B-3：多语句隐式事务异常时显式回滚，不留半程状态占用连接
+        # 多步写异常路径必须回滚：悬挂事务会被下一个不相干写操作的
+        # commit 收尾提交，造成部分写入提前可见
         await db.rollback()
         raise
+    await db.commit()
     return deleted
 
 
@@ -1338,13 +1339,23 @@ async def set_item_reminder(item_id: str, remind_at: str | None) -> bool:
     """设置/清除卡片提醒时间（None=清除）；返回是否命中卡片。
 
     返回命中与否供前端"先清后通知"竞态判定：多标签页同时到点时，
-    只有一个标签页的清除调用命中并负责通知。
+    只有一个标签页的清除调用命中并负责通知。清除分支限定
+    `remind_at IS NOT NULL`——对无提醒卡片清除必须返回 False，
+    否则 rowcount 恒真，多标签页互斥判据失效（重复通知）。
     """
     db = await get_db()
-    async with _cursor(
-        db, "UPDATE items SET remind_at = ? WHERE id = ?", (remind_at, item_id)
-    ) as cursor:
-        changed = cursor.rowcount > 0
+    if remind_at is None:
+        async with _cursor(
+            db,
+            "UPDATE items SET remind_at = NULL WHERE id = ? AND remind_at IS NOT NULL",
+            (item_id,),
+        ) as cursor:
+            changed = cursor.rowcount > 0
+    else:
+        async with _cursor(
+            db, "UPDATE items SET remind_at = ? WHERE id = ?", (remind_at, item_id)
+        ) as cursor:
+            changed = cursor.rowcount > 0
     await db.commit()
     return changed
 
@@ -1369,6 +1380,24 @@ async def get_due_reminders(now_local: str) -> list[ReminderRow]:
         (now_local,),
     )
     return [cast(ReminderRow, dict(row)) for row in rows]
+
+
+async def get_items_verified_flags(item_ids: list[str]) -> dict[str, int]:
+    """批量读取卡片人工核验状态：id → is_verified（缺失 id 得 0）。
+
+    提醒路由据此分流「查看」跳转目标（备忘录卡进备忘录视图）；独立成
+    db 助手以遵守游标纪律（_fetchall），避免调用方手写裸游标。
+    """
+    if not item_ids:
+        return {}
+    db = await get_db()
+    placeholders = ",".join("?" * len(item_ids))
+    rows = await _fetchall(
+        db,
+        f"SELECT id, is_verified FROM items WHERE id IN ({placeholders})",
+        item_ids,
+    )
+    return {row["id"]: row["is_verified"] for row in rows}
 
 
 async def get_items_by_subject(subject: str, limit: int, offset: int) -> list[ItemRow]:
@@ -1408,24 +1437,30 @@ async def purge_expired_ignored(expiry_hours: int) -> int:
     """
     db = await get_db()
     cutoff = (datetime.now(UTC) - timedelta(hours=expiry_hours)).isoformat()
-    await db.execute(
-        "DELETE FROM item_embeddings WHERE item_id IN ("
-        "SELECT id FROM items WHERE is_verified = -1 AND verified_at <= ?"
-        ")",
-        (cutoff,),
-    )
-    await db.execute(
-        "DELETE FROM raw_messages WHERE (source, msg_id) IN ("
-        "SELECT source, source_msg_id FROM items WHERE is_verified = -1 AND verified_at <= ?"
-        ")",
-        (cutoff,),
-    )
-    async with _cursor(
-        db,
-        "DELETE FROM items WHERE is_verified = -1 AND verified_at <= ?",
-        (cutoff,),
-    ) as cursor:
-        purged = cursor.rowcount
+    try:
+        await db.execute(
+            "DELETE FROM item_embeddings WHERE item_id IN ("
+            "SELECT id FROM items WHERE is_verified = -1 AND verified_at <= ?"
+            ")",
+            (cutoff,),
+        )
+        await db.execute(
+            "DELETE FROM raw_messages WHERE (source, msg_id) IN ("
+            "SELECT source, source_msg_id FROM items WHERE is_verified = -1 AND verified_at <= ?"
+            ")",
+            (cutoff,),
+        )
+        async with _cursor(
+            db,
+            "DELETE FROM items WHERE is_verified = -1 AND verified_at <= ?",
+            (cutoff,),
+        ) as cursor:
+            purged = cursor.rowcount
+    except Exception:
+        # 多步写异常路径必须回滚：悬挂事务会被下一个不相干写操作的
+        # commit 收尾提交，造成部分写入提前可见
+        await db.rollback()
+        raise
     await db.commit()
     return purged
 
@@ -1433,19 +1468,28 @@ async def purge_expired_ignored(expiry_hours: int) -> int:
 # ── Processed Messages ──
 
 
+_PROCESSED_QUERY_CHUNK = 900  # 单语句占位符预算，远低于 SQLite 变量上限（32766）
+
+
 async def are_messages_processed(source: str, msg_ids: list[str]) -> set[str]:
+    """批量查询已处理消息；按 900 条分块，防超 SQLite 变量上限整批崩。"""
     if not msg_ids:
         return set()
     db = await get_db()
-    placeholders = ",".join("?" for _ in msg_ids)
-    # 物化读取（_fetchall）：流式 async for 会保持活动游标，与实时监听
-    # 管道并发 commit 时触发 "cannot commit transaction - SQL statements in progress"
-    rows = await _fetchall(
-        db,
-        f"SELECT msg_id FROM processed_messages WHERE source = ? AND msg_id IN ({placeholders})",
-        (source, *msg_ids),
-    )
-    return {row["msg_id"] for row in rows}
+    found: set[str] = set()
+    for start in range(0, len(msg_ids), _PROCESSED_QUERY_CHUNK):
+        chunk = msg_ids[start : start + _PROCESSED_QUERY_CHUNK]
+        placeholders = ",".join("?" for _ in chunk)
+        # 物化读取（_fetchall）：流式 async for 会保持活动游标，与实时监听
+        # 管道并发 commit 时触发 "cannot commit transaction - SQL statements in progress"
+        rows = await _fetchall(
+            db,
+            f"SELECT msg_id FROM processed_messages WHERE source = ? "
+            f"AND msg_id IN ({placeholders})",
+            (source, *chunk),
+        )
+        found.update(row["msg_id"] for row in rows)
+    return found
 
 
 async def mark_message_processed(source: str, msg_id: str) -> None:
@@ -1692,12 +1736,12 @@ async def update_category(
             await db.execute(
                 "UPDATE categories SET color = ? WHERE id = ?", (color, cat_id)
             )
-        await db.commit()
     except Exception:
-        # 审计 B-3：改名撞 UNIQUE 等异常时显式回滚，避免"级联已生效但
-        # prompt/color 未改"的半程状态残留在连接事务里
+        # 改名 + items 同步是两步写：中途失败若不回滚，悬挂事务被后续
+        # commit 收尾后会出现"类别已改、卡片未跟上"的孤儿卡片
         await db.rollback()
         raise
+    await db.commit()
     return await _get_category(db, cat_id)
 
 
@@ -1751,11 +1795,12 @@ async def delete_category(
                     f"DELETE FROM items WHERE id IN ({placeholders})", tuple(deleted_ids)
                 )
         await db.execute("DELETE FROM categories WHERE id = ?", (cat_id,))
-        await db.commit()
     except Exception:
-        # 审计 B-3：级联删除中途失败时显式回滚，不留部分删除状态
+        # 级联删除是三表多步写：中途失败若不回滚，悬挂事务被后续 commit
+        # 收尾后会留下删了一半的卡片（如 embeddings 删了但 items 还在）
         await db.rollback()
         raise
+    await db.commit()
     return cast(CategoryRow, dict(row)), deleted_ids
 
 

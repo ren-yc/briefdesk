@@ -83,7 +83,8 @@ async def api_create_category(body: dict):
         1 if _parse_flag(body.get("enabled"), field="enabled", default=True) else 0
     )
     try:
-        row = await insert_category(name, prompt, color, enabled=enabled_val)
+        async with storage_lock:
+            row = await insert_category(name, prompt, color, enabled=enabled_val)
     except aiosqlite.IntegrityError:
         raise HTTPException(409, f"类别已存在: {name}")
     await publish_items_updated({"categoriesChanged": True})
@@ -101,7 +102,8 @@ async def api_update_category(cat_id: int, body: dict):
     prompt = body.get("prompt")
     color = body.get("color")
     try:
-        row = await update_category(cat_id, name=name, prompt=prompt, color=color)
+        async with storage_lock:
+            row = await update_category(cat_id, name=name, prompt=prompt, color=color)
     except aiosqlite.IntegrityError:
         raise HTTPException(409, "类别已存在")
     if row is None:
@@ -112,7 +114,8 @@ async def api_update_category(cat_id: int, body: dict):
 
 @app.post("/api/categories/{cat_id}/toggle")
 async def api_toggle_category(cat_id: int):
-    row = await toggle_category(cat_id)
+    async with storage_lock:
+        row = await toggle_category(cat_id)
     if row is None:
         raise HTTPException(404, "Category not found")
     await publish_items_updated({"categoriesChanged": True})
@@ -123,16 +126,14 @@ async def api_toggle_category(cat_id: int):
 async def api_delete_category(cat_id: int, body: dict):
     """删除类别。body.purgeItems=true 时级联删除该类别全部卡片。"""
     purge_items = _parse_flag(body.get("purgeItems"), field="purgeItems", default=False)
-    if purge_items:
-        # DB 级联删除与去重缓存清理在 pipeline 存储锁内原子完成
-        async with storage_lock:
-            row, deleted_ids = await delete_category(cat_id, purge_items=purge_items)
-            if row is not None:
-                # 发布 items_deleted：去重插件订阅后同步清理内存缓存，
-                # 避免相似新消息被误判重复而永久不显示
-                await event_bus.publish(EVENT_ITEMS_DELETED, deleted_ids)
-    else:
+    # 整端点统一持存储锁：级联删除与去重缓存清理原子完成；非 purge 分支
+    # 同样锁内执行，与 pipeline 写路径串行化（单连接隐式事务防交叉提交）
+    async with storage_lock:
         row, deleted_ids = await delete_category(cat_id, purge_items=purge_items)
+        if row is not None and purge_items:
+            # 发布 items_deleted：去重插件订阅后同步清理内存缓存，
+            # 避免相似新消息被误判重复而永久不显示
+            await event_bus.publish(EVENT_ITEMS_DELETED, deleted_ids)
     if row is None:
         raise HTTPException(404, "Category not found")
     await publish_items_updated({"categoriesChanged": True})

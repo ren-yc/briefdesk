@@ -48,8 +48,17 @@ async def _local_security_guard(request: Request, call_next):
         return JSONResponse({"detail": "Invalid Host header"}, status_code=400)
 
     if request.method in _MUTATING_METHODS and request.url.path.startswith("/api/"):
-        origin = request.headers.get("origin") or request.headers.get("referer")
-        if origin is not None and not _same_origin(origin, request):
+        origin = request.headers.get("origin")
+        referer = request.headers.get("referer")
+        # Origin/Referer 双缺失不得静默放行：浏览器 fetch/表单跨站 POST
+        # 总会携带 Origin，双缺只出现在剥离 Referer 的旧浏览器/隐私扩展
+        # 环境——此时宁可拒绝（前端同源请求不受影响）
+        source = origin or referer
+        if source is None:
+            return JSONResponse(
+                {"detail": "Missing Origin/Referer header"}, status_code=403
+            )
+        if not _same_origin(source, request):
             return JSONResponse(
                 {"detail": "Cross-origin request rejected"}, status_code=403
             )

@@ -166,7 +166,13 @@ class PriorityChainTest(unittest.TestCase):
 class EnvRoutesTest(StagedFileTestCase):
     def setUp(self) -> None:
         super().setUp()
-        self.client = TestClient(srv.app, base_url="http://localhost")
+        # 中间件 CSRF 收口后，/api 变更接口要求 Origin/Referer 至少其一；
+        # 默认带同源 Origin 模拟浏览器 fetch 行为（与 test_server._client 对齐）
+        self.client = TestClient(
+            srv.app,
+            base_url="http://localhost",
+            headers={"Origin": "http://localhost"},
+        )
 
     def test_get_env_returns_schema_and_state(self) -> None:
         res = self.client.get("/api/settings/env")

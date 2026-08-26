@@ -12,11 +12,14 @@ entry point 组 briefdesk.plugins，启用走 PLUGINS/PLUGINS_DISABLED）。
 
 import asyncio
 import logging
+import time as time_module
 from collections.abc import Awaitable, Callable, Coroutine
 from typing import Any, Literal, Protocol
 
 import httpx
 
+from briefdesk.config import config
+from briefdesk.logger import fmt_dur
 from briefdesk.types import InternalMessage, PollResult, SessionInfo
 
 logger = logging.getLogger(__name__)
@@ -72,6 +75,116 @@ async def with_connect_retry[T](
     raise last_error
 
 
+def make_sse_timeout(read_timeout_s: float) -> httpx.Timeout:
+    """SSE 长连接超时：连接 10s、读超时可配置、写/连接池不限。
+
+    ReadTimeout 是 httpx.RequestError 的子类：会被 stream_events 的既有
+    except 捕获置 offline 并正常结束生成器，由监听器的退避重连循环接管
+    ——半开连接自愈的关键路径。write=None/pool=None 对一次性单请求的
+    SSE 专用客户端无争用面。
+    """
+    return httpx.Timeout(
+        connect=10.0,
+        read=read_timeout_s,
+        write=None,
+        pool=None,
+    )
+
+
+class BatchBuffer:
+    """按数量或超时批量刷新消息的缓冲区。
+
+    跨源共享（weflow/qqflow 监听器共用），勿在各插件包另立副本。
+    """
+
+    def __init__(self, on_flush: BatchHandler):
+        self._buffer: list[InternalMessage] = []
+        self._on_flush = on_flush
+        self._timer: asyncio.Task | None = None
+        self._started_at: float | None = None
+        # in-flight 批处理任务跟踪：stop 后等待其收尾，避免关停竞态丢批
+        self._inflight: set[asyncio.Task] = set()
+
+    def add(self, msg: InternalMessage) -> None:
+        if not self._buffer:
+            self._started_at = time_module.perf_counter()
+        self._buffer.append(msg)
+        if len(self._buffer) >= config.realtime_batch_max_count:
+            self._schedule_flush()
+        elif self._timer is None:
+            self._timer = asyncio.create_task(self._delayed_flush())
+
+    async def _delayed_flush(self) -> None:
+        await asyncio.sleep(config.realtime_batch_timeout_ms / 1000)
+        self._schedule_flush()
+
+    def _schedule_flush(self) -> None:
+        if self._timer:
+            self._timer.cancel()
+            self._timer = None
+        if self._buffer:
+            batch = self._buffer[:]
+            self._buffer.clear()
+            self._log_flush(batch)
+            task = asyncio.create_task(self._safe_flush(batch))
+            self._inflight.add(task)
+            task.add_done_callback(self._inflight.discard)
+
+    async def _safe_flush(self, batch: list[InternalMessage]) -> None:
+        """fire-and-forget 安全包装：批处理异常记日志，不产生
+        "Task exception was never retrieved"（未标记 processed 的消息
+        由回填窗口内重试恢复，不永久丢失）。"""
+        try:
+            await self._on_flush(batch)
+        except Exception:
+            logger.exception("批处理失败（%d 条，下轮回填重试）", len(batch))
+
+    async def flush(self) -> None:
+        """冲刷缓冲区残余消息并等待 in-flight 批处理收尾（stop 后由 drain 任务调用）。"""
+        if self._timer:
+            self._timer.cancel()
+            self._timer = None
+        if self._buffer:
+            batch = self._buffer[:]
+            self._buffer.clear()
+            self._log_flush(batch)
+            await self._on_flush(batch)
+        pending = [t for t in self._inflight if not t.done()]
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+
+    def _log_flush(self, batch: list[InternalMessage]) -> None:
+        wait = time_module.perf_counter() - (self._started_at or time_module.perf_counter())
+        self._started_at = None
+        logger.debug("批刷新: %d 条 (攒批 %s)", len(batch), fmt_dur(wait))
+
+
+class DrainableListenerMixin:
+    """stop() 后冲刷批缓冲的收尾钩子（配合共享 BatchBuffer 使用）。
+
+    RealtimeListener 协议的 stop 为同步方法：冲刷以受跟踪的后台任务执行，
+    监听器实现方在 stop() 末尾调用 _start_final_drain()；aclose() 可等待其
+    完成（SourceRuntime.close 经 getattr 探测调用）。幂等。
+    """
+
+    _batch_buffer: BatchBuffer
+    _drain_task: asyncio.Task | None = None
+
+    def _start_final_drain(self) -> None:
+        if self._drain_task is None:
+            self._drain_task = asyncio.create_task(self._final_drain())
+
+    async def _final_drain(self) -> None:
+        try:
+            await self._batch_buffer.flush()
+        except Exception:
+            logger.exception("停止冲刷批缓冲失败（未标记 processed 的消息由回填恢复）")
+
+    async def aclose(self) -> None:
+        if self._drain_task is not None:
+            await asyncio.gather(self._drain_task, return_exceptions=True)
+
+
 class SourceError(Exception):
     """消息源侧错误基类。"""
 
@@ -103,6 +216,8 @@ class RealtimeListener[S: SourceClient](Protocol):
     """实时消息监听器契约 — 插件包内的监听器实现。
 
     仅约束生命周期与会话缓存刷新,事件解析等源特有细节留在实现内部。
+
+    实现可另提供 `async aclose()`：等待关停冲刷（残余缓冲 + in-flight 批任务）收尾；SourceRuntime.close 经 getattr 探测调用，缺失则跳过（可选扩展钩子，不入协议方法集）。
     """
 
     def start(self) -> None:

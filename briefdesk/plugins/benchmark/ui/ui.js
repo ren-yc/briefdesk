@@ -18,6 +18,7 @@
   "use strict";
   const PLUGIN = "benchmark";
   let pollTimer = null;
+  let runActive = false; // 最近一次状态轮询的运行中标记（驱动轮询保活）
 
   // ── 设置弹窗「关于」面板注入基准区块 ──
   function buildSection() {
@@ -52,9 +53,12 @@
   }
 
   // ── 状态刷新：用例数 + 记录状态 + 运行状态 ──
-  async function refreshStatus() {
+  async function renderStatus() {
     const $status = document.getElementById("bench-status");
-    if (!$status) return;
+    if (!$status) {
+      runActive = false;
+      return;
+    }
     let casesText = "-";
     try {
       const res = await fetch("/api/benchmark/cases");
@@ -85,10 +89,12 @@
       if (res.ok) {
         const st = await res.json();
         if (st.running) {
+          runActive = true;
           $status.innerHTML = "运行中（用例：" + esc(casesText) + "）…请勿触发同步"
             + (recordText ? "；" + esc(recordText) : "");
           return;
         }
+        runActive = false;
         if (st.error) {
           $status.innerHTML = "用例：" + esc(casesText) + "。最近一次运行失败：" + esc(st.error)
             + (recordText ? "；" + esc(recordText) : "");
@@ -128,10 +134,24 @@
     }
   }
 
-  function startPolling() {
-    if (pollTimer) clearInterval(pollTimer);
-    pollTimer = setInterval(refreshStatus, 3000);
-    setTimeout(refreshStatus, 500);
+  // 轮询门控：仅设置弹窗打开或基准运行中时保持 3s 轮询，其余时刻停表，
+  // 避免页面整个生命周期内对 /api/benchmark/* 的无谓轮询。
+  function syncPolling(immediate = false) {
+    const $modal = document.getElementById("settings-modal");
+    const open = !!$modal && !$modal.classList.contains("hidden");
+    const need = open || runActive;
+    if (need && !pollTimer) {
+      pollTimer = setInterval(refreshStatus, 3000);
+      if (immediate) refreshStatus();
+    } else if (!need && pollTimer) {
+      clearInterval(pollTimer);
+      pollTimer = null;
+    }
+  }
+
+  async function refreshStatus() {
+    await renderStatus();
+    syncPolling(); // 运行结束且弹窗已关 → 就地停表
   }
 
   // ── 事件 ──
@@ -254,7 +274,8 @@
         return;
       }
       $status.textContent = "运行中…请勿触发同步";
-      startPolling();
+      runActive = true;
+      syncPolling(true);
     } catch (err) {
       console.error("Benchmark run error:", err);
       showToast("启动失败，请重试", { type: "error", duration: 4000 });
@@ -293,7 +314,15 @@
     if ($dropRecBtn) $dropRecBtn.addEventListener("click", dropRecord);
     if ($runBtn) $runBtn.addEventListener("click", runBench);
     if ($clearBtn) $clearBtn.addEventListener("click", clearCases);
-    startPolling();
+    // 弹窗开合驱动轮询门控；初始若弹窗已开则立即拉一轮状态
+    const $settingsModal = document.getElementById("settings-modal");
+    if ($settingsModal) {
+      new MutationObserver(() => syncPolling(true)).observe($settingsModal, {
+        attributes: true,
+        attributeFilter: ["class"],
+      });
+    }
+    syncPolling(true);
   }
 
   window.briefdeskPlugins = window.briefdeskPlugins || {};

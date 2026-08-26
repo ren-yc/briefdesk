@@ -12,7 +12,6 @@
 
 import asyncio
 import logging
-import re
 import time as time_module
 from datetime import UTC, datetime
 
@@ -27,6 +26,7 @@ from briefdesk.db import (
 )
 from briefdesk.db import storage_lock as _storage_lock
 from briefdesk.logger import fmt_dur
+from briefdesk.masking import PLACEHOLDER_ONLY_RE
 from briefdesk.realtime import publish_items_updated, publish_sync_progress
 from briefdesk.sources_base import SourceClient
 from briefdesk.stages import get_context, get_stages
@@ -40,12 +40,20 @@ from briefdesk.types import BatchContext, InternalMessage
 
 logger = logging.getLogger(__name__)
 
-# 纯附件占位符消息（整条内容为单个方括号片段）：[图片]/[image]/[语音]/[视频]…
-# 与源侧 normalize 的占位符判定语义一致（qqflow 的通用方括号模式；weflow
-# 的 [图片] 亦匹配）。OCR 未启用（enrich 槽位为空）时，这类带图消息无信息
-# 价值，入口直接屏蔽（不落 raw/不进分类/不标记 processed）；图片+文字
-# 混合消息（content 非占位符）不受影响，文字照常处理。
-_PLACEHOLDER_ONLY_RE = re.compile(r"^\s*\[[^\]]+\]\s*$")
+# benchmark 门闸：置位后 process_all_batches 直接返回 False（批次保留待回填），
+# 不触 DB/AI；benchmark 插件跑基线时用它冻结实时管道。
+_processing_paused = False
+# 暂停门闸的首次 INFO 已落日志标志：暂停期间后续批次降级 DEBUG，防刷屏；
+# 恢复时复位，保证下一轮暂停仍有一条 INFO。
+_paused_logged_once = False
+
+
+def set_processing_paused(paused: bool) -> None:
+    """暂停/恢复消息管道处理（benchmark 契约，签名固定）。"""
+    global _processing_paused, _paused_logged_once
+    _processing_paused = paused
+    if not paused:
+        _paused_logged_once = False
 
 
 def _split_batches(
@@ -99,6 +107,20 @@ async def process_all_batches(
                 config.realtime_batch_max_count，保持原有行为。
             origin: 处理路径标识（"realtime" / "backfill"），仅用于日志
     """
+    # benchmark 暂停门闸：优先于一切处理（含空批快速路径），
+    # 返回 False 让 poll_cycle 跳过水位推进，消息留给回填窗口恢复。
+    # 首批 INFO 提示进入暂停态，其后每批只留 DEBUG 轨迹防刷屏。
+    global _paused_logged_once
+    if _processing_paused:
+        if not _paused_logged_once:
+            _paused_logged_once = True
+            logger.info("[pipeline] 处理已暂停（benchmark），后续批次静默保留待回填")
+        logger.debug(
+            "[pipeline] 处理已暂停（benchmark），本批 %d 条保留待回填",
+            len(messages),
+        )
+        return False
+
     if not messages:
         return True
 
@@ -129,19 +151,20 @@ async def process_all_batches(
     # 不进分类、不标记 processed——OCR 重新启用后回填窗口内自动重拉重处理
     # （与 IGNORE_SELF 过滤同语义，可逆）。图片+文字混合消息（content 非
     # 占位符）不受影响：文字仍有信息价值，照常处理。
+    # 判定正则单源见 briefdesk.masking.PLACEHOLDER_ONLY_RE。
     enrich_stages = get_stages("enrich")
     images_filtered = 0
     if not enrich_stages:
         images_filtered = sum(
             1
             for m in messages
-            if m.image_urls and _PLACEHOLDER_ONLY_RE.match(m.content)
+            if m.image_urls and PLACEHOLDER_ONLY_RE.match(m.content)
         )
         if images_filtered:
             messages = [
                 m
                 for m in messages
-                if not (m.image_urls and _PLACEHOLDER_ONLY_RE.match(m.content))
+                if not (m.image_urls and PLACEHOLDER_ONLY_RE.match(m.content))
             ]
             logger.info(
                 "[pipeline] %s 屏蔽纯占位符图片消息（OCR 未启用）: %d 条",

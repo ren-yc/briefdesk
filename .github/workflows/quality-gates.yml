@@ -1,0 +1,46 @@
+# Quality gates: aligned with the "pre-commit quality gates" in AGENTS.md.
+# Triggers: push to master / pull requests.
+# Notes:
+# - windows-latest matches the dev environment (keyring behaves differently on
+#   headless Linux runners; avoids platform-specific noise)
+# - both [dev] and [ocr] extras are installed: rapidocr/onnxruntime are heavy,
+#   but the OCR plugin runs in production and its tests cover real engine wiring;
+#   installing them keeps CI faithful to the dev environment
+# - mypy checks the package only: test files are covered by ruff + pytest,
+#   and type-checking test-stub idioms is signature-level noise
+#   (see the [tool.mypy] comments in pyproject.toml)
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+jobs:
+  quality-gates:
+    name: Quality gates (ruff / mypy / pytest)
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install dependencies (editable, dev + ocr extras)
+        run: pip install -e ".[dev,ocr]"
+
+      - name: Lint (ruff)
+        run: python -m ruff check briefdesk/ tests/
+
+      - name: Type check (mypy, package only)
+        run: python -m mypy briefdesk/
+
+      - name: Test (pytest)
+        run: python -m pytest tests/

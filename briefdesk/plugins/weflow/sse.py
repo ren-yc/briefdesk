@@ -8,80 +8,30 @@ import asyncio
 import logging
 import math
 import random
-import time as time_module
+from collections import deque
 
-from briefdesk.config import config
-from briefdesk.logger import fmt_dur
 from briefdesk.plugins.weflow.client import WeFlowClient, WeFlowEvent
 from briefdesk.plugins.weflow.config import WeFlowSettings
 from briefdesk.plugins.weflow.normalize import normalize_sse, pre_filter_sse
-from briefdesk.sources_base import BatchHandler, RealtimeListener
-from briefdesk.types import InternalMessage
+from briefdesk.sources_base import (
+    BatchBuffer,
+    BatchHandler,
+    DrainableListenerMixin,
+    RealtimeListener,
+)
 
 logger = logging.getLogger(__name__)
+
+# 近期事件去重缓存上限（按 event+rawid，FIFO）：防断线重连/上游重复投递导致
+# 同一事件重复进管道（weflow-api.md 明确建议接收端按 event+rawid 去重；
+# 与 qqflow 监听器一致）。被去重挡下的消息未标记 processed，回填窗口内可恢复
+_SEEN_LIMIT = 1024
 
 # 周期统计上报间隔（秒）
 _STATS_INTERVAL_SECONDS = 60
 
 
-class BatchBuffer:
-    """按数量或超时批量刷新消息的缓冲区。"""
-
-    def __init__(self, on_flush: BatchHandler):
-        self._buffer: list[InternalMessage] = []
-        self._on_flush = on_flush
-        self._timer: asyncio.Task | None = None
-        self._started_at: float | None = None
-
-    def add(self, msg: InternalMessage) -> None:
-        if not self._buffer:
-            self._started_at = time_module.perf_counter()
-        self._buffer.append(msg)
-        if len(self._buffer) >= config.realtime_batch_max_count:
-            self._schedule_flush()
-        elif self._timer is None:
-            self._timer = asyncio.create_task(self._delayed_flush())
-
-    async def _delayed_flush(self) -> None:
-        await asyncio.sleep(config.realtime_batch_timeout_ms / 1000)
-        self._schedule_flush()
-
-    def _schedule_flush(self) -> None:
-        if self._timer:
-            self._timer.cancel()
-            self._timer = None
-        if self._buffer:
-            batch = self._buffer[:]
-            self._buffer.clear()
-            self._log_flush(batch)
-            asyncio.create_task(self._safe_flush(batch))
-
-    async def _safe_flush(self, batch: list[InternalMessage]) -> None:
-        """fire-and-forget 安全包装：批处理异常记日志，不产生
-        "Task exception was never retrieved"（未标记 processed 的消息
-        由回填窗口内重试恢复，不永久丢失）。"""
-        try:
-            await self._on_flush(batch)
-        except Exception:
-            logger.exception("批处理失败（%d 条，下轮回填重试）", len(batch))
-
-    async def flush(self) -> None:
-        if self._timer:
-            self._timer.cancel()
-            self._timer = None
-        if self._buffer:
-            batch = self._buffer[:]
-            self._buffer.clear()
-            self._log_flush(batch)
-            await self._on_flush(batch)
-
-    def _log_flush(self, batch: list[InternalMessage]) -> None:
-        wait = time_module.perf_counter() - (self._started_at or time_module.perf_counter())
-        self._started_at = None
-        logger.debug("批刷新: %d 条 (攒批 %s)", len(batch), fmt_dur(wait))
-
-
-class WeFlowSseClient(RealtimeListener[WeFlowClient]):
+class WeFlowSseClient(DrainableListenerMixin, RealtimeListener[WeFlowClient]):
     """SSE 实时消息监听器，自动重连。实现 RealtimeListener 契约。"""
 
     def __init__(
@@ -98,10 +48,17 @@ class WeFlowSseClient(RealtimeListener[WeFlowClient]):
         self._reconnect_attempt = 0
         self._batch_buffer = BatchBuffer(self._on_batch)
         self._task: asyncio.Task | None = None
-        # 监听统计（周期/停止时上报）：事件总数、预过滤丢弃数
+        # 近期事件去重缓存（event, rawid)，FIFO 有界（见模块级 _SEEN_LIMIT）
+        self._seen: set[tuple[str, str]] = set()
+        self._seen_order: deque[tuple[str, str]] = deque()
+        # 监听统计（周期/停止时上报）：事件总数、预过滤丢弃数、去重命中数
         self._stats_events = 0
         self._stats_filtered = 0
+        self._stats_deduped = 0
         self._stats_task: asyncio.Task | None = None
+        # stop() 启动的收尾冲刷任务（协议要求 stop 为同步方法，故后台执行；
+        # DrainableListenerMixin 提供，此处显式置 None 以便类型检查）
+        self._drain_task: asyncio.Task | None = None
 
     def invalidate_session_cache(self) -> None:
         # 启用会话过滤已收敛到 pipeline 入口（每批实时查询），无缓存可失效；
@@ -122,6 +79,9 @@ class WeFlowSseClient(RealtimeListener[WeFlowClient]):
             self._stats_task.cancel()
         if self._task:
             self._task.cancel()
+        # 冲刷残余缓冲并等待 in-flight 批收尾；RealtimeListener 协议的 stop
+        # 为同步方法，故经共享 mixin 以后台任务执行，aclose() 供 runtime 等待
+        self._start_final_drain()
 
     async def _stats_loop(self) -> None:
         """周期上报监听统计（INFO，默认 60s 一次，无事件时静默）。"""
@@ -130,15 +90,21 @@ class WeFlowSseClient(RealtimeListener[WeFlowClient]):
             self._log_stats()
 
     def _log_stats(self) -> None:
-        if self._stats_events == 0 and self._stats_filtered == 0:
+        if (
+            self._stats_events == 0
+            and self._stats_filtered == 0
+            and self._stats_deduped == 0
+        ):
             return
         logger.info(
-            "SSE 统计: 事件 %d, 预过滤丢弃 %d",
+            "SSE 统计: 事件 %d, 预过滤丢弃 %d, 去重命中 %d",
             self._stats_events,
             self._stats_filtered,
+            self._stats_deduped,
         )
         self._stats_events = 0
         self._stats_filtered = 0
+        self._stats_deduped = 0
 
     async def _connect_loop(self) -> None:
         while self._running:
@@ -177,6 +143,15 @@ class WeFlowSseClient(RealtimeListener[WeFlowClient]):
         if not pre_filter_sse(event):
             self._stats_filtered += 1
             return
+        # 按 event+rawid 去重（上游文档建议；防断线重连重放/重复投递）
+        key = (event.get("event", ""), event.get("rawid", ""))
+        if key in self._seen:
+            self._stats_deduped += 1
+            return
+        self._seen.add(key)
+        self._seen_order.append(key)
+        if len(self._seen_order) > _SEEN_LIMIT:
+            self._seen.discard(self._seen_order.popleft())
         try:
             msgs = await normalize_sse(event, self._weflow)
         except Exception as e:  # noqa: BLE001 — 单条失败不应拖垮监听循环

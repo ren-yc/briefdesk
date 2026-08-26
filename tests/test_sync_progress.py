@@ -20,6 +20,7 @@ from briefdesk.pipeline import process_all_batches
 from briefdesk.plugin.base import PluginContext
 from briefdesk.plugins.dedup.plugin import DedupPlugin
 from briefdesk.realtime import (
+    get_dropped_count,
     publish_items_updated,
     publish_sync_progress,
     subscribe,
@@ -231,6 +232,33 @@ class RealtimePublishEventTest(unittest.IsolatedAsyncioTestCase):
         await unsubscribe(q)
         await publish_sync_progress({"newCount": 1, "pendingCount": 1})
         self.assertTrue(q.empty())
+
+
+class RealtimeDropCounterTest(unittest.IsolatedAsyncioTestCase):
+    """审查修复 #9：SSE 订阅队列满丢弃事件必须可观测（累计计数器）。"""
+
+    async def test_full_queue_drop_increments_counter(self):
+        before = get_dropped_count()
+        q = await subscribe()
+        try:
+            for i in range(32):  # 队列容量 maxsize=32
+                q.put_nowait("e" + str(i))
+            await publish_items_updated({"k": 1})  # 满 → 丢弃
+            await publish_items_updated({"k": 2})  # 满 → 丢弃
+            self.assertEqual(q.qsize(), 32)
+            self.assertEqual(get_dropped_count() - before, 2)
+        finally:
+            await unsubscribe(q)
+
+    async def test_non_full_queue_does_not_increment(self):
+        before = get_dropped_count()
+        q = await subscribe()
+        try:
+            await publish_items_updated({"k": 1})
+            self.assertEqual(q.qsize(), 1)
+            self.assertEqual(get_dropped_count(), before)
+        finally:
+            await unsubscribe(q)
 
 
 # ── pipeline 埋点：正常处理计数、早退路径不计数 ──

@@ -95,6 +95,10 @@ class PollResult:
         default_factory=list
     )  # 本轮发现的联系人（应用层 upsert）
     session_count: int = 0
+    failed_sessions: set[str] = field(default_factory=set)
+    # 本轮【未成功拉取】的 session_id 集合（源侧瞬态错误静默跳过，如 qqflow
+    # 索引期 503）。poll_cycle 对这些会话跳过水位推进：它们的消息未落
+    # raw_messages，钉窗机制看不到，若照常推进水位会造成窗口内消息永久漏拉。
 
 
 # ── 管道跨插件契约（由各阶段插件实现/消费，定义在核心）──

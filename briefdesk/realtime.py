@@ -7,9 +7,15 @@ sync_progress（同步进度事件）两类事件。
 
 import asyncio
 import json
+import logging
+
+logger = logging.getLogger(__name__)
 
 _subscribers: set[asyncio.Queue[tuple[str, str]]] = set()
 _subscribers_lock = asyncio.Lock()
+
+# 队列满导致的累计丢弃事件数（诊断只读：客户端漏事件时先查这里）
+_dropped_count = 0
 
 # 服务关闭事件：置位后所有 /api/stream 流主动结束。
 # 若流不结束，uvicorn 优雅退出会无限等待这些常驻 ASGI 任务
@@ -31,6 +37,11 @@ def signal_shutdown() -> None:
         _shutdown_event.set()
 
 
+def get_dropped_count() -> int:
+    """返回累计丢弃的实时事件数（订阅队列满时丢弃，只读诊断口径）。"""
+    return _dropped_count
+
+
 async def subscribe() -> asyncio.Queue[tuple[str, str]]:
     q: asyncio.Queue[tuple[str, str]] = asyncio.Queue(maxsize=32)
     async with _subscribers_lock:
@@ -44,11 +55,16 @@ async def unsubscribe(q: asyncio.Queue[tuple[str, str]]) -> None:
 
 
 async def _publish(name: str, payload: dict | None = None) -> None:
+    global _dropped_count
     data = json.dumps(payload or {}, ensure_ascii=False)
     async with _subscribers_lock:
         subscribers = list(_subscribers)
     for q in subscribers:
         if q.full():
+            # 慢客户端积压超限：丢弃并计数（前端靠轮询兜底收敛），
+            # 不静默——否则客户端状态不同步无从排查
+            _dropped_count += 1
+            logger.debug("SSE 订阅队列已满，丢弃事件（累计丢弃 %d）", _dropped_count)
             continue
         q.put_nowait((name, data))
 

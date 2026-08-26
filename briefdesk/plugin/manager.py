@@ -187,6 +187,10 @@ class PluginManager:
                 self._fail_if_required(name)
                 continue
             except Exception as e:
+                # 装配失败先 best-effort 回收副作用再标 failed。回收范围以插件
+                # teardown 自身实现为准：内置插件的资源获取严格先于各类注册，
+                # 无可达残留路径；第三方插件需自行保证 teardown 覆盖其注册行为。
+                await self._best_effort_teardown(name, plugin)
                 self._mark(name, "failed", f"setup 失败: {e!r}")
                 logger.exception("插件 %s setup 失败", name)
                 self._fail_if_required(name)
@@ -206,6 +210,9 @@ class PluginManager:
             try:
                 await plugin.activate(ctx)
             except Exception as e:
+                # P2 修复：activate 失败同样 best-effort 回滚（该插件仍在
+                # _load_order，关闭时 teardown_all 会按幂等契约再调一次）
+                await self._best_effort_teardown(name, plugin)
                 self._mark(name, "failed", f"activate 失败: {e!r}")
                 logger.exception("插件 %s activate 失败", name)
                 self._fail_if_required(name)
@@ -318,6 +325,17 @@ class PluginManager:
     ) -> None:
         self._records[name].status = status
         self._records[name].reason = reason
+
+    async def _best_effort_teardown(self, name: str, plugin: Plugin) -> None:
+        """装配失败后回收半装配副作用（best-effort）。
+
+        teardown 自身异常吞掉记 DEBUG：失败隔离原则下不得因清理失败掩盖
+        原始装配错误；插件 teardown 契约本就要求幂等。
+        """
+        try:
+            await plugin.teardown()
+        except Exception as e:  # noqa: BLE001 — 清理失败不得掩盖原始错误
+            logger.debug("插件 %s teardown 回收失败（忽略）: %r", name, e)
 
     def _fail_if_required(self, name: str) -> None:
         if name in self._settings.plugins_required:

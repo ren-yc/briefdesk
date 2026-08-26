@@ -43,9 +43,9 @@ _QQ_RICH_XML_RE = re.compile(r'm_fileName\s*=\s*"[^"]+"\s+m_resid\s*=\s*"[^"]+"'
 def is_self_message(msg: QqFlowMessage, self_uid: str) -> bool:
     """判定消息是否本账号自己发送（IGNORE_SELF 识别谓词）。
 
-    qqflow-server v1 的 isSend 恒 0（方向不可推导），主判据为发送者 UID
-    等于自身账号 UID（QQ NT UID 约定：u_<QQ号>）；isSend 保留为上游
-    未来版本提供方向时的兜底。self_uid 为空 → 仅按 isSend 兜底（不误杀）。
+    主判据为发送者 UID 等于自身账号 UID（QQ NT UID 约定：u_<QQ号>）；
+    isSend 来自上游 40013 列（部分 QQ 版本缺列或值非 1/2 时恒 0），
+    作为方向信息的优先兜底。self_uid 为空 → 仅按 isSend 兜底（不误杀）。
     """
     if bool(msg.get("isSend")):
         return True
@@ -105,6 +105,11 @@ def pre_filter_sse(event: QqFlowEvent) -> bool:
             event.get("rawid"),
             event.get("event"),
         )
+        return False
+    if not event.get("rawid"):
+        # 无 rawid 无法生成 msg_id/标记 processed——就地丢弃，防去重键
+        # ("message.new","") 碰撞误吞后续正常事件（审查 A5）
+        logger.debug("丢弃 SSE: message.new 缺 rawid")
         return False
     # 任意发送者为空的消息均丢弃：上游可能把入群/名片等系统事件编码成
     # “无发送者 + 内容为显示名”的形式，这类消息没有可展示/可分类的信息价值。

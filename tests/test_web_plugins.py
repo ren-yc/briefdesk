@@ -225,3 +225,37 @@ class CoreFrontendBoundaryTest(unittest.TestCase):
             text = (ui_dir / fname).read_text(encoding="utf-8")
             for marker in markers:
                 self.assertNotIn(marker, text, f"{fname} 不应再包含 {marker}（插件前端已随插件分发）")
+
+
+class IncludeRouterIdempotentTest(unittest.TestCase):
+    """审查修复 #10：include_plugin_router 对同一 router 重复调用幂等。"""
+
+    def test_double_include_inserts_routes_once(self):
+        from fastapi import APIRouter
+
+        router = APIRouter()
+
+        @router.get("/api/idempotency-probe")
+        async def probe():
+            return {}
+
+        srv.include_plugin_router(router)
+
+        def count():
+            return sum(
+                1
+                for r in srv.app.routes
+                if getattr(r, "path", "") == "/api/idempotency-probe"
+            )
+
+        try:
+            self.assertEqual(count(), 1)
+            srv.include_plugin_router(router)  # 第二次必须跳过
+            self.assertEqual(count(), 1, "重复 include 不应插入重复路由")
+        finally:
+            # 清理探针路由，避免污染其它测试的路由匹配
+            srv.app.routes[:] = [
+                r
+                for r in srv.app.routes
+                if getattr(r, "path", "") != "/api/idempotency-probe"
+            ]

@@ -1766,8 +1766,9 @@ function renderNav(categories, ignoredCount, memoCount) {
     const isActive = !currentSearch && cat.key === currentCategory && currentVerified === "unverified";
     // 图标：硬编码默认五类 → 按类别颜色从预设色板映射（自定义/改名类别）→ 空
     const icon = _CAT_ICONS[cat.key] || _paletteIcon(catColor.get(cat.key)) || "";
-    // 颜色数据驱动：内联 --cat（遗留类别无 color → 空，回退 CSS 默认）
-    const colorStyle = catColor.get(cat.key) ? ` style="--cat:${catColor.get(cat.key)}"` : "";
+    // 颜色数据驱动：内联 --cat（遗留类别无 color → 空，回退 CSS 默认）；
+    // 类别名/颜色均为用户可控输入，属性插值一律 escAttr（与 filterBar 同纪律）
+    const colorStyle = catColor.get(cat.key) ? ` style="--cat:${escAttr(catColor.get(cat.key))}"` : "";
     html += `
       <a href="#" class="cat-link${isActive ? " active" : ""}"${colorStyle} data-category="${escAttr(cat.key)}" data-verified="unverified">
         ${icon ? `<img src="${icon}" class="icon-sm cat-icon" alt="">` : ""}${esc(cat.key)}

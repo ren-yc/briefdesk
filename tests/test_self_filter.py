@@ -452,7 +452,7 @@ class QqflowLookupMessageTest(unittest.IsolatedAsyncioTestCase):
         m = await client.lookup_message("g1", "42", 1005)
         self.assertIsNotNone(m)
         self.assertEqual(m["localId"], 42)
-        client.fetch_messages.assert_awaited_once_with("g1", start=885, limit=50)
+        client.fetch_messages.assert_awaited_once_with("g1", start=885, limit=200)
 
     async def test_out_of_window_not_matched(self):
         client = self._client()

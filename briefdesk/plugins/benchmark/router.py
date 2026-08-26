@@ -11,7 +11,9 @@
 - 运行在后台任务中执行（真实 AI 调用可能耗时数分钟），状态经
   GET /api/benchmark/run 轮询；结果（payload + HTML 报告）驻留内存，
   经 /api/benchmark/report(.json) 取回；
-- 运行期间补丁 briefdesk.db.get_db 指向临时库：请勿同时触发同步。
+- 运行期间补丁 briefdesk.db.get_db 指向临时库，并经 pipeline.set_processing_paused
+  暂停生产处理管道——实时消息延后到下一轮回填窗口处理，不丢失；请勿同时
+  手动触发同步。
 """
 
 from __future__ import annotations

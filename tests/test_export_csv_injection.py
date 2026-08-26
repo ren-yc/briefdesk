@@ -13,17 +13,19 @@ from unittest.mock import AsyncMock, patch
 from starlette.testclient import TestClient
 
 import briefdesk.server as srv
-import briefdesk.server.routes_items as routes_items
+from briefdesk.server import routes_items
 
 
 def _page(items: list[dict]) -> dict:
+    """get_items_page 契约形状（对齐 tests/test_server.py 同类 fake）。"""
     return {
         "items": items,
-        "total": len(items),
-        "group_total": len(items),
+        "total_count": len(items),
+        "group_count": len(items),
         "source_groups": [],
         "next_offset": 0,
         "has_more": False,
+        "filter_now": None,
     }
 
 

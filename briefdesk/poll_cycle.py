@@ -88,13 +88,26 @@ async def run_poll_cycle(source: SourceRuntime) -> None:
             batch_size=config.backfill_batch_max_count,
             origin="backfill",
         )
-        # 管道早退（无启用类别/阶段插件缺失）时消息未落 raw、未标记 processed，
-        # 推进水位会导致下轮窗口永久跳过这些消息 → 只有处理完成才推进
+        # 只有处理完成才推进水位：管道早退或源侧拉取失败（result.failed_sessions，
+        # 契约详见 types.PollResult）的会话消息未落 raw_messages，推进即永久漏拉
         if ok:
-            await update_session_last_polls(
-                source.name,
-                [(s.session_id, int(cycle_start.timestamp())) for s in enabled],
-            )
+            advanced = [
+                s for s in enabled if s.session_id not in result.failed_sessions
+            ]
+            if advanced:
+                await update_session_last_polls(
+                    source.name,
+                    [
+                        (s.session_id, int(cycle_start.timestamp()))
+                        for s in advanced
+                    ],
+                )
+            elif enabled:
+                logger.info(
+                    "[%s] 本轮 %d 个启用会话均未成功拉取，水位不推进",
+                    source.name,
+                    len(enabled),
+                )
         logger.info(
             "[%s] 轮询周期完成: %d 新消息, %d 会话, %d 联系人 (%s)",
             source.name,

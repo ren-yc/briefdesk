@@ -3,12 +3,19 @@
 日历查询同时覆盖 extra_times（主字段命中 OR extra_times 非空取回后按区间
 过滤）；extra_times 是 JSON 文本无法走索引，本地库规模下按「非空」取回后
 内存过滤可接受。核心 db.py 不含日历专属查询。
+
+结果上限 _MAX_CALENDAR_ITEMS 在**区间内存过滤之后**应用：SQL 阶段不加
+LIMIT——超量与区间无关的 extra_times 候选行（含 start/end 为 NULL 的行，
+排序时靠前）不会把真正的区间内卡片挤出结果集。
 """
 
 import json
 from typing import cast
 
 from briefdesk.db import ItemRow, get_db
+
+# 日历单次返回的卡片上限：过滤后截断，保持原「前 1000」语义
+_MAX_CALENDAR_ITEMS = 1000
 
 
 def _extra_times_in_range(raw: str, date_from: str, date_to_excl: str) -> bool:
@@ -39,7 +46,8 @@ async def get_calendar_items(date_from: str, date_to_excl: str) -> list[ItemRow]
 
     时间存 "YYYY-MM-DD HH:MM" 文本，按前缀字符串比较即日期序；
     extra_times 是 JSON 文本无法走索引，按「主字段命中 OR 非空」取回后
-    由 _extra_times_in_range 过滤（本地库规模可接受）。
+    由 _extra_times_in_range 过滤（本地库规模可接受），过滤后再截断到
+    _MAX_CALENDAR_ITEMS 条。
     排除已忽略（is_verified >= 0），保留未处理 + 备忘录。
     """
     db = await get_db()
@@ -49,8 +57,7 @@ async def get_calendar_items(date_from: str, date_to_excl: str) -> list[ItemRow]
              AND ((start >= ? AND start < ?)
                 OR (end >= ? AND end < ?)
                 OR extra_times != '')
-           ORDER BY COALESCE(start, end)
-           LIMIT 1000""",
+           ORDER BY COALESCE(start, end)""",
         (date_from, date_to_excl, date_from, date_to_excl),
     )
     try:
@@ -65,4 +72,6 @@ async def get_calendar_items(date_from: str, date_to_excl: str) -> list[ItemRow]
             dl and date_from <= dl < date_to_excl
         ) or _extra_times_in_range(r.get("extra_times") or "", date_from, date_to_excl):
             out.append(cast(ItemRow, r))
+            if len(out) >= _MAX_CALENDAR_ITEMS:
+                break
     return out
