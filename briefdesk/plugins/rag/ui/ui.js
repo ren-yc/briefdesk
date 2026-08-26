@@ -49,6 +49,9 @@
       + "</div>"
       + '<div id="rag-result" class="rag-result"></div>'
       + "</div>";
+    $ragInput = document.getElementById("rag-input");
+    $ragAskBtn = document.getElementById("rag-ask");
+    $ragResult = document.getElementById("rag-result");
     const $main = document.querySelector("main");
     const $loadMoreWrap = document.getElementById("load-more-wrap");
     if ($loadMoreWrap) $loadMoreWrap.after($ragView);
@@ -75,11 +78,12 @@
       if (askMode) exitAskMode();
       else enterAskMode();
     });
-    $ragAskBtn.addEventListener("click", submitQuestion);
-    $ragInput.addEventListener("keydown", (e) => {
+    if ($ragAskBtn) $ragAskBtn.addEventListener("click", submitQuestion);
+    if ($ragInput) $ragInput.addEventListener("keydown", (e) => {
       if (e.key === "Enter") submitQuestion();
     });
-    document.getElementById("rag-ctx-close").addEventListener("click", hideCtxModal);
+    const $closeBtn = document.getElementById("rag-ctx-close");
+    if ($closeBtn) $closeBtn.addEventListener("click", hideCtxModal);
     $ctxModal.addEventListener("click", (e) => {
       if (e.target === $ctxModal) hideCtxModal();
     });
@@ -93,7 +97,7 @@
     $ragBtn.classList.add("active");
     $ragView.classList.remove("hidden");
     syncHash("push");
-    $ragInput.focus();
+    if ($ragInput) $ragInput.focus();
   }
 
   function exitAskMode() {
