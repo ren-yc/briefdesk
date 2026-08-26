@@ -21,6 +21,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 import aiosqlite
+import numpy as np
 
 from briefdesk import ai_ports
 from briefdesk.db import get_db, get_embed_db
@@ -107,7 +108,12 @@ class RagEngine:
         self._vec_model: str | None = None
         self._vec_watermark = ""
         self._vec_count_seen = 0
-        self._vec_entries: dict[tuple[str, str], tuple[ChunkRow, list[float]]] = {}
+        self._vec_entries: dict[tuple[str, str], tuple[ChunkRow, "np.ndarray"]] = {}
+        # 预组 float32 矩阵（缓存变更时重组，ask 路径零转换零拷贝直用）
+        self._matrix: np.ndarray | None = None
+        self._matrix_keys: list[tuple[str, str]] = []
+        self._matrix_chunks: list[ChunkRow] = []
+        self._refresh_lock = asyncio.Lock()
         # 嵌入降级自愈：before_run 成功前最多踢一次回填，防供应商宕机刷踢
         self._kicked_since_embed_ok = False
         self._stale_warned = False
@@ -121,6 +127,9 @@ class RagEngine:
         self._vec_entries.clear()
         self._vec_count_seen = 0
         self._vec_watermark = ""
+        self._matrix = None
+        self._matrix_keys = []
+        self._matrix_chunks = []
 
     async def _ensure_db_ready(self) -> aiosqlite.Connection:
         db = await self._db_factory()
@@ -139,11 +148,10 @@ class RagEngine:
         """当前可检索会话集合；None 表示无会话约束（group_only 关且未收窄）。
 
         启用状态每次查询现取——停用会话即时失效，不依赖索引期快照。
+        返回 (source, session_id) 元组集合（跨源撞名安全），恒非 None。
         """
 
-        if not group_only and session_id is None:
-            return None
-        sql = "SELECT session_id FROM sessions WHERE enabled = 1"
+        sql = "SELECT source, session_id FROM sessions WHERE enabled = 1"
         params: list[object] = []
         if group_only:
             sql += " AND is_group = 1"
@@ -155,7 +163,7 @@ class RagEngine:
             rows = await cursor.fetchall()
         finally:
             await cursor.close()
-        return {r["session_id"] for r in rows}
+        return {(r["source"], r["session_id"]) for r in rows}
 
     # ------------------------------------------------------------ 索引路径 --
 
@@ -196,7 +204,7 @@ class RagEngine:
         for msg in batch.messages:
             if not _indexable(msg.content):
                 continue
-            if allowed is not None and msg.session_id not in allowed:
+            if allowed is not None and (msg.source, msg.session_id) not in allowed:
                 continue
             row = ChunkRow(
                 source=msg.source,
@@ -240,9 +248,10 @@ class RagEngine:
         """
 
         self.last_cycle_embed_failed = False
+        # 先建表再判 days=0：维护循环在全新库上也要能安全空转（GC/预热依赖表）
+        db = await self._ensure_db_ready()
         if self.settings.backfill_days == 0:
             return 0
-        db = await self._ensure_db_ready()
         model = ai_ports.embed_model_name()
         scope = (
             " AND EXISTS (SELECT 1 FROM sessions s WHERE s.source = r.source"
@@ -259,7 +268,7 @@ class RagEngine:
             "LEFT JOIN rag_chunk_embeddings e ON e.source = r.source "
             "AND e.msg_id = r.msg_id "
             "WHERE (c.msg_id IS NULL OR e.msg_id IS NULL OR e.model <> ?)"
-            " AND trim(r.content) <> ''"
+            " AND trim(r.content, ' ' || char(9)) <> ''"
             + scope
         )
         params: list[object] = [model]
@@ -281,6 +290,7 @@ class RagEngine:
                 content=r["content"],
             )
             for r in raw_rows
+            if _indexable(r["content"])
         ]
         if not rows:
             return 0
@@ -347,6 +357,29 @@ class RagEngine:
         self._vec_entries.clear()
         self._vec_watermark = ""
         self._vec_count_seen = 0
+        self._matrix = None
+        self._matrix_keys = []
+        self._matrix_chunks = []
+        self._matrix_sessions = []
+
+    def _rebuild_matrix(self) -> None:
+        """缓存变更后重组 float32 矩阵（ask 路径零转换直接用）。"""
+
+        if not self._vec_entries:
+            self._matrix = None
+            self._matrix_keys = []
+            self._matrix_chunks = []
+            self._matrix_sessions = []
+            return
+        keys = list(self._vec_entries.keys())
+        self._matrix_keys = keys
+        self._matrix_chunks = [self._vec_entries[k][0] for k in keys]
+        self._matrix_sessions = [
+            (chunk.source, chunk.session_id) for chunk in self._matrix_chunks
+        ]
+        self._matrix = np.asarray(
+            [self._vec_entries[k][1] for k in keys], dtype=np.float32
+        )
 
     async def _refresh_vector_cache(self) -> None:
         model = ai_ports.embed_model_name()
@@ -375,6 +408,7 @@ class RagEngine:
             self._vec_entries[(chunk.source, chunk.msg_id)] = (chunk, vec)
         self._vec_watermark = max_created
         self._vec_count_seen = total
+        self._rebuild_matrix()
 
     @staticmethod
     async def _delete_bad_embeddings(
@@ -418,7 +452,8 @@ class RagEngine:
             logger.exception("rag: 查询嵌入失败")
             return None
         db = await self._ensure_db_ready()
-        await self._refresh_vector_cache()
+        async with self._refresh_lock:
+            await self._refresh_vector_cache()
         allowed = await self._allowed_sessions(db, self.settings.group_only, session_id)
         if (
             not self._vec_entries
@@ -433,19 +468,26 @@ class RagEngine:
             self._stale_warned = True
         if self._vec_entries:
             self._stale_warned = False
-        filtered = [
-            (chunk, vec)
-            for key, (chunk, vec) in self._vec_entries.items()
-            if (allowed is None or chunk.session_id in allowed)
-        ]
+        # 向量腿：预组 float32 矩阵上做作用域/收窄过滤（会话元组判定，
+        # 跨源撞名安全；缓存填充时已按白名单过滤，这里再按查询参数收窄）
         vec_hits: list[tuple[ChunkRow, float]] = []
-        if filtered:
-            chunks = [c for c, _ in filtered]
-            mats = [v for _, v in filtered]
-            for idx, sim in ai_ports.top_k_similar(
-                q_vec, mats, self.settings.top_k, _VEC_MIN_COS
-            ):
-                vec_hits.append((chunks[idx], float(sim)))
+        if self._matrix is not None and self._matrix_keys:
+            idxs = [
+                i
+                for i, sess in enumerate(self._matrix_sessions)
+                if allowed is None or sess in allowed
+            ]
+            if idxs:
+                mats = (
+                    self._matrix[idxs]
+                    if len(idxs) != len(self._matrix_keys)
+                    else self._matrix
+                )
+                chunks = [self._matrix_chunks[i] for i in idxs]
+                for idx, sim in ai_ports.top_k_similar(
+                    q_vec, mats, self.settings.top_k, _VEC_MIN_COS
+                ):
+                    vec_hits.append((chunks[idx], float(sim)))
         fts_rows: list[ChunkRow] = []
         if self._fts_enabled:
             fts_rows = await fts_search(

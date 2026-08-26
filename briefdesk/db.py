@@ -425,6 +425,12 @@ async def get_db() -> aiosqlite.Connection:
     return _db
 
 
+def get_embed_lock() -> asyncio.Lock:
+    """向量专用连接的语句级互斥锁（插件共享该连接约定时使用，如 rag）。"""
+
+    return _embed_lock
+
+
 async def get_embed_db() -> aiosqlite.Connection:
     """向量持久化专用连接（与主连接隔离，WAL + busy_timeout）。
 

@@ -186,6 +186,7 @@ class RagDbTest(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertTrue(await ensure_fts(self.db))
+        await _seed_session(self.db, "weflow", "s1", enabled=1, is_group=1)
         await upsert_chunks(self.db, [self._row()])  # 事实源先行（fts_search 读它）
         await sync_fts(self.db, [self._row()])
         hits = await fts_search(self.db, "有通知", limit=10)  # ≥3 字符走 FTS MATCH
@@ -196,6 +197,7 @@ class RagDbTest(unittest.IsolatedAsyncioTestCase):
             ensure_fts, fts_search, sync_fts, upsert_chunks,
         )
 
+        await _seed_session(self.db, "weflow", "s1", enabled=1, is_group=1)
         await ensure_fts(self.db)
         await upsert_chunks(self.db, [self._row()])
         await sync_fts(self.db, [self._row()])
@@ -209,6 +211,7 @@ class RagDbTest(unittest.IsolatedAsyncioTestCase):
             ensure_fts, fts_search, sync_fts, upsert_chunks,
         )
 
+        await _seed_session(self.db, "weflow", "s1", enabled=1, is_group=1)
         await ensure_fts(self.db)
         await upsert_chunks(self.db, [self._row()])
         await sync_fts(self.db, [self._row()])
@@ -260,6 +263,7 @@ class RagDbTest(unittest.IsolatedAsyncioTestCase):
             upsert_embeddings,
         )
 
+        await _seed_session(self.db, "weflow", "s1", enabled=1, is_group=1)
         await upsert_chunks(self.db, [self._row(), self._row("m2")])
         await upsert_embeddings(
             self.db, [("weflow", "m1"), ("weflow", "m2")],
@@ -268,11 +272,19 @@ class RagDbTest(unittest.IsolatedAsyncioTestCase):
         raw, watermark = await fetch_new_embeddings(self.db, "old-model", "")
         entries, bad = parse_embedding_rows(raw)
         self.assertEqual([c.msg_id for c, _ in entries], ["m1", "m2"])
-        self.assertEqual(entries[0][1], [0.1, 0.2])
+        self.assertEqual(
+            [round(x, 5) for x in entries[0][1].tolist()], [0.1, 0.2]
+        )
         self.assertEqual(watermark, "t0")
-        # 水位之后无新增
-        raw2, wm2 = await fetch_new_embeddings(self.db, "old-model", watermark)
-        self.assertEqual((raw2, wm2), ([], "t0"))
+        # 闭区间 >=：同秒提交的新行不会被严格大于漏掉（W1/N3）
+        await upsert_chunks(self.db, [self._row("m3")])
+        await upsert_embeddings(self.db, [("weflow", "m3")], [[0.5]], "old-model", "t0")
+        raw_same, _ = await fetch_new_embeddings(self.db, "old-model", watermark)
+        self.assertEqual([r["msg_id"] for r in raw_same], ["m1", "m2", "m3"])  # 闭区间幂等重取
+        # 同水位再拉：仍返回边界秒全部行（引擎侧按键覆盖去重，幂等无害）
+        raw2, wm2 = await fetch_new_embeddings(self.db, "old-model", "t0")
+        self.assertEqual(sorted(r["msg_id"] for r in raw2), ["m1", "m2", "m3"])
+        self.assertEqual(wm2, "t0")
         # 模型变更后旧行失配
         raw3, _ = await fetch_new_embeddings(self.db, "new-model", "")
         self.assertEqual(raw3, [])
@@ -705,6 +717,7 @@ class RagRouterTest(unittest.IsolatedAsyncioTestCase):
         engine = Mock()
         engine.settings = RS()
         engine.request_backfill = Mock(return_value=True)
+        engine.maintenance_gc = AsyncMock(return_value=2)
         engine.ask = AsyncMock(
             return_value=AskResult(
                 refused=False,
@@ -830,4 +843,77 @@ class MaintenanceLoopTest(unittest.IsolatedAsyncioTestCase):
         finally:
             await db.close()
             await edb.close()
+
+
+class RagCrossSourceScopeTest(_MemoryEngineBase):
+    """作用域判定按 (source, session_id) 元组——跨源撞名不放行（回归）。"""
+
+    async def test_legacy_row_from_disabled_source_not_retrievable(self):
+        from briefdesk.plugins.rag.db import (
+            ChunkRow, ensure_rag_schema, upsert_chunks, upsert_embeddings,
+        )
+
+        await ensure_rag_schema(self.db)  # 直接落库前先建 rag 表
+        # 基座已种 weflow/s1=启用；改为停用以构造「同 ID 跨源停用源」场景
+        cursor = await self.db.execute(
+            "UPDATE sessions SET enabled = 0 "
+            "WHERE source = 'weflow' AND session_id = 's1'"
+        )
+        await cursor.close()
+        await self.db.commit()
+        # weflow/s1 停用、qqflow/s1 启用群聊：同 session_id 不同源
+        await _seed_session(self.db, "qqflow", "s1", enabled=1, is_group=1)
+        legacy = ChunkRow(
+            source="weflow", msg_id="m1", session_id="s1", group_name="测试群",
+            sender_name="小明", msg_time=1700000000,
+            content="周六6点开会有通知", item_id="",
+        )
+        await upsert_chunks(self.db, [legacy])
+        await upsert_embeddings(
+            self.db, [("weflow", "m1")], [[1.0, 0.0]], "test-model", "t0"
+        )
+        await self.engine.warm_vectors()
+        # 查询期白名单为 (qqflow,s1)：遗留 (weflow,s1) 行不可见（检索全哑→None）
+        self.assertIsNone(await self.engine.retrieve("周六6点开会有通知"))
+
+
+class RagFreshDbDays0Test(unittest.IsolatedAsyncioTestCase):
+    """days=0 时维护路径在全新库上也安全空转（回归：早退先于建表曾致循环崩溃）。"""
+
+    async def test_days0_fresh_db_safe(self):
+        import aiosqlite
+
+        from briefdesk import ai_ports
+        from briefdesk.db import init_schema
+        from briefdesk.plugins.rag.config import RagSettings as RS
+        from briefdesk.plugins.rag.engine import RagEngine
+
+        db = await aiosqlite.connect(":memory:")
+        db.row_factory = aiosqlite.Row
+        await init_schema(db)
+        provider = Mock()
+        provider.is_embedding_enabled = Mock(return_value=True)
+        provider.embed_model_name = Mock(return_value="m")
+        ai_ports.set_ai(provider)
+
+        async def _factory():
+            return db
+
+        engine = RagEngine(RS(backfill_days=0), db_factory=_factory,
+                           embed_factory=_factory)
+        try:
+            self.assertEqual(await engine.backfill_step(1_800_000_000), 0)
+            await engine.warm_vectors()      # 不应抛 no such table
+            await engine.maintenance_gc()    # 同上
+            cursor = await db.execute(
+                "SELECT name FROM sqlite_master WHERE name='rag_chunks'"
+            )
+            try:
+                row = await cursor.fetchone()
+            finally:
+                await cursor.close()
+            self.assertIsNotNone(row)  # days=0 也完成了建表
+        finally:
+            await engine.teardown()
             ai_ports.set_ai(None)
+            await db.close()

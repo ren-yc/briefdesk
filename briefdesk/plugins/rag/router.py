@@ -90,7 +90,6 @@ async def rag_reindex() -> dict:
     """孤儿对账清理（GC）并触发新一轮补齐回填（有界、可续跑）。"""
 
     engine = _require_engine()
-    db = await get_db()
-    removed = await gc_orphans(db)
+    removed = await engine.maintenance_gc()
     kicked = engine.request_backfill()
     return {"removed": removed, "kicked": kicked}

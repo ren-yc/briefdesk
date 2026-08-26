@@ -2,12 +2,13 @@
 
 rag 三表是 raw_messages 的派生索引：插件自管建表（不在核心 EXPECTED_SCHEMA
 内，validate_schema 取交集校验不受影响），不复制事实源语义，可随时重建。
-所有函数接受显式连接（生产传核心 get_db()，测试传内存库）；游标纪律：
-try/finally close、executemany 后必须 close 再继续。
+所有函数接受显式连接（生产传核心 get_db()/get_embed_db()，测试传内存库）；
+游标纪律：try/finally close、executemany 后必须 close 再继续。
 
-FTS 说明：trigram 分词对中文可用但仅能匹配 >=3 字符查询串——更短的查询
-自动走 rag_chunks 的 LIKE 子串兜底路径（本地库规模下可接受，与 calendar
-「取回后内存过滤」同款取舍）。
+FTS 说明：trigram 分词对中文可用但仅能匹配 >=3 字符「词元」——查询含任一
+更短词元时整体走 LIKE 逐词 AND 兜底（本地库规模下可接受，与 calendar
+「取回后内存过滤」同款取舍）。作用域过滤对启用会话强制生效（group_only
+追加群聊限定），与引擎侧白名单双保险。
 """
 
 from __future__ import annotations
@@ -17,6 +18,7 @@ import re
 from dataclasses import dataclass
 
 import aiosqlite
+import numpy as np
 
 # LIKE 兜底路径的转义字符（chr(92) = 反斜杠；避免源码内裸反斜杠）
 _BS = chr(92)
@@ -168,11 +170,9 @@ def _scope_sql(
     """检索侧会话白名单过滤片段（对别名 c 的 chunks 行生效）。
 
     启用会话恒为前提；group_only 追加 is_group=1。session_id 进一步收窄。
-    返回 (SQL 片段, 绑定参数)；无约束时返回空串与空参列表。
+    返回 (SQL 片段, 绑定参数)。
     """
 
-    if not enabled_group_only and session_id is None:
-        return "", []
     clause = (
         " AND EXISTS (SELECT 1 FROM sessions s WHERE s.source = c.source"
         " AND s.session_id = c.session_id AND s.enabled = 1"
@@ -214,17 +214,16 @@ async def fts_search(
     session_id: str | None = None,
     enabled_group_only: bool = False,
 ) -> list[ChunkRow]:
-    """关键词召回：>=3 字符走 FTS MATCH（rank 排序），更短走 LIKE 子串兜底。
+    """关键词召回：全部词元 >=3 字走 FTS MATCH（rank 排序），否则 LIKE 兜底。
 
-    trigram 最小匹配长度是 3 字符，中文双字词（「开会」）必须走兜底；
-    本地库规模下 LIKE 全表扫可接受（与 calendar 内存过滤同款取舍）。
+    trigram 最小匹配长度按「词元」计——整串够长但含 2 字词（「开会 吗」）
+    时 FTS 会零命中，必须整体降级；多词兜底为逐词 AND 链（整串含空格会
+    必然失配）。
     """
 
     cleaned = query.strip()
     if not cleaned:
         return []
-    # trigram 最小匹配长度是按「词元」计的：整串 ≥3 字但含 2 字词（如
-    # 「开会 吗」）时 FTS 路会零命中，必须逐词判定后统一走 LIKE 兜底。
     use_fts = _min_token_len(cleaned) >= 3 and bool(await get_meta(db, "fts_tokenizer"))
     order = " ORDER BY rank LIMIT ?"
     params: list[object]
@@ -237,7 +236,6 @@ async def fts_search(
         )
         params = [_fts_query(cleaned)]
     else:
-        # 多词 AND 链：每个词元独立子串匹配（整串含空格会必然失配）
         tokens = [p for p in cleaned.split() if p] or [cleaned]
         like_clause = " AND ".join(
             "c.content LIKE '%' || ? || '%' ESCAPE ?" for _ in tokens
@@ -321,8 +319,10 @@ async def fetch_new_embeddings(
 ) -> tuple[list[dict], str]:
     """按 created_at 水位增量拉取当前模型的向量行（供引擎缓存增量填充）。
 
-    返回 (raw_rows, max_created_at)；raw_rows 为含 chunks 字段 + embedding
-    原文的字典列表，解析由调用方放到工作线程（避免冻结事件循环）。
+    水位比较用闭区间 >=：秒级精度下同秒提交的行不会被永久跳过
+    （entries 按 key 覆盖天然幂等，代价只是边界行重复拉取一次）。
+    返回 (raw_rows, max_created_at)；raw_rows 含 chunks 字段 + embedding
+    原文，JSON 解析由调用方放到工作线程（避免冻结事件循环）。
     """
 
     sql = (
@@ -330,7 +330,7 @@ async def fetch_new_embeddings(
         " c.msg_time, c.content, c.item_id, e.embedding, e.created_at"
         " FROM rag_chunk_embeddings e"
         " JOIN rag_chunks c ON c.source = e.source AND c.msg_id = e.msg_id"
-        " WHERE e.model = ? AND e.created_at > ?"
+        " WHERE e.model = ? AND e.created_at >= ?"
     )
     params: list[object] = [model, since_created_at]
     scope_sql, scope_params = _scope_sql(enabled_group_only, None)
@@ -347,14 +347,14 @@ async def fetch_new_embeddings(
 
 def parse_embedding_rows(
     raw_rows: list[dict],
-) -> tuple[list[tuple[ChunkRow, list[float]]], list[tuple[str, str]]]:
-    """纯函数：解析向量行（可放工作线程执行）。
+) -> tuple[list[tuple[ChunkRow, "np.ndarray"]], list[tuple[str, str]]]:
+    """纯函数：解析向量行为 float32 ndarray（可放工作线程执行）。
 
     返回 (entries, bad_keys)；脏 JSON 行不进 entries，其键返回给调用方
     删除（回填反连接下一轮自动重嵌入）。
     """
 
-    entries: list[tuple[ChunkRow, list[float]]] = []
+    entries: list[tuple[ChunkRow, "np.ndarray"]] = []
     bad_keys: list[tuple[str, str]] = []
     for r in raw_rows:
         key = (r["source"], r["msg_id"])
@@ -362,7 +362,7 @@ def parse_embedding_rows(
             vec = json.loads(r["embedding"])
             if not isinstance(vec, list):
                 raise ValueError("embedding 非数组")
-            floats = [float(x) for x in vec]
+            floats = np.asarray(vec, dtype=np.float32)
         except (json.JSONDecodeError, TypeError, ValueError):
             bad_keys.append(key)
             continue

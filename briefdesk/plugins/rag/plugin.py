@@ -105,8 +105,17 @@ class RagPlugin(StagePlugin, WebPlugin):
         backoff_step = 0
         try:
             while self._engine is not None:
-                processed = await self._engine.backfill_step(int(time.time()))
-                if self._engine.last_cycle_embed_failed:
+                processed = 0
+                failed = False
+                try:
+                    processed = await self._engine.backfill_step(int(time.time()))
+                    failed = self._engine.last_cycle_embed_failed
+                except asyncio.CancelledError:
+                    raise
+                except Exception:  # noqa: BLE001 — 单轮回填异常退避续跑
+                    logger.exception("rag: 回填轮异常，退避续跑")
+                    failed = True
+                if failed:
                     wait = min(
                         _EMBED_FAIL_BACKOFF_BASE * (2**backoff_step), 600.0
                     )
@@ -117,15 +126,18 @@ class RagPlugin(StagePlugin, WebPlugin):
                 backoff_step = 0
                 if processed > 0:
                     continue  # 仍有存量，立即继续排空
-                await self._engine.maintenance_gc()
-                await self._engine.warm_vectors(force_full=True)
+                try:
+                    await self._engine.maintenance_gc()
+                    await self._engine.warm_vectors(force_full=True)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:  # noqa: BLE001 — GC/预热失败下周期重试
+                    logger.exception("rag: GC/预热异常，下周期重试")
                 await asyncio.sleep(
                     self._engine.settings.maintenance_interval_seconds
                 )
         except asyncio.CancelledError:
             raise
-        except Exception:  # noqa: BLE001 — 维护循环异常不影响主流程
-            logger.exception("rag: 维护循环异常终止")
 
     async def teardown(self) -> None:
         if self._backfill_task is not None:
