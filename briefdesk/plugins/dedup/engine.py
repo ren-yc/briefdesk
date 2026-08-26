@@ -584,9 +584,21 @@ class DedupEngine(DedupService):
 
         # 弱候选低置信复核（②）：全部候选一致判 SAME 才命中
         if weak_mode:
-            verdicts = await asyncio.gather(
-                *[self._ask_ai(cand, title, source_quote) for cand, _ in candidates]
+            raw = await asyncio.gather(
+                *[self._ask_ai(cand, title, source_quote) for cand, _ in candidates],
+                return_exceptions=True,
             )
+            verdicts: list[bool] = []
+            for (cand, _score), r in zip(candidates, raw):
+                if isinstance(r, BaseException):
+                    # S1 容错：失败候选按 DIFFERENT 计（全员一致才判重的语义
+                    # 下等价于投反对票），异常不抛穿中止整轮管道
+                    logger.warning(
+                        f'  [weak] "{cand.title}" 判定失败，按 DIFFERENT 计: {r}'
+                    )
+                    verdicts.append(False)
+                else:
+                    verdicts.append(r)
             for (cand, _score), same in zip(candidates, verdicts):
                 logger.info(f'  [weak] "{cand.title}": {"SAME" if same else "DIFFERENT"}')
             if all(verdicts):
@@ -613,50 +625,60 @@ class DedupEngine(DedupService):
         strong = [c for c in candidates if c[1] >= config.dedup_strong_threshold]
         if strong:
             strong_cand, strong_score = strong[0]
-            verdict = await self._ask_ai(strong_cand, title, source_quote)
-            logger.info(
-                f'  [strong] "{strong_cand.title}" ({metric}: {strong_score * 100:.0f}%): '
-                f'{"SAME" if verdict else "DIFFERENT"}'
-            )
-            if verdict:
+            try:
+                verdict = await self._ask_ai(strong_cand, title, source_quote)
+            except Exception as e:  # noqa: BLE001 — S1 容错：短路判定失败降级参与多数票
+                logger.warning(
+                    f'  [strong] "{strong_cand.title}" 判定失败（{e}），'
+                    "该候选保留参与后续多数票"
+                )
+                verdict = None
+            if verdict is not None:
                 logger.info(
-                    f'SAME → merging source "{source_group}" into {strong_cand.id}'
+                    f'  [strong] "{strong_cand.title}" ({metric}: {strong_score * 100:.0f}%): '
+                    f'{"SAME" if verdict else "DIFFERENT"}'
                 )
-                await merge_source_group(strong_cand.id, source_group)
-                return DedupResult(
-                    is_duplicate=True,
-                    similar_to_id=strong_cand.id,
-                    candidate=self._snapshot(strong_cand),
-                )
-            # 强候选判 DIFFERENT（同文本但内容不同，罕见）：只剔除已判定的
-            # 该候选（④），其余 ≥threshold 候选保留参与多数票——避免连带
-            # 作废其它可能判 SAME 的同文本候选
-            candidates.remove((strong_cand, strong_score))
-            if not candidates:
-                return DedupResult(
-                    is_duplicate=False,
-                    candidate=self._snapshot(strong_cand),
-                )
+                if verdict:
+                    logger.info(
+                        f'SAME → merging source "{source_group}" into {strong_cand.id}'
+                    )
+                    await merge_source_group(strong_cand.id, source_group)
+                    return DedupResult(
+                        is_duplicate=True,
+                        similar_to_id=strong_cand.id,
+                        candidate=self._snapshot(strong_cand),
+                    )
+                # 强候选判 DIFFERENT（同文本但内容不同，罕见）：只剔除已判定的
+                # 该候选（④），其余 ≥threshold 候选保留参与多数票——避免连带
+                # 作废其它可能判 SAME 的同文本候选
+                candidates.remove((strong_cand, strong_score))
+                if not candidates:
+                    return DedupResult(
+                        is_duplicate=False,
+                        candidate=self._snapshot(strong_cand),
+                    )
 
         # 并行判定全部候选，加权多数票（⑦）：票权 = 候选相似度，高相似候选的
         # 判定更可信——SAME 权重和 > 总权重一半才命中，抑制低置信票的干扰
         # （实验：串行「任一候选 same 即命中」会把相似但不同信息的噪声放大成
         # 误判）；等权时退化为原 >K/2 规则，单候选退化为一次判定。
-        verdicts = await asyncio.gather(
-            *[self._ask_ai(cand, title, source_quote) for cand, _ in candidates]
+        raw = await asyncio.gather(
+            *[self._ask_ai(cand, title, source_quote) for cand, _ in candidates],
+            return_exceptions=True,
         )
-        for (cand, _score), same in zip(candidates, verdicts):
-            logger.info(f'  "{cand.title}": {"SAME" if same else "DIFFERENT"}')
-        same_weight = sum(
-            score
-            for (_cand, score), same in zip(candidates, verdicts)
-            if same
-        )
-        total_weight = sum(score for _cand, score in candidates)
-        if same_weight > total_weight / 2:
-            target = next(
-                cand for (cand, _score), same in zip(candidates, verdicts) if same
-            )
+        voted: list[tuple[CachedItem, float, bool]] = []
+        for (cand, score), r in zip(candidates, raw):
+            if isinstance(r, BaseException):
+                # S1 容错：失败候选剔除出计权（既无 SAME 票也不占分母），
+                # 全部失败时退化为保守不判重——异常绝不抛穿中止整轮管道
+                logger.warning(f'  "{cand.title}" 判定失败，剔除该候选票: {r}')
+                continue
+            voted.append((cand, score, r))
+            logger.info(f'  "{cand.title}": {"SAME" if r else "DIFFERENT"}')
+        total_weight = sum(score for _cand, score, _ in voted)
+        same_weight = sum(score for _cand, score, same in voted if same)
+        if total_weight and same_weight > total_weight / 2:
+            target = next(cand for cand, _score, same in voted if same)
             logger.info(f'SAME → merging source "{source_group}" into {target.id}')
             await merge_source_group(target.id, source_group)
             return DedupResult(

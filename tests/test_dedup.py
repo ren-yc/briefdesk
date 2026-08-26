@@ -1073,5 +1073,112 @@ class QuoteShortcutTest(unittest.IsolatedAsyncioTestCase):
         merge_mock.assert_not_awaited()
 
 
+class AskAiFailureIsolationTest(unittest.IsolatedAsyncioTestCase):
+    """S1 回归：单个候选 AI 判定失败不得抛穿 check_dedup 中止整轮管道。
+
+    失败候选按"无票"处理（剔除权重、不参与多数票），全部失败保守判
+    不重复——与 classify（failed 重试）/merge（None 降级）的容错语义对齐。
+    """
+
+    def _engine(self, items: list[tuple[str, str, str]]) -> DedupEngine:
+        engine = DedupEngine()
+        engine._cache_loaded = True
+        engine._cache = [
+            CachedItem(id=i, title=t, source_quote=q, embedding=[0.1, 0.2])
+            for i, t, q in items
+        ]
+        return engine
+
+    @staticmethod
+    def _resp(same: bool) -> SimpleNamespace:
+        return SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content='{"same": true}' if same else '{"same": false}'
+                    ),
+                    finish_reason="stop",
+                )
+            ]
+        )
+
+    async def test_single_candidate_ai_failure_returns_not_duplicate(self):
+        """单候选 AI 报错：保守返回不重复，异常不得抛出。"""
+        engine = self._engine([("a1", "篮球社招新", "内容甲")])
+        with (
+            patch(
+                "briefdesk.plugins.dedup.engine.chat",
+                new=AsyncMock(side_effect=RuntimeError("API down")),
+            ),
+            patch(
+                "briefdesk.plugins.dedup.engine.merge_source_group", new=AsyncMock()
+            ),
+        ):
+            result = await engine.check_dedup("篮球社招新", "新生2群", q_emb=[0.5, 0.6])
+        self.assertFalse(result.is_duplicate)
+
+    async def test_majority_vote_excludes_failed_candidate_weight(self):
+        """两候选一败一 SAME：失败票剔除后，剩余 SAME 票正常计权命中。"""
+        engine = self._engine(
+            [("a1", "篮球社招新", "内容甲"), ("a2", "篮球社团招新啦", "内容乙")]
+        )
+
+        async def flaky_chat(messages, **kwargs):
+            # 按"消息A"引用内容判定成败（与候选内部排序解耦）：
+            # a1（内容甲）的判定必失败，a2 正常判 SAME
+            user = messages[1]["content"]
+            block_a = user.split("消息B：")[0]
+            if "内容甲" in block_a:
+                raise RuntimeError("API down")
+            return self._resp(True)
+
+        with (
+            patch("briefdesk.plugins.dedup.engine.chat", new=flaky_chat),
+            patch(
+                "briefdesk.plugins.dedup.engine.merge_source_group",
+                new=AsyncMock(),
+            ) as merge_mock,
+        ):
+            result = await engine.check_dedup("篮球社招新", "新生2群", q_emb=[0.5, 0.6])
+        self.assertTrue(result.is_duplicate)
+        self.assertEqual(result.similar_to_id, "a2")
+        merge_mock.assert_awaited_once_with("a2", "新生2群")
+
+    async def test_strong_shortcircuit_failure_conservative(self):
+        """strong 候选（余弦≥0.99）AI 失败：不抛错，无其余候选保守判不重复。"""
+        engine = self._engine([("s1", "篮球社招新", "内容甲")])
+        with (
+            patch(
+                "briefdesk.plugins.dedup.engine.chat",
+                new=AsyncMock(side_effect=RuntimeError("API down")),
+            ),
+            patch(
+                "briefdesk.plugins.dedup.engine.merge_source_group", new=AsyncMock()
+            ) as merge_mock,
+        ):
+            result = await engine.check_dedup("篮球社招新", "新生2群", q_emb=[0.1, 0.2])
+        self.assertFalse(result.is_duplicate)
+        merge_mock.assert_not_awaited()
+
+    async def test_weak_mode_all_failed_conservative(self):
+        """weak 低置信复核全员 AI 失败：视为非 SAME 票，保守不判重。"""
+        engine = DedupEngine()
+        engine._cache_loaded = True
+        engine._cache = [
+            CachedItem(id="w1", title="羽毛球社招新", source_quote="内容甲", embedding=[0.7, 0.7])
+        ]
+        with (
+            patch(
+                "briefdesk.plugins.dedup.engine.chat",
+                new=AsyncMock(side_effect=RuntimeError("API down")),
+            ),
+            patch(
+                "briefdesk.plugins.dedup.engine.merge_source_group", new=AsyncMock()
+            ),
+        ):
+            result = await engine.check_dedup("羽毛球社招新", "新生2群", q_emb=[1.0, 0.0])
+        self.assertFalse(result.is_duplicate)
+
+
 if __name__ == "__main__":
     unittest.main()

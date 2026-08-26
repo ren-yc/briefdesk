@@ -134,6 +134,17 @@ _ITEM_EXPORT_COLS = [
     "msg_time", "start", "end", "extra_times", "article_url", "source_quote", "is_verified",
 ]
 
+# Excel/WPS 公式注入防护（审计 #9）：导出单元格源自群聊消息（攻击者可控），
+# 以 = + - @ \t \r 开头的文本在电子表格应用中打开会被当作公式执行
+# （命令执行/外联/数据外带）。统一加 "'" 前缀降级为纯文本；数字列不受影响。
+_CSV_FORMULA_PREFIXES = ("=", "+", "-", "@", "\t", "\r")
+
+
+def _csv_safe_cell(value: object) -> object:
+    if isinstance(value, str) and value.startswith(_CSV_FORMULA_PREFIXES):
+        return "'" + value
+    return value
+
 
 def _export_attachment(content: str, media_type: str, filename: str) -> Response:
     return Response(
@@ -180,11 +191,13 @@ async def api_export_items(
             offset=offset,
         )
         for r in page["items"]:
-            w.writerow(
-                r.get(c, "") if not isinstance(r.get(c), (dict, list))
-                else json.dumps(r.get(c), ensure_ascii=False)
-                for c in _ITEM_EXPORT_COLS
-            )
+            cells = []
+            for c in _ITEM_EXPORT_COLS:
+                v = r.get(c, "")
+                if isinstance(v, (dict, list)):
+                    v = json.dumps(v, ensure_ascii=False)
+                cells.append(_csv_safe_cell(v))
+            w.writerow(cells)
         if not page["has_more"] or not page["items"]:
             break
         offset = page["next_offset"]
@@ -210,7 +223,20 @@ async def api_export_recat_samples(fmt: str = Query("jsonl", alias="format")):
         w = csv.writer(out)
         w.writerow(["item_id", "source", "source_msg_id", "category_before", "category_after", "content", "created_at"])
         for s in samples:
-            w.writerow([s["item_id"], s["source"], s["source_msg_id"], s["category_before"], s["category_after"], s["content"], s["created_at"]])
+            w.writerow(
+                [
+                    _csv_safe_cell(v)
+                    for v in (
+                        s["item_id"],
+                        s["source"],
+                        s["source_msg_id"],
+                        s["category_before"],
+                        s["category_after"],
+                        s["content"],
+                        s["created_at"],
+                    )
+                ]
+            )
         return _export_attachment(
             out.getvalue(),
             "text/csv; charset=utf-8",

@@ -1769,7 +1769,7 @@ function renderNav(categories, ignoredCount, memoCount) {
     // 颜色数据驱动：内联 --cat（遗留类别无 color → 空，回退 CSS 默认）
     const colorStyle = catColor.get(cat.key) ? ` style="--cat:${catColor.get(cat.key)}"` : "";
     html += `
-      <a href="#" class="cat-link${isActive ? " active" : ""}"${colorStyle} data-category="${cat.key}" data-verified="unverified">
+      <a href="#" class="cat-link${isActive ? " active" : ""}"${colorStyle} data-category="${escAttr(cat.key)}" data-verified="unverified">
         ${icon ? `<img src="${icon}" class="icon-sm cat-icon" alt="">` : ""}${esc(cat.key)}
         <span class="cat-count">${cat.count}</span>
       </a>`;

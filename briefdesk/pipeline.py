@@ -88,8 +88,9 @@ async def process_all_batches(
     """对所有新消息执行完整管道：并行分类，按完成顺序入库并实时通知前端。
 
     返回 bool：True = 消息已处理或无需处理（调用方可推进会话水位）；
-    False = 存在未落 raw 的保留消息（无启用类别/阶段插件缺失早退），
-    调用方必须跳过本轮水位推进，否则下轮窗口会永久跳过这些消息。
+    False = 调用方必须跳过本轮水位推进——包括存在未落 raw 的保留消息
+    （无启用类别/阶段插件缺失早退），以及零产出（全部消息分类失败，
+    审计 #1：失败消息由"最早未处理消息钉窗"在后续轮次找回）。
 
         Args:
             messages: 待处理消息
@@ -346,6 +347,8 @@ async def process_all_batches(
         logger.warning(
             f"本轮零产出：{total_failed} 条失败待回填，不刷新 lastSync"
         )
-    # 正常路径（消息已落 raw）：可推进水位；失败待回填的消息仍能被
-    # "最早未处理消息钉窗"机制在后续轮次找回
-    return True
+    # 返回值语义（审计 #1）：零产出（全部消息分类失败）返回 False——
+    # poll_cycle 据此跳过本轮水位推进，失败待回填的消息由
+    # "最早未处理消息钉窗"机制在后续轮次找回；实时路径忽略返回值。
+    processed_any = total_inserted + total_dupes + total_skipped > 0
+    return processed_any

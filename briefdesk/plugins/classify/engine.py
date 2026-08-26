@@ -144,11 +144,22 @@ _MAX_BATCH_CHARS = 40000  # 整批 user 消息字符总量上限（防御性兜�
 _BATCH_DELIMITER = "=" * 3  # 数据边界标记：框定群聊消息数据区（提示词注入缓解）
 
 
-def _build_user_message(groups: list[dict]) -> str:
-    """构建分类 user 消息：数据用边界标记框定，单条/总量按字符截断。"""
+def _build_user_message_ex(groups: list[dict]) -> tuple[str, list[int]]:
+    """构建分类 user 消息：数据用边界标记框定，单条按字符截断、总量按行预算。
+
+    超出 _MAX_BATCH_CHARS 的消息**整条剔除**（而非字符串中段截断），并把
+    被剔除的消息 index 随元组返回——调用方必须将其并入 outcome.failed
+    走回填重试。此前实现做中段截断，被截掉的消息既不出现在 AI 输入也
+    不进 failed，会被 _mark_skipped 当闲聊标记 processed（静默丢失）。
+    """
     parts: list[str] = []
+    total = 0
+    truncated: list[int] = []
     for gi, group in enumerate(groups):
-        lines = [f"群 {gi}: {group['groupName']}"]
+        header = f"群 {gi}: {group['groupName']}"
+        lines: list[str] = [header]
+        group_cost = len(header)
+        kept_any = False
         for msg in group["messages"]:
             text = msg["content"].replace("\n", " ").replace("\r", " ")
             # QR 有效期提示清洗只作用于 OCR 文本（[OCR] 前缀）；普通文本不筛，避免误伤
@@ -158,15 +169,27 @@ def _build_user_message(groups: list[dict]) -> str:
             if len(clean) > _MAX_MSG_CHARS:
                 clean = clean[:_MAX_MSG_CHARS] + "…[已截断]"
             anchor = f" [{msg['sentAt']}]" if msg.get("sentAt") else ""
-            lines.append(f"{msg['index']}: {msg['senderName']}{anchor}: {clean}")
-        parts.append("\n".join(lines))
+            line = f"{msg['index']}: {msg['senderName']}{anchor}: {clean}"
+            cost = len(line) + 1  # 含换行
+            if total + group_cost + cost > _MAX_BATCH_CHARS:
+                truncated.append(msg["index"])
+                continue
+            lines.append(line)
+            group_cost += cost
+            kept_any = True
+        if kept_any:
+            parts.append("\n".join(lines))
+            total += group_cost + 2  # 组间空行
     body = "\n\n".join(parts)
-    if len(body) > _MAX_BATCH_CHARS:
-        body = body[:_MAX_BATCH_CHARS] + "\n…[输入总量已截断]"
     return (
         f"{_BATCH_DELIMITER}\n群聊消息开始\n{_BATCH_DELIMITER}\n"
         f"{body}\n{_BATCH_DELIMITER}\n群聊消息结束\n{_BATCH_DELIMITER}"
-    )
+    ), truncated
+
+
+def _build_user_message(groups: list[dict]) -> str:
+    """兼容包装：仅返回消息文本（测试与既有调用使用）。"""
+    return _build_user_message_ex(groups)[0]
 
 
 # 允许两种格式：带时刻 "YYYY-MM-DD HH:MM" 或仅日期 "YYYY-MM-DD"（日历/徽章可只按天展示）
@@ -706,7 +729,7 @@ async def _classify_once(
     depth: int,
 ) -> ClassifyOutcome:
     groups = _group_messages(messages)
-    user_message = _build_user_message(groups)
+    user_message, budget_dropped = _build_user_message_ex(groups)
 
     logger.info(f"Sending {len(messages)} msgs in {len(groups)} groups to AI...")
 
@@ -756,6 +779,17 @@ async def _classify_once(
         results = [replace(r, msg_index=r.msg_index + offset) for r in results]
         retry_indexes = [i + offset for i in retry_indexes]
         time_indexes = [i + offset for i in time_indexes]
+    if budget_dropped:
+        # S2 防静默丢失：被预算剔除的消息未送分类，必须并入 failed 由
+        # 回填重试——否则会被 _mark_skipped 当闲聊标记 processed
+        logger.warning(
+            "分类输入超出单批字符预算（%d），%d 条消息整条剔除待回填"
+            "（建议调小批大小）: %s",
+            _MAX_BATCH_CHARS,
+            len(budget_dropped),
+            budget_dropped,
+        )
+        retry_indexes = sorted(set(retry_indexes) | {offset + i for i in budget_dropped})
     logger.info(f"Got {len(results)} relevant, {len(retry_indexes)} retry")
     return ClassifyOutcome(results, retry_indexes, time_indexes)
 

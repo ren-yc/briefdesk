@@ -50,7 +50,8 @@ _STATUS_CODE_COLORS = {
 # 访问日志需要掩码的疑似密钥查询参数键：令牌/密钥经 URL 查询参数传递时
 # （如 weflow SSE 的 ?access_token=）会出现在 uvicorn access log 请求行中。
 _QUERY_SECRET_PARAM_RE = re.compile(
-    r"([?&](?:access_token|token|api[_-]?key|apikey|key|secret|auth)=)[^&\s]*"
+    r"([?&](?:access[_-]?token|token|api[_-]?key|apikey|key|secret|auth)=)[^&\s]*",
+    re.IGNORECASE,  # 键名大小写不敏感（审计 #11：Token=/APIKey=/AccessToken 变体同样掩码）
 )
 
 

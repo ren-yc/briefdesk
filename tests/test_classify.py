@@ -14,12 +14,14 @@ from typing import ClassVar
 from unittest.mock import AsyncMock, patch
 
 from briefdesk.plugins.classify.engine import (
+    _MAX_BATCH_CHARS,
     _MAX_MSG_CHARS,
     _SUMMARY_MAX_MSG_CHARS,
     _SUMMARY_PROMPT_TEMPLATE,
     _build_summary_user_message,
     _build_time_user_message,
     _build_user_message,
+    _build_user_message_ex,
     _group_messages,
     _local_datetime,
     _parse_response,
@@ -1111,6 +1113,105 @@ class ExtractTimesTest(unittest.IsolatedAsyncioTestCase):
         with patch("briefdesk.plugins.classify.engine.chat", new=AsyncMock()) as chat:
             await extract_times([], [], [])
         chat.assert_not_awaited()
+
+
+class BatchBudgetTruncationTest(unittest.TestCase):
+    """S2：整批字符预算超限时整条剔除并报告被截 index（防静默丢失）。"""
+
+    @staticmethod
+    def _groups(contents: list[str]) -> list[dict]:
+        return [
+            {
+                "groupName": "g",
+                "messages": [
+                    {"index": i, "senderName": "A", "content": c}
+                    for i, c in enumerate(contents)
+                ],
+            }
+        ]
+
+    def test_small_batch_no_truncation(self):
+        msg, truncated = _build_user_message_ex(self._groups(["你好", "再见"]))
+        self.assertEqual(truncated, [])
+        self.assertIn("0: A: 你好", msg)
+        self.assertIn("1: A: 再见", msg)
+
+    def test_over_budget_messages_dropped_whole_and_reported(self):
+        # 单条会被 _MAX_MSG_CHARS 截到 ~810 字符/行，需 >49 条才能触顶预算
+        n = 60
+        contents = ["首条"] + ["长" * 1000] * (n - 1)
+        msg, truncated = _build_user_message_ex(self._groups(contents))
+        # 被剔集合必为连续后缀（行成本单调递增）
+        self.assertTrue(truncated, "超预算批次必须产生被截消息")
+        self.assertEqual(truncated, list(range(n - len(truncated), n)))
+        # 被剔消息整条不出现在输入中（而非中段截断残留半行）
+        self.assertNotIn(f"{truncated[0]}: A:", msg)
+        self.assertIn("0: A: 首条", msg)
+        # 剔除后总量回到预算内（边界标记与群头留余量）
+        self.assertLessEqual(len(msg), _MAX_BATCH_CHARS + 200)
+
+    def test_wrapper_returns_text_only(self):
+        msg = _build_user_message(self._groups(["你好"]))
+        self.assertIn("0: A: 你好", msg)
+
+
+class ClassifyBatchTruncationFailedTest(unittest.IsolatedAsyncioTestCase):
+    """集成：被预算剔除的消息必须进 outcome.failed（回填重试），
+    不得因"未出现在 AI 输出"而被标记 processed 静默丢失。"""
+
+    async def test_truncated_indexes_merged_into_failed(self):
+        n = 60  # 单条被截到 ~810 字符/行，60 条必触顶 40000 预算
+        messages = [
+            InternalMessage(
+                msg_id=("m%d" % i),
+                content=("首条" if i == 0 else "长" * 1000),
+                sender_name="张三",
+                sender_id="u1",
+                session_id="s1",
+                group_name="社团群",
+                timestamp=1750000000,
+            )
+            for i in range(n)
+        ]
+        expected_dropped = _build_user_message_ex(_group_messages(messages))[1]
+        self.assertTrue(expected_dropped, "前置：该批次必须真实触发预算剔除")
+        payload = (
+            '{"task":"classify","data":'
+            '[{"index":0,"category":"活动通知","time":false,"quote":"首条","key":["k"]}]}'
+        )
+        resp = SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(content=payload),
+                    finish_reason="stop",
+                )
+            ]
+        )
+        with (
+            patch(
+                "briefdesk.plugins.classify.engine.chat",
+                new=AsyncMock(return_value=resp),
+            ),
+            patch(
+                "briefdesk.plugins.classify.engine.get_enabled_categories",
+                new=AsyncMock(
+                    return_value=[
+                        {"name": "活动通知", "prompt": "", "color": "", "enabled": 1}
+                    ]
+                ),
+            ),
+            patch(
+                "briefdesk.plugins.classify.engine.summarize_results",
+                new=AsyncMock(),
+            ),
+            patch(
+                "briefdesk.plugins.classify.engine.extract_times", new=AsyncMock()
+            ),
+        ):
+            outcome = await classify_batch(messages)
+        # 被预算剔除的消息必须全部进 failed（回填重试），不得静默标 processed
+        self.assertEqual(sorted(outcome.failed), sorted(expected_dropped))
+        self.assertEqual([r.msg_index for r in outcome.results], [0])
 
 
 if __name__ == "__main__":

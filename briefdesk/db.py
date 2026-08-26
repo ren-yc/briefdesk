@@ -396,6 +396,10 @@ async def get_db() -> aiosqlite.Connection:
                 await cursor.close()
                 cursor = await conn.execute("PRAGMA foreign_keys = ON")
                 await cursor.close()
+                # 与向量连接对称（审计 B-1）：embed 连接持写锁落向量期间，
+                # 主连接的写操作短暂等待而非立即抛 "database is locked"
+                cursor = await conn.execute("PRAGMA busy_timeout = 5000")
+                await cursor.close()
                 await conn.commit()
                 try:
                     await validate_schema(conn)
@@ -1132,22 +1136,27 @@ async def delete_items(ids: list[str], *, keep_raw_messages: bool = False) -> in
         return 0
     db = await get_db()
     placeholders = ",".join("?" for _ in ids)
-    await db.execute(
-        f"DELETE FROM item_embeddings WHERE item_id IN ({placeholders})", tuple(ids)
-    )
-    if not keep_raw_messages:
+    try:
         await db.execute(
-            f"DELETE FROM raw_messages WHERE (source, msg_id) IN ("
-            f"SELECT source, source_msg_id FROM items WHERE id IN ({placeholders}))",
-            tuple(ids),
+            f"DELETE FROM item_embeddings WHERE item_id IN ({placeholders})", tuple(ids)
         )
-    async with _cursor(
-        db,
-        f"DELETE FROM items WHERE id IN ({placeholders})",
-        tuple(ids),
-    ) as cursor:
-        deleted = cursor.rowcount
-    await db.commit()
+        if not keep_raw_messages:
+            await db.execute(
+                f"DELETE FROM raw_messages WHERE (source, msg_id) IN ("
+                f"SELECT source, source_msg_id FROM items WHERE id IN ({placeholders}))",
+                tuple(ids),
+            )
+        async with _cursor(
+            db,
+            f"DELETE FROM items WHERE id IN ({placeholders})",
+            tuple(ids),
+        ) as cursor:
+            deleted = cursor.rowcount
+        await db.commit()
+    except Exception:
+        # 审计 B-3：多语句隐式事务异常时显式回滚，不留半程状态占用连接
+        await db.rollback()
+        raise
     return deleted
 
 
@@ -1644,22 +1653,28 @@ async def update_category(
     if not row:
         return None
     old_name = row["name"]
-    if name is not None:
-        await db.execute("UPDATE categories SET name = ? WHERE id = ?", (name, cat_id))
-        if name != old_name:
+    try:
+        if name is not None:
+            await db.execute("UPDATE categories SET name = ? WHERE id = ?", (name, cat_id))
+            if name != old_name:
+                await db.execute(
+                    "UPDATE items SET category = ? WHERE category = ?",
+                    (name, old_name),
+                )
+        if prompt is not None:
             await db.execute(
-                "UPDATE items SET category = ? WHERE category = ?",
-                (name, old_name),
+                "UPDATE categories SET prompt = ? WHERE id = ?", (prompt, cat_id)
             )
-    if prompt is not None:
-        await db.execute(
-            "UPDATE categories SET prompt = ? WHERE id = ?", (prompt, cat_id)
-        )
-    if color is not None:
-        await db.execute(
-            "UPDATE categories SET color = ? WHERE id = ?", (color, cat_id)
-        )
-    await db.commit()
+        if color is not None:
+            await db.execute(
+                "UPDATE categories SET color = ? WHERE id = ?", (color, cat_id)
+            )
+        await db.commit()
+    except Exception:
+        # 审计 B-3：改名撞 UNIQUE 等异常时显式回滚，避免"级联已生效但
+        # prompt/color 未改"的半程状态残留在连接事务里
+        await db.rollback()
+        raise
     return await _get_category(db, cat_id)
 
 
@@ -1692,27 +1707,32 @@ async def delete_category(
     if not row:
         return None, []
     deleted_ids: list[str] = []
-    if purge_items:
-        rows = await _fetchall(
-            db, "SELECT id FROM items WHERE category = ?", (row["name"],)
-        )
-        deleted_ids = [r["id"] for r in rows]
-        if deleted_ids:
-            placeholders = ",".join("?" for _ in deleted_ids)
-            await db.execute(
-                f"DELETE FROM item_embeddings WHERE item_id IN ({placeholders})",
-                tuple(deleted_ids),
+    try:
+        if purge_items:
+            rows = await _fetchall(
+                db, "SELECT id FROM items WHERE category = ?", (row["name"],)
             )
-            await db.execute(
-                f"DELETE FROM raw_messages WHERE (source, msg_id) IN ("
-                f"SELECT source, source_msg_id FROM items WHERE id IN ({placeholders}))",
-                tuple(deleted_ids),
-            )
-            await db.execute(
-                f"DELETE FROM items WHERE id IN ({placeholders})", tuple(deleted_ids)
-            )
-    await db.execute("DELETE FROM categories WHERE id = ?", (cat_id,))
-    await db.commit()
+            deleted_ids = [r["id"] for r in rows]
+            if deleted_ids:
+                placeholders = ",".join("?" for _ in deleted_ids)
+                await db.execute(
+                    f"DELETE FROM item_embeddings WHERE item_id IN ({placeholders})",
+                    tuple(deleted_ids),
+                )
+                await db.execute(
+                    f"DELETE FROM raw_messages WHERE (source, msg_id) IN ("
+                    f"SELECT source, source_msg_id FROM items WHERE id IN ({placeholders}))",
+                    tuple(deleted_ids),
+                )
+                await db.execute(
+                    f"DELETE FROM items WHERE id IN ({placeholders})", tuple(deleted_ids)
+                )
+        await db.execute("DELETE FROM categories WHERE id = ?", (cat_id,))
+        await db.commit()
+    except Exception:
+        # 审计 B-3：级联删除中途失败时显式回滚，不留部分删除状态
+        await db.rollback()
+        raise
     return cast(CategoryRow, dict(row)), deleted_ids
 
 
