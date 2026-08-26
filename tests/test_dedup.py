@@ -1161,9 +1161,9 @@ class LockEmbedFallbackTest(unittest.IsolatedAsyncioTestCase):
 
 
 class CandidateErrorIsolationTest(unittest.IsolatedAsyncioTestCase):
-    """单候选 AI 异常不中止整批（P2 低成本修复）：gather 改
-    return_exceptions=True，异常候选按 DIFFERENT 计票（票权 0、总权重不变，
-    加权多数票语义对其余候选保持不变）并打 WARNING。"""
+    """单候选 AI 异常不中止整批：gather 改 return_exceptions=True，
+    加权多数票路径异常候选剔除出计权（既无 SAME 票也不占分母——远程
+    审计 S1 语义；全部失败退化为保守不判重）并打 WARNING。"""
 
     def _engine(self, items):
         engine = DedupEngine()
@@ -1201,7 +1201,7 @@ class CandidateErrorIsolationTest(unittest.IsolatedAsyncioTestCase):
         return fake_chat
 
     async def test_vote_survives_single_candidate_error(self):
-        """三候选一票异常：按 DIFFERENT 计票 → 0.85 < 半数 1.275 不判重（不抛错）。"""
+        """三候选一票异常：剔除后剩 0.85 对 0.85，未过半数 → 不判重（不抛错）。"""
         engine = self._engine(
             [
                 ("n1", "篮球社招新", "内容甲"),
@@ -1231,10 +1231,10 @@ class CandidateErrorIsolationTest(unittest.IsolatedAsyncioTestCase):
             result = await engine.check_dedup("篮球社招新", "新生2群", q_emb=[0.5, 0.6])
         self.assertFalse(result.is_duplicate)
         merge_mock.assert_not_awaited()
-        self.assertTrue(any("按 DIFFERENT" in line for line in logs.output))
+        self.assertTrue(any("剔除该候选票" in line for line in logs.output))
 
     async def test_error_candidate_zero_weight_others_can_still_hit(self):
-        """异常票权重 0 但其余两 SAME 票照常投票：1.7 > 半数 1.275 → 命中 n1。"""
+        """异常票剔除出计权：其余两 SAME 票 1.7 > 剩余半数 0.85 → 命中 n1。"""
         engine = self._engine(
             [
                 ("n1", "篮球社招新", "内容甲"),
@@ -1268,8 +1268,8 @@ class CandidateErrorIsolationTest(unittest.IsolatedAsyncioTestCase):
 class AskAiFailureIsolationTest(unittest.IsolatedAsyncioTestCase):
     """S1 回归：单个候选 AI 判定失败不得抛穿 check_dedup 中止整轮管道。
 
-    失败候选按 DIFFERENT 计票（SAME 权重记 0、总权重不变，与上游 aa3cdfc
-    加权多数票语义一致）：异常不抛穿，也不会抬高其余 SAME 票的相对权重。
+    失败候选按"无票"处理（剔除权重、不参与多数票），全部失败保守判
+    不重复——与 classify（failed 重试）/merge（None 降级）的容错语义对齐。
     """
 
     def _engine(self, items: list[tuple[str, str, str]]) -> DedupEngine:
@@ -1309,9 +1309,8 @@ class AskAiFailureIsolationTest(unittest.IsolatedAsyncioTestCase):
             result = await engine.check_dedup("篮球社招新", "新生2群", q_emb=[0.5, 0.6])
         self.assertFalse(result.is_duplicate)
 
-    async def test_majority_vote_failure_keeps_denominator_conservative(self):
-        """两候选等权一败一 SAME：失败票按 DIFFERENT 计且分母不变，
-        平票保守不判重（合并调和：采用上游计票语义后的预期）。"""
+    async def test_majority_vote_excludes_failed_candidate_weight(self):
+        """两候选一败一 SAME：失败票剔除后，剩余 SAME 票正常计权命中。"""
         engine = self._engine(
             [("a1", "篮球社招新", "内容甲"), ("a2", "篮球社团招新啦", "内容乙")]
         )
@@ -1333,8 +1332,9 @@ class AskAiFailureIsolationTest(unittest.IsolatedAsyncioTestCase):
             ) as merge_mock,
         ):
             result = await engine.check_dedup("篮球社招新", "新生2群", q_emb=[0.5, 0.6])
-        self.assertFalse(result.is_duplicate)
-        merge_mock.assert_not_awaited()
+        self.assertTrue(result.is_duplicate)
+        self.assertEqual(result.similar_to_id, "a2")
+        merge_mock.assert_awaited_once_with("a2", "新生2群")
 
     async def test_strong_shortcircuit_failure_conservative(self):
         """strong 候选（余弦≥0.99）AI 失败：不抛错，无其余候选保守判不重复。"""

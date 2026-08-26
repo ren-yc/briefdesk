@@ -5,8 +5,9 @@
 「核心模块」；每步的就地依据见对应方法内注释。DedupResult 契约类型定义在
 briefdesk/types.py。模块级单例与包装函数保留（实验脚本兼容，见文件尾）。
 
-加权多数票容错：单候选请求异常按 DIFFERENT 计票（权重 0）并打 WARNING，
-不中止整批。
+加权多数票容错：单候选请求异常剔除出计权（既无 SAME 票也不占分母，全部
+失败退化为保守不判重——远程审计 S1 语义）并打 WARNING，不中止整批；
+weak 全员一致复核中失败候选按反对票计（语义等效）。
 """
 
 import asyncio
@@ -377,17 +378,17 @@ class DedupEngine(DedupService):
         candidates: list[tuple[CachedItem, float]],
         raw_verdicts: list[bool | BaseException],
     ) -> list[bool]:
-        """gather(return_exceptions=True) 结果整形：异常候选按 DIFFERENT 计票。
+        """gather(return_exceptions=True) 结果整形（仅用于 weak 全员一致复核）。
 
-        单候选瞬时 API 故障只作废该候选的票（SAME 权重记 0、总权重不变，
-        加权多数票语义对其余候选保持不变），并打 WARNING——不中止整批判定、
-        不把整批消息打回下轮回填。
+        weak 复核要求全员判 SAME 才命中：失败候选取 False 等价投反对票，
+        异常不抛穿、不中止整批判定。加权多数票路径不走本方法——其失败
+        候选按「剔除计权」处理（见 check_dedup 内注释与模块 docstring）。
         """
         out: list[bool] = []
         for (cand, _score), res in zip(candidates, raw_verdicts):
             if isinstance(res, BaseException):
                 logger.warning(
-                    '候选 "%s" 判重请求异常，按 DIFFERENT 计票: %r',
+                    '候选 "%s" 判重请求异常，按反对票计: %r',
                     cand.title,
                     res,
                 )
@@ -698,28 +699,23 @@ class DedupEngine(DedupService):
         # 判定更可信——SAME 权重和 > 总权重一半才命中，抑制低置信票的干扰
         # （实验：串行「任一候选 same 即命中」会把相似但不同信息的噪声放大成
         # 误判）；等权时退化为原 >K/2 规则，单候选退化为一次判定。
-        verdicts = self._flatten_verdicts(
-            candidates,
-            await asyncio.gather(
-                *[
-                    self._ask_ai(cand, title, source_quote)
-                    for cand, _ in candidates
-                ],
-                return_exceptions=True,
-            ),
+        raw = await asyncio.gather(
+            *[self._ask_ai(cand, title, source_quote) for cand, _ in candidates],
+            return_exceptions=True,
         )
-        for (cand, _score), same in zip(candidates, verdicts):
-            logger.info(f'  "{cand.title}": {"SAME" if same else "DIFFERENT"}')
-        same_weight = sum(
-            score
-            for (_cand, score), same in zip(candidates, verdicts)
-            if same
-        )
-        total_weight = sum(score for _cand, score in candidates)
-        if same_weight > total_weight / 2:
-            target = next(
-                cand for (cand, _score), same in zip(candidates, verdicts) if same
-            )
+        voted: list[tuple[CachedItem, float, bool]] = []
+        for (cand, score), r in zip(candidates, raw):
+            if isinstance(r, BaseException):
+                # S1 容错：失败候选剔除出计权（既无 SAME 票也不占分母），
+                # 全部失败时退化为保守不判重——异常绝不抛穿中止整轮管道
+                logger.warning(f'  "{cand.title}" 判定失败，剔除该候选票: {r}')
+                continue
+            voted.append((cand, score, r))
+            logger.info(f'  "{cand.title}": {"SAME" if r else "DIFFERENT"}')
+        total_weight = sum(score for _cand, score, _ in voted)
+        same_weight = sum(score for _cand, score, same in voted if same)
+        if total_weight and same_weight > total_weight / 2:
+            target = next(cand for cand, _score, same in voted if same)
             logger.info(f'SAME → merging source "{source_group}" into {target.id}')
             await merge_source_group(target.id, source_group)
             return DedupResult(
