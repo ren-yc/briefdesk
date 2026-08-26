@@ -1,13 +1,19 @@
 """RAG 引擎 — 批次索引、历史回填、混合检索与引用式问答编排。
 
 写路径（post_insert 槽位）：before_run 锁外预嵌入 → run 锁内纯 SQLite 落库
-（pipeline 骨架对 post_insert 全程持 _storage_lock，run 内严禁网络调用）；
-读路径（/api/rag/ask）：向量 + FTS 双路召回 → RRF 融合 → 拒答门 →
-AI 引用式回答。rag 三表是 raw_messages 的派生索引，不复制事实源语义。
+（pipeline 骨架对存储相两槽统一探测可选钩子；run 内严禁网络调用）。
+读路径（/api/rag/ask）：向量缓存（created_at 水位增量填充，解析放工作线程）
+→ FTS 双路召回 → RRF 融合 → 拒答门 → AI 引用式回答。
+
+作用域语义（隐私边界，见 architecture.md）：启用会话恒为前提；
+RAG_GROUP_ONLY（默认开）进一步限定群聊——停用会话即时不可问出。
+rag 三表是 raw_messages 的派生索引；向量表走专用连接（get_embed_db 同款
+隔离约定），脏行删除不与主连接上的管道事务互相提交。
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 from collections.abc import Awaitable, Callable
@@ -17,14 +23,16 @@ from datetime import datetime, timezone
 import aiosqlite
 
 from briefdesk import ai_ports
-from briefdesk.db import get_db
+from briefdesk.db import get_db, get_embed_db
 from briefdesk.plugins.rag.config import RagSettings
 from briefdesk.plugins.rag.db import (
     ChunkRow,
     ensure_fts,
     ensure_rag_schema,
+    fetch_new_embeddings,
     fts_search,
-    load_embeddings,
+    gc_orphans,
+    parse_embedding_rows,
     sync_fts,
     upsert_chunks,
     upsert_embeddings,
@@ -34,7 +42,18 @@ from briefdesk.types import BatchContext
 logger = logging.getLogger(__name__)
 
 _RRF_K = 60  # RRF 平滑常数（论文默认，抑制单路名次噪声）
-_VEC_MIN_COS = 0.05  # 向量路最低余弦：低于此视为噪声不入融合（0 相似垃圾）
+_VEC_MIN_COS = 0.05  # 向量路最低余弦：低于此视为噪声不入融合
+_EMBED_FAIL_BACKOFF_BASE = 60.0  # 回填失败退避基数（秒），指数封顶 600
+
+# OCR 失败/附件占位符不入检索索引（对齐 pipeline 入口的占位符图片屏蔽口径）
+_PLACEHOLDER_RE = re.compile(
+    r"^\[(?:图片|image|视频|视频号|文件|链接|语音)\]$", re.IGNORECASE
+)
+
+
+def _indexable(content: str) -> bool:
+    text = content.strip()
+    return bool(text) and not _PLACEHOLDER_RE.match(text)
 
 
 @dataclass
@@ -73,44 +92,84 @@ class RagEngine:
         self,
         settings: RagSettings,
         db_factory: Callable[[], Awaitable[aiosqlite.Connection]] | None = None,
+        embed_factory: Callable[[], Awaitable[aiosqlite.Connection]] | None = None,
     ) -> None:
         self.settings = settings
-        # 生产用核心连接单例；测试注入内存库工厂（签名兼容 get_db）
+        # 生产用核心连接单例；测试注入内存库工厂（签名兼容 get_db/get_embed_db）
         self._db_factory = db_factory or (lambda: get_db())
+        self._embed_factory = embed_factory or (lambda: get_embed_db())
         # before_run 预嵌入暂存：(source, msg_id) → 向量；run 消费后清空
         self._pending: dict[tuple[str, str], list[float]] = {}
         # FTS 可用性惰性探测结果（None=未探测；False=纯向量模式）
         self._fts_enabled: bool | None = None
-        # 回填重启钩子（plugin.activate 注入；/api/rag/reindex 经此拉起新一轮）
+        self._schema_ready = False
+        # 向量缓存：created_at 水位增量填充；模型切换/行数回退全量重建
+        self._vec_model: str | None = None
+        self._vec_watermark = ""
+        self._vec_count_seen = 0
+        self._vec_entries: dict[tuple[str, str], tuple[ChunkRow, list[float]]] = {}
+        # 嵌入降级自愈：before_run 成功前最多踢一次回填，防供应商宕机刷踢
+        self._kicked_since_embed_ok = False
+        self._stale_warned = False
+        # 回填维护循环观测位（plugin 循环据此做失败退避）
+        self.last_cycle_embed_failed = False
+        # 维护循环拉起钩子（plugin.activate 注入；reindex 经此重启循环）
         self.on_backfill_kick: Callable[[], None] | None = None
 
     async def teardown(self) -> None:
         self._pending.clear()
+        self._vec_entries.clear()
+        self._vec_count_seen = 0
+        self._vec_watermark = ""
 
     async def _ensure_db_ready(self) -> aiosqlite.Connection:
         db = await self._db_factory()
-        await ensure_rag_schema(db)
-        if self._fts_enabled is None:
+        if not self._schema_ready:
+            await ensure_rag_schema(db)
             self._fts_enabled = await ensure_fts(db)
             if not self._fts_enabled:
                 logger.warning("rag: FTS 不可用，降级纯向量检索")
+            self._schema_ready = True
         return db
 
-    # ---------------------------------------------------------- 索引路径 --
+    @staticmethod
+    async def _allowed_sessions(
+        db: aiosqlite.Connection, group_only: bool, session_id: str | None
+    ) -> set[str] | None:
+        """当前可检索会话集合；None 表示无会话约束（group_only 关且未收窄）。
+
+        启用状态每次查询现取——停用会话即时失效，不依赖索引期快照。
+        """
+
+        if not group_only and session_id is None:
+            return None
+        sql = "SELECT session_id FROM sessions WHERE enabled = 1"
+        params: list[object] = []
+        if group_only:
+            sql += " AND is_group = 1"
+        if session_id is not None:
+            sql += " AND session_id = ?"
+            params.append(session_id)
+        cursor = await db.execute(sql, params)
+        try:
+            rows = await cursor.fetchall()
+        finally:
+            await cursor.close()
+        return {r["session_id"] for r in rows}
+
+    # ------------------------------------------------------------ 索引路径 --
 
     async def before_run(self, batch: BatchContext) -> None:
         """锁外预嵌入：只允许在这里发生网络调用。"""
 
         self._pending.clear()
-        candidates = [m for m in batch.messages if m.content.strip()]
+        candidates = [m for m in batch.messages if _indexable(m.content)]
         if not candidates:
             return
         try:
-            vectors = await ai_ports.embed_texts(
-                [m.content for m in candidates]
-            )
-        except Exception:  # noqa: BLE001 — 只放弃嵌入，不影响管道；
-        # 内容仍会在 run 入索引，缺失向量由历史回填的反连接自动补齐
+            vectors = await ai_ports.embed_texts([m.content for m in candidates])
+        except Exception:  # noqa: BLE001 — 只放弃嵌入不影响管道；
+        # 内容仍会在 run 入索引，缺失向量由维护循环的反连接自动补齐
             logger.exception("rag: 批次预嵌入失败（本批仅跳过嵌入）")
             return
         if len(vectors) != len(candidates):
@@ -121,19 +180,23 @@ class RagEngine:
             return
         for msg, vec in zip(candidates, vectors):
             self._pending[(msg.source, msg.msg_id)] = vec
+        self._kicked_since_embed_ok = False  # 嵌入恢复，允许后续再次降级自愈
 
     async def run(self, batch: BatchContext) -> None:
         """锁内落库：纯 SQLite 操作，禁止任何网络调用。"""
 
         db = await self._ensure_db_ready()
+        allowed = await self._allowed_sessions(db, self.settings.group_only, None)
         item_map = {(r.msg.source, r.msg.msg_id): r.item_id for r in batch.inserted}
         rows: list[ChunkRow] = []
-        now_iso = datetime.now(timezone.utc).isoformat(timespec="seconds")
         emb_items: list[tuple[str, str]] = []
         emb_vecs: list[list[float]] = []
         model = ai_ports.embed_model_name()
+        now_iso = datetime.now(timezone.utc).isoformat(timespec="seconds")
         for msg in batch.messages:
-            if not msg.content.strip():
+            if not _indexable(msg.content):
+                continue
+            if allowed is not None and msg.session_id not in allowed:
                 continue
             row = ChunkRow(
                 source=msg.source,
@@ -156,21 +219,38 @@ class RagEngine:
         if self._fts_enabled:
             await sync_fts(db, rows)
         if emb_items:
-            await upsert_embeddings(db, emb_items, emb_vecs, model, now_iso)
+            edb = await self._embed_factory()
+            await upsert_embeddings(edb, emb_items, emb_vecs, model, now_iso)
+        elif ai_ports.is_embedding_enabled() and not self._kicked_since_embed_ok:
+            # 内容已入索引但零向量：嵌入能力在而预嵌入没发生 → 自愈踢一次
+            if self.request_backfill():
+                self._kicked_since_embed_ok = True
+                logger.warning("rag: 实时批次缺向量，已触发补齐回填")
+        # 未被消费的 pending（如整批被作用域过滤）直接丢弃，避免跨批串味
+        self._pending.clear()
 
-    # ---------------------------------------------------------- 历史回填 --
+    # ------------------------------------------------------------ 历史回填 --
 
     async def backfill_step(self, now_ts: int) -> int:
         """单轮有界回填：索引窗口内缺失/模型失配的 raw_messages。
 
         反连接条件天然可续跑：嵌入失败或预算截断的行下一轮仍会被选中；
         返回本轮处理条数，0 表示回填完成。backfill_days：>0 窗口天，
-        0 关闭，-1 全量。"""
+        0 关闭，-1 全量。last_cycle_embed_failed 供维护循环做失败退避。
+        """
 
+        self.last_cycle_embed_failed = False
         if self.settings.backfill_days == 0:
             return 0
         db = await self._ensure_db_ready()
         model = ai_ports.embed_model_name()
+        scope = (
+            " AND EXISTS (SELECT 1 FROM sessions s WHERE s.source = r.source"
+            " AND s.session_id = r.session_id AND s.enabled = 1"
+        )
+        if self.settings.group_only:
+            scope += " AND s.is_group = 1"
+        scope += ")"
         sql = (
             "SELECT r.source, r.msg_id, r.session_id, r.group_name, "
             "r.sender_name, r.timestamp AS msg_time, r.content "
@@ -179,6 +259,8 @@ class RagEngine:
             "LEFT JOIN rag_chunk_embeddings e ON e.source = r.source "
             "AND e.msg_id = r.msg_id "
             "WHERE (c.msg_id IS NULL OR e.msg_id IS NULL OR e.model <> ?)"
+            " AND trim(r.content) <> ''"
+            + scope
         )
         params: list[object] = [model]
         if self.settings.backfill_days > 0:
@@ -193,49 +275,138 @@ class RagEngine:
             await cursor.close()
         rows = [
             ChunkRow(
-                source=r["source"], msg_id=r["msg_id"], session_id=r["session_id"],
-                group_name=r["group_name"], sender_name=r["sender_name"],
-                msg_time=r["msg_time"], content=r["content"],
+                source=r["source"], msg_id=r["msg_id"],
+                session_id=r["session_id"], group_name=r["group_name"],
+                sender_name=r["sender_name"], msg_time=r["msg_time"],
+                content=r["content"],
             )
             for r in raw_rows
-            if r["content"] and r["content"].strip()
         ]
         if not rows:
             return 0
-        # 分批嵌入；失败时保留已成功前缀，剩余行下轮反连接自动重试
+        # 分批嵌入 + 逐批数量守卫：供应商短返回时截断到已对齐前缀，
+        # 防错位向量静默落库（反连接无法纠正的错误数据）
         vectors: list[list[float]] = []
+        failed = False
         batch_size = self.settings.backfill_batch
-        try:
-            for start in range(0, len(rows), batch_size):
-                part = rows[start : start + batch_size]
-                vectors.extend(await ai_ports.embed_texts([r.content for r in part]))
-        except Exception:  # noqa: BLE001 — 同上：只放弃嵌入，不拖垮回填循环
-            logger.exception("rag: 回填补入嵌入失败（已得 %d 条）", len(vectors))
+        for start in range(0, len(rows), batch_size):
+            part = rows[start : start + batch_size]
+            try:
+                part_vecs = await ai_ports.embed_texts([r.content for r in part])
+            except Exception:  # noqa: BLE001 — 只放弃嵌入，不影响续跑
+                logger.exception("rag: 回填嵌入批次失败（已得 %d 条）", len(vectors))
+                failed = True
+                break
+            if len(part_vecs) != len(part):
+                logger.warning(
+                    "rag: 回填嵌入返回数不符（%d/%d），截断至已对齐前缀",
+                    len(part_vecs), len(part),
+                )
+                failed = True
+                break
+            vectors.extend(part_vecs)
         now_iso = datetime.now(timezone.utc).isoformat(timespec="seconds")
         await upsert_chunks(db, rows)
         if self._fts_enabled:
             await sync_fts(db, rows)
         paired = min(len(vectors), len(rows))
         if paired:
+            edb = await self._embed_factory()
             await upsert_embeddings(
-                db,
+                edb,
                 [(r.source, r.msg_id) for r in rows[:paired]],
                 vectors[:paired],
                 model,
                 now_iso,
             )
+        self.last_cycle_embed_failed = failed
         logger.info("rag: 回填本轮处理 %d 条（含向量 %d 条）", len(rows), paired)
         return len(rows)
 
-    # ---------------------------------------------------------- 检索路径 --
+    # ------------------------------------------------------------ 维护循环 --
+
+    async def maintenance_gc(self) -> int:
+        """孤儿对账：chunks/FTS 在主连接清，向量在专用连接清。"""
+
+        db = await self._db_factory()
+        edb = await self._embed_factory()
+        removed = await gc_orphans(db, edb)
+        if removed:
+            logger.info("rag: GC 清理孤儿索引 %d 行", removed)
+        return removed
+
+    async def warm_vectors(self, force_full: bool = False) -> None:
+        """填充/刷新向量缓存；force_full 用于维护周期整表重扫（覆盖删除）。"""
+
+        if force_full:
+            self._vec_watermark = ""
+            self._vec_count_seen = 0
+        await self._refresh_vector_cache()
+
+    def _vec_cache_clear(self) -> None:
+        self._vec_entries.clear()
+        self._vec_watermark = ""
+        self._vec_count_seen = 0
+
+    async def _refresh_vector_cache(self) -> None:
+        model = ai_ports.embed_model_name()
+        if self._vec_model != model:
+            logger.info("rag: 嵌入模型切换 %s -> %s，重建向量缓存", self._vec_model, model)
+            self._vec_cache_clear()
+            self._vec_model = model
+        edb = await self._embed_factory()
+        cursor = await edb.execute("SELECT COUNT(*) AS c FROM rag_chunk_embeddings")
+        try:
+            row = await cursor.fetchone()
+        finally:
+            await cursor.close()
+        total = int(row["c"]) if row is not None else 0
+        if total < self._vec_count_seen:
+            self._vec_cache_clear()  # 有删除（GC），水位失效，整表重建
+        raw_rows, max_created = await fetch_new_embeddings(
+            edb, model, self._vec_watermark, self.settings.group_only
+        )
+        if not raw_rows:
+            return
+        entries, bad_keys = await asyncio.to_thread(parse_embedding_rows, raw_rows)
+        if bad_keys:
+            await self._delete_bad_embeddings(edb, bad_keys)
+        for chunk, vec in entries:
+            self._vec_entries[(chunk.source, chunk.msg_id)] = (chunk, vec)
+        self._vec_watermark = max_created
+        self._vec_count_seen = total
+
+    @staticmethod
+    async def _delete_bad_embeddings(
+        edb: aiosqlite.Connection, bad_keys: list[tuple[str, str]]
+    ) -> None:
+        # 专用连接上逐条原子删除；反连接下一轮自动重嵌入
+        for key in bad_keys:
+            cursor = await edb.execute(
+                "DELETE FROM rag_chunk_embeddings WHERE source = ? AND msg_id = ?",
+                key,
+            )
+            await cursor.close()
+        await edb.commit()
+
+    def request_backfill(self) -> bool:
+        """请求拉起一轮回填循环（reindex/降级自愈）；返回是否已触发。"""
+
+        if self.on_backfill_kick is None:
+            return False
+        self.on_backfill_kick()
+        return True
+
+    # ------------------------------------------------------------ 检索路径 --
 
     async def retrieve(
         self, question: str, session_id: str | None = None
     ) -> list[Hit] | None:
-        """混合检索：向量 Top-K 与 FTS 双路召回 → RRF 融合 → 拒答门。
+        """混合检索：向量缓存 + FTS 双路召回 → RRF 融合 → 拒答门。
 
-        拒答门：前 5 名中存在 FTS 命中则放行（关键词是硬证据）；
-        否则要求 top1 余弦 >= min_score。返回 None 表示应诚实拒答。
+        拒答门：存在任一 FTS 命中即放行（最优 FTS 命中的融合位次数学上
+        ≤2，「排第 6 之后」不可达，故无需窗口判断）；否则要求 top1 余弦
+        ≥ min_score。返回 None 表示应诚实拒答。
         """
 
         cleaned = question.strip()
@@ -247,28 +418,52 @@ class RagEngine:
             logger.exception("rag: 查询嵌入失败")
             return None
         db = await self._ensure_db_ready()
-        model = ai_ports.embed_model_name()
-        chunks, vectors = await load_embeddings(db, model, session_id)
+        await self._refresh_vector_cache()
+        allowed = await self._allowed_sessions(db, self.settings.group_only, session_id)
+        if (
+            not self._vec_entries
+            and not self._stale_warned
+            and self.settings.backfill_days == 0
+        ):
+            # 换模型 + 回填关闭：检索将静默全哑，至少告警一次
+            logger.warning(
+                "rag: 当前模型 %s 无可用向量且 RAG_BACKFILL_DAYS=0，向量路不可用",
+                ai_ports.embed_model_name(),
+            )
+            self._stale_warned = True
+        if self._vec_entries:
+            self._stale_warned = False
+        filtered = [
+            (chunk, vec)
+            for key, (chunk, vec) in self._vec_entries.items()
+            if (allowed is None or chunk.session_id in allowed)
+        ]
         vec_hits: list[tuple[ChunkRow, float]] = []
-        if vectors:
+        if filtered:
+            chunks = [c for c, _ in filtered]
+            mats = [v for _, v in filtered]
             for idx, sim in ai_ports.top_k_similar(
-                q_vec, vectors, self.settings.top_k, _VEC_MIN_COS
+                q_vec, mats, self.settings.top_k, _VEC_MIN_COS
             ):
                 vec_hits.append((chunks[idx], float(sim)))
         fts_rows: list[ChunkRow] = []
         if self._fts_enabled:
-            fts_rows = await fts_search(db, cleaned, self.settings.fts_limit, session_id)
+            fts_rows = await fts_search(
+                db, cleaned, self.settings.fts_limit, session_id,
+                enabled_group_only=self.settings.group_only,
+            )
 
-        # RRF 融合：key = (source, msg_id)；并列按 msg_time 新者在前
         fused: dict[tuple[str, str], _FusionEntry] = {}
         for rank, (chunk, sim) in enumerate(vec_hits, start=1):
-            key = (chunk.source, chunk.msg_id)
-            entry = fused.setdefault(key, _FusionEntry(chunk=chunk))
+            entry = fused.setdefault(
+                (chunk.source, chunk.msg_id), _FusionEntry(chunk=chunk)
+            )
             entry.cos = max(entry.cos, sim)
             entry.rrf += 1.0 / (_RRF_K + rank)
         for rank, chunk in enumerate(fts_rows, start=1):
-            key = (chunk.source, chunk.msg_id)
-            entry = fused.setdefault(key, _FusionEntry(chunk=chunk))
+            entry = fused.setdefault(
+                (chunk.source, chunk.msg_id), _FusionEntry(chunk=chunk)
+            )
             entry.has_fts = True
             entry.rrf += 1.0 / (_RRF_K + rank)
 
@@ -281,11 +476,11 @@ class RagEngine:
         )
         if not hits:
             return None
-        if not any(h.has_fts for h in hits[:5]) and hits[0].cos < self.settings.min_score:
+        if not any(h.has_fts for h in hits) and hits[0].cos < self.settings.min_score:
             return None
         return hits[: self.settings.max_evidence]
 
-    # ---------------------------------------------------------- 问答路径 --
+    # ------------------------------------------------------------ 问答路径 --
 
     _CITE_RE = re.compile(r"\[(\d{1,2})\]")
 
@@ -327,14 +522,6 @@ class RagEngine:
         nums = sorted(cited) if cited else list(range(1, len(hits) + 1))
         citations = [self._citation(n, hits[n - 1]) for n in nums]
         return AskResult(refused=False, answer=content, citations=citations)
-
-    def request_backfill(self) -> bool:
-        """请求拉起一轮回填循环（reindex 后补齐）；返回是否已触发。"""
-
-        if self.on_backfill_kick is None:
-            return False
-        self.on_backfill_kick()
-        return True
 
 
 _instance: RagEngine | None = None

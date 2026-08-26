@@ -138,7 +138,7 @@
     }
     const chips = (data.citations || [])
       .map((c) =>
-        '<button class="rag-cite-chip" data-n="' + c.n + '" title="'
+        '<button class="rag-cite-chip" data-n="' + escAttr(String(c.n)) + '" title="'
         + escAttr(c.group_name + "·" + c.sender_name) + '">[' + c.n + "] "
         + escAttr(c.sender_name) + "</button>")
       .join("");

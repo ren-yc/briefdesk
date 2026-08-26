@@ -26,7 +26,11 @@ from briefdesk.plugin.base import (
     StagePlugin,
     WebPlugin,
 )
-from briefdesk.plugins.rag.engine import RagEngine, set_engine
+from briefdesk.plugins.rag.engine import (
+    _EMBED_FAIL_BACKOFF_BASE,
+    RagEngine,
+    set_engine,
+)
 from briefdesk.types import BatchContext
 
 logger = logging.getLogger(__name__)
@@ -62,13 +66,20 @@ class RagPlugin(StagePlugin, WebPlugin):
         from briefdesk.plugins.rag.config import RagSettings
 
         engine = RagEngine(RagSettings())
-        self._engine = engine
-        set_engine(engine)
-        ctx.register_stage(self)
-        ctx.register_router(self.router())
-        asset_dir = self.asset_dir()
-        if asset_dir is not None:
-            ctx.register_plugin_assets(self.name, str(asset_dir))
+        try:
+            self._engine = engine
+            set_engine(engine)
+            ctx.register_stage(self)
+            ctx.register_router(self.router())
+            asset_dir = self.asset_dir()
+            if asset_dir is not None:
+                ctx.register_plugin_assets(self.name, str(asset_dir))
+        except Exception:
+            # 半初始化残留清理（单例/引擎引用），避免路由拿到未装配引擎
+            await engine.teardown()
+            self._engine = None
+            set_engine(None)
+            raise
 
     async def activate(self, ctx: PluginContext) -> None:
         # 启动历史回填（fire-and-forget，逐轮有界；DB 已在 setup 前就绪）
@@ -82,19 +93,39 @@ class RagPlugin(StagePlugin, WebPlugin):
         if self._backfill_task is not None and not self._backfill_task.done():
             return
         self._backfill_task = asyncio.create_task(
-            self._backfill_loop(), name="rag-backfill"
+            self._maintenance_loop(), name="rag-maintenance"
         )
 
-    async def _backfill_loop(self) -> None:
+    async def _maintenance_loop(self) -> None:
+        """常驻维护：排空回填 → GC 对账 → 缓存整表预热 → 按间隔休眠。
+
+        嵌入失败按指数退避（60s 起、600s 封顶），恢复后立即续跑。
+        """
+
+        backoff_step = 0
         try:
             while self._engine is not None:
                 processed = await self._engine.backfill_step(int(time.time()))
-                if processed <= 0:
-                    return
+                if self._engine.last_cycle_embed_failed:
+                    wait = min(
+                        _EMBED_FAIL_BACKOFF_BASE * (2**backoff_step), 600.0
+                    )
+                    backoff_step += 1
+                    logger.warning("rag: 回填嵌入失败，%.0fs 后重试", wait)
+                    await asyncio.sleep(wait)
+                    continue
+                backoff_step = 0
+                if processed > 0:
+                    continue  # 仍有存量，立即继续排空
+                await self._engine.maintenance_gc()
+                await self._engine.warm_vectors(force_full=True)
+                await asyncio.sleep(
+                    self._engine.settings.maintenance_interval_seconds
+                )
         except asyncio.CancelledError:
             raise
-        except Exception:  # noqa: BLE001 — 回填失败不影响主流程
-            logger.exception("rag: 历史回填异常终止")
+        except Exception:  # noqa: BLE001 — 维护循环异常不影响主流程
+            logger.exception("rag: 维护循环异常终止")
 
     async def teardown(self) -> None:
         if self._backfill_task is not None:
@@ -102,6 +133,8 @@ class RagPlugin(StagePlugin, WebPlugin):
             with contextlib.suppress(asyncio.CancelledError):
                 await self._backfill_task
             self._backfill_task = None
+        if self._engine is not None:
+            await self._engine.teardown()
         self._engine = None
         set_engine(None)
 

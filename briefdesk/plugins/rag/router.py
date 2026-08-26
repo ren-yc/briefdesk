@@ -7,7 +7,7 @@ Host 白名单与同源校验由核心中间件覆盖，本路由不做额外鉴
 from __future__ import annotations
 
 from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from briefdesk import ai_ports
 from briefdesk.db import get_db
@@ -32,6 +32,15 @@ class CitationModel(BaseModel):
 class AskRequest(BaseModel):
     question: str = Field(min_length=2, max_length=500)
     session_id: str | None = None
+
+    @field_validator("question")
+    @classmethod
+    def _question_not_blank(cls, v: str) -> str:
+        # strip 后仍须 ≥2 字符：纯空白/单字问题直接 422，而非 200 拒答
+        stripped = v.strip()
+        if len(stripped) < 2:
+            raise ValueError("question 需至少 2 个非空白字符")
+        return stripped
 
 
 class AskResponse(BaseModel):

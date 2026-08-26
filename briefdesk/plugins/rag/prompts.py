@@ -18,9 +18,11 @@ def build_answer_prompt(
     for i, hit in enumerate(hits, start=1):
         chunk = hit.chunk
         stamp = datetime.fromtimestamp(chunk.msg_time).strftime("%Y-%m-%d %H:%M")
+        # 压平换行：多行原文无法伪造出新的「[n] 发送者:」证据行（间接注入面）
+        flat = " ".join(chunk.content.split())
         line = (
             f"[{i}] {stamp} {chunk.group_name}·{chunk.sender_name}: "
-            f"{chunk.content}"
+            f"{flat}"
         )
         if chunk.item_id:
             line += f"（关联卡片 #{chunk.item_id}）"

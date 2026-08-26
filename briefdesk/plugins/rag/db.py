@@ -13,6 +13,7 @@ FTS 说明：trigram 分词对中文可用但仅能匹配 >=3 字符查询串—
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 
 import aiosqlite
@@ -105,8 +106,24 @@ def _fts_ddl(tokenizer: str) -> str:
 
 async def ensure_fts(db: aiosqlite.Connection) -> bool:
     """惰性创建 FTS 表：trigram 优先（中文子串可用），失败降级 unicode61，
-    再失败返回 False（纯向量模式）。结果记入 rag_meta(fts_tokenizer)。"""
+    再失败返回 False（纯向量模式）。
 
+    表已存在时从 sqlite_master 反解真实 tokenizer 回写 meta——IF NOT EXISTS
+    会短路 CREATE，历史 unicode61 表不能被误报成 trigram（口径失真）。
+    """
+
+    cursor = await db.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'rag_fts'"
+    )
+    try:
+        existing = await cursor.fetchone()
+    finally:
+        await cursor.close()
+    if existing is not None:
+        m = re.search(r"tokenize='([^']+)'", existing["sql"] or "")
+        tok = m.group(1) if m else "default"
+        await set_meta(db, "fts_tokenizer", tok)
+        return True
     for tokenizer in ("trigram", "unicode61"):
         try:
             await db.execute(_fts_ddl(tokenizer))
@@ -136,6 +153,40 @@ def _fts_query(query: str) -> str:
     return " ".join('"' + p.replace('"', '""') + '"' for p in parts)
 
 
+def _min_token_len(query: str) -> int:
+    """查询串按空白切词后的最短词元长度（trigram 路由判据）。"""
+
+    parts = [p for p in query.split() if p]
+    if not parts:
+        parts = [query.strip()] if query.strip() else []
+    return min((len(p) for p in parts), default=0)
+
+
+def _scope_sql(
+    enabled_group_only: bool, session_id: str | None
+) -> tuple[str, list[object]]:
+    """检索侧会话白名单过滤片段（对别名 c 的 chunks 行生效）。
+
+    启用会话恒为前提；group_only 追加 is_group=1。session_id 进一步收窄。
+    返回 (SQL 片段, 绑定参数)；无约束时返回空串与空参列表。
+    """
+
+    if not enabled_group_only and session_id is None:
+        return "", []
+    clause = (
+        " AND EXISTS (SELECT 1 FROM sessions s WHERE s.source = c.source"
+        " AND s.session_id = c.session_id AND s.enabled = 1"
+    )
+    params: list[object] = []
+    if enabled_group_only:
+        clause += " AND s.is_group = 1"
+    if session_id is not None:
+        clause += " AND s.session_id = ?"
+        params.append(session_id)
+    clause += ")"
+    return clause, params
+
+
 async def sync_fts(db: aiosqlite.Connection, rows: list[ChunkRow]) -> None:
     """同步 FTS 行（先删后插保幂等；表未启用时静默跳过）。"""
 
@@ -157,7 +208,11 @@ async def sync_fts(db: aiosqlite.Connection, rows: list[ChunkRow]) -> None:
 
 
 async def fts_search(
-    db: aiosqlite.Connection, query: str, limit: int, session_id: str | None = None
+    db: aiosqlite.Connection,
+    query: str,
+    limit: int,
+    session_id: str | None = None,
+    enabled_group_only: bool = False,
 ) -> list[ChunkRow]:
     """关键词召回：>=3 字符走 FTS MATCH（rank 排序），更短走 LIKE 子串兜底。
 
@@ -168,7 +223,9 @@ async def fts_search(
     cleaned = query.strip()
     if not cleaned:
         return []
-    use_fts = len(cleaned) >= 3 and bool(await get_meta(db, "fts_tokenizer"))
+    # trigram 最小匹配长度是按「词元」计的：整串 ≥3 字但含 2 字词（如
+    # 「开会 吗」）时 FTS 路会零命中，必须逐词判定后统一走 LIKE 兜底。
+    use_fts = _min_token_len(cleaned) >= 3 and bool(await get_meta(db, "fts_tokenizer"))
     order = " ORDER BY rank LIMIT ?"
     params: list[object]
     if use_fts:
@@ -180,15 +237,19 @@ async def fts_search(
         )
         params = [_fts_query(cleaned)]
     else:
-        sql = (
-            "SELECT c.* FROM rag_chunks c "
-            "WHERE c.content LIKE '%' || ? || '%' ESCAPE ?"
+        # 多词 AND 链：每个词元独立子串匹配（整串含空格会必然失配）
+        tokens = [p for p in cleaned.split() if p] or [cleaned]
+        like_clause = " AND ".join(
+            "c.content LIKE '%' || ? || '%' ESCAPE ?" for _ in tokens
         )
-        params = [_like_escape(cleaned), _BS]
+        sql = "SELECT c.* FROM rag_chunks c WHERE " + like_clause
+        params = []
+        for tok in tokens:
+            params.extend([_like_escape(tok), _BS])
         order = " ORDER BY c.msg_time DESC LIMIT ?"
-    if session_id is not None:
-        sql += " AND c.session_id = ?"
-        params.append(session_id)
+    scope_sql, scope_params = _scope_sql(enabled_group_only, session_id)
+    sql += scope_sql
+    params.extend(scope_params)
     sql += order
     params.append(limit)
     cursor = await db.execute(sql, params)
@@ -252,47 +313,71 @@ async def upsert_embeddings(
 # ---------------------------------------------------------------- 读取侧 --
 
 
-async def load_embeddings(
-    db: aiosqlite.Connection, model: str, session_id: str | None = None
-) -> tuple[list[ChunkRow], list[list[float]]]:
-    """加载指定模型的全部向量（含所属索引行；JSON 解析失败按脏行丢弃）。"""
+async def fetch_new_embeddings(
+    db: aiosqlite.Connection,
+    model: str,
+    since_created_at: str,
+    enabled_group_only: bool = False,
+) -> tuple[list[dict], str]:
+    """按 created_at 水位增量拉取当前模型的向量行（供引擎缓存增量填充）。
+
+    返回 (raw_rows, max_created_at)；raw_rows 为含 chunks 字段 + embedding
+    原文的字典列表，解析由调用方放到工作线程（避免冻结事件循环）。
+    """
 
     sql = (
-        "SELECT c.*, e.embedding FROM rag_chunks c "
-        "JOIN rag_chunk_embeddings e ON c.source = e.source AND c.msg_id = e.msg_id "
-        "WHERE e.model = ?"
+        "SELECT c.source, c.msg_id, c.session_id, c.group_name, c.sender_name,"
+        " c.msg_time, c.content, c.item_id, e.embedding, e.created_at"
+        " FROM rag_chunk_embeddings e"
+        " JOIN rag_chunks c ON c.source = e.source AND c.msg_id = e.msg_id"
+        " WHERE e.model = ? AND e.created_at > ?"
     )
-    params: list[object] = [model]
-    if session_id is not None:
-        sql += " AND c.session_id = ?"
-        params.append(session_id)
+    params: list[object] = [model, since_created_at]
+    scope_sql, scope_params = _scope_sql(enabled_group_only, None)
+    sql += scope_sql
+    params.extend(scope_params)
     cursor = await db.execute(sql, params)
     try:
-        rows = await cursor.fetchall()
+        rows = [dict(r) for r in await cursor.fetchall()]
     finally:
         await cursor.close()
-    chunks: list[ChunkRow] = []
-    vectors: list[list[float]] = []
-    for r in rows:
-        d = dict(r)
-        raw = d.pop("embedding")
+    max_created = max((r["created_at"] for r in rows), default=since_created_at)
+    return rows, max_created
+
+
+def parse_embedding_rows(
+    raw_rows: list[dict],
+) -> tuple[list[tuple[ChunkRow, list[float]]], list[tuple[str, str]]]:
+    """纯函数：解析向量行（可放工作线程执行）。
+
+    返回 (entries, bad_keys)；脏 JSON 行不进 entries，其键返回给调用方
+    删除（回填反连接下一轮自动重嵌入）。
+    """
+
+    entries: list[tuple[ChunkRow, list[float]]] = []
+    bad_keys: list[tuple[str, str]] = []
+    for r in raw_rows:
+        key = (r["source"], r["msg_id"])
         try:
-            vec = json.loads(raw)
+            vec = json.loads(r["embedding"])
             if not isinstance(vec, list):
                 raise ValueError("embedding 非数组")
             floats = [float(x) for x in vec]
         except (json.JSONDecodeError, TypeError, ValueError):
-            # 脏向量行直接删除：回填反连接（e.msg_id IS NULL）下一轮自动重嵌入
-            cursor = await db.execute(
-                "DELETE FROM rag_chunk_embeddings WHERE source = ? AND msg_id = ?",
-                (d["source"], d["msg_id"]),
-            )
-            await cursor.close()
-            await db.commit()
+            bad_keys.append(key)
             continue
-        chunks.append(ChunkRow(**d))
-        vectors.append(floats)
-    return chunks, vectors
+        entries.append(
+            (
+                ChunkRow(
+                    source=r["source"], msg_id=r["msg_id"],
+                    session_id=r["session_id"], group_name=r["group_name"],
+                    sender_name=r["sender_name"], msg_time=r["msg_time"],
+                    content=r["content"], item_id=r["item_id"],
+                ),
+                floats,
+            )
+        )
+    return entries, bad_keys
 
 
 async def count_status(db: aiosqlite.Connection) -> dict[str, object]:
@@ -310,11 +395,15 @@ async def count_status(db: aiosqlite.Connection) -> dict[str, object]:
     return out
 
 
-async def gc_orphans(db: aiosqlite.Connection) -> int:
+async def gc_orphans(
+    db: aiosqlite.Connection, embed_db: aiosqlite.Connection | None = None
+) -> int:
     """三表对账清理：不在 raw_messages 中的索引行级联清除。
 
-    类别删除会级联清 raw_messages 但不发事件（最终一致），reindex 时经此
-    对账。返回清理的总行数。
+    类别删除会级联清 raw_messages 但不发事件（最终一致），维护循环与
+    reindex 经此对账。embed_db 提供时向量表在专用连接上清理（与核心
+    get_embed_db 隔离约定一致；跨连接子查询读的是同库已提交快照，安全）。
+    返回清理的总行数。
     """
 
     before = db.total_changes
@@ -322,9 +411,6 @@ async def gc_orphans(db: aiosqlite.Connection) -> int:
         "DELETE FROM rag_chunks WHERE NOT EXISTS ("
         "SELECT 1 FROM raw_messages r WHERE r.source = rag_chunks.source "
         "AND r.msg_id = rag_chunks.msg_id)",
-        "DELETE FROM rag_chunk_embeddings WHERE NOT EXISTS ("
-        "SELECT 1 FROM rag_chunks c WHERE c.source = rag_chunk_embeddings.source "
-        "AND c.msg_id = rag_chunk_embeddings.msg_id)",
     ):
         cursor = await db.execute(ddl)
         await cursor.close()
@@ -337,4 +423,16 @@ async def gc_orphans(db: aiosqlite.Connection) -> int:
         )
         await cursor.close()
     await db.commit()
-    return db.total_changes - before
+    removed = db.total_changes - before
+    if embed_db is not None:
+        # 向量表在专用连接清理：不与主连接上管道/删除路径的半程事务互相提交
+        embed_before = embed_db.total_changes
+        cursor = await embed_db.execute(
+            "DELETE FROM rag_chunk_embeddings WHERE NOT EXISTS ("
+            "SELECT 1 FROM rag_chunks c WHERE c.source = rag_chunk_embeddings.source "
+            "AND c.msg_id = rag_chunk_embeddings.msg_id)"
+        )
+        await cursor.close()
+        await embed_db.commit()
+        removed += embed_db.total_changes - embed_before
+    return removed

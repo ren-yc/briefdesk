@@ -22,6 +22,10 @@ class RagSettings(BaseSettings):
     backfill_budget_per_cycle: int = Field(
         default=2000, ge=1
     )  # env: RAG_BACKFILL_BUDGET_PER_CYCLE 单轮回填总预算
+    group_only: bool = Field(default=True)  # env: RAG_GROUP_ONLY 仅索引/检索群聊会话（启用会话恒为前提）
+    maintenance_interval_seconds: int = Field(
+        default=3600, ge=30
+    )  # env: RAG_MAINTENANCE_INTERVAL_SECONDS 维护循环空闲间隔
 
     model_config = {
         "env_prefix": "RAG_",  # top_k → RAG_TOP_K
