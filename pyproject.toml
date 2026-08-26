@@ -41,6 +41,7 @@ merge = "briefdesk.plugins.merge.plugin:plugin"
 calendar = "briefdesk.plugins.calendar.plugin:plugin"
 reminders = "briefdesk.plugins.reminders.plugin:plugin"
 benchmark = "briefdesk.plugins.benchmark.plugin:plugin"
+rag = "briefdesk.plugins.rag.plugin:plugin"
 
 [tool.setuptools.packages.find]
 where = ["."]

@@ -1,0 +1,92 @@
+/* rag 插件前端样式 —— 全部选择器锚定 #rag-view / #rag-btn / #rag-ctx-modal，
+ * 不污染核心与其它插件的样式空间。 */
+
+#rag-view {
+  padding: 16px 4px;
+}
+
+#rag-view .rag-panel {
+  max-width: 760px;
+  margin: 0 auto;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+#rag-view .rag-title {
+  margin: 0;
+  font-size: 1.1rem;
+}
+
+#rag-view .rag-hint {
+  margin: 0;
+  font-size: 0.86rem;
+  color: var(--text-muted, #8a8f98);
+}
+
+#rag-view .rag-input-row {
+  display: flex;
+  gap: 8px;
+}
+
+#rag-view #rag-input {
+  flex: 1;
+  min-width: 0;
+}
+
+#rag-view .rag-result {
+  margin-top: 4px;
+}
+
+#rag-view .rag-thinking {
+  font-size: 0.88rem;
+}
+
+#rag-view .rag-refused {
+  font-size: 0.92rem;
+  color: var(--text-muted, #8a8f98);
+  background: rgba(128, 128, 128, 0.08);
+  border-radius: 8px;
+  padding: 10px 12px;
+}
+
+#rag-view .rag-error {
+  font-size: 0.92rem;
+  color: #d64545;
+}
+
+#rag-view .rag-answer-text {
+  margin: 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-family: inherit;
+  font-size: 0.94rem;
+  line-height: 1.65;
+  background: transparent;
+  padding: 0;
+  border: none;
+}
+
+#rag-view .rag-cites {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.84rem;
+}
+
+#rag-view .rag-cite-chip {
+  cursor: pointer;
+  border: 1px solid rgba(128, 128, 128, 0.35);
+  background: rgba(128, 128, 128, 0.08);
+  color: inherit;
+  border-radius: 999px;
+  padding: 3px 10px;
+  font-size: 0.82rem;
+  transition: background 0.15s ease, border-color 0.15s ease;
+}
+
+#rag-view .rag-cite-chip:hover {
+  background: rgba(128, 128, 128, 0.18);
+  border-color: rgba(128, 128, 128, 0.55);
+}
