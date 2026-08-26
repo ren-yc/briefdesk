@@ -1359,6 +1359,24 @@ async def get_due_reminders(now_local: str) -> list[ReminderRow]:
     return [cast(ReminderRow, dict(row)) for row in rows]
 
 
+async def get_items_verified_flags(item_ids: list[str]) -> dict[str, int]:
+    """批量读取卡片人工核验状态：id → is_verified（缺失 id 得 0）。
+
+    提醒路由据此分流「查看」跳转目标（备忘录卡进备忘录视图）；独立成
+    db 助手以遵守游标纪律（_fetchall），避免调用方手写裸游标。
+    """
+    if not item_ids:
+        return {}
+    db = await get_db()
+    placeholders = ",".join("?" * len(item_ids))
+    rows = await _fetchall(
+        db,
+        f"SELECT id, is_verified FROM items WHERE id IN ({placeholders})",
+        item_ids,
+    )
+    return {row["id"]: row["is_verified"] for row in rows}
+
+
 async def get_items_by_subject(subject: str, limit: int, offset: int) -> list[ItemRow]:
     """主体时间线：跨类别查询该主体的全部历史卡片（排除已忽略）。
 

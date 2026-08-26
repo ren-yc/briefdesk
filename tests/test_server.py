@@ -304,14 +304,15 @@ class ReminderApiTest(unittest.TestCase):
                 {"id": "i1", "title": "到期卡片", "category": "活动通知", "remind_at": "2000-01-01 00:00"}
             ]
         )
-        # is_verified 补查（路由层合并，核心 get_due_reminders 契约不变）
-        fake_cursor = AsyncMock()
-        fake_cursor.fetchall.return_value = [{"id": "i1", "is_verified": 1}]
-        fake_db = AsyncMock()
-        fake_db.execute.return_value = fake_cursor
+        # is_verified 由 db 助手批量补查（路由经 get_items_verified_flags 合并，
+        # 核心 get_due_reminders 契约不变）
+        fake_flags = AsyncMock(return_value={"i1": 1})
         with (
             patch("briefdesk.plugins.reminders.router.get_due_reminders", new=fake),
-            patch("briefdesk.plugins.reminders.router.get_db", new=AsyncMock(return_value=fake_db)),
+            patch(
+                "briefdesk.plugins.reminders.router.get_items_verified_flags",
+                new=fake_flags,
+            ),
         ):
             resp = self.client.get("/api/reminders/due")
         self.assertEqual(resp.status_code, 200)

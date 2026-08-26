@@ -71,6 +71,14 @@
 
   async function setReminderApi(id, atOrNull, { silent = false } = {}) {
     try {
+      // 首次设提醒前同步申请桌面通知权限（页面后台时的到期提醒依赖它）：
+      // Firefox 要求权限弹窗绑定 user activation，放到 await fetch 之后
+      // 激活态可能已被消费而静默不弹（审查 A4）。仅 default 态请求；点击
+      // 菜单已是强意图信号，设置失败多弹一次可接受。拒绝/失败静默降级——
+      // 前台 toast 提醒始终可用。
+      if ("Notification" in window && Notification.permission === "default") {
+        try { Notification.requestPermission().catch(() => { }); } catch { /* 忽略 */ }
+      }
       const res = await fetch("/api/items/" + encodeURIComponent(id) + "/reminder", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -78,11 +86,6 @@
       });
       if (!res.ok) throw new Error("HTTP " + res.status);
       const data = await res.json();
-      // 首次设提醒时补申请桌面通知权限（页面在后台时的到期提醒依赖它）；
-      // 拒绝/失败静默降级——前台 toast 提醒始终可用
-      if (data.remind_at && "Notification" in window && Notification.permission === "default") {
-        try { Notification.requestPermission().catch(() => { }); } catch { /* 忽略 */ }
-      }
       const it = currentItems.find(x => String(x.id) === id);
       if (it) it.remind_at = data.remind_at || null;
       document.querySelectorAll(".card-remind-menu").forEach(m => m.classList.add("hidden"));

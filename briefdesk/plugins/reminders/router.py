@@ -6,7 +6,11 @@ from datetime import datetime
 
 from fastapi import APIRouter, HTTPException
 
-from briefdesk.db import get_db, get_due_reminders, set_item_reminder
+from briefdesk.db import (
+    get_due_reminders,
+    get_items_verified_flags,
+    set_item_reminder,
+)
 
 router = APIRouter()
 
@@ -56,17 +60,9 @@ async def reminders_due():
     now_local = time.strftime("%Y-%m-%d %H:%M", time.localtime())
     items = await get_due_reminders(now_local)
     if items:
-        db = await get_db()
-        placeholders = ",".join("?" * len(items))
-        cursor = await db.execute(
-            f"SELECT id, is_verified FROM items WHERE id IN ({placeholders})",
-            [it["id"] for it in items],
-        )
-        try:
-            rows = await cursor.fetchall()
-        finally:
-            await cursor.close()
-        verified = {r["id"]: r["is_verified"] for r in rows}
+        # is_verified 由 db 助手批量补查（游标纪律收口在 db.py），前端据此
+        # 决定「查看」跳转目标；缺失 id 兜底 0（按未处理卡定位主列表）
+        flags = await get_items_verified_flags([it["id"] for it in items])
         for it in items:
-            it["is_verified"] = verified.get(it["id"], 0)
+            it["is_verified"] = flags.get(it["id"], 0)
     return {"items": items}
