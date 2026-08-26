@@ -112,5 +112,6 @@ def top_k_similar(
     q = q / (np.linalg.norm(q) + 1e-12)
     m = m / (np.linalg.norm(m, axis=1, keepdims=True) + 1e-12)
     sims = m @ q
-    ranked = np.argsort(sims)[::-1][:top_k]
+    # 稳定排序：并列相似度按原始下标序，保证跨次调用确定性（rag 检索依赖）
+    ranked = np.argsort(-sims, kind="stable")[:top_k]
     return [(int(i), float(sims[i])) for i in ranked if sims[i] >= threshold]

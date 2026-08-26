@@ -7,7 +7,7 @@
   盖章 → 过滤（自消息/启用会话/纯占位符图片（OCR 未启用）/已处理）→ raw 落库 → 切批
   → 并行：enrich + classify（锁外）
   → 串行（_storage_lock 内）：dedup（判重/入库/缓存）→ 跳过标记 → post_insert（合并）
-  → 锁外：dedup after_run（向量落库）→ 计数 → 状态 → 实时通知
+  → 锁外：dedup/post_insert 的 after_run（向量落库等收尾）→ 计数 → 状态 → 实时通知
 """
 
 import asyncio
@@ -261,9 +261,10 @@ async def process_all_batches(
             batch_start = time_module.perf_counter()
             outcome = bctx.outcomes
             failed_set = set(outcome.failed) if outcome else set()
-            # 锁外预计算：dedup 阶段的行规划 + 批内预嵌入（每批最多一次嵌入调用，
-            # 避免在 _storage_lock 内 await 远程嵌入导致管道整体阻塞）
-            for stage in dedup_stages:
+            # 锁外预计算：存储相阶段（dedup + post_insert）的 before_run——
+            # dedup 做行规划/批内预嵌入，rag 等后置阶段做各自的预嵌入；网络调用
+            # 只允许发生在锁外（避免在 _storage_lock 内 await 远程嵌入阻塞管道）
+            for stage in [*dedup_stages, *merge_stages]:
                 before = getattr(stage, "before_run", None)
                 if before is not None:
                     await before(bctx, ctx)
@@ -274,8 +275,8 @@ async def process_all_batches(
                 await _mark_skipped(bctx, failed_set)
                 for stage in merge_stages:
                     await stage.run(bctx, ctx)
-            # 锁外批量持久化本批新增向量（一次 DB 调用）
-            for stage in dedup_stages:
+            # 锁外批量持久化本批新增向量等收尾（一次 DB 调用）
+            for stage in [*dedup_stages, *merge_stages]:
                 after = getattr(stage, "after_run", None)
                 if after is not None:
                     await after(bctx, ctx)

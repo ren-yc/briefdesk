@@ -541,6 +541,65 @@ class ZeroOutputStatusTest(_StageTestBase):
         self.assertEqual(status_calls[0]["lastError"], "")
 
 
+class PostInsertHookProbeTest(_StageTestBase):
+    """骨架对 post_insert 槽同样探测 before_run/after_run——rag 等后置
+    阶段的锁外预嵌入/向量落库依赖此契约（回归：曾只遍历 dedup_stages）。"""
+
+    async def test_post_insert_stage_hooks_invoked(self):
+        calls: list[str] = []
+
+        async def classify_all_skipped(messages):
+            return ClassifyOutcome([], [])
+
+        _install_dedup_stage(_dedup_engine_mock())
+        _install_merge_stage()
+        stages.register_stage(_classify_stage(classify_all_skipped))
+        async def _rec_before(batch, ctx):
+            calls.append("before")
+
+        async def _rec_after(batch, ctx):
+            calls.append("after")
+
+        async def _noop_run(batch, ctx):
+            return None
+
+        stages.register_stage(
+            _Stage(
+                "post_insert",
+                _noop_run,
+                priority=10,
+                before=_rec_before,
+                after=_rec_after,
+            )
+        )
+        db = await aiosqlite.connect(":memory:")
+        try:
+            db.row_factory = aiosqlite.Row
+            await init_schema(db)
+            with patch("briefdesk.db.get_db", new=AsyncMock(side_effect=lambda: db)), patch(
+                "briefdesk.pipeline.get_enabled_sessions",
+                new=AsyncMock(return_value=[{"session_id": "s1"}]),
+            ), patch(
+                "briefdesk.pipeline.get_enabled_categories",
+                new=AsyncMock(return_value=[{"name": "x"}]),
+            ), patch(
+                "briefdesk.pipeline.are_messages_processed", new=AsyncMock(return_value=set())
+            ), patch(
+                "briefdesk.plugins.merge.plugin.get_merge_candidates",
+                new=AsyncMock(return_value=[]),
+            ), patch(
+                "briefdesk.pipeline.set_status", side_effect=lambda d: None
+            ), patch("briefdesk.pipeline.publish_items_updated", new=AsyncMock()):
+                await process_all_batches(
+                    [_pipeline_msg("m1", session_id="s1", ts=1)],
+                    _pipeline_client(),
+                    origin="test",
+                )
+        finally:
+            await db.close()
+        self.assertEqual(calls, ["before", "after"])
+
+
 class IgnoreSelfFilterTest(_StageTestBase):
     """IGNORE_SELF 入口过滤：is_self 消息在管道入口被丢弃，不进分类也不落 raw。"""
 

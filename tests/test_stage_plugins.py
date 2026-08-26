@@ -150,6 +150,27 @@ class StagePluginMetaTest(unittest.TestCase):
             self.assertEqual(cls.priority, 0)
 
 
+class TopKSimilarStableOrderTest(unittest.TestCase):
+    """并列相似度必须按原始下标序稳定输出（rag 检索的确定性依赖）。"""
+
+    def test_ties_keep_original_index_order(self):
+        from briefdesk.ai_ports import top_k_similar
+
+        hits = top_k_similar(
+            [1.0, 0.0], [[1.0, 0.0], [1.0, 0.0], [0.0, 1.0]], top_k=3, threshold=0.5
+        )
+        self.assertEqual([i for i, _ in hits], [0, 1])
+        self.assertAlmostEqual(hits[0][1], hits[1][1], places=6)
+
+    def test_descending_order_unchanged(self):
+        from briefdesk.ai_ports import top_k_similar
+
+        hits = top_k_similar(
+            [1.0, 0.0], [[0.9, 0.1], [0.5, 0.5], [1.0, 0.0]], top_k=3, threshold=0.0
+        )
+        self.assertEqual([i for i, _ in hits], [2, 0, 1])
+
+
 class AiProviderPluginTest(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         ai_ports.set_ai(None)

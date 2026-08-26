@@ -62,9 +62,9 @@ class StagePlugin(Plugin, Protocol):
     """管道阶段插件能力协议：单槽位、可多实例（同槽按 priority 升序）；
     实现类显式继承本协议。
 
-    run(batch, ctx) 由 pipeline 骨架在对应槽位调用；dedup 阶段额外实现
-    before_run（锁外：行规划/预嵌入）与 after_run（锁外：向量落库），
-    骨架用 getattr 探测可选钩子。
+    run(batch, ctx) 由 pipeline 骨架在对应槽位调用；存储相阶段（dedup 与
+    post_insert 槽）可额外实现 before_run（锁外：预嵌入等网络调用）与
+    after_run（锁外：向量落库等收尾），骨架对两槽统一 getattr 探测可选钩子。
     """
 
     slot: str  # "enrich" | "classify" | "dedup" | "post_insert"
