@@ -89,4 +89,12 @@ async def plugin_assets(name: str, path: str):
         return PlainTextResponse("Asset not found", status_code=404)
     if not file.is_file():
         return PlainTextResponse("Asset not found", status_code=404)
-    return FileResponse(file)
+    return _no_cache_file(file)
+
+
+def _no_cache_file(file):
+    """插件资源随插随改：响应带 no-cache，浏览器每次向服务端校验证书。"""
+
+    response = FileResponse(file)
+    response.headers["Cache-Control"] = "no-cache"
+    return response

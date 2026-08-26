@@ -542,7 +542,10 @@ class RagEngine:
         }
 
     async def ask(
-        self, question: str, session_id: str | None = None
+        self,
+        question: str,
+        session_id: str | None = None,
+        history: list[dict] | None = None,
     ) -> AskResult:
         """检索 + 引用式回答；检索为空 → 诚实拒答且不调用 AI。"""
 
@@ -551,7 +554,9 @@ class RagEngine:
         hits = await self.retrieve(question, session_id)
         if not hits:
             return AskResult(refused=True, answer="没有在群聊记录里找到相关消息。")
-        messages = build_answer_prompt(datetime.now(), question.strip(), hits)
+        messages = build_answer_prompt(
+            datetime.now(), question.strip(), hits, history or []
+        )
         resp = await ai_ports.chat(messages, temperature=0.2, max_tokens=1024)
         content = ""
         if getattr(resp, "choices", None):

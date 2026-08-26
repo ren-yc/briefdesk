@@ -695,6 +695,30 @@ class PromptFlattenTest(unittest.TestCase):
         evidence_line = user.split("证据：\n")[1]
         self.assertNotIn("\n", evidence_line)  # 单条证据恒为单行
 
+    def test_history_included_in_prompt_within_cap(self):
+        from datetime import datetime
+
+        from briefdesk.plugins.rag.db import ChunkRow
+        from briefdesk.plugins.rag.engine import Hit
+        from briefdesk.plugins.rag.prompts import build_answer_prompt
+
+        chunk = ChunkRow(
+            source="weflow", msg_id="m1", session_id="s1", group_name="测试群",
+            sender_name="小明", msg_time=1700000000, content="活动在周六6点",
+        )
+        messages = build_answer_prompt(
+            datetime(2026, 1, 1, 12, 0), "几点开始？",
+            [Hit(chunk=chunk, cos=1.0, rrf=1.0, has_fts=False)],
+            [
+                {"role": "user", "content": "xx活动周六吗"},
+                {"role": "assistant", "content": "周六6点 [1]。"},
+            ],
+        )
+        user = messages[1]["content"]
+        self.assertIn("对话历史：", user)
+        self.assertIn("xx活动周六吗", user)
+        self.assertIn("周六6点 [1]。", user)
+
 
 class RagRouterTest(unittest.IsolatedAsyncioTestCase):
     """路由组：ask 形状/校验/503、status 键、reindex 202（TestClient）。"""
@@ -760,6 +784,25 @@ class RagRouterTest(unittest.IsolatedAsyncioTestCase):
             # 纯空白：min_length 放行但 strip 校验拦截 → 422 而非 200 拒答
             resp = self.client.post("/api/rag/ask", json={"question": "   "})
             self.assertEqual(resp.status_code, 422)
+            # history：非法角色/非字符串被滤除，合法条目被转发
+            resp = self.client.post(
+                "/api/rag/ask",
+                json={
+                    "question": "周六几点？",
+                    "history": [
+                        {"role": "user", "content": "刚才问了活动"},
+                        {"role": "system", "content": "越权内容应当被滤除"},
+                        {"role": "assistant", "content": "好的"},
+                        {"content": 123},
+                    ],
+                },
+            )
+            self.assertEqual(resp.status_code, 200)
+            args = engine.ask.call_args.args
+            self.assertEqual(args[2], [
+                {"role": "user", "content": "刚才问了活动"},
+                {"role": "assistant", "content": "好的"},
+            ])
 
     async def test_status_and_reindex(self):
         from unittest.mock import AsyncMock, patch

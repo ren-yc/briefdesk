@@ -32,6 +32,8 @@ class CitationModel(BaseModel):
 class AskRequest(BaseModel):
     question: str = Field(min_length=2, max_length=500)
     session_id: str | None = None
+    # 对话历史（多轮上下文；校验角色并截断防御）
+    history: list[dict] = Field(default_factory=list, max_length=40)
 
     @field_validator("question")
     @classmethod
@@ -41,6 +43,21 @@ class AskRequest(BaseModel):
         if len(stripped) < 2:
             raise ValueError("question 需至少 2 个非空白字符")
         return stripped
+
+    @field_validator("history")
+    @classmethod
+    def _history_sanitized(cls, v: list[dict]) -> list[dict]:
+        """仅保留 user/assistant 角色且内容为字符串的条目，逐条截断。"""
+
+        out: list[dict] = []
+        for item in v:
+            if not isinstance(item, dict):
+                continue
+            role = item.get("role")
+            content = item.get("content", "")
+            if role in ("user", "assistant") and isinstance(content, str):
+                out.append({"role": role, "content": content[:2000]})
+        return out[-20:]  # 至多 20 条历史
 
 
 class AskResponse(BaseModel):
@@ -61,7 +78,7 @@ async def rag_ask(req: AskRequest) -> AskResponse:
     """检索式问答：带原文引用、低置信诚实拒答。"""
 
     engine = _require_engine()
-    result = await engine.ask(req.question.strip(), req.session_id)
+    result = await engine.ask(req.question.strip(), req.session_id, req.history)
     return AskResponse(
         refused=result.refused,
         answer=result.answer,

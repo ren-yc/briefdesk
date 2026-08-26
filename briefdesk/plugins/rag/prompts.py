@@ -10,9 +10,9 @@ if TYPE_CHECKING:
 
 
 def build_answer_prompt(
-    now: datetime, question: str, hits: list[Hit]
+    now: datetime, question: str, hits: list[Hit], history: list[dict] | None = None
 ) -> list[dict]:
-    """构造回答消息序列：system 纪律 + 当前时间锚定 + 编号证据块。"""
+    """构造回答消息序列：system 纪律 + 当前时间锚定 + 对话历史 + 编号证据块。"""
 
     lines: list[str] = []
     for i, hit in enumerate(hits, start=1):
@@ -37,9 +37,14 @@ def build_answer_prompt(
         "5. 用简体中文简洁作答。"
     )
     now_stamp = now.strftime("%Y-%m-%d %H:%M")
+    history_block = "\n".join(
+        f"{h.get('role', 'user')}: {h.get('content', '')}" for h in (history or [])
+    )
     user = (
         f"当前时间：{now_stamp}\n\n"
-        f"问题：{question}\n\n证据：\n" + "\n".join(lines)
+        + (f"对话历史：\n{history_block}\n\n" if history else "")
+        + f"问题：{question}\n\n证据：\n"
+        + "\n".join(lines)
     )
     return [
         {"role": "system", "content": system},
