@@ -6,7 +6,7 @@ from datetime import datetime
 
 from fastapi import APIRouter, HTTPException
 
-from briefdesk.db import get_due_reminders, set_item_reminder
+from briefdesk.db import get_db, get_due_reminders, set_item_reminder
 
 router = APIRouter()
 
@@ -48,8 +48,25 @@ async def set_reminder(item_id: str, body: dict):
 async def reminders_due():
     """到期提醒：remind_at 不晚于本地现在的卡片（排除已忽略），供前端轮询。
 
-    返回提醒所需最小字段；不清除 remind_at（清除走 POST /reminder null，
-    保留多标签页"先清后通知"竞态语义）。
+    返回提醒所需最小字段，并补充 is_verified（get_due_reminders 不携带）：
+    前端据此决定「查看」跳转目标——备忘录卡进备忘录视图，其余卡定位主列表。
+    不清除 remind_at（清除走 POST /reminder null，保留多标签页"先清后通知"
+    竞态语义）。
     """
     now_local = time.strftime("%Y-%m-%d %H:%M", time.localtime())
-    return {"items": await get_due_reminders(now_local)}
+    items = await get_due_reminders(now_local)
+    if items:
+        db = await get_db()
+        placeholders = ",".join("?" * len(items))
+        cursor = await db.execute(
+            f"SELECT id, is_verified FROM items WHERE id IN ({placeholders})",
+            [it["id"] for it in items],
+        )
+        try:
+            rows = await cursor.fetchall()
+        finally:
+            await cursor.close()
+        verified = {r["id"]: r["is_verified"] for r in rows}
+        for it in items:
+            it["is_verified"] = verified.get(it["id"], 0)
+    return {"items": items}

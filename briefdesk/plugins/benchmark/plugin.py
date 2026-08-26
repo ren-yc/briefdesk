@@ -10,7 +10,9 @@
   筛选的卡片逐功能覆盖导出到 cases/*.fromweb.json（classify/dedup/merge/
   title 四类用例，期望=卡片当前状态），前端无需手动用例管理；
 - 运行：与生产同引擎同 AI 供应商（真实调用，耗时数分钟，后台任务执行）；
-  运行期间补丁 briefdesk.db.get_db 指向临时库，请勿同时触发同步。
+  运行期间补丁 briefdesk.db.get_db 指向临时库，并经 pipeline.set_processing_paused
+  暂停生产处理管道——实时消息延后到下一轮回填窗口处理，不丢失；请勿同时
+  手动触发同步。
 - CLI：python -m briefdesk.plugins.benchmark.cli。
 """
 

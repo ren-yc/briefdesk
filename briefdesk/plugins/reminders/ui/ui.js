@@ -78,6 +78,11 @@
       });
       if (!res.ok) throw new Error("HTTP " + res.status);
       const data = await res.json();
+      // 首次设提醒时补申请桌面通知权限（页面在后台时的到期提醒依赖它）；
+      // 拒绝/失败静默降级——前台 toast 提醒始终可用
+      if (data.remind_at && "Notification" in window && Notification.permission === "default") {
+        try { Notification.requestPermission().catch(() => { }); } catch { /* 忽略 */ }
+      }
       const it = currentItems.find(x => String(x.id) === id);
       if (it) it.remind_at = data.remind_at || null;
       document.querySelectorAll(".card-remind-menu").forEach(m => m.classList.add("hidden"));
@@ -162,6 +167,28 @@
     }
   }
 
+  // 到期提醒「查看」跳转：备忘录卡 → 备忘录视图；其余卡（未处理等，提醒
+  // 可设在任意卡片上）→ 主列表全部视图后定位并高亮该卡片
+  function locateDueItem(it) {
+    exitPluginViews();
+    if (it.is_verified === 1) {
+      $memoLink.click();
+      return;
+    }
+    const navAll = document.querySelector('.cat-link[data-category="全部"][data-verified="unverified"]');
+    if (navAll) navAll.click();
+    setTimeout(() => {
+      const card = document.querySelector('.item-card[data-id="' + CSS.escape(String(it.id)) + '"]');
+      if (!card) {
+        showToast("该卡片不在当前列表首页，可在搜索框输入标题查找", { type: "info", duration: 5000 });
+        return;
+      }
+      card.scrollIntoView({ block: "center", behavior: "smooth" });
+      card.classList.add("card-new");
+      setTimeout(() => card.classList.remove("card-new"), 4000);
+    }, 600);
+  }
+
   // ── 到期轮询：与列表加载状态解耦（任意分类/页面的提醒都能触发）──
   function startReminderTimer() {
     if (remindTimer) clearInterval(remindTimer);
@@ -205,7 +232,7 @@
             type: "info",
             duration: 8000,
             actionLabel: "查看",
-            actionFn: () => { exitPluginViews(); $memoLink.click(); },
+            actionFn: () => locateDueItem(it),
           });
         }
         document.querySelectorAll('[data-id="' + CSS.escape(String(it.id)) + '"] .btn-remind').forEach(b => {
