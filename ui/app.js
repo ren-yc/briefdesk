@@ -548,6 +548,7 @@ function setupEvents() {
     try {
       const res = await fetch("/api/sessions/refresh", { method: "POST" });
       const data = await res.json();
+      await loadEnabledSources(); // 刷新后按最新启用源裁剪（防残留源会话混入）
       renderSessions(data.sessions || []);
       fetchData();
     } catch (err) {
@@ -1931,7 +1932,10 @@ async function initOnboarding() {
     const res = await fetch("/api/sessions");
     if (!res.ok) return;
     const data = await res.json();
-    if (Array.isArray(data.sessions) && data.sessions.some(s => s.enabled)) {
+    await loadEnabledSources(); // 残留停用源会话不应触发「已使用」判定
+    if (
+      filterSessionsByEnabledSources(data.sessions).some(s => s.enabled)
+    ) {
       markOnboarded();
       return;
     }
@@ -2025,6 +2029,8 @@ async function renderOnboardSessions() {
       ? data.backfillHours
       : null;
   const sessions = Array.isArray(data && data.sessions) ? data.sessions : [];
+  await loadEnabledSources(); // 裁剪依据：实际启用源（单源部署过滤残留停用源会话）
+  const visibleSessions = filterSessionsByEnabledSources(sessions);
   // 进入 step2 重置筛选状态（与设置每次打开重置类型筛选一致）
   onboardTypes.clear();
   onboardSources.clear();
@@ -2034,19 +2040,19 @@ async function renderOnboardSessions() {
   if ($onboardTimePreset) $onboardTimePreset.value = "all";
   if ($onboardTimeCustom) $onboardTimeCustom.value = "";
   updateOnboardTypeChips();
-  if (!sessions.length) {
+  if (!visibleSessions.length) {
     el.innerHTML = '<p class="text-muted">暂未发现会话，可稍后在 设置 → 群聊筛选 中「发现新群聊」。</p>';
     return;
   }
   // 行结构与设置「群聊筛选」一致（data-is-group/data-is-official/data-source/data-last-active），
   // 共用 sessionRowMatches 过滤规则；群聊默认勾选，私聊/公众号不勾（避免无意监控私聊）
-  const allChecked = sessions.length > 0 && sessions.every(s => s.is_group);
+  const allChecked = visibleSessions.length > 0 && visibleSessions.every(s => s.is_group);
   const html = [
     `<label class="session-row session-row-all">
       <input type="checkbox" id="onboard-select-all" ${allChecked ? "checked" : ""}>
       <span>全选</span>
     </label>`,
-    ...sessions.map(s => {
+    ...visibleSessions.map(s => {
       const kindTag = s.is_official ? '公' : (s.is_group ? '群' : '私');
       const checked = s.is_group ? "checked" : "";
       return `
@@ -2219,7 +2225,10 @@ async function renderEmptyStateGuide() {
     if (res.ok) data = await res.json();
   } catch { /* 忽略 */ }
   if ($emptyState.classList.contains("hidden")) return; // 已被后续渲染隐藏（新数据到达等）
-  const sessions = Array.isArray(data && data.sessions) ? data.sessions : [];
+  await loadEnabledSources(); // 空态统计同样按实际启用源裁剪残留停用源会话
+  const sessions = filterSessionsByEnabledSources(
+    Array.isArray(data && data.sessions) ? data.sessions : []
+  );
   const enabled = sessions.filter(s => s.enabled).length;
   if (!sessions.length) {
     $emptyState.innerHTML =
@@ -3424,8 +3433,18 @@ function setSessionTimeFilter(v) {
   applySessionFilters();
 }
 
+// 按「实际启用源」裁剪会话列表：后端 /api/sessions 会返回库里全部会话
+// （含历史上曾启用、现已停用源的残留行，如仅启用 qqflow 时的 weflow 会话）。
+// enabledSources 为空（/api/status 尚未加载或加载失败）时保守放行全部，避免误伤。
+function filterSessionsByEnabledSources(sessions) {
+  if (!Array.isArray(sessions)) return [];
+  if (enabledSources.length === 0) return sessions;
+  return sessions.filter(s => enabledSources.includes(s.source));
+}
+
 async function loadSessions() {
   try {
+    await loadEnabledSources(); // 确保裁剪依据（启用源列表）在渲染前就绪
     const res = await fetch("/api/sessions");
     const data = await res.json();
     if (typeof data.backfillHours === "number" && Number.isFinite(data.backfillHours)) {
@@ -3439,6 +3458,8 @@ async function loadSessions() {
 }
 
 function renderSessions(sessions) {
+  // 只显示「实际启用源」的会话，剔除残留的已停用源会话（见 filterSessionsByEnabledSources）
+  sessions = filterSessionsByEnabledSources(sessions);
   // 快照服务端启用状态，作为保存时 diff 基准（草稿模式）
   sessionOriginal = sessions.map(s => ({ source: s.source, session_id: s.session_id, enabled: s.enabled }));
   if (sessions.length === 0) {
