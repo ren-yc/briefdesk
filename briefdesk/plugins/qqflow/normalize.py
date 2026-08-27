@@ -169,17 +169,29 @@ def normalize_rest(
     session_id: str,
     group_name: str,
     contacts: dict[str, str] | None = None,
-    group_members: dict[str, str] | None = None,
     self_uid: str = "",
 ) -> InternalMessage:
+    """REST 消息 → InternalMessage。
+
+    显示名取上游已解析的 senderName（本会话群名片 > 备注 > 最新消息昵称 >
+    档案昵称 > UID，与 SSE sourceName 同值）；contacts 仅为无该字段的旧上游
+    兜底。群名片是 per-conversation 的，全局 contacts 结构上表达不了。
+    """
     uid = msg.get("senderUsername") or ""
     # IGNORE_SELF 判定：自身 UID 匹配（QQ NT UID 约定 u_<QQ号>），
     # isSend 为上游未来版本方向兜底；self_uid 为空时 fail-open
     is_self = is_self_message(msg, self_uid)
-    # 群成员名（本群群名片等 per-session 名字）优先于全局联系人名；
-    # 逐级净化后为空才回退 UID，避免空显示名进入 raw_messages/items。
+    # 上游 senderName 已按「本会话群名片 > 备注 > 最新消息昵称 > 档案昵称 >
+    # UID」解析（与 SSE sourceName 同值），直接采用：群名片是 per-conversation
+    # 的，全局 contacts 结构上表达不了，实测活跃群里过半消息与 contacts 解析
+    # 结果不同。它退化为 UID 时让位于后续候选。
+    upstream_name = clean_display_name(msg.get("senderName"))
+    if upstream_name == uid:
+        upstream_name = ""
+    # contacts 为旧上游（无 senderName 字段）兜底，逐级净化后为空才回退
+    # UID，避免空显示名进入 raw_messages/items。
     display_name = (
-        clean_display_name((group_members or {}).get(uid))
+        upstream_name
         or clean_display_name((contacts or {}).get(uid))
         or uid
         or "未知"

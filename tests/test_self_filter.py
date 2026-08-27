@@ -109,9 +109,7 @@ class QqflowRestSelfDetectionTest(unittest.TestCase):
         return base
 
     def test_self_uid_match_marks_self(self):
-        m = qq_normalize_rest(
-            self._msg(), "s1", "g", {}, {}, self_uid="u_12345678"
-        )
+        m = qq_normalize_rest(self._msg(), "s1", "g", {}, self_uid="u_12345678")
         self.assertTrue(m.is_self)
 
     def test_other_uid_not_self(self):
@@ -120,13 +118,12 @@ class QqflowRestSelfDetectionTest(unittest.TestCase):
             "s1",
             "g",
             {},
-            {},
             self_uid="u_12345678",
         )
         self.assertFalse(m.is_self)
 
     def test_empty_self_uid_fails_open(self):
-        m = qq_normalize_rest(self._msg(), "s1", "g", {}, {}, self_uid="")
+        m = qq_normalize_rest(self._msg(), "s1", "g", {}, self_uid="")
         self.assertFalse(m.is_self)
 
     def test_is_send_future_proof(self):
@@ -135,7 +132,6 @@ class QqflowRestSelfDetectionTest(unittest.TestCase):
             self._msg(isSend=1, senderUsername="u_other"),
             "s1",
             "g",
-            {},
             {},
             self_uid="u_12345678",
         )
@@ -370,9 +366,6 @@ class QqflowPollerSelfDropTest(unittest.IsolatedAsyncioTestCase):
 
         async def fetch_messages(self, talker, start=None, limit=500, offset=0):
             return {"messages": self._messages, "hasMore": False}
-
-        async def fetch_group_members(self, chatroom_id):
-            return {}
 
     def _enabled(self):
         return [

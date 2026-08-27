@@ -10,7 +10,7 @@ qqflow-server 提供本地 HTTP API（已支持 GET 和 POST 请求），便于�
 - 默认端口：`5032`
 - 基础地址：`http://127.0.0.1:5032`
 - **账号为客户端驱动**：启动时仅做平台路径扫描，发现的账号列为 `awaiting_key`（零账号启动合法）；由客户端调用 `POST /api/v1/accounts` 传入 `{qq, key, db_path}` 注册账号后，服务在后台以只读直连方式打开源库（偏移 VFS 虚拟剥离自定义头）、解密并构建索引（见 §1.1）
-- API Token：首次启动自动生成（32 字节随机数的 64 字符十六进制）并持久化到 `<data-dir>/token.txt`（启动日志仅打印保存路径，不打印 token 值）
+- API Token：首次启动自动生成（32 字节随机数的 64 字符十六进制）并持久化到系统凭据库（`--show-token` 获取）（启动日志仅打印保存路径，不打印 token 值）
 - 索引就绪前（存在 `awaiting_key` / `indexing` / `error` 账号时），业务接口返回 `503`（见 §8 错误）；`/health` 返回 `starting` 状态。例外：SSE 接口 `/api/v1/push/messages` 与 `/api/v1/accounts` 不检查就绪状态，可随时调用
 - 新消息检测：后台以**文件系统事件**驱动（Windows ReadDirectoryChangesW / Linux inotify / macOS FSEvents，`--watch-debounce-ms` 默认 350ms 防抖，辅以 `--watch-fallback-ms` 默认 30s 慢速兜底轮询防事件丢失），源数据库文件变化时执行完整同步（直连活库的增量读取，零拷贝），经 `GET /api/v1/push/messages` 推送 SSE；客户端亦可主动调用 `POST /api/v1/sync` 立即同步
 
@@ -110,17 +110,35 @@ POST /api/v1/accounts
 **响应**
 
 ```json
-{ "success": true, "qq": "1234567890", "state": "accepted" }
+{
+  "success": true,
+  "qq": "1234567890",
+  "state": "accepted",
+  "status": "indexing",
+  "db_path": "C:\\SomeUser\\Documents\\Tencent Files\\1234567890\\nt_qq\\nt_db\\nt_msg.db"
+}
 ```
 
-| `state` | 说明 |
-| ------- | ---- |
-| `accepted` | 参数合法，后台开始初始化（`/health` 可见 `indexing` → `ready`） |
-| `invalid_key` | 密钥未通过校验（非 16 字节可打印 ASCII） |
-| `invalid_db_path` | `db_path` 不存在或目录下无 `nt_msg.db` |
-| `unknown_qq` | 未扫描到该账号且未提供 `db_path` |
-| `already_ready` | 账号已就绪（幂等无操作） |
-| `in_progress` | 账号正在索引 |
+| 字段 | 说明 |
+| ---- | ---- |
+| `state` | **本次注册请求的结果**（见下表） |
+| `status` | **账号当前状态机值** ∈ `awaiting_key \| indexing \| ready \| error`，与 `/health` 的 `accounts[].state` 同一枚举；账号此前从未出现过时省略 |
+| `db_path` | 服务端**实际解析到的** `nt_msg.db` 路径；无法解析时省略 |
+
+| `state` | 说明 | 伴随的 `status` |
+| ------- | ---- | ---- |
+| `accepted` | 参数合法，后台开始初始化（`/health` 可见 `indexing` → `ready`） | `indexing` |
+| `invalid_key` | 密钥未通过校验（非 16 字节可打印 ASCII） | 账号原状态（未变） |
+| `invalid_db_path` | `db_path` 不存在或目录下无 `nt_msg.db` | 账号原状态（未变） |
+| `unknown_qq` | 未扫描到该账号且未提供 `db_path` | 账号原状态（未变） |
+| `already_ready` | 账号已就绪（幂等无操作） | `ready` |
+| `in_progress` | 账号正在索引 | `indexing` |
+
+`status` 的用途是免去注册后立刻再打一次 `/health`：拒绝类响应（`invalid_key` / `invalid_db_path` / `unknown_qq`）不改变账号状态，`status` 因此告诉客户端账号**此刻仍处于什么状态**——例如密钥填错重注册一个此前失败的账号，会得到 `state=invalid_key` + `status=error`，即"这次被拒且账号仍然坏着"。
+
+**`status: "indexing"` 不代表密钥正确**：本接口只校验密钥格式，真正的解密验证在后台初始化中完成（失败 → `error`）。客户端仍需轮询 `/health` 等到 `ready`。
+
+`db_path` 回显的是解析结果而非请求原值：请求里的 `db_path` 可以是文件、可以是 Tencent Files 风格根目录、也可以省略（走启动扫描），回显让客户端确认服务端最终读的是哪个库。幂等分支（`already_ready` / `in_progress`）回显的是**运行中账号当初使用的路径**，本次请求携带的 `db_path` 在这些分支下被忽略。
 
 密钥仅保存在内存中，**不持久化**；进程退出后需重新注册。密钥错误时账号进入 `error` 状态（`/health` 的 `accounts[].error` 给出原因），重新调用本接口传入正确参数即可恢复。
 
@@ -156,7 +174,7 @@ GET /api/v1/push/messages
 | `sessionType` | `group` 或 `private` |
 | `rawid` | 消息 rowid（字符串） |
 | `avatarUrl` | v1 恒省略（序列化时跳过该字段） |
-| `sourceName` | 发送者显示名（群聊：本群群名片（40090）> 备注 > 最新昵称 > 档案昵称 > UID；私聊：备注 > 最新昵称 > 档案昵称 > UID——群名片只在所属群内显示，不会泄漏进私聊/联系人） |
+| `sourceName` | 发送者显示名，与 §3 的 `senderName` 同一解析链路、同一取值（群聊：本群群名片（40090）> 备注 > 最新昵称 > 档案昵称 > UID；私聊无群名片，从备注起算——群名片只在所属群内显示，不会泄漏进私聊/联系人）。混用推送与 REST 的客户端，同一发送者在两个通道拿到的名字一致 |
 | `groupName` | 会话显示名（群聊：群备注 > 改名消息群名 > 群信息库群名 > 群号；私聊：备注 > 对方昵称（会话名） > 档案昵称 > UID）；仅 `message.new` / `message.revoke` 携带，缺失时省略该字段 |
 | `content` | 消息内容 |
 | `timestamp` | 消息时间，秒级 Unix 时间戳 |
@@ -230,7 +248,8 @@ curl "http://127.0.0.1:5032/api/v1/messages?talker=u_abc123&start=20260101&end=2
 | `localType` | 消息类型码（见下表） |
 | `createTime` | 秒级 Unix 时间戳（优先 `40050` 列，缺列时回退 seq 高位） |
 | `isSend` | 方向：`1`=本人发送，`0`=他人/系统（来自 `40013` 列；QQ 版本缺列或值非 1/2 时恒 `0`） |
-| `senderUsername` | 发送者 UID |
+| `senderUsername` | 发送者 UID（稳定标识，客户端据此去重） |
+| `senderName` | 发送者显示名，按**本会话**解析：群聊为本群群名片（`40090`）> 备注（`20009`）> 最新昵称（`40093`）> 档案昵称（`20002`）> UID；私聊无群名片，从备注起算。同一 UID 在不同会话可得不同显示名（群名片只在本群生效，不会外泄到私聊或联系人列表）。回退链末端是 UID 本身，故 `senderUsername` 非空时该字段必非空；系统消息等无发送者的行 `senderUsername` 为空，此字段同为空串（真实账号抽样 2568 条中 369 条属此类）。**有此字段后，客户端无需为显示名再调用 `/api/v1/contacts` 与 `/api/v1/group-members`** |
 | `content` / `rawContent` / `parsedContent` | v1 三者相同，为解析后文本 |
 | `mediaType` | 仅图片/语音/视频消息：`image` / `voice` / `video` |
 | `media` | 仅媒体消息：元数据对象（`uuid`/`md5`/`fileName`/`size`/`width`/`height`/`localPath`/`urls`，均为可选字段，缺失即省略） |
@@ -268,6 +287,7 @@ curl "http://127.0.0.1:5032/api/v1/messages?talker=u_abc123&start=20260101&end=2
       "createTime": 1782864000,
       "isSend": 0,
       "senderUsername": "u_a",
+      "senderName": "张三（群名片）",
       "content": "[image]",
       "rawContent": "[image]",
       "parsedContent": "[image]",
@@ -290,6 +310,7 @@ curl "http://127.0.0.1:5032/api/v1/messages?talker=u_abc123&start=20260101&end=2
       "createTime": 1782863900,
       "isSend": 0,
       "senderUsername": "u_b",
+      "senderName": "李四",
       "content": "你好",
       "rawContent": "你好",
       "parsedContent": "你好"
@@ -304,8 +325,8 @@ curl "http://127.0.0.1:5032/api/v1/messages?talker=u_abc123&start=20260101&end=2
 
 - `chatlab.version`（`"0.0.2"`）、`chatlab.exportedAt`、`chatlab.generator`（`"qqflow-server"`）
 - `meta.name`（会话显示名：群聊为群备注 > 改名消息群名 > 群信息库群名 > 群号；私聊为备注 > 对方昵称（会话名） > 档案昵称 > UID）、`meta.platform`（`"qq"`）、`meta.type`（`group`/`private`）、`meta.groupId`（群聊为群号，私聊为对方 UID）
-- `members[].platformId`、`members[].accountName`（群聊：本群群名片 > 备注 > 最新昵称 > 档案昵称 > UID；私聊同链路无卡片）、`members[].groupNickname`（群聊群名片，私聊恒空）、`members[].avatar`（恒空）
-- `messages[].sender`、`messages[].accountName`（同上，群聊群名片优先）、`messages[].timestamp`、`messages[].type`、`messages[].content`、`messages[].platformMessageId`
+- `members[].platformId`、`members[].accountName`（即 §3 的 `senderName`，同一解析链路）、`members[].groupNickname`（同 `accountName`）、`members[].avatar`（恒空）
+- `messages[].sender`、`messages[].accountName`（同上）、`messages[].timestamp`、`messages[].type`、`messages[].content`、`messages[].platformMessageId`
 
 ---
 
@@ -420,6 +441,8 @@ GET /api/v1/sessions/{id}/messages
 
 ### 响应
 
+`members[].accountName` 与 `messages[].accountName` 与 §3 的 `senderName` 同一解析链路、同一取值（群聊含本群群名片）；`members[].groupNickname` 群聊同 `accountName`、私聊恒为空串。
+
 ```json
 {
   "chatlab": {
@@ -481,15 +504,22 @@ GET /api/v1/contacts
 
 ### 响应字段（按 `(displayName, username)` 排序）
 
-**必须翻页**：`limit` 默认 100，不传只拿到前 100 条（实测真实账号 23864 条），
-截断外的发送者显示名在下游退化为 UID。按 `offset` 递增到 `hasMore=false`；
-下游走 `sources_base.fetch_all_pages`（`page_size=5000`）取尽。
-排序含 `username` 次键——显示名不唯一，仅按显示名排序时并列项在多次请求间
-顺序不定，offset 翻页会漏行/重复行。
+> 仅为「显示消息发送者名字」而调用本接口已无必要：§3 的每条消息自带
+> `senderName`，且它按会话解析、含本群群名片，比本接口的 `displayName`（全局，
+> 无群名片）更准。本接口留给需要**完整通讯录**的场景（例如列出无聊天记录的联系人、
+> 读取 `alias`/QQ 号）。
+
+**必须翻页**：`limit` 默认 100，不传就只拿到前 100 条，静默丢掉其余联系人。
+按 `offset` 递增直到 `hasMore=false`：
+
+- `total` 为过滤后总数，与 `offset` 无关；`count` 是本页条数；
+- 排序加了 `username` 次键——显示名不唯一，仅按显示名排序时并列项在多次请求间
+  顺序不定，offset 翻页会漏行/重复行；
+- `offset` 超出末尾返回空页且 `hasMore=false`。
 
 - `success`
 - `count`（本页条数）
-- `total`（过滤后总数，与 offset 无关）
+- `total`（过滤后总数）
 - `hasMore`（`offset + count < total`）
 - `contacts[].username`（UID）
 - `contacts[].displayName`（备注 > 消息昵称 > 档案昵称 > UID）
@@ -506,6 +536,9 @@ GET /api/v1/contacts
 > 当使用 POST 时，请将参数放在 JSON Body 中（Content-Type: application/json）
 
 v1 成员来源：该群消息中出现过的发送者 UID + 昵称（无独立群成员库）。
+
+> 同 §5：只为显示发送者名字不必调用本接口，§3 每条消息的 `senderName` 已是同一条
+> 解析链路（含本群群名片）。本接口留给需要成员名单本身的场景（发言数统计等）。
 
 **请求**
 
@@ -575,7 +608,7 @@ POST /api/v1/sync
   "synced": 3,
   "hasMore": false,
   "messages": [
-    { "localId": 1234567890123, "serverId": "1234567890123", "localType": 0, "createTime": 1782864000, "isSend": 0, "senderUsername": "u_a", "content": "你好", "rawContent": "你好", "parsedContent": "你好" }
+    { "localId": 1234567890123, "serverId": "1234567890123", "localType": 0, "createTime": 1782864000, "isSend": 0, "senderUsername": "u_a", "senderName": "张三（群名片）", "content": "你好", "rawContent": "你好", "parsedContent": "你好" }
   ]
 }
 ```
@@ -609,7 +642,7 @@ POST /api/v1/sync
 ### cURL
 
 ```bash
-TOKEN=$(Get-Content "$env:LOCALAPPDATA\qqflow-server\token.txt")   # PowerShell
+TOKEN=$(Get-Content "$env:LOCALAPPDATA\qqflow-server\系统凭据库（--show-token 获取）")   # PowerShell
 # 注册账号（客户端驱动启动；密钥仅内存保存）
 curl -X POST http://127.0.0.1:5032/api/v1/accounts \
   -H "Content-Type: application/json" \

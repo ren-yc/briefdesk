@@ -13,11 +13,11 @@ from datetime import UTC, datetime
 from briefdesk.config import config
 from briefdesk.db import (
     are_messages_processed,
+    bulk_upsert_contacts,
     get_enabled_sessions,
     get_oldest_unprocessed_by_session,
     get_session_last_polls,
     update_session_last_polls,
-    upsert_contact,
     upsert_session,
 )
 from briefdesk.logger import fmt_dur
@@ -71,8 +71,9 @@ async def run_poll_cycle(source: SourceRuntime) -> None:
             window_start_by_session=windows,
         )
         # 源只产出数据，写库统一在此完成（顺序与重构前一致：contacts 先、sessions 后）
-        for c in result.contacts:
-            await upsert_contact(c.source, c.sender_id, c.display_name)
+        await bulk_upsert_contacts(
+            [(c.source, c.sender_id, c.display_name) for c in result.contacts]
+        )
         for s in result.sessions:
             await upsert_session(
                 s.source,

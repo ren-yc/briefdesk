@@ -145,8 +145,8 @@ async def poll(
     total_self = 0  # IGNORE_SELF 预滤的自消息数（不进管道、不标记 processed）
     not_ready_skips = 0
     session_idx = 0
-    # 群成员映射按 session 缓存一轮：同一轮内重复会话不重复请求
-    group_members_cache: dict[str, dict[str, str]] = {}
+    # 不再查 /api/v1/group-members：其 groupNickname 与消息自带的 senderName
+    # 是上游同一条 display_sender 链的产物，纯冗余（每个启用群省一次请求）。
 
     for session in enabled_sessions:
         session_idx += 1
@@ -232,27 +232,12 @@ async def poll(
                         continue
                     pending.append(msg)
 
-                group_members: dict[str, str] = {}
-                if pending and session.is_group:
-                    # 懒加载：仅有新候选时才查群成员；503 由外层瞬态捕获
-                    # 跳过本会话，404 由 client 降级为空映射，其他错误传播。
-                    if session_id not in group_members_cache:
-                        group_members_cache[
-                            session_id
-                        ] = await client.fetch_group_members(session_id)
-                    else:
-                        logger.debug(
-                            f"  [{session_idx}/{len(enabled_sessions)}] {label}: 群成员命中本轮缓存"
-                        )
-                    group_members = group_members_cache[session_id]
-
                 for msg in pending:
                     normalized = normalize_rest(
                         msg,
                         session_id,
                         label,
                         contacts,
-                        group_members,
                         self_uid=client.self_uid,
                     )
                     result.messages.append(normalized)

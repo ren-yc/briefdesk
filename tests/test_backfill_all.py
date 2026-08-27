@@ -101,9 +101,6 @@ class _QqPagedClient:
             "hasMore": offset + len(page) < len(self._messages),
         }
 
-    async def fetch_group_members(self, chatroom_id: str) -> dict[str, str]:
-        return {"u": "用户"}
-
 
 async def _no_processed(ids):
     return set()

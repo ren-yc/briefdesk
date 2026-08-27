@@ -1852,12 +1852,21 @@ async def _get_category(db: aiosqlite.Connection, cat_id: int) -> CategoryRow | 
 # ── Contacts ──
 
 
-async def upsert_contact(source: str, sender_id: str, display_name: str) -> None:
+async def bulk_upsert_contacts(rows: list[tuple[str, str, str]]) -> None:
+    """批量 upsert contacts（单事务），入参 [(source, sender_id, display_name)]。
+
+    曾是逐条 upsert + 逐条 commit，每行一次 fsync；实测 qqflow 的 2.4w
+    联系人要 ~18s，占满整轮轮询耗时。executemany + 单次 commit 把 N 次
+    fsync 压成 1 次。
+    """
+    if not rows:
+        return
     db = await get_db()
-    await db.execute(
+    cursor = await db.executemany(
         "INSERT OR REPLACE INTO contacts (source, sender_id, display_name) VALUES (?, ?, ?)",
-        (source, sender_id, display_name),
+        rows,
     )
+    await cursor.close()
     await db.commit()
 
 

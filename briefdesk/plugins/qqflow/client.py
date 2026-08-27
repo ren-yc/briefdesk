@@ -74,17 +74,6 @@ class QqFlowContact(TypedDict):
     type: str
 
 
-class QqFlowGroupMember(TypedDict):
-    """群成员（/api/v1/group-members）。"""
-
-    wxid: str
-    displayName: str
-    nickname: str
-    remark: str
-    alias: str
-    groupNickname: str
-
-
 class QqFlowMessage(TypedDict):
     """REST API 返回的消息。"""
 
@@ -93,7 +82,10 @@ class QqFlowMessage(TypedDict):
     localType: int  # 0文本 / 1其他 / 3图片 / 4语音 / 5视频 / 6撤回 / 7系统
     createTime: int  # 秒级 Unix
     isSend: int  # 方向（上游 40013 列）：1=本人发送；QQ 版本缺列或值非 1/2 时恒 0
-    senderUsername: str  # 发送者 UID
+    senderUsername: str  # 发送者 UID（稳定去重键）
+    senderName: str  # 上游已解析的发送者显示名：本会话群名片(40090) > 备注
+    # (20009) > 最新消息昵称(40093) > 档案昵称(20002) > UID。与 SSE sourceName
+    # 同值。senderUsername 非空即非空 → 无需再拼 contacts/group-members 映射
     content: str  # 解析后文本（媒体消息为 [image] 等占位符）
     rawContent: str
     parsedContent: str
@@ -122,11 +114,6 @@ class QqFlowSessionsResponse(TypedDict):
 
 class QqFlowContactsResponse(TypedDict):
     contacts: list[QqFlowContact]
-
-
-class QqFlowGroupMembersResponse(TypedDict):
-    members: list[QqFlowGroupMember]
-
 
 
 logger = logging.getLogger(__name__)
@@ -369,43 +356,9 @@ class QqFlowClient(SourceClient):
             )
         return contacts
 
-    async def fetch_group_members(self, chatroom_id: str) -> dict[str, str]:
-        """获取群成员 → {uid: 群内显示名}。
-
-        groupNickname 已由上游按「本群群名片 > 备注 > 最新消息昵称 >
-        档案昵称 > UID」计算，优先采用；若它只是 UID 回退值则改用
-        displayName/nickname/remark。每级候选经 clean_display_name 净化，
-        全部为空才不进入映射（由 normalize 回退 contacts / UID）。
-        404（群不存在）返回空映射；503 仍走 QqFlowNotReadyError 瞬态语义。
-        """
-        data: QqFlowGroupMembersResponse | None = await self._get(
-            "/api/v1/group-members",
-            params={"chatroomId": chatroom_id},
-            not_found_ok=True,
-        )
-        if not data:
-            logger.warning(f"群成员接口 404（群可能不存在）: {chatroom_id}")
-            return {}
-
-        members: dict[str, str] = {}
-        for m in data.get("members", []):
-            uid = m.get("wxid") or ""
-            if not uid:
-                continue
-            group_nick = clean_display_name(m.get("groupNickname"))
-            # 上游无任何名字来源时会以 UID 兜底，此时应让位于其他候选
-            if group_nick == uid:
-                group_nick = ""
-            name = (
-                group_nick
-                or clean_display_name(m.get("displayName"))
-                or clean_display_name(m.get("nickname"))
-                or clean_display_name(m.get("remark"))
-            )
-            if name:
-                members[uid] = name
-        logger.debug("群成员拉取: %s → %d 名成员", chatroom_id, len(members))
-        return members
+    # 不再有 fetch_group_members：/api/v1/group-members 的 groupNickname 与
+    # 消息自带的 senderName 出自上游同一条 display_sender 链（本群群名片 >
+    # 备注 > 最新消息昵称 > 档案昵称 > UID），逐群再查一次纯属冗余。
 
     async def fetch_sessions(self) -> list[QqFlowSession]:
         """获取所有会话列表。
