@@ -18,7 +18,7 @@ import logging
 import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import aiosqlite
 import numpy as np
@@ -108,7 +108,7 @@ class RagEngine:
         self._vec_model: str | None = None
         self._vec_watermark = ""
         self._vec_count_seen = 0
-        self._vec_entries: dict[tuple[str, str], tuple[ChunkRow, "np.ndarray"]] = {}
+        self._vec_entries: dict[tuple[str, str], tuple[ChunkRow, np.ndarray]] = {}
         # 预组 float32 矩阵（缓存变更时重组，ask 路径零转换零拷贝直用）
         self._matrix: np.ndarray | None = None
         self._matrix_keys: list[tuple[str, str]] = []
@@ -144,7 +144,7 @@ class RagEngine:
     @staticmethod
     async def _allowed_sessions(
         db: aiosqlite.Connection, group_only: bool, session_id: str | None
-    ) -> set[str] | None:
+    ) -> set[tuple[str, str]]:
         """当前可检索会话集合；None 表示无会话约束（group_only 关且未收窄）。
 
         启用状态每次查询现取——停用会话即时失效，不依赖索引期快照。
@@ -176,8 +176,8 @@ class RagEngine:
             return
         try:
             vectors = await ai_ports.embed_texts([m.content for m in candidates])
-        except Exception:  # noqa: BLE001 — 只放弃嵌入不影响管道；
-        # 内容仍会在 run 入索引，缺失向量由维护循环的反连接自动补齐
+        except Exception:
+            # 内容仍会在 run 入索引，缺失向量由维护循环的反连接自动补齐
             logger.exception("rag: 批次预嵌入失败（本批仅跳过嵌入）")
             return
         if len(vectors) != len(candidates):
@@ -200,7 +200,7 @@ class RagEngine:
         emb_items: list[tuple[str, str]] = []
         emb_vecs: list[list[float]] = []
         model = ai_ports.embed_model_name()
-        now_iso = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        now_iso = datetime.now(UTC).isoformat(timespec="seconds")
         for msg in batch.messages:
             if not _indexable(msg.content):
                 continue
@@ -303,7 +303,7 @@ class RagEngine:
             part = rows[start : start + batch_size]
             try:
                 part_vecs = await ai_ports.embed_texts([r.content for r in part])
-            except Exception:  # noqa: BLE001 — 只放弃嵌入，不影响续跑
+            except Exception:
                 logger.exception("rag: 回填嵌入批次失败（已得 %d 条）", len(vectors))
                 failed = True
                 break
@@ -315,7 +315,7 @@ class RagEngine:
                 failed = True
                 break
             vectors.extend(part_vecs)
-        now_iso = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        now_iso = datetime.now(UTC).isoformat(timespec="seconds")
         await upsert_chunks(db, rows)
         if self._fts_enabled:
             await sync_fts(db, rows)
@@ -360,7 +360,7 @@ class RagEngine:
         self._matrix = None
         self._matrix_keys = []
         self._matrix_chunks = []
-        self._matrix_sessions = []
+        self._matrix_sessions: list[tuple[str, str]] = []
 
     def _rebuild_matrix(self) -> None:
         """缓存变更后重组 float32 矩阵（ask 路径零转换直接用）。"""
@@ -448,7 +448,7 @@ class RagEngine:
             return None
         try:
             q_vec = (await ai_ports.embed_texts([cleaned]))[0]
-        except Exception:  # noqa: BLE001 — 查询嵌入失败按拒答处理
+        except Exception:
             logger.exception("rag: 查询嵌入失败")
             return None
         db = await self._ensure_db_ready()
@@ -551,7 +551,7 @@ class RagEngine:
         hits = await self.retrieve(question, session_id)
         if not hits:
             return AskResult(refused=True, answer="没有在群聊记录里找到相关消息。")
-        messages = build_answer_prompt(datetime.now(), question.strip(), hits)
+        messages = build_answer_prompt(datetime.now(UTC).astimezone(), question.strip(), hits)
         resp = await ai_ports.chat(messages, temperature=0.2, max_tokens=1024)
         content = ""
         if getattr(resp, "choices", None):

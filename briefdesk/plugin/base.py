@@ -49,6 +49,16 @@ class Plugin(Protocol):
     async def teardown(self) -> None: ...
 
 
+class SettingsSchemaPlugin(Protocol):
+    """可选的插件设置能力。
+
+    为保持第三方旧插件兼容，该方法不是 Plugin 最小生命周期契约的一部分；
+    实现后设置页会自动显示该插件当前配置。返回值必须是 JSON 安全字段描述。
+    """
+
+    def settings_schema(self) -> list[dict[str, Any]]: ...
+
+
 class SourcePlugin(Plugin, Protocol):
     """消息源插件能力协议；实现类显式继承本协议。
 

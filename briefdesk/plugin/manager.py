@@ -237,6 +237,38 @@ class PluginManager:
         """全部插件的发现/装配摘要（供 /api/plugins 与测试使用）。"""
         return [rec.info() for rec in self._records.values()]
 
+    def settings_schema(self) -> list[dict[str, Any]]:
+        """返回当前配置选中的插件设置描述。
+
+        依据选中的插件而不是仅依据 ``loaded`` 状态筛选：插件因缺少必填
+        配置自禁用时，用户仍需能在设置页补齐它的配置。
+        """
+        self.discover()
+        selected = set(self.enabled_names())
+        result: list[dict[str, Any]] = []
+        for name, rec in self._records.items():
+            if name not in selected or rec.plugin is None:
+                continue
+            callback = getattr(rec.plugin, "settings_schema", None)
+            if not callable(callback):
+                continue
+            try:
+                fields = callback()
+            except Exception:
+                logger.exception("读取插件 %s 设置 schema 失败", name)
+                continue
+            for field in fields:
+                if not isinstance(field, dict) or not isinstance(
+                    field.get("key"), str
+                ):
+                    logger.warning("插件 %s 返回了无效设置 schema 字段", name)
+                    continue
+                item = dict(field)
+                item["plugin"] = name
+                item["pluginStatus"] = rec.status
+                result.append(item)
+        return result
+
     def records(self) -> dict[str, PluginRecord]:
         return dict(self._records)
 

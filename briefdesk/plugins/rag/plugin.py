@@ -17,6 +17,7 @@ import contextlib
 import logging
 import time
 from pathlib import Path
+from typing import Any
 
 from fastapi import APIRouter
 
@@ -31,6 +32,7 @@ from briefdesk.plugins.rag.engine import (
     RagEngine,
     set_engine,
 )
+from briefdesk.settings_schema import build_settings_schema
 from briefdesk.types import BatchContext
 
 logger = logging.getLogger(__name__)
@@ -48,6 +50,28 @@ class RagPlugin(StagePlugin, WebPlugin):
     def __init__(self) -> None:
         self._engine: RagEngine | None = None
         self._backfill_task: asyncio.Task[None] | None = None
+
+    def settings_schema(self) -> list[dict[str, Any]]:
+        from briefdesk.plugins.rag.config import RagSettings
+
+        return build_settings_schema(
+            RagSettings,
+            plugin=self.name,
+            labels={
+                "top_k": "向量召回条数",
+                "fts_limit": "关键词召回条数",
+                "max_evidence": "最大证据条数",
+                "min_score": "最低相关度",
+                "backfill_days": "历史回填天数",
+                "backfill_batch": "回填嵌入批量",
+                "backfill_budget_per_cycle": "单轮回填预算",
+                "group_only": "仅限群聊",
+                "maintenance_interval_seconds": "维护间隔（秒）",
+            },
+            hints={
+                "backfill_days": "0 = 关闭回填；-1 = 全量回填",
+            },
+        )
 
     def router(self) -> APIRouter:
         from briefdesk.plugins.rag import router as rag_router
@@ -112,7 +136,7 @@ class RagPlugin(StagePlugin, WebPlugin):
                     failed = self._engine.last_cycle_embed_failed
                 except asyncio.CancelledError:
                     raise
-                except Exception:  # noqa: BLE001 — 单轮回填异常退避续跑
+                except Exception:
                     logger.exception("rag: 回填轮异常，退避续跑")
                     failed = True
                 if failed:
@@ -131,12 +155,13 @@ class RagPlugin(StagePlugin, WebPlugin):
                     await self._engine.warm_vectors(force_full=True)
                 except asyncio.CancelledError:
                     raise
-                except Exception:  # noqa: BLE001 — GC/预热失败下周期重试
+                except Exception:
                     logger.exception("rag: GC/预热异常，下周期重试")
                 await asyncio.sleep(
                     self._engine.settings.maintenance_interval_seconds
                 )
-        except asyncio.CancelledError:
+
+        except asyncio.CancelledError:  # noqa: TRY203 — 保持维护任务取消语义
             raise
 
     async def teardown(self) -> None:

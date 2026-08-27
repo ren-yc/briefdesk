@@ -3914,26 +3914,32 @@ async function loadEnvConfig() {
 
 function _envBadges(item) {
   const badges = [];
-  if (item.staged !== null && item.source === "override") {
+  if (item.staged !== null && item.staged !== undefined) {
     badges.push('<span class="env-badge env-badge-staged">已暂存 · 重启生效</span>');
   }
   if (item.source === "env") {
     badges.push('<span class="env-badge env-badge-env">环境变量优先</span>');
+  }
+  if (item.plugin && item.pluginStatus && item.pluginStatus !== "loaded") {
+    badges.push('<span class="env-badge">插件' + esc(item.pluginStatus === "disabled" ? "未启用" : "不可用") + '</span>');
   }
   return badges.join("");
 }
 
 function _envControl(item) {
   const key = item.key;
-  const cur = item.current;
+  const keyAttr = escAttr(key);
+  const cur = _envInputValue(item);
+  const displayValue = cur === null || cur === undefined ? "" : cur;
   if (item.type === "boolean") {
-    return '<label class="env-chip"><input type="checkbox" data-env-key="' + key + '"'
+    return '<label class="env-chip"><input type="checkbox" data-env-key="' + keyAttr + '"'
       + (cur ? " checked" : "") + "><span>启用</span></label>";
   }
   if (item.type === "select") {
-    return '<select class="settings-select" data-env-key="' + key + '">'
-      + item.options.map(o => '<option value="' + escAttr(o) + '"'
-        + (String(cur) === o ? " selected" : "") + ">" + esc(o) + "</option>").join("")
+    const options = Array.isArray(item.options) ? item.options : [];
+    return '<select class="settings-select" data-env-key="' + keyAttr + '">'
+      + options.map(o => '<option value="' + escAttr(o) + '"'
+        + (String(displayValue) === o ? " selected" : "") + ">" + esc(o) + "</option>").join("")
       + "</select>";
   }
   if (item.type === "multi") {
@@ -3944,19 +3950,26 @@ function _envControl(item) {
       if (!opts.includes(name)) opts.push(name);
     }
     if (!opts.includes("*")) opts.unshift("*");
-    return '<div class="env-multi" data-env-key="' + key + '">'
+    return '<div class="env-multi" data-env-key="' + keyAttr + '">'
       + opts.map(o => '<label class="env-chip"><input type="checkbox" value="' + escAttr(o) + '"'
         + (current.includes(o) ? " checked" : "") + "><span>" + esc(o) + "</span></label>").join("")
       + "</div>";
   }
   if (item.type === "number") {
-    return '<input type="number" class="env-input" data-env-key="' + key + '"'
+    return '<input type="number" class="env-input" data-env-key="' + keyAttr + '"'
       + (item.min !== undefined ? ' min="' + item.min + '"' : "")
       + (item.max !== undefined ? ' max="' + item.max + '"' : "")
       + (item.step !== undefined ? ' step="' + item.step + '"' : "")
-      + ' value="' + escAttr(String(cur)) + '">';
+      + ' value="' + escAttr(String(displayValue)) + '">';
   }
-  return '<input type="text" class="env-input" data-env-key="' + key + '" value="' + escAttr(String(cur)) + '">';
+  return '<input type="text" class="env-input" data-env-key="' + keyAttr + '" value="' + escAttr(String(displayValue)) + '">';
+}
+
+function _envInputValue(item) {
+  if (item.staged === null || item.staged === undefined) return item.current;
+  if (item.type === "boolean") return item.staged === true || item.staged === "true";
+  if (item.type === "multi") return Array.isArray(item.staged) ? item.staged : item.current;
+  return item.staged;
 }
 
 function renderEnvConfig() {
@@ -3971,33 +3984,70 @@ function renderEnvConfig() {
   }
   if ($path) $path.textContent = "暂存文件：" + envData.filePath;
   if ($items) {
-    $items.innerHTML = envData.items.map(item => {
-      const restore = item.staged !== null
-        ? '<button type="button" class="env-restore" data-env-restore="' + item.key + '">恢复默认</button>'
+    const groups = [];
+    const groupMap = new Map();
+    for (const item of envData.items) {
+      const group = item.plugin || "core";
+      if (!groupMap.has(group)) {
+        const entry = { name: group, items: [] };
+        groupMap.set(group, entry);
+        groups.push(entry);
+      }
+      groupMap.get(group).items.push(item);
+    }
+    $items.innerHTML = groups.map(group => {
+      const heading = group.name === "core"
+        ? ""
+        : '<h3 class="settings-section env-plugin-heading">插件：' + esc(group.name) + "</h3>";
+      return heading + group.items.map(item => {
+      const restore = item.staged !== null && item.staged !== undefined
+        ? '<button type="button" class="env-restore" data-env-restore="' + escAttr(item.key) + '">恢复默认</button>'
         : "";
-      return '<div class="env-row" data-env-key="' + item.key + '">'
+      return '<div class="env-row" data-env-key="' + escAttr(item.key) + '">'
         + '<div class="env-row-head"><label class="env-label">' + esc(item.label) + "</label>"
         + _envBadges(item) + "</div>"
         + _envControl(item)
         + (item.hint ? '<p class="text-muted settings-hint">' + esc(item.hint) + "</p>" : "")
         + restore
         + "</div>";
+      }).join("");
     }).join("");
   }
   if ($secrets) {
-    $secrets.innerHTML = (envData.secrets || []).map(s => {
-      const state = s.configured
+    const secretGroups = [];
+    const secretGroupMap = new Map();
+    for (const secret of (envData.secrets || [])) {
+      const group = secret.plugin || "core";
+      if (!secretGroupMap.has(group)) {
+        const entry = { name: group, items: [] };
+        secretGroupMap.set(group, entry);
+        secretGroups.push(entry);
+      }
+      secretGroupMap.get(group).items.push(secret);
+    }
+    $secrets.innerHTML = secretGroups.map(group => {
+      const heading = group.name === "core"
+        ? ""
+        : '<h3 class="settings-section env-plugin-heading">插件：' + esc(group.name) + "</h3>";
+      return heading + group.items.map(s => {
+      const keyringConfigured = s.keyringConfigured !== undefined
+        ? !!s.keyringConfigured
+        : !!s.configured;
+      const state = keyringConfigured
         ? '<span class="env-badge env-badge-ok">已配置（钥匙串）</span>'
-        : '<span class="env-badge">未配置</span>';
-      const input = s.configured ? "" : '<div class="env-secret-input">'
+        : s.configured
+          ? '<span class="env-badge env-badge-env">已配置（环境变量/.env）</span>'
+          : '<span class="env-badge">未配置</span>';
+      const input = keyringConfigured ? "" : '<div class="env-secret-input">'
         + '<input type="password" class="env-input" data-sec-input="' + escAttr(s.name) + '" placeholder="输入 ' + esc(s.label) + '" autocomplete="off"> '
         + '<button type="button" class="settings-outline-btn" data-sec-set="' + escAttr(s.name) + '">保存</button></div>';
-      const clear = s.configured
+      const clear = keyringConfigured
         ? '<button type="button" class="env-restore" data-sec-clear="' + escAttr(s.name) + '">清除</button>'
         : "";
       return '<div class="env-row"><div class="env-row-head">'
         + '<label class="env-label">' + esc(s.label) + "</label>" + state + "</div>"
         + input + clear + "</div>";
+      }).join("");
     }).join("") || '<p class="text-muted">无</p>';
   }
 }
@@ -4007,24 +4057,30 @@ function _collectEnvChanges() {
   const $items = document.getElementById("env-items");
   for (const item of envData.items) {
     const key = item.key;
-    const el = $items.querySelector('[data-env-key="' + key + '"]');
-    if (!el) continue;
+    const row = [...$items.querySelectorAll(".env-row")]
+      .find(el => el.dataset.envKey === key);
+    if (!row) continue;
     let newVal;
     let oldVal;
     if (item.type === "boolean") {
+      const el = row.querySelector('input[type="checkbox"]');
+      if (!el) continue;
       newVal = el.checked;
-      oldVal = !!item.current;
+      oldVal = !!_envInputValue(item);
     } else if (item.type === "multi") {
-      newVal = [...el.querySelectorAll("input:checked")].map(c => c.value);
-      oldVal = Array.isArray(item.current) ? item.current.slice().sort() : [];
+      newVal = [...row.querySelectorAll("input:checked")].map(c => c.value);
+      const current = _envInputValue(item);
+      oldVal = Array.isArray(current) ? current.slice().sort() : [];
       newVal = newVal.slice().sort();
       if (JSON.stringify(newVal) === JSON.stringify(oldVal)) continue;
       changes[key] = JSON.stringify(newVal);
       continue;
     } else {
+      const el = row.querySelector("[data-env-key]");
+      if (!el) continue;
       newVal = el.value;
-      oldVal = String(item.current);
-      if (!newVal || newVal === oldVal) continue;
+      oldVal = String(_envInputValue(item));
+      if (newVal === oldVal) continue;
     }
     if (item.type === "boolean") changes[key] = newVal ? "true" : "false";
     else changes[key] = String(newVal);

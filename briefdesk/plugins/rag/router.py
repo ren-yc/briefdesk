@@ -11,7 +11,7 @@ from pydantic import BaseModel, Field, field_validator
 
 from briefdesk import ai_ports
 from briefdesk.db import get_db
-from briefdesk.plugins.rag.db import count_status, gc_orphans
+from briefdesk.plugins.rag.db import count_status
 from briefdesk.plugins.rag.engine import RagEngine, get_engine
 
 router = APIRouter()

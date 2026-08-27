@@ -10,8 +10,10 @@ teardown 关闭 runtime（幂等）。
 """
 
 import logging
+from typing import Any
 
 from briefdesk.plugin.base import PluginContext, SourcePlugin
+from briefdesk.settings_schema import build_settings_schema
 from briefdesk.sources_base import SourceRuntime
 
 logger = logging.getLogger(__name__)
@@ -26,6 +28,24 @@ class WeFlowPlugin(SourcePlugin):
 
     def __init__(self) -> None:
         self._runtime: SourceRuntime | None = None
+
+    def settings_schema(self) -> list[dict[str, Any]]:
+        from briefdesk.plugins.weflow.config import WeFlowSettings
+
+        return build_settings_schema(
+            WeFlowSettings,
+            plugin=self.name,
+            labels={
+                "api_base": "WeFlow API 地址",
+                "api_token": "WeFlow 访问令牌",
+                "sse_reconnect_initial_ms": "SSE 初始重连间隔（毫秒）",
+                "sse_reconnect_max_ms": "SSE 最大重连间隔（毫秒）",
+                "sse_read_timeout_ms": "SSE 读取超时（毫秒）",
+            },
+            hints={
+                "api_token": "密钥只保存到系统钥匙串，不会写入暂存文件",
+            },
+        )
 
     async def setup(self, ctx: PluginContext) -> None:
         # 延迟导入 + 模块属性访问：仅加载本插件依赖，且便于测试替换

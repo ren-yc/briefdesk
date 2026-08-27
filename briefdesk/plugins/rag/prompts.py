@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -17,7 +17,9 @@ def build_answer_prompt(
     lines: list[str] = []
     for i, hit in enumerate(hits, start=1):
         chunk = hit.chunk
-        stamp = datetime.fromtimestamp(chunk.msg_time).strftime("%Y-%m-%d %H:%M")
+        stamp = datetime.fromtimestamp(chunk.msg_time, tz=UTC).astimezone().strftime(
+            "%Y-%m-%d %H:%M"
+        )
         # 压平换行：多行原文无法伪造出新的「[n] 发送者:」证据行（间接注入面）
         flat = " ".join(chunk.content.split())
         line = (

@@ -19,18 +19,36 @@ from briefdesk.server.app import app
 from briefdesk.server.media import _is_safe_media_path
 
 _plugins_info_callback: Callable[[], list[dict]] | None = None
+_settings_schema_callback: Callable[[], list[dict]] | None = None
 
 
-def set_plugins_info_callback(cb: Callable[[], list[dict]]) -> None:
+def set_plugins_info_callback(cb: Callable[[], list[dict]] | None) -> None:
     """注入插件装配摘要回调（main 注册 manager.infos）。"""
     global _plugins_info_callback
     _plugins_info_callback = cb
+
+
+def set_settings_schema_callback(cb: Callable[[], list[dict]] | None) -> None:
+    """注入启用插件设置 schema 回调（main 注册 manager.settings_schema）。"""
+    global _settings_schema_callback
+    _settings_schema_callback = cb
 
 
 def get_plugins_info() -> list[dict]:
     """读取插件装配摘要（未注入回调时返回空列表）。"""
     cb = _plugins_info_callback
     return cb() if cb is not None else []
+
+
+def get_settings_schema() -> list[dict]:
+    """读取启用插件设置 schema（未注入时返回空列表）。"""
+    cb = _settings_schema_callback
+    return cb() if cb is not None else []
+
+
+def has_settings_schema_callback() -> bool:
+    """返回是否已接入插件管理器的设置 schema 回调。"""
+    return _settings_schema_callback is not None
 
 
 @app.get("/api/plugins")

@@ -1463,6 +1463,7 @@ body.modal-open { overflow: hidden; }
 
 /* ── 启动配置面板（设置 → 启动配置） ── */
 .env-row { margin: 10px 0; }
+.env-plugin-heading { margin-top: 18px; font-size: 14px; }
 .env-row-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 4px; }
 .env-label { font-weight: 600; }
 .env-badge {
