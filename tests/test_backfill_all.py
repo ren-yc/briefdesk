@@ -1,8 +1,8 @@
 """BACKFILL_HOURS=-1 全量拉取测试。
 
-覆盖 weflow / qqflow 两个源在 -1 配置下的行为：
+覆盖 weflow-legacy / qqflow 两个源在 -1 配置下的行为：
 - 不做年龄截止（极旧消息保留）
-- weflow：start 不传（服务端不限时间），按 offset 翻页直至 hasMore=False
+- weflow-legacy：start 不传（服务端不限时间），按 offset 翻页直至 hasMore=False
 - qqflow：start 不传（服务端不限时间），仅由 hasMore 驱动翻页
 - 配置校验：-1 合法，-2 非法
 """
@@ -14,7 +14,7 @@ from pydantic import ValidationError
 
 from briefdesk.config import Settings, config
 from briefdesk.plugins.qqflow.poller import poll as qq_poll
-from briefdesk.plugins.weflow.poller import poll as we_poll
+from briefdesk.plugins.weflow_legacy.poller import poll as we_poll
 from briefdesk.types import SessionInfo
 
 # 2018-01-01 的消息时间戳：正常 24h 窗口下必然被年龄截止过滤
@@ -44,7 +44,7 @@ def _qqflow_msg(msg_id: int, ts: int) -> dict:
 class _WeFlowPagedClient:
     """按条数 offset 切页的假客户端（500 条/页，与真实 API 的 offset 语义一致）。"""
 
-    name = "weflow"
+    name = "weflow-legacy"
 
     def __init__(self, messages: list[dict]):
         self._messages = messages
@@ -124,7 +124,7 @@ class WeFlowBackfillAllTest(unittest.IsolatedAsyncioTestCase):
             messages.append(_weflow_msg("old", _OLD_TS))  # 501 条 → 两页
             client = _WeFlowPagedClient(messages)
 
-            result = await we_poll(client, _enabled("weflow"), _no_processed)
+            result = await we_poll(client, _enabled("weflow-legacy"), _no_processed)
 
             self.assertEqual(len(result.messages), 501)
             ids = {m.msg_id for m in result.messages}

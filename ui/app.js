@@ -3434,7 +3434,7 @@ function setSessionTimeFilter(v) {
 }
 
 // 按「实际启用源」裁剪会话列表：后端 /api/sessions 会返回库里全部会话
-// （含历史上曾启用、现已停用源的残留行，如仅启用 qqflow 时的 weflow 会话）。
+// （含历史上曾启用、现已停用源的残留行，如仅启用 qqflow 时的 weflow-legacy 会话）。
 // enabledSources 为空（/api/status 尚未加载或加载失败）时保守放行全部，避免误伤。
 function filterSessionsByEnabledSources(sessions) {
   if (!Array.isArray(sessions)) return [];
@@ -4533,7 +4533,7 @@ async function loadPluginFrontends() {
   //    显隐由对应插件 ui.js 决定；
   // 3) 只对声明了前端资源的插件（has_frontend=true）注入
   //    /plugin-assets/<name>/ui.css（样式）与 ui.js（脚本）——无前端资源的
-  //    插件（如 weflow/ai_provider）不请求，避免 404 触发浏览器严格 MIME
+  //    插件（如 weflow-legacy/ai_provider）不请求，避免 404 触发浏览器严格 MIME
   //    检查告警；has_frontend 缺失（旧版元数据）时保守注入，404 静默；
   // 4) 注入完成后调用 window.briefdeskPlugins.<name>.init({ isLoaded }),
   //    init 抛错只 console.warn，不阻断页面其余初始化。

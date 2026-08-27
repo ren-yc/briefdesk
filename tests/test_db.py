@@ -211,26 +211,26 @@ class ContextMessagesSenderNameTest(unittest.IsolatedAsyncioTestCase):
         await self.db.execute(
             "INSERT OR REPLACE INTO sessions "
             "(source, session_id, name, is_group, enabled) "
-            "VALUES ('weflow', 'g1', '项目群', ?, 1)",
+            "VALUES ('weflow-legacy', 'g1', '项目群', ?, 1)",
             (is_group,),
         )
         await self.db.execute(
             "INSERT OR REPLACE INTO contacts (source, sender_id, display_name) "
-            "VALUES ('weflow', 'u1', ?)",
+            "VALUES ('weflow-legacy', 'u1', ?)",
             (contact_name,),
         )
         await self.db.execute(
             "INSERT OR REPLACE INTO raw_messages "
             "(source, msg_id, session_id, group_name, sender_id, sender_name, "
             "content, timestamp) "
-            "VALUES ('weflow', 'm1', 'g1', '项目群', 'u1', ?, 'hello', 100)",
+            "VALUES ('weflow-legacy', 'm1', 'g1', '项目群', 'u1', ?, 'hello', 100)",
             (raw_sender_name,),
         )
         await self.db.commit()
 
     async def _context_sender(self) -> str:
         with patch("briefdesk.db.get_db", new=AsyncMock(return_value=self.db)):
-            rows = await get_context_messages("weflow", "g1", 100)
+            rows = await get_context_messages("weflow-legacy", "g1", 100)
         self.assertEqual(len(rows), 1)
         return rows[0]["sender"]
 
@@ -270,9 +270,9 @@ class ContextMessagesSenderNameTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_image_placeholder_resolves_to_ocr_quote(self):
         # 图片消息（raw 内容为占位符 [图片]）应回填 OCR 后的原文，并去掉 [OCR] 与 [图片 N OCR 结果] 标记行
-        await self._seed_image_context("weflow", "[图片]")
+        await self._seed_image_context("weflow-legacy", "[图片]")
         with patch("briefdesk.db.get_db", new=AsyncMock(return_value=self.db)):
-            rows = await get_context_messages("weflow", "g1", 100)
+            rows = await get_context_messages("weflow-legacy", "g1", 100)
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["content"], "戟川学社\n招新啦！")
 
@@ -372,7 +372,7 @@ class GetCategoryCountsTest(unittest.IsolatedAsyncioTestCase):
         await self.db.execute(
             "INSERT INTO items (id, category, title, source_quote, source_group, "
             "source, source_msg_id, msg_time, is_verified, created_at) "
-            "VALUES (?, ?, '标题', '引文', '项目群', 'weflow', ?, 100, 0, '2026-01-01T00:00:00+00:00')",
+            "VALUES (?, ?, '标题', '引文', '项目群', 'weflow-legacy', ?, 100, 0, '2026-01-01T00:00:00+00:00')",
             (item_id, category, item_id),
         )
         await self.db.commit()
@@ -415,7 +415,7 @@ class GetItemsSearchTest(unittest.IsolatedAsyncioTestCase):
             "INSERT INTO items (id, category, title, source_quote, source_group, "
             "source, source_msg_id, msg_time, is_verified, created_at) "
             "VALUES ('i1', '学术', '机器学习讲座报名', 'quote', '项目群', "
-            "'weflow', 'm1', 100, 0, '2026-01-01T00:00:00+00:00')"
+            "'weflow-legacy', 'm1', 100, 0, '2026-01-01T00:00:00+00:00')"
         )
         await self.db.commit()
 
@@ -480,8 +480,8 @@ class ItemsPageTest(unittest.IsolatedAsyncioTestCase):
             "INSERT INTO sessions "
             "(source, session_id, name, is_group, enabled) VALUES (?, ?, ?, 1, ?)",
             [
-                ("weflow", "active", "启用群", 1),
-                ("weflow", "disabled", "停用群", 0),
+                ("weflow-legacy", "active", "启用群", 1),
+                ("weflow-legacy", "disabled", "停用群", 0),
             ],
         )
         await self.db.execute("UPDATE categories SET enabled = 0 WHERE name = '交易'")
@@ -496,7 +496,7 @@ class ItemsPageTest(unittest.IsolatedAsyncioTestCase):
                     "quote",
                     "群A" if i % 2 == 0 else "群B",
                     f"主体{i // 2}",
-                    "weflow",
+                    "weflow-legacy",
                     f"m{i:03d}",
                     "active",
                     i,
@@ -516,7 +516,7 @@ class ItemsPageTest(unittest.IsolatedAsyncioTestCase):
                     "quote",
                     "群C",
                     "部分截止",
-                    "weflow",
+                    "weflow-legacy",
                     "m-partial",
                     "active",
                     999,
@@ -533,7 +533,7 @@ class ItemsPageTest(unittest.IsolatedAsyncioTestCase):
                     "quote",
                     "群A",
                     "已截止",
-                    "weflow",
+                    "weflow-legacy",
                     "m-expired",
                     "active",
                     998,
@@ -550,7 +550,7 @@ class ItemsPageTest(unittest.IsolatedAsyncioTestCase):
                     "quote",
                     "停用群",
                     "停用会话",
-                    "weflow",
+                    "weflow-legacy",
                     "m-disabled-session",
                     "disabled",
                     997,
@@ -567,7 +567,7 @@ class ItemsPageTest(unittest.IsolatedAsyncioTestCase):
                     "quote",
                     "群A",
                     "停用类别",
-                    "weflow",
+                    "weflow-legacy",
                     "m-disabled-category",
                     "active",
                     996,
@@ -670,7 +670,7 @@ class ReminderAndCalendarTest(unittest.IsolatedAsyncioTestCase):
             "source_quote": "quote",
             "source_group": "社团群",
             "subject": "摄影社",
-            "source": "weflow",
+            "source": "weflow-legacy",
             "source_msg_id": "m",
             "session_id": "s1",
             "msg_time": 100,
@@ -808,7 +808,7 @@ class SubjectTimelineNormalizationTest(unittest.IsolatedAsyncioTestCase):
             "source_quote": "q",
             "source_group": "社团群",
             "subject": normalize_subject(subject),  # 模拟 pipeline 写侧归一化
-            "source": "weflow",
+            "source": "weflow-legacy",
             "source_msg_id": msg_id,
             "session_id": "s1",
             "msg_time": msg_time,
@@ -866,7 +866,7 @@ class GetGroupCountTest(unittest.IsolatedAsyncioTestCase):
             "source_quote": "q",
             "source_group": "社团群",
             "subject": subject,
-            "source": "weflow",
+            "source": "weflow-legacy",
             "source_msg_id": msg_id,
             "session_id": "s1",
             "msg_time": 1,
@@ -945,7 +945,7 @@ class UpsertSessionTest(unittest.IsolatedAsyncioTestCase):
             return await get_all_sessions()
 
     async def test_insert_then_update_keeps_enabled_and_watermark(self):
-        await self._upsert("weflow", "s1", "群A", True)
+        await self._upsert("weflow-legacy", "s1", "群A", True)
         rows = await self._all()
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["enabled"], 0)  # 新会话默认停用
@@ -954,9 +954,9 @@ class UpsertSessionTest(unittest.IsolatedAsyncioTestCase):
         # 模拟用户启用 + 水位推进后再次 upsert（刷新会话）：
         # enabled/last_poll_ts 必须保留，名称/类型等元数据更新
         with patch("briefdesk.db.get_db", new=AsyncMock(return_value=self.db)):
-            await toggle_session("weflow", "s1")
-            await update_session_last_polls("weflow", [("s1", 1000)])
-        await self._upsert("weflow", "s1", "群A新名", True, is_official=True, last_active_at=2000)
+            await toggle_session("weflow-legacy", "s1")
+            await update_session_last_polls("weflow-legacy", [("s1", 1000)])
+        await self._upsert("weflow-legacy", "s1", "群A新名", True, is_official=True, last_active_at=2000)
         rows = await self._all()
         self.assertEqual(len(rows), 1)  # 不产生重复行
         self.assertEqual(rows[0]["name"], "群A新名")
@@ -968,7 +968,7 @@ class UpsertSessionTest(unittest.IsolatedAsyncioTestCase):
     async def test_concurrent_upserts_same_session_no_error(self):
         # 多源并发刷新同一会话：UPSERT 原子执行，不抛主键冲突、不产生重复行
         async def run():
-            await self._upsert("weflow", "s1", f"群{id(self)}", True)
+            await self._upsert("weflow-legacy", "s1", f"群{id(self)}", True)
 
         import asyncio
 
@@ -990,7 +990,7 @@ class SessionWatermarkTest(unittest.IsolatedAsyncioTestCase):
         for sid in ("g1", "g2"):
             await self.db.execute(
                 "INSERT INTO sessions (source, session_id, name, is_group, enabled) "
-                "VALUES ('weflow', ?, ?, 1, 0)",
+                "VALUES ('weflow-legacy', ?, ?, 1, 0)",
                 (sid, sid),
             )
         await self.db.commit()
@@ -1001,51 +1001,51 @@ class SessionWatermarkTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_get_session_last_polls_none_then_value(self):
         self.assertEqual(
-            await get_session_last_polls("weflow", ["g1", "g2"]),
+            await get_session_last_polls("weflow-legacy", ["g1", "g2"]),
             {"g1": None, "g2": None},
         )
-        await update_session_last_polls("weflow", [("g1", 100), ("g2", 200)])
+        await update_session_last_polls("weflow-legacy", [("g1", 100), ("g2", 200)])
         self.assertEqual(
-            await get_session_last_polls("weflow", ["g1", "g2"]),
+            await get_session_last_polls("weflow-legacy", ["g1", "g2"]),
             {"g1": 100, "g2": 200},
         )
         # 多源隔离：不存在的源/会话不在结果中
         self.assertEqual(await get_session_last_polls("qqflow", ["g1"]), {})
 
     async def test_get_oldest_unprocessed_by_session(self):
-        self.assertEqual(await get_oldest_unprocessed_by_session("weflow"), {})
+        self.assertEqual(await get_oldest_unprocessed_by_session("weflow-legacy"), {})
         await self.db.execute(
             "INSERT INTO raw_messages (source, msg_id, session_id, group_name, "
             "sender_id, sender_name, content, timestamp) "
-            "VALUES ('weflow', 'f1', 'g1', '群', 'u', 'n', 'x', 100), "
-            "('weflow', 'f2', 'g1', '群', 'u', 'n', 'x', 300), "
-            "('weflow', 'f3', 'g2', '群', 'u', 'n', 'x', 200), "
+            "VALUES ('weflow-legacy', 'f1', 'g1', '群', 'u', 'n', 'x', 100), "
+            "('weflow-legacy', 'f2', 'g1', '群', 'u', 'n', 'x', 300), "
+            "('weflow-legacy', 'f3', 'g2', '群', 'u', 'n', 'x', 200), "
             "('qqflow', 'q1', 'g1', '群', 'u', 'n', 'x', 50)"
         )
         await self.db.commit()
         # 按会话分组取最早未处理（源隔离，不含 qqflow 的 50）
         self.assertEqual(
-            await get_oldest_unprocessed_by_session("weflow"), {"g1": 100, "g2": 200}
+            await get_oldest_unprocessed_by_session("weflow-legacy"), {"g1": 100, "g2": 200}
         )
         # 标记 g1 全部已处理 → g1 不再出现
-        await mark_message_processed("weflow", "f1")
-        await mark_message_processed("weflow", "f2")
-        self.assertEqual(await get_oldest_unprocessed_by_session("weflow"), {"g2": 200})
+        await mark_message_processed("weflow-legacy", "f1")
+        await mark_message_processed("weflow-legacy", "f2")
+        self.assertEqual(await get_oldest_unprocessed_by_session("weflow-legacy"), {"g2": 200})
 
     async def test_toggle_enable_clears_watermark(self):
-        await update_session_last_polls("weflow", [("g1", 100)])
+        await update_session_last_polls("weflow-legacy", [("g1", 100)])
         # 启用 → 水位清空（NULL = 待回填）
-        row = await toggle_session("weflow", "g1")
+        row = await toggle_session("weflow-legacy", "g1")
         self.assertEqual(row["enabled"], 1)
         self.assertEqual(
-            await get_session_last_polls("weflow", ["g1"]), {"g1": None}
+            await get_session_last_polls("weflow-legacy", ["g1"]), {"g1": None}
         )
         # 停用 → 不动水位
-        await update_session_last_polls("weflow", [("g1", 100)])
-        row = await toggle_session("weflow", "g1")
+        await update_session_last_polls("weflow-legacy", [("g1", 100)])
+        row = await toggle_session("weflow-legacy", "g1")
         self.assertEqual(row["enabled"], 0)
         self.assertEqual(
-            await get_session_last_polls("weflow", ["g1"]), {"g1": 100}
+            await get_session_last_polls("weflow-legacy", ["g1"]), {"g1": 100}
         )
 
 
@@ -1073,7 +1073,7 @@ class MergeHelpersTest(unittest.IsolatedAsyncioTestCase):
         ts=100,
         session="s1",
         category="交易",
-        source="weflow",
+        source="weflow-legacy",
         is_verified=0,
         title="t",
         quote="q",
@@ -1093,18 +1093,18 @@ class MergeHelpersTest(unittest.IsolatedAsyncioTestCase):
         await self._insert("c1", ts=130, session="s2")  # 会话不符
         await self._insert("d1", ts=120, is_verified=1)  # 已核实不参与
         await self._insert("e1", ts=1000)  # 窗口外
-        cands = await get_merge_candidates("weflow", "s1", "交易", 200, 300, [], 10)
+        cands = await get_merge_candidates("weflow-legacy", "s1", "交易", 200, 300, [], 10)
         self.assertEqual([c["id"] for c in cands], ["a1", "a2"])  # msg_time 升序
-        cands = await get_merge_candidates("weflow", "s1", "交易", 200, 300, ["a1"], 10)
+        cands = await get_merge_candidates("weflow-legacy", "s1", "交易", 200, 300, ["a1"], 10)
         self.assertEqual([c["id"] for c in cands], ["a2"])  # exclude_ids 排除
         cands = await get_merge_candidates("qqflow", "s1", "交易", 200, 300, [], 10)
         self.assertEqual(cands, [])  # 源隔离
         cands = await get_merge_candidates(
-            "weflow", "s1", "交易", 200, 300, [], 2
+            "weflow-legacy", "s1", "交易", 200, 300, [], 2
         )
         self.assertEqual([c["id"] for c in cands], ["a1", "a2"])  # limit 生效
         cands = await get_merge_candidates(
-            "weflow", "s1", "交易", 200, 300, [], 1
+            "weflow-legacy", "s1", "交易", 200, 300, [], 1
         )
         self.assertEqual([c["id"] for c in cands], ["a1"])
 
@@ -1143,7 +1143,7 @@ class MergeHelpersTest(unittest.IsolatedAsyncioTestCase):
         await self.db.execute(
             "INSERT INTO raw_messages (source, msg_id, session_id, group_name, "
             "sender_id, sender_name, content, timestamp) "
-            "VALUES ('weflow', 'k1', 's1', 'g', 'u', 'n', '原文', 100)"
+            "VALUES ('weflow-legacy', 'k1', 's1', 'g', 'u', 'n', '原文', 100)"
         )
         await self.db.commit()
         # keep_raw_messages=True（会话合并吸收片段卡用）：保留原文行
@@ -1157,7 +1157,7 @@ class MergeHelpersTest(unittest.IsolatedAsyncioTestCase):
         await self.db.execute(
             "INSERT INTO raw_messages (source, msg_id, session_id, group_name, "
             "sender_id, sender_name, content, timestamp) "
-            "VALUES ('weflow', 'k2', 's1', 'g', 'u', 'n', '原文2', 110)"
+            "VALUES ('weflow-legacy', 'k2', 's1', 'g', 'u', 'n', '原文2', 110)"
         )
         await self.db.commit()
         await delete_items(["k2"])
@@ -1178,7 +1178,7 @@ class BulkRawInsertTest(unittest.IsolatedAsyncioTestCase):
 
     def _msg(self, i: int) -> RawMsgInput:
         return {
-            "source": "weflow",
+            "source": "weflow-legacy",
             "msg_id": f"m{i}",
             "session_id": "s1",
             "group_name": "群",
@@ -1226,7 +1226,7 @@ class InsertItemConflictTest(unittest.IsolatedAsyncioTestCase):
             "source_quote": "quote",
             "source_group": "群",
             "subject": "主体",
-            "source": "weflow",
+            "source": "weflow-legacy",
             "source_msg_id": source_msg_id,
             "session_id": "s1",
             "msg_time": 100,
@@ -1242,7 +1242,7 @@ class InsertItemConflictTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(first, second)
         cursor = await self.db.execute("SELECT COUNT(*) AS cnt FROM items")
         self.assertEqual((await cursor.fetchone())["cnt"], 1)
-        cursor = await self.db.execute("SELECT id FROM items WHERE source='weflow' AND source_msg_id='m'")
+        cursor = await self.db.execute("SELECT id FROM items WHERE source='weflow-legacy' AND source_msg_id='m'")
         row = await cursor.fetchone()
         self.assertEqual(second, row["id"])
 
@@ -1273,7 +1273,7 @@ class RecatLogTest(unittest.IsolatedAsyncioTestCase):
             "source_quote": "原文内容（已脱敏）",
             "source_group": "群",
             "subject": "主体",
-            "source": "weflow",
+            "source": "weflow-legacy",
             "source_msg_id": "m1",
             "session_id": "s1",
             "msg_time": 100,
@@ -1334,7 +1334,7 @@ class BackupRestoreTest(unittest.IsolatedAsyncioTestCase):
                 await insert_item({
                     "category": "活动通知", "title": marker,
                     "key_info": "k", "sender_name": "A", "source_quote": marker,
-                    "source_group": "群", "subject": "主体", "source": "weflow",
+                    "source_group": "群", "subject": "主体", "source": "weflow-legacy",
                     "source_msg_id": marker, "session_id": "s1", "msg_time": 1,
                     "is_verified": 0, "content_hash": "h",
                 })
@@ -1448,7 +1448,7 @@ class GetItemTextsTest(unittest.IsolatedAsyncioTestCase):
         await insert_item({
             "category": "活动通知", "title": "标题X",
             "key_info": "k", "sender_name": "A", "source_quote": "原文Z",
-            "source_group": "群", "subject": "主体", "source": "weflow",
+            "source_group": "群", "subject": "主体", "source": "weflow-legacy",
             "source_msg_id": "m1", "session_id": "s1", "msg_time": 1,
             "is_verified": 0, "content_hash": "h",
         })
@@ -1491,7 +1491,7 @@ class MergeVectorCleanupTest(unittest.IsolatedAsyncioTestCase):
         item_id = await insert_item({
             "category": "活动通知", "title": "旧标题",
             "key_info": "k", "sender_name": "A", "source_quote": "旧原文",
-            "source_group": "群", "subject": "主体", "source": "weflow",
+            "source_group": "群", "subject": "主体", "source": "weflow-legacy",
             "source_msg_id": "m1", "session_id": "s1", "msg_time": 1,
             "is_verified": 0, "content_hash": "h",
         })
@@ -1523,7 +1523,7 @@ class SourceGroupsSplitTest(unittest.IsolatedAsyncioTestCase):
         await self.db.execute(
             "INSERT INTO items (id, category, title, source_quote, source_group, "
             "source, source_msg_id, msg_time, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (item_id, "活动通知", "标题", "原文", source_group, "weflow", item_id, 100,
+            (item_id, "活动通知", "标题", "原文", source_group, "weflow-legacy", item_id, 100,
              "2026-08-18T00:00:00+00:00"),
         )
         await self.db.commit()
@@ -1563,7 +1563,7 @@ class MergeSourceGroupTest(unittest.IsolatedAsyncioTestCase):
         await self.db.execute(
             "INSERT INTO items (id, category, title, source_quote, source_group, "
             "source, source_msg_id, msg_time, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (item_id, "活动通知", "标题", "原文", source_group, "weflow", item_id, 100,
+            (item_id, "活动通知", "标题", "原文", source_group, "weflow-legacy", item_id, 100,
              "2026-08-18T00:00:00+00:00"),
         )
         await self.db.commit()
@@ -1714,7 +1714,7 @@ class _InMemoryDbTest(unittest.IsolatedAsyncioTestCase):
             "source_quote": "quote",
             "source_group": "群A",
             "subject": "主体",
-            "source": "weflow",
+            "source": "weflow-legacy",
             "source_msg_id": source_msg_id,
             "session_id": "s1",
             "msg_time": 100,
@@ -1755,7 +1755,7 @@ class DeleteCategoryPurgeCascadeTest(_InMemoryDbTest):
             await bulk_insert_raw_messages(
                 [
                     {
-                        "source": "weflow",
+                        "source": "weflow-legacy",
                         "msg_id": "m1",
                         "session_id": "s1",
                         "group_name": "群A",
@@ -1766,7 +1766,7 @@ class DeleteCategoryPurgeCascadeTest(_InMemoryDbTest):
                     }
                 ]
             )
-            await mark_message_processed("weflow", "m1")
+            await mark_message_processed("weflow-legacy", "m1")
             await upsert_embeddings([(item_id, "embed-model", [0.1, 0.2])])
             row, deleted_ids = await delete_category(cat["id"], purge_items=True)
         self.assertIsNotNone(row)
@@ -1807,7 +1807,7 @@ class DeleteItemsRollbackTest(_InMemoryDbTest):
             await bulk_insert_raw_messages(
                 [
                     {
-                        "source": "weflow",
+                        "source": "weflow-legacy",
                         "msg_id": "m1",
                         "session_id": "s1",
                         "group_name": "群A",
@@ -1857,7 +1857,7 @@ class DeleteItemsRollbackTest(_InMemoryDbTest):
             await bulk_insert_raw_messages(
                 [
                     {
-                        "source": "weflow",
+                        "source": "weflow-legacy",
                         "msg_id": "m1",
                         "session_id": "s1",
                         "group_name": "群A",
@@ -1916,7 +1916,7 @@ class DeleteItemsRollbackTest(_InMemoryDbTest):
             await bulk_insert_raw_messages(
                 [
                     {
-                        "source": "weflow",
+                        "source": "weflow-legacy",
                         "msg_id": "m1",
                         "session_id": "s1",
                         "group_name": "群A",
@@ -1962,7 +1962,7 @@ class AreMessagesProcessedChunkTest(unittest.IsolatedAsyncioTestCase):
         with patch("briefdesk.db.get_db", new=AsyncMock()), patch(
             "briefdesk.db._fetchall", new=fake_fetchall
         ):
-            got = await are_messages_processed("weflow", ids)
+            got = await are_messages_processed("weflow-legacy", ids)
 
         self.assertEqual(got, set(ids))
         self.assertEqual(len(calls), 2)  # ceil(1100/900) = 2 次
@@ -1980,7 +1980,7 @@ class AreMessagesProcessedChunkTest(unittest.IsolatedAsyncioTestCase):
         with patch("briefdesk.db.get_db", new=AsyncMock()), patch(
             "briefdesk.db._fetchall", new=fake_fetchall
         ):
-            got = await are_messages_processed("weflow", ids)
+            got = await are_messages_processed("weflow-legacy", ids)
 
         self.assertEqual(got, {"a", "b"})
         self.assertEqual(len(calls), 1)
@@ -1992,8 +1992,8 @@ class AreMessagesProcessedLargeSetTest(_InMemoryDbTest):
     async def test_1100_processed_ids_all_found(self):
         with patch("briefdesk.db.get_db", new=AsyncMock(return_value=self.db)):
             for i in range(1100):
-                await mark_message_processed("weflow", f"m{i}")
-            got = await are_messages_processed("weflow", [f"m{i}" for i in range(1100)])
+                await mark_message_processed("weflow-legacy", f"m{i}")
+            got = await are_messages_processed("weflow-legacy", [f"m{i}" for i in range(1100)])
         self.assertEqual(len(got), 1100)
 
 

@@ -1,14 +1,14 @@
 """消息源健壮性修复测试（审查报告 P1/P2/P3 项）。
 
 覆盖：
-- qqflow fetch_sessions 大 limit（会话发现截断坑，对齐 weflow 同接口）
+- qqflow fetch_sessions 大 limit（会话发现截断坑，对齐 weflow-legacy 同接口）
 - 两源 SSE 读超时（config 字段 + 客户端 Timeout 构造）
 - qqflow ensure_ready 被拒态不记忆化（下轮重试引导注册）
 - 两源回查链路 _LOOKUP_LIMIT=200 且显式 retry_on_empty=False
-- weflow SSE (event, rawid) FIFO 去重缓存
+- weflow-legacy SSE (event, rawid) FIFO 去重缓存
 - 两源 stop()/aclose() 冲刷批缓冲并等待 in-flight 批任务收尾
 - qqflow sync/ping 心跳不计入消息统计
-- qqflow SSE 地址 URL.join 防拼接坏、weflow 错误体安全解码
+- qqflow SSE 地址 URL.join 防拼接坏、weflow-legacy 错误体安全解码
 
 全部用内存构造（mock 方法/假回调），不触碰网络与文件系统。
 """
@@ -24,13 +24,13 @@ from briefdesk.config import config
 from briefdesk.plugins.qqflow.client import QqFlowClient
 from briefdesk.plugins.qqflow.config import QqFlowSettings
 from briefdesk.plugins.qqflow.sse import QqFlowSseClient
-from briefdesk.plugins.weflow.client import WeFlowClient
-from briefdesk.plugins.weflow.config import WeFlowSettings
-from briefdesk.plugins.weflow.sse import WeFlowSseClient
+from briefdesk.plugins.weflow_legacy.client import WeFlowLegacyClient
+from briefdesk.plugins.weflow_legacy.config import WeFlowLegacySettings
+from briefdesk.plugins.weflow_legacy.sse import WeFlowLegacySseClient
 
 
 def _wf_event(rawid: str = "r1", content: str = "今天下午三点开会讨论") -> dict:
-    """构造可通过 weflow pre_filter 的 SSE 事件（非图片、内容 >= 5 字）。"""
+    """构造可通过 weflow-legacy pre_filter 的 SSE 事件（非图片、内容 >= 5 字）。"""
     return {
         "event": "message.new",
         "sessionType": "group",
@@ -84,20 +84,20 @@ class SseReadTimeoutTest(unittest.TestCase):
 
     def test_weflow_config_default(self):
         with patch.dict(os.environ, {}, clear=False):
-            os.environ.pop("WEFLOW_SSE_READ_TIMEOUT_MS", None)
+            os.environ.pop("WEFLOW_LEGACY_SSE_READ_TIMEOUT_MS", None)
             os.environ.pop("QQFLOW_SSE_READ_TIMEOUT_MS", None)
-            settings = WeFlowSettings(_env_file=None)
+            settings = WeFlowLegacySettings(_env_file=None)
         self.assertEqual(settings.sse_read_timeout_ms, 300000)
 
     def test_qqflow_config_default(self):
         with patch.dict(os.environ, {}, clear=False):
-            os.environ.pop("WEFLOW_SSE_READ_TIMEOUT_MS", None)
+            os.environ.pop("WEFLOW_LEGACY_SSE_READ_TIMEOUT_MS", None)
             os.environ.pop("QQFLOW_SSE_READ_TIMEOUT_MS", None)
             settings = QqFlowSettings(_env_file=None)
         self.assertEqual(settings.sse_read_timeout_ms, 60000)
 
     def test_weflow_client_builds_timeout_with_read(self):
-        client = WeFlowClient(
+        client = WeFlowLegacyClient(
             "http://127.0.0.1:5031", "tok", sse_read_timeout_ms=300000
         )
         t = client.sse_timeout()
@@ -107,7 +107,7 @@ class SseReadTimeoutTest(unittest.TestCase):
         self.assertIsNone(t.pool)
 
     def test_weflow_client_explicit_override(self):
-        client = WeFlowClient("http://127.0.0.1:5031", "tok", sse_read_timeout_ms=1500)
+        client = WeFlowLegacyClient("http://127.0.0.1:5031", "tok", sse_read_timeout_ms=1500)
         self.assertEqual(client.sse_timeout().read, 1.5)
 
     def test_qqflow_client_builds_timeout_with_read(self):
@@ -163,7 +163,7 @@ class LookupLimitTest(unittest.IsolatedAsyncioTestCase):
     """【5·P2】回查链路 limit 提升为 _LOOKUP_LIMIT=200 且显式关闭空结果重试。"""
 
     async def test_weflow_lookup_uses_limit_and_no_retry(self):
-        client = WeFlowClient("http://127.0.0.1:5031", "tok")
+        client = WeFlowLegacyClient("http://127.0.0.1:5031", "tok")
         captured: dict = {}
 
         async def fake_fetch(talker, start_ts, limit=500, offset=0, media=False,
@@ -193,7 +193,7 @@ class LookupLimitTest(unittest.IsolatedAsyncioTestCase):
 
 
 class WeflowSseDedupTest(unittest.IsolatedAsyncioTestCase):
-    """【6·P2】weflow 监听器按 (event, rawid) 去重：同一事件重投只消费一次。"""
+    """【6·P2】weflow-legacy 监听器按 (event, rawid) 去重：同一事件重投只消费一次。"""
 
     async def test_duplicate_event_consumed_once(self):
         received: list = []
@@ -201,9 +201,9 @@ class WeflowSseDedupTest(unittest.IsolatedAsyncioTestCase):
         async def on_batch(batch):
             received.extend(batch)
 
-        listener = WeFlowSseClient(
-            WeFlowClient("http://127.0.0.1:5031", "tok"), on_batch,
-            settings=WeFlowSettings(),
+        listener = WeFlowLegacySseClient(
+            WeFlowLegacyClient("http://127.0.0.1:5031", "tok"), on_batch,
+            settings=WeFlowLegacySettings(),
         )
         ev = _wf_event()
         await listener._handle_event(ev)
@@ -218,9 +218,9 @@ class WeflowSseDedupTest(unittest.IsolatedAsyncioTestCase):
         async def on_batch(batch):
             received.extend(batch)
 
-        listener = WeFlowSseClient(
-            WeFlowClient("http://127.0.0.1:5031", "tok"), on_batch,
-            settings=WeFlowSettings(),
+        listener = WeFlowLegacySseClient(
+            WeFlowLegacyClient("http://127.0.0.1:5031", "tok"), on_batch,
+            settings=WeFlowLegacySettings(),
         )
         await listener._handle_event(_wf_event(rawid="a"))
         await listener._handle_event(_wf_event(rawid="b"))
@@ -237,8 +237,8 @@ class StopDrainsBufferTest(unittest.IsolatedAsyncioTestCase):
         async def on_batch(batch):
             received.extend(batch)
 
-        client = WeFlowClient("http://127.0.0.1:5031", "tok")
-        listener = WeFlowSseClient(client, on_batch, settings=WeFlowSettings())
+        client = WeFlowLegacyClient("http://127.0.0.1:5031", "tok")
+        listener = WeFlowLegacySseClient(client, on_batch, settings=WeFlowLegacySettings())
         with patch.object(config, "realtime_batch_max_count", 5):
             await listener._handle_event(_wf_event())  # 攒在缓冲区不触发刷新
         self.assertEqual(len(received), 0)
@@ -254,8 +254,8 @@ class StopDrainsBufferTest(unittest.IsolatedAsyncioTestCase):
             await release.wait()
             received.extend(batch)
 
-        client = WeFlowClient("http://127.0.0.1:5031", "tok")
-        listener = WeFlowSseClient(client, slow_on_batch, settings=WeFlowSettings())
+        client = WeFlowLegacyClient("http://127.0.0.1:5031", "tok")
+        listener = WeFlowLegacySseClient(client, slow_on_batch, settings=WeFlowLegacySettings())
         await listener._handle_event(_wf_event())  # 默认 max_count=1 → in-flight
         self.assertEqual(len(received), 0)
         listener.stop()
@@ -322,7 +322,7 @@ class WeflowErrorBodySafeDecodeTest(unittest.IsolatedAsyncioTestCase):
         def handler(request: httpx.Request) -> httpx.Response:
             return httpx.Response(500, content=b"\xff\xfe\xff binary")
 
-        client = WeFlowClient("http://127.0.0.1:5031", "tok")
+        client = WeFlowLegacyClient("http://127.0.0.1:5031", "tok")
         client._client = httpx.AsyncClient(
             base_url="http://127.0.0.1:5031", transport=httpx.MockTransport(handler)
         )
@@ -353,10 +353,10 @@ class RuntimeCloseOrderingTest(unittest.IsolatedAsyncioTestCase):
     """【增量·P3】runtime.close()：stop → await listener.aclose → client.close。"""
 
     async def test_weflow_close_ordering_and_idempotent(self):
-        from briefdesk.plugins.weflow.runtime import WeFlowSource
+        from briefdesk.plugins.weflow_legacy.runtime import WeFlowLegacySource
 
         events: list = []
-        source = WeFlowSource(base_url="http://127.0.0.1:5031", api_token="tok")
+        source = WeFlowLegacySource(base_url="http://127.0.0.1:5031", api_token="tok")
         closed = {"done": False}
 
         async def recording_close():  # 镜像真实 client.close 的幂等守卫
@@ -396,14 +396,14 @@ class RuntimeCloseOrderingTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_weflow_close_flushes_pending_batch_before_returning(self):
         """真实监听器接线：close 返回前必须完成缓冲消息冲刷（先于 client.close）。"""
-        from briefdesk.plugins.weflow.runtime import WeFlowSource
+        from briefdesk.plugins.weflow_legacy.runtime import WeFlowLegacySource
 
         received: list = []
 
         async def on_batch(batch):
             received.extend(batch)
 
-        source = WeFlowSource(base_url="http://127.0.0.1:5031", api_token="tok")
+        source = WeFlowLegacySource(base_url="http://127.0.0.1:5031", api_token="tok")
         source.start(on_batch)
         with patch.object(config, "realtime_batch_max_count", 5):
             await source.listener._handle_event(_wf_event())  # 攒在缓冲区
@@ -441,13 +441,13 @@ class SseRawidGuardTest(unittest.TestCase):
     去重键 ("message.new","") 碰撞与回填间反复投递，必须在 pre_filter 拦下。"""
 
     def test_weflow_message_new_without_rawid_dropped(self):
-        from briefdesk.plugins.weflow.normalize import pre_filter_sse
+        from briefdesk.plugins.weflow_legacy.normalize import pre_filter_sse
 
         ev = {"event": "message.new", "content": "正常内容长度超过五字"}
         self.assertFalse(pre_filter_sse(ev))
 
     def test_weflow_with_rawid_still_passes_shape(self):
-        from briefdesk.plugins.weflow.normalize import pre_filter_sse
+        from briefdesk.plugins.weflow_legacy.normalize import pre_filter_sse
 
         ev = {"event": "message.new", "rawid": "r1", "content": "正常内容长度超过五字"}
         self.assertTrue(pre_filter_sse(ev))

@@ -126,12 +126,12 @@ def _pipeline_msg(mid, content="c", session_id="s", ts=1, is_self=False):
         session_id=session_id,
         group_name="g",
         timestamp=ts,
-        source="weflow",
+        source="weflow-legacy",
         is_self=is_self,
     )
 
 
-def _pipeline_client(name="weflow"):
+def _pipeline_client(name="weflow-legacy"):
     c = Mock()
     c.name = name
     c.download_media = AsyncMock(return_value=b"x")
@@ -148,7 +148,7 @@ class BuildItemInputTest(unittest.TestCase):
             session_id="s1",
             group_name="group",
             timestamp=123456,
-            source="weflow",
+            source="weflow-legacy",
             image_urls=["a.jpg"],
         )
 
@@ -235,7 +235,7 @@ class OcrEnrichTest(unittest.IsolatedAsyncioTestCase):
             session_id="s1",
             group_name="group",
             timestamp=123456,
-            source="weflow",
+            source="weflow-legacy",
             image_urls=["a.jpg"],
         )
 
@@ -951,7 +951,7 @@ class ConversationMergeStageTest(unittest.IsolatedAsyncioTestCase):
             session_id="s1",
             group_name="g",
             timestamp=ts,
-            source="weflow",
+            source="weflow-legacy",
         )
 
     async def _seed_cand(
@@ -972,14 +972,14 @@ class ConversationMergeStageTest(unittest.IsolatedAsyncioTestCase):
             "INSERT INTO items (id, category, title, key_info, source_quote, "
             "source_group, subject, source, source_msg_id, session_id, msg_time, "
             "is_verified, remind_at, end, start, extra_times, created_at) "
-            "VALUES (?, ?, ?, ?, ?, 'g', NULL, 'weflow', ?, 's1', ?, 0, ?, ?, ?, ?, '2026-08-01')",
+            "VALUES (?, ?, ?, ?, ?, 'g', NULL, 'weflow-legacy', ?, 's1', ?, 0, ?, ?, ?, ?, '2026-08-01')",
             (id, category, title, key_info, quote or "", id, ts, remind_at, end, start, extra_times or ""),
         )
         # 候选卡的原文行（验证合并删除时保留：片段仍属对话上下文）
         await self.db.execute(
             "INSERT INTO raw_messages (source, msg_id, session_id, group_name, "
             "sender_id, sender_name, content, timestamp) "
-            "VALUES ('weflow', ?, 's1', 'g', 'u', 'A', ?, ?)",
+            "VALUES ('weflow-legacy', ?, 's1', 'g', 'u', 'A', ?, ?)",
             (id, quote or "", ts),
         )
         await self.db.commit()
@@ -991,7 +991,7 @@ class ConversationMergeStageTest(unittest.IsolatedAsyncioTestCase):
             "INSERT INTO items (id, category, title, key_info, "
             "source_quote, source_group, subject, source, source_msg_id, session_id, "
             "msg_time, is_verified, created_at) "
-            "VALUES (?, ?, ?, ?, ?, 'g', NULL, 'weflow', ?, 's1', ?, 0, '2026-08-01')",
+            "VALUES (?, ?, ?, ?, ?, 'g', NULL, 'weflow-legacy', ?, 's1', ?, 0, '2026-08-01')",
             (
                 item_id,
                 result.category,

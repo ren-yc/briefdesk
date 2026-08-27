@@ -43,7 +43,7 @@ class SecretScanTest(unittest.TestCase):
         self.assertIn("环境变量", hits[0][1])
 
     def test_empty_env_assignment_is_template_not_hit(self) -> None:
-        diff = "+AI_API_KEY=\n+WEFLOW_API_TOKEN=\n"
+        diff = "+AI_API_KEY=\n+WEFLOW_LEGACY_API_TOKEN=\n"
         self.assertEqual(scan_text(diff), [])
 
     def test_plain_code_not_hit(self) -> None:

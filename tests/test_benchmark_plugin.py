@@ -282,11 +282,11 @@ class RecorderTest(unittest.IsolatedAsyncioTestCase):
     def _dedup_check(self, same: bool) -> DedupCheck:
         cand = DedupCandidate(
             item_id="i1", title="标题A", source_quote="内容A",
-            source="weflow", image_urls=["a.jpg"],
+            source="weflow-legacy", image_urls=["a.jpg"],
         )
         msg = InternalMessage(
             msg_id="m2", content="内容B", sender_name="张三", sender_id="u2",
-            session_id="s1", group_name="群1", timestamp=1000, source="weflow",
+            session_id="s1", group_name="群1", timestamp=1000, source="weflow-legacy",
         )
         return DedupCheck(msg=msg, title="标题B", is_duplicate=same, candidate=cand)
 
@@ -294,12 +294,12 @@ class RecorderTest(unittest.IsolatedAsyncioTestCase):
         head = MergeCard(
             title="团购", desc="团购 价格 运费", key_info="价格", subject="主体X",
             sender_name="张三", session_id="s1", group_name="群1", msg_time=1000,
-            source="weflow", msg_id="m1", source_quote="团购",
+            source="weflow-legacy", msg_id="m1", source_quote="团购",
         )
         tail = MergeCard(
             title="补充", desc="补充 45元", key_info="45元", subject="主体X",
             sender_name="张三", session_id="s1", group_name="群1", msg_time=1200,
-            source="weflow", msg_id="m2", source_quote="补充",
+            source="weflow-legacy", msg_id="m2", source_quote="补充",
         )
         check = MergeCheck(same=same, head=head, tail=tail)
         if same:
@@ -337,7 +337,7 @@ class RecorderTest(unittest.IsolatedAsyncioTestCase):
     def test_dedup_no_candidate_skipped(self):
         msg = InternalMessage(
             msg_id="m", content="c", sender_name="A", sender_id="u",
-            session_id="s", group_name="g", timestamp=1, source="weflow",
+            session_id="s", group_name="g", timestamp=1, source="weflow-legacy",
         )
         batch = BatchContext(messages=[], client=Mock())
         batch.dedup_checks = [
@@ -420,7 +420,7 @@ class RecordEndpointsTest(unittest.IsolatedAsyncioTestCase):
         cand = DedupCandidate(item_id="i1", title="标题A", source_quote="内容A")
         msg = InternalMessage(
             msg_id="m2", content="内容B", sender_name="张三", sender_id="u2",
-            session_id="s1", group_name="群1", timestamp=1000, source="weflow",
+            session_id="s1", group_name="群1", timestamp=1000, source="weflow-legacy",
         )
         batch = BatchContext(messages=[], client=Mock())
         batch.dedup_checks = [

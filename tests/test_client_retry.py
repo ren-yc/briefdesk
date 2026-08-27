@@ -5,7 +5,7 @@
   不重试 / ConnectTimeout（ConnectError 子类）同样重试；
 - qqflow：_get 链路（fetch_contacts）与 fetch_health 接入重试；503 就绪
   门控语义保持不变（连接重试只覆盖 TCP 失败，503 不重试）；
-- weflow：_get 链路（fetch_contacts）接入重试。
+- weflow-legacy：_get 链路（fetch_contacts）接入重试。
 """
 
 import json
@@ -16,7 +16,7 @@ from unittest.mock import AsyncMock
 import httpx
 
 from briefdesk.plugins.qqflow.client import QqFlowClient, QqFlowNotReadyError
-from briefdesk.plugins.weflow.client import WeFlowClient
+from briefdesk.plugins.weflow_legacy.client import WeFlowLegacyClient
 from briefdesk.sources_base import with_connect_retry
 
 
@@ -135,9 +135,9 @@ class QqFlowClientRetryTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(fake.get.call_count, 3)
 
 
-class WeFlowClientRetryTest(unittest.IsolatedAsyncioTestCase):
+class WeFlowLegacyClientRetryTest(unittest.IsolatedAsyncioTestCase):
     async def test_fetch_contacts_retries_connect_errors(self):
-        client = WeFlowClient(base_url="http://127.0.0.1:5031", api_token="t")
+        client = WeFlowLegacyClient(base_url="http://127.0.0.1:5031", api_token="t")
         resp = _FakeResp(
             200, {"contacts": [{"username": "wx_1", "nickname": "B"}]}
         )

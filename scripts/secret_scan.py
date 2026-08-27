@@ -17,7 +17,7 @@ import sys
 _KNOWN_SECRET_ENV = (
     "AI_API_KEY",
     "EMBED_API_KEY",
-    "WEFLOW_API_TOKEN",
+    "WEFLOW_LEGACY_API_TOKEN",
     "QQFLOW_API_TOKEN",
     "QQFLOW_KEY",
 )

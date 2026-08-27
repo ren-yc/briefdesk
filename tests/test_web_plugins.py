@@ -26,12 +26,12 @@ class PluginsApiTest(unittest.TestCase):
 
     def test_callback_result_passthrough(self):
         def fake():
-            return [{"name": "weflow", "version": "1.0.0", "status": "loaded", "reason": ""}]
+            return [{"name": "weflow-legacy", "version": "1.0.0", "status": "loaded", "reason": ""}]
         srv.set_plugins_info_callback(fake)
         try:
             resp = self.client.get("/api/plugins")
             self.assertEqual(resp.status_code, 200)
-            self.assertEqual(resp.json()["plugins"][0]["name"], "weflow")
+            self.assertEqual(resp.json()["plugins"][0]["name"], "weflow-legacy")
         finally:
             srv.set_plugins_info_callback(None)
 

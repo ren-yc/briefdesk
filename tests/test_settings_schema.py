@@ -10,7 +10,7 @@ from pydantic_settings import BaseSettings
 
 from briefdesk.plugins.qqflow.plugin import QqFlowPlugin
 from briefdesk.plugins.rag.plugin import RagPlugin
-from briefdesk.plugins.weflow.plugin import WeFlowPlugin
+from briefdesk.plugins.weflow_legacy.plugin import WeFlowLegacyPlugin
 from briefdesk.settings_schema import build_settings_schema, normalize_setting
 
 
@@ -121,11 +121,11 @@ class SettingsSchemaTest(unittest.TestCase):
             normalize_setting(ratio, "0.35")
 
     def test_builtin_plugin_schemas_expose_their_settings(self) -> None:
-        weflow = {item["key"]: item for item in WeFlowPlugin().settings_schema()}
+        weflow = {item["key"]: item for item in WeFlowLegacyPlugin().settings_schema()}
         qqflow = {item["key"]: item for item in QqFlowPlugin().settings_schema()}
         rag = {item["key"]: item for item in RagPlugin().settings_schema()}
-        self.assertIn("WEFLOW_API_BASE", weflow)
-        self.assertTrue(weflow["WEFLOW_API_TOKEN"]["secret"])
+        self.assertIn("WEFLOW_LEGACY_API_BASE", weflow)
+        self.assertTrue(weflow["WEFLOW_LEGACY_API_TOKEN"]["secret"])
         self.assertIn("QQFLOW_QQ", qqflow)
         self.assertTrue(qqflow["QQFLOW_KEY"]["secret"])
         self.assertEqual(rag["RAG_GROUP_ONLY"]["type"], "boolean")

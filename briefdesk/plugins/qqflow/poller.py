@@ -1,4 +1,4 @@
-"""REST 轮询器 — 通过 QqFlowClient 拉取历史消息，参照 weflow poller.py。
+"""REST 轮询器 — 通过 QqFlowClient 拉取历史消息，参照 weflow-legacy poller.py。
 
 只产出源无关数据（PollResult），不触碰 DB；写库由应用层（poll_cycle）完成。
 

@@ -1,4 +1,4 @@
-"""SSE 客户端 — 通过 QqFlowClient 实时监听消息流（参照 weflow sse.py）。
+"""SSE 客户端 — 通过 QqFlowClient 实时监听消息流（参照 weflow-legacy sse.py）。
 
 只负责监听与攒批，不触碰 DB：启用会话过滤、已处理过滤与 raw 落库
 均由应用层（pipeline 入口）统一完成。

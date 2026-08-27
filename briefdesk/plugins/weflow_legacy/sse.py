@@ -1,4 +1,4 @@
-"""SSE 客户端 — 通过 WeFlowClient 实时监听消息流。
+"""SSE 客户端 — 通过 WeFlowLegacyClient 实时监听消息流。
 
 只负责监听与攒批，不触碰 DB：启用会话过滤、已处理过滤与 raw 落库
 均由应用层（pipeline 入口）统一完成。
@@ -10,9 +10,12 @@ import math
 import random
 from collections import deque
 
-from briefdesk.plugins.weflow.client import WeFlowClient, WeFlowEvent
-from briefdesk.plugins.weflow.config import WeFlowSettings
-from briefdesk.plugins.weflow.normalize import normalize_sse, pre_filter_sse
+from briefdesk.plugins.weflow_legacy.client import (
+    WeFlowLegacyClient,
+    WeFlowLegacyEvent,
+)
+from briefdesk.plugins.weflow_legacy.config import WeFlowLegacySettings
+from briefdesk.plugins.weflow_legacy.normalize import normalize_sse, pre_filter_sse
 from briefdesk.sources_base import (
     BatchBuffer,
     BatchHandler,
@@ -23,7 +26,7 @@ from briefdesk.sources_base import (
 logger = logging.getLogger(__name__)
 
 # 近期事件去重缓存上限（按 event+rawid，FIFO）：防断线重连/上游重复投递导致
-# 同一事件重复进管道（weflow-api.md 明确建议接收端按 event+rawid 去重；
+# 同一事件重复进管道（weflow-legacy-api.md 明确建议接收端按 event+rawid 去重；
 # 与 qqflow 监听器一致）。被去重挡下的消息未标记 processed，回填窗口内可恢复
 _SEEN_LIMIT = 1024
 
@@ -31,15 +34,17 @@ _SEEN_LIMIT = 1024
 _STATS_INTERVAL_SECONDS = 60
 
 
-class WeFlowSseClient(DrainableListenerMixin, RealtimeListener[WeFlowClient]):
+class WeFlowLegacySseClient(
+    DrainableListenerMixin, RealtimeListener[WeFlowLegacyClient]
+):
     """SSE 实时消息监听器，自动重连。实现 RealtimeListener 契约。"""
 
     def __init__(
         self,
-        weflow: WeFlowClient,
+        weflow: WeFlowLegacyClient,
         on_batch: BatchHandler,
         *,
-        settings: WeFlowSettings,
+        settings: WeFlowLegacySettings,
     ):
         self._weflow = weflow
         self._on_batch = on_batch
@@ -138,7 +143,7 @@ class WeFlowSseClient(DrainableListenerMixin, RealtimeListener[WeFlowClient]):
             self._reconnect_attempt = 0
             await self._handle_event(event)
 
-    async def _handle_event(self, event: WeFlowEvent) -> None:
+    async def _handle_event(self, event: WeFlowLegacyEvent) -> None:
         self._stats_events += 1
         if not pre_filter_sse(event):
             self._stats_filtered += 1

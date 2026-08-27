@@ -1,6 +1,6 @@
 """日志脱敏守卫：uvicorn access log 的查询参数掩码不得输出令牌明文。
 
-weflow SSE 长连接按上游文档以 ?access_token= 携带令牌（与 Bearer 头同时
+weflow-legacy SSE 长连接按上游文档以 ?access_token= 携带令牌（与 Bearer 头同时
 携带），该参数会出现在 uvicorn access log 的请求行中；本模块验证
 redact_query_string 与 _BriefFormatter 的联动掩码行为。
 """

@@ -1908,7 +1908,7 @@ async def bulk_insert_raw_messages(messages: list[RawMsgInput]) -> None:
 
 _OCR_MARKER_LINE_RE = re.compile(r"^\[(?:OCR|图片 \d+ OCR 结果)\]$")
 
-# weflow 图片 raw 占位符为 [图片]，qqflow 为 [image]；两者都在上下文里
+# weflow-legacy 图片 raw 占位符为 [图片]，qqflow 为 [image]；两者都在上下文里
 # 回填 items.source_quote 的 OCR 正文，保持一致的展示行为。
 _IMAGE_PLACEHOLDER_RE = re.compile(r"^\[(?:图片|image)\]$")
 

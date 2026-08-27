@@ -401,7 +401,7 @@ class QqFlowClient(SourceClient):
 
         显式传大 limit：上游默认 limit=100 且按最后消息时间倒序
         （qqflow-server-api.md §4），不传参只会发现最近活跃的 100 个会话，
-        更早的会话将永远无法被发现/启用/轮询——与 weflow 同接口的修复对齐。
+        更早的会话将永远无法被发现/启用/轮询——与 weflow-legacy 同接口的修复对齐。
         """
         data: QqFlowSessionsResponse = await self._get(
             "/api/v1/sessions", params={"limit": 10000}
@@ -468,7 +468,7 @@ class QqFlowClient(SourceClient):
 
     def _push_url(self) -> str:
         """SSE 推送地址（RFC 3986 join）：base_url 误带路径/查询串时不会拼坏，
-        与 weflow client 及本类 _build_media_url 的拼接策略一致。"""
+        与 weflow-legacy client 及本类 _build_media_url 的拼接策略一致。"""
         return str(httpx.URL(self._base_url).join("/api/v1/push/messages"))
 
     async def stream_events(self) -> AsyncIterator[QqFlowEvent]:

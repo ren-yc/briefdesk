@@ -155,22 +155,22 @@ class KeyringPriorityChainTest(KeyringTestCase):
 
     def test_plugin_settings_read_keyring(self) -> None:
         from briefdesk.plugins.qqflow.config import QqFlowSettings
-        from briefdesk.plugins.weflow.config import WeFlowSettings
+        from briefdesk.plugins.weflow_legacy.config import WeFlowLegacySettings
 
-        self._seed("WEFLOW_API_TOKEN", "weflow-ring-token")
+        self._seed("WEFLOW_LEGACY_API_TOKEN", "weflow-ring-token")
         self._seed("QQFLOW_API_TOKEN", "qqflow-ring-token")
         self._seed("QQFLOW_KEY", "qqflow-ring-key")
-        weflow = WeFlowSettings()
+        weflow = WeFlowLegacySettings()
         qqflow = QqFlowSettings()
         self.assertEqual(weflow.api_token.get_secret_value(), "weflow-ring-token")
         self.assertEqual(qqflow.api_token.get_secret_value(), "qqflow-ring-token")
         self.assertEqual(qqflow.key.get_secret_value(), "qqflow-ring-key")
 
     def test_plugin_settings_env_wins_when_keyring_empty(self) -> None:
-        from briefdesk.plugins.weflow.config import WeFlowSettings
+        from briefdesk.plugins.weflow_legacy.config import WeFlowLegacySettings
 
-        with patch.dict(os.environ, {"WEFLOW_API_TOKEN": "env-token"}):
-            settings = WeFlowSettings()
+        with patch.dict(os.environ, {"WEFLOW_LEGACY_API_TOKEN": "env-token"}):
+            settings = WeFlowLegacySettings()
         self.assertEqual(settings.api_token.get_secret_value(), "env-token")
 
 

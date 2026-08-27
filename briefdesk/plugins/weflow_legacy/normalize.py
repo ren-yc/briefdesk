@@ -1,4 +1,4 @@
-"""消息规范化与预过滤 — weflow 版。
+"""消息规范化与预过滤 — weflow-legacy 版。
 
 - normalize_sse / normalize_rest 均产出源无关的 InternalMessage 列表
   （普通消息 1 条；公众号文章卡片按 mmreader 拆为多条，见 parse_appmsg_xml）
@@ -16,7 +16,11 @@ import re
 from typing import TypedDict
 
 from briefdesk.masking import clean_display_name
-from briefdesk.plugins.weflow.client import WeFlowClient, WeFlowEvent, WeFlowMessage
+from briefdesk.plugins.weflow_legacy.client import (
+    WeFlowLegacyClient,
+    WeFlowLegacyEvent,
+    WeFlowLegacyMessage,
+)
 from briefdesk.types import InternalMessage
 
 logger = logging.getLogger(__name__)
@@ -154,7 +158,7 @@ def _article_messages(
 
 
 async def normalize_sse(
-    event: WeFlowEvent, client: WeFlowClient | None = None
+    event: WeFlowLegacyEvent, client: WeFlowLegacyClient | None = None
 ) -> list[InternalMessage]:
     """SSE 事件 → InternalMessage 列表（普通消息 1 条，文章卡片拆条）。
 
@@ -238,7 +242,7 @@ _ATTACHMENT_RE = re.compile(
 )
 
 
-def pre_filter_sse(event: WeFlowEvent) -> bool:
+def pre_filter_sse(event: WeFlowLegacyEvent) -> bool:
     if event.get("event") == "message.revoke":
         logger.debug("丢弃 SSE rawid=%s: 撤回消息", event.get("rawid"))
         return False
@@ -270,7 +274,7 @@ def pre_filter_sse(event: WeFlowEvent) -> bool:
 
 
 def normalize_rest(
-    msg: WeFlowMessage,
+    msg: WeFlowLegacyMessage,
     session_id: str,
     group_name: str,
     contacts: dict[str, str] | None = None,
@@ -349,7 +353,7 @@ def normalize_rest(
 # ── Pre-Filter ──
 
 
-def pre_filter_rest(msg: WeFlowMessage) -> bool:
+def pre_filter_rest(msg: WeFlowLegacyMessage) -> bool:
     local_type = msg.get("localType")
     # 文章卡片（公众号推送/转发文章）放行，交给 normalize_rest 拆条
     if local_type == _APPMSG_LOCAL_TYPE:

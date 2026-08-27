@@ -1,4 +1,4 @@
-"""REST 轮询器 — 通过 WeFlowClient 拉取历史消息。
+"""REST 轮询器 — 通过 WeFlowLegacyClient 拉取历史消息。
 
 只产出源无关数据（PollResult），不触碰 DB；写库由应用层（poll_cycle）完成。
 
@@ -17,14 +17,14 @@ from datetime import UTC, datetime
 from briefdesk.config import config
 from briefdesk.logger import fmt_dur
 from briefdesk.masking import clean_display_name
-from briefdesk.plugins.weflow.client import (
+from briefdesk.plugins.weflow_legacy.client import (
     ChatLabSession,
-    WeFlowClient,
-    WeFlowMessage,
+    WeFlowLegacyClient,
+    WeFlowLegacyMessage,
     is_official_session,
     is_private_session,
 )
-from briefdesk.plugins.weflow.normalize import (
+from briefdesk.plugins.weflow_legacy.normalize import (
     _APPMSG_LOCAL_TYPE,
     _is_appmsg_content,
     normalize_rest,
@@ -44,7 +44,7 @@ _MAX_PAGES = 2000
 
 
 async def poll(
-    client: WeFlowClient,
+    client: WeFlowLegacyClient,
     enabled_sessions: list[SessionInfo],
     is_processed: ProcessedQuery,
     *,
@@ -53,7 +53,7 @@ async def poll(
     """执行一次完整的 REST 轮询。
 
         Args:
-            client: WeFlowClient 实例
+            client: WeFlowLegacyClient 实例
             enabled_sessions: 应用层传入的已启用会话列表（源不访问 DB）
             is_processed: 应用层提供的已处理查询，用于剔除已处理消息
             window_start_by_session: 应用层按会话计算的增量窗口下界
@@ -71,7 +71,7 @@ async def poll(
 
     if pull_all:
         logger.warning(
-            "[weflow] BACKFILL_HOURS=-1：将拉取全部历史消息，每次同步都会全量扫描，"
+            "[weflow-legacy] BACKFILL_HOURS=-1：将拉取全部历史消息，每次同步都会全量扫描，"
             "消息量大时非常耗时且 AI 调用量激增；建议全量拉取完成后改回正常小时数"
         )
     backfill_count = 0
@@ -85,7 +85,7 @@ async def poll(
         f"按会话窗口（{backfill_count} 会话回填）" if backfill_count else "按会话窗口"
     )
     logger.info(
-        f"[weflow] poll 开始: 窗口 {window_desc}, {len(enabled_sessions)} 个启用会话"
+        f"[weflow-legacy] poll 开始: 窗口 {window_desc}, {len(enabled_sessions)} 个启用会话"
     )
 
     # 获取联系人（只产出数据，写库由应用层完成）
@@ -94,7 +94,7 @@ async def poll(
     try:
         contacts: dict[str, str] = await client.fetch_contacts()
     except Exception as e:
-        logger.error(f"[weflow] 拉取联系人失败: {e}")
+        logger.error(f"[weflow-legacy] 拉取联系人失败: {e}")
         raise
 
     # 获取会话列表（发现会话的唯一途径，写库由应用层完成）。
@@ -188,7 +188,7 @@ async def poll(
             # 统一翻页：所有模式都按 offset 递增直至 hasMore=False / 空页，
             # 单会话不再有"每轮最多 500 条"的硬顶；_MAX_PAGES 仅为防异常
             # 状态下的无界循环守卫（全量/异常时打 WARNING）。
-            messages: list[WeFlowMessage] = []
+            messages: list[WeFlowLegacyMessage] = []
             offset = 0
             for page in range(_MAX_PAGES):
                 resp = await client.fetch_messages(
@@ -228,7 +228,7 @@ async def poll(
                         msg_ids.extend(f"{m['serverId']}_{i}" for i in range(1, n + 1))
             processed_set = await is_processed(msg_ids)
 
-            candidates: list[WeFlowMessage] = []
+            candidates: list[WeFlowLegacyMessage] = []
             seen_server_ids: set[str] = set()  # 翻页期间上游插入 → offset 漂移产生跨页重复
             session_new = 0
             session_skipped = 0
@@ -361,12 +361,12 @@ async def poll(
 
     if config.ignore_self and total_raw and not saw_is_send_field:
         logger.warning(
-            "[weflow] IGNORE_SELF=true 但本轮消息均无 isSend 字段：当前 WeFlow "
+            "[weflow-legacy] IGNORE_SELF=true 但本轮消息均无 isSend 字段：当前 WeFlow "
             "版本可能不提供该字段，自己发送的消息过滤未生效"
         )
 
     summary = (
-        f"[weflow] poll 完成: {len(result.messages)} 条新消息 "
+        f"[weflow-legacy] poll 完成: {len(result.messages)} 条新消息 "
         f"(原始 {total_raw}, 预过滤 {total_skipped}, "
         f"{len(enabled_sessions)} 会话, {fmt_dur(time_module.perf_counter() - poll_start)})"
     )

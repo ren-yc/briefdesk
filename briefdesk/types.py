@@ -62,7 +62,7 @@ class SessionInfo:
     session_id: str
     name: str
     is_group: bool
-    is_official: bool = False  # 公众号会话（与群聊/私聊并列的第三类，仅 weflow 产出）
+    is_official: bool = False  # 公众号会话（与群聊/私聊并列的第三类，仅 weflow-legacy 产出）
     last_active_at: int = 0  # 会话内最后一条消息时间（秒级 epoch；0 = 未知）
 
     def __post_init__(self) -> None:

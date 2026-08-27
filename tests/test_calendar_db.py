@@ -42,7 +42,7 @@ async def _insert_item(
             "t",
             "quote",
             "测试群",
-            "weflow",
+            "weflow-legacy",
             item_id,
             1893456000,
             end,

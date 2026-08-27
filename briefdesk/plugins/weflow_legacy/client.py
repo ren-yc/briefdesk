@@ -1,7 +1,7 @@
 """WeFlow HTTP API 客户端 — 封装所有与 WeFlow 的通信细节。
 
 用法:
-    client = WeFlowClient(base_url="http://127.0.0.1:5031", api_token="xxx")
+    client = WeFlowLegacyClient(base_url="http://127.0.0.1:5031", api_token="xxx")
     contacts = await client.fetch_contacts()
     sessions = await client.fetch_sessions()
     resp = await client.fetch_messages(talker="...", start_ts=1750000000, limit=500)
@@ -22,7 +22,7 @@ import httpx
 
 from briefdesk.logger import fmt_dur
 from briefdesk.masking import clean_display_name
-from briefdesk.plugins.weflow.config import WeFlowSettings
+from briefdesk.plugins.weflow_legacy.config import WeFlowLegacySettings
 from briefdesk.sources_base import (
     ConnectionStatus,
     MediaError,
@@ -34,7 +34,7 @@ from briefdesk.sources_base import (
 # ── WeFlow API 数据类型 ──
 
 
-class WeFlowContact(TypedDict):
+class WeFlowLegacyContact(TypedDict):
     """联系人（/api/v1/contacts）。"""
 
     username: str
@@ -46,7 +46,7 @@ class WeFlowContact(TypedDict):
     type: str
 
 
-class WeFlowGroupMember(TypedDict):
+class WeFlowLegacyGroupMember(TypedDict):
     """群成员（/api/v1/group-members）。"""
 
     wxid: str
@@ -97,7 +97,7 @@ def is_official_session(session: ChatLabSession) -> bool:
     return session_kind(session) == "official"
 
 
-class WeFlowMessage(TypedDict):
+class WeFlowLegacyMessage(TypedDict):
     """REST API 返回的消息。"""
 
     serverId: str
@@ -113,7 +113,7 @@ class WeFlowMessage(TypedDict):
     mediaLocalPath: str
 
 
-class WeFlowEvent(TypedDict):
+class WeFlowLegacyEvent(TypedDict):
     """SSE 推送的原始事件。"""
 
     event: Literal["message.new", "message.revoke"]
@@ -126,16 +126,16 @@ class WeFlowEvent(TypedDict):
     sessionType: Literal["group", "private"]
 
 
-class WeFlowContactsResponse(TypedDict):
-    contacts: list[WeFlowContact]
+class WeFlowLegacyContactsResponse(TypedDict):
+    contacts: list[WeFlowLegacyContact]
 
 
-class WeFlowGroupMembersResponse(TypedDict):
-    members: list[WeFlowGroupMember]
+class WeFlowLegacyGroupMembersResponse(TypedDict):
+    members: list[WeFlowLegacyGroupMember]
 
 
-class WeFlowMessagesResponse(TypedDict):
-    messages: list[WeFlowMessage]
+class WeFlowLegacyMessagesResponse(TypedDict):
+    messages: list[WeFlowLegacyMessage]
     hasMore: bool
 
 
@@ -155,10 +155,10 @@ _MAX_MEDIA_BYTES = 20 * 1024 * 1024
 _LOOKUP_LIMIT = 200
 
 
-class WeFlowClient(SourceClient):
+class WeFlowLegacyClient(SourceClient):
     """封装所有 WeFlow API HTTP 通信。"""
 
-    name = "weflow"  # 源标识，SourceClient 契约成员
+    name = "weflow-legacy"  # 源标识，SourceClient 契约成员
     connection_status: ConnectionStatus = "offline"
 
     def __init__(
@@ -170,11 +170,11 @@ class WeFlowClient(SourceClient):
     ) -> None:
         self._base_url = base_url.rstrip("/")
         self._api_token = api_token
-        # SSE 读超时（毫秒）：缺省读 WEFLOW_SSE_READ_TIMEOUT_MS。
+        # SSE 读超时（毫秒）：缺省读 WEFLOW_LEGACY_SSE_READ_TIMEOUT_MS。
         # 半开连接（对端假死/断网无 FIN）下若无读超时，stream_events 的
         # aiter_lines 会永久阻塞，重连循环永远得不到控制权（监听静默死亡）
         if sse_read_timeout_ms is None:
-            sse_read_timeout_ms = WeFlowSettings().sse_read_timeout_ms
+            sse_read_timeout_ms = WeFlowLegacySettings().sse_read_timeout_ms
         self._sse_read_timeout_s = sse_read_timeout_ms / 1000
         self._client: httpx.AsyncClient | None = None
         self.connection_status = "offline"
@@ -266,7 +266,7 @@ class WeFlowClient(SourceClient):
 
     async def _lookup_message(
         self, talker: str, rawid: str, ts: int, media: bool
-    ) -> WeFlowMessage | None:
+    ) -> WeFlowLegacyMessage | None:
         """按 serverId 回查 REST 获取消息原始对象。
 
         用 timestamp 缩小查询范围（start=ts-120 起，客户端再按 ±120s 过滤），
@@ -326,7 +326,7 @@ class WeFlowClient(SourceClient):
         )
         return None
 
-    async def fetch_message_raw(self, talker: str, rawid: str, ts: int) -> WeFlowMessage | None:
+    async def fetch_message_raw(self, talker: str, rawid: str, ts: int) -> WeFlowLegacyMessage | None:
         """按 rawid 回查 REST（media=False）获取消息原始内容。
 
         回填以 media=True 拉取时，WeFlow 会把文章卡片 XML 渲染成占位符
@@ -415,7 +415,7 @@ class WeFlowClient(SourceClient):
         脏数据），全部净化后为空才回退 username。候选选择发生在构造前，必须
         在此显式净化（types.py 的构造净化不参与候选选择）。
         """
-        data: WeFlowContactsResponse = await self._get("/api/v1/contacts")
+        data: WeFlowLegacyContactsResponse = await self._get("/api/v1/contacts")
         contacts: dict[str, str] = {}
         for c in data["contacts"]:
             contacts[c["username"]] = (
@@ -435,7 +435,7 @@ class WeFlowClient(SourceClient):
         群不存在（404）返回空映射（群可能已解散，降级处理）；其他错误
         照常抛出，由 poller 中止本轮回填，避免 u_/wxid 名永久入库。
         """
-        data: WeFlowGroupMembersResponse | None = await self._get(
+        data: WeFlowLegacyGroupMembersResponse | None = await self._get(
             "/api/v1/group-members",
             params={"chatroomId": chatroom_id},
             not_found_ok=True,
@@ -487,7 +487,7 @@ class WeFlowClient(SourceClient):
         offset: int = 0,
         media: bool = False,
         retry_on_empty: bool = True,
-    ) -> WeFlowMessagesResponse:
+    ) -> WeFlowLegacyMessagesResponse:
         """获取指定会话的历史消息（返回完整信封，含 hasMore）。
 
         上游按 createTime 过滤，start 为闭区间下界（createTime >= start 的消息
@@ -507,14 +507,14 @@ class WeFlowClient(SourceClient):
             qs += f"&start={start_ts}"
         if media:
             qs += "&media=1&image=1"
-        data: WeFlowMessagesResponse = await self._get(
+        data: WeFlowLegacyMessagesResponse = await self._get(
             f"/api/v1/messages?{qs}", retry_on_empty=retry_on_empty
         )
         return data
 
     # ── SSE 流 ──
 
-    async def stream_events(self) -> AsyncIterator[WeFlowEvent]:
+    async def stream_events(self) -> AsyncIterator[WeFlowLegacyEvent]:
         """SSE 实时消息流 — 异步迭代器，持续产出解析后的 JSON 事件。
 
         用法:

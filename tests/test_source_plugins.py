@@ -1,4 +1,4 @@
-"""内置消息源插件测试（weflow / qqflow）。"""
+"""内置消息源插件测试（weflow-legacy / qqflow）。"""
 
 import unittest
 from types import SimpleNamespace
@@ -10,7 +10,7 @@ from pydantic import SecretStr
 from briefdesk.config import Settings
 from briefdesk.plugin.base import PluginContext, PluginDisabledError
 from briefdesk.plugins.qqflow.plugin import QqFlowPlugin
-from briefdesk.plugins.weflow.plugin import WeFlowPlugin
+from briefdesk.plugins.weflow_legacy.plugin import WeFlowLegacyPlugin
 
 
 def _ctx() -> tuple[PluginContext, list]:
@@ -35,13 +35,13 @@ def _ctx() -> tuple[PluginContext, list]:
     return ctx, registered
 
 
-class WeFlowPluginTest(unittest.IsolatedAsyncioTestCase):
+class WeFlowLegacyPluginTest(unittest.IsolatedAsyncioTestCase):
     async def test_setup_registers_runtime(self):
         ctx, registered = _ctx()
-        fake_runtime = SimpleNamespace(name="weflow")
-        plugin = WeFlowPlugin()
+        fake_runtime = SimpleNamespace(name="weflow-legacy")
+        plugin = WeFlowLegacyPlugin()
         with patch(
-            "briefdesk.plugins.weflow.runtime.WeFlowSource", return_value=fake_runtime
+            "briefdesk.plugins.weflow_legacy.runtime.WeFlowLegacySource", return_value=fake_runtime
         ):
             await plugin.setup(ctx)
         self.assertEqual(registered, [fake_runtime])
@@ -49,17 +49,17 @@ class WeFlowPluginTest(unittest.IsolatedAsyncioTestCase):
     async def test_teardown_closes_runtime(self):
         ctx, _ = _ctx()
         close_spy = AsyncMock()
-        fake_runtime = SimpleNamespace(name="weflow", close=close_spy)
-        plugin = WeFlowPlugin()
+        fake_runtime = SimpleNamespace(name="weflow-legacy", close=close_spy)
+        plugin = WeFlowLegacyPlugin()
         with patch(
-            "briefdesk.plugins.weflow.runtime.WeFlowSource", return_value=fake_runtime
+            "briefdesk.plugins.weflow_legacy.runtime.WeFlowLegacySource", return_value=fake_runtime
         ):
             await plugin.setup(ctx)
         await plugin.teardown()
         close_spy.assert_awaited_once()
 
     async def test_teardown_without_setup_noop(self):
-        await WeFlowPlugin().teardown()
+        await WeFlowLegacyPlugin().teardown()
 
 
 class QqFlowPluginTest(unittest.IsolatedAsyncioTestCase):
