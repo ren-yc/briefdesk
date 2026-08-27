@@ -51,9 +51,11 @@
       + '<button id="rag-clear" class="rag-drawer-btn" title="清空对话">清空</button>'
       + '<button id="rag-close" class="rag-drawer-btn rag-drawer-x" title="关闭 (Esc)">×</button>'
       + "</div>"
-      + '<div id="rag-msgs" class="rag-msgs"></div>'
+      // 回答异步流入，无 aria-live 时读屏用户不会被告知任何新消息
+      + '<div id="rag-msgs" class="rag-msgs" role="log" aria-live="polite" aria-label="对话记录"></div>'
       + '<div class="rag-input-row">'
-      + '<input id="rag-input" type="text" maxlength="500" '
+      // placeholder 不是可访问名称：补 aria-label，否则读屏只报"编辑框"
+      + '<input id="rag-input" type="text" maxlength="500" aria-label="输入问题" '
       + 'placeholder="例如：那个活动的报名截止时间是什么时候？" autocomplete="off"/>'
       + '<button id="rag-send" type="button">发送</button>'
       + "</div>";
@@ -115,13 +117,18 @@
   function openDrawer() {
     open = true;
     $navLink.classList.add("active");
+    $navLink.setAttribute("aria-expanded", "true");
     document.body.classList.add("rag-open");
     $input.focus();
   }
   function closeDrawer() {
     open = false;
     $navLink.classList.remove("active");
+    $navLink.setAttribute("aria-expanded", "false");
     document.body.classList.remove("rag-open");
+    // 此前不还原焦点：抽屉隐藏后焦点仍停在已不可见的内部元素上，
+    // 键盘用户按 Tab 会从文档开头重新走一遍。
+    if (typeof $navLink.focus === "function") $navLink.focus();
   }
 
   function clearChat() {

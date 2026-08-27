@@ -50,7 +50,13 @@
   }
 
   function renderButton(item) {
-    return '<button class="btn-remind' + (item.remind_at ? " active" : "") + '" title="设置提醒"><img src="/icons/alarm-clock.svg" class="icon-sm" alt="">提醒</button>';
+    // 原先 .active 只是视觉态，读屏用户无法得知提醒是否已设置；
+    // title 也恒为"设置提醒"，已设提醒的卡片上是错的。
+    const on = !!item.remind_at;
+    return '<button type="button" class="btn-remind' + (on ? " active" : "") +
+      '" aria-pressed="' + (on ? "true" : "false") +
+      '" title="' + (on ? "修改或清除提醒" : "设置提醒") +
+      '"><img src="/icons/alarm-clock.svg" class="icon-sm" alt="">提醒</button>';
   }
 
   function renderMenu(item) {
@@ -58,8 +64,10 @@
       : remindInputValue(nextUpcomingTime(item) || item.end || item.start || "");
     return [
       '<div class="card-remind-menu hidden">',
-      '<div class="remind-menu-head">提醒时间' + (item.remind_at ? "（已设）" : "") + "</div>",
-      '<input type="datetime-local" class="remind-input" value="' + escAttr(dv) + '">',
+      '<div class="remind-menu-head" id="remind-head-' + item.id + '">提醒时间' + (item.remind_at ? "（已设）" : "") + "</div>",
+      // 原先该输入框没有任何可访问名称，读屏只报控件类型
+      '<input type="datetime-local" class="remind-input" aria-label="提醒时间"' +
+        ' aria-describedby="remind-head-' + item.id + '" value="' + escAttr(dv) + '">',
       '<div class="remind-menu-actions">',
       '<button class="remind-save">保存</button>',
       item.remind_at ? '<button class="remind-clear">清除提醒</button>' : "",
@@ -91,6 +99,8 @@
       document.querySelectorAll(".card-remind-menu").forEach(m => m.classList.add("hidden"));
       document.querySelectorAll('[data-id="' + CSS.escape(id) + '"] .btn-remind').forEach(b => {
         b.classList.toggle("active", !!data.remind_at);
+        b.setAttribute("aria-pressed", data.remind_at ? "true" : "false");
+        b.title = data.remind_at ? "修改或清除提醒" : "设置提醒";
       });
       if (!silent) {
         showToast(data.remind_at ? "提醒已设置" : "提醒已清除", { type: "success", duration: 2000 });
@@ -147,6 +157,22 @@
     if (!e.target.closest(".btn-remind") && !e.target.closest(".card-remind-menu")) {
       document.querySelectorAll(".card-remind-menu").forEach(m => m.classList.add("hidden"));
     }
+  }
+
+  // Esc 关闭提醒菜单。核心的 Esc 栈只覆盖自身浮层，不认识插件行内菜单：
+  // 此前菜单打开时按 Esc 会穿透到栈末尾（清空搜索框），菜单本身留在原地。
+  // 用捕获阶段抢在核心 document 监听之前处理，并在消费掉时阻止继续传播。
+  function onEscCapture(e) {
+    if (e.key !== "Escape") return;
+    const openMenus = document.querySelectorAll(".card-remind-menu:not(.hidden)");
+    if (!openMenus.length) return;
+    const trigger = openMenus[0].closest("[data-id]");
+    openMenus.forEach(m => m.classList.add("hidden"));
+    e.stopPropagation();
+    e.preventDefault();
+    // 焦点回到触发按钮，避免菜单隐藏后焦点悬在不可见元素上
+    const btn = trigger && trigger.querySelector(".btn-remind");
+    if (btn && typeof btn.focus === "function") btn.focus();
   }
 
   // 自动提醒：加入备忘录且开启自动提醒、卡片带具体时刻且尚未设提醒
@@ -260,6 +286,7 @@
         if (value === 1 && !(opts && opts.overlay)) maybeAutoRemind(id, opts);
       },
     });
+    document.addEventListener("keydown", onEscCapture, true);
     startReminderTimer();
   }
 

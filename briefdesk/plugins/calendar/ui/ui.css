@@ -11,8 +11,10 @@ body.calendar-mode .empty-state,
 body.calendar-mode #loading-state { display: none !important; }
 .cal-head {
   display: flex; align-items: center; gap: 8px; margin-bottom: 12px;
+  flex-wrap: wrap; /* 6 个控件在窄屏一行放不下，原先直接溢出容器 */
 }
-.cal-title { font-size: 15px; font-weight: 650; color: var(--text); flex: 1; }
+/* 650 不在核心字重阶梯（400/500/600/700）内，且可变字重下与 600 几乎无差别 */
+.cal-title { font-size: 15px; font-weight: 600; color: var(--text); flex: 1; min-width: 120px; }
 .cal-head button {
   border: 1px solid var(--border); background: var(--surface); color: var(--text-2);
   font-size: 13px; padding: 4px 12px; border-radius: var(--radius-sm); cursor: pointer; font-family: inherit;
@@ -36,7 +38,10 @@ body.calendar-mode #loading-state { display: none !important; }
   background: var(--surface); padding: 4px; overflow: hidden;
   display: flex; flex-direction: column; gap: 3px;
 }
-.cal-cell.out { opacity: .45; }
+/* .45 会让 --text-3 的日期数字降到约 2.4:1，远低于 AA。
+   用背景区分本月/非本月，而不是整体降透明度。 */
+.cal-cell.out { background: var(--bg); opacity: 1; }
+.cal-cell.out .cal-daynum { color: var(--text-3); }
 .cal-cell.today { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent) inset; }
 .cal-daynum { font-size: 11px; font-weight: 600; color: var(--text-3); }
 .cal-cell.today .cal-daynum { color: var(--accent); }
@@ -50,7 +55,8 @@ body.calendar-mode #loading-state { display: none !important; }
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
 .cal-chip:hover { filter: brightness(.95); }
-.cal-chip.expired { opacity: .5; text-decoration: line-through; }
+/* 过期 chip 保留删除线语义，但 opacity .5 叠加淡色底会低于 AA，抬到 .75 */
+.cal-chip.expired { opacity: .75; text-decoration: line-through; }
 .cal-more {
   font-size: 11px; color: var(--text-3); padding: 1px 6px; text-align: left;
   border: none; background: none; cursor: pointer; font-family: inherit; border-radius: 4px;
@@ -69,6 +75,38 @@ body.calendar-mode #loading-state { display: none !important; }
 }
 @media (prefers-reduced-motion: reduce) {
   .cal-filter-anim .cal-chip, .cal-filter-anim .cal-more { animation: none; }
+}
+
+/* 加载失败占位（保留头部导航，仅替换网格区域） */
+.cal-error {
+  display: flex; flex-direction: column; align-items: center; gap: 10px;
+  padding: 48px 16px; text-align: center;
+}
+.cal-retry {
+  border: 1px solid var(--border-strong); background: var(--surface); color: var(--text);
+  font-size: 13px; padding: 6px 16px; min-height: 32px; border-radius: var(--radius-sm);
+  cursor: pointer; font-family: inherit;
+}
+.cal-retry:hover { background: var(--bg); border-color: var(--accent); color: var(--accent); }
+
+/* ── 响应式：此前整个日历插件没有任何 @media，窄屏下 7 列固定网格
+   会把单元格压到 30-40px，chip 文本完全不可读 ── */
+@media (max-width: 860px) {
+  .cal-cell { min-height: 76px; }
+  .cal-chip { font-size: 11px; padding: 2px 4px; }
+  .cal-daynum { font-size: 10px; }
+}
+@media (max-width: 640px) {
+  /* 放弃 7 列月视图：改为 2 列，只渲染有内容的格子更实际，
+     但在纯 CSS 范围内至少让单元格保持可读宽度 */
+  .cal-weekdays { display: none; }
+  .cal-grid { grid-template-columns: repeat(2, 1fr); gap: 6px; }
+  .cal-cell { min-height: auto; padding: 8px; }
+  .cal-cell.out { display: none; } /* 非本月补位格在 2 列布局里纯属噪音 */
+  .cal-daynum { font-size: 12px; }
+  .cal-chip { white-space: normal; }  /* 窄屏允许折行，省略号会吃掉全部信息 */
+  .cal-head { gap: 6px; }
+  .cal-exit { margin-left: 0; }
 }
 
 /* ── 日历详情 / 当日事件浮层 ── */

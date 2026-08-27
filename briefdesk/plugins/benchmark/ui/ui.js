@@ -43,7 +43,7 @@
       + '<button id="bench-run-btn" class="settings-outline-btn">运行基准测试</button>'
       + '<button id="bench-clear-btn" class="settings-outline-btn">清空基准用例</button>'
       + "</div>"
-      + '<p id="bench-status" class="text-muted settings-hint" style="margin-top:8px">加载中…</p>';
+      + '<p id="bench-status" class="text-muted settings-hint" role="status" aria-live="polite">加载中…</p>';
     // 挂在「数据导出」区块之后
     const exportSection = about.querySelector(".settings-section");
     const anchor = exportSection && exportSection.parentNode.querySelector(

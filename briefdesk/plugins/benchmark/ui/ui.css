@@ -3,10 +3,16 @@
  * 此处仅补充插件专属细节。
  */
 #benchmark-settings-section .settings-outline-btn:disabled {
-  opacity: 0.55;
+  /* .55 会把按钮文字压到 AA 以下；禁用态本就有 cursor 与语义提示，
+     不需要靠这么低的透明度表达 */
+  opacity: 0.7;
   cursor: not-allowed;
 }
 #bench-status a {
-  color: var(--accent, #2563eb);
+  /* 回退值 #2563eb 是旧主题色，与当前 --accent（墨绿）不符：
+     核心一定会定义 --accent，回退只会在出错时给出错误的品牌色 */
+  color: var(--accent);
   text-decoration: underline;
 }
+/* 原先写在 JS 里的 style="margin-top:8px"，移入样式表 */
+#bench-status { margin-top: 8px; }

@@ -3,12 +3,31 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="description" content="简报台：本地运行的群聊信息聚合看板，自动分类、去重与合并同话题消息。">
+  <meta name="color-scheme" content="light dark">
   <title>简报台</title>
   <!-- 默认 favicon（网格图标）；JS 启动后按随机主题色动态替换 -->
   <link rel="icon" type="image/svg+xml" href="/icons/layout-grid.svg">
   <link rel="stylesheet" href="/style.css">
+  <!-- 主题必须在首次绘制前落定：app.js 在 body 末尾且无 defer，若等到
+       DOMContentLoaded 再 applyTheme()，深色用户每次刷新都会闪一次浅色。
+       这段同步脚本刻意放在 <head> 内阻塞执行，与 app.js 的 initTheme 同源同 key。 -->
+  <script>
+    (function () {
+      try {
+        /* 默认值必须与 app.js 的 applyTheme() 一致（"light"），否则未显式选过
+           主题的用户会在预置脚本与 app.js 之间被切换两次。 */
+        var t = localStorage.getItem("briefdesk.theme") || "light";
+        if (t === "system") {
+          t = window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+        }
+        document.documentElement.dataset.theme = t;
+      } catch (e) { document.documentElement.dataset.theme = "light"; }
+    })();
+  </script>
 </head>
 <body>
+  <a href="#content" class="skip-link">跳到主内容</a>
   <div id="app">
     <header class="top-bar">
       <h1>简报台 (BRIEFDESK)</h1>
@@ -19,11 +38,14 @@
         <a href="#" id="settings-link-top" class="top-settings-link">
           <img src="/icons/settings.svg" class="icon" alt="">设置
         </a>
-        <div id="status-indicator" class="status offline" title="点击查看运行状态详情" role="button" tabindex="0">
+        <!-- aria-expanded 让读屏用户感知面板开合；进度文本移出按钮可访问名之外
+             （见下方 #status-progress 的 aria-live），避免按钮名称随同步进度不断变化 -->
+        <div id="status-indicator" class="status offline" title="点击查看运行状态详情"
+             role="button" tabindex="0" aria-expanded="false" aria-controls="status-popover">
           <span id="status-text">等待首次同步...</span>
-          <span id="status-progress" class="status-progress hidden"></span>
         </div>
-        <div id="status-popover" class="status-popover hidden"></div>
+        <span id="status-progress" class="status-progress hidden" role="status" aria-live="polite"></span>
+        <div id="status-popover" class="status-popover hidden" role="dialog" aria-label="运行状态"></div>
       </div>
     </header>
     <div class="main-layout">
@@ -61,10 +83,10 @@
             <button class="seg-btn active" data-mode="collapsed" role="tab" aria-selected="true" title="同主体卡片合并展示">合并</button>
             <button class="seg-btn" data-mode="expanded" role="tab" aria-selected="false" title="平铺展示全部卡片">平铺</button>
           </div>
-          <button id="batch-toggle" class="batch-toggle-btn" type="button" title="勾选多张卡片统一处理">
+          <button id="batch-toggle" class="batch-toggle-btn" type="button" aria-pressed="false" title="勾选多张卡片统一处理">
             <img src="/icons/check.svg" class="icon-sm" alt="">批量操作
           </button>
-          <button id="hide-expired-toggle" class="batch-toggle-btn" type="button" title="隐藏截止时间已过的卡片">
+          <button id="hide-expired-toggle" class="batch-toggle-btn" type="button" aria-pressed="false" title="隐藏截止时间已过的卡片">
             <img src="/icons/clock.svg" class="icon-sm" alt="">隐藏已截止
           </button>
           <button id="kb-help-btn" class="batch-toggle-btn" type="button" title="键盘快捷键（按 ? 也可打开）">快捷键指南</button>
@@ -73,10 +95,13 @@
         </div>
         <!-- 错误/警告横幅：同步失败、阶段缺失等状态提示（数据来自 /api/status） -->
         <div id="error-banner" class="error-banner hidden" role="alert"></div>
-        <div id="loading-state" class="skeleton-container">
-          <div class="skeleton-card"></div>
-          <div class="skeleton-card"></div>
-          <div class="skeleton-card"></div>
+        <!-- 骨架屏对读屏用户是三个空 div，毫无"正在加载"语义：
+             aria-busy + 视觉隐藏文本让加载状态可被朗读 -->
+        <div id="loading-state" class="skeleton-container" role="status" aria-busy="true" aria-live="polite">
+          <span class="sr-only">正在加载信息卡片…</span>
+          <div class="skeleton-card" aria-hidden="true"></div>
+          <div class="skeleton-card" aria-hidden="true"></div>
+          <div class="skeleton-card" aria-hidden="true"></div>
         </div>
         <div id="empty-state" class="empty-state hidden">
           <p>暂无信息，等待新消息中...</p>
@@ -91,9 +116,11 @@
     </div>
   </div>
 
-  <div id="settings-modal" class="modal hidden">
+  <!-- role/aria-modal 由 pushModalFocus() 在打开时补齐，这里预置
+       aria-labelledby 把标题关联为可访问名称 -->
+  <div id="settings-modal" class="modal hidden" aria-labelledby="settings-modal-title">
     <div class="modal-content settings-modal-content">
-      <h2>设置</h2>
+      <h2 id="settings-modal-title">设置</h2>
       <div class="settings-layout">
         <nav class="settings-menu" id="settings-menu" aria-label="设置分组">
           <button type="button" class="settings-menu-item active" data-panel="general">常规</button>

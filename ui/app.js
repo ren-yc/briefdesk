@@ -35,7 +35,6 @@ let timeTicker = null;          // 相对时间每分钟刷新定时器
 let manualSyncWait = false;     // 手动点击同步后等待 synced 事件
 let syncWaitTimer = null;       // 手动同步兜底超时
 let lastUndo = null;            // 最近一次可撤销的卡片操作 { id, prevValue }
-let lastModalFocus = null;      // 弹窗打开前的焦点元素
 
 // ── 操控层级状态（二级/三级界面）──
 let overlayKey = "";            // 当前打开的浮层键 (subject + category)
@@ -421,7 +420,6 @@ function setupEvents() {
 
   function openSettings(e) {
     e.preventDefault();
-    lastModalFocus = document.activeElement;
     $settingsModal.classList.remove("hidden");
     syncBodyScrollLock();
     setSettingsPanel("general"); // 二级菜单：每次打开默认回到「常规」
@@ -435,7 +433,7 @@ function setupEvents() {
     loadAboutSources();
     loadPlugins();
     loadEnvConfig();
-    setTimeout(() => $refreshInterval.focus(), 0);
+    pushModalFocus($settingsModal, { initialFocus: $refreshInterval });
   }
 
   // 二级菜单切换：仅显示选中分组的面板，草稿跨分组保留（保存时统一提交）
@@ -547,12 +545,16 @@ function setupEvents() {
     text.textContent = "发现中...";
     try {
       const res = await fetch("/api/sessions/refresh", { method: "POST" });
+      // 此前不检查 res.ok：500 响应也会走 res.json()，解析失败落进 catch 后
+      // 只打 console，按钮恢复成"发现新群聊"，用户看不出任何失败迹象。
+      if (!res.ok) throw new Error("HTTP " + res.status);
       const data = await res.json();
       await loadEnabledSources(); // 刷新后按最新启用源裁剪（防残留源会话混入）
       renderSessions(data.sessions || []);
       fetchData();
     } catch (err) {
       console.error("Refresh sessions error:", err);
+      showToast("发现新群聊失败，请稍后重试", { type: "error", duration: 4000 });
     } finally {
       btn.disabled = false;
       icon.classList.remove("icon-spin");
@@ -757,16 +759,15 @@ function setupEvents() {
       return;
     }
 
-    // Handle quote toggle (div, not button)
     const toggle = e.target.closest(".card-quote-toggle");
     if (toggle) {
       const card = toggle.closest(".item-card");
       const quote = card.querySelector(".card-quote");
       const isOpen = !quote.classList.contains("open");
       quote.classList.toggle("open");
-      toggle.innerHTML = isOpen
-        ? '<img src="/icons/chevron-up.svg" class="icon-sm" alt="">原文引用'
-        : '<img src="/icons/chevron-down.svg" class="icon-sm" alt="">原文引用';
+      toggle.setAttribute("aria-expanded", String(isOpen));
+      // 保留原标签：无原文的卡片标签是「查看上下文」，此前一律被改写成「原文引用」
+      setQuoteToggleLabel(toggle, isOpen);
 
       // 展开状态记入视图状态，视图切换后恢复
       if (isOpen) currentExpandedIds.add(card.dataset.id);
@@ -1374,6 +1375,7 @@ function setupEvents() {
     hideExpired = !hideExpired;
     localStorage.setItem("briefdesk.hideExpired", hideExpired ? "1" : "0");
     $hideExpiredToggle.classList.toggle("active", hideExpired);
+    $hideExpiredToggle.setAttribute("aria-pressed", String(hideExpired));
     fetchData();
   });
 
@@ -1743,6 +1745,23 @@ async function fetchData() {
     $statusIndicator.className = "status offline";
     $statusText.innerHTML = '连接失败 <button type="button" class="status-retry">重试</button>';
     renderStatusBanner({ lastError: "无法连接服务器，请确认应用仍在运行（python main.py）" });
+    // 骨架屏只在 renderItems() 里被隐藏，而失败路径不会走到那里：
+    // 首屏请求失败时三张骨架卡会永久脉冲，看起来像"一直在加载"而非"加载失败"。
+    // 仅在列表还没有任何内容时替换为失败态，避免抹掉已经渲染好的旧数据。
+    $loadingState.classList.add("hidden");
+    if (!$itemsContainer.querySelector(".item-card, .group-block")) {
+      $emptyState.innerHTML =
+        '<p>无法连接服务器</p>' +
+        '<p class="text-muted">请确认应用仍在运行（python main.py），然后重试。</p>' +
+        '<button type="button" class="reset-filter-link" id="fetch-retry-btn">重试</button>';
+      $emptyState.classList.remove("hidden");
+      const retry = document.getElementById("fetch-retry-btn");
+      if (retry) retry.addEventListener("click", () => {
+        $emptyState.classList.add("hidden");
+        $loadingState.classList.remove("hidden");
+        fetchData();
+      });
+    }
   } finally {
     if (seq === fetchSeq) {
       listRefreshing = false;
@@ -1904,17 +1923,16 @@ function _kbFocusItem() {
 function openKbHelp() {
   const modal = document.getElementById("kb-help-modal");
   if (!modal) return;
-  lastModalFocus = document.activeElement;
   modal.classList.remove("hidden");
   syncBodyScrollLock();
+  pushModalFocus(modal, { initialFocus: document.getElementById("kb-help-close") });
 }
 function closeKbHelp() {
   const modal = document.getElementById("kb-help-modal");
   if (!modal) return;
   modal.classList.add("hidden");
   syncBodyScrollLock();
-  if (lastModalFocus && document.contains(lastModalFocus)) lastModalFocus.focus();
-  lastModalFocus = null;
+  popModalFocus(modal);
 }
 
 // ── 首次使用向导：环境检查 → 启用群聊 → 触发同步（三步，可跳过）──
@@ -1945,11 +1963,11 @@ async function initOnboarding() {
 
 function openOnboarding() {
   if (!$onboardModal) return;
-  lastModalFocus = document.activeElement;
   $onboardModal.classList.remove("hidden");
   syncBodyScrollLock();
   showOnboardStep(1);
   renderOnboardEnv();
+  pushModalFocus($onboardModal);
 }
 
 function showOnboardStep(n) {
@@ -1964,8 +1982,7 @@ function closeOnboarding({ skip = false } = {}) {
   $onboardModal.classList.add("hidden");
   syncBodyScrollLock();
   if (skip) markOnboarded();
-  if (lastModalFocus && document.contains(lastModalFocus)) lastModalFocus.focus();
-  lastModalFocus = null;
+  popModalFocus($onboardModal);
   if (!skip) fetchData(); // 完整走完向导后刷新主列表
 }
 
@@ -2005,13 +2022,16 @@ function fillOnboardBackfill() {
     render(onboardBackfillHours);
     return;
   }
-  // 会话接口尚未拉取成功：异步补拉一次再填（失败保持省略号占位）
+  // 会话接口尚未拉取成功：异步补拉一次再填
   fetch("/api/sessions").then(r => (r.ok ? r.json() : null)).then(d => {
     if (d && typeof d.backfillHours === "number" && Number.isFinite(d.backfillHours)) {
       onboardBackfillHours = d.backfillHours;
       render(d.backfillHours);
+    } else {
+      // 原先失败时保留"…"占位，读起来像还在加载；给出明确的未知态
+      el.textContent = "未知";
     }
-  }).catch(() => {});
+  }).catch(() => { el.textContent = "未知"; });
 }
 
 async function renderOnboardSessions() {
@@ -2110,6 +2130,7 @@ function updateOnboardTypeChips() {
     const t = c.dataset.type;
     const active = (!t || t === "all") ? onboardTypes.size === 0 : onboardTypes.has(t);
     c.classList.toggle("active", active);
+    c.setAttribute("aria-pressed", String(active));
   });
 }
 
@@ -2134,6 +2155,7 @@ function updateOnboardSourceChips() {
       ? onboardSources.size === 0
       : onboardSources.has(c.dataset.source);
     c.classList.toggle("active", active);
+    c.setAttribute("aria-pressed", String(active));
   });
 }
 
@@ -2220,11 +2242,24 @@ function showEmptyState() {
 async function renderEmptyStateGuide() {
   $emptyState.innerHTML = '<p>暂无信息，等待新消息中...</p>';
   let data = null;
+  let failed = false;
   try {
     const res = await fetch("/api/sessions");
     if (res.ok) data = await res.json();
-  } catch { /* 忽略 */ }
+    else failed = true;
+  } catch { failed = true; }
   if ($emptyState.classList.contains("hidden")) return; // 已被后续渲染隐藏（新数据到达等）
+  // 拉取失败时不能沿用"暂未发现任何会话"——那会把一次网络故障说成
+  // "你还没有任何群聊"，把用户引向错误的排查方向。
+  if (failed) {
+    $emptyState.innerHTML =
+      '<p>无法读取会话列表</p>' +
+      '<p class="text-muted">接口 /api/sessions 请求失败，暂时无法判断是否已启用群聊。</p>' +
+      '<button type="button" class="empty-guide-btn" id="empty-guide-retry">重试</button>';
+    const again = document.getElementById("empty-guide-retry");
+    if (again) again.addEventListener("click", () => renderEmptyStateGuide());
+    return;
+  }
   await loadEnabledSources(); // 空态统计同样按实际启用源裁剪残留停用源会话
   const sessions = filterSessionsByEnabledSources(
     Array.isArray(data && data.sessions) ? data.sessions : []
@@ -2350,7 +2385,7 @@ function applyExpandedState() {
     const toggle = card.querySelector(".card-quote-toggle");
     if (quote && !quote.classList.contains("open")) {
       quote.classList.add("open");
-      if (toggle) toggle.innerHTML = '<img src="/icons/chevron-up.svg" class="icon-sm" alt="">原文引用';
+      if (toggle) { toggle.setAttribute("aria-expanded", "true"); setQuoteToggleLabel(toggle, true); }
       const ctxDiv = card.querySelector(".card-quote-context");
       if (ctxDiv && ctxDiv.classList.contains("hidden")) {
         ctxDiv.classList.remove("hidden");
@@ -2720,7 +2755,7 @@ function renderCollapsedGroup(group) {
   const n = group.members.length;
   // 批量模式：组是不可分的选择单元，初始渲染即还原整组选中态
   const allSelected = batchMode && group.members.every(m => selectedIds.has(String(m.id)));
-  const colorStyle = catColor.get(group.category) ? `--cat:${catColor.get(group.category)}` : "";
+  const colorStyle = catColor.get(group.category) ? `--cat:${escAttr(catColor.get(group.category))}` : "";
   return `
     <div class="group-collapsed${allSelected ? " selected" : ""}" data-key="${escAttr(group.key)}" data-msgtime="${itemTime(rep)}" data-subject="${escAttr(group.subject)}" data-category="${escAttr(group.category)}" style="${colorStyle}">
       <button class="group-more-btn group-head" data-subject="${escAttr(group.subject)}" data-cat="${escAttr(group.category)}" title="${batchMode ? "选择 / 取消选择该主体全部卡片（" + n + " 张）" : "查看该主体全部卡片"}">
@@ -2735,7 +2770,7 @@ function renderCollapsedGroup(group) {
 function renderGroupHeader(group) {
   const n = group.members.length;
   const allSelected = batchMode && group.members.every(m => selectedIds.has(String(m.id)));
-  const colorStyle = catColor.get(group.category) ? `--cat:${catColor.get(group.category)}` : "";
+  const colorStyle = catColor.get(group.category) ? `--cat:${escAttr(catColor.get(group.category))}` : "";
   return `
     <div class="group-header" data-key="${escAttr(group.key)}" data-msgtime="${itemTime(group.members[0])}" style="${colorStyle}">
       ${batchMode ? `<label class="batch-check" title="选择 / 取消选择该主体全部卡片"><input type="checkbox" ${allSelected ? "checked" : ""}></label>` : ""}
@@ -2759,7 +2794,6 @@ function openGroupOverlay(subject, category) {
   const key = subject + "\x01" + (category || "");
   const members = groupMap.get(key) || [];
   if (members.length < 2) return;
-  lastModalFocus = document.activeElement;
   overlayKey = key;
   overlayNeedsSync = false;
   // overlayExpandedIds 跨开关持久：重开浮层时恢复展开行（配合滚动位置记忆）
@@ -2769,8 +2803,7 @@ function openGroupOverlay(subject, category) {
   renderOverlayList(key);
   $groupOverlay.classList.remove("hidden");
   syncBodyScrollLock();
-  const closeBtn = document.getElementById("group-overlay-close");
-  if (closeBtn) closeBtn.focus();
+  pushModalFocus($groupOverlay, { initialFocus: document.getElementById("group-overlay-close") });
   // 恢复上次关闭时的滚动位置
   const saved = overlayScrolls.get(key);
   if ($groupOverlayContent && saved) $groupOverlayContent.scrollTop = saved;
@@ -2785,8 +2818,7 @@ function closeGroupOverlay() {
   overlayKey = "";
   $groupOverlay.classList.add("hidden");
   syncBodyScrollLock();
-  if (lastModalFocus && document.contains(lastModalFocus)) lastModalFocus.focus();
-  lastModalFocus = null;
+  popModalFocus($groupOverlay);
   if (needSync) fetchData(); // 浮层内处理过卡片 → 收敛主列表（组结构/代表卡）
 }
 
@@ -2827,10 +2859,100 @@ function syncBodyScrollLock() {
   document.body.classList.toggle("modal-open", anyOpen);
 }
 
+// ══ 浮层焦点管理 ══
+// 此前每个浮层各自 lastModalFocus = document.activeElement + 手工还原，导致：
+//   1) 单变量被嵌套浮层互相覆盖（浮层内开灯箱 → 浮层的触发元素丢失）；
+//   2) 无焦点圈闭，Tab 会漏到背景（批量删除确认尤其危险：焦点可能停在
+//      背景某张卡片的按钮上，盲按 Enter 触发意外操作）；
+//   3) 背景未 inert，读屏可继续朗读被遮挡的内容。
+// 这里改为栈式管理，配合 aria-modal 与背景 inert 统一处理。
+const modalFocusStack = [];
+// 背景容器（浮层之外的一切）——打开任一浮层时置 inert
+const _INERT_ROOTS = [".top-bar", ".main-layout"];
+
+function _focusables(root) {
+  const sel = 'a[href], button:not([disabled]), input:not([disabled]):not([type="hidden"]),' +
+    'select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])';
+  return Array.from(root.querySelectorAll(sel)).filter(el => {
+    if (el.closest(".hidden")) return false;
+    // offsetParent 为 null ⇒ display:none 链上（position:fixed 元素例外）
+    return el.offsetParent !== null || getComputedStyle(el).position === "fixed";
+  });
+}
+
+// Tab 圈闭：只在栈顶浮层内循环
+function _onModalTabKeydown(e) {
+  if (e.key !== "Tab") return;
+  const top = modalFocusStack[modalFocusStack.length - 1];
+  if (!top || !document.contains(top.modal)) return;
+  const items = _focusables(top.modal);
+  if (!items.length) { e.preventDefault(); return; }
+  const first = items[0];
+  const last = items[items.length - 1];
+  const active = document.activeElement;
+  if (e.shiftKey) {
+    if (active === first || !top.modal.contains(active)) { e.preventDefault(); last.focus(); }
+  } else if (active === last || !top.modal.contains(active)) {
+    e.preventDefault(); first.focus();
+  }
+}
+
+function _syncInertBackground() {
+  const anyOpen = modalFocusStack.length > 0;
+  for (const sel of _INERT_ROOTS) {
+    const el = document.querySelector(sel);
+    if (!el) continue;
+    if (anyOpen) el.setAttribute("inert", "");
+    else el.removeAttribute("inert");
+  }
+}
+
+// 打开浮层：登记触发元素 → 移焦到 initialFocus（危险对话框应传"取消"按钮）→ 开启圈闭
+// modal 需为 .modal 容器元素；dialog 为承载 role=dialog/aria-modal 的内层（缺省取 modal 自身）
+function pushModalFocus(modal, { initialFocus = null, dialog = null } = {}) {
+  if (!modal) return;
+  const dlg = dialog || modal.querySelector(".modal-content") || modal;
+  dlg.setAttribute("role", dlg.getAttribute("role") || "dialog");
+  dlg.setAttribute("aria-modal", "true");
+  modalFocusStack.push({ modal: modal, trigger: document.activeElement });
+  if (modalFocusStack.length === 1) document.addEventListener("keydown", _onModalTabKeydown, true);
+  _syncInertBackground();
+  // inert 会让当前焦点元素失焦，需在其之后移焦
+  const target = initialFocus || _focusables(dlg)[0] || dlg;
+  setTimeout(() => {
+    if (!document.contains(target)) return;
+    if (target === dlg && !dlg.hasAttribute("tabindex")) dlg.setAttribute("tabindex", "-1");
+    target.focus();
+  }, 0);
+}
+
+// 关闭浮层：还原触发元素焦点。按 modal 精确出栈，嵌套浮层乱序关闭也不串位。
+function popModalFocus(modal) {
+  const idx = modal ? modalFocusStack.findIndex(e => e.modal === modal) : modalFocusStack.length - 1;
+  if (idx < 0) return;
+  const entry = modalFocusStack.splice(idx, 1)[0];
+  const dlg = (modal && (modal.querySelector(".modal-content") || modal)) || null;
+  if (dlg) dlg.removeAttribute("aria-modal");
+  if (!modalFocusStack.length) document.removeEventListener("keydown", _onModalTabKeydown, true);
+  _syncInertBackground();
+  const t = entry.trigger;
+  if (t && document.contains(t) && typeof t.focus === "function") {
+    // 背景刚解除 inert，同步 focus 可能被忽略，推到下一帧
+    setTimeout(() => { if (document.contains(t)) t.focus(); }, 0);
+  }
+}
+
 // 多来源合并卡片的 source_group 为 ", " 连接的字符串，拆成多个来源 chip 展示
-function sourceGroupChips(source_group) {
+// 返回数组而非拼接字符串：此前多个来源被 join("") 直接粘连（"A群B群"），
+// 而同级的关键信息用 " · " 分隔，同一行里出现两种拼法。改由调用方统一处理。
+function sourceGroupChipList(source_group) {
   return (source_group || "").split(", ").filter(Boolean)
-    .map(g => `<span>${esc(g)}</span>`).join("");
+    .map(g => `<span>${esc(g)}</span>`);
+}
+
+// 引用区等纯文本上下文用：无来源时返回空串
+function sourceGroupChips(source_group) {
+  return sourceGroupChipList(source_group).join(" · ");
 }
 
 // ── 统一行渲染：组浮层(overlay) / 日历详情(detail) / 主体时间线(timeline) 共用 ──
@@ -2841,7 +2963,8 @@ function renderItemRow(item, { cls = "", showSubject = false, showSubscribed = f
     .replaceAll("，", ",").split(",").map(s => s.trim()).filter(Boolean);
   const meta = [];
   for (const p of keyPoints) meta.push(`<span>${highlight(p)}</span>`);
-  meta.push(sourceGroupChips(item.source_group));
+  // 此前无条件 push：source_group 为空时压入空串，join(" · ") 会留下尾部孤立圆点
+  meta.push(...sourceGroupChipList(item.source_group));
 
   let imagesHtml = "";
   if (item.image_urls) {
@@ -2858,7 +2981,7 @@ function renderItemRow(item, { cls = "", showSubject = false, showSubscribed = f
   const msgTime = item.msg_time
     ? new Date(item.msg_time * 1000).toLocaleString("zh-CN")
     : (item.created_at ? new Date(item.created_at).toLocaleString("zh-CN") : "");
-  const catColorStyle = catColor.get(item.category) ? `--cat:${catColor.get(item.category)};` : "";
+  const catColorStyle = catColor.get(item.category) ? `--cat:${escAttr(catColor.get(item.category))};` : "";
   // 按钮标签随卡片状态变化，避免"点忽略=取消忽略"的反直觉
   const memoLabel = item.is_verified === 1 ? "移出备忘录" : "加入备忘录";
   const ignoreLabel = item.is_verified === -1 ? "取消忽略" : "忽略";
@@ -2881,7 +3004,7 @@ function renderItemRow(item, { cls = "", showSubject = false, showSubscribed = f
         <button class="btn-copy btn-copy-icon" title="复制标题与关键信息" aria-label="复制标题与关键信息"><img src="/icons/copy.svg" class="icon-sm" alt="复制"></button>
       </div>
       <div class="ov-title">${highlight(item.title)}</div>
-      ${meta.length ? `<div class="ov-meta">${meta.join(" · ")}</div>` : ""}
+      ${meta.length ? `<div class="ov-meta">${meta.join("")}</div>` : ""}
       ${detailBlock}
       <div class="ov-actions">
         <span class="btn-more-wrap">
@@ -2889,8 +3012,8 @@ function renderItemRow(item, { cls = "", showSubject = false, showSubscribed = f
           ${renderMoreMenu(item)}
         </span>
         ${renderItemRowButtons(item)}
-        <button class="btn-memo${item.is_verified === 1 ? " active" : ""}" title="${memoLabel}">${memoLabel}</button>
-        <button class="btn-ignore${item.is_verified === -1 ? " active" : ""}" title="${ignoreLabel}">${ignoreLabel}</button>
+        <button type="button" class="btn-memo${item.is_verified === 1 ? " active" : ""}" title="${memoLabel}" aria-pressed="${item.is_verified === 1}">${memoLabel}</button>
+        <button type="button" class="btn-ignore${item.is_verified === -1 ? " active" : ""}" title="${ignoreLabel}" aria-pressed="${item.is_verified === -1}">${ignoreLabel}</button>
       </div>
       ${renderItemRowMenus(item)}
     </div>`;
@@ -3042,7 +3165,7 @@ function renderCard(item, groupKey = "") {
       metaParts.push(`<span>${highlight(p)}</span>`);
     }
   }
-  metaParts.push(sourceGroupChips(item.source_group));
+  metaParts.push(...sourceGroupChipList(item.source_group));
 
   const msgTime = item.msg_time
     ? new Date(item.msg_time * 1000).toLocaleString("zh-CN")
@@ -3061,7 +3184,7 @@ function renderCard(item, groupKey = "") {
     } catch { /* ignore parse errors */ }
   }
 
-  const catColorStyle = catColor.get(item.category) ? `--cat:${catColor.get(item.category)};` : "";
+  const catColorStyle = catColor.get(item.category) ? `--cat:${escAttr(catColor.get(item.category))};` : "";
   // 按钮标签随卡片状态变化，避免"点忽略=取消忽略"的反直觉
   const memoLabel = item.is_verified === 1 ? "移出备忘录" : "加入备忘录";
   const ignoreLabel = item.is_verified === -1 ? "取消忽略" : "忽略";
@@ -3080,9 +3203,9 @@ function renderCard(item, groupKey = "") {
         <button class="btn-copy btn-copy-icon" title="复制标题与关键信息" aria-label="复制标题与关键信息"><img src="/icons/copy.svg" class="icon-sm" alt="复制"></button>
       </div>
       <div class="card-title">${highlight(item.title)}</div>
-      ${metaParts.length ? `<div class="card-meta">${metaParts.join(" · ")}</div>` : ""}
+      ${metaParts.length ? `<div class="card-meta">${metaParts.join("")}</div>` : ""}
       ${imagesHtml}
-      <div class="card-quote-toggle"><img src="/icons/chevron-down.svg" class="icon-sm" alt="">${hasQuote ? "原文引用" : "查看上下文"}</div>
+      <button type="button" class="card-quote-toggle" aria-expanded="false"><img src="/icons/chevron-down.svg" class="icon-sm" alt="">${hasQuote ? "原文引用" : "查看上下文"}</button>
       <div class="card-quote">
         <div class="card-quote-main">
           <div class="quote-meta">${esc(item.sender_name || "未知")} · ${msgTime} · ${sourceGroupChips(item.source_group)}</div>
@@ -3099,11 +3222,36 @@ function renderCard(item, groupKey = "") {
           ${renderMoreMenu(item)}
         </span>
         ${renderItemRowButtons(item)}
-        <button class="btn-memo${item.is_verified === 1 ? " active" : ""}" title="${memoLabel}">${memoLabel}</button>
-        <button class="btn-ignore${item.is_verified === -1 ? " active" : ""}" title="${ignoreLabel}">${ignoreLabel}</button>
+        <button type="button" class="btn-memo${item.is_verified === 1 ? " active" : ""}" title="${memoLabel}" aria-pressed="${item.is_verified === 1}">${memoLabel}</button>
+        <button type="button" class="btn-ignore${item.is_verified === -1 ? " active" : ""}" title="${ignoreLabel}" aria-pressed="${item.is_verified === -1}">${ignoreLabel}</button>
       </div>
       ${renderItemRowMenus(item)}
     </div>`;
+}
+
+// 备忘/忽略按钮的视觉态与无障碍态、文案必须一起改：
+// 此前各处只 toggle 了 .active，渲染时写入的 aria-pressed 与 title
+// 在用户点击后就永久停留在初始值上（读屏播报与实际状态相反）。
+function setToggleBtnState(btn, on, labelOn, labelOff) {
+  if (!btn) return;
+  btn.classList.toggle("active", on);
+  btn.setAttribute("aria-pressed", String(on));
+  const label = on ? labelOn : labelOff;
+  btn.textContent = label;
+  btn.title = label;
+}
+
+function syncVerifyButtons(root, value) {
+  setToggleBtnState(root.querySelector(".btn-memo"), value === 1, "移出备忘录", "加入备忘录");
+  setToggleBtnState(root.querySelector(".btn-ignore"), value === -1, "取消忽略", "忽略");
+}
+
+// 切换「原文引用 / 查看上下文」箭头方向，保留原有文案
+// （此前两处 innerHTML 硬编码为「原文引用」，无原文的卡片一展开就丢掉「查看上下文」标签）
+function setQuoteToggleLabel(toggle, isOpen) {
+  const label = (toggle.textContent || "").trim() || "原文引用";
+  const icon = isOpen ? "chevron-up" : "chevron-down";
+  toggle.innerHTML = '<img src="/icons/' + icon + '.svg" class="icon-sm" alt="">' + esc(label);
 }
 
 // ── Lightbox ──
@@ -3114,6 +3262,9 @@ function openLightbox(srcs, index) {
   updateLightbox();
   $lightbox.classList.remove("hidden");
   syncBodyScrollLock();
+  // 灯箱此前既不存触发元素也不还原焦点：从组浮层内打开再关闭时，
+  // 焦点会落到 body，键盘用户需从头 Tab。纳入统一栈后可正确回到原图片按钮。
+  pushModalFocus($lightbox, { initialFocus: document.getElementById("lightbox-close") });
   document.addEventListener("keydown", onLightboxKeydown);
 }
 
@@ -3121,6 +3272,7 @@ function closeLightbox() {
   $lightbox.classList.add("hidden");
   lightboxSrcs = [];
   syncBodyScrollLock();
+  popModalFocus($lightbox);
   document.removeEventListener("keydown", onLightboxKeydown);
 }
 
@@ -3209,14 +3361,10 @@ async function verifyItem(id, value, cardEl, { refresh = false, overlay = false 
       return;
     }
 
-    const btnMemo = cardEl.querySelector(".btn-memo");
-    const btnIgnore = cardEl.querySelector(".btn-ignore");
-
     if (value === 0) {
       // Deactivated — remove all styling
       cardEl.classList.remove("memo", "ignored");
-      if (btnMemo) btnMemo.classList.remove("active");
-      if (btnIgnore) btnIgnore.classList.remove("active");
+      syncVerifyButtons(cardEl, 0);
       // If on memo or ignored view, card no longer matches filter
       if (currentVerified === "memo" || currentVerified === "ignored") {
         cardEl.style.transition = "opacity 0.3s";
@@ -3225,8 +3373,7 @@ async function verifyItem(id, value, cardEl, { refresh = false, overlay = false 
       }
     } else if (value === 1) {
       // Marked as memo
-      if (btnMemo) btnMemo.classList.add("active");
-      if (btnIgnore) btnIgnore.classList.remove("active");
+      syncVerifyButtons(cardEl, 1);
       if (currentVerified === "memo") {
         cardEl.classList.add("memo");
         cardEl.classList.remove("ignored");
@@ -3238,8 +3385,7 @@ async function verifyItem(id, value, cardEl, { refresh = false, overlay = false 
       }
     } else if (value === -1) {
       // Marked as ignored
-      if (btnIgnore) btnIgnore.classList.add("active");
-      if (btnMemo) btnMemo.classList.remove("active");
+      syncVerifyButtons(cardEl, -1);
       if (currentVerified === "ignored") {
         cardEl.classList.add("ignored");
         cardEl.classList.remove("memo");
@@ -3555,6 +3701,7 @@ function updateSessionTypeChips() {
     const t = c.dataset.type;
     const active = (!t || t === "all") ? selectedTypes.size === 0 : selectedTypes.has(t);
     c.classList.toggle("active", active);
+    c.setAttribute("aria-pressed", String(active));
   });
 }
 
@@ -3603,6 +3750,7 @@ function updateSessionSourceChips() {
       ? selectedSources.size === 0
       : selectedSources.has(c.dataset.source);
     c.classList.toggle("active", active);
+    c.setAttribute("aria-pressed", String(active));
   });
 }
 
@@ -3906,7 +4054,10 @@ function loadSettings() {
   notifyMode = localStorage.getItem("briefdesk.notifyMode") || "off";
   if ($notifyMode) $notifyMode.value = notifyMode;
   hideExpired = localStorage.getItem("briefdesk.hideExpired") === "1";
-  if ($hideExpiredToggle) $hideExpiredToggle.classList.toggle("active", hideExpired);
+  if ($hideExpiredToggle) {
+    $hideExpiredToggle.classList.toggle("active", hideExpired);
+    $hideExpiredToggle.setAttribute("aria-pressed", String(hideExpired));
+  }
 }
 
 function saveSettings() {
@@ -4447,7 +4598,8 @@ function renderFilterBar() {
     const active = c.name === "全部类别" ? !searchFilterCat : searchFilterCat === c.name;
     let dot = "";
     if (c.color) dot = '<span class="filter-dot" style="background:' + escAttr(c.color) + '"></span>';
-    chips += '<button type="button" class="filter-chip' + (active ? " active" : "") + '" data-cat="' + escAttr(c.name) + '">' + dot + esc(c.name) + '</button>';
+    chips += '<button type="button" class="filter-chip' + (active ? " active" : "") +
+      '" aria-pressed="' + active + '" data-cat="' + escAttr(c.name) + '">' + dot + esc(c.name) + '</button>';
   }
   let group = '<select class="filter-range filter-group" aria-label="按来源群过滤">';
   group += '<option value="">全部来源</option>';
@@ -4468,8 +4620,13 @@ function renderFilterBar() {
 // ── 弹窗与同步按钮 ──
 function setSettingsPanel(name) {
   // 二级菜单切换：菜单项高亮 + 面板显隐
+  // 菜单是 <nav> 内的单选导航（互斥、非开关），用 aria-current 而非
+  // aria-pressed：此前只有 .active 高亮，读屏用户无法得知当前在哪一组。
   $settingsMenu.querySelectorAll(".settings-menu-item").forEach(b => {
-    b.classList.toggle("active", b.dataset.panel === name);
+    const on = b.dataset.panel === name;
+    b.classList.toggle("active", on);
+    if (on) b.setAttribute("aria-current", "true");
+    else b.removeAttribute("aria-current");
   });
   $settingsModal.querySelectorAll(".settings-panel").forEach(p => {
     p.classList.toggle("hidden", p.dataset.panel !== name);
@@ -4599,8 +4756,7 @@ function injectPluginScript(name) {
 function closeSettingsModal() {
   $settingsModal.classList.add("hidden");
   syncBodyScrollLock();
-  if (lastModalFocus && document.contains(lastModalFocus)) lastModalFocus.focus();
-  lastModalFocus = null;
+  popModalFocus($settingsModal);
 }
 
 function setSyncButton(busy) {
@@ -4704,8 +4860,13 @@ function applyTheme() {
 function updateThemeChips() {
   if (!$themeToggle) return;
   const mode = localStorage.getItem("briefdesk.theme") || "light";
+  // 三档互斥 ⇒ 语义是单选组而非独立开关，用 role=radio + aria-checked
+  $themeToggle.setAttribute("role", "radiogroup");
   $themeToggle.querySelectorAll(".filter-chip").forEach(c => {
-    c.classList.toggle("active", c.dataset.mode === mode);
+    const on = c.dataset.mode === mode;
+    c.classList.toggle("active", on);
+    c.setAttribute("role", "radio");
+    c.setAttribute("aria-checked", String(on));
   });
 }
 
@@ -4939,6 +5100,7 @@ function exitBatchMode() {
 
 function updateBatchToggle() {
   $batchToggle.classList.toggle("active", batchMode);
+  $batchToggle.setAttribute("aria-pressed", String(batchMode));
 }
 
 function toggleSelect(id, card) {
@@ -5014,11 +5176,14 @@ function openBatchConfirm() {
   $batchConfirmN.textContent = selectedIds.size;
   $batchConfirmModal.classList.remove("hidden");
   syncBodyScrollLock();
+  // 破坏性对话框默认聚焦"取消"，避免盲按 Enter 直接删除
+  pushModalFocus($batchConfirmModal, { initialFocus: document.getElementById("batch-confirm-cancel") });
 }
 
 function closeBatchConfirm() {
   $batchConfirmModal.classList.add("hidden");
   syncBodyScrollLock();
+  popModalFocus($batchConfirmModal);
 }
 
 async function batchApply(action) {
@@ -5041,13 +5206,19 @@ async function batchApply(action) {
 async function openStatusPanel() {
   $statusPopover.innerHTML = '<p class="text-muted">加载中...</p>';
   $statusPopover.classList.remove("hidden");
+  $statusPopover.setAttribute("aria-busy", "true");
+  $statusIndicator.setAttribute("aria-expanded", "true");
   let status = null;
   try {
     const res = await fetch("/api/status");
     if (res.ok) status = await res.json();
   } catch { /* 保持 null */ }
+  $statusPopover.removeAttribute("aria-busy");
   if (!status) {
-    $statusPopover.innerHTML = '<p class="text-muted">状态获取失败</p>';
+    $statusPopover.innerHTML = '<p class="text-muted">状态获取失败</p>' +
+      '<button type="button" class="status-retry" id="status-panel-retry">重试</button>';
+    const retry = document.getElementById("status-panel-retry");
+    if (retry) retry.addEventListener("click", () => { openStatusPanel(); });
     return;
   }
   const sources = Object.entries(status.sources || {});
@@ -5075,6 +5246,7 @@ async function openStatusPanel() {
 
 function closeStatusPanel() {
   $statusPopover.classList.add("hidden");
+  $statusIndicator.setAttribute("aria-expanded", "false");
 }
 
 // ── 分页加载更多 ──
@@ -5273,13 +5445,13 @@ function timeBadgeHtml(item) {
 // ── 主体时间线 ──
 async function openSubjectTimeline(subject, { syncHash: sh = true } = {}) {
   if (!subject) return;
-  lastModalFocus = document.activeElement;
   timeline = { subject: subject, items: [], offset: 0, hasMore: false, count: 0, expandedIds: new Set() };
   $timelineTitle.textContent = subject;
   $timelineList.innerHTML = '<p class=\'text-muted\'>加载中...</p>';
   $timelineLoadMoreWrap.innerHTML = "";
   $timelineModal.classList.remove("hidden");
   syncBodyScrollLock();
+  pushModalFocus($timelineModal, { initialFocus: document.getElementById("timeline-close") });
   if (sh) syncHash("push");
   await loadTimelinePage();
 }
@@ -5289,8 +5461,7 @@ function closeSubjectTimeline({ syncHash: sh = true } = {}) {
   timeline = null;
   $timelineModal.classList.add("hidden");
   syncBodyScrollLock();
-  if (lastModalFocus && document.contains(lastModalFocus)) lastModalFocus.focus();
-  lastModalFocus = null;
+  popModalFocus($timelineModal);
   if (sh) { syncHash("push"); fetchData(); } // 时间线内可能做过处理，收敛主列表
 }
 
@@ -5370,10 +5541,7 @@ async function timelineVerify(id, value, row) {
     } else {
       row.classList.toggle("memo", value === 1);
       row.classList.remove("ignored");
-      const bm = row.querySelector(".btn-memo");
-      const bi = row.querySelector(".btn-ignore");
-      if (bm) { bm.classList.toggle("active", value === 1); bm.textContent = value === 1 ? "移出备忘录" : "加入备忘录"; }
-      if (bi) { bi.classList.toggle("active", false); bi.textContent = "忽略"; }
+      syncVerifyButtons(row, value === 1 ? 1 : 0);
     }
   } catch (err) {
     console.error("Timeline verify error:", err);

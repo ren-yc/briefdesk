@@ -124,7 +124,17 @@
       renderCalendar(calAllItems);
     } catch (err) {
       console.error("Calendar error:", err);
-      $calendarView.innerHTML = '<p class=\'text-muted\'>日历加载失败</p>';
+      // 原先直接 innerHTML 覆盖整个视图，连月份导航一起抹掉：
+      // 加载失败后用户既不能重试也不能切换月份，只能刷新页面。
+      // 改为只替换网格区域，保留头部导航，并提供重试按钮。
+      const grid = $calendarView.querySelector(".cal-grid");
+      const box = '<div class="cal-error" role="alert">' +
+        '<p class="text-muted">日历加载失败</p>' +
+        '<button type="button" class="cal-retry">重试</button></div>';
+      if (grid) grid.outerHTML = box;
+      else $calendarView.innerHTML = renderCalHead() + box;
+      const retry = $calendarView.querySelector(".cal-retry");
+      if (retry) retry.addEventListener("click", loadCalendar);
     }
   }
 
@@ -177,6 +187,22 @@
     return { text: text, expired: timeExpired(e.time) };
   }
 
+  // 头部导航（上月/今天/仅看备忘录/标题/下月/返回列表）。
+  // 抽成 helper 供正常渲染与加载失败态共用：失败时也必须保留可操作的导航。
+  function renderCalHead() {
+    let h = '<div class="cal-head">';
+    h += '<button class="cal-nav" data-nav="prev" title="上月" aria-label="上一个月">‹</button>';
+    h += '<button class="cal-today">今天</button>';
+    h += '<button class="cal-memo-toggle' + (calMemoOnly ? " active" : "") +
+      '" aria-pressed="' + (calMemoOnly ? "true" : "false") +
+      '" title="仅显示备忘录卡片的截止日期">仅看备忘录截止</button>';
+    h += '<span class="cal-title" role="heading" aria-level="2">' + calYear + " 年 " + calMonth + " 月</span>";
+    h += '<button class="cal-nav" data-nav="next" title="下月" aria-label="下一个月">›</button>';
+    h += '<button class="cal-exit">返回列表</button>';
+    h += "</div>";
+    return h;
+  }
+
   function renderCalendar(items) {
     // 「仅看备忘录截止」：只渲染备忘录卡片（is_verified=1）
     if (calMemoOnly) items = items.filter(it => it.is_verified === 1);
@@ -193,14 +219,7 @@
     }
     const todayStr = fmtDate(new Date());
     let html = '';
-    html += '<div class="cal-head">';
-    html += '<button class="cal-nav" data-nav="prev" title="上月">‹</button>';
-    html += '<button class="cal-today">今天</button>';
-    html += '<button class="cal-memo-toggle' + (calMemoOnly ? " active" : "") + '" title="仅显示备忘录卡片的截止日期">仅看备忘录截止</button>';
-    html += '<span class="cal-title">' + calYear + " 年 " + calMonth + " 月</span>";
-    html += '<button class="cal-nav" data-nav="next" title="下月">›</button>';
-    html += '<button class="cal-exit">返回列表</button>';
-    html += "</div>";
+    html += renderCalHead();
     html += '<div class="cal-weekdays">' + ["日", "一", "二", "三", "四", "五", "六"].map(w => "<span>" + w + "</span>").join("") + "</div>";
     html += '<div class="cal-grid">';
     const cur = new Date(gridStart);
