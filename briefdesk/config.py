@@ -47,14 +47,9 @@ class Settings(BaseSettings):
     """设为 true 时，AI 请求会附带 reasoning_effort="none"，
     用于关闭 Qwen3 / Qwen3.5 等模型的思考模式。"""
 
-    # RAG 问答专用模型通道（留空复用 ai_*）：分类/去重/合并用微调模型，
-    # RAG 引用式问答可单独指向通用/云端模型
-    rag_model: str = Field(default="", alias="RAG_MODEL")
-    """RAG 问答专用模型名（留空 = 复用 ai_model）。"""
-    rag_api_base: str = Field(default="", alias="RAG_API_BASE")
-    """RAG 问答专用端点（留空 = 复用 ai_api_base）。"""
-    rag_api_key: SecretStr = Field(default=SecretStr(""), alias="RAG_API_KEY")
-    """RAG 问答专用 API Key（留空 = 复用 ai_api_key）。"""
+    # RAG 问答专用模型通道（RAG_MODEL/RAG_API_BASE/RAG_API_KEY）不在此声明：
+    # `RAG_` 前缀归 rag 插件所有，三项由 briefdesk/plugins/rag/config.py 承载，
+    # 经 ai_ports.rag_chat 的 override 参数下传（见该模块 docstring）。
 
     max_classify_tokens: int = Field(default=8192, alias="MAX_CLASSIFY_TOKENS", gt=0)
 

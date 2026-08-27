@@ -156,6 +156,9 @@ class AIProvider(Protocol):
         *,
         temperature: float,
         max_tokens: int,
+        model: str = "",
+        api_base: str = "",
+        api_key: str = "",
     ) -> ChatResponse: ...
     async def embed_texts(self, texts: list[str]) -> list[list[float]]: ...
     def is_embedding_enabled(self) -> bool: ...

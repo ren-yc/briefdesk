@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, patch
 from pydantic import SecretStr
 
 from briefdesk.config import config
-from briefdesk.plugins.ai_provider.engine import chat, embed_texts
+from briefdesk.plugins.ai_provider.engine import chat, embed_texts, rag_chat
 
 
 def _fake_client():
@@ -60,6 +60,74 @@ class ChatThinkingSwitchTest(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("response_format", kwargs)
         self.assertEqual(kwargs["temperature"], 0.1)
         self.assertEqual(kwargs["max_tokens"], 64)
+
+
+class AltChannelClientTest(unittest.TestCase):
+    """备用通道客户端：按 (base_url, api_key) 缓存；两项全空回退主客户端。"""
+
+    def setUp(self) -> None:
+        from briefdesk.plugins.ai_provider import engine
+
+        self._engine = engine
+        engine._alt_clients.clear()
+        self.addCleanup(engine._alt_clients.clear)
+
+    def test_empty_overrides_return_main_client(self) -> None:
+        client, _ = _fake_client()
+        with patch(
+            "briefdesk.plugins.ai_provider.engine.get_ai_client", return_value=client
+        ):
+            self.assertIs(self._engine.get_alt_client("", ""), client)
+        self.assertEqual(self._engine._alt_clients, {})
+
+    def test_same_override_pair_reuses_one_instance(self) -> None:
+        with patch.object(config, "ai_api_key", SecretStr("main-key")), patch.object(
+            config, "ai_api_base", "https://main.invalid/v1"
+        ):
+            first = self._engine.get_alt_client("https://alt.invalid/v1", "alt-key")
+            second = self._engine.get_alt_client("https://alt.invalid/v1", "alt-key")
+            third = self._engine.get_alt_client("https://other.invalid/v1", "alt-key")
+        self.assertIs(first, second)
+        self.assertIsNot(first, third)
+        self.assertEqual(len(self._engine._alt_clients), 2)
+
+    def test_single_override_falls_back_per_item(self) -> None:
+        """只给 api_key 时 base 回退主配置（"只换 Key 不换端点"）。"""
+        with patch.object(config, "ai_api_key", SecretStr("main-key")), patch.object(
+            config, "ai_api_base", "https://main.invalid/v1"
+        ):
+            self._engine.get_alt_client("", "alt-key")
+        self.assertIn(("https://main.invalid/v1", "alt-key"), self._engine._alt_clients)
+
+
+class RagChatModelFallbackTest(unittest.IsolatedAsyncioTestCase):
+    """rag_chat 的 model override：留空回退 ai_model，给值则原样使用。"""
+
+    async def test_empty_model_falls_back_to_ai_model(self):
+        client, create = _fake_client()
+        with patch(
+            "briefdesk.plugins.ai_provider.engine.get_alt_client", return_value=client
+        ), patch.object(config, "ai_disable_thinking", False), patch.object(
+            config, "ai_model", "deepseek-v4-flash"
+        ):
+            await rag_chat([], temperature=0.2, max_tokens=128)
+
+        _, kwargs = create.call_args
+        self.assertEqual(kwargs["model"], "deepseek-v4-flash")
+
+    async def test_explicit_model_is_used(self):
+        client, create = _fake_client()
+        with patch(
+            "briefdesk.plugins.ai_provider.engine.get_alt_client", return_value=client
+        ), patch.object(config, "ai_disable_thinking", False), patch.object(
+            config, "ai_model", "deepseek-v4-flash"
+        ):
+            await rag_chat([], temperature=0.2, max_tokens=128, model="qwen-plus")
+
+        _, kwargs = create.call_args
+        self.assertEqual(kwargs["model"], "qwen-plus")
+        # 问答走正文，不强制 JSON 外壳
+        self.assertNotIn("response_format", kwargs)
 
 
 class ChatJsonObjectTest(unittest.IsolatedAsyncioTestCase):

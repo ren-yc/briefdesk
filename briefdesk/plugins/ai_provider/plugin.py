@@ -41,9 +41,18 @@ class AiProviderPlugin(Plugin, AIProvider):
         assert self._provider is not None
         return await self._provider.chat(messages, temperature=temperature, max_tokens=max_tokens)
 
-    async def rag_chat(self, messages, *, temperature, max_tokens):
+    async def rag_chat(
+        self, messages, *, temperature, max_tokens, model="", api_base="", api_key=""
+    ):
         assert self._provider is not None
-        return await self._provider.rag_chat(messages, temperature=temperature, max_tokens=max_tokens)
+        return await self._provider.rag_chat(
+            messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            model=model,
+            api_base=api_base,
+            api_key=api_key,
+        )
 
     async def embed_texts(self, texts):
         assert self._provider is not None

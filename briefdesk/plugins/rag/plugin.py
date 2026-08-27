@@ -67,9 +67,15 @@ class RagPlugin(StagePlugin, WebPlugin):
                 "backfill_budget_per_cycle": "单轮回填预算",
                 "group_only": "仅限群聊",
                 "maintenance_interval_seconds": "维护间隔（秒）",
+                "model": "问答专用模型",
+                "api_base": "问答专用 API 地址",
+                "api_key": "问答专用 API Key",
             },
             hints={
                 "backfill_days": "0 = 关闭回填；-1 = 全量回填",
+                "model": "留空 = 复用主链路 AI_MODEL（分类/去重用的微调模型）",
+                "api_base": "留空 = 复用主链路 AI_API_BASE",
+                "api_key": "留空 = 复用主链路 AI_API_KEY；密钥只保存到系统钥匙串，不会写入暂存文件",
             },
         )
 

@@ -1064,17 +1064,59 @@ class RagChatRoutingTest(unittest.IsolatedAsyncioTestCase):
 
             async def chat(self, messages, *, temperature, max_tokens):
                 self.used = "chat"
-                return None
 
-            async def rag_chat(self, messages, *, temperature, max_tokens):
+            async def rag_chat(
+                self, messages, *, temperature, max_tokens,
+                model="", api_base="", api_key="",
+            ):
                 self.used = "rag"
-                return None
 
         p = _Provider()
         ai_ports.set_ai(p)  # type: ignore[arg-type]
         try:
             await ai_ports.rag_chat([{"role": "user", "content": "x"}])
             self.assertEqual(p.used, "rag")
+        finally:
+            ai_ports.set_ai(None)
+
+    async def test_forwards_channel_overrides_to_provider(self):
+        """override 三元组由调用方下传，端口原样转发给供应商。"""
+        from briefdesk import ai_ports
+
+        class _Provider:
+            def __init__(self):
+                self.seen: dict | None = None
+
+            async def chat(self, messages, *, temperature, max_tokens):
+                raise AssertionError("不应回退 chat")
+
+            async def rag_chat(
+                self, messages, *, temperature, max_tokens,
+                model="", api_base="", api_key="",
+            ):
+                self.seen = {
+                    "model": model,
+                    "api_base": api_base,
+                    "api_key": api_key,
+                }
+
+        p = _Provider()
+        ai_ports.set_ai(p)  # type: ignore[arg-type]
+        try:
+            await ai_ports.rag_chat(
+                [{"role": "user", "content": "x"}],
+                model="qwen-plus",
+                api_base="https://example.invalid/v1",
+                api_key="rag-key",
+            )
+            self.assertEqual(
+                p.seen,
+                {
+                    "model": "qwen-plus",
+                    "api_base": "https://example.invalid/v1",
+                    "api_key": "rag-key",
+                },
+            )
         finally:
             ai_ports.set_ai(None)
 
@@ -1087,12 +1129,39 @@ class RagChatRoutingTest(unittest.IsolatedAsyncioTestCase):
 
             async def chat(self, messages, *, temperature, max_tokens):
                 self.used = "chat"
-                return None
 
         p = _OldProvider()
         ai_ports.set_ai(p)  # type: ignore[arg-type]
         try:
             await ai_ports.rag_chat([{"role": "user", "content": "x"}])
             self.assertEqual(p.used, "chat")
+        finally:
+            ai_ports.set_ai(None)
+
+    async def test_fallback_drops_overrides_without_error(self):
+        """旧供应商无专用通道概念：回退 chat 时静默丢弃 override，不得抛错。
+
+        守住 ai_ports.rag_chat docstring 里写明的行为——回退路径按主通道应答。
+        """
+        from briefdesk import ai_ports
+
+        class _OldProvider:
+            def __init__(self):
+                self.kwargs: dict | None = None
+
+            async def chat(self, messages, *, temperature, max_tokens):
+                self.kwargs = {"temperature": temperature, "max_tokens": max_tokens}
+
+        p = _OldProvider()
+        ai_ports.set_ai(p)  # type: ignore[arg-type]
+        try:
+            await ai_ports.rag_chat(
+                [{"role": "user", "content": "x"}],
+                model="qwen-plus",
+                api_base="https://example.invalid/v1",
+                api_key="rag-key",
+            )
+            # chat 只收到通用参数，override 未泄漏为未知 kwarg（否则 TypeError）
+            self.assertEqual(p.kwargs, {"temperature": 0.2, "max_tokens": 1024})
         finally:
             ai_ports.set_ai(None)

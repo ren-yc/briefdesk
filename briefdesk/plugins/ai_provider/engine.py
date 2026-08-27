@@ -20,7 +20,10 @@ from briefdesk.plugin.base import AIProvider, ChatResponse
 _client: AsyncOpenAI | None = None
 _ai_semaphore: asyncio.Semaphore | None = None
 _embed_client: AsyncOpenAI | None = None
-_rag_client: AsyncOpenAI | None = None
+# 备用通道客户端缓存：键为 (base_url, api_key)。调用方（如 rag 插件）从自己的
+# 配置域传入 override，同一组合复用同一实例，避免逐次调用重建连接池。
+# 与 _client/_embed_client 同为模块级惰性缓存，不额外引入生命周期管理。
+_alt_clients: dict[tuple[str, str], AsyncOpenAI] = {}
 
 
 def get_ai_client() -> AsyncOpenAI:
@@ -34,16 +37,22 @@ def get_ai_client() -> AsyncOpenAI:
     return _client
 
 
-def get_rag_client() -> AsyncOpenAI:
-    """RAG 专用 AsyncOpenAI 实例（RAG_MODEL/RAG_API_BASE/RAG_API_KEY 覆盖，回退 ai_*）。"""
-    global _rag_client
-    if _rag_client is None:
-        key = config.rag_api_key.get_secret_value() or config.ai_api_key.get_secret_value()
-        _rag_client = AsyncOpenAI(
-            api_key=key,
-            base_url=config.rag_api_base or config.ai_api_base,
-        )
-    return _rag_client
+def get_alt_client(api_base: str = "", api_key: str = "") -> AsyncOpenAI:
+    """按 override 取备用通道客户端；两项都留空即返回主 AI 客户端。
+
+    本函数只提供「换端点/换 Key」的机制，不知道调用方是谁——具体取值由调用
+    方从自己的配置域传入（rag 插件传 RAG_API_BASE/RAG_API_KEY）。单项留空即
+    该项回退主 AI 配置，便于「只换模型不换端点」这类组合。
+    """
+    base = api_base or config.ai_api_base
+    key = api_key or config.ai_api_key.get_secret_value()
+    if not api_base and not api_key:
+        return get_ai_client()
+    cached = _alt_clients.get((base, key))
+    if cached is None:
+        cached = AsyncOpenAI(api_key=key, base_url=base)
+        _alt_clients[(base, key)] = cached
+    return cached
 
 
 def get_ai_semaphore() -> asyncio.Semaphore | None:
@@ -128,26 +137,32 @@ async def rag_chat(
     *,
     temperature: float = 0.2,
     max_tokens: int = 1024,
+    model: str = "",
+    api_base: str = "",
+    api_key: str = "",
 ) -> ChatCompletion:
-    """RAG 问答专用入口：模型/端点/Key 可用 RAG_* 覆盖，全部留空则与 chat 同源。
+    """RAG 问答专用入口：模型/端点/Key 由调用方传入，留空逐项回退主 AI 配置。
+
+    override 取值由调用方（rag 插件）从自己的配置域给出，本模块不读 `RAG_*`
+    ——避免 ai_provider 反向依赖依赖它的插件。
 
     与 chat 的差异：不强制 JSON 外壳（问答为正文；引用由 RAG prompt 约束）；
     仍遵守 ai_disable_thinking 与并发信号量。
     """
-    client = get_rag_client()
-    model = config.rag_model or config.ai_model
+    client = get_alt_client(api_base, api_key)
+    chat_model = model or config.ai_model
 
     async def _create() -> ChatCompletion:
         if config.ai_disable_thinking:
             return await client.chat.completions.create(
-                model=model,
+                model=chat_model,
                 messages=messages,
                 temperature=temperature,
                 max_tokens=max_tokens,
                 reasoning_effort="none",
             )
         return await client.chat.completions.create(
-            model=model,
+            model=chat_model,
             messages=messages,
             temperature=temperature,
             max_tokens=max_tokens,
@@ -251,6 +266,9 @@ class Provider(AIProvider):
         *,
         temperature: float,
         max_tokens: int,
+        model: str = "",
+        api_base: str = "",
+        api_key: str = "",
     ) -> ChatResponse:
         return cast(
             ChatResponse,
@@ -258,6 +276,9 @@ class Provider(AIProvider):
                 cast(list[ChatCompletionMessageParam], messages),
                 temperature=temperature,
                 max_tokens=max_tokens,
+                model=model,
+                api_base=api_base,
+                api_key=api_key,
             ),
         )
 

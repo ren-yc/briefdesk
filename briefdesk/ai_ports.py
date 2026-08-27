@@ -1,9 +1,10 @@
 """AI 供应商端口 — ai_provider 插件在 setup 阶段注册实例，
 引擎（classify/dedup/merge）经本模块端口函数调用，核心不依赖具体供应商实现。
 
-- chat / embed_texts / is_embedding_enabled / embed_model_name：转发到
-  已注册的 AIProvider 实例（未注册时 chat/embed 抛 RuntimeError 明示
-  配置错误，启用性检查安全返回 False）；
+- chat / rag_chat / embed_texts / is_embedding_enabled / embed_model_name：
+  转发到已注册的 AIProvider 实例（未注册时 chat/embed 抛 RuntimeError 明示
+  配置错误，启用性检查安全返回 False）；`rag_chat` 额外接受 model/api_base/
+  api_key override，由调用方从自己的配置域下传（见该函数 docstring）；
 - loads_json / top_k_similar：供应商无关的纯工具（JSON 修复解析、
   余弦 Top-K 候选选择）。
 
@@ -55,17 +56,31 @@ async def rag_chat(
     *,
     temperature: float = 0.2,
     max_tokens: int = 1024,
+    model: str = "",
+    api_base: str = "",
+    api_key: str = "",
 ) -> ChatResponse:
-    """RAG 问答专用端口：模型/端点/Key 由 RAG_* 配置覆盖（留空复用主 AI）。
+    """RAG 问答专用端口：模型/端点/Key 由调用方以 override 参数传入。
 
-    供应商未实现 rag_chat（旧实现/测试桩）时回退复用 chat 端口。
+    override 三元组由调用方（rag 插件）从**自己的**配置域取值下传——`RAG_`
+    前缀归 rag 插件所有，核心与 ai_provider 都不读它，故不存在核心配置对
+    插件命名空间的侵占，ai_provider 也无需反向依赖 rag 插件。三项留空即
+    复用主 AI 通道（与 chat 同源）。
+
+    供应商未实现 rag_chat（旧实现/测试桩）时回退复用 chat 端口。注意此路径
+    **静默丢弃 override**：旧供应商没有专用通道的概念，只能按主通道应答。
     """
     ai = _require_ai()
     # 类级检测：Mock/旧实现等实例级动态属性（__getattr__）不视为实现了 rag_chat，
     # 只有真正声明该方法的供应商类才走专用通道，否则回退复用 chat。
     if hasattr(type(ai), "rag_chat"):
         return await ai.rag_chat(  # type: ignore[attr-defined]
-            messages, temperature=temperature, max_tokens=max_tokens
+            messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            model=model,
+            api_base=api_base,
+            api_key=api_key,
         )
     return await ai.chat(messages, temperature=temperature, max_tokens=max_tokens)
 

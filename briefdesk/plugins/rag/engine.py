@@ -559,7 +559,15 @@ class RagEngine:
             datetime.now(UTC).astimezone(), question.strip(), hits, history or [],
             self.settings.evidence_chars,
         )
-        resp = await ai_ports.rag_chat(messages, temperature=0.2, max_tokens=1024)
+        # 问答模型通道 override 来自本插件配置域（三项留空 = 复用主链路 AI）
+        resp = await ai_ports.rag_chat(
+            messages,
+            temperature=0.2,
+            max_tokens=1024,
+            model=self.settings.model,
+            api_base=self.settings.api_base,
+            api_key=self.settings.api_key.get_secret_value(),
+        )
         content = ""
         if getattr(resp, "choices", None):
             content = (resp.choices[0].message.content or "").strip()
