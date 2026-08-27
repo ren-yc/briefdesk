@@ -27,6 +27,9 @@ class AiProviderPlugin(Plugin, AIProvider):
         ai_ports.set_ai(provider)
         ctx.ai = provider
         self._provider = provider
+        # 嵌入未启用属持续性条件：setup 时按配置置位/撤销公告（可达性由
+        # 运行时 embed 调用失败/成功探测，见 engine.embed_texts）
+        await ai_engine.announce_embedding_state()
 
     async def activate(self, ctx: PluginContext) -> None: ...
 

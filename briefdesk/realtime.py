@@ -1,8 +1,8 @@
 """进程内实时事件分发（后端任务 -> 前端 SSE）。
 
 订阅队列项为 (事件名, data JSON 字符串) 二元组：api_stream 依事件名生成
-`event: <name>` 的 SSE 帧，从而支持 items_updated（列表刷新）与
-sync_progress（同步进度事件）两类事件。
+`event: <name>` 的 SSE 帧，从而支持 items_updated（列表刷新）、
+sync_progress（同步进度事件）与 announcements_updated（公告增删）三类事件。
 """
 
 import asyncio
@@ -77,3 +77,8 @@ async def publish_items_updated(payload: dict | None = None) -> None:
 async def publish_sync_progress(payload: dict | None = None) -> None:
     """同步进度事件：携带 SyncProgress 快照，驱动前端状态胶囊的进度展示。"""
     await _publish("sync_progress", payload)
+
+
+async def publish_announcements_updated(payload: dict | None = None) -> None:
+    """公告增删事件：携带公告快照，驱动前端公告条即时刷新。"""
+    await _publish("announcements_updated", payload)

@@ -13,6 +13,7 @@ from openai import AsyncOpenAI
 from openai.types import CreateEmbeddingResponse
 from openai.types.chat import ChatCompletion, ChatCompletionMessageParam
 
+from briefdesk import announcements
 from briefdesk.ai_ports import loads_json, top_k_similar  # noqa: F401 — re-export
 from briefdesk.config import config
 from briefdesk.plugin.base import AIProvider, ChatResponse
@@ -206,8 +207,54 @@ def get_embed_client() -> AsyncOpenAI:
     return _embed_client
 
 
+# 公告 code：嵌入持续性条件的顶部横幅（注册表见 briefdesk.announcements）
+_ANNOUNCE_EMBEDDING_DISABLED = "embedding_disabled"
+_ANNOUNCE_EMBEDDING_UNREACHABLE = "embedding_unreachable"
+
+_EMBEDDING_DISABLED_MESSAGE = (
+    "嵌入模型未启用（EMBED_API_BASE 未配置）：RAG 向量检索不可用，语义去重降级"
+    "为字符重叠。可在 .env 配置 EMBED_API_BASE / EMBED_MODEL 后重启应用生效。"
+)
+
+
+def _embedding_unreachable_message() -> str:
+    return (
+        f"嵌入服务不可用或异常（{embed_api_base()}，模型 {embed_model_name()}）："
+        "RAG 向量检索与向量去重暂时降级；服务恢复后本公告自动消失。"
+    )
+
+
+async def announce_embedding_state() -> None:
+    """setup 钩子：按嵌入配置置位/撤销"未启用"公告（可达性由运行时探测）。"""
+    if is_embedding_enabled():
+        await announcements.revoke(_ANNOUNCE_EMBEDDING_DISABLED)
+    else:
+        await announcements.announce(
+            _ANNOUNCE_EMBEDDING_DISABLED, "warning", _EMBEDDING_DISABLED_MESSAGE
+        )
+
+
+async def _announce_embed_failure() -> None:
+    """嵌入调用失败时的公告分流：已配置 → 不可达；未配置 → 归入未启用。"""
+    if is_embedding_enabled():
+        await announcements.announce(
+            _ANNOUNCE_EMBEDDING_UNREACHABLE,
+            "warning",
+            _embedding_unreachable_message(),
+        )
+    else:
+        await announcements.announce(
+            _ANNOUNCE_EMBEDDING_DISABLED, "warning", _EMBEDDING_DISABLED_MESSAGE
+        )
+
+
 async def embed_texts(texts: list[str]) -> list[list[float]]:
-    """批量嵌入文本，返回与输入同序的向量列表。按 EMBED_BATCH_SIZE 分批。"""
+    """批量嵌入文本，返回与输入同序的向量列表。按 EMBED_BATCH_SIZE 分批。
+
+    失败/恢复联动公告（所有嵌入调用方的唯一咽喉）：任一异常置位
+    embedding_unreachable（EMBED_API_BASE 未配置时归入 embedding_disabled），
+    全部成功撤销——公告随条件自动出现与消失。
+    """
     if not texts:
         return []
     batch_size = max(1, config.embed_batch_size)
@@ -217,24 +264,29 @@ async def embed_texts(texts: list[str]) -> list[list[float]]:
     async def _create(chunk: list[str]) -> CreateEmbeddingResponse:
         return await client.embeddings.create(model=embed_model_name(), input=chunk)
 
-    results: list[list[float]] = []
-    for i in range(0, len(texts), batch_size):
-        chunk = texts[i : i + batch_size]
-        if sem is None:
-            resp = await _create(chunk)
-        else:
-            async with sem:
+    try:
+        results: list[list[float]] = []
+        for i in range(0, len(texts), batch_size):
+            chunk = texts[i : i + batch_size]
+            if sem is None:
                 resp = await _create(chunk)
-        # 按 index 排序保证与输入同序（防御性）
-        ordered = sorted(resp.data, key=lambda d: d.index)
-        if len(ordered) != len(chunk):
-            # 数量不符即整批失败（调用方 preembed_batch 已有整批回退路径）：
-            # 少返时后续文本向量整体错位，错位一旦 upsert 进 item_embeddings
-            # （按 item_id 持久化）将永久污染余弦通道且重启不自愈
-            raise ValueError(
-                f"嵌入返回数量不符：请求 {len(chunk)} 条，实际 {len(ordered)} 条"
-            )
-        results.extend(d.embedding for d in ordered)
+            else:
+                async with sem:
+                    resp = await _create(chunk)
+            # 按 index 排序保证与输入同序（防御性）
+            ordered = sorted(resp.data, key=lambda d: d.index)
+            if len(ordered) != len(chunk):
+                # 数量不符即整批失败（调用方 preembed_batch 已有整批回退路径）：
+                # 少返时后续文本向量整体错位，错位一旦 upsert 进 item_embeddings
+                # （按 item_id 持久化）将永久污染余弦通道且重启不自愈
+                raise ValueError(
+                    f"嵌入返回数量不符：请求 {len(chunk)} 条，实际 {len(ordered)} 条"
+                )
+            results.extend(d.embedding for d in ordered)
+    except Exception:
+        await _announce_embed_failure()
+        raise
+    await announcements.revoke(_ANNOUNCE_EMBEDDING_UNREACHABLE)
     return results
 
 

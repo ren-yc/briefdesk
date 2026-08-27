@@ -12,6 +12,7 @@
 from datetime import UTC, datetime
 from typing import TypedDict
 
+from briefdesk.announcements import get_announcements
 from briefdesk.sources_base import RealtimeListener, SourceClient
 
 
@@ -164,4 +165,5 @@ def get_status_info() -> dict:
         "lastWarning": _app_status["lastWarning"] or None,
         "syncing": _app_status["syncing"],
         "syncProgress": get_sync_progress(),
+        "announcements": get_announcements(),
     }

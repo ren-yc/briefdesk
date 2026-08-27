@@ -1549,6 +1549,11 @@ function connectRealtimeStream() {
     try { renderSyncProgress(JSON.parse(ev.data || "{}")); } catch { /* 忽略 */ }
   });
 
+  // 公告：嵌入不可用等持续条件（后端条件解除自动撤销，前端即时刷新）
+  stream.addEventListener("announcements_updated", (ev) => {
+    try { renderAnnouncements((JSON.parse(ev.data || "{}")).announcements || []); } catch { /* 忽略 */ }
+  });
+
   stream.addEventListener("error", () => {
     if (stream) {
       stream.close();
@@ -1729,6 +1734,7 @@ async function fetchData() {
     // 全部目标页成功后再原子更新列表状态，避免刷新中途失败留下半套数据。
     applySidebarData(data);
     renderStatusBanner(data.status);
+    renderAnnouncements(data.status && data.status.announcements);
     hasMore = !!pageData.hasMore;
     nextOffset = offset;
     loadedPageCount = pagesFetched;
@@ -3489,6 +3495,40 @@ function renderStatusBanner(status) {
       const link = document.getElementById("settings-link-top");
       if (link) link.click();
     }
+  });
+}
+
+// ── 公告条：持续条件通知（嵌入未启用/不可用等），条件解除自动消失 ──
+// 数据两路：/api/status.announcements（fetchData 轮询兜底）+
+// announcements_updated SSE（增删即时推送）。× 仅本会话隐藏；
+// 后端撤销公告后前端自然清除，不做本地过期推断。
+const _dismissedAnnouncements = new Set();
+
+function renderAnnouncements(announcements) {
+  const box = document.getElementById("announcements");
+  if (!box) return;
+  const list = (announcements || []).filter(
+    a => a && a.message && !_dismissedAnnouncements.has(a.code)
+  );
+  if (!list.length) {
+    box.classList.add("hidden");
+    box.innerHTML = "";
+    return;
+  }
+  box.classList.remove("hidden");
+  box.innerHTML = list.map(a =>
+    '<div class="error-banner warning" data-code="' + esc(a.code || "") + '">' +
+    '<span class="error-banner-text">' + esc(a.message) + '</span>' +
+    '<button type="button" class="error-banner-close" title="关闭" aria-label="关闭">×</button>' +
+    '</div>'
+  ).join("");
+  box.querySelectorAll(".error-banner-close").forEach(btn => {
+    btn.addEventListener("click", () => {
+      const banner = btn.closest(".error-banner");
+      if (banner && banner.dataset.code) _dismissedAnnouncements.add(banner.dataset.code);
+      banner.remove();
+      if (!box.querySelector(".error-banner")) box.classList.add("hidden");
+    });
   });
 }
 

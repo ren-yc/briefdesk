@@ -95,6 +95,8 @@
         </div>
         <!-- 错误/警告横幅：同步失败、阶段缺失等状态提示（数据来自 /api/status） -->
         <div id="error-banner" class="error-banner hidden" role="alert"></div>
+        <!-- 公告条：持续条件通知（如嵌入服务未启用/不可用），条件解除自动消失 -->
+        <div id="announcements" class="hidden"></div>
         <!-- 骨架屏对读屏用户是三个空 div，毫无"正在加载"语义：
              aria-busy + 视觉隐藏文本让加载状态可被朗读 -->
         <div id="loading-state" class="skeleton-container" role="status" aria-busy="true" aria-live="polite">

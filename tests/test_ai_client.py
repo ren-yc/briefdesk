@@ -216,5 +216,115 @@ class EmbedBatchCountTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(got, [[0.1], [0.2]])
 
 
+class EmbedAnnouncementTest(unittest.IsolatedAsyncioTestCase):
+    """嵌入公告联动：失败置位 embedding_unreachable、成功撤销、未配置归 disabled。"""
+
+    def setUp(self) -> None:
+        from briefdesk import announcements
+
+        self.announcements = announcements
+        announcements.reset_announcements()
+        self.addCleanup(announcements.reset_announcements)
+
+    def _embed_client(self, *, error: Exception | None = None):
+        create = AsyncMock(
+            return_value=SimpleNamespace(
+                data=[SimpleNamespace(index=0, embedding=[0.1])]
+            )
+        )
+        if error is not None:
+            create.side_effect = error
+        return SimpleNamespace(embeddings=SimpleNamespace(create=create))
+
+    def _patches(self, client, *, embed_base: str):
+        return (
+            patch(
+                "briefdesk.plugins.ai_provider.engine.get_embed_client",
+                return_value=client,
+            ),
+            patch.object(config, "embed_batch_size", 10),
+            patch.object(config, "ai_max_concurrency", 0),
+            patch.object(config, "embed_api_base", embed_base),
+            patch.object(config, "embed_model", "bge-m3"),
+        )
+
+    async def test_failure_announces_unreachable_and_reraises(self):
+        client = self._embed_client(error=RuntimeError("connection refused"))
+        p = self._patches(client, embed_base="http://embed.invalid/v1")
+        with p[0], p[1], p[2], p[3], p[4], self.assertRaises(RuntimeError):
+            await embed_texts(["a"])
+        items = self.announcements.get_announcements()
+        self.assertEqual([x["code"] for x in items], ["embedding_unreachable"])
+        self.assertEqual(items[0]["level"], "warning")
+        self.assertIn("http://embed.invalid/v1", items[0]["message"])
+
+    async def test_success_revokes_stale_announcement(self):
+        client = self._embed_client()
+        p = self._patches(client, embed_base="http://embed.invalid/v1")
+        await self.announcements.announce("embedding_unreachable", "warning", "stale")
+        with p[0], p[1], p[2], p[3], p[4]:
+            await embed_texts(["a"])
+        self.assertEqual(self.announcements.get_announcements(), [])
+
+    async def test_failure_when_disabled_announces_disabled_not_unreachable(self):
+        client = self._embed_client(error=RuntimeError("boom"))
+        p = self._patches(client, embed_base="")
+        with p[0], p[1], p[2], p[3], p[4], self.assertRaises(RuntimeError):
+            await embed_texts(["a"])
+        self.assertEqual(
+            [x["code"] for x in self.announcements.get_announcements()],
+            ["embedding_disabled"],
+        )
+
+
+class PluginSetupAnnouncementTest(unittest.IsolatedAsyncioTestCase):
+    """ai_provider setup：按嵌入配置置位/撤销 embedding_disabled 公告。"""
+
+    def setUp(self) -> None:
+        from briefdesk import announcements
+
+        self.announcements = announcements
+        announcements.reset_announcements()
+        self.addCleanup(announcements.reset_announcements)
+
+    async def _setup_plugin(self, *, embed_base: str):
+        from briefdesk.plugin.base import PluginContext
+        from briefdesk.plugins.ai_provider.plugin import AiProviderPlugin
+
+        plugin = AiProviderPlugin()
+        try:
+            with patch.object(config, "embed_api_base", embed_base):
+                await plugin.setup(
+                    PluginContext(
+                        config=config,
+                        publish_event=AsyncMock(),
+                        subscribe_event=lambda *a, **k: None,
+                        register_source=lambda *a, **k: None,
+                        register_stage=lambda *a, **k: None,
+                    )
+                )
+        except BaseException:
+            await plugin.teardown()
+            raise
+        return plugin
+
+    async def test_setup_without_embed_announces_disabled(self):
+        plugin = await self._setup_plugin(embed_base="")
+        try:
+            self.assertEqual(
+                [x["code"] for x in self.announcements.get_announcements()],
+                ["embedding_disabled"],
+            )
+        finally:
+            await plugin.teardown()
+
+    async def test_setup_with_embed_does_not_announce_disabled(self):
+        plugin = await self._setup_plugin(embed_base="http://embed.invalid/v1")
+        try:
+            self.assertEqual(self.announcements.get_announcements(), [])
+        finally:
+            await plugin.teardown()
+
+
 if __name__ == "__main__":
     unittest.main()
