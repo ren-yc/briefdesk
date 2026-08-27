@@ -101,6 +101,7 @@ _SECRET_LABELS = {
     "WEFLOW_LEGACY_API_TOKEN": "WeFlow Legacy 访问令牌",
     "QQFLOW_API_TOKEN": "qqflow 访问令牌",
     "QQFLOW_KEY": "qqflow 引导密钥",
+    "RAG_API_KEY": "RAG 问答 API Key",
 }
 
 

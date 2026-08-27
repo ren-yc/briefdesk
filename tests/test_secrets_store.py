@@ -155,16 +155,21 @@ class KeyringPriorityChainTest(KeyringTestCase):
 
     def test_plugin_settings_read_keyring(self) -> None:
         from briefdesk.plugins.qqflow.config import QqFlowSettings
+        from briefdesk.plugins.rag.config import RagSettings
         from briefdesk.plugins.weflow_legacy.config import WeFlowLegacySettings
 
         self._seed("WEFLOW_LEGACY_API_TOKEN", "weflow-ring-token")
         self._seed("QQFLOW_API_TOKEN", "qqflow-ring-token")
         self._seed("QQFLOW_KEY", "qqflow-ring-key")
+        self._seed("RAG_API_KEY", "rag-ring-key")
         weflow = WeFlowLegacySettings()
         qqflow = QqFlowSettings()
+        rag = RagSettings()
         self.assertEqual(weflow.api_token.get_secret_value(), "weflow-ring-token")
         self.assertEqual(qqflow.api_token.get_secret_value(), "qqflow-ring-token")
         self.assertEqual(qqflow.key.get_secret_value(), "qqflow-ring-key")
+        # rag 问答通道密钥归插件声明域，与上面两个源插件同机制
+        self.assertEqual(rag.api_key.get_secret_value(), "rag-ring-key")
 
     def test_plugin_settings_env_wins_when_keyring_empty(self) -> None:
         from briefdesk.plugins.weflow_legacy.config import WeFlowLegacySettings

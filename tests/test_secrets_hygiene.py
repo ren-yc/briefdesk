@@ -1,7 +1,7 @@
 """密钥卫生守卫：Settings 的 repr/str/model_dump 不得泄露密钥明文。
 
-覆盖 app 级配置（briefdesk/config.py）与两个消息源专属配置
-（weflow-legacy/qqflow 的 config.py）：字段以 SecretStr 持有后，任何
+覆盖 app 级配置（briefdesk/config.py）与各插件专属配置（weflow-legacy /
+qqflow 消息源、rag 问答通道的 config.py）：字段以 SecretStr 持有后，任何
 repr/str/序列化输出都必须只剩掩码，明文只能经 get_secret_value() 取用。
 """
 
@@ -45,6 +45,15 @@ class PluginSettingsHygieneTest(unittest.TestCase):
         )
         self.assertNotIn("q-" + _DUMMY_KEY, str(settings))
         self.assertNotIn("k-" + _DUMMY_KEY, str(settings))
+
+    def test_rag_settings_mask_api_key(self) -> None:
+        from briefdesk.plugins.rag.config import RagSettings
+
+        settings = RagSettings(api_key="r-" + _DUMMY_KEY)
+        self.assertNotIn("r-" + _DUMMY_KEY, repr(settings))
+        self.assertNotIn("r-" + _DUMMY_KEY, str(settings))
+        self.assertNotIn("r-" + _DUMMY_KEY, str(settings.model_dump()))
+        self.assertEqual(settings.api_key.get_secret_value(), "r-" + _DUMMY_KEY)
 
 
 if __name__ == "__main__":

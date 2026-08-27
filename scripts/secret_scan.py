@@ -25,6 +25,7 @@ _KNOWN_SECRET_ENV = (
     "WEFLOW_LEGACY_API_TOKEN",
     "QQFLOW_API_TOKEN",
     "QQFLOW_KEY",
+    "RAG_API_KEY",
 )
 
 _PATTERNS: list[tuple[re.Pattern[str], str]] = [

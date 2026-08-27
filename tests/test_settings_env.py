@@ -190,7 +190,7 @@ class EnvRoutesTest(StagedFileTestCase):
             self.assertIn(item["source"], ("default", "dotenv", "env", "override"))
             self.assertIn("current", item)
             self.assertIn("staged", item)
-        self.assertEqual(len(data["secrets"]), 10)
+        self.assertEqual(len(data["secrets"]), 11)
         self.assertEqual(
             {s["name"] for s in data["secrets"]},
             {
@@ -204,6 +204,8 @@ class EnvRoutesTest(StagedFileTestCase):
                 "WEFLOW_LEGACY_API_TOKEN",
                 "QQFLOW_API_TOKEN",
                 "QQFLOW_KEY",
+                # rag 插件密钥（RAG_ 前缀归插件域，与 WEFLOW_/QQFLOW_ 同级）
+                "RAG_API_KEY",
             },
         )
 

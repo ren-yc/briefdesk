@@ -35,6 +35,7 @@ SECRET_NAMES = (
     "WEFLOW_LEGACY_API_TOKEN",
     "QQFLOW_API_TOKEN",
     "QQFLOW_KEY",
+    "RAG_API_KEY",
 )
 
 
