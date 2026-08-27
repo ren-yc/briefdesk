@@ -93,6 +93,11 @@ _CORE_SECRET_SCHEMA = [item for item in _CORE_SCHEMA if item.get("secret")]
 _SECRET_LABELS = {
     "AI_API_KEY": "AI API Key",
     "EMBED_API_KEY": "嵌入 API Key",
+    "WEFLOW_API_TOKEN": "weflow 访问令牌",
+    "WEFLOW_IMG_AES_KEY": "weflow 图片 AES 解密密钥",
+    "WEFLOW_IMG_XOR_KEY": "weflow 图片 XOR 解密密钥",
+    "WEFLOW_DB_KEYS": "weflow 库密钥映射（JSON 前半）",
+    "WEFLOW_DB_KEYS_2": "weflow 库密钥映射（JSON 后半）",
     "WEFLOW_LEGACY_API_TOKEN": "WeFlow Legacy 访问令牌",
     "QQFLOW_API_TOKEN": "qqflow 访问令牌",
     "QQFLOW_KEY": "qqflow 引导密钥",

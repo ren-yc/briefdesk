@@ -190,12 +190,17 @@ class EnvRoutesTest(StagedFileTestCase):
             self.assertIn(item["source"], ("default", "dotenv", "env", "override"))
             self.assertIn("current", item)
             self.assertIn("staged", item)
-        self.assertEqual(len(data["secrets"]), 5)
+        self.assertEqual(len(data["secrets"]), 10)
         self.assertEqual(
             {s["name"] for s in data["secrets"]},
             {
                 "AI_API_KEY",
                 "EMBED_API_KEY",
+                "WEFLOW_API_TOKEN",
+                "WEFLOW_IMG_AES_KEY",
+                "WEFLOW_IMG_XOR_KEY",
+                "WEFLOW_DB_KEYS",
+                "WEFLOW_DB_KEYS_2",
                 "WEFLOW_LEGACY_API_TOKEN",
                 "QQFLOW_API_TOKEN",
                 "QQFLOW_KEY",

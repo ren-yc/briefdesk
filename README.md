@@ -1,10 +1,10 @@
 # 简报台
 
-> 本地运行的网页应用，通过可插拔消息源（默认 WeFlow 监听微信群，另支持 qqflow-server 监听 QQ 群）获取群消息，AI 自动分类筛选有价值的信息并结构化展示。
+> 本地运行的网页应用，通过可插拔消息源（weflow-server 或 WeFlow 监听微信群，qqflow-server 监听 QQ 群）获取群消息，AI 自动分类筛选有价值的信息并结构化展示。
 
 ## 功能
 
-- **消息获取**：启动时后台自动回填一次（仅已启用会话参与；会话启用/从未轮询时按 `BACKFILL_HOURS` 默认 24h 窗口回填一次，设为 -1 拉取全部历史——每次同步都会全量扫描，慎用），此后每轮**按会话增量轮询**（各会话独立水位，`POLL_OVERLAP_SECONDS` 控制重叠容错），并辅以 SSE 实时监听（WeFlow 微信群 / qqflow-server QQ 群可多源共存）
+- **消息获取**：启动时后台自动回填一次（仅已启用会话参与；会话启用/从未轮询时按 `BACKFILL_HOURS` 默认 24h 窗口回填一次，设为 -1 拉取全部历史——每次同步都会全量扫描，慎用），此后每轮**按会话增量轮询**（各会话独立水位，`POLL_OVERLAP_SECONDS` 控制重叠容错），并辅以 SSE 实时监听（weflow-server / WeFlow 微信群、qqflow-server QQ 群可多源共存）
 - **AI 分类**：AI 自动将消息分类，默认活动通知、社团招新、学术、交易、实习五类；可在设置中自定义类别（名称/提示词/颜色/启停）
 - **图片 OCR**：聊天图片自动 OCR 识别文字，识别结果纳入分类与展示
 - **语义去重**：同一条信息在多个群转发时自动合并，保留多来源标注
@@ -19,7 +19,7 @@
 ### 前置条件
 
 - Python >= 3.12
-- 任一消息源运行中：WeFlow（HTTP API 已开启）或 qqflow-server（默认 `http://127.0.0.1:5032`）
+- 任一消息源运行中：weflow-server（微信 4.x，默认 `http://127.0.0.1:5033`）、WeFlow（HTTP API 已开启，默认 `:5031`）或 qqflow-server（默认 `http://127.0.0.1:5032`）
 - AI API Key（环境变量 `AI_API_KEY`）
 
 ### 安装运行
@@ -53,7 +53,7 @@ python main.py
 
 首次打开页面会弹出**首次使用向导**（仅当浏览器从未完成过向导且尚未启用任何群聊时出现；后端不可用时不弹），分三步：
 
-1. **环境检查**：展示各消息源连接状态；若后端有错误/警告（如 `AI_API_KEY` / `WEFLOW_LEGACY_API_TOKEN` 缺失、消息源未启动）会给出提示与常见原因；
+1. **环境检查**：展示各消息源连接状态；若后端有错误/警告（如 `AI_API_KEY` / 所选消息源的必填密钥缺失、消息源未启动）会给出提示与常见原因；
 2. **选择群聊**：勾选要监控的会话——**群聊默认勾选，私聊 / 公众号默认不勾**（避免无意监控私聊）。会话列表为空时可先到 设置 → 群聊筛选 点「发现新群聊」拉取最新会话列表，再回来重试；
 3. **开始同步**：首次会按 `BACKFILL_HOURS`（默认 24 小时）回填一次已启用会话的历史消息，此后按会话增量轮询 + SSE 实时监听；同步完成后回到主页面，AI 分类后的信息卡片会陆续出现。
 
@@ -98,7 +98,7 @@ OCR 依赖为**可选**（`pip install -e ".[ocr]"`）：
    copy .env.example .env
    ```
 
-2. 编辑 `.env`，填入必填项 `AI_API_KEY`；消息源为 `weflow-legacy` 时另需 `WEFLOW_LEGACY_API_TOKEN`，为 `qqflow` 时需 `QQFLOW_API_TOKEN`/`QQFLOW_QQ`/`QQFLOW_KEY`（缺失任一 → qqflow 插件自禁用）。消息源启用走 `PLUGINS` / `PLUGINS_DISABLED`（weflow-legacy/qqflow 为内置插件），其余按需修改。
+2. 编辑 `.env`，填入必填项 `AI_API_KEY`；消息源为 `weflow` 时需 `WEFLOW_API_TOKEN`/`WEFLOW_WXID`/`WEFLOW_DB_KEYS`（微信每库独立密钥的 JSON 映射，过长时拆 `WEFLOW_DB_KEYS_2` 第二段；密钥项走系统钥匙串而非 `.env`），为 `weflow-legacy` 时需 `WEFLOW_LEGACY_API_TOKEN`，为 `qqflow` 时需 `QQFLOW_API_TOKEN`/`QQFLOW_QQ`/`QQFLOW_KEY`（weflow/qqflow 缺失任一必填项 → 该插件自禁用）。消息源启用走 `PLUGINS` / `PLUGINS_DISABLED`（weflow/weflow-legacy/qqflow 均为内置插件），其余按需修改。
 3. `AI_MODEL` 默认 `deepseek-v4-flash`：若你对接的 OpenAI 兼容服务没有该模型名，请改为实际模型名（如 `deepseek-chat`、`qwen-turbo` 等），否则首次分类会报模型不存在。
 
 常用可调项（完整清单与逐项注释见 `.env.example`）：
@@ -151,6 +151,7 @@ briefdesk/
 │   ├── types.py            # 跨模块基础类型（含管道跨插件契约）
 │   ├── server/             # FastAPI 服务子包（app/中间件/核心路由/类别路由/媒体代理/静态托管/插件注入/回调）
 │   └── plugins/            # 内置插件（消息源 + AI 供应商 + 管道阶段 + Web 插件）
+│       ├── weflow/             # weflow 消息源（微信 4.x，weflow-server :5033；同构六文件分层 + weflow-server-api.md）
 │       ├── weflow_legacy/      # WeFlow Legacy 消息源（plugin.py + client/config/normalize/poller/runtime/sse + weflow-legacy-api.md）
 │       ├── qqflow/             # qqflow 消息源（plugin.py + 同构六文件分层 + qqflow-server-api.md）
 │       ├── ai_provider/        # AI 供应商插件（plugin.py 注册端口 / engine.py OpenAI 兼容 chat + 嵌入）
@@ -160,6 +161,7 @@ briefdesk/
 │       ├── merge/              # 同话题合并阶段插件（plugin.py 槽位 post_insert / engine.py 判官）
 │       ├── calendar/           # 日历 Web 插件（plugin.py + router.py + db.py：/api/calendar；ui/ 含完整前端）
 │       ├── reminders/          # 提醒 Web 插件（plugin.py + router.py：提醒设置 + 到期轮询；ui/ 含完整前端）
+│       ├── rag/                # 检索问答 Web 插件（plugin.py + router.py + db.py + engine.py + prompts.py；ui/ 含完整前端）
 │       └── benchmark/           # 实验基准（case 样例 + runner + 报告生成，见 benchmark/README.md；默认禁用，PLUGINS 显式列名启用）
 ├── ui/
 │   ├── index.html          # 桌面端页面
@@ -181,8 +183,8 @@ briefdesk/
 - 单插件失败只禁用该插件；`PLUGINS_REQUIRED` 名单内的失败则中止启动
 - 依赖方向由 `tests/test_no_core_imports_plugins.py` 守卫：核心永不 import
   `briefdesk.plugins.*`
-- 消息源为内置插件（weflow-legacy/qqflow），启用走 `PLUGINS` / `PLUGINS_DISABLED`
-  （不再使用 SOURCES）
+- 消息源为内置插件（weflow/weflow-legacy/qqflow），启用走 `PLUGINS` /
+  `PLUGINS_DISABLED`（不再使用 SOURCES）
 - 声明 `default_disabled = True` 的插件（如实验性 benchmark）默认不随
   `PLUGINS=["*"]` 加载，需显式列名（`PLUGINS=["*", "benchmark"]`）才启用；
   `PLUGINS_DISABLED` 仍为最高优先级
@@ -197,8 +199,8 @@ briefdesk/
   `briefdesk/ai_ports.py` 端口，引擎经端口函数调用、核心不依赖具体供应商；
   分类/去重/合并声明依赖 ai_provider（被禁用时随依赖降级，管道对
   "阶段缺失"整批保留不标记，防消息丢失）
-- Web 插件（`WebPlugin` 协议：router + 静态资源）：日历/提醒路由为示范
-  插件（`briefdesk/plugins/{calendar,reminders}/`）；核心提供 `/api/plugins`
+- Web 插件（`WebPlugin` 协议：router + 静态资源）：日历/提醒/检索问答路由为
+  示范插件（`briefdesk/plugins/{calendar,reminders,rag}/`）；核心提供 `/api/plugins`
   元数据与 `/plugin-assets/<name>/` 静态资源；**插件的完整前端随插件包
   分发**——calendar 的按钮/视图容器/浮层/样式全在 `calendar/ui/`
   （`ui.js` 自建 DOM 并注册核心 `registerPluginView` 视图钩子接入 hash
@@ -213,7 +215,7 @@ briefdesk/
 
 ## 架构
 
-简报台采用「核心骨架 + 插件」架构：可插拔消息源（weflow-legacy / qqflow）产出归一化消息，经 pipeline 入口统一过滤后进入阶段插件流水线（OCR 增强 → AI 分类 → 语义去重 → 同话题合并），结果写入 SQLite，由 FastAPI 服务端经 SSE 实时推送到原生 JS 前端；本体只保留存储、管道骨架、HTTP 与状态总线等核心。
+简报台采用「核心骨架 + 插件」架构：可插拔消息源（weflow / weflow-legacy / qqflow）产出归一化消息，经 pipeline 入口统一过滤后进入阶段插件流水线（OCR 增强 → AI 分类 → 语义去重 → 同话题合并），结果写入 SQLite，由 FastAPI 服务端经 SSE 实时推送到原生 JS 前端；本体只保留存储、管道骨架、HTTP 与状态总线等核心。
 
 完整的数据流图、模块职责、插件框架、数据库 Schema、配置项与设计陷阱详见 [docs/architecture.md](docs/architecture.md)。
 
@@ -225,4 +227,4 @@ briefdesk/
 - **AI**: AI Chat API (openai SDK 兼容)
 - **HTTP 客户端**: httpx (异步)
 - **前端**: 原生 HTML + CSS + JavaScript（无框架）
-- **消息源**: 可插拔多源（默认 WeFlow HTTP API，另支持 qqflow-server；消息源为内置插件，通过 `PLUGINS` / `PLUGINS_DISABLED` 启用，JSON 数组格式）
+- **消息源**: 可插拔多源（weflow-server :5033 微信 4.x、WeFlow :5031、qqflow-server :5032；消息源为内置插件，通过 `PLUGINS` / `PLUGINS_DISABLED` 启用，JSON 数组格式）

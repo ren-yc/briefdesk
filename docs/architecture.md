@@ -11,14 +11,16 @@
 ## 总览与数据流
 
 ```
-WeFlow :5031                              qqflow-server :5032
-  ├─ SSE /api/v1/push/messages             ├─ SSE /api/v1/push/messages
-  └─ REST /api/v1/messages                 └─ REST /api/v1/messages
-                                           └─ REST /api/v1/media/{id}（图片字节）
-              │                                          │
-              └────────────────┬─────────────────────────┘
-                               ↓
-        briefdesk/plugins/weflow-legacy|qqflow/
+weflow-server :5033        WeFlow(legacy) :5031        qqflow-server :5032
+  ├─ SSE  /api/v1/push/messages（三源同路径）
+  ├─ REST /api/v1/messages（三源同路径）
+  ├─ REST /api/v1/media/...（图片字节：weflow 为 /{talker}/{type}/{file}，
+  │                          qqflow 为 /{id}）
+  └─ weflow 专属：POST /api/v1/accounts 客户端驱动注册 + GET /health 账号状态
+              │                    │                        │
+              └────────────────────┼────────────────────────┘
+                                   ↓
+        briefdesk/plugins/weflow|weflow_legacy|qqflow/
         （sse.py 实时监听 / poller.py 回填 / normalize.py 归一化为 InternalMessage 并预滤噪音）
                                ↓
         pipeline 入口统一过滤（IGNORE_SELF 自消息 / 启用会话 / 已处理 /
@@ -72,6 +74,8 @@ WeFlow :5031                              qqflow-server :5032
 | `briefdesk/plugins/reminders/plugin.py` + `router.py` | `RemindersPlugin`（显式实现 WebPlugin）：`POST /api/items/:id/reminder`（设置/清除卡片提醒，aware→本地墙钟换算、参数校验）与 `GET /api/reminders/due`（到期提醒轮询）；`asset_dir()` 返回插件包内 `ui/`（**提醒完整前端**：`ui/ui.js` 自建卡片「提醒」按钮/菜单、设置弹窗「通知」面板自动提醒控件与到期轮询定时器，经核心 `registerItemRowExtension` 行内扩展钩子接入 `renderItemRow`/`renderCard` 动作区与 `handleRowAction`，`ui/ui.css` 提醒菜单样式，经 `/plugin-assets/reminders/` 由核心加载器注入；核心 `ui/` 无任何提醒前端残留——由 tests/test_web_plugins.py 的核心前端边界守卫测试覆盖）。`GET /api/reminders/due` 返回项经 `db.get_items_verified_flags` 批量补查合并 `is_verified`（核心查询契约不变、游标纪律收口在 db.py；前端据此决定「查看」跳转目标）；`POST .../reminder` 清除分支限定 `remind_at IS NOT NULL`——对无提醒卡片清除返回 False（多标签页「先清后通知」互斥判据）；前端首次设提醒申请桌面通知权限，到期「查看」定位跳转（备忘录卡进备忘录视图，其余卡定位主列表高亮）。 |
 | `briefdesk/plugins/benchmark/` | 实验性基准插件（`default_disabled`，显式实现 WebPlugin + StagePlugin 双能力）：`/api/benchmark/*` 路由 + 自带前端（设置弹窗内运行，前端轮询门控——仅设置弹窗打开或基准运行中保活 3s 轮询）+ CLI 入口（`python -m briefdesk.plugins.benchmark.cli`）。运行环境 `providers.bench_environment`（Web 与 CLI 共用同一套门闸）：进入即 `pipeline.set_processing_paused(True)` 暂停生产管道（process_all_batches 顶部直接返回 False，实时消息不入库不标 processed、延后下轮回填恢复）、补丁 `briefdesk.db.get_db`/`get_embed_db` 指向临时库；退出 finally 先复位暂停标志再还原 DB 补丁（两者之间无 await 点、事件循环内原子切换，不存在「管道已放行而补丁未还原」窗口）。临时库落本次运行专属 uuid 子目录 `.tmp/bench-<hex>/bench.sqlite`（插件包内 `.tmp/`），退出只删该子目录——共享 `.tmp` 根内其它内容（如并行 CLI 目录）不受影响。 |
 | `briefdesk/sources_base.py` | 消息源抽象（核心契约模块，无 sources 包）：`SourceClient` Protocol（`name`/`connection_status`/`download_media`/`close` 客户端能力契约）——pipeline 与 server 只依赖该协议，新消息源实现它即可被消费；`RealtimeListener[S]`（`start`/`stop`/`invalidate_session_cache` 监听器生命周期契约，泛型参数绑定监听器所服务的客户端类型；本仓库监听器另实现可选 `aclose()`——等待关停冲刷（残余缓冲 + in-flight 批任务）收尾，runtime 经 getattr 探测调用）——server 只依赖它；`SourceRuntime`（`client`/`listener`/`fetch_history(enabled_sessions, is_processed)`/`refresh_sessions() -> list[SessionInfo]`/`start`/`close` 已装配源单元，**源只产出源无关数据、不触碰 DB**，`is_processed` 为应用层注入的已处理查询端口 `ProcessedQuery`）——main 依赖它编排启动/关闭，**新增源 = 实现 `SourceRuntime` 并以插件发布（`briefdesk/plugins/*`，entry point 组 `briefdesk.plugins`，启用走 `PLUGINS`）**。通用类型 `ConnectionStatus`、`BatchHandler`、`ProcessedQuery`、异常 `SourceError`/`MediaError`（`download_media` 失败统一抛 `MediaError`，server 据此映射 404）；**`with_connect_retry`**（连接类失败短退避重试：捕获 `httpx.ConnectError`/`ConnectTimeout`，0.5s/1s/2s 共 3 次，耗尽原样上抛；不重试 HTTP 状态错误与 503 门控、不用于 SSE 流（监听器已有退避重连））。**另提供共享 `BatchBuffer`（实时批缓冲）/`DrainableListenerMixin`（关停冲刷收尾）与 `make_sse_timeout`（SSE 读超时构造），weflow-legacy/qqflow 监听器共用**。轮询拉取/实时监听等源内控制流留在各插件包内，跨源编排在 `poll_cycle.py`。 |
+| `briefdesk/plugins/weflow/plugin.py` | `WeFlowPlugin`（显式实现 SourcePlugin）：setup 校验 `WEFLOW_API_TOKEN`/`WEFLOW_WXID`/`WEFLOW_DB_KEYS(+_2)` 必填配置，缺失任一抛 `PluginDisabledError` 自禁用（无密钥无法解密微信库，注册必然失败，自禁用比调用期报错更早暴露问题）；齐备则构造 `WeFlowSource` 并经 `ctx.register_source` 注册。`settings_schema()` 经 `build_settings_schema` 暴露到设置 UI（密钥字段标注「只保存到系统钥匙串」）。teardown 关闭 runtime。 |
+| `briefdesk/plugins/weflow/` | weflow 消息源（实现 `SourceRuntime`，接入 weflow-server 默认 :5033，微信 4.x 活库直读）。与 qqflow / weflow-legacy 同构六文件分层（config/client/sse/poller/normalize/runtime）。**契约与实测细节见插件内 vendored `weflow-server-api.md`（含「下游实测补注」小节，记录上游文档与实现不符之处）**。要点：**账号引导注册**（`ensure_ready` 健康检查驱动：先读 `/health` 的 `accounts[].state`（上游 v0.3.0 起下发每账号状态 `awaiting_key\|indexing\|ready\|error` + `message_count` + `error`），已有 ready/indexing 即短路返回**不重复注册**，仅零账号或 error/awaiting_key 才 `POST /api/v1/accounts`；注册响应有两套独立词表——`state`（`accepted`/`already_ready`/`in_progress`，本次注册结果）与 `status`（账号状态机值），**勿混用**；上游注册已幂等，重复注册 ready/indexing 账号不重建索引；被拒态不记忆化，下轮重试自愈；error 态账号的 `error` 字符串打 WARNING 暴露根因）、**503 就绪门控**（索引期瞬态，`WeFlowNotReadyError` 静默跳过不污染 lastError；503 复位 `_ready_checked` 以自愈服务端重启导致的内存注册表丢失——不会引发注册风暴，因下轮先查 health 会命中 indexing 短路）、**密钥**（26 个库各自独立 SQLCipher enc_key，整份 JSON 映射拆两段存系统钥匙串，见 `config.py`）、**媒体**（图片经 `media=1&image=1` 触发上游导出，消息 `media` 对象回填完整 URL → `_extract_media_path` 取相对路径 → `GET /api/v1/media/{talker}/{type}/{file}` 取字节做 OCR）、**fetch_contacts / fetch_sessions 均显式 `limit=10000`**（上游两个端点默认 limit=100 静默截断：实测 contacts 仅回 100/4533，截断外发送者显示名回退成 wxid）、msg_id 用 `serverId`（SSE `rawid` 同值）、会话类型以 `sessionType` 为权威（`group`/`private`/`official`/`other`）、数字 `type` 按 `SessionKind` 枚举序兜底（private=0/group=1/official=2/other=3）、监听器按 `(event, rawid)` FIFO 去重（上限 1024）。**上游已知缺陷兜底**：`sessions` 端点会列出无消息表的聚合会话（如 `brandsessionholder`，`messageCount=0`）但 `messages` 对其 404，故 poller 用 `fetch_messages(not_found_ok=True)` 降级为空信封、静默跳过不中断整轮。**文章卡片**：`localType=0x500000031`，上游 `rawContent` 在 `media=1` 下也保留原始 XML，直接拆条无需回查（区别于 weflow-legacy 需 `media=False` 回查）。 |
 | `briefdesk/plugins/weflow_legacy/plugin.py` | `WeFlowLegacyPlugin`（显式实现 SourcePlugin）：setup 构造 `WeFlowLegacySource` 并经 `ctx.register_source` 注册；activate 无副作用（监听启动由应用层编排）；teardown 关闭 runtime。无必填配置校验（缺 WEFLOW_LEGACY_API_TOKEN 时上游调用期报错）。模块底部暴露 `plugin` 实例供 entry point 引用。 |
 | `briefdesk/plugins/qqflow/plugin.py` | `QqFlowPlugin`（显式实现 SourcePlugin）：setup 校验 `QQFLOW_API_TOKEN`/`QQFLOW_QQ`/`QQFLOW_KEY` 必填配置，缺失抛 `PluginDisabledError` 自禁用；齐备则构造 `QqFlowSource` 并经 `ctx.register_source` 注册。teardown 关闭 runtime。 |
 | `briefdesk/plugins/weflow_legacy/runtime.py` | `WeFlowLegacySource`（实现 `SourceRuntime`）— weflow-legacy 源装配门面：构造 `WeFlowLegacyClient`（参数缺省时读 `WeFlowLegacySettings` 的 `WEFLOW_LEGACY_*`）、`fetch_history`（= `poller.poll`）、`refresh_sessions`（拉会话返回 `list[SessionInfo]`，**不写库**，由应用层 main 的 `_refresh_all` 统一落库 + 失效监听器缓存）、`start(on_batch)`（建 `WeFlowLegacySseClient` 并启动）、`close()`（stop → 等待监听器 `aclose` 冲刷残余缓冲与 in-flight 批任务收尾 → 关客户端，消除关停竞态丢批）。main 经 PluginManager（WeFlowLegacyPlugin）接入，不接触 weflow-legacy 具体类型。 |
@@ -134,9 +138,9 @@ Vanilla JS SPA in `ui/` (`index.html`, `app.js`, `style.css`, `icons/`). No buil
 
 ## 配置
 
-All via `.env` file, with an additional UI-staged overlay layer (see 「密钥解析链」下方). Required: `AI_API_KEY`; `WEFLOW_LEGACY_API_TOKEN` when the `weflow-legacy` plugin is enabled (default); `QQFLOW_API_TOKEN`/`QQFLOW_QQ`/`QQFLOW_KEY` when the `qqflow` plugin is enabled (missing any of the latter three → the plugin self-disables via `PluginDisabledError`). Optional (with defaults):
+All via `.env` file, with an additional UI-staged overlay layer (see 「密钥解析链」下方). Required: `AI_API_KEY`; `WEFLOW_API_TOKEN`/`WEFLOW_WXID`/`WEFLOW_DB_KEYS(+_2)` when the `weflow` plugin is enabled; `WEFLOW_LEGACY_API_TOKEN` when the `weflow-legacy` plugin is enabled; `QQFLOW_API_TOKEN`/`QQFLOW_QQ`/`QQFLOW_KEY` when the `qqflow` plugin is enabled (missing any required field of `weflow`/`qqflow` → that plugin self-disables via `PluginDisabledError`). Optional (with defaults):
 
-> 密钥型字段（`AI_API_KEY`/`EMBED_API_KEY`/`WEFLOW_LEGACY_API_TOKEN`/`QQFLOW_API_TOKEN`/`QQFLOW_KEY`）以 pydantic `SecretStr` 持有：`repr()`/`str()`/序列化输出一律为 `**********` 掩码，明文只能在「配置→客户端」边界经 `get_secret_value()` 取用；`tests/test_secrets_hygiene.py` 对全部密钥字段做了防泄露守卫。
+> 密钥型字段（`AI_API_KEY`/`EMBED_API_KEY`/`WEFLOW_API_TOKEN`/`WEFLOW_IMG_AES_KEY`/`WEFLOW_IMG_XOR_KEY`/`WEFLOW_DB_KEYS`/`WEFLOW_DB_KEYS_2`/`WEFLOW_LEGACY_API_TOKEN`/`QQFLOW_API_TOKEN`/`QQFLOW_KEY`）以 pydantic `SecretStr` 持有：`repr()`/`str()`/序列化输出一律为 `**********` 掩码，明文只能在「配置→客户端」边界经 `get_secret_value()` 取用；`tests/test_secrets_hygiene.py` 对全部密钥字段做了防泄露守卫。
 
 > 默认值的事实来源是 `briefdesk/config.py` 与各插件包的 `config.py`；本表仅为速查，修改代码默认值时须同步本表。
 
@@ -146,6 +150,8 @@ All via `.env` file, with an additional UI-staged overlay layer (see 「密钥�
 | `PLUGINS_DISABLED` | `[]` | **JSON array** of disabled plugin names (takes precedence over `PLUGINS`) |
 | `PLUGINS_REQUIRED` | `[]` | **JSON array** of plugins whose setup/activate failure is fatal (`PluginError` 中止启动) |
 | `PLUGIN_PATH` | `` (disabled) | 开发期插件目录：目录下每个 *.py 暴露 `plugin` 实例即被加载（免打包） |
+| `WEFLOW_API_BASE` / `WEFLOW_WXID` / `WEFLOW_DB_PATH` / `WEFLOW_SSE_RECONNECT_INITIAL_MS` / `WEFLOW_SSE_RECONNECT_MAX_MS` / `WEFLOW_SSE_READ_TIMEOUT_MS` | `http://127.0.0.1:5033` / `` / `` / `1000` / `60000` / `300000` | weflow source-specific 非密钥项（read by `briefdesk/plugins/weflow/config.py`, only when the `weflow` plugin is enabled）。`WXID` 必填（参与注册与库路径推导）；`DB_PATH` 可留空（上游按 wxid 推导 `xwechat_files/<wxid>`）；SSE 读超时默认 5 分钟 = 上游 25s ping 的 12 个周期 |
+| `WEFLOW_API_TOKEN` / `WEFLOW_IMG_AES_KEY` / `WEFLOW_IMG_XOR_KEY` / `WEFLOW_DB_KEYS` / `WEFLOW_DB_KEYS_2` | 全为空 | weflow 密钥项，**只走系统钥匙串（keyring），不落 .env 明文**。`DB_KEYS(+_2)` 存 `{库相对路径: 64位hex enc_key}` 的整份 JSON：微信 4.x 每库独立密钥（实测 26 个库约 2347 字节），而 Windows 凭据管理器单条上限约 1280 字节，故**拆两段存储**，`db_keys_map` property 合并解析（非法 JSON / 形状不符 → 空 dict + WARNING，由 plugin 决定自禁用）。`API_TOKEN` 与 `DB_KEYS` 缺失 → 插件自禁用 |
 | `WEFLOW_LEGACY_API_BASE` / `WEFLOW_LEGACY_API_TOKEN` / `WEFLOW_LEGACY_SSE_RECONNECT_INITIAL_MS` / `WEFLOW_LEGACY_SSE_RECONNECT_MAX_MS` | `http://127.0.0.1:5031` / `` / `1000` / `60000` | WeFlow source-specific (read by `briefdesk/plugins/weflow_legacy/config.py`, only when the `weflow-legacy` plugin is enabled) |
 | `QQFLOW_API_BASE` / `QQFLOW_API_TOKEN` / `QQFLOW_QQ` / `QQFLOW_KEY` / `QQFLOW_DB_PATH` / `QQFLOW_SSE_RECONNECT_INITIAL_MS` / `QQFLOW_SSE_RECONNECT_MAX_MS` | `http://127.0.0.1:5032` / `` / `` / `` / `` / `1000` / `60000` | qqflow source-specific (read by `briefdesk/plugins/qqflow/config.py`, only when the `qqflow` plugin is enabled). `API_TOKEN`/`QQ`/`KEY` **required** — missing any → the plugin self-disables (`PluginDisabledError`). `DB_PATH` optional (empty → upstream qqflow-server falls back to platform defaults, e.g. Windows `Documents\Tencent Files`) |
 | `WEFLOW_LEGACY_SSE_READ_TIMEOUT_MS` | `300000` | WeFlow SSE 读超时（毫秒）：上游无心跳，默认 5 分钟防半开连接下监听静默死亡；超时转化为 ReadTimeout 走监听器既有退避重连路径 |

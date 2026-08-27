@@ -31,6 +31,7 @@ dependencies = [
 briefdesk = "briefdesk.main:main"
 
 [project.entry-points."briefdesk.plugins"]
+weflow = "briefdesk.plugins.weflow.plugin:plugin"
 weflow-legacy = "briefdesk.plugins.weflow_legacy.plugin:plugin"
 qqflow = "briefdesk.plugins.qqflow.plugin:plugin"
 ai_provider = "briefdesk.plugins.ai_provider.plugin:plugin"

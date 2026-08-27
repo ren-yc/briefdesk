@@ -1,0 +1,747 @@
+"""weflow-server HTTP API 客户端（微信 4.x，默认 :5033）— 封装所有通信细节。
+
+参考 qqflow（引导注册 + 503 就绪门控）与 weflow-legacy（WeFlow API 契约形状）。
+
+用法:
+    client = WeFlowClient(base_url="http://127.0.0.1:5033", api_token="xxx",
+                          wxid="wxid_...", db_path="...", db_keys={...},
+                          img_aes_key="...", img_xor_key="...")
+    await client.ensure_ready()          # 健康检查 + 账号注册（客户端驱动）
+    sessions = await client.fetch_sessions()
+    resp = await client.fetch_messages(talker="...", start_ts=..., limit=500)
+    async for event in client.stream_events():
+        ...
+"""
+
+import asyncio
+import json
+import logging
+import time as time_module
+from collections.abc import AsyncIterator
+from datetime import UTC, datetime, timedelta
+from typing import Any, Literal, TypedDict
+
+import httpx
+
+from briefdesk.logger import fmt_dur
+from briefdesk.masking import clean_display_name
+from briefdesk.plugins.weflow.config import WeFlowSettings
+from briefdesk.sources_base import (
+    ConnectionStatus,
+    MediaError,
+    SourceClient,
+    SourceError,
+    make_sse_timeout,
+    with_connect_retry,
+)
+
+# ── weflow-server API 数据类型 ──
+
+
+class WeFlowEvent(TypedDict):
+    """SSE 推送的原始事件（data 行的 JSON 载荷）。
+
+    只有 message.new 参与管道（见 normalize.pre_filter_sse），其余全部丢弃：
+    - ready：连接基线，载荷实测为 `{"status":"ok"}`——**不含 event 键**
+      （事件名只在 SSE 的 `event:` 帧头，本客户端只解析 data 行故读不到），
+      因此在 pre_filter_sse 的事件类型分支被丢弃；
+    - sync：水位重基通知（`{event, watermarks[]}`；订阅端滞后时为
+      `{"rebased":true}`），无消息体；
+    - message.revoke：撤回，显式丢弃。
+    """
+
+    event: Literal["ready", "message.new", "message.revoke", "sync"]
+    sessionId: str
+    # 与 REST 的 sessionType 同源（store::SessionKind::as_str）；会话不在索引时
+    # 上游兜底为 "other"。normalize 只判 group，其余一律按非群处理
+    sessionType: Literal["group", "private", "official", "other"]
+    groupName: str  # 仅群聊；缺失时省略
+    rawid: str  # 消息 serverId（字符串），跨路径去重键
+    sourceName: str  # 发送者昵称；缺失时省略
+    content: str
+    timestamp: int  # 秒级 Unix
+
+
+class WeFlowSession(TypedDict):
+    """会话（原生格式；sessionType 权威，chatlab 的 type 实测不可靠）。"""
+
+    username: str  # 会话 id：群=群号/群 id，私聊/公众号=wxid 或 gh_
+    displayName: str
+    sessionType: str  # "group" / "private" / "official" / "other"（权威）
+    type: int  # 数字类型（兜底，SessionKind 枚举序：private=0/group=1/official=2/other=3）
+    messageCount: int
+    summary: str
+    unreadCount: int
+    lastTimestamp: int
+
+
+class WeFlowContact(TypedDict):
+    """联系人。"""
+
+    username: str
+    displayName: str
+    nickname: str
+    remark: str
+    alias: str
+    avatarUrl: str
+    type: str
+
+
+class WeFlowGroupMember(TypedDict):
+    """群成员（/api/v1/group-members）。"""
+
+    wxid: str
+    displayName: str
+    nickname: str
+    remark: str
+    alias: str
+    groupNickname: str
+
+
+class WeFlowMedia(TypedDict):
+    """消息媒体元数据（可解析媒体的消息恒有；导出字段仅 media=1 时填充）。
+
+    上游 `message_json` 恒下发 type/fileName/md5 与空串 url/localPath；
+    media=1 且该条导出成功时，导出流水线回填 url/localPath 并补 exported=true
+    （未导出的消息无 exported 键，故用 total=False 语义按 get 访问）。
+    """
+
+    type: Literal["image", "voice", "video", "emoji", "file"]
+    fileName: str
+    md5: str
+    url: str  # 完整下载 URL（含 ?access_token= 查询参数；未导出时为空串）
+    localPath: str  # 导出后的本地绝对路径；未导出时为空串
+    exported: bool  # 仅导出成功时出现
+
+
+class WeFlowMessage(TypedDict):
+    """REST API 返回的消息。"""
+
+    serverId: str  # 消息唯一 id（字符串，SSE rawid 同值）—— msg_id 来源
+    localId: int  # rowid 数字
+    localType: int  # 1 = 文本, 3 = 图片, 34 = 语音, 0x500000031 = 文章卡片
+    createTime: int  # 秒级 Unix
+    sortSeq: int  # 上游水位排序键之一（本仓库不使用）
+    isSend: int  # 0 = 收到, 1 = 自己发送
+    senderUsername: str
+    senderName: str
+    content: str  # 解析后文本（媒体消息为 [图片]/[语音] 等占位符）
+    rawContent: str  # 原始内容（文章卡片为 <msg><appmsg> XML）
+    parsedContent: str
+    replyToMessageId: str | None  # 引用目标消息 id（本仓库不使用）
+    quote: dict | None  # {platformMessageId, sender, accountName, content, type}
+    media: WeFlowMedia | None  # 可解析媒体时携带（导出字段见 WeFlowMedia）
+
+
+class WeFlowMessagesResponse(TypedDict):
+    """GET /api/v1/messages 的完整信封。"""
+
+    success: bool
+    talker: str
+    count: int
+    hasMore: bool
+    messages: list[WeFlowMessage]
+    media: dict | None  # {count, enabled, exportPath}
+
+
+class WeFlowSessionsResponse(TypedDict):
+    sessions: list[WeFlowSession]
+
+
+class WeFlowContactsResponse(TypedDict):
+    contacts: list[WeFlowContact]
+
+
+class WeFlowGroupMembersResponse(TypedDict):
+    members: list[WeFlowGroupMember]
+
+
+logger = logging.getLogger(__name__)
+
+# 媒体下载大小上限：防止异常/恶意上游返回超大文件造成内存放大
+_MAX_MEDIA_BYTES = 20 * 1024 * 1024
+
+# 按消息回查 REST（SSE 图片 mediaUrl）的单页条数：倒序响应下目标消息之后
+# 120s 窗口内的新消息会把它挤出首页，50 条在刷屏场景不够，放宽到 200
+_LOOKUP_LIMIT = 200
+
+# 注册响应的两套词表（weflow-server v0.3.0 起分离，勿混用）：
+# - state：本次注册的结果语义（qqflow-server 风格）
+# - status：账号状态机当前值，同时也是 /health 的 accounts[].state 取值
+# 良性 = 已受理或已就绪，可记忆化，索引期内不重复注册。
+_BENIGN_REGISTER_STATES = ("accepted", "already_ready", "in_progress")
+_BENIGN_ACCOUNT_STATUSES = ("indexing", "ready")
+
+
+class WeFlowNotReadyError(SourceError):
+    """weflow-server 尚未就绪（503 就绪门控：无账号或正在建索引），瞬态。
+
+    调用方（poller/runtime）捕获后应静默跳过，不视为错误。
+    """
+
+
+class WeFlowClient(SourceClient):
+    """封装所有 weflow-server API HTTP 通信。"""
+
+    name = "weflow"  # 源标识，SourceClient 契约成员
+    connection_status: ConnectionStatus = "offline"
+
+    def __init__(
+        self,
+        base_url: str,
+        api_token: str,
+        wxid: str = "",
+        db_path: str = "",
+        db_keys: dict[str, str] | None = None,
+        img_aes_key: str = "",
+        img_xor_key: str = "",
+        *,
+        sse_read_timeout_ms: int | None = None,
+    ) -> None:
+        self._base_url = base_url.rstrip("/")
+        self._api_token = api_token
+        self._wxid = wxid
+        self._db_path = db_path
+        self._db_keys = db_keys or {}
+        self._img_aes_key = img_aes_key
+        self._img_xor_key = img_xor_key
+        # SSE 读超时（毫秒）：缺省读 WEFLOW_SSE_READ_TIMEOUT_MS。
+        # 上游每 25s 发 ping 保活；半开连接下若无读超时，stream_events 的
+        # aiter_lines 会永久阻塞，重连循环永远得不到控制权（监听静默死亡）
+        if sse_read_timeout_ms is None:
+            sse_read_timeout_ms = WeFlowSettings().sse_read_timeout_ms
+        self._sse_read_timeout_s = sse_read_timeout_ms / 1000
+        self._client: httpx.AsyncClient | None = None
+        self._ready_checked = False
+        # 串行化健康检查 + 引导注册（SSE 强制重检与轮询检查并发竞争时避免重复注册）
+        self._ready_lock = asyncio.Lock()
+        # 上游版本号（/health 的 version）：首次就绪时记一条日志，便于排查
+        # 「下游按新契约调用、上游还是旧二进制」的错配
+        self._logged_version: str | None = None
+        self.connection_status = "offline"
+
+    def sse_timeout(self) -> httpx.Timeout:
+        return make_sse_timeout(self._sse_read_timeout_s)
+
+    # ── 内部 ──
+
+    def _get_client(self) -> httpx.AsyncClient:
+        """获取共享的 httpx 客户端（懒初始化）。"""
+        if self._client is None:
+            self._client = httpx.AsyncClient(
+                base_url=self._base_url,
+                timeout=httpx.Timeout(30.0),
+            )
+        return self._client
+
+    def _auth_headers(self) -> dict[str, str]:
+        return {"Authorization": f"Bearer {self._api_token}"}
+
+    async def _get(
+        self,
+        path: str,
+        *,
+        params: dict[str, Any] | None = None,
+        not_found_ok: bool = False,
+    ) -> Any:
+        """通用 GET 请求，带错误处理。
+
+        Args:
+            path: API 路径，如 "/api/v1/sessions"
+            params: 查询参数
+            not_found_ok: 为 True 时，404 返回 None（由调用方降级处理）
+
+        Returns:
+            JSON 响应；not_found_ok 且上游返回 404 时为 None
+
+        Raises:
+            WeFlowNotReadyError: 服务端未就绪（503 就绪门控，瞬态）
+            RuntimeError: 其他非成功状态
+        """
+        client = self._get_client()
+        start = time_module.perf_counter()
+        resp = await with_connect_retry(
+            lambda: client.get(path, params=params, headers=self._auth_headers())
+        )
+        logger.debug(
+            "GET %s%s → %s (%s)",
+            path,
+            f"?{resp.url.query.decode()}" if resp.url.query else "",
+            resp.status_code,
+            fmt_dur(time_module.perf_counter() - start),
+        )
+        if resp.status_code == 503:
+            # 就绪门控（瞬态）：失效记忆化标志——服务端重启（内存态注册表丢失）
+            # 后，下一轮 ensure_ready 会重新健康检查 + 引导注册（自愈）。
+            # 复位不会引发注册风暴：下一轮 ensure_ready 先查 /health，索引期
+            # 会看到 indexing 良性态而直接返回，且上游注册已幂等（v0.3.0 起
+            # 重复注册 ready/indexing 账号不重建索引）。
+            logger.debug("GET %s → 503（服务端索引期，瞬态）", path)
+            self._ready_checked = False
+            raise WeFlowNotReadyError(
+                f"weflow-server 尚未就绪（503）: {resp.text[:200]}"
+            )
+        if not resp.is_success:
+            if not_found_ok and resp.status_code == 404:
+                return None
+            raise RuntimeError(
+                f"WeFlow API error: {resp.status_code} on {path} — {resp.text[:200]}"
+            )
+        return resp.json()
+
+    # ── 账号引导 ──
+
+    async def fetch_health(self) -> dict[str, Any]:
+        """健康检查（免鉴权）。
+
+        返回 {status, version, accounts:[{wxid, state, message_count, error?}]}：
+        - status：ok（至少一个账号且全部 ready）/ starting（无账号或仍在建索引）；
+        - accounts[].state：awaiting_key / indexing / ready / error。
+        零账号时也返回 200（status=starting，accounts 为空数组）。
+        """
+        client = self._get_client()
+        resp = await with_connect_retry(lambda: client.get("/health"))
+        if not resp.is_success:
+            raise RuntimeError(
+                f"WeFlow API error: {resp.status_code} on /health — {resp.text[:200]}"
+            )
+        return resp.json()
+
+    async def register_account(self) -> tuple[str, str]:
+        """POST /api/v1/accounts 注册账号（客户端驱动启动），返回 (state, status)。
+
+        - state：本次注册结果 —— accepted（已受理，开始后台构建）/
+          already_ready（账号已就绪）/ in_progress（正在构建中）；
+        - status：账号状态机值 —— awaiting_key / indexing / ready / error。
+
+        注册幂等（上游 v0.3.0 起）：重复注册已 ready/indexing 的账号不会重建
+        索引、不中止 watcher，直接返回现有句柄；仅 error/awaiting_key 会被
+        替换重建（密钥或路径填错后重新注册即可自愈）。
+        """
+        client = self._get_client()
+        payload: dict[str, Any] = {"wxid": self._wxid}
+        if self._db_path:
+            payload["db_path"] = self._db_path
+        if self._db_keys:
+            payload["keys"] = self._db_keys
+        if self._img_aes_key:
+            payload["img_aes_key"] = self._img_aes_key
+        if self._img_xor_key:
+            payload["img_xor_key"] = self._img_xor_key
+        resp = await with_connect_retry(
+            lambda: client.post(
+                "/api/v1/accounts",
+                json=payload,
+                headers=self._auth_headers(),
+            )
+        )
+        if not resp.is_success:
+            raise RuntimeError(
+                f"WeFlow API error: {resp.status_code} on /api/v1/accounts — "
+                f"{resp.text[:200]}"
+            )
+        data = resp.json()
+        return data.get("state", "unknown"), data.get("status", "unknown")
+
+    async def ensure_ready(self, force: bool = False) -> None:
+        """确保服务端有就绪账号（健康检查驱动，记忆化，可强制重检）。
+
+        先查 /health 的 accounts[].state（上游 v0.3.0 起下发每账号状态）：
+        已有 ready / indexing 账号即记忆化返回，**不重复注册**；只有零账号
+        （或账号处于 error / awaiting_key）时才注册。注册后进入索引期，业务
+        接口的 503 由 WeFlowNotReadyError 瞬态处理兜底，不在此阻塞等待。
+
+        force=True 时忽略记忆化标志重新健康检查（SSE 重连后服务端可能已重启，
+        内存态账号注册表丢失，需重新注册）。良性态（_BENIGN_REGISTER_STATES /
+        _BENIGN_ACCOUNT_STATUSES）记忆；被拒态与网络失败不记忆，下轮重试（自愈）。
+
+        单账号假设（与 qqflow 同）：状态判定不按 wxid 过滤——本仓库只配一个
+        WEFLOW_WXID，且业务端点不传 wxid 时上游取「第一个 ready 账号」，故
+        「有任一账号就绪」与「我们的账号就绪」在本部署形态下等价。若将来支持
+        多账号，需按 self._wxid 过滤 accounts 并在业务请求上带 wxid 参数。
+        """
+        if self._ready_checked and not force:
+            return
+        async with self._ready_lock:
+            # 锁内双检：并发调用（SSE 强制检查 vs 轮询检查）先到者注册并置位，
+            # 后到者在此短路，避免重复注册
+            if self._ready_checked and not force:
+                return
+            try:
+                health = await self.fetch_health()
+            except Exception:
+                self._ready_checked = False
+                raise
+            version = health.get("version")
+            if version and version != self._logged_version:
+                logger.info("[weflow] weflow-server 版本: %s", version)
+                self._logged_version = str(version)
+            accounts = health.get("accounts", [])
+            states = [a.get("state") for a in accounts]
+            logger.debug("[weflow] 健康检查: 账号状态 %s", states or "（无账号）")
+            # error 态账号带 error 字符串（密钥/路径填错的原因），显式告警——
+            # 否则用户只能看到业务接口持续 503，看不到根因
+            for a in accounts:
+                if a.get("state") == "error" and a.get("error"):
+                    logger.warning(
+                        "[weflow] 账号 %s 初始化失败: %s",
+                        a.get("wxid") or "<未知>",
+                        a["error"],
+                    )
+            if any(a.get("state") == "ready" for a in accounts):
+                self._ready_checked = True
+                logger.debug("[weflow] 已有就绪账号，跳过注册")
+                return
+            if any(a.get("state") in _BENIGN_ACCOUNT_STATUSES for a in accounts):
+                self._ready_checked = True
+                logger.debug("[weflow] 账号建索引中（良性状态），不再重复注册")
+                return
+            logger.info(
+                "[weflow] 无就绪账号，注册账号 wxid=%s (db_path=%s, keys=%d 个库)",
+                self._wxid,
+                self._db_path or "<默认>",
+                len(self._db_keys),
+            )
+            state, status = await self.register_account()
+            if state in _BENIGN_REGISTER_STATES or status in _BENIGN_ACCOUNT_STATUSES:
+                self._ready_checked = True
+                logger.info("[weflow] 账号注册: state=%s, status=%s", state, status)
+            else:
+                # 被拒态（error / awaiting_key 等）不记忆化：保持未检查标志让
+                # 下一轮重试；否则零账号部署下没有业务 503 兜底复位标志，
+                # 注册失败后永不自愈
+                logger.warning(
+                    "[weflow] 账号注册被拒: state=%s, status=%s（下轮重试）",
+                    state,
+                    status,
+                )
+
+    # ── REST API ──
+
+    async def fetch_contacts(self) -> dict[str, str]:
+        """获取联系人 → {username: display_name}（displayName 优先，UID 兜底）。
+
+        每级候选经 clean_display_name 净化（上游档案昵称含控制字符/空白等
+        脏数据），全部净化后为空才回退 UID。候选选择发生在构造前，必须在此
+        显式净化（types.py 的构造净化不参与候选选择）。
+
+        显式传大 limit：上游 /api/v1/contacts 默认 limit=100（上限 10000）会
+        静默截断通讯录（实测仅回 100/4533 条），导致截断外的发送者显示名回退
+        成 wxid。与 fetch_sessions 同一类坑。
+        """
+        data: WeFlowContactsResponse = await self._get(
+            "/api/v1/contacts", params={"limit": 10000}
+        )
+        contacts: dict[str, str] = {}
+        for c in data["contacts"]:
+            contacts[c["username"]] = (
+                clean_display_name(c.get("displayName"))
+                or clean_display_name(c.get("nickname"))
+                or clean_display_name(c.get("remark"))
+                or c["username"]
+            )
+        return contacts
+
+    async def fetch_group_members(self, chatroom_id: str) -> dict[str, str]:
+        """获取群成员 → {wxid: 群内显示名}。
+
+        候选顺序（每级经 clean_display_name 净化，净化后为空才回退）：
+        groupNickname → displayName → nickname → remark；全部为空则该成员
+        不进入映射，由 normalize 回退到全局 contacts / wxid。
+        404（群不存在）返回空映射；503 仍走 WeFlowNotReadyError 瞬态语义。
+        """
+        data: WeFlowGroupMembersResponse | None = await self._get(
+            "/api/v1/group-members",
+            params={"chatroomId": chatroom_id},
+            not_found_ok=True,
+        )
+        if not data:
+            logger.warning(f"群成员接口 404（群可能不存在）: {chatroom_id}")
+            return {}
+
+        members: dict[str, str] = {}
+        for m in data.get("members", []):
+            uid = m.get("wxid") or ""
+            if not uid:
+                continue
+            group_nick = clean_display_name(m.get("groupNickname"))
+            # 上游无任何名字来源时会以 wxid 兜底，此时应让位于其他候选
+            if group_nick == uid:
+                group_nick = ""
+            name = (
+                group_nick
+                or clean_display_name(m.get("displayName"))
+                or clean_display_name(m.get("nickname"))
+                or clean_display_name(m.get("remark"))
+            )
+            if name:
+                members[uid] = name
+        logger.debug("群成员拉取: %s → %d 名成员", chatroom_id, len(members))
+        return members
+
+    async def fetch_sessions(self) -> list[WeFlowSession]:
+        """获取所有会话列表（原生格式，sessionType 权威）。
+
+        显式传大 limit：上游默认 limit=100 会截断会话发现（实测仅回最近
+        活跃的少数会话），不传参只会发现最近活跃的 100 个会话。
+        chatlab 格式的 type 实测不可靠（official 会话也返回 private），
+        故用原生格式的 sessionType 判定会话类型。
+        """
+        data: WeFlowSessionsResponse = await self._get(
+            "/api/v1/sessions", params={"limit": 10000}
+        )
+        return data["sessions"]
+
+    async def fetch_messages(
+        self,
+        talker: str,
+        start_ts: int | None,
+        limit: int = 500,
+        offset: int = 0,
+        media: bool = False,
+        retry_on_empty: bool = True,
+        not_found_ok: bool = False,
+    ) -> WeFlowMessagesResponse:
+        """获取指定会话的历史消息（返回完整信封，含 hasMore）。
+
+        上游按 createTime 过滤，start 为闭区间下界（createTime >= start 的消息
+        均返回，实测含边界）；响应按时间倒序。翻页用 offset 递增至 hasMore=False。
+
+        Args:
+            talker: 会话 ID
+            start_ts: 起始时间（秒级 Unix 时间戳，含边界）；None 不过滤
+            limit: 单页返回条数
+            offset: 分页偏移
+            media: 是否导出媒体（图片等），为 True 时附加 media=1&image=1，
+                消息对象 media 字段携带 url
+            retry_on_empty: 空结果是否 500ms 后重试一次（回查链路应传 False；
+                轮询首页保留默认 True 以维持既有「刚入库查不到」竞态兜底）
+            not_found_ok: 会话不存在（404，如 brandsessionholder 等无消息的
+                系统会话）时返回空信封而非抛错；轮询路径应传 True
+        """
+        params: dict[str, Any] = {"talker": talker, "limit": limit, "offset": offset}
+        if start_ts is not None:
+            params["start"] = start_ts
+        if media:
+            params["media"] = 1
+            params["image"] = 1
+        data = await self._get(
+            "/api/v1/messages", params=params, not_found_ok=not_found_ok
+        )
+        if data is None:
+            return {
+                "success": True,
+                "talker": talker,
+                "count": 0,
+                "hasMore": False,
+                "messages": [],
+                "media": None,
+            }
+        return data
+
+    async def _lookup_message(
+        self, talker: str, rawid: str, ts: int, media: bool
+    ) -> WeFlowMessage | None:
+        """按 serverId 回查 REST 获取消息原始对象。
+
+        用 timestamp 缩小查询范围（start=ts-120 起，客户端再按 ±120s 过滤），
+        在返回的消息中匹配 serverId == rawid。回查显式 retry_on_empty=False：
+        miss 是常见路径，不应在监听/回填热路径上为空结果白付 500ms 重试。
+        """
+        start_ts = int((datetime.fromtimestamp(ts, tz=UTC) - timedelta(seconds=120)).timestamp())
+
+        try:
+            resp = await self.fetch_messages(
+                talker, start_ts, limit=_LOOKUP_LIMIT, media=media,
+                retry_on_empty=False,
+            )
+        except Exception as e:
+            logger.error(f"回查消息失败: {e}")
+            raise
+
+        window = 120
+        for m in resp.get("messages", []):
+            if str(m.get("serverId", "")) != rawid:
+                continue
+            ct = m.get("createTime", 0)
+            if abs(ct - ts) > window:
+                continue
+            return m
+        return None
+
+    async def fetch_message_media(self, talker: str, rawid: str, ts: int) -> str | None:
+        """通过 rawid 回查 REST（media=1），获取图片消息的媒体相对路径。
+
+        SSE 事件不含媒体信息，需要回查 REST。用 timestamp 缩小查询范围
+        （前后各 120s），在返回的消息中匹配 serverId == rawid。
+
+        Returns:
+            媒体相对路径（如 "{talker}/images/xxx.jpg"）或 None
+        """
+        m = await self._lookup_message(talker, rawid, ts, media=True)
+        if m is None:
+            return None
+        media = m.get("media")
+        if media is not None and media.get("type") == "image" and media.get("url"):
+            return self._extract_media_path(str(media["url"]))
+        logger.debug(
+            "SSE 消息 %s media=%s 无图片 URL",
+            rawid,
+            media.get("type") if media else None,
+        )
+        return None
+
+    # ── 媒体 ──
+
+    @staticmethod
+    def _extract_media_path(url: str) -> str | None:
+        """从完整媒体 URL 提取相对路径（去掉 /api/v1/media/ 前缀与查询串）。
+
+        "http://127.0.0.1:5033/api/v1/media/{talker}/images/abc.jpg?access_token=..."
+        → "{talker}/images/abc.jpg"
+        """
+        idx = url.find("/api/v1/media/")
+        if idx < 0:
+            return None
+        path = url[idx + len("/api/v1/media/"):]
+        # 去掉查询串
+        return path.split("?", 1)[0]
+
+    def _build_media_url(self, path: str) -> str:
+        """将媒体相对路径规范化为 weflow-server 完整 URL。
+
+        用 RFC 3986 的 URL join 拼接：绝对路径引用会替换掉 base 自带的
+        路径与查询串，_base_url 即使误配成
+        "http://127.0.0.1:5033/api/v1/push/messages?access_token=..."
+        也不会把媒体路径拼进查询串（朴素字符串拼接会打出坏 URL 导致图片挂死）。
+        """
+        return str(
+            httpx.URL(self._base_url).join(f"/api/v1/media/{path.lstrip('/')}")
+        )
+
+    async def download_media(self, path: str) -> bytes:
+        """下载媒体文件原始字节（GET /api/v1/media/{path}，带鉴权）。
+
+        404（媒体未导出/缓存被清理）/ 503（就绪门控）等非成功状态统一映射为
+        MediaError，由 pipeline 跳过 OCR、server 代理映射为 404 兜底。
+
+        Args:
+            path: 媒体相对路径（normalize 从 media.url 提取）
+
+        Returns:
+            媒体文件原始内容
+
+        Raises:
+            MediaError: 网络错误或 weflow-server 返回非成功状态（cause 保留原异常）
+        """
+        client = self._get_client()
+        start = time_module.perf_counter()
+        try:
+            async with client.stream(
+                "GET", self._build_media_url(path), headers=self._auth_headers()
+            ) as resp:
+                if not resp.is_success:
+                    raise MediaError(
+                        f"WeFlow media error: {resp.status_code} on {path}"
+                    )
+                chunks: list[bytes] = []
+                total = 0
+                async for chunk in resp.aiter_bytes():
+                    total += len(chunk)
+                    if total > _MAX_MEDIA_BYTES:
+                        raise MediaError(f"WeFlow media too large: {path}")
+                    chunks.append(chunk)
+                logger.debug(
+                    "媒体下载完成: %s (%d bytes, %s)",
+                    path,
+                    total,
+                    fmt_dur(time_module.perf_counter() - start),
+                )
+                return b"".join(chunks)
+        except httpx.RequestError as e:
+            raise MediaError(f"media fetch failed: {path}") from e
+
+    # ── SSE 流 ──
+
+    def _push_url(self) -> str:
+        """SSE 推送地址（RFC 3986 join）：base_url 误带路径/查询串时不会拼坏。"""
+        return str(httpx.URL(self._base_url).join("/api/v1/push/messages"))
+
+    async def stream_events(self) -> AsyncIterator[WeFlowEvent]:
+        """SSE 实时消息流 — 异步迭代器，持续产出解析后的 JSON 事件。
+
+        用法:
+            async for event in client.stream_events():
+                process(event)
+
+        连接失败（非 2xx，含 503）时置 offline 并正常返回，
+        由监听器的退避重连循环处理。
+        连接成功（HTTP 200）后会强制重做一次就绪检查/引导注册，自愈
+        服务端重启导致的注册表丢失（注册幂等 + 先查 /health，已就绪账号
+        只会命中健康检查短路，不会触发索引重建）。
+        """
+        logger.debug("SSE 连接中...")
+        self.connection_status = "reconnecting"
+
+        # SSE 需要独立的客户端：写/池不限，但保留可配置的读超时
+        # （上游 25s ping 保活）以自愈半开连接
+        async with httpx.AsyncClient(timeout=self.sse_timeout()) as sse_client:
+            try:
+                async with sse_client.stream(
+                    "GET",
+                    self._push_url(),
+                    headers={
+                        **self._auth_headers(),
+                        "Accept": "text/event-stream",
+                    },
+                ) as resp:
+                    if not resp.is_success:
+                        logger.warning(f"SSE 连接失败: {resp.status_code}")
+                        self.connection_status = "offline"
+                        return
+
+                    logger.info("SSE 已连接")
+                    self.connection_status = "online"
+
+                    # 服务端重启后账号注册表（内存态）丢失；SSE HTTP 200 是服务端
+                    # 已恢复的可靠信号，强制重做一次就绪检查 + 引导注册。
+                    # 失败仅告警不阻断流：业务 503 由 _get 自愈、重连由监听器
+                    # 退避循环兜底。
+                    try:
+                        await self.ensure_ready(force=True)
+                    except Exception as e:  # noqa: BLE001 — 自愈尽力而为，失败不阻断流
+                        logger.warning(f"SSE 就绪自愈检查失败: {e}")
+
+                    buffer = ""
+                    async for line in resp.aiter_lines():
+                        buffer += line + "\n"
+                        while "\n\n" in buffer:
+                            event_text, buffer = buffer.split("\n\n", 1)
+                            for event_line in event_text.split("\n"):
+                                if event_line.startswith("data: "):
+                                    try:
+                                        event = json.loads(event_line[6:])
+                                        logger.debug(
+                                            "SSE 事件: %s rawid=%s",
+                                            event.get("event"),
+                                            event.get("rawid"),
+                                        )
+                                        yield event
+                                    except json.JSONDecodeError:
+                                        logger.debug("SSE 数据行 JSON 解析失败，跳过")
+
+            except httpx.RequestError as e:
+                logger.warning(f"SSE 连接错误: {e}")
+                self.connection_status = "offline"
+            except asyncio.CancelledError:
+                self.connection_status = "offline"
+                raise
+
+        self.connection_status = "offline"
+        logger.info("SSE 流结束")
+
+    async def close(self) -> None:
+        """关闭 HTTP 客户端。"""
+        if self._client is not None:
+            await self._client.aclose()
+            self._client = None

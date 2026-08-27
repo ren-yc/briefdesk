@@ -103,9 +103,10 @@ powershell -ExecutionPolicy Bypass -File scripts/install-hooks.ps1
 简报台是本地网页应用：可插拔消息源采集群聊消息，经统一过滤与阶段化管道（OCR 增强 → AI 分类 → 语义去重 → 同话题合并）写入 SQLite，由 FastAPI 经 SSE 实时推送到原生 JS 前端。
 
 ```text
-消息源插件(weflow-legacy :5031 / qqflow :5032) → normalize 归一化 → pipeline 入口统一过滤
-→ enrich(OCR) → classify(AI) → dedup(判重/入库) → post_insert(合并) → db(SQLite)
-→ realtime(pub/sub) → server(FastAPI :3000) → ui/ SPA（SSE 实时刷新）
+消息源插件(weflow :5033 / weflow-legacy :5031 / qqflow :5032) → normalize 归一化
+→ pipeline 入口统一过滤 → enrich(OCR) → classify(AI) → dedup(判重/入库)
+→ post_insert(合并) → db(SQLite) → realtime(pub/sub) → server(FastAPI :3000)
+→ ui/ SPA（SSE 实时刷新）
 ```
 
 - **完整架构文档**：[docs/architecture.md](docs/architecture.md)——模块职责、插件框架、数据库 schema、server 路由清单、配置项表、设计要点与陷阱。涉及架构的任务先读它。
