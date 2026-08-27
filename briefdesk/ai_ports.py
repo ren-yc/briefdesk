@@ -96,7 +96,7 @@ def loads_json(text: str, *, repair: bool = True) -> object | None:
 
 
 def top_k_similar(
-    query_embedding: list[float],
+query_embedding: list[float] | np.ndarray,
     item_embeddings: list[list[float]] | np.ndarray,
     top_k: int,
     threshold: float,

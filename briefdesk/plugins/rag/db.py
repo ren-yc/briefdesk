@@ -347,21 +347,21 @@ async def fetch_new_embeddings(
 
 def parse_embedding_rows(
     raw_rows: list[dict],
-) -> tuple[list[tuple[ChunkRow, "np.ndarray"]], list[tuple[str, str]]]:
+) -> tuple[list[tuple[ChunkRow, np.ndarray]], list[tuple[str, str]]]:
     """纯函数：解析向量行为 float32 ndarray（可放工作线程执行）。
 
     返回 (entries, bad_keys)；脏 JSON 行不进 entries，其键返回给调用方
     删除（回填反连接下一轮自动重嵌入）。
     """
 
-    entries: list[tuple[ChunkRow, "np.ndarray"]] = []
+    entries: list[tuple[ChunkRow, np.ndarray]] = []
     bad_keys: list[tuple[str, str]] = []
     for r in raw_rows:
         key = (r["source"], r["msg_id"])
         try:
             vec = json.loads(r["embedding"])
             if not isinstance(vec, list):
-                raise ValueError("embedding 非数组")
+                raise TypeError("embedding 非数组")
             floats = np.asarray(vec, dtype=np.float32)
         except (json.JSONDecodeError, TypeError, ValueError):
             bad_keys.append(key)
@@ -408,9 +408,11 @@ async def gc_orphans(
 
     before = db.total_changes
     for ddl in (
-        "DELETE FROM rag_chunks WHERE NOT EXISTS ("
-        "SELECT 1 FROM raw_messages r WHERE r.source = rag_chunks.source "
-        "AND r.msg_id = rag_chunks.msg_id)",
+        (
+            "DELETE FROM rag_chunks WHERE NOT EXISTS ("
+            "SELECT 1 FROM raw_messages r WHERE r.source = rag_chunks.source "
+            "AND r.msg_id = rag_chunks.msg_id)"
+        ),
     ):
         cursor = await db.execute(ddl)
         await cursor.close()

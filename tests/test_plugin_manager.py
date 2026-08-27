@@ -62,6 +62,19 @@ class _BrokenAssetDirPlugin(FakePlugin):
         raise RuntimeError("boom")
 
 
+class _SettingsPlugin(FakePlugin):
+    def settings_schema(self):
+        return [
+            {
+                "key": "EXAMPLE_LIMIT",
+                "type": "number",
+                "numberKind": "integer",
+                "min": 1,
+                "current": 3,
+            }
+        ]
+
+
 class _EmptyEPS(list):
     """空 entry point 列表桩（manager 只调用 .select(group=...)）。"""
 
@@ -323,6 +336,26 @@ class RegistrationTest(unittest.TestCase):
         self.assertIs(by_name["backend"]["has_frontend"], False)
         self.assertIs(by_name["frontend"]["has_frontend"], True)
         self.assertIs(by_name["broken"]["has_frontend"], False)
+
+
+class SettingsSchemaTest(_ManagerTestBase):
+    async def test_selected_plugin_schema_is_returned(self):
+        manager = PluginManager(make_settings())
+        manager.register(_SettingsPlugin("example"))
+        await manager.setup_all(make_ctx())
+        schema = manager.settings_schema()
+        self.assertEqual(schema[0]["key"], "EXAMPLE_LIMIT")
+        self.assertEqual(schema[0]["plugin"], "example")
+        self.assertEqual(schema[0]["pluginStatus"], "loaded")
+
+    async def test_self_disabled_plugin_schema_remains_configurable(self):
+        manager = PluginManager(make_settings())
+        manager.register(
+            _SettingsPlugin("example", setup_disabled="missing configuration")
+        )
+        await manager.setup_all(make_ctx())
+        schema = manager.settings_schema()
+        self.assertEqual(schema[0]["pluginStatus"], "disabled")
 
 
 class DiscoveryTest(_ManagerTestBase):

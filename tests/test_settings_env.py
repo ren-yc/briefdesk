@@ -17,11 +17,13 @@ from unittest.mock import patch
 
 import keyring
 from keyring.backend import KeyringBackend
+from pydantic import SecretStr
 from starlette.testclient import TestClient
 
 import briefdesk.server as srv
 from briefdesk import settings_env
 from briefdesk.config import Settings
+from briefdesk.server import routes_settings_env as settings_routes
 from briefdesk.settings_env import (
     get_settings_file,
     read_staged,
@@ -128,7 +130,7 @@ class SettingsFileTest(StagedFileTestCase):
         self.assertEqual(read_staged()["DB_PATH"], r"C:\data\app.db?x=1")
 
     def test_source_of_priority(self) -> None:
-        # override（暂存文件）> 环境变量 > .env > default
+        # 环境变量 > override（暂存文件）> .env > default
         with tempfile.TemporaryDirectory() as d:
             env_root = Path(d)
             (env_root / ".env").write_text(
@@ -140,6 +142,9 @@ class SettingsFileTest(StagedFileTestCase):
                 self.assertEqual(source_of("LOG_LEVEL"), "default")
                 write_staged({"SERVER_PORT": "3001"})
                 self.assertEqual(source_of("SERVER_PORT"), "override")
+                with patch.dict(os.environ, {"IGNORE_SELF": "false"}):
+                    self.assertEqual(source_of("IGNORE_SELF"), "env")
+                write_staged({"IGNORE_SELF": "true"})
                 with patch.dict(os.environ, {"IGNORE_SELF": "false"}):
                     self.assertEqual(source_of("IGNORE_SELF"), "env")
                 self.assertEqual(source_of("POLL_OVERLAP_SECONDS"), "dotenv")
@@ -216,6 +221,83 @@ class EnvRoutesTest(StagedFileTestCase):
         self.assertEqual(res.status_code, 200)
         self.assertEqual(read_staged()["PLUGINS"], '["*","benchmark"]')
 
+    def test_dynamic_plugin_schema_is_rendered_validated_and_saved(self) -> None:
+        dynamic = [
+            {
+                "key": "RAG_TOP_K",
+                "type": "number",
+                "numberKind": "integer",
+                "min": 1,
+                "label": "向量召回条数",
+                "plugin": "rag",
+                "pluginStatus": "loaded",
+                "current": 12,
+                "secret": False,
+            },
+            {
+                "key": "RAG_API_KEY",
+                "type": "text",
+                "label": "RAG API Key",
+                "plugin": "rag",
+                "pluginStatus": "loaded",
+                "secret": True,
+            },
+        ]
+        with patch.object(settings_routes, "get_settings_schema", return_value=dynamic):
+            data = self.client.get("/api/settings/env").json()
+            item = next(i for i in data["items"] if i["key"] == "RAG_TOP_K")
+            self.assertEqual(item["plugin"], "rag")
+            self.assertEqual(item["current"], 12)
+            self.assertIn(
+                {
+                    "name": "RAG_API_KEY",
+                    "label": "RAG API Key",
+                    "plugin": "rag",
+                    "configured": False,
+                    "keyringConfigured": False,
+                },
+                data["secrets"],
+            )
+            res = self.client.put(
+                "/api/settings/env", json={"items": {"RAG_TOP_K": "20"}}
+            )
+            self.assertEqual(res.status_code, 200)
+            self.assertEqual(read_staged()["RAG_TOP_K"], "20")
+            self.assertEqual(
+                self.client.put(
+                    "/api/settings/env", json={"items": {"RAG_TOP_K": "0"}}
+                ).status_code,
+                422,
+            )
+            self.assertEqual(
+                self.client.post(
+                    "/api/settings/secrets",
+                    json={"name": "RAG_API_KEY", "value": "fake-rag-key"},
+                ).status_code,
+                200,
+            )
+
+    def test_empty_manager_schema_hides_plugin_secrets(self) -> None:
+        with patch.object(settings_routes, "get_settings_schema", return_value=[]), patch.object(
+            settings_routes, "has_settings_schema_callback", return_value=True
+        ):
+            data = self.client.get("/api/settings/env").json()
+        self.assertEqual(
+            {secret["name"] for secret in data["secrets"]},
+            {"AI_API_KEY", "EMBED_API_KEY"},
+        )
+
+    def test_core_schema_is_derived_from_settings_fields(self) -> None:
+        keys = {
+            item["key"] for item in self.client.get("/api/settings/env").json()["items"]
+        }
+        expected = {
+            str(field.alias)
+            for field in Settings.model_fields.values()
+            if field.alias and field.annotation is not SecretStr
+        }
+        self.assertTrue(expected <= keys)
+
     def test_put_rejects_unknown_key(self) -> None:
         res = self.client.put(
             "/api/settings/env", json={"items": {"NOT_A_REAL_KEY": "x"}}
@@ -256,28 +338,51 @@ class EnvRoutesTest(StagedFileTestCase):
         self.assertEqual(read_staged(), {})
 
     def test_secret_set_get_delete(self) -> None:
-        res = self.client.post(
-            "/api/settings/secrets",
-            json={"name": "AI_API_KEY", "value": _VALID_SECRET},
-        )
-        self.assertEqual(res.status_code, 200)
-        data = self.client.get("/api/settings/env").json()
+        # 测试只验证 keyring 的写删；宿主项目 .env 可能有真实配置，需排除其
+        # 对“删除 keyring 后仍已配置”的有效影响。
+        core_schema = [
+            {**item, "configured": False}
+            for item in settings_routes._CORE_SECRET_SCHEMA
+        ]
+        with patch.object(settings_routes, "_CORE_SECRET_SCHEMA", core_schema):
+            res = self.client.post(
+                "/api/settings/secrets",
+                json={"name": "AI_API_KEY", "value": _VALID_SECRET},
+            )
+            self.assertEqual(res.status_code, 200)
+            data = self.client.get("/api/settings/env").json()
+            ai = next(s for s in data["secrets"] if s["name"] == "AI_API_KEY")
+            self.assertTrue(ai["configured"])
+            self.assertTrue(ai["keyringConfigured"])
+            # 明文永不回传
+            self.assertNotIn(_VALID_SECRET, json.dumps(data))
+            res = self.client.delete("/api/settings/secrets/AI_API_KEY")
+            self.assertEqual(res.status_code, 200)
+            ai = next(
+                s
+                for s in self.client.get("/api/settings/env").json()["secrets"]
+                if s["name"] == "AI_API_KEY"
+            )
+            self.assertFalse(ai["configured"])
+            self.assertFalse(ai["keyringConfigured"])
+            # 幂等删除
+            self.assertEqual(
+                self.client.delete("/api/settings/secrets/AI_API_KEY").status_code,
+                200,
+            )
+
+    def test_secret_separates_effective_and_keyring_configuration(self) -> None:
+        core_schema = [
+            {**item, "configured": item["key"] == "AI_API_KEY"}
+            for item in settings_routes._CORE_SECRET_SCHEMA
+        ]
+        with patch.object(settings_routes, "_CORE_SECRET_SCHEMA", core_schema), patch.object(
+            settings_routes, "get_secret", return_value=None
+        ):
+            data = self.client.get("/api/settings/env").json()
         ai = next(s for s in data["secrets"] if s["name"] == "AI_API_KEY")
         self.assertTrue(ai["configured"])
-        # 明文永不回传
-        self.assertNotIn(_VALID_SECRET, json.dumps(data))
-        res = self.client.delete("/api/settings/secrets/AI_API_KEY")
-        self.assertEqual(res.status_code, 200)
-        ai = next(
-            s
-            for s in self.client.get("/api/settings/env").json()["secrets"]
-            if s["name"] == "AI_API_KEY"
-        )
-        self.assertFalse(ai["configured"])
-        # 幂等删除
-        self.assertEqual(
-            self.client.delete("/api/settings/secrets/AI_API_KEY").status_code, 200
-        )
+        self.assertFalse(ai["keyringConfigured"])
 
     def test_secret_rejects_unknown_name_and_empty_value(self) -> None:
         res = self.client.post(
@@ -309,6 +414,7 @@ class FrontendGuardTest(unittest.TestCase):
         self.assertIn('"/api/settings/secrets"', js)
         self.assertIn("data-env-restore", js)
         self.assertIn("data-sec-set", js)
+        self.assertIn("keyringConfigured", js)
         self.assertIn('class="env-input"', js)
 
 

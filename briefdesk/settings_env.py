@@ -78,15 +78,15 @@ def write_staged(updates: dict[str, str | None]) -> None:
 
 
 def source_of(alias: str) -> str:
-    """某配置键当前的生效来源：override（暂存）/ env / dotenv / default。
+    """某配置键当前的生效来源：env / override（暂存）/ dotenv / default。
 
     判定顺序与解析优先级一致（环境变量 > 暂存文件 > .env > 默认）：
     缺文件时静默跳过对应层。
     """
-    if alias in read_staged():
-        return "override"
     if os.environ.get(alias) is not None:
         return "env"
+    if alias in read_staged():
+        return "override"
     try:
         dotenv = dotenv_values(str(PROJECT_ROOT / ".env"), encoding="utf-8")
     except OSError:

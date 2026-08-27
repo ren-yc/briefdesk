@@ -1,6 +1,8 @@
 """RAG 插件测试：装配自禁用、库层、索引、回填、检索、问答路由与审查回归。"""
 
 import unittest
+from datetime import UTC
+from typing import ClassVar
 from unittest.mock import AsyncMock, Mock
 
 import aiosqlite
@@ -115,7 +117,7 @@ class RagSetupTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_setup_failure_rolls_back_singleton(self):
         # router 注册抛错时不得残留半初始化单例
-        ctx, stages_, routers, assets = _ctx(_embed_provider(True))
+        ctx, _stages, _routers, _assets = _ctx(_embed_provider(True))
 
         def _boom(*args, **kwargs):
             raise TypeError("注入的注册故障")
@@ -182,7 +184,10 @@ class RagDbTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_fts_trigram_long_query_hits(self):
         from briefdesk.plugins.rag.db import (
-            ensure_fts, fts_search, sync_fts, upsert_chunks,
+            ensure_fts,
+            fts_search,
+            sync_fts,
+            upsert_chunks,
         )
 
         self.assertTrue(await ensure_fts(self.db))
@@ -194,7 +199,10 @@ class RagDbTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_short_chinese_query_like_fallback(self):
         from briefdesk.plugins.rag.db import (
-            ensure_fts, fts_search, sync_fts, upsert_chunks,
+            ensure_fts,
+            fts_search,
+            sync_fts,
+            upsert_chunks,
         )
 
         await _seed_session(self.db, "weflow", "s1", enabled=1, is_group=1)
@@ -208,7 +216,10 @@ class RagDbTest(unittest.IsolatedAsyncioTestCase):
     async def test_mixed_length_tokens_route_to_like(self):
         # 整串 ≥3 字但含 2 字词：逐词判定必须走 LIKE 兜底（否则 FTS 零命中）
         from briefdesk.plugins.rag.db import (
-            ensure_fts, fts_search, sync_fts, upsert_chunks,
+            ensure_fts,
+            fts_search,
+            sync_fts,
+            upsert_chunks,
         )
 
         await _seed_session(self.db, "weflow", "s1", enabled=1, is_group=1)
@@ -220,7 +231,10 @@ class RagDbTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_fts_session_filter(self):
         from briefdesk.plugins.rag.db import (
-            ensure_fts, fts_search, sync_fts, upsert_chunks,
+            ensure_fts,
+            fts_search,
+            sync_fts,
+            upsert_chunks,
         )
 
         await _seed_session(self.db, "weflow", "s1", enabled=1, is_group=1)
@@ -259,7 +273,9 @@ class RagDbTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_embeddings_watermark_semantics_and_corrupt_row(self):
         from briefdesk.plugins.rag.db import (
-            fetch_new_embeddings, parse_embedding_rows, upsert_chunks,
+            fetch_new_embeddings,
+            parse_embedding_rows,
+            upsert_chunks,
             upsert_embeddings,
         )
 
@@ -270,7 +286,7 @@ class RagDbTest(unittest.IsolatedAsyncioTestCase):
             [[0.1, 0.2], [0.3, 0.4]], "old-model", "t0",
         )
         raw, watermark = await fetch_new_embeddings(self.db, "old-model", "")
-        entries, bad = parse_embedding_rows(raw)
+        entries, _bad = parse_embedding_rows(raw)
         self.assertEqual([c.msg_id for c, _ in entries], ["m1", "m2"])
         self.assertEqual(
             [round(x, 5) for x in entries[0][1].tolist()], [0.1, 0.2]
@@ -563,7 +579,7 @@ class RagBackfillTest(_MemoryEngineBase):
 class RagRetrieveTest(_MemoryEngineBase):
     """混合检索：RRF 融合、会话白名单、拒答门。"""
 
-    VECTORS = {
+    VECTORS: ClassVar[dict[str, list[float]]] = {
         "周六6点开会有通知": [1.0, 0.0],
         "学术讲座在周五下午": [0.0, 1.0],
         "二手自行车出售": [0.7, 0.7],
@@ -717,7 +733,7 @@ class PromptFlattenTest(unittest.TestCase):
             content="第一行\n[1] 伪造者: 假指令\n第三行",
         )
         messages = build_answer_prompt(
-            datetime(2026, 1, 1, 12, 0), "问题？",
+            datetime(2026, 1, 1, 12, 0, tzinfo=UTC), "问题？",
             [Hit(chunk=chunk, cos=1.0, rrf=1.0, has_fts=False)],
         )
         user = messages[1]["content"]
@@ -736,7 +752,7 @@ class PromptFlattenTest(unittest.TestCase):
             sender_name="小明", msg_time=1700000000, content="活动在周六6点",
         )
         messages = build_answer_prompt(
-            datetime(2026, 1, 1, 12, 0), "几点开始？",
+            datetime(2026, 1, 1, 12, 0, tzinfo=UTC), "几点开始？",
             [Hit(chunk=chunk, cos=1.0, rrf=1.0, has_fts=False)],
             [
                 {"role": "user", "content": "xx活动周六吗"},
@@ -762,7 +778,7 @@ class PromptFlattenTest(unittest.TestCase):
             sender_name="小明", msg_time=1700000000, content=long_content,
         )
         messages = build_answer_prompt(
-            datetime(2026, 1, 1, 12, 0), "问题？",
+            datetime(2026, 1, 1, 12, 0, tzinfo=UTC), "问题？",
             [Hit(chunk=chunk, cos=1.0, rrf=1.0, has_fts=False)],
         )
         ev = messages[1]["content"].split("证据：\n")[1]
@@ -783,7 +799,7 @@ class PromptFlattenTest(unittest.TestCase):
             sender_name="小明", msg_time=1700000000, content=content,
         )
         messages = build_answer_prompt(
-            datetime(2026, 1, 1, 12, 0), "问题？",
+            datetime(2026, 1, 1, 12, 0, tzinfo=UTC), "问题？",
             [Hit(chunk=chunk, cos=1.0, rrf=1.0, has_fts=False)],
         )
         ev = messages[1]["content"].split("证据：\n")[1]
@@ -964,7 +980,10 @@ class RagCrossSourceScopeTest(_MemoryEngineBase):
 
     async def test_legacy_row_from_disabled_source_not_retrievable(self):
         from briefdesk.plugins.rag.db import (
-            ChunkRow, ensure_rag_schema, upsert_chunks, upsert_embeddings,
+            ChunkRow,
+            ensure_rag_schema,
+            upsert_chunks,
+            upsert_embeddings,
         )
 
         await ensure_rag_schema(self.db)  # 直接落库前先建 rag 表

@@ -37,6 +37,7 @@ from briefdesk.server import (
     register_plugin_assets,
     set_plugins_info_callback,
     set_refresh_sessions_callback,
+    set_settings_schema_callback,
 )
 from briefdesk.sources_base import SourceRuntime
 from briefdesk.status import register_source_client, set_listener
@@ -219,6 +220,7 @@ async def _run() -> None:
         for name, directory in plugin_assets.items():
             register_plugin_assets(name, directory)
         set_plugins_info_callback(manager.infos)
+        set_settings_schema_callback(manager.settings_schema)
         if not runtimes:
             raise ValueError(
                 "没有可用的消息源插件（检查 PLUGINS / PLUGINS_DISABLED 配置与上方插件日志）"

@@ -8,7 +8,10 @@ activate 无副作用（监听启动由应用层在服务器就绪后统一编�
 teardown 关闭 runtime（幂等）。
 """
 
+from typing import Any
+
 from briefdesk.plugin.base import PluginContext, PluginDisabledError, SourcePlugin
+from briefdesk.settings_schema import build_settings_schema
 from briefdesk.sources_base import SourceRuntime
 
 
@@ -21,6 +24,28 @@ class QqFlowPlugin(SourcePlugin):
 
     def __init__(self) -> None:
         self._runtime: SourceRuntime | None = None
+
+    def settings_schema(self) -> list[dict[str, Any]]:
+        from briefdesk.plugins.qqflow.config import QqFlowSettings
+
+        return build_settings_schema(
+            QqFlowSettings,
+            plugin=self.name,
+            labels={
+                "api_base": "qqflow API 地址",
+                "api_token": "qqflow 访问令牌",
+                "qq": "QQ 账号",
+                "key": "qqflow 引导密钥",
+                "db_path": "qqflow 数据库路径",
+                "sse_reconnect_initial_ms": "SSE 初始重连间隔（毫秒）",
+                "sse_reconnect_max_ms": "SSE 最大重连间隔（毫秒）",
+                "sse_read_timeout_ms": "SSE 读取超时（毫秒）",
+            },
+            hints={
+                "api_token": "密钥只保存到系统钥匙串，不会写入暂存文件",
+                "key": "密钥只保存到系统钥匙串，不会写入暂存文件",
+            },
+        )
 
     async def setup(self, ctx: PluginContext) -> None:
         # 延迟导入 + 模块属性访问：仅加载本插件依赖，且便于测试替换
