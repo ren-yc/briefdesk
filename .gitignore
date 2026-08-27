@@ -59,3 +59,5 @@ debug*.py
 briefdesk/plugins/benchmark/reports/
 briefdesk/plugins/benchmark/.tmp/
 briefdesk/plugins/benchmark/cases/*.fromweb.json
+
+.data-review/
