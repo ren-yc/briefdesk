@@ -682,10 +682,39 @@ class RagAskTest(_MemoryEngineBase):
         self.assertEqual(result.citations, [])
         self.provider.chat.assert_not_awaited()
 
+    async def test_json_contract_answer(self):
+        # deepseek 系 json_object 输出：JSON 契约解析优先
+        self.provider.chat = AsyncMock(
+            return_value=_chat_response(
+                '{"answer": "活动在周六6点举行 [1]。", "citations": [1]}'
+            )
+        )
+        result = await self.engine.ask("周六6点开会有通知")
+        self.assertFalse(result.refused)
+        self.assertEqual(result.answer, "活动在周六6点举行 [1]。")
+        self.assertEqual([c["msg_id"] for c in result.citations], ["m1"])
+
     async def test_chat_failure_propagates(self):
         self.provider.chat = AsyncMock(side_effect=RuntimeError("ai down"))
         with self.assertRaises(RuntimeError):
             await self.engine.ask("周六6点开会有通知")
+
+
+    async def test_evidence_chars_setting_truncates_prompt(self):
+        # RAG_EVIDENCE_CHARS 传入证据构造：超长消息在 prompt 内被截断并标注
+        from briefdesk.plugins.rag.config import RagSettings as RS
+
+        self.engine.settings = RS(evidence_chars=50)
+        long_content = "长消息内容" * 149 + "独特结尾句"  # 750 字符
+        await self._index([_msg("m9", long_content)])
+        self.provider.chat = AsyncMock(return_value=_chat_response("答案 [1]。"))
+        result = await self.engine.ask("长消息内容")
+        self.assertFalse(result.refused)
+        messages = self.provider.chat.call_args.args[0]
+        ev = messages[1]["content"].split("证据：\n")[1]
+        self.assertTrue(ev.endswith("…"))
+        self.assertIn(long_content[:50], ev)
+        self.assertNotIn("独特结尾句", ev)
 
 
 class PromptFlattenTest(unittest.TestCase):
@@ -710,6 +739,72 @@ class PromptFlattenTest(unittest.TestCase):
         user = messages[1]["content"]
         evidence_line = user.split("证据：\n")[1]
         self.assertNotIn("\n", evidence_line)  # 单条证据恒为单行
+
+    def test_history_included_in_prompt_within_cap(self):
+        from datetime import datetime
+
+        from briefdesk.plugins.rag.db import ChunkRow
+        from briefdesk.plugins.rag.engine import Hit
+        from briefdesk.plugins.rag.prompts import build_answer_prompt
+
+        chunk = ChunkRow(
+            source="weflow", msg_id="m1", session_id="s1", group_name="测试群",
+            sender_name="小明", msg_time=1700000000, content="活动在周六6点",
+        )
+        messages = build_answer_prompt(
+            datetime(2026, 1, 1, 12, 0, tzinfo=UTC), "几点开始？",
+            [Hit(chunk=chunk, cos=1.0, rrf=1.0, has_fts=False)],
+            [
+                {"role": "user", "content": "xx活动周六吗"},
+                {"role": "assistant", "content": "周六6点 [1]。"},
+            ],
+        )
+        user = messages[1]["content"]
+        self.assertIn("对话历史：", user)
+        self.assertIn("xx活动周六吗", user)
+        self.assertIn("周六6点 [1]。", user)
+
+
+    def test_evidence_truncated_over_cap(self):
+        from datetime import datetime
+
+        from briefdesk.plugins.rag.db import ChunkRow
+        from briefdesk.plugins.rag.engine import Hit
+        from briefdesk.plugins.rag.prompts import build_answer_prompt
+
+        long_content = "长消息内容" * 149 + "独特结尾句"  # 750 字符，默认上限 600
+        chunk = ChunkRow(
+            source="weflow", msg_id="m1", session_id="s1", group_name="测试群",
+            sender_name="小明", msg_time=1700000000, content=long_content,
+        )
+        messages = build_answer_prompt(
+            datetime(2026, 1, 1, 12, 0, tzinfo=UTC), "问题？",
+            [Hit(chunk=chunk, cos=1.0, rrf=1.0, has_fts=False)],
+        )
+        ev = messages[1]["content"].split("证据：\n")[1]
+        self.assertTrue(ev.endswith("…"))
+        self.assertIn(long_content[:600], ev)
+        self.assertNotIn("独特结尾句", ev)
+
+    def test_evidence_not_truncated_within_cap(self):
+        from datetime import datetime
+
+        from briefdesk.plugins.rag.db import ChunkRow
+        from briefdesk.plugins.rag.engine import Hit
+        from briefdesk.plugins.rag.prompts import build_answer_prompt
+
+        content = "短" * 600  # 恰在上限内：不截断不加标记
+        chunk = ChunkRow(
+            source="weflow", msg_id="m1", session_id="s1", group_name="测试群",
+            sender_name="小明", msg_time=1700000000, content=content,
+        )
+        messages = build_answer_prompt(
+            datetime(2026, 1, 1, 12, 0, tzinfo=UTC), "问题？",
+            [Hit(chunk=chunk, cos=1.0, rrf=1.0, has_fts=False)],
+        )
+        ev = messages[1]["content"].split("证据：\n")[1]
+        self.assertNotIn("…", ev)
+        self.assertIn(content, ev)
 
 
 class RagRouterTest(unittest.IsolatedAsyncioTestCase):
@@ -776,6 +871,25 @@ class RagRouterTest(unittest.IsolatedAsyncioTestCase):
             # 纯空白：min_length 放行但 strip 校验拦截 → 422 而非 200 拒答
             resp = self.client.post("/api/rag/ask", json={"question": "   "})
             self.assertEqual(resp.status_code, 422)
+            # history：非法角色/非字符串被滤除，合法条目被转发
+            resp = self.client.post(
+                "/api/rag/ask",
+                json={
+                    "question": "周六几点？",
+                    "history": [
+                        {"role": "user", "content": "刚才问了活动"},
+                        {"role": "system", "content": "越权内容应当被滤除"},
+                        {"role": "assistant", "content": "好的"},
+                        {"content": 123},
+                    ],
+                },
+            )
+            self.assertEqual(resp.status_code, 200)
+            args = engine.ask.call_args.args
+            self.assertEqual(args[2], [
+                {"role": "user", "content": "刚才问了活动"},
+                {"role": "assistant", "content": "好的"},
+            ])
 
     async def test_status_and_reindex(self):
         from unittest.mock import AsyncMock, patch

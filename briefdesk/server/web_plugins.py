@@ -12,7 +12,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 from fastapi import APIRouter
-from fastapi.responses import FileResponse, PlainTextResponse
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from starlette.routing import Mount
 
 from briefdesk.server.app import app
@@ -53,8 +53,15 @@ def has_settings_schema_callback() -> bool:
 
 @app.get("/api/plugins")
 async def api_plugins():
-    """插件发现/装配摘要（名称/版本/状态/原因），前端据此渲染插件区。"""
-    return {"plugins": get_plugins_info()}
+    """插件发现/装配摘要（名称/版本/状态/原因），前端据此渲染插件区。
+
+    响应带 no-store：装配状态只反映当前进程，禁止浏览器陈旧快照
+    （插件顺序/状态变化直接决定前端加载行为）。
+    """
+
+    response = JSONResponse({"plugins": get_plugins_info()})
+    response.headers["Cache-Control"] = "no-store"
+    return response
 
 
 _plugin_assets: dict[str, str] = {}
@@ -107,4 +114,12 @@ async def plugin_assets(name: str, path: str):
         return PlainTextResponse("Asset not found", status_code=404)
     if not file.is_file():
         return PlainTextResponse("Asset not found", status_code=404)
-    return FileResponse(file)
+    return _no_cache_file(file)
+
+
+def _no_cache_file(file):
+    """插件资源随插随改：响应带 no-cache，浏览器每次向服务端校验证书。"""
+
+    response = FileResponse(file)
+    response.headers["Cache-Control"] = "no-cache"
+    return response

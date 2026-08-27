@@ -16,6 +16,7 @@ class RagSettings(BaseSettings):
     top_k: int = Field(default=12, ge=1)  # env: RAG_TOP_K 向量召回条数
     fts_limit: int = Field(default=12, ge=1)  # env: RAG_FTS_LIMIT 关键词召回条数
     max_evidence: int = Field(default=10, ge=1)  # env: RAG_MAX_EVIDENCE 注入 prompt 的证据上限
+    evidence_chars: int = Field(default=600, ge=50)  # env: RAG_EVIDENCE_CHARS 单条证据注入 prompt 的字符上限（超出以「…」截断）
     min_score: float = Field(default=0.25, ge=0.0, le=1.0)  # env: RAG_MIN_SCORE 余弦拒答门限
     backfill_days: int = Field(default=7)  # env: RAG_BACKFILL_DAYS 回填窗口天；0=关 -1=全量
     backfill_batch: int = Field(default=256, ge=1)  # env: RAG_BACKFILL_BATCH 嵌入子批大小

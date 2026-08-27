@@ -9,9 +9,11 @@ __pycache__/
 .ruff_cache/
 pytest-cache-files-*/
 .tmp-pytest/
+.tmp-test/
 
 # Agent tooling state（本地会话状态，禁止入库）
 .agent-teams/
+.tmp-edge/
 
 # Virtual environment
 .venv/

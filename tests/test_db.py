@@ -2016,5 +2016,52 @@ class SetItemReminderClearMutexTest(_InMemoryDbTest):
         self.assertFalse(second_clear, "第二次清除不得命中（已被第一个标签页清掉）")
 
 
+class DefaultCategoriesUpgradeTest(_InMemoryDbTest):
+    """默认分类 5→13 升级：出厂启用态 + 存量库 user_version 一次性回填。
+
+    契约：新装库播种 13 类但仅原五类启用；存量库经回填补齐缺失默认类
+    （新增八类以停用态入库），绝不改写已有行；迁移只跑一次，此后删除被尊重。
+    """
+
+    _ORIGINAL_FIVE = ("活动通知", "社团招新", "学术", "交易", "实习")
+    _NEW_EIGHT = ("失物招领", "求助互助", "组队拼团", "兼职家教",
+                  "免费福利", "房屋租售", "志愿公益", "奖助申报")
+
+    async def _load_enabled_map(self) -> dict:
+        cursor = await self.db.execute("SELECT name, enabled FROM categories")
+        return {r["name"]: r["enabled"] for r in await cursor.fetchall()}
+
+    async def test_fresh_seed_enables_only_original_five(self):
+        rows = await self._load_enabled_map()
+        self.assertEqual(len(rows), 13)
+        enabled = {n for n, e in rows.items() if e}
+        self.assertEqual(enabled, set(self._ORIGINAL_FIVE))
+
+    async def test_backfill_adds_missing_disabled_respects_existing(self):
+        # 模拟升级前旧库：删掉新增八类；用户曾手动禁用"交易"；重置迁移标记
+        await self.db.execute("DELETE FROM categories WHERE enabled = 0")
+        await self.db.execute("UPDATE categories SET enabled = 0 WHERE name = '交易'")
+        await self.db.execute("PRAGMA user_version = 0")
+        await self.db.commit()
+        await init_schema(self.db)  # 触发一次性回填
+        rows = await self._load_enabled_map()
+        self.assertEqual(len(rows), 13)
+        self.assertEqual(rows["交易"], 0)   # 已有行绝不被回填改写
+        for n in self._NEW_EIGHT:
+            self.assertEqual(rows[n], 0, n)  # 补入项按出厂态停用
+        for n in ("活动通知", "社团招新", "学术", "实习"):
+            self.assertEqual(rows[n], 1, n)
+
+    async def test_backfill_runs_once_and_respects_deletion(self):
+        await self.db.execute("DELETE FROM categories WHERE name = '失物招领'")
+        await self.db.commit()
+        await init_schema(self.db)  # user_version 已置位 → 不再回填
+        cursor = await self.db.execute(
+            "SELECT COUNT(*) AS cnt FROM categories WHERE name = '失物招领'"
+        )
+        row = await cursor.fetchone()
+        self.assertEqual(row["cnt"], 0, "迁移完成后用户的删除必须被尊重")
+
+
 if __name__ == "__main__":
     unittest.main()

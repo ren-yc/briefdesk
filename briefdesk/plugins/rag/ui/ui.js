@@ -1,58 +1,65 @@
-/* rag 插件前端：「问一问」视图的完整前端随插件包分发。
+/* rag 插件前端：右侧「问一问」聊天侧边栏。
  *
- * 核心只提供通用加载器与视图钩子（app.js 的 registerPluginView）：
- * - 本文件注入后自行创建入口按钮 / 视图容器 / 上下文浮层（DOM 不入核心 index.html）；
- * - 提问走 POST /api/rag/ask；答案渲染引用芯片，点击复用核心 fetchContext 打开原文；
- * - 复用的核心全局工具：esc / registerPluginView / parseHash / syncHash /
- *   batchMode / exitBatchMode / inlineSvgIcons / fetchContext。
+ * 架构决定：不注册插件视图（registerPluginView），不触碰头部按钮区——
+ * 日历按钮/视图系统保持原样；本面板是纯状态抽屉：侧边栏 nav-special 入口
+ * 点击开合，Esc 关闭，会话历史保存在内存中。
+ * 复用核心全局：esc / escAttr / fetchContext / inlineSvgIcons。
  */
 (function () {
   "use strict";
   const PLUGIN = "rag";
+  const ICON = "/icons/search.svg";
 
-  // ── 状态 ──
-  let askMode = false;   // 视图开关
-  let asking = false;    // 请求互斥
-
-  // ── 元素（init 时创建）──
-  let $ragBtn = null;
-  let $ragView = null;
-  let $ragInput = null;
-  let $ragAskBtn = null;
-  let $ragResult = null;
+  let $navLink = null;
+  let $drawer = null;
+  let $msgs = null;
+  let $input = null;
+  let $sendBtn = null;
+  let $clearBtn = null;
   let $ctxModal = null;
 
+  let open = false;        // 抽屉开关
+  let asking = false;      // 请求互斥
+  const history = [];      // 会话内对话历史 [{role, content}]
+
   function buildDom() {
-    $ragBtn = document.createElement("button");
-    $ragBtn.id = "rag-btn";
-    $ragBtn.className = "sync-btn";
-    $ragBtn.title = "问一问（向群聊记录提问，带原文引用）";
-    $ragBtn.innerHTML = '<img src="/icons/search.svg" class="icon" alt="">问一问';
-    const $calBtn = document.getElementById("calendar-btn");
-    if ($calBtn) $calBtn.parentNode.insertBefore($ragBtn, $calBtn);
-    else {
-      const $syncBtn = document.getElementById("sync-btn");
-      if ($syncBtn) $syncBtn.parentNode.insertBefore($ragBtn, $syncBtn);
+    // ── 侧边栏入口（工具类固定排在视图类之后，nav-special 底部）──
+    $navLink = document.createElement("a");
+    $navLink.id = "rag-nav-link";
+    $navLink.href = "#";
+    $navLink.className = "cat-link";
+    $navLink.title = "问一问（向群聊记录提问，带原文引用）";
+    $navLink.innerHTML =
+      '<span class="cat-link-main"><img src="' + ICON + '" class="icon-sm cat-icon" alt="">问一问</span>';
+    const $ignored = document.getElementById("ignored-link");
+    if ($ignored && $ignored.parentNode) {
+      $ignored.parentNode.insertBefore($navLink, $ignored.nextSibling);
+    } else {
+      const $aside = document.querySelector("aside.sidebar");
+      if ($aside) $aside.appendChild($navLink);
     }
 
-    $ragView = document.createElement("div");
-    $ragView.id = "rag-view";
-    $ragView.classList.add("hidden");
-    $ragView.innerHTML =
-      '<div class="rag-panel">'
-      + '<h2 class="rag-title">问一问</h2>'
-      + '<p class="rag-hint">向已启用的群聊记录提问（如「那个活动什么时候截止」），回答附原始消息引用。</p>'
-      + '<div class="rag-input-row">'
-      + '<input id="rag-input" type="text" maxlength="500" placeholder="例如：xx活动的报名截止时间是什么时候？"/>'
-      + '<button id="rag-ask" class="sync-btn">提问</button>'
+    // ── 右侧聊天抽屉 ──
+    $drawer = document.createElement("aside");
+    $drawer.id = "rag-drawer";
+    $drawer.setAttribute("role", "complementary");
+    $drawer.setAttribute("aria-label", "问一问聊天");
+    $drawer.classList.add("hidden");
+    $drawer.innerHTML =
+      '<div class="rag-drawer-head">'
+      + '<h2 class="rag-drawer-title">问一问</h2>'
+      + '<button id="rag-clear" class="rag-drawer-btn" title="清空对话">清空</button>'
+      + '<button id="rag-close" class="rag-drawer-btn rag-drawer-x" title="关闭 (Esc)">×</button>'
       + "</div>"
-      + '<div id="rag-result" class="rag-result"></div>'
+      + '<div id="rag-msgs" class="rag-msgs"></div>'
+      + '<div class="rag-input-row">'
+      + '<input id="rag-input" type="text" maxlength="500" '
+      + 'placeholder="例如：那个活动的报名截止时间是什么时候？" autocomplete="off"/>'
+      + '<button id="rag-send" type="button">发送</button>'
       + "</div>";
-    const $main = document.querySelector("main");
-    const $loadMoreWrap = document.getElementById("load-more-wrap");
-    if ($loadMoreWrap) $loadMoreWrap.after($ragView);
-    else if ($main) $main.appendChild($ragView);
+    document.body.appendChild($drawer);
 
+    // ── 引用原文上下文浮层（复用核心 fetchContext）──
     $ctxModal = document.createElement("div");
     $ctxModal.id = "rag-ctx-modal";
     $ctxModal.className = "modal hidden";
@@ -67,94 +74,128 @@
       + '<div id="rag-ctx-body"></div>'
       + "</div>";
     document.body.appendChild($ctxModal);
+
+    $msgs = document.getElementById("rag-msgs");
+    $input = document.getElementById("rag-input");
+    $sendBtn = document.getElementById("rag-send");
+    $clearBtn = document.getElementById("rag-clear");
   }
 
   function bindEvents() {
-    $ragBtn.addEventListener("click", () => {
-      if (askMode) exitAskMode();
-      else enterAskMode();
+    $navLink.addEventListener("click", (e) => {
+      e.preventDefault();
+      toggleDrawer();
     });
-    $ragAskBtn.addEventListener("click", submitQuestion);
-    $ragInput.addEventListener("keydown", (e) => {
+    $sendBtn.addEventListener("click", submitQuestion);
+    $input.addEventListener("keydown", (e) => {
       if (e.key === "Enter") submitQuestion();
     });
+    document.getElementById("rag-clear").addEventListener("click", clearChat);
+    document.getElementById("rag-close").addEventListener("click", closeDrawer);
     document.getElementById("rag-ctx-close").addEventListener("click", hideCtxModal);
     $ctxModal.addEventListener("click", (e) => {
       if (e.target === $ctxModal) hideCtxModal();
     });
+    $drawer.addEventListener("click", (e) => {
+      if (e.target === $drawer) return;
+    });
+    document.addEventListener("keydown", (e) => {
+      if (e.key !== "Escape") return;
+      if (!$ctxModal.classList.contains("hidden")) { hideCtxModal(); return; }
+      if (open) closeDrawer();
+    });
   }
 
-  // ── 视图进出 ──
-  function enterAskMode() {
-    askMode = true;
-    if (typeof batchMode !== "undefined" && batchMode) exitBatchMode();
-    document.body.classList.add("rag-mode");
-    $ragBtn.classList.add("active");
-    $ragView.classList.remove("hidden");
-    syncHash("push");
-    $ragInput.focus();
+  // ── 抽屉开合 ──
+  function toggleDrawer() {
+    if (open) closeDrawer();
+    else openDrawer();
+  }
+  function openDrawer() {
+    open = true;
+    $navLink.classList.add("active");
+    $drawer.classList.remove("hidden");
+    $input.focus();
+  }
+  function closeDrawer() {
+    open = false;
+    $navLink.classList.remove("active");
+    $drawer.classList.add("hidden");
   }
 
-  function exitAskMode() {
-    askMode = false;
-    document.body.classList.remove("rag-mode");
-    $ragBtn.classList.remove("active");
-    $ragView.classList.add("hidden");
-    hideCtxModal();
-    syncHash("push");
+  function clearChat() {
+    history.length = 0;
+    $msgs.innerHTML = "";
+    addMsg("assistant", "已清空对话。可以直接开始提问了。");
   }
 
-  // ── 提问与渲染 ──
+  function addMsg(role, content, extra) {
+    const wrap = document.createElement("div");
+    wrap.className = "rag-msg rag-msg-" + (role === "user" ? "user" : "assistant");
+    const bubble = document.createElement("div");
+    bubble.className = "rag-bubble";
+    bubble.textContent = content;
+    wrap.appendChild(bubble);
+    if (extra && extra.citations && extra.citations.length) {
+      const chips = document.createElement("div");
+      chips.className = "rag-cites";
+      extra.citations.forEach((c) => {
+        const chip = document.createElement("button");
+        chip.type = "button";
+        chip.className = "rag-cite-chip";
+        chip.dataset.n = String(c.n);
+        chip.title = escAttr((c.group_name ? c.group_name + " · " : "") + c.sender_name);
+        chip.textContent = "[" + c.n + "] " + c.sender_name;
+        chip.addEventListener("click", () => openCtx(c));
+        chips.appendChild(chip);
+      });
+      wrap.appendChild(chips);
+    }
+    $msgs.appendChild(wrap);
+    $msgs.scrollTop = $msgs.scrollHeight;
+  }
+
   async function submitQuestion() {
     if (asking) return;
-    const question = ($ragInput.value || "").trim();
+    const question = ($input.value || "").trim();
     if (question.length < 2) return;
     asking = true;
-    $ragAskBtn.disabled = true;
-    $ragResult.innerHTML = '<p class="text-muted rag-thinking">检索并生成中…</p>';
+    $sendBtn.disabled = true;
+    addMsg("user", question);
+    const turnHistory = history.slice(-20);
+    history.push({ role: "user", content: question });
+    const thinking = document.createElement("div");
+    thinking.className = "rag-msg rag-msg-assistant rag-thinking";
+    thinking.textContent = "检索并生成中…";
+    $msgs.appendChild(thinking);
+    $msgs.scrollTop = $msgs.scrollHeight;
     try {
       const res = await fetch("/api/rag/ask", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ question }),
+        body: JSON.stringify({ question, history: turnHistory }),
       });
       if (!res.ok) throw new Error("HTTP " + res.status);
       const data = await res.json();
-      renderAnswer(data);
+      thinking.remove();
+      if (data.refused) {
+        addMsg("assistant", data.answer || "没有找到相关消息。");
+      } else {
+        addMsg("assistant", data.answer, data);
+        history.push({ role: "assistant", content: data.answer });
+      }
     } catch {
-      $ragResult.innerHTML =
-        '<p class="rag-error">问答服务暂时不可用，请稍后再试。</p>';
+      thinking.remove();
+      addMsg("assistant", "问答服务暂时不可用，请稍后再试。");
     } finally {
       asking = false;
-      $ragAskBtn.disabled = false;
+      $sendBtn.disabled = false;
+      $input.value = "";
+      $input.focus();
     }
   }
 
-  function renderAnswer(data) {
-    if (data.refused) {
-      $ragResult.innerHTML =
-        '<p class="rag-refused">' + esc(data.answer || "没有找到相关消息。") + "</p>";
-      return;
-    }
-    const chips = (data.citations || [])
-      .map((c) =>
-        '<button class="rag-cite-chip" data-n="' + escAttr(String(c.n)) + '" title="'
-        + escAttr(c.group_name + "·" + c.sender_name) + '">[' + c.n + "] "
-        + escAttr(c.sender_name) + "</button>")
-      .join("");
-    $ragResult.innerHTML =
-      '<div class="rag-answer"><pre class="rag-answer-text">' + esc(data.answer) + "</pre></div>"
-      + '<div class="rag-cites"><span class="text-muted">引用：</span>' + chips + "</div>";
-    $ragResult.querySelectorAll(".rag-cite-chip").forEach((chip) => {
-      chip.addEventListener("click", () => {
-        const n = Number(chip.dataset.n);
-        const cite = (data.citations || []).find((c) => c.n === n);
-        if (cite) openCtx(cite);
-      });
-    });
-  }
-
-  // ── 引用 → 原文上下文浮层（复用核心 fetchContext）──
+  // ── 引用 → 原文上下文浮层 ──
   function openCtx(cite) {
     document.getElementById("rag-ctx-title").textContent =
       (cite.group_name ? cite.group_name + " · " : "") + cite.sender_name;
@@ -163,30 +204,8 @@
     $ctxModal.classList.remove("hidden");
     fetchContext(body, cite.source, cite.session_id, cite.time, cite.msg_id);
   }
-
   function hideCtxModal() {
     $ctxModal.classList.add("hidden");
-  }
-
-  // ── 核心视图钩子：hash 路由 / fetchData / Esc 联动 ──
-  function registerViewHook() {
-    registerPluginView({
-      name: PLUGIN,
-      matches: (v) => !!v && v.view === PLUGIN,
-      hash: (v) => {
-        if (v && v.view === PLUGIN) enterAskMode();
-        else exitAskMode();
-      },
-      isActive: () => askMode,
-      refresh: () => {},
-      onEsc: () => {
-        if (!$ctxModal.classList.contains("hidden")) { hideCtxModal(); return true; }
-        if (askMode) { exitAskMode(); return true; }
-        return false;
-      },
-      buildHash: () => (askMode ? "#ask" : null),
-      sidebarReady: () => {},
-    });
   }
 
   // ── 入口：核心加载器注入本脚本后调用 ──
@@ -194,11 +213,8 @@
     if (!api || typeof api.isLoaded !== "function" || !api.isLoaded(PLUGIN)) return;
     buildDom();
     bindEvents();
-    registerViewHook();
-    inlineSvgIcons(); // 内联按钮图标（与核心图标一致）
-    // F5 刷新 #ask：加载器注入晚于核心 hash 初始化，此处自查补进入
-    const v = parseHash();
-    if (v && v.view === PLUGIN) enterAskMode();
+    inlineSvgIcons();
+    addMsg("assistant", "你好，我是群聊知识助手。问我任何在消息里出现过的问题——我会附上原文引用。");
   }
 
   window.briefdeskPlugins = window.briefdeskPlugins || {};

@@ -138,7 +138,7 @@
             <h3 class="settings-section">关键词订阅</h3>
             <label>命中关键词的卡片会高亮标记（空格分隔多个关键词，任一命中即算）</label>
             <div id="subs-list" class="subs-list"></div>
-            <button id="subs-add" style="margin:4px 0 8px;font-size:13px;padding:4px 10px;display:inline-flex;align-items:center;gap:4px;background:var(--surface);border:1px solid var(--border);border-radius:6px;color:var(--text-2);cursor:pointer">+ 添加订阅</button>
+            <button id="subs-add" class="settings-add-btn">+ 添加订阅</button>
             <div id="subs-add-form" class="cat-edit-form hidden">
               <input type="text" id="subs-add-kw" placeholder="关键词，空格分隔（如：大创 内推 志愿）">
               <div class="cat-edit-actions">
@@ -147,10 +147,10 @@
               </div>
             </div>
 
-            <h3 class="settings-section" style="margin-top:18px">黑名单关键词</h3>
+            <h3 class="settings-section settings-subsection">黑名单关键词</h3>
             <label>命中关键词的卡片在列表中隐藏（优先级高于订阅；仅本地生效，不影响已存数据）</label>
             <div id="block-list" class="subs-list"></div>
-            <button id="block-add" style="margin:4px 0 8px;font-size:13px;padding:4px 10px;display:inline-flex;align-items:center;gap:4px;background:var(--surface);border:1px solid var(--border);border-radius:6px;color:var(--text-2);cursor:pointer">+ 添加黑名单关键词</button>
+            <button id="block-add" class="settings-add-btn">+ 添加黑名单关键词</button>
             <div id="block-add-form" class="cat-edit-form hidden">
               <input type="text" id="block-add-kw" placeholder="关键词，空格分隔（如：代写 广告 拼团）">
               <div class="cat-edit-actions">
@@ -167,7 +167,7 @@
             <div id="category-toggles">
               <p class="text-muted">加载中...</p>
             </div>
-            <button id="category-add" style="margin:4px 0 8px;font-size:13px;padding:4px 10px;display:inline-flex;align-items:center;gap:4px;background:var(--surface);border:1px solid var(--border);border-radius:6px;color:var(--text-2);cursor:pointer">+ 添加类别</button>
+            <button id="category-add" class="settings-add-btn">+ 添加类别</button>
             <div id="cat-add-form" class="cat-edit-form hidden">
               <input type="text" id="cat-add-name" placeholder="类别名称（≤20 字）" maxlength="20">
               <textarea id="cat-add-prompt" placeholder="类别提示词：描述该类别的信息特征，供 AI 分类参考（≤50 字）" maxlength="50" rows="3"></textarea>
@@ -182,7 +182,7 @@
           <section class="settings-panel hidden" data-panel="sessions">
             <h3 class="settings-section">群聊筛选</h3>
             <label>仅拉取已启用的群聊（修改将在保存后生效）</label>
-            <button id="session-refresh" style="margin:4px 0 8px;font-size:13px;padding:4px 10px;display:inline-flex;align-items:center;gap:4px;background:var(--surface);border:1px solid var(--border);border-radius:6px;color:var(--text-2);cursor:pointer">
+            <button id="session-refresh" class="settings-add-btn">
               <img id="session-refresh-icon" src="/icons/refresh-cw.svg" class="icon-sm" alt=""> <span id="session-refresh-text">发现新群聊</span>
             </button>
             <label>消息类型</label>
@@ -231,7 +231,7 @@
             <p class="text-muted settings-hint" id="env-file-path"></p>
             <button id="env-save" class="settings-outline-btn" style="margin-top:6px">暂存更改</button>
             <div id="env-items"></div>
-            <h3 class="settings-section" style="margin-top:18px">密钥（系统钥匙串）</h3>
+            <h3 class="settings-section settings-subsection">密钥（系统钥匙串）</h3>
             <p class="text-muted settings-hint">写入后<strong>重启应用生效</strong>；密钥只存系统钥匙串，服务端不会回传明文。</p>
             <div id="env-secrets"></div>
           </section>
@@ -244,16 +244,16 @@
             <div id="about-sources" class="about-sources"><p class="text-muted">加载中...</p></div>
             <p class="text-muted settings-hint">数据保存在本地 SQLite 文件；修改 .env / 配置后需重启应用生效；新消息实时推送，列表刷新间隔仅作兜底轮询。</p>
 
-            <h3 class="settings-section" style="margin-top:18px">数据导出</h3>
+            <h3 class="settings-section settings-subsection">数据导出</h3>
             <p class="text-muted settings-hint">导出当前筛选的卡片（CSV），或人工分类修正样本（JSONL，供模型微调）。内容已脱敏。</p>
-            <div class="about-sources" style="display:flex;gap:8px;flex-wrap:wrap">
+            <div class="about-sources settings-btn-row">
               <button id="export-items-btn" class="settings-outline-btn">导出卡片 CSV</button>
               <button id="export-recat-btn" class="settings-outline-btn">导出修正样本 JSONL</button>
             </div>
 
-            <h3 class="settings-section" style="margin-top:18px">数据备份 / 恢复</h3>
+            <h3 class="settings-section settings-subsection">数据备份 / 恢复</h3>
             <p class="text-muted settings-hint">下载当前数据库备份；恢复需上传备份文件，校验通过后<strong>重启应用生效</strong>（将替换当前全部数据）。</p>
-            <div class="about-sources" style="display:flex;gap:8px;flex-wrap:wrap">
+            <div class="about-sources settings-btn-row">
               <button id="backup-download" class="settings-outline-btn">下载备份</button>
               <button id="restore-upload" class="settings-outline-btn">从备份恢复</button>
               <input type="file" id="restore-file" accept=".sqlite,.db,application/octet-stream" class="hidden">

@@ -113,6 +113,7 @@ class RagEngine:
         self._matrix: np.ndarray | None = None
         self._matrix_keys: list[tuple[str, str]] = []
         self._matrix_chunks: list[ChunkRow] = []
+        self._matrix_sessions: list[tuple[str, str]] = []
         self._refresh_lock = asyncio.Lock()
         # 嵌入降级自愈：before_run 成功前最多踢一次回填，防供应商宕机刷踢
         self._kicked_since_embed_ok = False
@@ -145,7 +146,7 @@ class RagEngine:
     async def _allowed_sessions(
         db: aiosqlite.Connection, group_only: bool, session_id: str | None
     ) -> set[tuple[str, str]]:
-        """当前可检索会话集合；None 表示无会话约束（group_only 关且未收窄）。
+        """当前可检索会话集合（恒非 None；group_only 关且未收窄时含全部启用会话）。
 
         启用状态每次查询现取——停用会话即时失效，不依赖索引期快照。
         返回 (source, session_id) 元组集合（跨源撞名安全），恒非 None。
@@ -360,7 +361,7 @@ class RagEngine:
         self._matrix = None
         self._matrix_keys = []
         self._matrix_chunks = []
-        self._matrix_sessions: list[tuple[str, str]] = []
+        self._matrix_sessions = []
 
     def _rebuild_matrix(self) -> None:
         """缓存变更后重组 float32 矩阵（ask 路径零转换直接用）。"""
@@ -542,7 +543,10 @@ class RagEngine:
         }
 
     async def ask(
-        self, question: str, session_id: str | None = None
+        self,
+        question: str,
+        session_id: str | None = None,
+        history: list[dict] | None = None,
     ) -> AskResult:
         """检索 + 引用式回答；检索为空 → 诚实拒答且不调用 AI。"""
 
@@ -551,19 +555,39 @@ class RagEngine:
         hits = await self.retrieve(question, session_id)
         if not hits:
             return AskResult(refused=True, answer="没有在群聊记录里找到相关消息。")
-        messages = build_answer_prompt(datetime.now(UTC).astimezone(), question.strip(), hits)
+        messages = build_answer_prompt(
+            datetime.now(UTC).astimezone(), question.strip(), hits, history or [],
+            self.settings.evidence_chars,
+        )
         resp = await ai_ports.chat(messages, temperature=0.2, max_tokens=1024)
         content = ""
         if getattr(resp, "choices", None):
             content = (resp.choices[0].message.content or "").strip()
-        cited = {
-            int(m.group(1))
-            for m in self._CITE_RE.finditer(content)
-            if 1 <= int(m.group(1)) <= len(hits)
-        }
+        # 双态解析：deepseek 系强制 json_object 输出 → 优先 JSON 契约；
+        # 其它供应商纯文本 → 回退 [n] 正则（兼容两路）
+        answer = content
+        cited: set[int] = set()
+        parsed = ai_ports.loads_json(content)
+        if isinstance(parsed, dict) and isinstance(parsed.get("answer"), str):
+            answer = parsed["answer"].strip()
+            nums = parsed.get("citations")
+            if isinstance(nums, list):
+                for n in nums:
+                    try:
+                        v = int(n)
+                    except (TypeError, ValueError):
+                        continue
+                    if 1 <= v <= len(hits):
+                        cited.add(v)
+        if not cited:
+            cited = {
+                int(m.group(1))
+                for m in self._CITE_RE.finditer(content)
+                if 1 <= int(m.group(1)) <= len(hits)
+            }
         nums = sorted(cited) if cited else list(range(1, len(hits) + 1))
         citations = [self._citation(n, hits[n - 1]) for n in nums]
-        return AskResult(refused=False, answer=content, citations=citations)
+        return AskResult(refused=False, answer=answer, citations=citations)
 
 
 _instance: RagEngine | None = None

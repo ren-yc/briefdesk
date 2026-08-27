@@ -9,7 +9,6 @@ body.calendar-mode .list-toolbar,
 body.calendar-mode #load-more-wrap,
 body.calendar-mode .empty-state,
 body.calendar-mode #loading-state { display: none !important; }
-.sync-btn.active { background: var(--accent); color: var(--on-accent); border-color: var(--accent); }
 .cal-head {
   display: flex; align-items: center; gap: 8px; margin-bottom: 12px;
 }
