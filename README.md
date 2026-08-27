@@ -53,7 +53,7 @@ python main.py
 
 首次打开页面会弹出**首次使用向导**（仅当浏览器从未完成过向导且尚未启用任何群聊时出现；后端不可用时不弹），分三步：
 
-1. **环境检查**：展示各消息源连接状态；若后端有错误/警告（如 `AI_API_KEY` / `WEFLOW_API_TOKEN` 缺失、消息源未启动）会给出提示与常见原因；
+1. **环境检查**：展示各消息源连接状态；若后端有错误/警告（如 `AI_API_KEY` / `WEFLOW_LEGACY_API_TOKEN` 缺失、消息源未启动）会给出提示与常见原因；
 2. **选择群聊**：勾选要监控的会话——**群聊默认勾选，私聊 / 公众号默认不勾**（避免无意监控私聊）。会话列表为空时可先到 设置 → 群聊筛选 点「发现新群聊」拉取最新会话列表，再回来重试；
 3. **开始同步**：首次会按 `BACKFILL_HOURS`（默认 24 小时）回填一次已启用会话的历史消息，此后按会话增量轮询 + SSE 实时监听；同步完成后回到主页面，AI 分类后的信息卡片会陆续出现。
 
@@ -98,7 +98,7 @@ OCR 依赖为**可选**（`pip install -e ".[ocr]"`）：
    copy .env.example .env
    ```
 
-2. 编辑 `.env`，填入必填项 `AI_API_KEY`；消息源为 `weflow` 时另需 `WEFLOW_API_TOKEN`，为 `qqflow` 时需 `QQFLOW_API_TOKEN`/`QQFLOW_QQ`/`QQFLOW_KEY`（缺失任一 → qqflow 插件自禁用）。消息源启用走 `PLUGINS` / `PLUGINS_DISABLED`（weflow/qqflow 为内置插件），其余按需修改。
+2. 编辑 `.env`，填入必填项 `AI_API_KEY`；消息源为 `weflow-legacy` 时另需 `WEFLOW_LEGACY_API_TOKEN`，为 `qqflow` 时需 `QQFLOW_API_TOKEN`/`QQFLOW_QQ`/`QQFLOW_KEY`（缺失任一 → qqflow 插件自禁用）。消息源启用走 `PLUGINS` / `PLUGINS_DISABLED`（weflow-legacy/qqflow 为内置插件），其余按需修改。
 3. `AI_MODEL` 默认 `deepseek-v4-flash`：若你对接的 OpenAI 兼容服务没有该模型名，请改为实际模型名（如 `deepseek-chat`、`qwen-turbo` 等），否则首次分类会报模型不存在。
 
 常用可调项（完整清单与逐项注释见 `.env.example`）：
@@ -151,7 +151,7 @@ briefdesk/
 │   ├── types.py            # 跨模块基础类型（含管道跨插件契约）
 │   ├── server/             # FastAPI 服务子包（app/中间件/核心路由/类别路由/媒体代理/静态托管/插件注入/回调）
 │   └── plugins/            # 内置插件（消息源 + AI 供应商 + 管道阶段 + Web 插件）
-│       ├── weflow/             # WeFlow 消息源（plugin.py + client/config/normalize/poller/runtime/sse + weflow-api.md）
+│       ├── weflow_legacy/      # WeFlow Legacy 消息源（plugin.py + client/config/normalize/poller/runtime/sse + weflow-legacy-api.md）
 │       ├── qqflow/             # qqflow 消息源（plugin.py + 同构六文件分层 + qqflow-server-api.md）
 │       ├── ai_provider/        # AI 供应商插件（plugin.py 注册端口 / engine.py OpenAI 兼容 chat + 嵌入）
 │       ├── ocr/                # OCR 阶段插件（plugin.py 槽位 enrich / engine.py RapidOCR；依赖可选，未安装时自禁用）
@@ -181,7 +181,7 @@ briefdesk/
 - 单插件失败只禁用该插件；`PLUGINS_REQUIRED` 名单内的失败则中止启动
 - 依赖方向由 `tests/test_no_core_imports_plugins.py` 守卫：核心永不 import
   `briefdesk.plugins.*`
-- 消息源为内置插件（weflow/qqflow），启用走 `PLUGINS` / `PLUGINS_DISABLED`
+- 消息源为内置插件（weflow-legacy/qqflow），启用走 `PLUGINS` / `PLUGINS_DISABLED`
   （不再使用 SOURCES）
 - 声明 `default_disabled = True` 的插件（如实验性 benchmark）默认不随
   `PLUGINS=["*"]` 加载，需显式列名（`PLUGINS=["*", "benchmark"]`）才启用；
@@ -213,7 +213,7 @@ briefdesk/
 
 ## 架构
 
-简报台采用「核心骨架 + 插件」架构：可插拔消息源（weflow / qqflow）产出归一化消息，经 pipeline 入口统一过滤后进入阶段插件流水线（OCR 增强 → AI 分类 → 语义去重 → 同话题合并），结果写入 SQLite，由 FastAPI 服务端经 SSE 实时推送到原生 JS 前端；本体只保留存储、管道骨架、HTTP 与状态总线等核心。
+简报台采用「核心骨架 + 插件」架构：可插拔消息源（weflow-legacy / qqflow）产出归一化消息，经 pipeline 入口统一过滤后进入阶段插件流水线（OCR 增强 → AI 分类 → 语义去重 → 同话题合并），结果写入 SQLite，由 FastAPI 服务端经 SSE 实时推送到原生 JS 前端；本体只保留存储、管道骨架、HTTP 与状态总线等核心。
 
 完整的数据流图、模块职责、插件框架、数据库 Schema、配置项与设计陷阱详见 [docs/architecture.md](docs/architecture.md)。
 

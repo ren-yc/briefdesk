@@ -25,7 +25,7 @@ _KEYRING_FIELDS = {
 class Settings(BaseSettings):
     plugins: list[str] = Field(default=["*"], alias="PLUGINS")
     """启用的插件名列表（JSON 数组；"*" = 全部发现的插件）。
-    消息源启用的唯一开关：weflow/qqflow 等源插件由本开关控制。"""
+    消息源启用的唯一开关：weflow-legacy/qqflow 等源插件由本开关控制。"""
 
     plugins_disabled: list[str] = Field(default=[], alias="PLUGINS_DISABLED")
     """明确禁用的插件名列表（JSON 数组），优先于 PLUGINS。"""
@@ -57,7 +57,7 @@ class Settings(BaseSettings):
 
     ignore_self: bool = Field(default=True, alias="IGNORE_SELF")
     """过滤本账号自己发送的消息（所有消息入口：SSE 实时 + REST 回填）。
-    weflow REST 按 isSend 判定、SSE 上游已不推送自消息；qqflow REST 按
+    weflow-legacy REST 按 isSend 判定、SSE 上游已不推送自消息；qqflow REST 按
     自身 UID（u_<QQFLOW_QQ>）判定、SSE 事件无发送者标识需按消息回查 REST。"""
 
     realtime_batch_max_count: int = Field(

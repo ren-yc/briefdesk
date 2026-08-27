@@ -1,4 +1,4 @@
-"""Message normalization and pre-filtering — qqflow-server 版（参照 weflow normalize.py）。
+"""Message normalization and pre-filtering — qqflow-server 版（参照 weflow-legacy normalize.py）。
 
 qqflow-server v1 差异：
 - 媒体经 mediaId + GET /api/v1/media/{id} 获取：图片消息（content 为
@@ -7,7 +7,7 @@ qqflow-server v1 差异：
   消费方，维持过滤
 - SSE 事件自带 media 对象（无路径元数据视图，上游不下发 localPath）与
   mediaId 字段（仅当索引注册了可读取的本地缓存时携带，与 REST 同规则）
-  → normalize_sse 为纯同步函数（weflow 的 async 是媒体回查的产物），
+  → normalize_sse 为纯同步函数（weflow-legacy 的 async 是媒体回查的产物），
   image_urls 直接取事件 mediaId，无推导/回查需求
 - msg_id 统一用 rowid：SSE rawid（字符串）与 REST localId（数字转 str）同值
 """

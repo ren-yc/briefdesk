@@ -1,7 +1,7 @@
 """增量轮询测试（按会话水位完整版）。
 
 覆盖：
-- weflow：window_start_by_session 传入 → 各会话 start 参数透传、多页翻页至
+- weflow-legacy：window_start_by_session 传入 → 各会话 start 参数透传、多页翻页至
   hasMore=False、窗口下界含边界（createTime == start 保留）、超窗口消息过滤；
   无窗口表/会话缺省 → 回退 BACKFILL_HOURS；-1 全量优先于窗口
 - qqflow：window_start_by_session 传入 → start=窗口下界、早停与边界过滤
@@ -26,7 +26,7 @@ from briefdesk.db import (
 )
 from briefdesk.plugins.qqflow.client import QqFlowNotReadyError
 from briefdesk.plugins.qqflow.poller import poll as qq_poll
-from briefdesk.plugins.weflow.poller import poll as we_poll
+from briefdesk.plugins.weflow_legacy.poller import poll as we_poll
 from briefdesk.poll_cycle import _compute_session_windows, run_poll_cycle
 from briefdesk.types import SessionInfo
 
@@ -53,10 +53,10 @@ def _qqflow_msg(msg_id: int, ts: int) -> dict:
     }
 
 
-class _WeFlowClient:
+class _WeFlowLegacyClient:
     """按条数 offset 切页的假客户端（500 条/页，hasMore 语义与真实 API 一致）。"""
 
-    name = "weflow"
+    name = "weflow-legacy"
 
     def __init__(self, messages: list[dict]):
         self._messages = messages
@@ -141,11 +141,11 @@ class WeFlowIncrementalTest(unittest.IsolatedAsyncioTestCase):
         messages = [_weflow_msg(f"m{i}", now - i * 10) for i in range(500)]
         messages.append(_weflow_msg("edge", window))  # createTime == start：含边界保留
         messages.append(_weflow_msg("old", window - 1))  # 超窗口：过滤
-        client = _WeFlowClient(messages)
+        client = _WeFlowLegacyClient(messages)
 
         result = await we_poll(
             client,
-            _enabled("weflow", "g1"),
+            _enabled("weflow-legacy", "g1"),
             _no_processed,
             window_start_by_session={"g1": window},
         )
@@ -163,14 +163,14 @@ class WeFlowIncrementalTest(unittest.IsolatedAsyncioTestCase):
         now = int(time.time())
         window = now - 3600
         messages = [_weflow_msg("m1", now - 10), _weflow_msg("m2", now - 20)]
-        client = _WeFlowClient(messages)
+        client = _WeFlowLegacyClient(messages)
 
         async def processed(ids):
             return {"m1"}
 
         result = await we_poll(
             client,
-            _enabled("weflow", "g1"),
+            _enabled("weflow-legacy", "g1"),
             processed,
             window_start_by_session={"g1": window},
         )
@@ -183,11 +183,11 @@ class WeFlowIncrementalTest(unittest.IsolatedAsyncioTestCase):
         config.backfill_hours = 24
         try:
             now = int(time.time())
-            client = _WeFlowClient([_weflow_msg("m1", now - 10)])
+            client = _WeFlowLegacyClient([_weflow_msg("m1", now - 10)])
 
             await we_poll(
                 client,
-                _enabled("weflow", "g1"),
+                _enabled("weflow-legacy", "g1"),
                 _no_processed,
                 window_start_by_session={"other_session": now - 3600},
             )
@@ -204,9 +204,9 @@ class WeFlowIncrementalTest(unittest.IsolatedAsyncioTestCase):
         try:
             now = int(time.time())
             messages = [_weflow_msg("m1", now - 10)]
-            client = _WeFlowClient(messages)
+            client = _WeFlowLegacyClient(messages)
 
-            await we_poll(client, _enabled("weflow", "g1"), _no_processed)
+            await we_poll(client, _enabled("weflow-legacy", "g1"), _no_processed)
 
             start_ts = client.calls[0][1]
             self.assertIsNotNone(start_ts)
@@ -220,11 +220,11 @@ class WeFlowIncrementalTest(unittest.IsolatedAsyncioTestCase):
         config.backfill_hours = 24
         try:
             now = int(time.time())
-            client = _WeFlowClient([_weflow_msg("m1", now - 10)])
+            client = _WeFlowLegacyClient([_weflow_msg("m1", now - 10)])
 
             await we_poll(
                 client,
-                _enabled("weflow", "g1"),
+                _enabled("weflow-legacy", "g1"),
                 _no_processed,
                 window_start_by_session={"g1": None},
             )
@@ -240,11 +240,11 @@ class WeFlowIncrementalTest(unittest.IsolatedAsyncioTestCase):
         config.backfill_hours = -1
         try:
             now = int(time.time())
-            client = _WeFlowClient([_weflow_msg("m1", now - 10)])
+            client = _WeFlowLegacyClient([_weflow_msg("m1", now - 10)])
 
             await we_poll(
                 client,
-                _enabled("weflow", "g1"),
+                _enabled("weflow-legacy", "g1"),
                 _no_processed,
                 window_start_by_session={"g1": now - 3600},
             )
@@ -317,7 +317,7 @@ class SessionWindowComputationTest(unittest.IsolatedAsyncioTestCase):
         for sid in ("g1", "g2"):
             await self.db.execute(
                 "INSERT INTO sessions (source, session_id, name, is_group, enabled) "
-                "VALUES ('weflow', ?, ?, 1, 1)",
+                "VALUES ('weflow-legacy', ?, ?, 1, 1)",
                 (sid, sid),
             )
         await self.db.commit()
@@ -332,59 +332,59 @@ class SessionWindowComputationTest(unittest.IsolatedAsyncioTestCase):
         await self.db.execute(
             "INSERT INTO raw_messages (source, msg_id, session_id, group_name, "
             "sender_id, sender_name, content, timestamp) "
-            "VALUES ('weflow', ?, ?, '群', 'u', 'n', 'x', ?)",
+            "VALUES ('weflow-legacy', ?, ?, '群', 'u', 'n', 'x', ?)",
             (msg_id, session_id, ts),
         )
         await self.db.commit()
 
     def _enabled(self) -> list[SessionInfo]:
-        return _enabled("weflow", "g1", "g2")
+        return _enabled("weflow-legacy", "g1", "g2")
 
     async def test_no_state_all_sessions_backfill(self):
         # 无水位会话 → 值 None（源按 BACKFILL_HOURS 回填）
-        windows = await _compute_session_windows("weflow", self._enabled())
+        windows = await _compute_session_windows("weflow-legacy", self._enabled())
         self.assertEqual(windows, {"g1": None, "g2": None})
 
     async def test_watermark_minus_overlap_per_session(self):
         now = int(time.time())
-        await update_session_last_polls("weflow", [("g1", now - _DAY), ("g2", now - 7200)])
-        windows = await _compute_session_windows("weflow", self._enabled())
+        await update_session_last_polls("weflow-legacy", [("g1", now - _DAY), ("g2", now - 7200)])
+        windows = await _compute_session_windows("weflow-legacy", self._enabled())
         self.assertEqual(windows["g1"], now - _DAY - 300)
         self.assertEqual(windows["g2"], now - 7200 - 300)
 
     async def test_unprocessed_pins_only_its_own_session(self):
         # g1 有更旧的未处理消息 → 仅 g1 窗口被钉住；g2 水位不受影响
         now = int(time.time())
-        await update_session_last_polls("weflow", [("g1", now - 3600), ("g2", now - 3600)])
+        await update_session_last_polls("weflow-legacy", [("g1", now - 3600), ("g2", now - 3600)])
         await self._seed_raw("g1", "f1", now - 7200)
-        windows = await _compute_session_windows("weflow", self._enabled())
+        windows = await _compute_session_windows("weflow-legacy", self._enabled())
         self.assertEqual(windows["g1"], now - 7200 - 300, "有未处理消息的会话以其最久远未处理消息为下界")
         self.assertEqual(windows["g2"], now - 3600 - 300, "完整处理后的会话水位不受影响")
 
     async def test_unprocessed_resolved_stops_pinning(self):
         now = int(time.time())
-        await update_session_last_polls("weflow", [("g1", now - 3600)])
+        await update_session_last_polls("weflow-legacy", [("g1", now - 3600)])
         await self._seed_raw("g1", "f1", now - 7200)
-        await mark_message_processed("weflow", "f1")
-        windows = await _compute_session_windows("weflow", self._enabled())
+        await mark_message_processed("weflow-legacy", "f1")
+        windows = await _compute_session_windows("weflow-legacy", self._enabled())
         self.assertEqual(windows["g1"], now - 3600 - 300)
 
     async def test_pull_all_returns_none(self):
         config.backfill_hours = -1
-        self.assertIsNone(await _compute_session_windows("weflow", self._enabled()))
+        self.assertIsNone(await _compute_session_windows("weflow-legacy", self._enabled()))
 
     async def test_empty_enabled_returns_empty_dict(self):
-        self.assertEqual(await _compute_session_windows("weflow", []), {})
+        self.assertEqual(await _compute_session_windows("weflow-legacy", []), {})
 
     async def test_db_functions_roundtrip(self):
         now = int(time.time())
         self.assertEqual(
-            await get_session_last_polls("weflow", ["g1", "g2"]), {"g1": None, "g2": None}
+            await get_session_last_polls("weflow-legacy", ["g1", "g2"]), {"g1": None, "g2": None}
         )
-        await update_session_last_polls("weflow", [("g1", now)])
-        self.assertEqual(await get_session_last_polls("weflow", ["g1", "g2"]), {"g1": now, "g2": None})
+        await update_session_last_polls("weflow-legacy", [("g1", now)])
+        self.assertEqual(await get_session_last_polls("weflow-legacy", ["g1", "g2"]), {"g1": now, "g2": None})
         await self._seed_raw("g1", "f1", now - 100)
-        self.assertEqual(await get_oldest_unprocessed_by_session("weflow"), {"g1": now - 100})
+        self.assertEqual(await get_oldest_unprocessed_by_session("weflow-legacy"), {"g1": now - 100})
 
 
 class PollCycleWatermarkTest(unittest.IsolatedAsyncioTestCase):
@@ -393,7 +393,7 @@ class PollCycleWatermarkTest(unittest.IsolatedAsyncioTestCase):
 
     def _source(self) -> Mock:
         source = Mock()
-        source.name = "weflow"
+        source.name = "weflow-legacy"
         source.client = Mock()
         source.fetch_history = AsyncMock(
             return_value=SimpleNamespace(
@@ -412,7 +412,7 @@ class PollCycleWatermarkTest(unittest.IsolatedAsyncioTestCase):
             new=AsyncMock(
                 return_value=[
                     {
-                        "source": "weflow",
+                        "source": "weflow-legacy",
                         "session_id": "g1",
                         "name": "g",
                         "is_group": 1,

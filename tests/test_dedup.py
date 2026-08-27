@@ -404,7 +404,7 @@ class ImageUrlShortCircuitTest(unittest.IsolatedAsyncioTestCase):
     content_hash 失效、余弦 0.65 擦边未召回、单候选 AI 判定恰好判错 →
     重复卡入库。图片路径（上游内容寻址）在重发场景是确定性证据，直接短路。
 
-    源限定：仅 weflow（图片消息无混合文本，同图必同文）参与；qqflow 实测
+    源限定：仅 weflow-legacy（图片消息无混合文本，同图必同文）参与；qqflow 实测
     存在图片+文字混合消息（同图可配不同文字），同图不等同于重复，不得短路。
     """
 
@@ -428,9 +428,9 @@ class ImageUrlShortCircuitTest(unittest.IsolatedAsyncioTestCase):
         return engine
 
     async def test_identical_images_skip_ai(self):
-        """weflow 同图重发（标题措辞不同也不影响）→ 不调 AI，直接判重合并。"""
+        """weflow-legacy 同图重发（标题措辞不同也不影响）→ 不调 AI，直接判重合并。"""
         engine = self._engine(
-            [("img1", "模政社团招新", "杨高模政社团招新", ["a/b.jpg"], "weflow")]
+            [("img1", "模政社团招新", "杨高模政社团招新", ["a/b.jpg"], "weflow-legacy")]
         )
         with (
             patch("briefdesk.plugins.dedup.engine.chat", new=AsyncMock()) as chat_mock,
@@ -442,7 +442,7 @@ class ImageUrlShortCircuitTest(unittest.IsolatedAsyncioTestCase):
                 "模拟政协招新",
                 "我们四个",
                 image_urls=["a/b.jpg"],
-                source="weflow",
+                source="weflow-legacy",
             )
         self.assertTrue(result.is_duplicate)
         self.assertEqual(result.similar_to_id, "img1")
@@ -450,9 +450,9 @@ class ImageUrlShortCircuitTest(unittest.IsolatedAsyncioTestCase):
         chat_mock.assert_not_awaited()
 
     async def test_order_insensitive_set_equality(self):
-        """weflow 多图乱序（集合相等）→ 仍判重。"""
+        """weflow-legacy 多图乱序（集合相等）→ 仍判重。"""
         engine = self._engine(
-            [("img1", "摄影展", "内容", ["a.jpg", "b.jpg"], "weflow")]
+            [("img1", "摄影展", "内容", ["a.jpg", "b.jpg"], "weflow-legacy")]
         )
         with (
             patch(
@@ -463,7 +463,7 @@ class ImageUrlShortCircuitTest(unittest.IsolatedAsyncioTestCase):
                 "摄影展",
                 "群A",
                 image_urls=["b.jpg", "a.jpg"],
-                source="weflow",
+                source="weflow-legacy",
             )
         self.assertTrue(result.is_duplicate)
         self.assertEqual(result.similar_to_id, "img1")
@@ -489,7 +489,7 @@ class ImageUrlShortCircuitTest(unittest.IsolatedAsyncioTestCase):
         chat_mock.assert_not_awaited()  # 无候选（重叠为 0）也不产生 AI 调用
 
     async def test_weflow_query_qqflow_cache_not_short_circuit(self):
-        """查询 weflow 但缓存条目属 qqflow（源不一致）→ 不短路。"""
+        """查询 weflow-legacy 但缓存条目属 qqflow（源不一致）→ 不短路。"""
         engine = self._engine(
             [("img1", "abc", "def", ["a.jpg"], "qqflow")]
         )
@@ -500,7 +500,7 @@ class ImageUrlShortCircuitTest(unittest.IsolatedAsyncioTestCase):
             ) as merge_mock,
         ):
             result = await engine.check_dedup(
-                "xyz", "群A", image_urls=["a.jpg"], source="weflow"
+                "xyz", "群A", image_urls=["a.jpg"], source="weflow-legacy"
             )
         self.assertFalse(result.is_duplicate)
         merge_mock.assert_not_awaited()
@@ -509,7 +509,7 @@ class ImageUrlShortCircuitTest(unittest.IsolatedAsyncioTestCase):
     async def test_unknown_source_not_short_circuit(self):
         """查询 source 为空（未知）→ 保守不短路。"""
         engine = self._engine(
-            [("img1", "abc", "def", ["a.jpg"], "weflow")]
+            [("img1", "abc", "def", ["a.jpg"], "weflow-legacy")]
         )
         with (
             patch("briefdesk.plugins.dedup.engine.chat", new=AsyncMock()) as chat_mock,
@@ -527,7 +527,7 @@ class ImageUrlShortCircuitTest(unittest.IsolatedAsyncioTestCase):
     async def test_different_images_falls_through(self):
         """图片不同 → 不触发短路，正常走候选路径（此处无候选 → 不判重）。"""
         engine = self._engine(
-            [("img1", "abc", "def", ["a.jpg"], "weflow")]
+            [("img1", "abc", "def", ["a.jpg"], "weflow-legacy")]
         )
         with (
             patch("briefdesk.plugins.dedup.engine.chat", new=AsyncMock()) as chat_mock,
@@ -536,7 +536,7 @@ class ImageUrlShortCircuitTest(unittest.IsolatedAsyncioTestCase):
             ) as merge_mock,
         ):
             result = await engine.check_dedup(
-                "xyz", "群A", image_urls=["b.jpg"], source="weflow"
+                "xyz", "群A", image_urls=["b.jpg"], source="weflow-legacy"
             )
         self.assertFalse(result.is_duplicate)
         merge_mock.assert_not_awaited()
@@ -545,7 +545,7 @@ class ImageUrlShortCircuitTest(unittest.IsolatedAsyncioTestCase):
     async def test_query_without_images_falls_through(self):
         """查询无图 → 图片短路不参与；缓存有图也不误判。"""
         engine = self._engine(
-            [("img1", "abc", "def", ["a.jpg"], "weflow")]
+            [("img1", "abc", "def", ["a.jpg"], "weflow-legacy")]
         )
         with (
             patch("briefdesk.plugins.dedup.engine.chat", new=AsyncMock()) as chat_mock,
@@ -554,7 +554,7 @@ class ImageUrlShortCircuitTest(unittest.IsolatedAsyncioTestCase):
             ) as merge_mock,
         ):
             result = await engine.check_dedup(
-                "xyz", "群A", source="weflow"
+                "xyz", "群A", source="weflow-legacy"
             )
         self.assertFalse(result.is_duplicate)
         merge_mock.assert_not_awaited()
@@ -563,7 +563,7 @@ class ImageUrlShortCircuitTest(unittest.IsolatedAsyncioTestCase):
     async def test_partial_overlap_not_short_circuit(self):
         """集合相等而非子集：查询 1 图命中缓存多图之一 → 不短路（防装饰图误判）。"""
         engine = self._engine(
-            [("img1", "abc", "def", ["a.jpg", "b.jpg"], "weflow")]
+            [("img1", "abc", "def", ["a.jpg", "b.jpg"], "weflow-legacy")]
         )
         with (
             patch("briefdesk.plugins.dedup.engine.chat", new=AsyncMock()) as chat_mock,
@@ -572,7 +572,7 @@ class ImageUrlShortCircuitTest(unittest.IsolatedAsyncioTestCase):
             ) as merge_mock,
         ):
             result = await engine.check_dedup(
-                "xyz", "群A", image_urls=["a.jpg"], source="weflow"
+                "xyz", "群A", image_urls=["a.jpg"], source="weflow-legacy"
             )
         self.assertFalse(result.is_duplicate)
         merge_mock.assert_not_awaited()
@@ -588,7 +588,7 @@ class ImageUrlShortCircuitTest(unittest.IsolatedAsyncioTestCase):
                 title="模政社团招新",
                 source_quote="杨高模政社团招新",
                 image_urls=_parse_images('["a/b.jpg"]'),
-                source="weflow",
+                source="weflow-legacy",
             )
         ]
         with (
@@ -601,7 +601,7 @@ class ImageUrlShortCircuitTest(unittest.IsolatedAsyncioTestCase):
                 "模拟政协招新",
                 "我们四个",
                 image_urls=["a/b.jpg"],
-                source="weflow",
+                source="weflow-legacy",
             )
         self.assertTrue(result.is_duplicate)
         self.assertEqual(result.similar_to_id, "img1")
@@ -612,10 +612,10 @@ class ImageUrlShortCircuitTest(unittest.IsolatedAsyncioTestCase):
         """add_to_cache 记录 source：同图条目在源不一致时不得互相短路。"""
         engine = DedupEngine()
         engine._cache_loaded = True
-        engine.add_to_cache("w1", "t", image_urls=["a.jpg"], source="weflow")
+        engine.add_to_cache("w1", "t", image_urls=["a.jpg"], source="weflow-legacy")
         engine.add_to_cache("q1", "t", image_urls=["a.jpg"], source="qqflow")
         by_id = {it.id: it for it in engine._cache}
-        self.assertEqual(by_id["w1"].source, "weflow")
+        self.assertEqual(by_id["w1"].source, "weflow-legacy")
         self.assertEqual(by_id["q1"].source, "qqflow")
         self.assertEqual(by_id["w1"].image_urls, frozenset({"a.jpg"}))
 

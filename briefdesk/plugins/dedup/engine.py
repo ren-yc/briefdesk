@@ -44,10 +44,10 @@ from briefdesk.types import (
 logger = logging.getLogger(__name__)
 
 # 图片精确短路适用的消息源：仅限"图片消息无混合文本、同图必同文"的源。
-# weflow 图片消息 content 恒为占位符（无图片+文字混合消息），同图重发必为重复；
+# weflow-legacy 图片消息 content 恒为占位符（无图片+文字混合消息），同图重发必为重复；
 # qqflow 实测存在图片+文字混合消息（同图可配不同文字），同图不等同于重复，
 # 不得参与短路。查询与缓存条目双方都须属于本集合才命中。
-_IMAGE_SHORTCUT_SOURCES = frozenset({"weflow"})
+_IMAGE_SHORTCUT_SOURCES = frozenset({"weflow-legacy"})
 
 
 @dataclass
@@ -450,7 +450,7 @@ class DedupEngine(DedupService):
         """判重检查。q_emb 由调用方在锁外预计算（批内一次 API 调用）；
         None 时不再锁内补嵌（P1 修复），直接降级字符重叠通道。image_urls 参与
         图片精确短路，仅当查询与缓存条目同属 _IMAGE_SHORTCUT_SOURCES
-        （当前仅 weflow）时生效；source_quote 参与原文哈希精确短路
+        （当前仅 weflow-legacy）时生效；source_quote 参与原文哈希精确短路
         （非空且非纯占位符原文，哈希全等时生效）。"""
         # 懒加载兜底（文档化取舍）：正常路径缓存已在 dedup 插件 setup
         # （HTTP 服务与源启动前）预热完毕；若走到此处首次加载，

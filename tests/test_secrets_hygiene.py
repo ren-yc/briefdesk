@@ -1,7 +1,7 @@
 """密钥卫生守卫：Settings 的 repr/str/model_dump 不得泄露密钥明文。
 
 覆盖 app 级配置（briefdesk/config.py）与两个消息源专属配置
-（weflow/qqflow 的 config.py）：字段以 SecretStr 持有后，任何
+（weflow-legacy/qqflow 的 config.py）：字段以 SecretStr 持有后，任何
 repr/str/序列化输出都必须只剩掩码，明文只能经 get_secret_value() 取用。
 """
 
@@ -31,9 +31,9 @@ class AppSettingsHygieneTest(unittest.TestCase):
 
 class PluginSettingsHygieneTest(unittest.TestCase):
     def test_weflow_settings_mask_token(self) -> None:
-        from briefdesk.plugins.weflow.config import WeFlowSettings
+        from briefdesk.plugins.weflow_legacy.config import WeFlowLegacySettings
 
-        settings = WeFlowSettings(api_token="w-" + _DUMMY_KEY)
+        settings = WeFlowLegacySettings(api_token="w-" + _DUMMY_KEY)
         self.assertNotIn("w-" + _DUMMY_KEY, str(settings))
         self.assertEqual(settings.api_token.get_secret_value(), "w-" + _DUMMY_KEY)
 

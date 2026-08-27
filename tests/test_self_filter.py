@@ -1,6 +1,6 @@
 """IGNORE_SELF 自消息识别测试：normalize 层 is_self 盖章 + qqflow SSE 回查。
 
-weflow REST 按 isSend 判定（缺失 fail-open）；qqflow REST 按自身 UID
+weflow-legacy REST 按 isSend 判定（缺失 fail-open）；qqflow REST 按自身 UID
 （u_<QQFLOW_QQ>）判定；qqflow SSE 事件无发送者标识，按消息回查 REST。
 管道入口的过滤行为见 tests/test_pipeline.py 的 IgnoreSelfFilterTest。
 """
@@ -14,8 +14,8 @@ from briefdesk.plugins.qqflow.normalize import is_self_message
 from briefdesk.plugins.qqflow.normalize import normalize_rest as qq_normalize_rest
 from briefdesk.plugins.qqflow.poller import poll as qq_poll
 from briefdesk.plugins.qqflow.sse import QqFlowSseClient
-from briefdesk.plugins.weflow.normalize import _APPMSG_LOCAL_TYPE, normalize_rest
-from briefdesk.plugins.weflow.poller import poll as we_poll
+from briefdesk.plugins.weflow_legacy.normalize import _APPMSG_LOCAL_TYPE, normalize_rest
+from briefdesk.plugins.weflow_legacy.poller import poll as we_poll
 from briefdesk.types import SessionInfo
 
 _MULTI_XML = """<msg>
@@ -37,7 +37,7 @@ _MULTI_XML = """<msg>
 
 
 class WeflowRestSelfDetectionTest(unittest.TestCase):
-    """weflow REST：isSend=1 → is_self；0/缺失 → 非自己（fail-open）。"""
+    """weflow-legacy REST：isSend=1 → is_self；0/缺失 → 非自己（fail-open）。"""
 
     def _msg(self, **over):
         base = {
@@ -273,10 +273,10 @@ class QqflowSseLookbackTest(unittest.IsolatedAsyncioTestCase):
 
 
 class WeflowPollerSelfDropTest(unittest.IsolatedAsyncioTestCase):
-    """weflow 回填：IGNORE_SELF 开启时 isSend=1 消息在 poller 预滤，不进管道。"""
+    """weflow-legacy 回填：IGNORE_SELF 开启时 isSend=1 消息在 poller 预滤，不进管道。"""
 
     class _Client:
-        name = "weflow"
+        name = "weflow-legacy"
 
         def __init__(self, messages):
             self._messages = messages
@@ -297,7 +297,7 @@ class WeflowPollerSelfDropTest(unittest.IsolatedAsyncioTestCase):
 
     def _enabled(self):
         return [
-            SessionInfo(source="weflow", session_id="g1", name="群", is_group=True)
+            SessionInfo(source="weflow-legacy", session_id="g1", name="群", is_group=True)
         ]
 
     @staticmethod

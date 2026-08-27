@@ -1,7 +1,7 @@
-"""WeFlow 消息源装配门面 — 客户端 + SSE 监听 + 历史拉取的唯一入口。
+"""WeFlow Legacy 消息源装配门面 — 客户端 + SSE 监听 + 历史拉取的唯一入口。
 
-main 通过 `WeFlowSource` 创建消息源：创建客户端、启动实时监听、
-关闭释放全部收敛在本类，main 不接触 weflow 具体类型。
+main 通过 `WeFlowLegacySource` 创建消息源：创建客户端、启动实时监听、
+关闭释放全部收敛在本类，main 不接触 weflow-legacy 具体类型。
 只产出源无关数据，不触碰 DB（写库由应用层完成）。
 """
 
@@ -10,10 +10,13 @@ import time as time_module
 
 from briefdesk.logger import fmt_dur
 from briefdesk.masking import clean_display_name
-from briefdesk.plugins.weflow.client import WeFlowClient, is_official_session
-from briefdesk.plugins.weflow.config import WeFlowSettings
-from briefdesk.plugins.weflow.poller import poll
-from briefdesk.plugins.weflow.sse import WeFlowSseClient
+from briefdesk.plugins.weflow_legacy.client import (
+    WeFlowLegacyClient,
+    is_official_session,
+)
+from briefdesk.plugins.weflow_legacy.config import WeFlowLegacySettings
+from briefdesk.plugins.weflow_legacy.poller import poll
+from briefdesk.plugins.weflow_legacy.sse import WeFlowLegacySseClient
 from briefdesk.sources_base import (
     BatchHandler,
     ProcessedQuery,
@@ -25,10 +28,10 @@ from briefdesk.types import PollResult, SessionInfo
 logger = logging.getLogger(__name__)
 
 
-class WeFlowSource(SourceRuntime[WeFlowClient]):
-    """已装配的 WeFlow 消息源，实现 SourceRuntime 协议。"""
+class WeFlowLegacySource(SourceRuntime[WeFlowLegacyClient]):
+    """已装配的 WeFlow Legacy 消息源，实现 SourceRuntime 协议。"""
 
-    name = "weflow"
+    name = "weflow-legacy"
 
     def __init__(
         self,
@@ -36,15 +39,17 @@ class WeFlowSource(SourceRuntime[WeFlowClient]):
         api_token: str | None = None,
     ):
         # 统一实例化一次源专属配置（reconnect 参数注入监听器）
-        self._settings = WeFlowSettings()
-        # 未显式传入时读取 weflow 专属配置（WEFLOW_API_BASE / WEFLOW_API_TOKEN）；
+        self._settings = WeFlowLegacySettings()
+        # 未显式传入时读取 weflow-legacy 专属配置
+        # （WEFLOW_LEGACY_API_BASE / WEFLOW_LEGACY_API_TOKEN）；
         # 密钥在「配置 → 客户端」边界解包为明文 str，客户端不感知 SecretStr
         if base_url is None or api_token is None:
             base_url = base_url or self._settings.api_base
             api_token = api_token or self._settings.api_token.get_secret_value()
-        # 具体类型而非 SourceClient：poll/WeFlowSseClient 需要 WeFlowClient 能力；
-        # 结构上仍满足 SourceClient 协议，可传给 pipeline/server
-        self.client = WeFlowClient(
+        # 具体类型而非 SourceClient：poll/WeFlowLegacySseClient 需要
+        # WeFlowLegacyClient 能力；结构上仍满足 SourceClient 协议，可传给
+        # pipeline/server
+        self.client = WeFlowLegacyClient(
             base_url=base_url,
             api_token=api_token,
         )
@@ -66,7 +71,7 @@ class WeFlowSource(SourceRuntime[WeFlowClient]):
         )
 
     async def refresh_sessions(self) -> list[SessionInfo]:
-        """从 WeFlow 重新拉取会话列表并返回（不写库），应用层负责落库。"""
+        """从 WeFlow Legacy 重新拉取会话列表并返回（不写库），应用层负责落库。"""
         start = time_module.perf_counter()
         sessions = await self.client.fetch_sessions()
         if self.listener is not None:
@@ -83,7 +88,7 @@ class WeFlowSource(SourceRuntime[WeFlowClient]):
             for s in sessions
         ]
         logger.info(
-            "[weflow] 会话刷新完成: %d 个会话 (%s)",
+            "[weflow-legacy] 会话刷新完成: %d 个会话 (%s)",
             len(result),
             fmt_dur(time_module.perf_counter() - start),
         )
@@ -91,8 +96,10 @@ class WeFlowSource(SourceRuntime[WeFlowClient]):
 
     def start(self, on_batch: BatchHandler) -> None:
         """创建并启动 SSE 实时监听。"""
-        logger.info("[weflow] 启动 SSE 实时监听")
-        self.listener = WeFlowSseClient(self.client, on_batch, settings=self._settings)
+        logger.info("[weflow-legacy] 启动 SSE 实时监听")
+        self.listener = WeFlowLegacySseClient(
+            self.client, on_batch, settings=self._settings
+        )
         self.listener.start()
 
     async def close(self) -> None:
@@ -113,4 +120,4 @@ class WeFlowSource(SourceRuntime[WeFlowClient]):
                 await drain()
             self.listener = None
         await self.client.close()
-        logger.info("[weflow] 已关闭")
+        logger.info("[weflow-legacy] 已关闭")

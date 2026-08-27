@@ -1,4 +1,4 @@
-"""weflow 公众号文章卡片（appmsg XML）解析与拆条测试。
+"""weflow-legacy 公众号文章卡片（appmsg XML）解析与拆条测试。
 
 样本为上海发布真实推送的简化形态：多图文 mmreader 含 2 篇 item；
 另覆盖单图文退化、title_v2 回退、解析失败兜底与预过滤放行。
@@ -6,14 +6,14 @@
 
 import unittest
 
-from briefdesk.plugins.weflow.normalize import (
+from briefdesk.plugins.weflow_legacy.normalize import (
     _APPMSG_LOCAL_TYPE,
     normalize_rest,
     normalize_sse,
     parse_appmsg_xml,
     pre_filter_rest,
 )
-from briefdesk.plugins.weflow.poller import poll
+from briefdesk.plugins.weflow_legacy.poller import poll
 from briefdesk.types import SessionInfo
 
 _MULTI_XML = """<msg>
@@ -214,7 +214,7 @@ class NormalizeSseAppmsgTest(unittest.IsolatedAsyncioTestCase):
 class _PlaceholderClient:
     """模拟 media=True 回填：文章消息 content 为占位符，回查才返回 XML。"""
 
-    name = "weflow"
+    name = "weflow-legacy"
 
     def __init__(self, placeholder: dict, raw_xml: dict):
         self._placeholder = placeholder
@@ -254,7 +254,7 @@ class PollerPlaceholderLookbackTest(unittest.IsolatedAsyncioTestCase):
         client = _PlaceholderClient(placeholder, raw)
         enabled = [
             SessionInfo(
-                source="weflow", session_id="gh_x", name="上海发布",
+                source="weflow-legacy", session_id="gh_x", name="上海发布",
                 is_group=False, is_official=True,
             )
         ]
@@ -282,7 +282,7 @@ class PollerPlaceholderLookbackTest(unittest.IsolatedAsyncioTestCase):
         client = _PlaceholderClient(msg, msg)
         enabled = [
             SessionInfo(
-                source="weflow", session_id="gh_x", name="上海发布",
+                source="weflow-legacy", session_id="gh_x", name="上海发布",
                 is_group=False, is_official=True,
             )
         ]
@@ -303,7 +303,7 @@ class PollerPlaceholderLookbackTest(unittest.IsolatedAsyncioTestCase):
     def _enabled(self):
         return [
             SessionInfo(
-                source="weflow", session_id="gh_x", name="上海发布",
+                source="weflow-legacy", session_id="gh_x", name="上海发布",
                 is_group=False, is_official=True,
             )
         ]

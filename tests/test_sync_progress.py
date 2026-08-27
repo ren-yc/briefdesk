@@ -114,13 +114,13 @@ def _pipeline_msg(mid, content="c", session_id="s", ts=1):
         session_id=session_id,
         group_name="g",
         timestamp=ts,
-        source="weflow",
+        source="weflow-legacy",
     )
 
 
 def _pipeline_client():
     c = AsyncMock()
-    c.name = "weflow"
+    c.name = "weflow-legacy"
     c.download_media = AsyncMock(return_value=b"x")
     return c
 

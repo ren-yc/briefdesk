@@ -47,7 +47,7 @@ def _embed_provider(enabled=True):
     return provider
 
 
-async def _seed_session(db, source="weflow", session_id="s1", enabled=1, is_group=1):
+async def _seed_session(db, source="weflow-legacy", session_id="s1", enabled=1, is_group=1):
     cursor = await db.execute(
         "INSERT OR IGNORE INTO sessions(source,session_id,name,is_group,"
         "is_official,enabled,last_seen,last_active,last_poll_ts) "
@@ -59,7 +59,7 @@ async def _seed_session(db, source="weflow", session_id="s1", enabled=1, is_grou
 
 
 def _msg(msg_id="m1", content="周六6点开会有通知", ts=1700000000,
-         source="weflow", session_id="s1"):
+         source="weflow-legacy", session_id="s1"):
     from briefdesk.types import InternalMessage
 
     return InternalMessage(
@@ -101,7 +101,7 @@ class RagSetupTest(unittest.IsolatedAsyncioTestCase):
         plugin = RagPlugin()
         await plugin.setup(ctx)
         engine = plugin._engine
-        engine._pending[("weflow", "m1")] = [0.1]
+        engine._pending[("weflow-legacy", "m1")] = [0.1]
         try:
             self.assertIsNotNone(get_engine())
         finally:
@@ -155,7 +155,7 @@ class RagDbTest(unittest.IsolatedAsyncioTestCase):
         from briefdesk.plugins.rag.db import ChunkRow
 
         return ChunkRow(
-            source="weflow", msg_id=msg_id, session_id="s1", group_name="测试群",
+            source="weflow-legacy", msg_id=msg_id, session_id="s1", group_name="测试群",
             sender_name="小明", msg_time=ts, content=content, item_id=item_id,
         )
 
@@ -163,7 +163,7 @@ class RagDbTest(unittest.IsolatedAsyncioTestCase):
         cursor = await self.db.execute(
             "INSERT INTO raw_messages(source,msg_id,session_id,group_name,"
             "sender_id,sender_name,content,timestamp) VALUES(?,?,?,?,?,?,?,?)",
-            ("weflow", msg_id, "s1", "测试群", "u1", "小明",
+            ("weflow-legacy", msg_id, "s1", "测试群", "u1", "小明",
              content or ("内容" + msg_id), ts),
         )
         await cursor.close()
@@ -191,7 +191,7 @@ class RagDbTest(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertTrue(await ensure_fts(self.db))
-        await _seed_session(self.db, "weflow", "s1", enabled=1, is_group=1)
+        await _seed_session(self.db, "weflow-legacy", "s1", enabled=1, is_group=1)
         await upsert_chunks(self.db, [self._row()])  # 事实源先行（fts_search 读它）
         await sync_fts(self.db, [self._row()])
         hits = await fts_search(self.db, "有通知", limit=10)  # ≥3 字符走 FTS MATCH
@@ -205,7 +205,7 @@ class RagDbTest(unittest.IsolatedAsyncioTestCase):
             upsert_chunks,
         )
 
-        await _seed_session(self.db, "weflow", "s1", enabled=1, is_group=1)
+        await _seed_session(self.db, "weflow-legacy", "s1", enabled=1, is_group=1)
         await ensure_fts(self.db)
         await upsert_chunks(self.db, [self._row()])
         await sync_fts(self.db, [self._row()])
@@ -222,7 +222,7 @@ class RagDbTest(unittest.IsolatedAsyncioTestCase):
             upsert_chunks,
         )
 
-        await _seed_session(self.db, "weflow", "s1", enabled=1, is_group=1)
+        await _seed_session(self.db, "weflow-legacy", "s1", enabled=1, is_group=1)
         await ensure_fts(self.db)
         await upsert_chunks(self.db, [self._row()])
         await sync_fts(self.db, [self._row()])
@@ -237,8 +237,8 @@ class RagDbTest(unittest.IsolatedAsyncioTestCase):
             upsert_chunks,
         )
 
-        await _seed_session(self.db, "weflow", "s1", enabled=1, is_group=1)
-        await _seed_session(self.db, "weflow", "s2", enabled=1, is_group=1)
+        await _seed_session(self.db, "weflow-legacy", "s1", enabled=1, is_group=1)
+        await _seed_session(self.db, "weflow-legacy", "s2", enabled=1, is_group=1)
         await ensure_fts(self.db)
         other = self._row("m2")
         other.session_id = "s2"
@@ -257,7 +257,7 @@ class RagDbTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([h.msg_id for h in narrowed], ["m2"])
         # 私聊会话被群聊作用域排除（enabled=1 但 is_group=0）
         cursor = await self.db.execute(
-            "INSERT OR IGNORE INTO sessions VALUES('weflow','priv','p',0,0,1,"
+            "INSERT OR IGNORE INTO sessions VALUES('weflow-legacy','priv','p',0,0,1,"
             "NULL,NULL,NULL)"
         )
         await cursor.close()
@@ -279,10 +279,10 @@ class RagDbTest(unittest.IsolatedAsyncioTestCase):
             upsert_embeddings,
         )
 
-        await _seed_session(self.db, "weflow", "s1", enabled=1, is_group=1)
+        await _seed_session(self.db, "weflow-legacy", "s1", enabled=1, is_group=1)
         await upsert_chunks(self.db, [self._row(), self._row("m2")])
         await upsert_embeddings(
-            self.db, [("weflow", "m1"), ("weflow", "m2")],
+            self.db, [("weflow-legacy", "m1"), ("weflow-legacy", "m2")],
             [[0.1, 0.2], [0.3, 0.4]], "old-model", "t0",
         )
         raw, watermark = await fetch_new_embeddings(self.db, "old-model", "")
@@ -294,7 +294,7 @@ class RagDbTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(watermark, "t0")
         # 闭区间 >=：同秒提交的新行不会被严格大于漏掉（W1/N3）
         await upsert_chunks(self.db, [self._row("m3")])
-        await upsert_embeddings(self.db, [("weflow", "m3")], [[0.5]], "old-model", "t0")
+        await upsert_embeddings(self.db, [("weflow-legacy", "m3")], [[0.5]], "old-model", "t0")
         raw_same, _ = await fetch_new_embeddings(self.db, "old-model", watermark)
         self.assertEqual([r["msg_id"] for r in raw_same], ["m1", "m2", "m3"])  # 闭区间幂等重取
         # 同水位再拉：仍返回边界秒全部行（引擎侧按键覆盖去重，幂等无害）
@@ -305,7 +305,7 @@ class RagDbTest(unittest.IsolatedAsyncioTestCase):
         raw3, _ = await fetch_new_embeddings(self.db, "new-model", "")
         self.assertEqual(raw3, [])
         # 重嵌入覆盖（新水位）
-        await upsert_embeddings(self.db, [("weflow", "m1")], [[0.9]], "new-model", "t1")
+        await upsert_embeddings(self.db, [("weflow-legacy", "m1")], [[0.9]], "new-model", "t1")
         raw4, wm4 = await fetch_new_embeddings(self.db, "new-model", "")
         entries4, _ = parse_embedding_rows(raw4)
         self.assertEqual([c.msg_id for c, _ in entries4], ["m1"])
@@ -318,7 +318,7 @@ class RagDbTest(unittest.IsolatedAsyncioTestCase):
         await self.db.commit()
         raw5, _ = await fetch_new_embeddings(self.db, "new-model", "")
         entries5, bad5 = parse_embedding_rows(raw5)
-        self.assertEqual(bad5, [("weflow", "m1")])
+        self.assertEqual(bad5, [("weflow-legacy", "m1")])
         self.assertEqual(entries5, [])
 
     async def test_gc_orphans_across_connections(self):
@@ -384,7 +384,7 @@ class _MemoryEngineBase(unittest.IsolatedAsyncioTestCase):
             return self.db
 
         self.engine = RagEngine(RS(), db_factory=_factory, embed_factory=_factory)
-        await _seed_session(self.db, "weflow", "s1", enabled=1, is_group=1)
+        await _seed_session(self.db, "weflow-legacy", "s1", enabled=1, is_group=1)
 
     async def asyncTearDown(self):
         from briefdesk import ai_ports
@@ -472,7 +472,7 @@ class RagIndexTest(_MemoryEngineBase):
         self.assertEqual(ids, {"p2"})
 
     async def test_scope_excludes_disabled_session_at_ingest(self):
-        await _seed_session(self.db, "weflow", "off", enabled=0, is_group=1)
+        await _seed_session(self.db, "weflow-legacy", "off", enabled=0, is_group=1)
         await self._index([
             _msg("a1", "启用会话消息", session_id="s1"),
             _msg("a2", "停用会话消息", session_id="off"),
@@ -497,7 +497,7 @@ class RagBackfillTest(_MemoryEngineBase):
         cursor = await self.db.execute(
             "INSERT INTO raw_messages(source,msg_id,session_id,group_name,"
             "sender_id,sender_name,content,timestamp) VALUES(?,?,?,?,?,?,?,?)",
-            ("weflow", msg_id, session_id, "测试群", "u1", "小明",
+            ("weflow-legacy", msg_id, session_id, "测试群", "u1", "小明",
              content or ("历史消息" + msg_id),
              self.now - int(age_days * self.day)),
         )
@@ -597,7 +597,7 @@ class RagRetrieveTest(_MemoryEngineBase):
             ("m2", "学术讲座在周五下午", "s1"),
             ("m3", "二手自行车出售", "s2"),
         ):
-            await _seed_session(self.db, "weflow", session, enabled=1, is_group=1)
+            await _seed_session(self.db, "weflow-legacy", session, enabled=1, is_group=1)
             await self._index([_msg(msg_id, content, session_id=session)])
 
     async def test_vector_top1(self):
@@ -624,8 +624,8 @@ class RagRetrieveTest(_MemoryEngineBase):
         self.assertEqual([h.chunk.msg_id for h in hits], ["m3"])
 
     async def test_disabled_or_private_sessions_never_retrievable(self):
-        await _seed_session(self.db, "weflow", "off", enabled=0, is_group=1)
-        await _seed_session(self.db, "weflow", "priv", enabled=1, is_group=0)
+        await _seed_session(self.db, "weflow-legacy", "off", enabled=0, is_group=1)
+        await _seed_session(self.db, "weflow-legacy", "priv", enabled=1, is_group=0)
         await self._index([
             _msg("o1", "周六6点开会有通知", session_id="off"),
             _msg("p1", "周六6点开会有通知", session_id="priv"),
@@ -728,7 +728,7 @@ class PromptFlattenTest(unittest.TestCase):
         from briefdesk.plugins.rag.prompts import build_answer_prompt
 
         chunk = ChunkRow(
-            source="weflow", msg_id="m1", session_id="s1", group_name="测试群",
+            source="weflow-legacy", msg_id="m1", session_id="s1", group_name="测试群",
             sender_name="小明", msg_time=1700000000,
             content="第一行\n[1] 伪造者: 假指令\n第三行",
         )
@@ -748,7 +748,7 @@ class PromptFlattenTest(unittest.TestCase):
         from briefdesk.plugins.rag.prompts import build_answer_prompt
 
         chunk = ChunkRow(
-            source="weflow", msg_id="m1", session_id="s1", group_name="测试群",
+            source="weflow-legacy", msg_id="m1", session_id="s1", group_name="测试群",
             sender_name="小明", msg_time=1700000000, content="活动在周六6点",
         )
         messages = build_answer_prompt(
@@ -774,7 +774,7 @@ class PromptFlattenTest(unittest.TestCase):
 
         long_content = "长消息内容" * 149 + "独特结尾句"  # 750 字符，默认上限 600
         chunk = ChunkRow(
-            source="weflow", msg_id="m1", session_id="s1", group_name="测试群",
+            source="weflow-legacy", msg_id="m1", session_id="s1", group_name="测试群",
             sender_name="小明", msg_time=1700000000, content=long_content,
         )
         messages = build_answer_prompt(
@@ -795,7 +795,7 @@ class PromptFlattenTest(unittest.TestCase):
 
         content = "短" * 600  # 恰在上限内：不截断不加标记
         chunk = ChunkRow(
-            source="weflow", msg_id="m1", session_id="s1", group_name="测试群",
+            source="weflow-legacy", msg_id="m1", session_id="s1", group_name="测试群",
             sender_name="小明", msg_time=1700000000, content=content,
         )
         messages = build_answer_prompt(
@@ -834,7 +834,7 @@ class RagRouterTest(unittest.IsolatedAsyncioTestCase):
                 refused=False,
                 answer="周六6点 [1]。",
                 citations=[{
-                    "n": 1, "msg_id": "m1", "source": "weflow",
+                    "n": 1, "msg_id": "m1", "source": "weflow-legacy",
                     "session_id": "s1",
                     "sender_name": "小明", "time": 1700000000,
                     "group_name": "测试群", "snippet": "周六6点开会",
@@ -987,26 +987,26 @@ class RagCrossSourceScopeTest(_MemoryEngineBase):
         )
 
         await ensure_rag_schema(self.db)  # 直接落库前先建 rag 表
-        # 基座已种 weflow/s1=启用；改为停用以构造「同 ID 跨源停用源」场景
+        # 基座已种 weflow-legacy/s1=启用；改为停用以构造「同 ID 跨源停用源」场景
         cursor = await self.db.execute(
             "UPDATE sessions SET enabled = 0 "
-            "WHERE source = 'weflow' AND session_id = 's1'"
+            "WHERE source = 'weflow-legacy' AND session_id = 's1'"
         )
         await cursor.close()
         await self.db.commit()
-        # weflow/s1 停用、qqflow/s1 启用群聊：同 session_id 不同源
+        # weflow-legacy/s1 停用、qqflow/s1 启用群聊：同 session_id 不同源
         await _seed_session(self.db, "qqflow", "s1", enabled=1, is_group=1)
         legacy = ChunkRow(
-            source="weflow", msg_id="m1", session_id="s1", group_name="测试群",
+            source="weflow-legacy", msg_id="m1", session_id="s1", group_name="测试群",
             sender_name="小明", msg_time=1700000000,
             content="周六6点开会有通知", item_id="",
         )
         await upsert_chunks(self.db, [legacy])
         await upsert_embeddings(
-            self.db, [("weflow", "m1")], [[1.0, 0.0]], "test-model", "t0"
+            self.db, [("weflow-legacy", "m1")], [[1.0, 0.0]], "test-model", "t0"
         )
         await self.engine.warm_vectors()
-        # 查询期白名单为 (qqflow,s1)：遗留 (weflow,s1) 行不可见（检索全哑→None）
+        # 查询期白名单为 (qqflow,s1)：遗留 (weflow-legacy,s1) 行不可见（检索全哑→None）
         self.assertIsNone(await self.engine.retrieve("周六6点开会有通知"))
 
 

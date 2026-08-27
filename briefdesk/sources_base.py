@@ -94,7 +94,7 @@ def make_sse_timeout(read_timeout_s: float) -> httpx.Timeout:
 class BatchBuffer:
     """按数量或超时批量刷新消息的缓冲区。
 
-    跨源共享（weflow/qqflow 监听器共用），勿在各插件包另立副本。
+    跨源共享（weflow-legacy/qqflow 监听器共用），勿在各插件包另立副本。
     """
 
     def __init__(self, on_flush: BatchHandler):

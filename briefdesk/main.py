@@ -1,7 +1,7 @@
 """入口 — 运行时生命周期管理（启动/优雅关闭）。
 
 轮询周期业务编排见 briefdesk/poll_cycle.py；插件装配见
-briefdesk/plugin/manager.py —— 消息源为内置插件（weflow/qqflow），
+briefdesk/plugin/manager.py —— 消息源为内置插件（weflow-legacy/qqflow），
 启用/禁用走 PLUGINS / PLUGINS_DISABLED 配置。
 """
 

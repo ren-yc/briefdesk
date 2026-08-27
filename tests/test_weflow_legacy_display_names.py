@@ -1,4 +1,4 @@
-"""weflow 发送者显示名处理测试。
+"""weflow-legacy 发送者显示名处理测试。
 
 覆盖 REST 联系人候选清洗/回退、SSE/REST 归一化显示名回退、
 poller 私聊会话显示名兜底与 runtime 会话名清洗。
@@ -8,15 +8,15 @@ import time
 import unittest
 from unittest.mock import AsyncMock, patch
 
-from briefdesk.plugins.weflow.client import (
-    WeFlowClient,
+from briefdesk.plugins.weflow_legacy.client import (
+    WeFlowLegacyClient,
     is_group_session,
     is_official_session,
     is_private_session,
 )
-from briefdesk.plugins.weflow.normalize import normalize_rest, normalize_sse
-from briefdesk.plugins.weflow.poller import poll
-from briefdesk.plugins.weflow.runtime import WeFlowSource
+from briefdesk.plugins.weflow_legacy.normalize import normalize_rest, normalize_sse
+from briefdesk.plugins.weflow_legacy.poller import poll
+from briefdesk.plugins.weflow_legacy.runtime import WeFlowLegacySource
 from briefdesk.types import SessionInfo
 
 
@@ -38,7 +38,7 @@ class SessionKindTest(unittest.TestCase):
 class FetchContactsTest(unittest.IsolatedAsyncioTestCase):
     async def test_candidates_cleaned_before_fallback(self):
         """每级候选必须净化后再判空：脏 displayName 不能压掉干净的 nickname/remark。"""
-        client = WeFlowClient(base_url="http://127.0.0.1:5031", api_token="t")
+        client = WeFlowLegacyClient(base_url="http://127.0.0.1:5031", api_token="t")
         payload = {
             "contacts": [
                 {"username": "u1", "displayName": "\x01\x01甲"},
@@ -62,7 +62,7 @@ class FetchContactsTest(unittest.IsolatedAsyncioTestCase):
                 },
             ]
         }
-        with patch.object(WeFlowClient, "_get", new=AsyncMock(return_value=payload)):
+        with patch.object(WeFlowLegacyClient, "_get", new=AsyncMock(return_value=payload)):
             contacts = await client.fetch_contacts()
         self.assertEqual(
             contacts,
@@ -72,7 +72,7 @@ class FetchContactsTest(unittest.IsolatedAsyncioTestCase):
 
 class FetchGroupMembersTest(unittest.IsolatedAsyncioTestCase):
     async def test_group_nickname_wins_and_candidates_cleaned(self):
-        client = WeFlowClient(base_url="http://127.0.0.1:5031", api_token="t")
+        client = WeFlowLegacyClient(base_url="http://127.0.0.1:5031", api_token="t")
         payload = {
             "members": [
                 {
@@ -106,7 +106,7 @@ class FetchGroupMembersTest(unittest.IsolatedAsyncioTestCase):
             ]
         }
         with patch.object(
-            WeFlowClient, "_get", new=AsyncMock(return_value=payload)
+            WeFlowLegacyClient, "_get", new=AsyncMock(return_value=payload)
         ) as mock:
             members = await client.fetch_group_members("g1")
         self.assertEqual(members, {"u1": "甲方", "u2": "李四", "u3": "乙"})
@@ -118,16 +118,16 @@ class FetchGroupMembersTest(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_not_found_returns_empty_mapping(self):
-        client = WeFlowClient(base_url="http://127.0.0.1:5031", api_token="t")
-        with patch.object(WeFlowClient, "_get", new=AsyncMock(return_value=None)):
+        client = WeFlowLegacyClient(base_url="http://127.0.0.1:5031", api_token="t")
+        with patch.object(WeFlowLegacyClient, "_get", new=AsyncMock(return_value=None)):
             members = await client.fetch_group_members("gone")
         self.assertEqual(members, {})
 
     async def test_other_errors_propagate(self):
-        client = WeFlowClient(base_url="http://127.0.0.1:5031", api_token="t")
+        client = WeFlowLegacyClient(base_url="http://127.0.0.1:5031", api_token="t")
         with (
             patch.object(
-                WeFlowClient, "_get", side_effect=RuntimeError("WeFlow API error: 500")
+                WeFlowLegacyClient, "_get", side_effect=RuntimeError("WeFlow API error: 500")
             ),
             self.assertRaisesRegex(RuntimeError, "500"),
         ):
@@ -219,7 +219,7 @@ class NormalizeRestDisplayNameTest(unittest.TestCase):
 
 
 class _FakeClient:
-    name = "weflow"
+    name = "weflow-legacy"
 
     def __init__(
         self,
@@ -340,7 +340,7 @@ class PollerDisplayNameTest(unittest.IsolatedAsyncioTestCase):
             ],
         )
         enabled = [
-            SessionInfo(source="weflow", session_id="g1", name="项目群", is_group=True)
+            SessionInfo(source="weflow-legacy", session_id="g1", name="项目群", is_group=True)
         ]
 
         async def no_processed(ids):
@@ -371,7 +371,7 @@ class PollerDisplayNameTest(unittest.IsolatedAsyncioTestCase):
             ],
         )
         enabled = [
-            SessionInfo(source="weflow", session_id="g1", name="项目群", is_group=True)
+            SessionInfo(source="weflow-legacy", session_id="g1", name="项目群", is_group=True)
         ]
 
         async def no_processed(ids):
@@ -383,7 +383,7 @@ class PollerDisplayNameTest(unittest.IsolatedAsyncioTestCase):
 
 class RuntimeRefreshSessionsTest(unittest.IsolatedAsyncioTestCase):
     async def test_dirty_session_display_name_falls_back_to_id(self):
-        source = WeFlowSource(base_url="http://127.0.0.1:5031", api_token="t")
+        source = WeFlowLegacySource(base_url="http://127.0.0.1:5031", api_token="t")
         source.client.fetch_sessions = AsyncMock(
             return_value=[
                 {

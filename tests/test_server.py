@@ -65,16 +65,16 @@ class MediaProxyRouteTest(unittest.TestCase):
 
     def test_blocked_paths_do_not_call_download(self):
         for path in (
-            "/api/media/weflow/..%2F..%2F..%2Fapi%2Fv1%2Fcontacts",
-            "/api/media/weflow/%2e%2e/%2e%2e/api/v1/contacts",
-            "/api/media/weflow/..%252F..%252F..%252Fapi%252Fv1%252Fcontacts",
+            "/api/media/weflow-legacy/..%2F..%2F..%2Fapi%2Fv1%2Fcontacts",
+            "/api/media/weflow-legacy/%2e%2e/%2e%2e/api/v1/contacts",
+            "/api/media/weflow-legacy/..%252F..%252F..%252Fapi%252Fv1%252Fcontacts",
         ):
             resp = self.client.get(path)
             self.assertEqual(resp.status_code, 404, path)
         self.assertEqual(self.fake.calls, [])
 
     def test_valid_path_forwards(self):
-        resp = self.client.get("/api/media/weflow/chat@room/images/abc.jpg")
+        resp = self.client.get("/api/media/weflow-legacy/chat@room/images/abc.jpg")
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(self.fake.calls, ["chat@room/images/abc.jpg"])
 
@@ -444,7 +444,7 @@ class MediaContentTypeTest(unittest.TestCase):
         self.client.close()
 
     def _get(self, path):
-        return self.client.get("/api/media/weflow/" + path)
+        return self.client.get("/api/media/weflow-legacy/" + path)
 
     def test_extensionless_media_sniffed_as_png(self):
         # qqflow mediaId 无扩展名：魔数嗅探兜底仍应放行位图类型
@@ -547,7 +547,7 @@ class CsvExportFormulaInjectionTest(unittest.TestCase):
             "sender_name": "\t制表符开头",
             "source_group": "正常群",
             "subject": "主体",
-            "source": "weflow",
+            "source": "weflow-legacy",
             "source_msg_id": "m1",
             "session_id": "s1",
             "msg_time": 100,
@@ -607,7 +607,7 @@ class CsvExportFormulaInjectionTest(unittest.TestCase):
         client = _client()
         sample = {
             "item_id": "i1",
-            "source": "weflow",
+            "source": "weflow-legacy",
             "source_msg_id": "m1",
             "category_before": "学术",
             "category_after": "活动通知",

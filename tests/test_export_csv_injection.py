@@ -51,7 +51,7 @@ class ExportItemsCsvInjectionTest(unittest.TestCase):
             "category": "活动通知",
             **raw,
             "subject": "subj",
-            "source": "weflow",
+            "source": "weflow-legacy",
             "source_msg_id": "m1",
             "session_id": "s1",
             "msg_time": "2026-01-01 10:00:00",
@@ -81,7 +81,7 @@ class ExportItemsCsvInjectionTest(unittest.TestCase):
             "sender_name": "李四",
             "source_group": "社团群",
             "subject": "",
-            "source": "weflow",
+            "source": "weflow-legacy",
             "source_msg_id": "m1",
             "session_id": "s1",
             "msg_time": "2026-01-01 10:00:00",
@@ -108,7 +108,7 @@ class ExportRecatSamplesCsvInjectionTest(unittest.TestCase):
     def test_content_cell_neutralized(self):
         sample = {
             "item_id": "i1",
-            "source": "weflow",
+            "source": "weflow-legacy",
             "source_msg_id": "m1",
             "category_before": "学术",
             "category_after": "活动通知",
