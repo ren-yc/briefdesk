@@ -282,7 +282,18 @@ weflow-server.exe --port 5033 --watch-fallback-ms 5000 --log info
    下游经 `fetch_all_pages` 翻页取尽。`/api/v1/sessions` **仍无 `offset`**，
    只能显式传 `limit=10000`（天花板，非取尽）；`/api/v1/group-members` 无 limit，
    不受影响。
-6. **已知上游缺陷（未修，下游已兜底）**：`sessions` 端点会列出无消息表的聚合会话
+6. **`/api/v1/group-members` 的 `groupNickname` 恒空，该端点对显示名无增量。**
+   实际响应键为 `wxid / displayName / nickname / remark / alias / groupNickname /
+   avatarUrl / isOwner / isFriend / messageCount`（`group_members.rs`），非上文示例的
+   `username / nickname`。其中 `groupNickname` 取自 `store.group_cards`，而该字段
+   **在上游全仓（含测试）没有任何一处写入**——两个 `Store` 构造点（`index.rs`、
+   `sync/mod.rs` 测试）都是 `..Default::default()` 的恒空 map。因此 `displayName`
+   走的 `sender_display()` 群名片分支恒落空，掉到 `contacts.display_name()`，
+   与消息自带 `senderName` 在 `index.rs::row_to_record` 的算法逐字相同。
+   实测最近活跃 5 群 208 名成员 `groupNickname` 非空 0 条；974 条消息两链 974 条
+   同值。**下游据此不再调该端点**，显示名直取 `senderName`，退化为 wxid 时回退
+   contacts。上游若日后补上 `group_cards` 填充，需重新评估。
+7. **已知上游缺陷（未修，下游已兜底）**：`sessions` 端点会列出无消息表的聚合会话
    （如 `brandsessionholder`，`messageCount=0`），但 `messages?talker=` 对其返回 404，
    两侧口径不一致。详见仓库外的缺陷报告；下游以 `fetch_messages(not_found_ok=True)`
    降级为空信封，回填时静默跳过。

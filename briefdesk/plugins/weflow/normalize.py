@@ -273,9 +273,12 @@ def normalize_rest(
     session_id: str,
     group_name: str,
     contacts: dict[str, str] | None = None,
-    group_members: dict[str, str] | None = None,
 ) -> list[InternalMessage]:
     """REST 消息 → InternalMessage 列表（普通消息 1 条，文章卡片拆条）。
+
+    显示名取上游 senderName（备注 > 昵称 > wxid），退化为 wxid 时让位
+    contacts —— 私聊/公众号对端可能不在上游 contacts 集合，poller 用会话
+    显示名回填了 contacts，那才是唯一名字来源。
 
     文章卡片解析失败（无 title）时返回空列表：REST 路径下非常规消息不进
     管道（丢弃语义）。图片消息（localType=3 且带 media.url）提取相对路径
@@ -285,11 +288,13 @@ def normalize_rest(
     # IGNORE_SELF 判定：微信 DB 的 isSend 原义 0=收到 / 1=自己发送
     # （上游 SSE 推送端也据此不推自消息）。字段缺失 → 视为非自己（fail-open）。
     is_self = bool(msg.get("isSend"))
-    # 取值后再清洗一道（幂等，防御调用方传入未清洗映射）：
-    # 群成员名（群名片等 per-session 名字）优先于全局联系人名，
-    # 两者都为空才回退 wxid，避免空显示名进入 raw_messages/items。
+    upstream_name = clean_display_name(msg.get("senderName"))
+    if upstream_name == wxid:
+        upstream_name = ""
+    # 取值后再清洗一道（幂等，防御调用方传入未清洗映射）：逐级净化后为空
+    # 才回退 wxid，避免空显示名进入 raw_messages/items。
     display_name = (
-        clean_display_name((group_members or {}).get(wxid))
+        upstream_name
         or clean_display_name((contacts or {}).get(wxid))
         or wxid
         or "未知"

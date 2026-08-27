@@ -169,8 +169,9 @@ async def poll(
     # IGNORE_SELF 开启时检测 isSend 字段是否可得（微信 DB 原义字段，
     # 个别版本可能不返回；缺失则自消息过滤实际未生效，需告警）
     saw_is_send_field = False
-    # 群成员映射按 session 缓存一轮：同一轮内重复会话不重复请求
-    group_members_cache: dict[str, dict[str, str]] = {}
+    # 不再查 /api/v1/group-members：其 groupNickname 出自上游从未被写入的
+    # group_cards（恒空），displayName 与消息自带 senderName 同出
+    # contacts.display_name()，纯冗余（每个启用群省一次请求）。
 
     for session in enabled_sessions:
         session_idx += 1
@@ -290,20 +291,6 @@ async def poll(
 
                 candidates.append(msg)
 
-            group_members: dict[str, str] = {}
-            if candidates and session.is_group:
-                # 懒加载：仅有新候选时才查群成员；404（群不存在）由 client
-                # 降级为空映射，其他错误传播中止本轮，避免错误名永久入库
-                if session_id not in group_members_cache:
-                    group_members_cache[session_id] = await client.fetch_group_members(
-                        session_id
-                    )
-                else:
-                    logger.debug(
-                        f"  [{session_idx}/{len(enabled_sessions)}] {label}: 群成员命中本轮缓存"
-                    )
-                group_members = group_members_cache[session_id]
-
             for msg in candidates:
                 # 文章卡片：rawContent 已在 media=True 下保留，直接拆条；
                 # 仍按拆条粒度查已处理（部分处理时由 pipeline 入口过滤）
@@ -322,9 +309,7 @@ async def poll(
                             session_processed += 1
                             continue
                 # 文章卡片拆条后返回多条；解析失败返回空列表（维持丢弃语义）
-                normalized_list = normalize_rest(
-                    msg, session_id, label, contacts, group_members
-                )
+                normalized_list = normalize_rest(msg, session_id, label, contacts)
                 result.messages.extend(normalized_list)
                 session_new += len(normalized_list)
 

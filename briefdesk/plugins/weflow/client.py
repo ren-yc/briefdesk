@@ -88,17 +88,6 @@ class WeFlowContact(TypedDict):
     type: str
 
 
-class WeFlowGroupMember(TypedDict):
-    """群成员（/api/v1/group-members）。"""
-
-    wxid: str
-    displayName: str
-    nickname: str
-    remark: str
-    alias: str
-    groupNickname: str
-
-
 class WeFlowMedia(TypedDict):
     """消息媒体元数据（可解析媒体的消息恒有；导出字段仅 media=1 时填充）。
 
@@ -124,8 +113,10 @@ class WeFlowMessage(TypedDict):
     createTime: int  # 秒级 Unix
     sortSeq: int  # 上游水位排序键之一（本仓库不使用）
     isSend: int  # 0 = 收到, 1 = 自己发送
-    senderUsername: str
-    senderName: str
+    senderUsername: str  # 发送者 wxid（稳定去重键）
+    senderName: str  # 上游已解析的发送者显示名：备注 > 昵称 > wxid（index
+    # 期由全局 contacts 算出，无群名片 —— 上游 group_cards 从未被写入）。
+    # 与 SSE sourceName 同值；退化为 wxid 时由下游回退 contacts
     content: str  # 解析后文本（媒体消息为 [图片]/[语音] 等占位符）
     rawContent: str  # 原始内容（文章卡片为 <msg><appmsg> XML）
     parsedContent: str
@@ -151,10 +142,6 @@ class WeFlowSessionsResponse(TypedDict):
 
 class WeFlowContactsResponse(TypedDict):
     contacts: list[WeFlowContact]
-
-
-class WeFlowGroupMembersResponse(TypedDict):
-    members: list[WeFlowGroupMember]
 
 
 logger = logging.getLogger(__name__)
@@ -448,42 +435,12 @@ class WeFlowClient(SourceClient):
             )
         return contacts
 
-    async def fetch_group_members(self, chatroom_id: str) -> dict[str, str]:
-        """获取群成员 → {wxid: 群内显示名}。
-
-        候选顺序（每级经 clean_display_name 净化，净化后为空才回退）：
-        groupNickname → displayName → nickname → remark；全部为空则该成员
-        不进入映射，由 normalize 回退到全局 contacts / wxid。
-        404（群不存在）返回空映射；503 仍走 WeFlowNotReadyError 瞬态语义。
-        """
-        data: WeFlowGroupMembersResponse | None = await self._get(
-            "/api/v1/group-members",
-            params={"chatroomId": chatroom_id},
-            not_found_ok=True,
-        )
-        if not data:
-            logger.warning(f"群成员接口 404（群可能不存在）: {chatroom_id}")
-            return {}
-
-        members: dict[str, str] = {}
-        for m in data.get("members", []):
-            uid = m.get("wxid") or ""
-            if not uid:
-                continue
-            group_nick = clean_display_name(m.get("groupNickname"))
-            # 上游无任何名字来源时会以 wxid 兜底，此时应让位于其他候选
-            if group_nick == uid:
-                group_nick = ""
-            name = (
-                group_nick
-                or clean_display_name(m.get("displayName"))
-                or clean_display_name(m.get("nickname"))
-                or clean_display_name(m.get("remark"))
-            )
-            if name:
-                members[uid] = name
-        logger.debug("群成员拉取: %s → %d 名成员", chatroom_id, len(members))
-        return members
+    # 不再有 fetch_group_members：该接口的 groupNickname 出自 store.group_cards，
+    # 而上游全仓（含测试）没有任何一处写入该字段 —— 两个 Store 构造点都是
+    # Default::default() 的恒空 HashMap。实测最近活跃 5 群 208 名成员，
+    # groupNickname 非空 0 条；其 displayName 走 sender_display()，群名片分支
+    # 恒落空后掉到 contacts.display_name()，与消息自带 senderName 在
+    # index.rs 的算法逐字相同。实测 974 条消息两者 974 条同值，纯冗余。
 
     async def fetch_sessions(self) -> list[WeFlowSession]:
         """获取所有会话列表（原生格式，sessionType 权威）。
