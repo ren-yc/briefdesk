@@ -73,8 +73,10 @@ def _contrast(fg: str, bg: str) -> float:
 def _mix(fg: str, bg: str, pct: float) -> str:
     """近似 color-mix(in srgb, fg pct%, bg)：用于叠在底色上的淡色底。"""
     f, b = _hex_to_rgb(fg), _hex_to_rgb(bg)
-    out = tuple(round(f[i] * pct + b[i] * (1 - pct)) for i in range(3))
-    return "#%02X%02X%02X" % out
+    # 解包成三个标量再拼（而非 `% out`）：ruff UP031 要求格式说明符，且元数
+    # 显式为 3 时它才能证明改写安全。蓝色分量借 bl —— b 已被底色元组占用
+    r, g, bl = (round(f[i] * pct + b[i] * (1 - pct)) for i in range(3))
+    return f"#{r:02X}{g:02X}{bl:02X}"
 
 
 def _tokens() -> tuple[dict[str, str], dict[str, str]]:
