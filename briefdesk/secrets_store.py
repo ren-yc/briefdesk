@@ -101,21 +101,11 @@ class KeyringSource(PydanticBaseSettingsSource):
 
     优先级由 settings_customise_sources 的返回顺序决定（本方案位于环境
     变量之前）：keyring > 环境变量 > .env > 默认值。
-
-    支持 `fallback_map`：字段 → 旧密钥环键名。主键（`field_map`）未命中时
-    回读旧键，用于迁移期兼容（如 WEFLOW_LEGACY_API_TOKEN 回退
-    WEFLOW_API_TOKEN）。
     """
 
-    def __init__(
-        self,
-        settings_cls: type[BaseSettings],
-        field_map: dict[str, str],
-        fallback_map: dict[str, str] | None = None,
-    ):
+    def __init__(self, settings_cls: type[BaseSettings], field_map: dict[str, str]):
         super().__init__(settings_cls)
         self._field_map = field_map
-        self._fallback_map = fallback_map or {}
 
     def _key_for_field(self, field_name: str) -> str:
         """输出键与 EnvSettingsSource 保持一致：用字段别名。
@@ -134,23 +124,16 @@ class KeyringSource(PydanticBaseSettingsSource):
     ) -> tuple[Any, str, bool]:
         """返回 (值, 键名, 是否有效)；字段不在映射中或未配置返回无效。"""
         name = self._field_map.get(field_name)
-        if name is not None:
-            value = get_secret(name)
-            if value is not None:
-                return SecretStr(value), self._key_for_field(field_name), True
-        legacy_name = self._fallback_map.get(field_name)
-        if legacy_name is not None:
-            value = get_secret(legacy_name)
-            if value is not None:
-                return SecretStr(value), self._key_for_field(field_name), True
-        return None, field_name, False
+        if name is None:
+            return None, field_name, False
+        value = get_secret(name)
+        if value is None:
+            return None, field_name, False
+        return SecretStr(value), self._key_for_field(field_name), True
 
     def __call__(self) -> dict[str, Any]:
-        result: dict[str, Any] = {}
-        for field_name, name in self._field_map.items():
-            value = get_secret(name)
-            if value is None:
-                value = get_secret(self._fallback_map.get(field_name, ""))
-            if value is not None:
-                result[self._key_for_field(field_name)] = SecretStr(value)
-        return result
+        return {
+            self._key_for_field(field_name): SecretStr(value)
+            for field_name, name in self._field_map.items()
+            if (value := get_secret(name)) is not None
+        }

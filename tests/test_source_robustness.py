@@ -125,43 +125,6 @@ class SseReadTimeoutTest(unittest.TestCase):
         self.assertIsNone(t.pool)
 
 
-class LegacyEnvPrefixFallbackTest(unittest.TestCase):
-    """改名后兼容：WEFLOW_LEGACY_* 缺失时回读旧前缀 WEFLOW_*。
-
-    验证新前缀优先、旧前缀兜底，且旧前缀不覆盖新前缀。
-    """
-
-    def test_new_prefix_wins_over_old(self):
-        with patch.dict(
-            os.environ,
-            {
-                "WEFLOW_LEGACY_API_TOKEN": "new-token",
-                "WEFLOW_API_TOKEN": "old-token",
-            },
-            clear=False,
-        ):
-            settings = WeFlowLegacySettings(_env_file=None)
-        self.assertEqual(settings.api_token.get_secret_value(), "new-token")
-
-    def test_old_prefix_fallback_when_new_missing(self):
-        with patch.dict(
-            os.environ,
-            {"WEFLOW_API_TOKEN": "old-token", "WEFLOW_API_BASE": "http://old:99"},
-            clear=False,
-        ):
-            settings = WeFlowLegacySettings(_env_file=None)
-        self.assertEqual(settings.api_token.get_secret_value(), "old-token")
-        self.assertEqual(settings.api_base, "http://old:99")
-
-    def test_old_prefix_fallback_defaults_when_both_missing(self):
-        with patch.dict(os.environ, {}, clear=False):
-            os.environ.pop("WEFLOW_API_TOKEN", None)
-            os.environ.pop("WEFLOW_LEGACY_API_TOKEN", None)
-            settings = WeFlowLegacySettings(_env_file=None)
-        self.assertEqual(settings.api_token.get_secret_value(), "")
-        self.assertEqual(settings.api_base, "http://127.0.0.1:5031")
-
-
 class EnsureReadyRejectedStateTest(unittest.IsolatedAsyncioTestCase):
     """【4·P2】ensure_ready 注册被拒（invalid_key 等）不得记忆化，下轮须重试。"""
 
