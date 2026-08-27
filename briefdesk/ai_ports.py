@@ -50,6 +50,26 @@ async def chat(
     )
 
 
+async def rag_chat(
+    messages: list[dict],
+    *,
+    temperature: float = 0.2,
+    max_tokens: int = 1024,
+) -> ChatResponse:
+    """RAG 问答专用端口：模型/端点/Key 由 RAG_* 配置覆盖（留空复用主 AI）。
+
+    供应商未实现 rag_chat（旧实现/测试桩）时回退复用 chat 端口。
+    """
+    ai = _require_ai()
+    # 类级检测：Mock/旧实现等实例级动态属性（__getattr__）不视为实现了 rag_chat，
+    # 只有真正声明该方法的供应商类才走专用通道，否则回退复用 chat。
+    if hasattr(type(ai), "rag_chat"):
+        return await ai.rag_chat(  # type: ignore[attr-defined]
+            messages, temperature=temperature, max_tokens=max_tokens
+        )
+    return await ai.chat(messages, temperature=temperature, max_tokens=max_tokens)
+
+
 async def embed_texts(texts: list[str]) -> list[list[float]]:
     """批量嵌入端口。"""
     return await _require_ai().embed_texts(texts)

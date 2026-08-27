@@ -559,7 +559,7 @@ class RagEngine:
             datetime.now(UTC).astimezone(), question.strip(), hits, history or [],
             self.settings.evidence_chars,
         )
-        resp = await ai_ports.chat(messages, temperature=0.2, max_tokens=1024)
+        resp = await ai_ports.rag_chat(messages, temperature=0.2, max_tokens=1024)
         content = ""
         if getattr(resp, "choices", None):
             content = (resp.choices[0].message.content or "").strip()

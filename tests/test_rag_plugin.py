@@ -1050,3 +1050,49 @@ class RagFreshDbDays0Test(unittest.IsolatedAsyncioTestCase):
             await engine.teardown()
             ai_ports.set_ai(None)
             await db.close()
+
+
+class RagChatRoutingTest(unittest.IsolatedAsyncioTestCase):
+    """RAG 模型通道路由：供应商类声明 rag_chat → 走专用通道；否则回退复用 chat。"""
+
+    async def test_uses_rag_chat_when_provider_implements(self):
+        from briefdesk import ai_ports
+
+        class _Provider:
+            def __init__(self):
+                self.used = None
+
+            async def chat(self, messages, *, temperature, max_tokens):
+                self.used = "chat"
+                return None
+
+            async def rag_chat(self, messages, *, temperature, max_tokens):
+                self.used = "rag"
+                return None
+
+        p = _Provider()
+        ai_ports.set_ai(p)  # type: ignore[arg-type]
+        try:
+            await ai_ports.rag_chat([{"role": "user", "content": "x"}])
+            self.assertEqual(p.used, "rag")
+        finally:
+            ai_ports.set_ai(None)
+
+    async def test_falls_back_to_chat_when_not_implemented(self):
+        from briefdesk import ai_ports
+
+        class _OldProvider:
+            def __init__(self):
+                self.used = None
+
+            async def chat(self, messages, *, temperature, max_tokens):
+                self.used = "chat"
+                return None
+
+        p = _OldProvider()
+        ai_ports.set_ai(p)  # type: ignore[arg-type]
+        try:
+            await ai_ports.rag_chat([{"role": "user", "content": "x"}])
+            self.assertEqual(p.used, "chat")
+        finally:
+            ai_ports.set_ai(None)

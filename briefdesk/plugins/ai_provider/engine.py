@@ -20,6 +20,7 @@ from briefdesk.plugin.base import AIProvider, ChatResponse
 _client: AsyncOpenAI | None = None
 _ai_semaphore: asyncio.Semaphore | None = None
 _embed_client: AsyncOpenAI | None = None
+_rag_client: AsyncOpenAI | None = None
 
 
 def get_ai_client() -> AsyncOpenAI:
@@ -31,6 +32,18 @@ def get_ai_client() -> AsyncOpenAI:
             base_url=config.ai_api_base,
         )
     return _client
+
+
+def get_rag_client() -> AsyncOpenAI:
+    """RAG 专用 AsyncOpenAI 实例（RAG_MODEL/RAG_API_BASE/RAG_API_KEY 覆盖，回退 ai_*）。"""
+    global _rag_client
+    if _rag_client is None:
+        key = config.rag_api_key.get_secret_value() or config.ai_api_key.get_secret_value()
+        _rag_client = AsyncOpenAI(
+            api_key=key,
+            base_url=config.rag_api_base or config.ai_api_base,
+        )
+    return _rag_client
 
 
 def get_ai_semaphore() -> asyncio.Semaphore | None:
@@ -98,6 +111,43 @@ async def chat(
             )
         return await client.chat.completions.create(
             model=config.ai_model,
+            messages=messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+
+    sem = get_ai_semaphore()
+    if sem is None:
+        return await _create()
+    async with sem:
+        return await _create()
+
+
+async def rag_chat(
+    messages: list[ChatCompletionMessageParam],
+    *,
+    temperature: float = 0.2,
+    max_tokens: int = 1024,
+) -> ChatCompletion:
+    """RAG 问答专用入口：模型/端点/Key 可用 RAG_* 覆盖，全部留空则与 chat 同源。
+
+    与 chat 的差异：不强制 JSON 外壳（问答为正文；引用由 RAG prompt 约束）；
+    仍遵守 ai_disable_thinking 与并发信号量。
+    """
+    client = get_rag_client()
+    model = config.rag_model or config.ai_model
+
+    async def _create() -> ChatCompletion:
+        if config.ai_disable_thinking:
+            return await client.chat.completions.create(
+                model=model,
+                messages=messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                reasoning_effort="none",
+            )
+        return await client.chat.completions.create(
+            model=model,
             messages=messages,
             temperature=temperature,
             max_tokens=max_tokens,
@@ -189,6 +239,22 @@ class Provider(AIProvider):
         return cast(
             ChatResponse,
             await chat(
+                cast(list[ChatCompletionMessageParam], messages),
+                temperature=temperature,
+                max_tokens=max_tokens,
+            ),
+        )
+
+    async def rag_chat(
+        self,
+        messages: list[dict],
+        *,
+        temperature: float,
+        max_tokens: int,
+    ) -> ChatResponse:
+        return cast(
+            ChatResponse,
+            await rag_chat(
                 cast(list[ChatCompletionMessageParam], messages),
                 temperature=temperature,
                 max_tokens=max_tokens,

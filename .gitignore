@@ -61,3 +61,6 @@ briefdesk/plugins/benchmark/.tmp/
 briefdesk/plugins/benchmark/cases/*.fromweb.json
 
 .data-review/
+.data-review-r2/
+.data-review-r3/
+.data-review-r4/

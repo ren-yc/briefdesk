@@ -152,6 +152,9 @@ All via `.env` file, with an additional UI-staged overlay layer (see 「密钥�
 | `QQFLOW_SSE_READ_TIMEOUT_MS` | `60000` | qqflow SSE 读超时（毫秒）：上游每 15s 发 KeepAlive，默认取其 4 个周期；超时转化为 ReadTimeout 走监听器既有退避重连路径 |
 | `AI_API_BASE` | `https://api.deepseek.com` | OpenAI-compatible API base |
 | `AI_MODEL` | `deepseek-v4-flash` | Model name for classify/dedup |
+| `RAG_MODEL` | `` (falls back to `AI_MODEL`) | RAG QA-only model name (citations answer); leave empty to share the main model |
+| `RAG_API_BASE` | `` (falls back to `AI_API_BASE`) | RAG QA-only endpoint |
+| `RAG_API_KEY` | `` (falls back to `AI_API_KEY`) | RAG QA-only API key |
 | `AI_MAX_CONCURRENCY` | `0` (unlimited) | Max concurrent AI API requests; set `1` for local models with concurrency limit 1 |
 | `AI_DISABLE_THINKING` | `false` | When `true`, chat requests pass `reasoning_effort="none"` to disable thinking mode (Qwen3/Qwen3.5); default sends no such parameter |
 | `MAX_CLASSIFY_TOKENS` | `8192` | Max output tokens per classify call (DeepSeek cap 8192; truncation breaks JSON) |
