@@ -31,6 +31,7 @@ from briefdesk.sources_base import (
     MediaError,
     SourceClient,
     SourceError,
+    fetch_all_pages,
     make_sse_timeout,
     with_connect_retry,
 )
@@ -425,15 +426,20 @@ class WeFlowClient(SourceClient):
         脏数据），全部净化后为空才回退 UID。候选选择发生在构造前，必须在此
         显式净化（types.py 的构造净化不参与候选选择）。
 
-        显式传大 limit：上游 /api/v1/contacts 默认 limit=100（上限 10000）会
-        静默截断通讯录（实测仅回 100/4533 条），导致截断外的发送者显示名回退
-        成 wxid。与 fetch_sessions 同一类坑。
+        **按 offset 翻页取全量**（fetch_all_pages）：上游 `limit` 默认 100，
+        不翻页只能拿到前 100 条且无任何错误提示（实测真实账号 4533 条），
+        截断外的发送者显示名会退化成 wxid。传大 limit 只是把天花板抬到上游
+        硬上限 10000，仍是猜值；翻页才是取尽。
         """
-        data: WeFlowContactsResponse = await self._get(
-            "/api/v1/contacts", params={"limit": 10000}
+        rows = await fetch_all_pages(
+            lambda path, params: self._get(path, params=params),
+            "/api/v1/contacts",
+            key="contacts",
+            dedup_key="username",
+            upstream_version=self._logged_version,
         )
         contacts: dict[str, str] = {}
-        for c in data["contacts"]:
+        for c in rows:
             contacts[c["username"]] = (
                 clean_display_name(c.get("displayName"))
                 or clean_display_name(c.get("nickname"))

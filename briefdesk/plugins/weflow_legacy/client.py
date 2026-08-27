@@ -24,6 +24,7 @@ from briefdesk.logger import fmt_dur
 from briefdesk.masking import clean_display_name
 from briefdesk.plugins.weflow_legacy.config import WeFlowLegacySettings
 from briefdesk.sources_base import (
+    LIST_MAX_LIMIT,
     ConnectionStatus,
     MediaError,
     SourceClient,
@@ -414,8 +415,16 @@ class WeFlowLegacyClient(SourceClient):
         每级候选经 clean_display_name 净化（上游昵称可能携带控制字符/空白等
         脏数据），全部净化后为空才回退 username。候选选择发生在构造前，必须
         在此显式净化（types.py 的构造净化不参与候选选择）。
+
+        显式传 `LIST_MAX_LIMIT`：上游 `limit` 默认 100 会静默截断通讯录，
+        截断外的发送者显示名退化为 username（与 fetch_sessions 同一类坑）。
+        这里**不翻页**——上游是 WeFlow 安装版（非本仓库可改的服务端），其
+        contacts 端点无 `offset` 参数，只能一次尽量多取；真实通讯录超过该
+        上限时仍会被截断，属该上游的固有限制。
         """
-        data: WeFlowLegacyContactsResponse = await self._get("/api/v1/contacts")
+        data: WeFlowLegacyContactsResponse = await self._get(
+            "/api/v1/contacts", params={"limit": LIST_MAX_LIMIT}
+        )
         contacts: dict[str, str] = {}
         for c in data["contacts"]:
             contacts[c["username"]] = (

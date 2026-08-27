@@ -91,6 +91,118 @@ def make_sse_timeout(read_timeout_s: float) -> httpx.Timeout:
     )
 
 
+# 列表端点单页条数：翻页的步长，不是总量上限。
+# 上游（weflow-server / qqflow-server）对 limit 的硬上限为 10000。取 5000 的
+# 依据是实测（qqflow 真实账号 23864 联系人）：page_size=1000 需 24 次请求
+# 耗时 2376ms，5000 需 5 次请求 589ms（4 倍），10000 需 3 次 413ms（收益已很小）。
+# 取 5000 兼顾三点：请求数少、单次响应不过大（约 5000×100B ≈ 500KB）、
+# 仍低于上游硬上限，使分页路径在常规规模下真实生效而非退化为单页。
+LIST_PAGE_SIZE = 5000
+
+# 上游硬上限：仅用于**不支持 offset** 的端点（如安装版 WeFlow 的 contacts），
+# 无法翻页时只能一次尽量多取。超过该数量仍会被上游静默截断。
+LIST_MAX_LIMIT = 10000
+
+
+async def fetch_all_pages(
+    get: Callable[[str, dict[str, Any]], Awaitable[Any]],
+    path: str,
+    *,
+    key: str,
+    dedup_key: str = "username",
+    page_size: int = LIST_PAGE_SIZE,
+    extra_params: dict[str, Any] | None = None,
+    upstream_version: str | None = None,
+) -> list[dict[str, Any]]:
+    """按 offset 翻页取完整列表（跨源共享，勿在插件包另立副本）。
+
+    上游列表端点（contacts / sessions）的 `limit` 默认值很小（100），不翻页
+    就只能拿到前 100 条且**没有任何错误提示**——截断外的联系人在下游退化为
+    显示 UID。传大 limit 只是把天花板抬到上游硬上限（10000），仍是猜值；
+    本函数按 `offset` 递增取到取尽为止。
+
+    Args:
+        get: 发请求的可调用（通常是 client._get 的包装），签名 (path, params)
+        path: 列表端点路径
+        key: 响应信封中承载列表的键（如 "contacts" / "sessions"）
+        dedup_key: 列表项的唯一键，用于跨页去重
+        page_size: 单页条数
+        extra_params: 附加查询参数（如 keyword）
+        upstream_version: 上游版本号，仅用于「疑似不支持 offset」的告警文案
+
+    Returns:
+        去重后的完整列表（顺序为上游返回顺序）
+
+    终止条件按优先级：
+    1. 响应带 `hasMore` → 以它为准（确定信号）；
+    2. 无 `hasMore` → 本页条数 < page_size 视为末页（旧上游兼容）；
+    3. **本页未带来任何新项** → 立即终止并告警。这一条是防御：上游若忽略
+       `offset`（版本过旧），前两条都不会成立，循环会永远重复取第一页。
+    """
+    items: list[dict[str, Any]] = []
+    seen: set[Any] = set()
+    offset = 0
+    # 守卫：正常规模（几千条）远达不到，纯防异常状态下的无界循环
+    max_pages = 1000
+
+    for page_no in range(max_pages):
+        params: dict[str, Any] = {"limit": page_size, "offset": offset}
+        if extra_params:
+            params.update(extra_params)
+        data = await get(path, params)
+        if not data:
+            break
+        page = data.get(key) or []
+        if not page:
+            break
+
+        new_count = 0
+        for item in page:
+            marker = item.get(dedup_key) if dedup_key else None
+            if marker is not None:
+                if marker in seen:
+                    # 翻页期间上游数据变动导致的跨页重复（与 poller 的
+                    # seen_server_ids 同理）
+                    continue
+                seen.add(marker)
+            items.append(item)
+            new_count += 1
+
+        if new_count == 0:
+            # 整页都是已见项：上游极可能忽略了 offset（版本过旧），
+            # 再循环下去只会重复取同一页
+            logger.warning(
+                "%s 翻页无新增（offset=%d，本页 %d 条全部重复）：上游可能不支持 "
+                "offset 参数%s，已按 %d 条截止——超出部分拿不到",
+                path,
+                offset,
+                len(page),
+                f"（上游版本 {upstream_version}）" if upstream_version else "",
+                len(items),
+            )
+            break
+
+        has_more = data.get("hasMore")
+        if has_more is not None:
+            if not has_more:
+                break
+        elif len(page) < page_size:
+            # 旧上游无 hasMore：短页即末页
+            break
+
+        offset += len(page)
+        if page_no == max_pages - 1:
+            logger.warning(
+                "%s 翻页达到守卫上限 %d 页（已取 %d 条），可能未取完",
+                path,
+                max_pages,
+                len(items),
+            )
+    if len(items) > page_size:
+        logger.debug("%s 翻页完成: %d 条", path, len(items))
+    return items
+
+
 class BatchBuffer:
     """按数量或超时批量刷新消息的缓冲区。
 

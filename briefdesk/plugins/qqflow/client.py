@@ -27,6 +27,7 @@ from briefdesk.sources_base import (
     MediaError,
     SourceClient,
     SourceError,
+    fetch_all_pages,
     make_sse_timeout,
     with_connect_retry,
 )
@@ -346,10 +347,20 @@ class QqFlowClient(SourceClient):
         每级候选经 clean_display_name 净化（上游档案昵称含控制字符/空白等
         脏数据），全部净化后为空才回退 UID。候选选择发生在构造前，必须在此
         显式净化（types.py 的构造净化不参与候选选择）。
+
+        **按 offset 翻页取全量**（fetch_all_pages）：上游 `limit` 默认 100，
+        不翻页只能拿到前 100 条且无任何错误提示，截断外的发送者显示名会
+        退化成 UID。传大 limit 只是把天花板抬到上游硬上限 10000，仍是猜值；
+        翻页才是取尽。
         """
-        data: QqFlowContactsResponse = await self._get("/api/v1/contacts")
+        rows = await fetch_all_pages(
+            lambda path, params: self._get(path, params=params),
+            "/api/v1/contacts",
+            key="contacts",
+            dedup_key="username",
+        )
         contacts: dict[str, str] = {}
-        for c in data["contacts"]:
+        for c in rows:
             contacts[c["username"]] = (
                 clean_display_name(c.get("displayName"))
                 or clean_display_name(c.get("nickname"))

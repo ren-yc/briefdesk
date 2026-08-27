@@ -154,13 +154,23 @@
 
 ### GET/POST `/api/v1/contacts` — 联系人
 
-参数：`limit`、`offset`、`keyword`。
+参数：`limit`（默认 100，上限 10000）、`offset`、`keyword`。
 
 ```json
-{ "success": true, "count": 4533, "contacts": [
+{ "success": true, "count": 100, "total": 4538, "hasMore": true, "contacts": [
   { "username": "wxid_friend_a", "nickname": "...", "remark": "客户张三", "alias": null, "avatar": null }
 ] }
 ```
+
+**必须翻页**：`limit` 默认 100，不传只拿到前 100 条（实测真实账号 4538 条），
+截断外的发送者显示名在下游退化为 wxid。按 `offset` 递增到 `hasMore=false`：
+
+- `total` 为过滤后总数，与 `offset` 无关；`count` 是本页条数；
+- 排序键为 `(displayName, username)`——显示名不唯一，仅按显示名排序时并列项
+  在多次请求间顺序不定，offset 翻页会漏行/重复行；
+- `offset` 超出末尾返回空页且 `hasMore=false`。
+
+下游走 `sources_base.fetch_all_pages`（`page_size=5000`）取尽。
 
 ### GET/POST `/api/v1/group-members` — 群成员
 
@@ -267,9 +277,11 @@ weflow-server.exe --port 5033 --watch-fallback-ms 5000 --log info
    发一帧 `sync` 作为水位基线（26 库账号的 `watermarks` 数组很长，调试时注意刷屏）。
 4. **`ready` 基线帧的 data 为 `{"status":"ok"}`，不含 `event` 键**——事件名只在 SSE 的
    `event:` 帧头里。只解析 `data:` 行的客户端读不到事件名，需按此判别。
-5. **`/api/v1/contacts` 的默认 `limit=100` 会静默截断通讯录**（实测 100/4533），
-   与 `/api/v1/sessions` 同一类坑；下游两处均显式传 `limit=10000`。
-   `/api/v1/group-members` 无 limit，不受影响。
+5. **`/api/v1/contacts` 的默认 `limit=100` 会静默截断通讯录**（实测 100/4538）。
+   已在上游补 `offset` + `(displayName, username)` 唯一排序 + `total`/`hasMore`，
+   下游经 `fetch_all_pages` 翻页取尽。`/api/v1/sessions` **仍无 `offset`**，
+   只能显式传 `limit=10000`（天花板，非取尽）；`/api/v1/group-members` 无 limit，
+   不受影响。
 6. **已知上游缺陷（未修，下游已兜底）**：`sessions` 端点会列出无消息表的聚合会话
    （如 `brandsessionholder`，`messageCount=0`），但 `messages?talker=` 对其返回 404，
    两侧口径不一致。详见仓库外的缺陷报告；下游以 `fetch_messages(not_found_ok=True)`

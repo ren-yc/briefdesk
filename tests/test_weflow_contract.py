@@ -237,26 +237,50 @@ class ReadyGateTest(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(resp["hasMore"])
 
 
-class ListLimitTest(unittest.IsolatedAsyncioTestCase):
-    """列表端点必须显式传大 limit：上游默认 100 会静默截断。"""
+class ListPaginationTest(unittest.IsolatedAsyncioTestCase):
+    """列表端点分页：contacts 按 offset 翻页取全量，sessions 传大 limit。"""
 
-    async def test_contacts_and_sessions_request_large_limit(self):
-        """/contacts 与 /sessions 都要带 limit=10000。
+    async def test_contacts_paginate_until_exhausted(self):
+        """contacts 按 offset 翻页直到 hasMore=false，合并所有页。
 
-        上游两个端点的默认 limit 均为 100（上限 10000）：contacts 不传会把
-        通讯录截断到 100 条，截断外的发送者显示名回退成 wxid；sessions 不传
-        只会发现最近活跃的 100 个会话。
+        上游 limit 默认 100，不翻页只能拿到前 100 条且无错误提示——截断外的
+        发送者显示名会退化成 wxid。
         """
         client = _client()
+        page1 = {
+            "contacts": [
+                {"username": f"wxid_{i:04d}", "displayName": f"联系人{i}"}
+                for i in range(1000)
+            ],
+            "total": 1500,
+            "hasMore": True,
+        }
+        page2 = {
+            "contacts": [
+                {"username": f"wxid_{i:04d}", "displayName": f"联系人{i}"}
+                for i in range(1000, 1500)
+            ],
+            "total": 1500,
+            "hasMore": False,
+        }
         with patch.object(
-            client, "_get", AsyncMock(return_value={"contacts": [], "sessions": []})
+            client, "_get", AsyncMock(side_effect=[page1, page2])
         ) as get:
-            await client.fetch_contacts()
+            contacts = await client.fetch_contacts()
+        self.assertEqual(len(contacts), 1500)
+        offsets = [c.kwargs["params"]["offset"] for c in get.await_args_list]
+        self.assertEqual(offsets, [0, 1000])
+        self.assertEqual(contacts["wxid_1499"], "联系人1499")
+
+    async def test_sessions_still_requests_large_limit(self):
+        """sessions 端点上游无 offset，只能显式传大 limit。"""
+        client = _client()
+        with patch.object(
+            client, "_get", AsyncMock(return_value={"sessions": []})
+        ) as get:
             await client.fetch_sessions()
-        paths = [call.args[0] for call in get.await_args_list]
-        limits = [call.kwargs["params"].get("limit") for call in get.await_args_list]
-        self.assertEqual(paths, ["/api/v1/contacts", "/api/v1/sessions"])
-        self.assertEqual(limits, [10000, 10000])
+        self.assertEqual(get.await_args.args[0], "/api/v1/sessions")
+        self.assertEqual(get.await_args.kwargs["params"]["limit"], 10000)
 
 
 class ControlEventStatsTest(unittest.IsolatedAsyncioTestCase):
