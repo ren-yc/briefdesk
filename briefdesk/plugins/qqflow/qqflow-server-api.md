@@ -16,11 +16,13 @@ qqflow-server 提供本地 HTTP API（已支持 GET 和 POST 请求），便于�
 
 ## 鉴权规范
 
-除健康检查接口外，所有 `/api/v1/*` 接口均受 Token 保护。支持三种传参方式（任选其一）：
+除健康检查接口外，所有 `/api/v1/*` 接口均受 Token 保护。支持五种传参方式（任选其一）：
 
 1. **HTTP Header (推荐)**: `Authorization: Bearer <您的Token>`
-2. **Query 参数**: `?access_token=<您的Token>`（SSE 长连接推荐此方式）
-3. **JSON Body**: `{"access_token": "<您的Token>"}`（仅限 POST 请求；SSE 接口除外，仅支持前两种）
+2. **HTTP Header**: `X-Api-Key: <您的Token>`
+3. **Query 参数**: `?access_token=<您的Token>`（SSE 长连接推荐此方式）
+4. **Query 参数**: `?token=<您的Token>`（与 3 等价，别名）
+5. **JSON Body**: `{"access_token": "<您的Token>"}` 或 `{"token": "<您的Token>"}`（仅限 POST 请求；SSE 接口除外，仅支持前四种 Header/Query 方式）
 
 ## 接口列表
 
@@ -62,7 +64,7 @@ GET /api/v1/health
 ```json
 {
   "status": "ok",
-  "version": "0.2.0",
+  "version": "<version>",
   "accounts": [
     { "qq": "123456789", "state": "ready", "message_count": 28314 }
   ]
@@ -84,7 +86,7 @@ GET /api/v1/health
 
 ## 1.1 注册账号（POST /api/v1/accounts）
 
-客户端驱动启动：下游客户端传入账号（`qq`）、数据库密钥（`key`）与可选数据库路径（`db_path`），服务在后台以只读长连接直连活库完成解密 + 索引构建，账号进入 `ready`。仅 POST；Token 保护（三通道）；**不受就绪门控**。
+客户端驱动启动：下游客户端传入账号（`qq`）、数据库密钥（`key`）与可选数据库路径（`db_path`），服务在后台以只读长连接直连活库完成解密 + 索引构建，账号进入 `ready`。仅 POST；Token 保护（五通道）；**不受就绪门控**。
 
 **请求**
 
@@ -128,15 +130,17 @@ POST /api/v1/accounts
 | `state` | 说明 | 伴随的 `status` |
 | ------- | ---- | ---- |
 | `accepted` | 参数合法，后台开始初始化（`/health` 可见 `indexing` → `ready`） | `indexing` |
-| `invalid_key` | 密钥未通过校验（非 16 字节可打印 ASCII） | 账号原状态（未变） |
+| `invalid_key` | 密钥未通过校验（非 16 字节可打印 ASCII）；**仅在账号/路径解析通过后评估** | 账号原状态（未变） |
 | `invalid_db_path` | `db_path` 不存在或目录下无 `nt_msg.db` | 账号原状态（未变） |
 | `unknown_qq` | 未扫描到该账号且未提供 `db_path` | 账号原状态（未变） |
 | `already_ready` | 账号已就绪（幂等无操作） | `ready` |
 | `in_progress` | 账号正在索引 | `indexing` |
 
+**判定顺序**（与实现一致）：① 幂等守卫——账号已 `ready`/`indexing` 时直接返回 `already_ready`/`in_progress`（优先于路径解析）；② 账号/库路径解析——未扫描到该账号且未提供 `db_path` → `unknown_qq`；提供了 `db_path` 但无法解析 → `invalid_db_path`；③ 路径解析通过后才校验密钥格式 → `invalid_key`。因此对未扫描到的账号传任何 key 都只会得到 `unknown_qq`（`invalid_key` 在该分支不可达）；`invalid_key` 只出现在账号已存在（扫描到或路径已解析）但密钥格式错误的情形。
+
 `status` 的用途是免去注册后立刻再打一次 `/health`：拒绝类响应（`invalid_key` / `invalid_db_path` / `unknown_qq`）不改变账号状态，`status` 因此告诉客户端账号**此刻仍处于什么状态**——例如密钥填错重注册一个此前失败的账号，会得到 `state=invalid_key` + `status=error`，即"这次被拒且账号仍然坏着"。
 
-**`status: "indexing"` 不代表密钥正确**：本接口只校验密钥格式，真正的解密验证在后台初始化中完成（失败 → `error`）。客户端仍需轮询 `/health` 等到 `ready`。
+**`status: "indexing"` 不代表密钥正确**：本接口在账号/路径解析通过后只校验密钥格式，真正的解密验证在后台初始化中完成（失败 → `error`）。客户端仍需轮询 `/health` 等到 `ready`。
 
 `db_path` 回显的是解析结果而非请求原值：请求里的 `db_path` 可以是文件、可以是 Tencent Files 风格根目录、也可以省略（走启动扫描），回显让客户端确认服务端最终读的是哪个库。幂等分支（`already_ready` / `in_progress`）回显的是**运行中账号当初使用的路径**，本次请求携带的 `db_path` 在这些分支下被忽略。
 
@@ -159,9 +163,11 @@ GET /api/v1/push/messages
 ### 说明
 
 - 响应类型为 `text/event-stream`
-- 连接建立后**先收到一个 `sync` 事件**（qqflow-server 扩展，携带当前 rowid 水位线），之后是 `message.new` / `message.revoke`
-- KeepAlive 每 15 秒发送 `ping`
+- 连接建立后**先收到一个 `ready` 事件**（`{"status":"ok"}`，表示流已就绪，对齐 WeFlow 契约），随后重放断线期间错过的事件（见下），再收到 `sync` 事件（qqflow-server 扩展，携带当前 rowid 水位线），之后是 `message.new` / `message.revoke`
+- **断线续传（Last-Event-ID 重放）**：每个 `message.new` / `message.revoke` 帧都带 `id:`（服务端单调递增序号）。客户端重连时携带 `Last-Event-ID: <序号>` 请求头（或 `?last_event_id=<序号>` 查询参数——浏览器 `EventSource` 无法设置自定义头），服务端重放序号之后、10 分钟 TTL 窗口内的历史事件；窗口外/无序号则从当前水位线重新开始。事件缓冲上限 1000 条
+- KeepAlive 每 25 秒发送 `ping`
 - 订阅端落后于广播缓冲（1024 条）时会重新收到 `sync` 事件对齐
+- 进程收到退出信号（Ctrl+C）时，服务端主动结束所有 SSE 流——客户端看到连接正常关闭，不会等到 3 秒宽限期超时
 - 建议接收端按 `event + rawid` 去重
 - **媒体路径不出现在推送里**：`media` 对象为无路径元数据视图（`localPath` 永不下发——QQ 缓存路径多为本机失效路径且无下游可用性）；媒体字节一律经 `GET /api/v1/media/{id}` 获取，键取 `mediaId`（仅当服务端已注册可读取的本地缓存时携带，与 messages 的 `mediaId` 同一规则，见 §3/§3.1）
 
@@ -169,7 +175,7 @@ GET /api/v1/push/messages
 
 | 字段 | 说明 |
 | ---- | ---- |
-| `event` | `sync` / `message.new` / `message.revoke` |
+| `event` | `ready` / `sync` / `message.new` / `message.revoke`（`ready` 仅携带 `status`） |
 | `sessionId` | 会话 ID：群聊为群号，私聊为对方 UID（`u_` 前缀） |
 | `sessionType` | `group` 或 `private` |
 | `rawid` | 消息 rowid（字符串） |
@@ -189,9 +195,13 @@ curl -N "http://127.0.0.1:5032/api/v1/push/messages?access_token=YOUR_TOKEN"
 ```
 
 ```text
+event: ready
+data: {"status":"ok"}
+
 event: sync
 data: {"event":"sync","sessionId":"","sessionType":"","rawid":"","content":"","timestamp":1782864000,"lastRowidGroup":1234567890123,"lastRowidC2c":9876543210987}
 
+id: 1
 event: message.new
 data: {"event":"message.new","sessionId":"10001","sessionType":"group","groupName":"10001","rawid":"1234567890123","sourceName":"张三","content":"你好","timestamp":1782864123}
 ```
