@@ -563,11 +563,9 @@ function setupEvents() {
     icon.classList.add("icon-spin");
     text.textContent = "发现中...";
     try {
-      const res = await fetch("/api/sessions/refresh", { method: "POST" });
-      // 此前不检查 res.ok：500 响应也会走 res.json()，解析失败落进 catch 后
-      // 只打 console，按钮恢复成"发现新群聊"，用户看不出任何失败迹象。
-      if (!res.ok) throw new Error("HTTP " + res.status);
-      const data = await res.json();
+      // 走 postJson：此前不检查 res.ok，500 响应也会进 res.json()，解析失败落进
+      // catch 后只打 console，按钮恢复成"发现新群聊"，用户看不出任何失败迹象。
+      const data = await postJson("/api/sessions/refresh");
       await loadEnabledSources(); // 刷新后按最新启用源裁剪（防残留源会话混入）
       renderSessions(data.sessions || []);
       fetchData();
@@ -644,10 +642,8 @@ function setupEvents() {
       if (!ops) return; // collectAllOps 已弹窗说明（未加载/名称冲突），中止本次保存
       // 实时查询同步状态（isSyncing 是缓存值，另一标签页/启动首轮可能已开始同步）
       let syncingNow = isSyncing;
-      try {
-        const statusRes = await fetch("/api/status");
-        if (statusRes.ok) syncingNow = !!(await statusRes.json()).syncing;
-      } catch { /* 查询失败回退缓存值 */ }
+      const liveStatus = await getJson("/api/status").catch(() => null); // 失败回退缓存值
+      if (liveStatus) syncingNow = !!liveStatus.syncing;
       if (syncingNow) {
         pendingChanges = ops; // 覆盖旧挂起项，最新意图为准
         showToast("当前正在同步，更改将在同步完成后自动应用", { type: "info", duration: 6000 });
@@ -714,6 +710,8 @@ function setupEvents() {
   $syncBtn.addEventListener("click", async () => {
     if ($syncBtn.disabled) return;
     try {
+      // 保留裸 fetch：409（已在同步中）要按状态码分流成 info 提示而非错误，
+      // reqJson 把所有非 2xx 抹平成同一个 Error，拿不回状态码。
       const res = await fetch("/api/sync", { method: "POST" });
       if (res.status === 409) {
         showToast("同步已在后台进行中，无需重复触发", { type: "info", duration: 4000 });
@@ -1048,6 +1046,7 @@ function setupEvents() {
     const fd = new FormData();
     fd.append("file", f);
     try {
+      // 保留裸 fetch：multipart/FormData 上传，reqJson 只走 JSON 序列化
       const res = await fetch("/api/restore", { method: "POST", body: fd });
       const data = await res.json().catch(() => ({}));
       if (!res.ok) {
@@ -1093,9 +1092,7 @@ function setupEvents() {
     while (Date.now() - t0 < 60000) {
       await new Promise(r => setTimeout(r, 1500));
       try {
-        const res = await fetch("/api/status");
-        const st = await res.json();
-        if (!st.syncing) break;
+        if (!(await getJson("/api/status")).syncing) break;
       } catch { break; }
     }
     btn.disabled = false;
@@ -1627,9 +1624,7 @@ function applySidebarData(data) {
 // 视图 chip 颜色丢失。数据就绪后通知各插件视图（sidebarReady）自行重渲染。
 async function fetchSidebarData() {
   try {
-    const res = await fetch("/api/items?verified=unverified&limit=1");
-    if (!res.ok) return;
-    applySidebarData(await res.json());
+    applySidebarData(await getJson("/api/items?verified=unverified&limit=1"));
     // 颜色/计数就绪后通知插件视图重渲染（用缓存数据，不重复请求）：
     // 修复视图先于侧边栏数据返回时 chip 无色的竞态（两种到达顺序均安全）
     notifyPluginViews("sidebarReady");
@@ -1678,9 +1673,7 @@ function itemPageParams(query, offset) {
 }
 
 async function requestItemPage(query, offset) {
-  const res = await fetch(`/api/items?${itemPageParams(query, offset)}`);
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
-  return res.json();
+  return getJson(`/api/items?${itemPageParams(query, offset)}`);
 }
 
 function appendUniqueItems(target, incoming, seen) {
@@ -1999,9 +1992,7 @@ async function initOnboarding() {
   if (localStorage.getItem("briefdesk.onboarded")) return;
   // 已有启用会话 → 视为已使用，不再打扰
   try {
-    const res = await fetch("/api/sessions");
-    if (!res.ok) return;
-    const data = await res.json();
+    const data = await getJson("/api/sessions"); // 抛错落进下方 catch，同为"不弹"
     await loadEnabledSources(); // 残留停用源会话不应触发「已使用」判定
     if (
       filterSessionsByEnabledSources(data.sessions).some(s => s.enabled)
@@ -2042,11 +2033,7 @@ async function renderOnboardEnv() {
   const el = document.getElementById("onboard-env");
   if (!el) return;
   el.innerHTML = '<p class="text-muted">检查中...</p>';
-  let status = null;
-  try {
-    const res = await fetch("/api/status");
-    if (res.ok) status = await res.json();
-  } catch { /* 保持 null */ }
+  const status = await getJson("/api/status").catch(() => null);
   if (!status) {
     el.innerHTML = '<div class="onboard-warn">无法连接后端，请确认应用正在运行（python main.py）。</div>';
     return;
@@ -2075,26 +2062,22 @@ function fillOnboardBackfill() {
     return;
   }
   // 会话接口尚未拉取成功：异步补拉一次再填
-  fetch("/api/sessions").then(r => (r.ok ? r.json() : null)).then(d => {
+  // 失败与字段缺失共用"未知"分支（原先失败时保留"…"占位，读起来像还在加载）
+  getJson("/api/sessions").catch(() => null).then(d => {
     if (d && typeof d.backfillHours === "number" && Number.isFinite(d.backfillHours)) {
       onboardBackfillHours = d.backfillHours;
       render(d.backfillHours);
     } else {
-      // 原先失败时保留"…"占位，读起来像还在加载；给出明确的未知态
       el.textContent = "未知";
     }
-  }).catch(() => { el.textContent = "未知"; });
+  });
 }
 
 async function renderOnboardSessions() {
   const el = document.getElementById("onboard-sessions");
   if (!el) return;
   el.innerHTML = '<p class="text-muted">加载中...</p>';
-  let data = null;
-  try {
-    const res = await fetch("/api/sessions");
-    if (res.ok) data = await res.json();
-  } catch { /* 保持 null */ }
+  const data = await getJson("/api/sessions").catch(() => null);
   // 会话接口携带配置值：缓存 backfillHours 供 step3 展示（复用同一通道）
   onboardBackfillHours =
     data && typeof data.backfillHours === "number" && Number.isFinite(data.backfillHours)
@@ -2303,13 +2286,8 @@ function showEmptyState() {
 // 失败或已被后续渲染隐藏时静默保留默认文案。
 async function renderEmptyStateGuide() {
   $emptyState.innerHTML = '<p>暂无信息，等待新消息中...</p>';
-  let data = null;
-  let failed = false;
-  try {
-    const res = await fetch("/api/sessions");
-    if (res.ok) data = await res.json();
-    else failed = true;
-  } catch { failed = true; }
+  const data = await getJson("/api/sessions").catch(() => null);
+  const failed = data === null; // 与下方"拉取失败"文案共用同一判据
   if ($emptyState.classList.contains("hidden")) return; // 已被后续渲染隐藏（新数据到达等）
   // 拉取失败时不能沿用"暂未发现任何会话"——那会把一次网络故障说成
   // "你还没有任何群聊"，把用户引向错误的排查方向。
@@ -3388,13 +3366,7 @@ async function verifyItem(id, value, cardEl, { refresh = false, overlay = false 
   const prev = cardEl.classList.contains("memo") ? 1 : cardEl.classList.contains("ignored") ? -1 : 0;
   if (prev === value) return;
   try {
-    const res = await fetch(`/api/items/${id}/verify`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ verified: value }),
-    });
-    if (!res.ok) throw new Error("HTTP " + res.status);
-    const data = await res.json();
+    const data = await postVerify(id, value);
 
     // 自动提醒：加入备忘录后委派插件行内扩展（reminders 插件按需自动设提醒）
     notifyItemRowVerify(id, value, { overlay: overlay });
@@ -3635,8 +3607,7 @@ async function fetchContext(ctxDiv, source, sessionId, aroundTime, sourceMsgId) 
   let msgs = contextCache.get(cacheKey);
   if (msgs === undefined) {
     try {
-      const res = await fetch(`/api/context?source=${encodeURIComponent(source)}&session_id=${encodeURIComponent(sessionId)}&t=${aroundTime || 0}&msgId=${encodeURIComponent(sourceMsgId || "")}`);
-      const data = await res.json();
+      const data = await getJson(`/api/context?source=${encodeURIComponent(source)}&session_id=${encodeURIComponent(sessionId)}&t=${aroundTime || 0}&msgId=${encodeURIComponent(sourceMsgId || "")}`);
       msgs = data.messages || [];
       if (contextCache.size > 50) contextCache.delete(contextCache.keys().next().value);
       contextCache.set(cacheKey, msgs);
@@ -3701,8 +3672,7 @@ function filterSessionsByEnabledSources(sessions) {
 async function loadSessions() {
   try {
     await loadEnabledSources(); // 确保裁剪依据（启用源列表）在渲染前就绪
-    const res = await fetch("/api/sessions");
-    const data = await res.json();
+    const data = await getJson("/api/sessions");
     if (typeof data.backfillHours === "number" && Number.isFinite(data.backfillHours)) {
       sessionDefaultBackfill = data.backfillHours;
     }
@@ -3822,9 +3792,7 @@ function updateSessionTypeChips() {
 // 拉取启用源列表（设置与向导 step2 共用）：失败时退化为空列表（不阻断）
 async function loadEnabledSources() {
   try {
-    const res = await fetch("/api/status");
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const status = await res.json();
+    const status = await getJson("/api/status");
     enabledSources = Object.keys(status.sources || {}).sort();
   } catch (err) {
     console.error("Load source filter chips error:", err);
@@ -3900,8 +3868,7 @@ function _paletteIcon(color) {
 
 async function loadCategories() {
   try {
-    const res = await fetch("/api/categories");
-    const data = await res.json();
+    const data = await getJson("/api/categories");
     const cats = data.categories || [];
     catOriginal = cats;
     catDraft = cats.map(c => ({ ...c, key: `s${c.id}` }));
@@ -4217,13 +4184,7 @@ function saveSettings() {
 let envData = null;
 
 async function loadEnvConfig() {
-  try {
-    const res = await fetch("/api/settings/env");
-    if (!res.ok) throw new Error("HTTP " + res.status);
-    envData = await res.json();
-  } catch {
-    envData = null;
-  }
+  envData = await getJson("/api/settings/env").catch(() => null);
   renderEnvConfig();
 }
 
@@ -4413,12 +4374,7 @@ async function saveEnvConfig() {
   const warnItem = envData.items.find(i => i.warn && changes[i.key] !== undefined);
   if (warnItem && !confirm(warnItem.label + "：" + warnItem.warn + "。确定暂存？")) return;
   try {
-    const res = await fetch("/api/settings/env", {
-      method: "PUT",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ items: changes }),
-    });
-    if (!res.ok) throw new Error("HTTP " + res.status);
+    await putJson("/api/settings/env", { items: changes });
     showToast("已暂存，重启应用后生效", { type: "success", duration: 4000 });
     await loadEnvConfig();
   } catch (err) {
@@ -4429,12 +4385,7 @@ async function saveEnvConfig() {
 
 async function restoreEnvKey(key) {
   try {
-    const res = await fetch("/api/settings/env", {
-      method: "PUT",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ items: { [key]: null } }),
-    });
-    if (!res.ok) throw new Error("HTTP " + res.status);
+    await putJson("/api/settings/env", { items: { [key]: null } });
     showToast(key + " 已恢复默认（重启生效）", { type: "success", duration: 3000 });
     await loadEnvConfig();
   } catch {
@@ -4450,12 +4401,7 @@ async function setEnvSecret(name) {
     return;
   }
   try {
-    const res = await fetch("/api/settings/secrets", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ name, value }),
-    });
-    if (!res.ok) throw new Error("HTTP " + res.status);
+    await postJson("/api/settings/secrets", { name, value });
     showToast(name + " 已写入钥匙串（重启生效）", { type: "success", duration: 4000 });
     await loadEnvConfig();
   } catch (err) {
@@ -4466,8 +4412,7 @@ async function setEnvSecret(name) {
 
 async function clearEnvSecret(name) {
   try {
-    const res = await fetch("/api/settings/secrets/" + encodeURIComponent(name), { method: "DELETE" });
-    if (!res.ok) throw new Error("HTTP " + res.status);
+    await deleteJson("/api/settings/secrets/" + encodeURIComponent(name));
     showToast(name + " 已从钥匙串清除", { type: "success", duration: 3000 });
     await loadEnvConfig();
   } catch {
@@ -4534,12 +4479,7 @@ function showUndoToast(id, prevValue, label) {
 
 async function undoVerify(u) {
   try {
-    const res = await fetch("/api/items/" + u.id + "/verify", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ verified: u.prevValue }),
-    });
-    if (!res.ok) throw new Error("HTTP " + res.status);
+    await postVerify(u.id, u.prevValue);
     showToast("已撤销", { type: "success", duration: 2000 });
     fetchData();
   } catch {
@@ -4788,9 +4728,7 @@ async function loadAboutSources() {
   const el = document.getElementById("about-sources");
   if (!el) return;
   try {
-    const res = await fetch("/api/status");
-    if (!res.ok) throw new Error("HTTP " + res.status);
-    const status = await res.json();
+    const status = await getJson("/api/status");
     const srcs = Object.keys(status.sources || {}).sort();
     el.innerHTML = srcs.length
       ? srcs.map(s => '<span class="about-source-chip">' + esc(s) + "</span>").join("")
@@ -4804,9 +4742,7 @@ async function loadPlugins() {
   // 「插件」页：/api/plugins 元数据（名称/版本/状态/原因），失败不阻塞弹窗
   if (!$pluginsList) return;
   try {
-    const res = await fetch("/api/plugins");
-    if (!res.ok) throw new Error("HTTP " + res.status);
-    const data = await res.json();
+    const data = await getJson("/api/plugins");
     const plugins = Array.isArray(data.plugins) ? data.plugins : [];
     if (!plugins.length) {
       $pluginsList.innerHTML = '<p class="text-muted">未发现任何插件</p>';
@@ -4841,11 +4777,7 @@ async function loadPluginFrontends() {
   //    检查告警；has_frontend 缺失（旧版元数据）时保守注入，404 静默；
   // 4) 注入完成后调用 window.briefdeskPlugins.<name>.init({ isLoaded }),
   //    init 抛错只 console.warn，不阻断页面其余初始化。
-  let data = null;
-  try {
-    const res = await fetch("/api/plugins");
-    if (res.ok) data = await res.json();
-  } catch { /* 元数据不可用 */ }
+  const data = await getJson("/api/plugins").catch(() => null); // 元数据不可用
   if (!data) return; // 拿不到插件状态：不干预入口可见性（保持默认）
   const loadedPlugins = (Array.isArray(data.plugins) ? data.plugins : [])
     .filter(p => p.status === "loaded");
@@ -5147,6 +5079,7 @@ function renderBlocklist() {
 }
 
 // ── 数据导出下载（Content-Disposition 文件名）──
+// 保留裸 fetch：要读响应头取文件名 + 取 blob，reqJson 只返回解析后的 JSON
 async function downloadExport(url) {
   try {
     const res = await fetch(url);
@@ -5222,12 +5155,7 @@ function renderMoreMenu(item) {
 
 async function doRecategorize(id, category) {
   try {
-    const res = await fetch("/api/items/" + encodeURIComponent(id) + "/recategorize", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ category }),
-    });
-    if (!res.ok) throw new Error("HTTP " + res.status);
+    await postJson("/api/items/" + encodeURIComponent(id) + "/recategorize", { category });
     showToast("已改为「" + category + "」", { type: "success", duration: 2500 });
     lastQueryKey = ""; // 分组键 (subject+category) 变化 → 强制全量渲染
     fetchData();
@@ -5354,12 +5282,8 @@ async function restoreBatch(prev) {
   let restored = 0;
   for (const [id, value] of prev) {
     try {
-      const res = await fetch(`/api/items/${id}/verify`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ verified: value }),
-      });
-      if (res.ok) restored++;
+      await postVerify(id, value);
+      restored++;
     } catch { /* 单张失败不中断，结束统一汇报 */ }
   }
   lastQueryKey = "";
@@ -5401,11 +5325,7 @@ async function openStatusPanel() {
   $statusPopover.classList.remove("hidden");
   $statusPopover.setAttribute("aria-busy", "true");
   $statusIndicator.setAttribute("aria-expanded", "true");
-  let status = null;
-  try {
-    const res = await fetch("/api/status");
-    if (res.ok) status = await res.json();
-  } catch { /* 保持 null */ }
+  const status = await getJson("/api/status").catch(() => null);
   $statusPopover.removeAttribute("aria-busy");
   if (!status) {
     $statusPopover.innerHTML = '<p class="text-muted">状态获取失败</p>' +
@@ -5665,9 +5585,7 @@ function closeSubjectTimeline({ syncHash: sh = true } = {}) {
 async function loadTimelinePage() {
   if (!timeline) return;
   try {
-    const res = await fetch("/api/subject/items?subject=" + encodeURIComponent(timeline.subject) + "&limit=50&offset=" + timeline.offset);
-    if (!res.ok) throw new Error("HTTP " + res.status);
-    const data = await res.json();
+    const data = await getJson("/api/subject/items?subject=" + encodeURIComponent(timeline.subject) + "&limit=50&offset=" + timeline.offset);
     if (!timeline) return;
     const items = data.items || [];
     timeline.items = timeline.offset === 0 ? items : timeline.items.concat(items);
@@ -5718,13 +5636,7 @@ async function timelineVerify(id, value, row) {
   const prev = row.classList.contains("memo") ? 1 : row.classList.contains("ignored") ? -1 : 0;
   if (prev === value) return;
   try {
-    const res = await fetch("/api/items/" + encodeURIComponent(id) + "/verify", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ verified: value }),
-    });
-    if (!res.ok) throw new Error("HTTP " + res.status);
-    const data = await res.json();
+    const data = await postVerify(id, value);
     renderNav(data.categories, data.ignoredCount, data.memoCount);
     updateActiveNav();
     if (value === -1) {

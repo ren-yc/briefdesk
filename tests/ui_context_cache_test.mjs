@@ -116,10 +116,12 @@ const messages = [
   { time: 1700000000, msg_id: "msg-beta", sender: "乙同学", content: "乙社团招新", article_url: "" },
 ];
 
+// 假响应带上 ok/status：生产侧统一走 reqJson，非 2xx 一律抛错。缺 ok 的桩会被
+// 判成失败请求 → 不写缓存 → 下次重复请求，把契约缺口伪装成缓存 bug。
 let fetchCalls = 0;
 sandbox.fetch = async () => {
   fetchCalls += 1;
-  return { json: async () => ({ messages }) };
+  return { ok: true, status: 200, json: async () => ({ messages }) };
 };
 
 const fetchContext = sandbox.fetchContext;
