@@ -241,3 +241,61 @@ def test_brand_coloured_shadows_follow_accent_token() -> None:
         "发现写死的旧主题色 rgba(27,94,65,…)，请改用 "
         "color-mix(in srgb, var(--accent) N%, transparent)"
     )
+
+
+def test_no_container_opacity_on_text_cards() -> None:
+    """守卫：承载正文的卡片容器禁止 opacity 调光。
+
+    容器级 opacity 发生在 token 合格之后，token 层对比度测试对它失明。
+    历史上 .item-card.ignored(.7) / .card-expired(.62) / .ov-row.ignored(.5)
+    三套取值把 11–13px 正文压到 2.06–3.58:1，全部跌破 AA。弱化必须走
+    元素级颜色降级（标题→--text-2，meta→--text-3）；降饱和 filter 可保留。
+    """
+    css = _strip_comments(STYLE.read_text(encoding="utf-8"))
+    offenders: list[str] = []
+    for sel in (".item-card.ignored", ".item-card.card-expired", ".ov-row.ignored"):
+        idx = css.find(sel)
+        while idx != -1:
+            brace = css.index("{", idx)
+            body_end = css.index("}", brace)
+            block = css[brace + 1 : body_end]
+            if re.search(r"(^|[^-])opacity\s*:", block):
+                offenders.append(f"{sel} → {block.strip()[:60]}")
+            idx = css.find(sel, body_end)
+    assert not offenders, (
+        "正文卡片容器不允许 opacity 调光（跌破 AA），请改元素级降级:\n"
+        + "\n".join(offenders)
+    )
+
+
+def test_category_foreground_chain_meets_aa() -> None:
+    """类别色"文字派生层"（--cat-fg）全色板对比度锁定。
+
+    DB 下发的类别装饰色不可直接作文字色（历史上 19 色中 0 色双主题过 AA）。
+    CSS 侧 --cat-fg 用 color-mix 派生：浅色 = 50% 类别色 + 50% --text，
+    深色 = 60% 类别色 + 40% 白。此处解析 app.js 的 _CAT_PALETTE 全表，
+    按同一公式复算 cat-fg 在自身 10% tint 底（.card-category 真实用途）与
+    --on-accent 在 cat-fg 实心底（.cat-link.active .cat-count）上的对比度。
+    改派生比例或色板时必须保持 ≥ 4.5:1。
+    """
+    app = REPO / "ui" / "app.js"
+    palette = re.findall(r'color:\s*"(#[0-9A-Fa-f]{6})"',
+                         app.read_text(encoding="utf-8"))
+    assert palette, "未能从 app.js 解析到类别色板（--cat-fg 链路失去数据源）"
+    light, dark = _tokens()
+    themes = (
+        ("light", light, light["--text"], 0.5),
+        ("dark", dark, "#FFFFFF", 0.6),
+    )
+    for name, block, mix_bg, pct in themes:
+        for cat in palette:
+            cat_fg = _mix(cat, mix_bg, pct)
+            tint = _mix(cat, block["--surface"], 0.10)
+            ratio = _contrast(cat_fg, tint)
+            assert ratio >= AA_TEXT, (
+                f"{name} {cat}: cat-fg on 10% tint = {ratio:.2f}:1 < {AA_TEXT}"
+            )
+            ratio2 = _contrast(block["--on-accent"], cat_fg)
+            assert ratio2 >= AA_TEXT, (
+                f"{name} {cat}: on-accent on cat-fg = {ratio2:.2f}:1 < {AA_TEXT}"
+            )

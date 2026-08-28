@@ -52,7 +52,7 @@
       <aside class="sidebar">
         <div class="sidebar-search">
           <img src="/icons/search.svg" class="icon-sm" alt="">
-          <input type="text" id="item-search" placeholder="搜索卡片..." autocomplete="off">
+          <input type="text" id="item-search" placeholder="搜索卡片..." aria-label="搜索卡片" autocomplete="off">
           <button id="item-search-clear" class="search-clear hidden" title="清除">
             <img src="/icons/x.svg" class="icon-sm" alt="">
           </button>
@@ -64,32 +64,34 @@
         <nav id="category-nav"></nav>
         <!-- 备忘录/已忽略：固定位于左侧栏最下部 -->
         <div class="nav-special">
-          <a href="#" id="subs-link" class="cat-link" data-category="全部" title="查看订阅关键词命中的卡片">
+          <button type="button" id="subs-link" class="cat-link" data-category="全部" title="查看订阅关键词命中的卡片">
             <span class="cat-link-main"><img src="/icons/bell-plus.svg" class="icon-sm cat-icon" alt="">订阅<span class="cat-count" id="subs-count">0</span></span>
-          </a>
-          <a href="#" id="memo-link" class="cat-link" data-category="全部" data-verified="memo" title="已加入备忘录的卡片">
+          </button>
+          <button type="button" id="memo-link" class="cat-link" data-category="全部" data-verified="memo" title="已加入备忘录的卡片">
             <span class="cat-link-main"><img src="/icons/bookmark-check.svg" class="icon-sm cat-icon" alt="">备忘录<span class="cat-count">0</span></span>
-          </a>
-          <a href="#" id="ignored-link" class="cat-link" data-category="全部" data-verified="ignored" title="已忽略的卡片">
+          </button>
+          <button type="button" id="ignored-link" class="cat-link" data-category="全部" data-verified="ignored" title="已忽略的卡片">
             <span class="cat-link-main"><img src="/icons/ban.svg" class="icon-sm cat-icon" alt="">已忽略<span class="cat-count">0</span></span>
-          </a>
+          </button>
         </div>
       </aside>
       <main id="content">
         <!-- 内容视图工具条：列表显示模式与计数，固定位于内容区顶部，不受下方空态/骨架屏影响 -->
         <div class="list-toolbar">
-          <div id="collapse-toggle" class="seg" role="tablist" aria-label="列表显示模式">
+          <div id="collapse-toggle" class="seg" role="radiogroup" aria-label="列表显示模式">
             <div class="seg-pill" aria-hidden="true"></div>
-            <button class="seg-btn active" data-mode="collapsed" role="tab" aria-selected="true" title="同主体卡片合并展示">合并</button>
-            <button class="seg-btn" data-mode="expanded" role="tab" aria-selected="false" title="平铺展示全部卡片">平铺</button>
+            <button class="seg-btn active" data-mode="collapsed" role="radio" aria-checked="true" title="同主体卡片合并展示">合并</button>
+            <button class="seg-btn" data-mode="expanded" role="radio" aria-checked="false" title="平铺展示全部卡片">平铺</button>
           </div>
+          <span class="toolbar-sep" aria-hidden="true"></span>
           <button id="batch-toggle" class="batch-toggle-btn" type="button" aria-pressed="false" title="勾选多张卡片统一处理">
             <img src="/icons/check.svg" class="icon-sm" alt="">批量操作
           </button>
           <button id="hide-expired-toggle" class="batch-toggle-btn" type="button" aria-pressed="false" title="隐藏截止时间已过的卡片">
             <img src="/icons/clock.svg" class="icon-sm" alt="">隐藏已截止
           </button>
-          <button id="kb-help-btn" class="batch-toggle-btn" type="button" title="键盘快捷键（按 ? 也可打开）">快捷键指南</button>
+          <span class="toolbar-sep" aria-hidden="true"></span>
+          <button id="kb-help-btn" class="batch-toggle-btn ghost" type="button" title="键盘快捷键（按 ? 也可打开）">快捷键指南</button>
           <span id="list-count" class="list-count"></span>
           <span id="blocked-hint" class="blocked-hint hidden" title="可在 设置 → 关键词订阅 的降噪黑名单中管理"></span>
         </div>
@@ -145,7 +147,7 @@
               <button type="button" class="filter-chip" data-mode="system">跟随系统</button>
             </div>
             <p class="text-muted settings-hint">选择后立即生效，并保存在本浏览器。</p>
-            <label>前端刷新间隔（秒）</label>
+            <label for="refresh-interval">前端刷新间隔（秒）</label>
             <input type="number" id="refresh-interval" min="30" value="300">
             <p class="text-muted settings-hint">新消息到达会实时推送，此间隔仅作为兜底轮询。</p>
           </section>
@@ -169,7 +171,7 @@
             <div id="subs-list" class="subs-list"></div>
             <button id="subs-add" class="settings-add-btn">+ 添加订阅</button>
             <div id="subs-add-form" class="cat-edit-form hidden">
-              <input type="text" id="subs-add-kw" placeholder="关键词，空格分隔（如：大创 内推 志愿）">
+              <input type="text" id="subs-add-kw" placeholder="关键词，空格分隔（如：大创 内推 志愿）" aria-label="订阅关键词">
               <div class="cat-edit-actions">
                 <button id="subs-add-save">确认</button>
                 <button id="subs-add-cancel">取消</button>
@@ -181,7 +183,7 @@
             <div id="block-list" class="subs-list"></div>
             <button id="block-add" class="settings-add-btn">+ 添加黑名单关键词</button>
             <div id="block-add-form" class="cat-edit-form hidden">
-              <input type="text" id="block-add-kw" placeholder="关键词，空格分隔（如：代写 广告 拼团）">
+              <input type="text" id="block-add-kw" placeholder="关键词，空格分隔（如：代写 广告 拼团）" aria-label="黑名单关键词">
               <div class="cat-edit-actions">
                 <button id="block-add-save">确认</button>
                 <button id="block-add-cancel">取消</button>
@@ -198,8 +200,8 @@
             </div>
             <button id="category-add" class="settings-add-btn">+ 添加类别</button>
             <div id="cat-add-form" class="cat-edit-form hidden">
-              <input type="text" id="cat-add-name" placeholder="类别名称（≤20 字）" maxlength="20">
-              <textarea id="cat-add-prompt" placeholder="类别提示词：描述该类别的信息特征，供 AI 分类参考（≤50 字）" maxlength="50" rows="3"></textarea>
+              <input type="text" id="cat-add-name" placeholder="类别名称（≤20 字）" aria-label="类别名称" maxlength="20">
+              <textarea id="cat-add-prompt" placeholder="类别提示词：描述该类别的信息特征，供 AI 分类参考（≤50 字）" aria-label="类别提示词" maxlength="50" rows="3"></textarea>
               <div class="cat-palette" id="cat-add-palette"></div>
               <div class="cat-edit-actions">
                 <button id="cat-add-save">确认</button>
@@ -227,7 +229,7 @@
             </div>
             <label>按时间过滤</label>
             <div class="session-time-filter">
-              <select id="session-time-preset" class="session-time-control">
+              <select id="session-time-preset" class="session-time-control" aria-label="按时间过滤预设">
                 <option value="all">全部（不过滤）</option>
                 <option value="6">6 小时内活跃</option>
                 <option value="12">12 小时内活跃</option>
@@ -237,11 +239,11 @@
                 <option value="168">7 天内活跃</option>
                 <option value="custom">自定义</option>
               </select>
-              <input type="number" id="session-time-custom" class="session-time-control" min="0" step="1" placeholder="小时">
+              <input type="number" id="session-time-custom" class="session-time-control" min="0" step="1" placeholder="小时" aria-label="自定义小时数">
             </div>
             <div class="sidebar-search session-search">
               <img src="/icons/search.svg" class="icon-sm" alt="">
-              <input type="text" id="session-search" placeholder="搜索群聊名称..." autocomplete="off">
+              <input type="text" id="session-search" placeholder="搜索群聊名称..." aria-label="搜索群聊名称" autocomplete="off">
             </div>
             <div id="session-list" class="session-list">
               <p class="text-muted">加载中...</p>
@@ -383,7 +385,7 @@
         <div id="onboard-filter-bar" class="onboard-filter-bar">
           <div class="sidebar-search">
             <img src="/icons/search.svg" class="icon-sm" alt="">
-            <input type="text" id="onboard-session-search" placeholder="搜索会话..." autocomplete="off">
+            <input type="text" id="onboard-session-search" placeholder="搜索会话..." aria-label="搜索会话" autocomplete="off">
           </div>
           <div id="onboard-type-filter" class="session-type-filter" role="group" aria-label="按类型筛选会话（可多选）">
             <button type="button" class="filter-chip active" data-type="all">全部</button>
@@ -395,7 +397,7 @@
             <div id="onboard-source-filter" class="session-type-filter" role="group" aria-label="按消息源筛选会话（可多选）"></div>
           </div>
           <div class="session-time-filter">
-            <select id="onboard-time-preset" class="session-time-control">
+            <select id="onboard-time-preset" class="session-time-control" aria-label="按时间过滤预设">
               <option value="all">全部（不过滤）</option>
               <option value="6">6 小时内活跃</option>
               <option value="12">12 小时内活跃</option>
@@ -405,7 +407,7 @@
               <option value="168">7 天内活跃</option>
               <option value="custom">自定义</option>
             </select>
-            <input type="number" id="onboard-time-custom" class="session-time-control" min="0" step="1" placeholder="小时">
+            <input type="number" id="onboard-time-custom" class="session-time-control" min="0" step="1" placeholder="小时" aria-label="自定义小时数">
           </div>
         </div>
         <div id="onboard-sessions" class="onboard-sessions"><p class="text-muted">加载中...</p></div>
@@ -436,6 +438,7 @@
         <div><kbd>m</kbd><span>加入 / 移出备忘录（焦点卡片）</span></div>
         <div><kbd>i</kbd><span>忽略 / 取消忽略（焦点卡片）</span></div>
         <div><kbd>u</kbd><span>撤销上一步操作</span></div>
+        <div><kbd>b</kbd><span>进入 / 退出批量操作</span></div>
         <div><kbd>c</kbd><span>复制焦点卡片标题与关键信息</span></div>
         <div><kbd>Enter</kbd><span>展开 / 收起焦点卡片原文引用</span></div>
         <div><kbd>/</kbd><span>聚焦搜索框</span></div>
@@ -450,7 +453,8 @@
   <!-- 新消息浮条 -->
   <div id="new-items-bar" class="new-items-bar hidden" role="status">
     <span id="new-items-bar-text">有 0 条新信息</span>
-    <button id="new-items-bar-btn">查看</button>
+    <button id="new-items-bar-btn">回到顶部查看</button>
+    <button id="new-items-bar-dismiss" aria-label="暂不查看，关闭提醒" title="暂不查看">×</button>
   </div>
 
   <!-- defer：脚本已在 body 末尾（不阻塞解析），defer 让它与 HTML 解析并行下载，
