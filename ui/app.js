@@ -64,17 +64,11 @@ let catDraft = null; // 类别草稿行 [{key, id|null, name, prompt, color, ena
 let catOriginal = []; // 打开弹窗时的服务端类别快照（diff 基准）
 let catDeleted = []; // 待删除类别 [{key, row, purgeItems}]
 let sessionOriginal = []; // 打开弹窗时的服务端会话快照（diff 基准）
-let selectedTypes = new Set(); // 群聊筛选类型（多选）：选中的类型；空集 = 全部/不筛选
-let selectedSources = new Set(); // 群聊筛选消息源（多选）：选中的源；空集 = 全部/不筛选
-let sessionTimeFilter = "all";  // 群聊筛选按时间过滤：'all'（不过滤）或小时数；默认取服务端 BACKFILL_HOURS
+// 会话筛选（类型/源/搜索/时间）的状态收敛进 createSessionFilter 实例，
+// 设置侧 sessionFilter 与向导侧 onboardFilter 各持一份；此处只留两侧真共享的量
 let sessionDefaultBackfill = 24; // 服务端默认回填窗口（BACKFILL_HOURS，来自 /api/sessions backfillHours）
 const SESSION_TIME_PRESETS = { "6": 6, "12": 12, "24": 24, "48": 48, "72": 72, "168": 168 };
 let enabledSources = []; // 实际启用消息源（/api/status 的 sources keys，决定筛选芯片）
-// 首次使用向导 step2 的会话筛选状态（与设置「群聊筛选」同规则、独立状态，互不干扰）
-let onboardTypes = new Set();    // 类型多选：空集 = 全部
-let onboardSources = new Set();  // 消息源多选：空集 = 全部
-let onboardSearch = "";          // 会话名称搜索词
-let onboardTime = "all";         // 时间过滤：'all' 或小时数
 let catSeq = 0; // 新增类别行的临时 key 计数器
 
 // ── 第一梯队功能状态 ──
@@ -120,19 +114,9 @@ const $settingsClose = document.getElementById("settings-close");
 const $syncBtn = document.getElementById("sync-btn");
 const $settingsLinkTop = document.getElementById("settings-link-top");
 const $sessionList = document.getElementById("session-list");
-const $sessionSearch = document.getElementById("session-search");
-const $sessionTypeFilter = document.getElementById("session-type-filter");
-const $sessionSourceFilter = document.getElementById("session-source-filter");
-const $sessionSourceGroup = document.getElementById("session-source-group");
-const $onboardSessionSearch = document.getElementById("onboard-session-search");
 const $onboardSessionList = document.getElementById("onboard-sessions");
-const $onboardTypeFilter = document.getElementById("onboard-type-filter");
-const $onboardSourceFilter = document.getElementById("onboard-source-filter");
-const $onboardSourceGroup = document.getElementById("onboard-source-group");
-const $onboardTimePreset = document.getElementById("onboard-time-preset");
-const $onboardTimeCustom = document.getElementById("onboard-time-custom");
-const $sessionTimePreset = document.getElementById("session-time-preset");
-const $sessionTimeCustom = document.getElementById("session-time-custom");
+// 筛选控件（搜索框/类型芯片/源芯片/时间下拉+输入框）不在此取：
+// 两侧都由 createSessionFilter 按 id 现取，避免同一控件两处引用各自漂移
 const $categoryToggles = document.getElementById("category-toggles");
 const $categoryAdd = document.getElementById("category-add");
 const $catAddForm = document.getElementById("cat-add-form");
@@ -442,11 +426,10 @@ function setupEvents() {
     $settingsModal.classList.remove("hidden");
     syncBodyScrollLock();
     setSettingsPanel("general"); // 二级菜单：每次打开默认回到「常规」
-    $sessionSearch.value = "";
-    selectedTypes.clear(); // 每次打开重置类型筛选（回到"全部"）
-    updateSessionTypeChips();
-    selectedSources.clear(); // 每次打开重置消息源筛选（回到"全部"）
-    loadSourceFilterChips(); // 按 /api/status 实际启用源渲染多选芯片
+    // 每次打开重置搜索与两组多选（回到"全部"）；时间档位随后由 loadSessions →
+    // initSessionTimeFilter 从 localStorage/服务端默认恢复，故此处的 'all' 只是过渡值
+    sessionFilter.reset();
+    sessionFilter.renderSourceChips(); // 按 /api/status 实际启用源渲染多选芯片
     loadSessions();
     loadCategories();
     loadAboutSources();
@@ -551,7 +534,7 @@ function setupEvents() {
   $sessionList.addEventListener("change", (e) => {
     const cb = e.target.closest("input[type=checkbox]");
     if (!cb) return;
-    updateSessionSelectAll(); // 全选框三态（全选/半选/未选）随勾选实时更新
+    sessionFilter.updateSelectAll(); // 全选框三态（全选/半选/未选）随勾选实时更新
   });
 
   // Refresh sessions from source
@@ -579,56 +562,8 @@ function setupEvents() {
     }
   });
 
-  // Session search filter
-  $sessionSearch.addEventListener("input", applySessionFilters);
-
-  // 消息类型筛选（多选，与消息源筛选/名称搜索叠加生效）：
-  // "全部" = 清空选中；类型 chip 独立开关；取消最后一个类型后回到"全部"（空集），不会出现空列表
-  $sessionTypeFilter.addEventListener("click", (e) => {
-    const chip = e.target.closest(".filter-chip");
-    if (!chip) return;
-    const type = chip.dataset.type;
-    if (!type || type === "all") {
-      selectedTypes.clear();
-    } else if (selectedTypes.has(type)) {
-      selectedTypes.delete(type);
-    } else {
-      selectedTypes.add(type);
-    }
-    updateSessionTypeChips();
-    applySessionFilters();
-  });
-
-  // 消息源筛选（多选，与类型筛选/搜索叠加生效）：
-  // "全部" = 清空选中；源 chip 独立开关；取消最后一个源后回到"全部"（空集），不会出现空列表
-  $sessionSourceFilter.addEventListener("click", (e) => {
-    const chip = e.target.closest(".filter-chip");
-    if (!chip) return;
-    const src = chip.dataset.source;
-    if (src === "all") {
-      selectedSources.clear();
-    } else if (selectedSources.has(src)) {
-      selectedSources.delete(src);
-    } else {
-      selectedSources.add(src);
-    }
-    updateSessionSourceChips();
-    applySessionFilters();
-  });
-
-  // 按时间过滤（预设下拉 + 自定义小时常驻共存，与类型/源/搜索叠加生效，仅显示层）：
-  // 下拉 = 快捷设置 + 档位指示；选中“自定义”仅聚焦输入框等用户输入；输入框空/0 视为“全部”
-  $sessionTimePreset.addEventListener("change", () => {
-    const v = $sessionTimePreset.value;
-    if (v === "custom") {
-      $sessionTimeCustom.focus(); // 仅聚焦输入框，保留当前值等用户修改
-    } else {
-      setSessionTimeFilter(v === "all" ? "all" : Number(v));
-    }
-  });
-  $sessionTimeCustom.addEventListener("input", () => {
-    setSessionTimeFilter($sessionTimeCustom.value); // 空/0 → all；数字 → 过滤
-  });
+  // 群聊筛选（名称搜索 / 类型多选 / 消息源多选 / 时间窗口，四者 AND 叠加，仅显示层）
+  sessionFilter.bindEvents();
 
   // "保存"统一应用三类更改：刷新间隔（localStorage）+ 类别草稿 + 会话草稿。
   // 同步进行中时延迟到同步完成后应用（本次同步按旧配置跑，避免数据与配置不一致）。
@@ -1100,45 +1035,8 @@ function setupEvents() {
     closeOnboarding(); // 不跳过：刷新主列表
   });
 
-  // 向导 step2 会话筛选（与设置「群聊筛选」同规则、独立状态）：
-  // 名称搜索 / 类型多选 / 消息源多选 / 时间过滤，叠加生效
-  if ($onboardSessionSearch) $onboardSessionSearch.addEventListener("input", () => {
-    onboardSearch = $onboardSessionSearch.value.toLowerCase().trim();
-    applyOnboardFilters();
-  });
-  if ($onboardTypeFilter) $onboardTypeFilter.addEventListener("click", (e) => {
-    const chip = e.target.closest(".filter-chip");
-    if (!chip) return;
-    const type = chip.dataset.type;
-    if (!type || type === "all") onboardTypes.clear();
-    else if (onboardTypes.has(type)) onboardTypes.delete(type);
-    else onboardTypes.add(type);
-    updateOnboardTypeChips();
-    applyOnboardFilters();
-  });
-  if ($onboardSourceFilter) $onboardSourceFilter.addEventListener("click", (e) => {
-    const chip = e.target.closest(".filter-chip");
-    if (!chip) return;
-    const src = chip.dataset.source;
-    if (src === "all") onboardSources.clear();
-    else if (onboardSources.has(src)) onboardSources.delete(src);
-    else onboardSources.add(src);
-    updateOnboardSourceChips();
-    applyOnboardFilters();
-  });
-  if ($onboardTimePreset) $onboardTimePreset.addEventListener("change", () => {
-    const v = $onboardTimePreset.value;
-    if (v === "custom") {
-      if ($onboardTimeCustom) $onboardTimeCustom.focus(); // 仅聚焦，保留当前值等用户输入
-    } else {
-      onboardTime = v === "all" ? "all" : Number(v);
-      applyOnboardFilters();
-    }
-  });
-  if ($onboardTimeCustom) $onboardTimeCustom.addEventListener("input", () => {
-    onboardTime = $onboardTimeCustom.value ? Number($onboardTimeCustom.value) : "all";
-    applyOnboardFilters();
-  });
+  // 向导 step2 会话筛选（与设置「群聊筛选」同规则、独立状态）
+  onboardFilter.bindEvents();
 
   // 向导 step2 全选框：仅作用于当前可见会话，不调 API；保存时统一应用
   if ($onboardSessionList) $onboardSessionList.addEventListener("change", (e) => {
@@ -1151,7 +1049,7 @@ function setupEvents() {
         if (row && row.style.display !== "none") one.checked = check;
       });
     }
-    updateOnboardSelectAll();
+    onboardFilter.updateSelectAll();
   });
 
   // 新消息浮条：点击滚动回顶部并确认新卡片
@@ -2087,14 +1985,7 @@ async function renderOnboardSessions() {
   await loadEnabledSources(); // 裁剪依据：实际启用源（单源部署过滤残留停用源会话）
   const visibleSessions = filterSessionsByEnabledSources(sessions);
   // 进入 step2 重置筛选状态（与设置每次打开重置类型筛选一致）
-  onboardTypes.clear();
-  onboardSources.clear();
-  onboardSearch = "";
-  onboardTime = "all";
-  if ($onboardSessionSearch) $onboardSessionSearch.value = "";
-  if ($onboardTimePreset) $onboardTimePreset.value = "all";
-  if ($onboardTimeCustom) $onboardTimeCustom.value = "";
-  updateOnboardTypeChips();
+  onboardFilter.reset();
   if (!visibleSessions.length) {
     el.innerHTML = '<p class="text-muted">暂未发现会话，可稍后在 设置 → 群聊筛选 中「发现新群聊」。</p>';
     return;
@@ -2119,79 +2010,8 @@ async function renderOnboardSessions() {
     })
   ].join("");
   el.innerHTML = html + '<p class="text-muted onboard-filter-empty hidden" style="padding:10px 12px">无匹配的会话</p>';
-  await loadOnboardSourceChips();
-  applyOnboardFilters();
-}
-
-// 向导 step2 会话过滤：与设置「群聊筛选」同一规则（sessionRowMatches）、独立状态
-function applyOnboardFilters() {
-  const list = document.getElementById("onboard-sessions");
-  if (!list) return;
-  const cutoff = onboardTime === "all" ? 0 : (Date.now() / 1000) - onboardTime * 3600;
-  let visible = 0;
-  list.querySelectorAll(".session-row:not(.session-row-all)").forEach(row => {
-    const show = sessionRowMatches(row, {
-      types: onboardTypes,
-      sources: onboardSources,
-      query: onboardSearch,
-      cutoff,
-    });
-    row.style.display = show ? "" : "none";
-    if (show) visible++;
-  });
-  const empty = list.querySelector(".onboard-filter-empty");
-  if (empty) empty.classList.toggle("hidden", visible > 0);
-  updateOnboardSelectAll();
-}
-
-// 向导全选框三态：全选 / 部分勾选（半选）/ 未选（仅统计当前可见行）
-function updateOnboardSelectAll() {
-  const all = document.getElementById("onboard-select-all");
-  const list = document.getElementById("onboard-sessions");
-  if (!all || !list) return;
-  const boxes = Array.from(list.querySelectorAll("input[data-session-id]"))
-    .filter(b => {
-      const row = b.closest(".session-row");
-      return row && row.style.display !== "none";
-    });
-  const checked = boxes.filter(b => b.checked).length;
-  all.checked = boxes.length > 0 && checked === boxes.length;
-  all.indeterminate = checked > 0 && checked < boxes.length;
-}
-
-function updateOnboardTypeChips() {
-  if (!$onboardTypeFilter) return;
-  $onboardTypeFilter.querySelectorAll(".filter-chip").forEach(c => {
-    const t = c.dataset.type;
-    const active = (!t || t === "all") ? onboardTypes.size === 0 : onboardTypes.has(t);
-    c.classList.toggle("active", active);
-    c.setAttribute("aria-pressed", String(active));
-  });
-}
-
-// 向导内消息源筛选芯片：多源（>=2）时显示；与设置一致复用 enabledSources 列表
-async function loadOnboardSourceChips() {
-  if (!$onboardSourceGroup || !$onboardSourceFilter) return;
-  if (!enabledSources.length) await loadEnabledSources();
-  const show = enabledSources.length >= 2;
-  $onboardSourceGroup.classList.toggle("hidden", !show);
-  $onboardSourceFilter.innerHTML =
-    `<button type="button" class="filter-chip" data-source="all">全部</button>` +
-    enabledSources.map(s =>
-      `<button type="button" class="filter-chip" data-source="${escAttr(s)}">${esc(s)}</button>`
-    ).join("");
-  updateOnboardSourceChips();
-}
-
-function updateOnboardSourceChips() {
-  if (!$onboardSourceFilter) return;
-  $onboardSourceFilter.querySelectorAll(".filter-chip").forEach(c => {
-    const active = c.dataset.source === "all"
-      ? onboardSources.size === 0
-      : onboardSources.has(c.dataset.source);
-    c.classList.toggle("active", active);
-    c.setAttribute("aria-pressed", String(active));
-  });
+  await onboardFilter.renderSourceChips();
+  onboardFilter.apply();
 }
 
 async function saveOnboardSessions() {
@@ -3621,43 +3441,12 @@ async function fetchContext(ctxDiv, source, sessionId, aroundTime, sourceMsgId) 
 
 // ── Sessions ──
 
-// 按时间过滤工具：值规范化 / 初始值 / 控件同步 / 设置
-function normalizeSessionTimeFilter(v) {
-  if (v === "all") return "all";
-  const n = Number(v);
-  if (!Number.isFinite(n) || n <= 0) return "all";
-  return n;
-}
-
-// 初始值：localStorage 存值优先，否则服务端默认（BACKFILL_HOURS；<=0 视为“全部”）
+// 设置侧时间档位初始值：localStorage 存值优先，否则服务端默认
+// （BACKFILL_HOURS；<=0 视为“全部”）。向导侧不持久化，进入时直接 reset() 回 'all'。
 function initSessionTimeFilter() {
   const saved = localStorage.getItem("briefdesk.sessionTimeFilter");
   const raw = saved !== null ? saved : (sessionDefaultBackfill > 0 ? sessionDefaultBackfill : "all");
-  sessionTimeFilter = normalizeSessionTimeFilter(raw);
-  syncSessionTimeControls();
-}
-
-// 控件状态与 sessionTimeFilter 双向同步：两框常驻共存——
-// 输入框是值的唯一事实来源，下拉是快捷设置 + 档位状态指示；
-// 命中预设则下拉选中该档并回填输入框，否则下拉显示“自定义”
-function syncSessionTimeControls() {
-  if (sessionTimeFilter === "all") {
-    $sessionTimePreset.value = "all";
-    $sessionTimeCustom.value = "";
-  } else if (SESSION_TIME_PRESETS[String(sessionTimeFilter)] !== undefined) {
-    $sessionTimePreset.value = String(sessionTimeFilter);
-    $sessionTimeCustom.value = String(sessionTimeFilter);
-  } else {
-    $sessionTimePreset.value = "custom";
-    $sessionTimeCustom.value = String(sessionTimeFilter);
-  }
-}
-
-function setSessionTimeFilter(v) {
-  sessionTimeFilter = normalizeSessionTimeFilter(v);
-  try { localStorage.setItem("briefdesk.sessionTimeFilter", sessionTimeFilter); } catch { /* ignore */ }
-  syncSessionTimeControls();
-  applySessionFilters();
+  sessionFilter.setTime(raw);
 }
 
 // 按「实际启用源」裁剪会话列表：后端 /api/sessions 会返回库里全部会话
@@ -3723,25 +3512,10 @@ function renderSessions(sessions) {
       });
     } finally {
       selectAllBusy = false;
-      updateSessionSelectAll();
+      sessionFilter.updateSelectAll();
     }
   });
-  applySessionFilters();
-  updateSessionSelectAll();
-}
-
-// 全选框三态：全选 / 部分勾选（半选）/ 未选（仅统计当前可见行）
-function updateSessionSelectAll() {
-  const all = document.getElementById("session-select-all");
-  if (!all) return;
-  const boxes = Array.from($sessionList.querySelectorAll("input[data-session-id]"))
-    .filter(b => {
-      const row = b.closest(".session-row");
-      return row && row.style.display !== "none";
-    });
-  const checked = boxes.filter(b => b.checked).length;
-  all.checked = boxes.length > 0 && checked === boxes.length;
-  all.indeterminate = checked > 0 && checked < boxes.length;
+  sessionFilter.apply(); // 内含 updateSelectAll
 }
 
 // 会话行过滤判定：设置「群聊筛选」与首次使用向导 step2 共用同一规则。
@@ -3760,36 +3534,221 @@ function sessionRowMatches(row, { types, sources, query, cutoff }) {
   return typeOk && sourceOk && textOk && timeOk;
 }
 
-// 会话列表统一过滤：类型（多选，全部/群聊/私聊/公众号）+ 消息源（多选）+ 名称搜索，叠加生效
-function applySessionFilters() {
-  const query = $sessionSearch.value.toLowerCase().trim();
-  // 按时间过滤的窗口起点（秒）：会话最近消息时间（last_active）>= 起点才显示
-  const cutoff = (sessionTimeFilter === "all") ? 0 : (Date.now() / 1000) - sessionTimeFilter * 3600;
-  $sessionList.querySelectorAll(".session-row:not(.session-row-all)").forEach(row => {
-    row.style.display = sessionRowMatches(row, {
-      types: selectedTypes,
-      sources: selectedSources,
-      query,
-      cutoff,
-    }) ? "" : "none";
-  });
-  updateSessionSelectAll();
+// ── 会话筛选控制器工厂 ──
+// 设置「群聊筛选」与向导 step2 是同一套筛选（sessionRowMatches 的四维 AND），
+// 此前两侧各自维护 4 个状态变量、8 个函数、2 组事件处理，改一处漏一处的成本极高
+// （向导侧的自定义小时数就漏了 normalize：输入非数字会得到 NaN cutoff 而全表隐藏）。
+// 现两侧都由本工厂产出实例，差异只剩三个显式选项：
+//   storageKey  时间档位是否持久化（设置持久化，向导每次进入重置）
+//   emptyHint   无匹配时是否显示提示行（向导有，设置无——保持各自现状）
+//   pruneSources 源列表变化时是否清理已选中的失效源（仅设置侧的芯片会重渲染）
+// 状态收敛进实例后，模块级只剩 enabledSources / sessionDefaultBackfill 两个真共享量。
+function createSessionFilter({ ids, storageKey = null, emptyHint = null, pruneSources = false }) {
+  const $ = (id) => (id ? document.getElementById(id) : null);
+  const state = { types: new Set(), sources: new Set(), time: "all" };
+
+  // 时间档位规范化：'all' 或正数小时；空/0/非数字一律退化为 'all'（不筛选）
+  const normalizeTime = (v) => {
+    if (v === "all") return "all";
+    const n = Number(v);
+    return !Number.isFinite(n) || n <= 0 ? "all" : n;
+  };
+
+  // 控件与 state.time 同步：输入框是值的唯一事实来源，下拉是快捷设置 + 档位指示；
+  // 命中预设则下拉选中该档并回填输入框，否则下拉显示“自定义”
+  function syncTimeControls() {
+    const preset = $(ids.timePreset);
+    const custom = $(ids.timeCustom);
+    if (!preset || !custom) return;
+    if (state.time === "all") {
+      preset.value = "all";
+      custom.value = "";
+    } else if (SESSION_TIME_PRESETS[String(state.time)] !== undefined) {
+      preset.value = String(state.time);
+      custom.value = String(state.time);
+    } else {
+      preset.value = "custom";
+      custom.value = String(state.time);
+    }
+  }
+
+  // 全选框三态：全选 / 部分勾选（半选）/ 未选（仅统计当前可见行）
+  function updateSelectAll() {
+    const all = $(ids.selectAll);
+    const list = $(ids.list);
+    if (!all || !list) return;
+    const boxes = Array.from(list.querySelectorAll("input[data-session-id]"))
+      .filter(b => {
+        const row = b.closest(".session-row");
+        return row && row.style.display !== "none";
+      });
+    const checked = boxes.filter(b => b.checked).length;
+    all.checked = boxes.length > 0 && checked === boxes.length;
+    all.indeterminate = checked > 0 && checked < boxes.length;
+  }
+
+  // 四维叠加过滤当前列表；搜索词从输入框现读（输入框即事实来源，无需另存状态）
+  function apply() {
+    const list = $(ids.list);
+    if (!list) return;
+    const search = $(ids.search);
+    const query = search ? search.value.toLowerCase().trim() : "";
+    // 时间窗口起点（秒）：会话最近消息时间（last_active）>= 起点才显示
+    const cutoff = state.time === "all" ? 0 : (Date.now() / 1000) - state.time * 3600;
+    let visible = 0;
+    list.querySelectorAll(".session-row:not(.session-row-all)").forEach(row => {
+      const show = sessionRowMatches(row, {
+        types: state.types,
+        sources: state.sources,
+        query,
+        cutoff,
+      });
+      row.style.display = show ? "" : "none";
+      if (show) visible++;
+    });
+    if (emptyHint) {
+      const hint = list.querySelector(emptyHint);
+      if (hint) hint.classList.toggle("hidden", visible > 0);
+    }
+    updateSelectAll();
+  }
+
+  // 芯片激活态：'all' 芯片在空集时点亮，其余按是否入选
+  function paintChips(containerId, key, attr) {
+    const box = $(containerId);
+    if (!box) return;
+    box.querySelectorAll(".filter-chip").forEach(c => {
+      const v = c.dataset[attr];
+      const active = (!v || v === "all") ? state[key].size === 0 : state[key].has(v);
+      c.classList.toggle("active", active);
+      c.setAttribute("aria-pressed", String(active));
+    });
+  }
+  const paintTypes = () => paintChips(ids.typeFilter, "types", "type");
+  const paintSources = () => paintChips(ids.sourceFilter, "sources", "source");
+
+  // 多选开关：点“全部”清空（=不筛选），否则该项独立切换；
+  // 取消最后一个选中项后回到空集，不会出现空列表
+  function toggle(key, value) {
+    if (!value || value === "all") state[key].clear();
+    else if (state[key].has(value)) state[key].delete(value);
+    else state[key].add(value);
+  }
+
+  function setTime(v) {
+    state.time = normalizeTime(v);
+    if (storageKey) {
+      try { localStorage.setItem(storageKey, state.time); } catch { /* 隐私模式等写入失败可忽略 */ }
+    }
+    syncTimeControls();
+    apply();
+  }
+
+  // 消息源芯片：芯片 = 实际启用源（/api/status 的 sources keys），
+  // 仅 1 个源时筛选无意义，整组隐藏；与类型/搜索 AND 叠加，不参与保存 diff
+  async function renderSourceChips() {
+    const box = $(ids.sourceFilter);
+    const group = $(ids.sourceGroup);
+    if (!box || !group) return;
+    if (!enabledSources.length) await loadEnabledSources();
+    group.classList.toggle("hidden", enabledSources.length < 2);
+    box.innerHTML =
+      `<button type="button" class="filter-chip" data-source="all">全部</button>` +
+      enabledSources.map(s =>
+        `<button type="button" class="filter-chip" data-source="${escAttr(s)}">${esc(s)}</button>`
+      ).join("");
+    if (pruneSources) {
+      // 源列表变化（异常场景）时清理残留选中项，避免选中已不存在的源
+      for (const s of state.sources) {
+        if (!enabledSources.includes(s)) state.sources.delete(s);
+      }
+    }
+    paintSources();
+  }
+
+  // 重置为初始态：清空多选与搜索框，时间档位回到 initial（设置侧传 localStorage/
+  // 服务端默认，向导侧不传 = 'all'）
+  function reset(initial = "all") {
+    state.types.clear();
+    state.sources.clear();
+    state.time = normalizeTime(initial);
+    const search = $(ids.search);
+    if (search) search.value = "";
+    syncTimeControls();
+    paintTypes();
+    paintSources();
+  }
+
+  // 事件绑定：搜索输入 / 类型芯片 / 源芯片 / 时间预设 + 自定义。
+  // 元素可能不存在（向导 DOM 是可选的），逐个判空。
+  function bindEvents() {
+    const search = $(ids.search);
+    if (search) search.addEventListener("input", apply);
+
+    const typeBox = $(ids.typeFilter);
+    if (typeBox) typeBox.addEventListener("click", (e) => {
+      const chip = e.target.closest(".filter-chip");
+      if (!chip) return;
+      toggle("types", chip.dataset.type);
+      paintTypes();
+      apply();
+    });
+
+    const sourceBox = $(ids.sourceFilter);
+    if (sourceBox) sourceBox.addEventListener("click", (e) => {
+      const chip = e.target.closest(".filter-chip");
+      if (!chip) return;
+      toggle("sources", chip.dataset.source);
+      paintSources();
+      apply();
+    });
+
+    const preset = $(ids.timePreset);
+    const custom = $(ids.timeCustom);
+    if (preset) preset.addEventListener("change", () => {
+      // 选中“自定义”仅聚焦输入框，保留当前值等用户修改
+      if (preset.value === "custom") { if (custom) custom.focus(); return; }
+      setTime(preset.value);
+    });
+    if (custom) custom.addEventListener("input", () => setTime(custom.value)); // 空/0 → all
+  }
+
+  return { state, apply, reset, setTime, bindEvents, renderSourceChips, paintTypes, paintSources, updateSelectAll, syncTimeControls };
 }
 
-function updateSessionTypeChips() {
-  $sessionTypeFilter.querySelectorAll(".filter-chip").forEach(c => {
-    const t = c.dataset.type;
-    const active = (!t || t === "all") ? selectedTypes.size === 0 : selectedTypes.has(t);
-    c.classList.toggle("active", active);
-    c.setAttribute("aria-pressed", String(active));
-  });
-}
+// 设置「群聊筛选」：时间档位持久化，源芯片重渲染时清理失效选中项，无空态提示行
+const sessionFilter = createSessionFilter({
+  ids: {
+    list: "session-list",
+    selectAll: "session-select-all",
+    search: "session-search",
+    typeFilter: "session-type-filter",
+    sourceFilter: "session-source-filter",
+    sourceGroup: "session-source-group",
+    timePreset: "session-time-preset",
+    timeCustom: "session-time-custom",
+  },
+  storageKey: "briefdesk.sessionTimeFilter",
+  pruneSources: true,
+});
 
-// ── 消息源筛选（多选）──
-// 芯片 = 实际启用源（/api/status 的 sources keys，即 .env 启用且配置完整的源），
-// 与类型筛选/搜索 AND 叠加；仅显示层过滤，不参与保存 diff。
+// 向导 step2：与设置同规则、独立状态；不持久化时间档位，无匹配时显示提示行
+const onboardFilter = createSessionFilter({
+  ids: {
+    list: "onboard-sessions",
+    selectAll: "onboard-select-all",
+    search: "onboard-session-search",
+    typeFilter: "onboard-type-filter",
+    sourceFilter: "onboard-source-filter",
+    sourceGroup: "onboard-source-group",
+    timePreset: "onboard-time-preset",
+    timeCustom: "onboard-time-custom",
+  },
+  emptyHint: ".onboard-filter-empty",
+});
 
-// 拉取启用源列表（设置与向导 step2 共用）：失败时退化为空列表（不阻断）
+// 拉取启用源列表（设置与向导 step2 共用，也是会话列表按启用源裁剪的依据）：
+// 失败时退化为空列表（不阻断）
 async function loadEnabledSources() {
   try {
     const status = await getJson("/api/status");
@@ -3798,38 +3757,6 @@ async function loadEnabledSources() {
     console.error("Load source filter chips error:", err);
     enabledSources = [];
   }
-}
-
-// 拉取启用源列表并渲染设置面板芯片；失败时退化为仅"全部"（不阻断设置弹窗）
-async function loadSourceFilterChips() {
-  await loadEnabledSources();
-  renderSourceFilterChips();
-}
-
-function renderSourceFilterChips() {
-  // 仅 1 个启用源时筛选无意义，标签与芯片整组隐藏
-  const show = enabledSources.length >= 2;
-  $sessionSourceGroup.classList.toggle("hidden", !show);
-  $sessionSourceFilter.innerHTML =
-    `<button type="button" class="filter-chip" data-source="all">全部</button>` +
-    enabledSources.map(s =>
-      `<button type="button" class="filter-chip" data-source="${escAttr(s)}">${esc(s)}</button>`
-    ).join("");
-  // 源列表变化（异常场景）时清理残留选中项，避免选中已不存在的源
-  for (const s of selectedSources) {
-    if (!enabledSources.includes(s)) selectedSources.delete(s);
-  }
-  updateSessionSourceChips();
-}
-
-function updateSessionSourceChips() {
-  $sessionSourceFilter.querySelectorAll(".filter-chip").forEach(c => {
-    const active = c.dataset.source === "all"
-      ? selectedSources.size === 0
-      : selectedSources.has(c.dataset.source);
-    c.classList.toggle("active", active);
-    c.setAttribute("aria-pressed", String(active));
-  });
 }
 
 // ── Categories ──

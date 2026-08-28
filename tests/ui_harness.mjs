@@ -1,0 +1,114 @@
+// 前端测试共用的最小 DOM/BOM 桩：把真实的 ui/app.js 加载进 Node vm。
+//
+// app.js 是同源 classic script（不能 ESM 化、不能 IIFE 包裹，见 docs/architecture.md），
+// 顶层就会 document.getElementById(...) 一大批常量，因此桩只需"任何 id 都返回一个
+// 元素"即可让脚本跑完；各测试再按需覆写 sandbox.fetch 等注入点。
+//
+// getElementById 按 id 缓存（同 id 恒返回同一对象）：app.js 里"渲染时写
+// innerHTML、随后另一处按 id 取回来读"的写法很常见，不缓存的话读到的是空白新元素。
+//
+// 测试数据一律虚构，不得写入真实聊天内容（见 AGENTS.md）。
+
+import fs from "node:fs";
+import path from "node:path";
+import vm from "node:vm";
+import { fileURLToPath } from "node:url";
+
+export const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+
+const ESC_MAP = { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" };
+
+export function makeElement() {
+  return {
+    innerHTML: "",
+    textContent: "",
+    value: "",
+    className: "",
+    style: {},
+    dataset: {},
+    hidden: false,
+    checked: false,
+    indeterminate: false,
+    classList: {
+      add() {},
+      remove() {},
+      contains() { return false; },
+      toggle() {},
+    },
+    addEventListener() {},
+    removeEventListener() {},
+    querySelector() { return null; },
+    querySelectorAll() { return []; },
+    closest() { return null; },
+    setAttribute() {},
+    removeAttribute() {},
+    focus() {},
+    appendChild() {},
+    remove() {},
+  };
+}
+
+// 建立 sandbox 并执行 ui/app.js；返回的 sandbox 即 window，其上是 app.js 的全局符号。
+export function loadAppJs() {
+  const elements = new Map();
+  const getElement = (id) => {
+    if (!elements.has(id)) elements.set(id, makeElement());
+    return elements.get(id);
+  };
+
+  const document = {
+    getElementById: getElement,
+    querySelector: () => makeElement(),
+    querySelectorAll: () => [],
+    createElement: (tag) => {
+      const el = makeElement();
+      if (tag === "div") {
+        // 模拟 textContent -> innerHTML 的转义语义（app.js 的 esc() 依赖该行为）
+        Object.defineProperty(el, "textContent", {
+          get() { return this._textContent || ""; },
+          set(value) {
+            this._textContent = String(value);
+            this.innerHTML = this._textContent.replace(/[&<>"']/g, (ch) => ESC_MAP[ch]);
+          },
+        });
+      }
+      return el;
+    },
+    addEventListener() {},
+    body: makeElement(),
+    documentElement: makeElement(),
+    scrollingElement: makeElement(),
+    activeElement: makeElement(),
+    contains: () => true,
+  };
+
+  const noop = () => {};
+  const sandbox = {
+    document,
+    localStorage: { getItem: () => null, setItem() {}, removeItem() {} },
+    navigator: { clipboard: {} },
+    EventSource: class { constructor() { this.readyState = 0; } close() {} },
+    MutationObserver: class { constructor() {} observe() {} disconnect() {} takeRecords() { return []; } },
+    IntersectionObserver: class { constructor() {} observe() {} disconnect() {} },
+    CSS: { escape: (s) => s },
+    console,
+    setTimeout,
+    clearTimeout,
+    setInterval,
+    clearInterval,
+    requestAnimationFrame: (fn) => fn(),
+    cancelAnimationFrame: noop,
+    matchMedia: () => ({ matches: false, addEventListener: noop, removeEventListener: noop }),
+    addEventListener: noop,
+    removeEventListener: noop,
+    open: noop,
+  };
+  sandbox.window = sandbox;
+  sandbox.self = sandbox;
+
+  vm.createContext(sandbox);
+  vm.runInContext(fs.readFileSync(path.join(ROOT, "ui", "app.js"), "utf8"), sandbox, {
+    filename: "ui/app.js",
+  });
+  return { sandbox, document, getElement };
+}
