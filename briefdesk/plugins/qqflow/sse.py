@@ -55,7 +55,7 @@ class QqFlowSseClient(DrainableListenerMixin, RealtimeListener[QqFlowClient]):
         self._seen: set[tuple[str, str]] = set()
         self._seen_order: deque[tuple[str, str]] = deque()
         # 监听统计（周期/停止时上报）：事件总数、预过滤丢弃数、去重命中数、
-        # IGNORE_SELF 回查判定的自消息数；sync/ping 控制事件不进统计
+        # IGNORE_SELF 回查判定的自消息数；ready/sync/ping 控制事件不进统计
         # （保持「无消息静默」语义）
         self._stats_events = 0
         self._stats_filtered = 0
@@ -149,10 +149,11 @@ class QqFlowSseClient(DrainableListenerMixin, RealtimeListener[QqFlowClient]):
 
     async def _handle_event(self, event: QqFlowEvent) -> None:
         # 控制事件不计入消息事件/预过滤统计（无消息静默语义），亦无需计数：
-        # sync（水位对齐）/ping（KeepAlive）直接跳过，否则每 15s 心跳会
-        # 让「无消息静默」统计失效
+        # ready（连接基线，载荷 {"status":"ok"} 不含 event 键故 etype 为空串，
+        # 与 weflow 监听器同一兜底）/ sync（水位对齐）/ ping（KeepAlive）直接
+        # 跳过，否则每次重连的基线帧与每 25s 心跳会让「无消息静默」统计失效
         etype = event.get("event", "")
-        if etype in ("sync", "ping"):
+        if etype in ("ready", "sync", "ping") or not etype:
             return
         self._stats_events += 1
         if not pre_filter_sse(event):

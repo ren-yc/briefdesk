@@ -8,7 +8,8 @@ import time
 import unittest
 from unittest.mock import AsyncMock
 
-from briefdesk.plugins.qqflow.client import QqFlowNotReadyError
+from briefdesk.plugins.qqflow.client import QqFlowClient, QqFlowNotReadyError
+from briefdesk.plugins.qqflow.config import QqFlowSettings
 from briefdesk.plugins.qqflow.normalize import (
     normalize_rest,
     normalize_sse,
@@ -17,6 +18,7 @@ from briefdesk.plugins.qqflow.normalize import (
 )
 from briefdesk.plugins.qqflow.poller import poll
 from briefdesk.plugins.qqflow.runtime import QqFlowSource
+from briefdesk.plugins.qqflow.sse import QqFlowSseClient
 from briefdesk.types import SessionInfo
 
 
@@ -404,6 +406,52 @@ class PollerDisplayNameTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.messages, [])
         # 503 会话不推进水位（防永久漏拉）
         self.assertEqual(result.failed_sessions, {"10001"})
+
+
+class ControlEventStatsTest(unittest.IsolatedAsyncioTestCase):
+    """控制事件（ready / sync）不进管道、也不计入监听统计。"""
+
+    async def test_control_events_skipped_without_inflating_stats(self):
+        """上游无就绪门控后每次重连都会带 ready（+可能 sync）基线帧。
+
+        它们不是消息：既不该进管道，也不该计入「事件」或「预过滤丢弃」——
+        否则「无消息静默」统计失效（与 weflow 监听器一致）。
+        ready 帧的载荷实测为 {"status":"ok"}，不含 event 键。
+        """
+        batches: list[list] = []
+
+        async def on_batch(msgs: list) -> None:
+            batches.append(msgs)
+
+        client = QqFlowClient(
+            "http://127.0.0.1:5032", "test-token", qq="12345678"
+        )
+        # IGNORE_SELF 自消息回查桩：避免测试发起真实 HTTP（fail-open 语义）
+        client.lookup_message = AsyncMock(return_value=None)  # type: ignore[method-assign]
+        listener = QqFlowSseClient(
+            client, on_batch, settings=QqFlowSettings(sse_read_timeout_ms=1000)
+        )
+        await listener._handle_event({"status": "ok"})  # type: ignore[arg-type]
+        await listener._handle_event({"event": "sync", "lastRowidGroup": 1})  # type: ignore[arg-type]
+        await listener._handle_event({"event": "ready", "status": "ok"})  # type: ignore[arg-type]
+        self.assertEqual(listener._stats_events, 0)
+        self.assertEqual(listener._stats_filtered, 0)
+        self.assertEqual(batches, [])
+
+        # 真实消息仍计入事件统计（证明跳过逻辑没有误伤 message.new）
+        await listener._handle_event(  # type: ignore[arg-type]
+            {
+                "event": "message.new",
+                "sessionId": "10001",
+                "sessionType": "group",
+                "groupName": "测试群",
+                "rawid": "1001",
+                "sourceName": "张三",
+                "content": "这是一条足够长的测试消息内容",
+                "timestamp": 1700000000,
+            }
+        )
+        self.assertEqual(listener._stats_events, 1)
 
 
 class RuntimeRefreshSessionsTest(unittest.IsolatedAsyncioTestCase):

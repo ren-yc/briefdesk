@@ -58,9 +58,14 @@ def _qq_message_new_event(rawid: str = "r1") -> dict:
 
 
 class QqFlowFetchSessionsLimitTest(unittest.IsolatedAsyncioTestCase):
-    """【1·P1】fetch_sessions 必须显式传大 limit，否则被上游默认 100 截断。"""
+    """【1·P1】fetch_sessions 必须按大页大小翻页取尽，否则被上游默认 100 截断。
 
-    async def test_fetch_sessions_passes_large_limit(self):
+    page_size=10000 = 上游 limit 硬上限：典型规模一个请求即取尽（与旧
+    「显式大 limit」实现请求数相同）；旧上游若忽略 offset，共享「本页无
+    新增」防御停在 10000 条——零回退。
+    """
+
+    async def test_fetch_sessions_pages_with_max_page_size(self):
         client = QqFlowClient("http://127.0.0.1:5032", "tok")
         captured: dict = {}
 
@@ -71,7 +76,8 @@ class QqFlowFetchSessionsLimitTest(unittest.IsolatedAsyncioTestCase):
 
         client._get = fake_get  # type: ignore[method-assign]
         await client.fetch_sessions()
-        self.assertEqual(captured["params"], {"limit": 10000})
+        self.assertEqual(captured["path"], "/api/v1/sessions")
+        self.assertEqual(captured["params"], {"limit": 10000, "offset": 0})
 
 
 class SseReadTimeoutTest(unittest.TestCase):

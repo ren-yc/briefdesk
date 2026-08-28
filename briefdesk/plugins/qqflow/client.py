@@ -36,7 +36,12 @@ from briefdesk.sources_base import (
 
 
 class QqFlowEvent(TypedDict):
-    """SSE 推送的原始事件（message.new / message.revoke / sync / ping）。"""
+    """SSE 推送的原始事件（ready / message.new / message.revoke / sync / ping）。
+
+    ready 为连接建立基线（上游对齐 WeFlow 契约，v0.3.x 起），载荷实测为
+    `{"status":"ok"}`——**不含 event 键**（事件名只在 SSE 的 `event:` 帧头，
+    本客户端只解析 data 行故读不到），监听器按空 etype 兜底跳过。
+    """
 
     event: str
     sessionId: str
@@ -108,10 +113,6 @@ class QqFlowMessagesResponse(TypedDict):
     messages: list[QqFlowMessage]
 
 
-class QqFlowSessionsResponse(TypedDict):
-    sessions: list[QqFlowSession]
-
-
 class QqFlowContactsResponse(TypedDict):
     contacts: list[QqFlowContact]
 
@@ -159,7 +160,7 @@ class QqFlowClient(SourceClient):
         self._key = key
         self._db_path = db_path
         # SSE 读超时（毫秒）：缺省读 QQFLOW_SSE_READ_TIMEOUT_MS。
-        # 上游每 15s 发 KeepAlive；半开连接下若无读超时，stream_events 的
+        # 上游每 25s 发 KeepAlive；半开连接下若无读超时，stream_events 的
         # aiter_lines 会永久阻塞，重连循环永远得不到控制权（监听静默死亡）
         if sse_read_timeout_ms is None:
             sse_read_timeout_ms = QqFlowSettings().sse_read_timeout_ms
@@ -361,16 +362,21 @@ class QqFlowClient(SourceClient):
     # 备注 > 最新消息昵称 > 档案昵称 > UID），逐群再查一次纯属冗余。
 
     async def fetch_sessions(self) -> list[QqFlowSession]:
-        """获取所有会话列表。
+        """获取所有会话列表（按 offset 翻页取尽，与 fetch_contacts 同模式）。
 
-        显式传大 limit：上游默认 limit=100 且按最后消息时间倒序
-        （qqflow-server-api.md §4），不传参只会发现最近活跃的 100 个会话，
-        更早的会话将永远无法被发现/启用/轮询——与 weflow-legacy 同接口的修复对齐。
+        上游 limit 默认 100 且按最后消息时间倒序（qqflow-server-api.md §4），
+        不翻页只会发现最近活跃的 100 个会话，更早的会话将永远无法被
+        发现/启用/轮询。page_size=10000 = 上游 limit 硬上限：典型规模一个
+        请求即取尽（与旧「显式大 limit」实现请求数相同）；旧上游若忽略
+        offset，共享「本页无新增」防御立即告警终止，停在 10000 条——零回退。
         """
-        data: QqFlowSessionsResponse = await self._get(
-            "/api/v1/sessions", params={"limit": 10000}
+        return await fetch_all_pages(
+            lambda path, params: self._get(path, params=params),
+            "/api/v1/sessions",
+            key="sessions",
+            dedup_key="username",
+            page_size=10000,
         )
-        return data["sessions"]
 
     async def fetch_messages(
         self,
@@ -451,7 +457,7 @@ class QqFlowClient(SourceClient):
         self.connection_status = "reconnecting"
 
         # SSE 需要独立的客户端：写/池不限，但保留可配置的读超时
-        # （上游 15s ping，默认 60s = 4 个心跳周期）以自愈半开连接
+        # （上游 25s ping，默认 60s ≈ 2.4 个心跳周期）以自愈半开连接
         async with httpx.AsyncClient(timeout=self.sse_timeout()) as sse_client:
             try:
                 async with sse_client.stream(

@@ -95,8 +95,9 @@ def normalize_sse(event: QqFlowEvent) -> InternalMessage:
 def pre_filter_sse(event: QqFlowEvent) -> bool:
     """SSE 事件预过滤：仅放行 message.new。
 
-    message.revoke（撤回）/ sync（基线水位，无消息载荷，pipeline 幂等已兜底）/
-    ping（KeepAlive）一律拒绝；发送者为空/缺失、空/短内容、QQ 富媒体 XML 残片
+    ready（连接基线，载荷无 event 键）/ message.revoke（撤回）/
+    sync（基线水位，无消息载荷，pipeline 幂等已兜底）/ ping（KeepAlive）
+    一律拒绝；发送者为空/缺失、空/短内容、QQ 富媒体 XML 残片
     （m_fileName/m_resid）与占位符消息拒绝。
     """
     if event.get("event") != "message.new":
