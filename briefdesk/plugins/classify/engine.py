@@ -10,7 +10,7 @@ import time
 from dataclasses import replace
 from difflib import SequenceMatcher
 
-from briefdesk.ai_ports import chat, loads_json
+from briefdesk.ai_ports import chat, embed_texts, is_embedding_enabled, loads_json
 from briefdesk.config import config
 from briefdesk.db import CategoryRow, get_enabled_categories
 from briefdesk.types import ClassifyOutcome, ClassifyResult, InternalMessage
@@ -293,28 +293,161 @@ def _slice_json_root(text: str) -> str:
     return text
 
 
-def _quote_matches_content(quote: str, content: str) -> bool:
-    """quote 与 content 是否对齐（F2 索引漂移守卫）。
+# ── F2 索引漂移守卫（两道关）──
+# 第一关（字面，同步）：quote 归一化后在全批消息上做包含率相对比较——
+# 自己必须明显第一（领先 _CHAR_ALIGN_MARGIN 才确认），明显落后判漂移，
+# 接近/平票记入 ambiguous_out 交第二关。不做绝对阈值：摘录天然短于原文，
+# 对称相似度（ratio）会被长原文分母数学性压死（2026-08 线上事故实证：
+# 逐字摘录 ratio 上限 0.491 < 0.5，全批误杀）。归一化含弯引号/直角引号
+# ——AI 抄写关键句时增删引号不应影响判定。
+# 第二关（语义，异步）：仅模糊条目触发，quotes+contents 一次性批量嵌入，
+# 余弦 argmax 复核归属；嵌入不可用/失败一律放行——宁放行勿误杀
+# （误杀即重试死循环；漏检有下游去重/原文展示/人工核对兜底，
+# 且嵌入不可用有公告条提示）。
 
-    quote 为"原文关键句"，正常应能近似匹配内容；AI 把下一条的 quote 标到
-    本条（index 漂移）时两者几乎无重叠 → False。去除空白/标点后先做
-    子串匹配（严格），再按前段字符的相似度兜底（宽松，防误伤少量改写）。
-    无 quote（未提供）视为跳过守卫。
-    """
-    q = re.sub(r"[\s，。；：、,.!?！？（）()【】\[\]\"'《》]", "", quote or "")
-    c = re.sub(r"[\s，。；：、,.!?！？（）()【】\[\]\"'《》]", "", content or "")
+_ALIGN_PUNCT_RE = re.compile(
+    r"[\s，。；：、,.!?！？（）()【】\[\]\"'《》“”‘’「」『』]"
+)
+_CHAR_ALIGN_MARGIN = 0.05  # 字面关：领先/落后超出此值才下"确认"结论
+_SEMANTIC_ALIGN_MARGIN = 0.05  # 语义关：别人高出自己不足此值视为平票放行
+_CHAR_SINGLE_FLOOR = 0.3  # 单条批：quote 与内容包含率低于此视为疑似幻觉
+
+
+def _norm_align_text(text: str) -> str:
+    """对齐比对归一化：去除空白与中英文标点（含弯引号/直角引号）。"""
+    return _ALIGN_PUNCT_RE.sub("", text or "")
+
+
+def _containment(q: str, c: str) -> float:
+    """q 的字符在 c 中能找到的比例（对 q 非对称，与 c 长度无关）。"""
+    if not q:
+        return 1.0
+    if not c:
+        return 0.0
+    if q in c:
+        return 1.0
+    m = sum(b.size for b in SequenceMatcher(None, q, c).get_matching_blocks())
+    return m / len(q)
+
+
+def _char_quote_verdict(
+    quote: str, own_idx: int, contents: list[str]
+) -> bool | None:
+    """第一关字面判定：True=确认对齐；False=确认漂移；None=模糊交语义裁判。"""
+    q = _norm_align_text(quote)
     if not q:
         return True
-    if not c:
-        return False
-    if q in c or c in q:
+    if len(contents) <= 1:
+        # 单条批：不存在"标到别人头上"的漂移对象；仅拦与内容几乎无
+        # 字面交集的疑似幻觉 quote（保持既有口径）
+        own_c = _norm_align_text(
+            contents[own_idx] if 0 <= own_idx < len(contents) else ""
+        )
+        return _containment(q, own_c) >= _CHAR_SINGLE_FLOOR
+    own = _containment(q, _norm_align_text(contents[own_idx]))
+    best_other = max(
+        (
+            _containment(q, _norm_align_text(c))
+            for i, c in enumerate(contents)
+            if i != own_idx
+        ),
+        default=0.0,
+    )
+    if own >= best_other + _CHAR_ALIGN_MARGIN:
         return True
-    return SequenceMatcher(None, q[:60], c[:120]).ratio() >= 0.5
+    if best_other >= own + _CHAR_ALIGN_MARGIN:
+        return False
+    return None
+
+
+def _cosine(a: list[float], b: list[float]) -> float:
+    dot = na = nb = 0.0
+    for x, y in zip(a, b):
+        dot += x * y
+        na += x * x
+        nb += y * y
+    if not na or not nb:
+        return 0.0
+    return dot / ((na ** 0.5) * (nb ** 0.5))
+
+
+async def _semantic_quote_referee(
+    quote: str, own_idx: int, contents: list[str]
+) -> bool:
+    """第二关语义裁判（单条）：quote 的嵌入与哪条消息最近；不可用/失败放行。"""
+    if not is_embedding_enabled():
+        logger.debug("嵌入未启用，语义对齐裁判跳过（宁放行勿误杀）")
+        return True
+    try:
+        vecs = await embed_texts([quote, *contents])
+    except Exception:  # noqa: BLE001 — 裁判失效按放行处理，不阻塞分类
+        logger.debug("语义对齐裁判嵌入失败，放行该条（宁放行勿误杀）")
+        return True
+    sims = [_cosine(vecs[0], v) for v in vecs[1:]]
+    own = sims[own_idx] if 0 <= own_idx < len(sims) else 0.0
+    best_other = max(
+        (s for i, s in enumerate(sims) if i != own_idx), default=0.0
+    )
+    return own >= best_other - _SEMANTIC_ALIGN_MARGIN
+
+
+async def _semantic_refine(
+    ambiguous: list[int],
+    results: list[ClassifyResult],
+    retry_indexes: list[int],
+    time_indexes: list[int],
+    contents: list[str],
+) -> tuple[list[ClassifyResult], list[int], list[int]]:
+    """对字面模糊条目跑语义裁判：漂移条目移出 results/time 并入 retry。
+
+    quotes 与 contents 一次性批量嵌入（每批最多一次嵌入调用）。
+    """
+    pairs: list[tuple[int, str]] = []
+    for idx in ambiguous:
+        quote = next((r.quote for r in results if r.msg_index == idx), "")
+        if quote:
+            pairs.append((idx, quote))
+    if not pairs:
+        return results, retry_indexes, time_indexes
+    if not is_embedding_enabled():
+        logger.debug(
+            "嵌入未启用，语义对齐裁判跳过（宁放行勿误杀）: %s",
+            [i for i, _ in pairs],
+        )
+        return results, retry_indexes, time_indexes
+    try:
+        vecs = await embed_texts([q for _, q in pairs] + list(contents))
+    except Exception:  # noqa: BLE001 — 裁判失效按放行处理，不阻塞分类
+        logger.debug("语义对齐裁判嵌入失败，放行模糊条目（宁放行勿误杀）")
+        return results, retry_indexes, time_indexes
+    qvecs = vecs[: len(pairs)]
+    cvecs = vecs[len(pairs) :]
+    for (idx, _quote), qv in zip(pairs, qvecs):
+        sims = [_cosine(qv, cv) for cv in cvecs]
+        own = sims[idx] if 0 <= idx < len(sims) else 0.0
+        best_other = max(
+            (s for i, s in enumerate(sims) if i != idx), default=0.0
+        )
+        if own >= best_other - _SEMANTIC_ALIGN_MARGIN:
+            continue
+        logger.warning(
+            "语义对齐裁判：quote 更接近其他消息（own=%.2f other=%.2f，"
+            "index %s），转重试",
+            own,
+            best_other,
+            idx,
+        )
+        results = [r for r in results if r.msg_index != idx]
+        retry_indexes.append(idx)
+        if idx in time_indexes:
+            time_indexes.remove(idx)
+    return results, retry_indexes, time_indexes
 
 
 def _parse_response(
     content: str, allowed: set[str], count: int,
     contents: list[str] | None = None,
+    ambiguous_out: list[int] | None = None,
 ) -> tuple[list[ClassifyResult], list[int], list[int]]:
     """解析 AI 分类 JSON（sysb 紧凑格式，支持显式 include 判定）。
 
@@ -393,13 +526,13 @@ def _parse_response(
             retry_indexes.append(msg_index)
             continue
 
-        # F2 索引漂移守卫：quote 与内容不对齐 → 该条转重试（不阻塞同批其它条目）
+        # F2 索引漂移守卫（第一关·字面）：quote 与自己内容明显不符而与
+        # 其他消息更吻合 → 转重试；平票模糊条目记入 ambiguous_out，
+        # 由 _classify_once 调第二关（语义裁判）复核
         if contents is not None:
             quote_raw = item.get("quote", "") or ""
-            msg_content = (
-                contents[msg_index] if 0 <= msg_index < len(contents) else ""
-            )
-            if not _quote_matches_content(quote_raw, msg_content):
+            verdict = _char_quote_verdict(quote_raw, msg_index, contents)
+            if verdict is False:
                 logger.warning(
                     "quote 与内容不对齐（疑似 index 漂移，index %s），"
                     "保留该条待重试，其余消息正常处理",
@@ -407,6 +540,8 @@ def _parse_response(
                 )
                 retry_indexes.append(msg_index)
                 continue
+            if verdict is None and ambiguous_out is not None:
+                ambiguous_out.append(msg_index)
 
         # key 为关键词数组（sysb 格式）：join 成逗号分隔字符串（下游契约）
         key_raw = item.get("key", "")
@@ -850,15 +985,24 @@ async def _classify_once(
         logger.warning("AI 返回空响应（本轮抛弃，下轮回填）")
         return ClassifyOutcome([], [offset + i for i in range(len(messages))])
 
+    ambiguous: list[int] = []
     try:
         results, retry_indexes, time_indexes = _parse_response(
             content, {c["name"] for c in cats}, len(messages),
-            [m.content for m in messages],
+            [m.content for m in messages], ambiguous,
         )
     except (RuntimeError, TypeError) as e:
         # 结构错误/越界 index/task 不匹配等：拆半无益，本轮抛弃，下轮回填
         logger.warning(f"AI 响应解析失败（本轮抛弃，下轮回填）: {e}")
         return ClassifyOutcome([], [offset + i for i in range(len(messages))])
+
+    # F2 索引漂移守卫（第二关·语义）：字面模糊条目交嵌入余弦复核。
+    # 置于 offset 合并前：ambiguous/contents 均为批内局部 index。
+    if ambiguous:
+        results, retry_indexes, time_indexes = await _semantic_refine(
+            ambiguous, results, retry_indexes, time_indexes,
+            [m.content for m in messages],
+        )
 
     # 合并回原批：子请求的 index 是相对本段列表的，需加 offset
     # （pipeline 用 batch[msg_index] 把结果映射回原消息）。

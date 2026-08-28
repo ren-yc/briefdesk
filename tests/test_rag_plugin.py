@@ -778,7 +778,7 @@ class PromptFlattenTest(unittest.TestCase):
 
         from briefdesk.plugins.rag.prompts import build_answer_prompt
 
-        history = [{"role": "user", "content": "第%d轮的历史消息内容" % i}
+        history = [{"role": "user", "content": f"第{i}轮的历史消息内容"}
                    for i in range(10)]
         messages = build_answer_prompt(
             datetime(2026, 1, 1, 12, 0, tzinfo=UTC), "问题？", [], history,

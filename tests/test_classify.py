@@ -1229,8 +1229,7 @@ class ExtractTimesTest(unittest.IsolatedAsyncioTestCase):
         def ok(idx: int):
             return self._resp(
                 "stop",
-                '{"task":"times","data":[{"index":%d,"times":[{"type":"start","time":"2026-03-15 14:00","label":"面试"}]}]}'
-                % idx,
+                '{"task":"times","data":[{"index":' + str(idx) + ',"times":[{"type":"start","time":"2026-03-15 14:00","label":"面试"}]}]}',
             )
 
         results = [
