@@ -285,8 +285,25 @@ async function _loadInlineSvg(img, src) {
 
 // 动态渲染（innerHTML 更新）后立即内联新增图标：
 // MutationObserver 回调在浏览器渲染前执行，缓存命中时替换是同步的，
-// 渲染与替换落在同一帧，不会出现黑色图标闪烁
-const _svgObserver = new MutationObserver(() => inlineSvgIcons());
+// 渲染与替换落在同一帧，不会出现黑色图标闪烁。
+//
+// 只扫新增子树，不做全文档 querySelectorAll：回调本身不能延后（放到
+// rAF/setTimeout 里会先绘制出黑色 <img> 再替换，反而闪烁），所以优化点
+// 在缩小扫描范围。列表整屏重渲染时原实现会对整个文档反复全扫，
+// 卡片数越多越明显。
+const _svgObserver = new MutationObserver((records) => {
+  for (const rec of records) {
+    for (const node of rec.addedNodes) {
+      if (node.nodeType !== 1) continue; // 只看元素节点
+      // 新增节点自身也可能就是图标
+      if (node.matches && node.matches("img.icon, img.icon-sm, img.icon-lg")) {
+        const src = node.getAttribute("src") || "";
+        if (src.endsWith(".svg")) _loadInlineSvg(node, src);
+      }
+      if (node.querySelectorAll) inlineSvgIcons(node);
+    }
+  }
+});
 _svgObserver.observe(document.body, { childList: true, subtree: true });
 
 window.addEventListener("beforeunload", () => {
@@ -2548,21 +2565,25 @@ function fadeOutCard(id) {
 }
 
 // 按 msg_time DESC 找到插入位置并插入（跳过日期分隔条）
+// 返回插入后的首个元素；插入 DocumentFragment 会把它的子节点搬进 DOM
+// 并清空自身，所以必须在插入前取好引用——原实现在插入后才读
+// frag.firstElementChild，因此恒返回 null。
 function insertBlockAtTime(html, timeSec) {
   const tpl = document.createElement("template");
   tpl.innerHTML = html.trim();
   const frag = tpl.content;
-  if (!frag.firstElementChild) return null;
+  const first = frag.firstElementChild;
+  if (!first) return null;
   const children = Array.from($itemsContainer.children);
   for (const child of children) {
     if (child.classList.contains("day-divider")) continue;
     if (timeSec > parseFloat(child.dataset.msgtime || "0")) {
       $itemsContainer.insertBefore(frag, child);
-      return frag.firstElementChild;
+      return first;
     }
   }
   $itemsContainer.appendChild(frag);
-  return frag.firstElementChild;
+  return first;
 }
 
 function findGroupHead(key) {
@@ -4376,6 +4397,10 @@ async function clearEnvSecret(name) {
 function showToast(message, { type = "info", duration = 3500, actionLabel = "", actionFn = null } = {}) {
   const el = document.createElement("div");
   el.className = "toast " + type;
+  // 容器是 aria-live="polite"，读屏会等当前朗读结束才播报。
+  // 错误提示需要打断（操作已失败，继续听完无意义），因此错误 toast
+  // 自带 role="alert"（等效 assertive），其余保持 polite 不打扰。
+  if (type === "error") el.setAttribute("role", "alert");
   const msg = document.createElement("span");
   msg.className = "toast-msg";
   msg.textContent = message;
@@ -5263,10 +5288,14 @@ async function openStatusPanel() {
   }
   const sources = Object.entries(status.sources || {});
   const rows = sources.map(([name, s]) => {
-    const st = s.status || "offline";
+    const raw = s.status || "offline";
+    // st 直接来自接口，此前被原样拼进 class 与文本：未知状态会造出一个
+    // 匹配不到任何规则的类名（徽章失去配色），文本也未转义。
+    // 收敛到已知状态白名单，未知一律按 offline 呈现并转义原值。
+    const st = Object.prototype.hasOwnProperty.call(_STATUS_LABELS, raw) ? raw : "offline";
     const icon = _STATUS_ICONS[st] || _STATUS_ICONS.offline;
     return '<div class="status-row"><img src="' + icon + '" class="icon-sm" alt="">' + esc(name) +
-      ' <span class="status ' + st + '">' + (_STATUS_LABELS[st] || st) + '</span></div>';
+      ' <span class="status ' + st + '">' + esc(_STATUS_LABELS[st] || raw) + '</span></div>';
   }).join("");
   const lastAbs = status.lastSync ? new Date(status.lastSync).toLocaleString("zh-CN") : "";
   const warnHtml = status.lastWarning

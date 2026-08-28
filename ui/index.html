@@ -9,7 +9,7 @@
   <!-- 默认 favicon（网格图标）；JS 启动后按随机主题色动态替换 -->
   <link rel="icon" type="image/svg+xml" href="/icons/layout-grid.svg">
   <link rel="stylesheet" href="/style.css">
-  <!-- 主题必须在首次绘制前落定：app.js 在 body 末尾且无 defer，若等到
+  <!-- 主题必须在首次绘制前落定：app.js 在 body 末尾且带 defer，若等到
        DOMContentLoaded 再 applyTheme()，深色用户每次刷新都会闪一次浅色。
        这段同步脚本刻意放在 <head> 内阻塞执行，与 app.js 的 initTheme 同源同 key。 -->
   <script>
@@ -258,7 +258,7 @@
             <h3 class="settings-section">启动配置（.env 暂存）</h3>
             <p class="text-muted settings-hint">修改将暂存到本机配置文件，<strong>重启应用后生效</strong>；密钥走系统钥匙串（见下方），不写入文件。环境变量级配置优先于暂存值。</p>
             <p class="text-muted settings-hint" id="env-file-path"></p>
-            <button id="env-save" class="settings-outline-btn" style="margin-top:6px">暂存更改</button>
+            <button id="env-save" class="settings-outline-btn env-save-btn">暂存更改</button>
             <div id="env-items"></div>
             <h3 class="settings-section settings-subsection">密钥（系统钥匙串）</h3>
             <p class="text-muted settings-hint">写入后<strong>重启应用生效</strong>；密钥只存系统钥匙串，服务端不会回传明文。</p>
@@ -339,7 +339,7 @@
       <h2>删除所选卡片？</h2>
       <p class="text-muted">将删除 <strong id="batch-confirm-n"></strong> 张卡片及其原文记录。<br>删除后无法恢复；相似内容的新消息可能重新出现。</p>
       <div class="modal-actions">
-        <button id="batch-confirm-delete" style="background:var(--danger);color:var(--on-accent);border-color:var(--danger)">确认删除</button>
+        <button id="batch-confirm-delete" class="btn-danger-solid">确认删除</button>
         <button id="batch-confirm-cancel">取消</button>
       </div>
     </div>
@@ -453,6 +453,8 @@
     <button id="new-items-bar-btn">查看</button>
   </div>
 
-  <script src="/app.js"></script>
+  <!-- defer：脚本已在 body 末尾（不阻塞解析），defer 让它与 HTML 解析并行下载，
+       并保证在 DOMContentLoaded 之前按序执行 -->
+  <script src="/app.js" defer></script>
 </body>
 </html>

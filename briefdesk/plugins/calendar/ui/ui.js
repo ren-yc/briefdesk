@@ -20,6 +20,10 @@
   let calAllItems = [];           // 日历原始数据（未过滤，供筛选开关重渲染）
   let calMonthItems = [];         // 当前月日历数据（供详情浮层查找）
   let calDetailItem = null;       // 日历详情浮层当前卡片
+  // 详情浮层里是否发生过改数据的操作（备忘/忽略/改分类）。
+  // 关闭时原先无条件 loadCalendar()：只是打开看一眼再关掉也会白跑一次
+  // /api/calendar 请求并整月重渲染。
+  let calDetailDirty = false;
 
   // ── 元素（init 时创建）──
   let $calendarBtn = null;
@@ -250,6 +254,7 @@
   function openCalDetail(item) {
     if (!item) return;
     calDetailItem = item;
+    calDetailDirty = false;
     $calDetailBody.innerHTML = renderItemRow(item, { cls: "cal-detail-row", showSubject: true, collapsible: false, showArticleLink: false });
     $calDetailModal.classList.remove("hidden");
     syncBodyScrollLock();
@@ -271,7 +276,9 @@
   function closeCalDetail() {
     $calDetailModal.classList.add("hidden");
     syncBodyScrollLock();
-    if (calendarMode) loadCalendar();
+    // 只在详情里真的改过数据时才重拉整月
+    if (calendarMode && calDetailDirty) loadCalendar();
+    calDetailDirty = false;
   }
 
   // ── 当日事件浮层（"+n" 入口）──
@@ -374,11 +381,12 @@
           rowOf: () => $calDetailBody.querySelector(".cal-detail-row"),
           closeBothOnRecat: false, // 日历详情：修正分类只收起同类菜单（保持原行为）
           copyItemOf: () => calDetailItem || {},
-          recatOption: (id, cat) => doRecategorize(id, cat),
+          recatOption: (id, cat) => { calDetailDirty = true; doRecategorize(id, cat); },
           verify: (id, btn, row) => {
             const isMemo = row.classList.contains("memo");
             const isIgnored = row.classList.contains("ignored");
             const value = btn.classList.contains("btn-memo") ? (isMemo ? 0 : 1) : (isIgnored ? 0 : -1);
+            calDetailDirty = true;
             verifyItem(id, value, row);
           },
         });

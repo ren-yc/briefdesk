@@ -7,10 +7,9 @@
   position: absolute; top: 40px; right: 22px; z-index: 30;
   display: flex; flex-direction: column; gap: 6px;
   background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-sm);
-  /* 与核心 .card-recat-menu 完全同形的浮层，阴影沿用同一个硬编码值：
-     深色模式下 rgba(0,0,0,.15) 几乎不可见，浮层与卡片糊在一起。
-     核心 --shadow 亦随主题切换，这里跟随它并保留一层加深投影。 */
-  box-shadow: var(--shadow), 0 6px 20px color-mix(in srgb, var(--text) 14%, transparent);
+  /* 与核心 .card-recat-menu 同形的浮层，用同一档抬升令牌（--shadow-lg），
+     不再自带硬编码阴影：深色下 rgba(0,0,0,.15) 几乎不可见。 */
+  box-shadow: var(--shadow-lg);
   padding: 10px; min-width: 220px;
 }
 .card-remind-menu.hidden { display: none; }

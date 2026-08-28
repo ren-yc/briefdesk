@@ -18,7 +18,13 @@
   --danger:    #C81E1E;
   --radius:    10px;
   --radius-sm: 6px;
-  --shadow:    0 1px 2px rgba(0,0,0,.04), 0 2px 8px rgba(0,0,0,.06);
+  /* 抬升阶梯（四档）。此前只有 --shadow 一档，另外 11 处浮层各自写死
+     rgba(0,0,0,…)：深色模式下黑影叠在深色背景上等于没有阴影，菜单/弹窗
+     与底层糊成一片。四档按"离页面多远"划分，深浅两套各自调 alpha。 */
+  --shadow:    0 1px 2px rgba(0,0,0,.04), 0 2px 8px rgba(0,0,0,.06);   /* 静置：卡片 */
+  --shadow-md: 0 1px 3px rgba(0,0,0,.06), 0 4px 16px rgba(0,0,0,.08);  /* 悬停抬起 */
+  --shadow-lg: 0 4px 16px rgba(0,0,0,.12);                             /* 菜单/下拉/toast */
+  --shadow-xl: 0 8px 40px rgba(0,0,0,.18);                             /* 模态/浮层 */
   --sidebar-w: 200px;
 
   /* 类别色现由数据库下发（见 briefdesk/db.py 的默认调色板），JS 以行内
@@ -152,7 +158,9 @@ body {
 .sync-btn, .top-settings-link {
   font-size: 13px; font-weight: 500;
   padding: 5px 14px; border-radius: var(--radius-sm);
-  cursor: pointer; transition: all .15s;
+  /* transition: all 会把 width/height 等尺寸属性也纳入动画，每帧触发布局；
+     且日后新增任何属性都会被动画化。这些控件实际只变色，逐一具名。 */
+  cursor: pointer; transition: background .15s, color .15s, border-color .15s, opacity .15s;
   text-decoration: none;
   font-family: inherit;
 }
@@ -236,7 +244,7 @@ mark { background: var(--accent-lt); color: var(--accent); border-radius: 2px; p
   padding: 7px 12px; border-radius: var(--radius-sm);
   text-decoration: none; color: var(--text-2);
   font-size: 13px; font-weight: 500;
-  transition: all .12s;
+  transition: background .12s, color .12s;
 }
 .cat-icon { color: var(--cat-default); }
 .cat-link:hover { background: var(--bg); color: var(--text); }
@@ -291,7 +299,7 @@ mark { background: var(--accent-lt); color: var(--accent); border-radius: 2px; p
   border-left: 4px solid var(--cat, var(--cat-default));
   transition: box-shadow .15s, opacity .3s;
 }
-.item-card:hover { box-shadow: 0 1px 3px rgba(0,0,0,.06), 0 4px 16px rgba(0,0,0,.08); }
+.item-card:hover { box-shadow: var(--shadow-md); }
 .item-card.memo { border-left-color: var(--memo); }
 /* 弱化"已忽略"但保持可读：opacity .45 会把正文压到 2.83:1，而侧边栏
    「已忽略」是一个主视图（整屏皆为此类卡片）。改用 .7 + 降饱和承担弱化观感。 */
@@ -327,7 +335,7 @@ mark { background: var(--accent-lt); color: var(--accent); border-radius: 2px; p
   font-size: 11px; line-height: 1.5;
   padding: 4px 10px; border-radius: 5px;
   white-space: nowrap; z-index: 40;
-  box-shadow: 0 4px 12px rgba(0,0,0,.18);
+  box-shadow: var(--shadow-lg);
   pointer-events: none;
 }
 .card-time[data-tooltip]:hover::before {
@@ -421,7 +429,8 @@ mark { background: var(--accent-lt); color: var(--accent); border-radius: 2px; p
 .card-actions button {
   padding: 4px 16px; border-radius: var(--radius-sm);
   border: 1px solid var(--border); background: var(--surface);
-  font-size: 12px; font-weight: 500; cursor: pointer; transition: all .12s;
+  font-size: 12px; font-weight: 500; cursor: pointer;
+  transition: background .12s, color .12s, border-color .12s;
   font-family: inherit;
 }
 .card-actions button:hover { background: var(--bg); }
@@ -491,7 +500,7 @@ body.modal-open { overflow: hidden; }
 .modal-content {
   background: var(--surface); border-radius: var(--radius);
   padding: 24px 28px; width: 440px; max-width: calc(100vw - 32px); max-height: 80vh; overflow-y: auto;
-  box-shadow: 0 8px 40px rgba(0,0,0,.12);
+  box-shadow: var(--shadow-xl);
 }
 .modal-content h2 { font-size: 16px; font-weight: 600; margin-bottom: 18px; color: var(--text); }
 
@@ -707,6 +716,13 @@ body.modal-open { overflow: hidden; }
 
 .text-muted { color: var(--text-3); font-size: 12px; }
 
+/* 原先写在 index.html 里的两处 style= 内联样式，移入样式表 */
+.env-save-btn { margin-top: 6px; }
+.btn-danger-solid {
+  background: var(--danger); color: var(--on-accent); border-color: var(--danger);
+}
+.btn-danger-solid:hover { background: color-mix(in srgb, var(--danger) 85%, black); }
+
 /* ── Lightbox ── */
 .lightbox {
   position: fixed; inset: 0; z-index: 200;
@@ -762,7 +778,8 @@ body.modal-open { overflow: hidden; }
   width: calc(50% - 2px); height: calc(100% - 4px);
   border-radius: 999px;
   background: var(--accent);
-  box-shadow: 0 1px 4px rgba(27,94,65,.28);
+  /* 原写死 rgba(27,94,65,…) 即旧墨绿字面值：主题色一变就不跟随 */
+  box-shadow: 0 1px 4px color-mix(in srgb, var(--accent) 28%, transparent);
   transition: transform .35s cubic-bezier(.22,1,.36,1);
 }
 .seg[data-active="expanded"] .seg-pill { transform: translateX(100%); }
@@ -793,7 +810,7 @@ body.modal-open { overflow: hidden; }
 }
 /* 整体联动：悬停面板任意处，头与卡一起浮起 */
 .group-collapsed:hover {
-  box-shadow: 0 1px 3px rgba(0,0,0,.06), 0 6px 20px rgba(0,0,0,.10);
+  box-shadow: var(--shadow-md);
   transform: translateY(-1px);
 }
 @media (prefers-reduced-motion: reduce) {
@@ -933,7 +950,7 @@ body.modal-open { overflow: hidden; }
   padding: 3px 14px; border-radius: var(--radius-sm);
   border: 1px solid var(--border); background: var(--surface);
   font-size: 12px; font-weight: 500; cursor: pointer; font-family: inherit;
-  transition: all .12s;
+  transition: background .12s, color .12s, border-color .12s;
 }
 .ov-actions button:hover { background: var(--bg); }
 
@@ -993,7 +1010,7 @@ body.modal-open { overflow: hidden; }
   display: flex; align-items: center; gap: 10px;
   background: var(--surface); color: var(--text);
   border: 1px solid var(--border); border-left: 4px solid var(--accent);
-  border-radius: var(--radius-sm); box-shadow: 0 4px 16px rgba(0,0,0,.12);
+  border-radius: var(--radius-sm); box-shadow: var(--shadow-lg);
   padding: 10px 12px; font-size: 13px;
   animation: toastIn .22s cubic-bezier(.22,1,.36,1);
 }
@@ -1025,7 +1042,7 @@ body.modal-open { overflow: hidden; }
   display: flex; align-items: center; gap: 10px;
   background: var(--accent); color: var(--on-accent); border-radius: 999px;
   padding: 7px 8px 7px 18px; font-size: 13px; font-weight: 500;
-  box-shadow: 0 4px 16px rgba(27,94,65,.35);
+  box-shadow: 0 4px 16px color-mix(in srgb, var(--accent) 35%, transparent);
   animation: newBarIn .25s cubic-bezier(.22,1,.36,1);
 }
 .new-items-bar button {
@@ -1100,7 +1117,7 @@ body.modal-open { overflow: hidden; }
   padding: 3px 12px; border-radius: 999px;
   border: 1px solid var(--border); background: var(--surface); color: var(--text-2);
   font-size: 12px; cursor: pointer; font-family: inherit;
-  transition: all .12s;
+  transition: background .12s, color .12s, border-color .12s;
 }
 .filter-chip:hover { background: var(--bg); color: var(--text); }
 .filter-chip.active { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
@@ -1135,7 +1152,11 @@ body.modal-open { overflow: hidden; }
   --accent-lt: #123527;
   --warn:      #FBBF24;
   --danger:    #F87171;
+  /* 深色下阴影要压得更重才能形成层次；菜单类另有 1px --border 收边辅助 */
   --shadow:    0 1px 2px rgba(0,0,0,.35), 0 2px 8px rgba(0,0,0,.45);
+  --shadow-md: 0 2px 6px rgba(0,0,0,.45), 0 6px 20px rgba(0,0,0,.55);
+  --shadow-lg: 0 6px 20px rgba(0,0,0,.6);
+  --shadow-xl: 0 12px 48px rgba(0,0,0,.7);
   --status-ok-bg:  #123527;
   --status-warn-bg: #3A2B0A;
   --status-danger-bg: #3B1D1D;
@@ -1170,7 +1191,7 @@ body.modal-open { overflow: hidden; }
   position: absolute; top: calc(100% + 10px); right: 0; z-index: 120;
   width: 300px; max-width: calc(100vw - 24px);
   background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);
-  box-shadow: 0 8px 40px rgba(0,0,0,.18);
+  box-shadow: var(--shadow-xl);
   padding: 14px 16px; font-size: 13px;
 }
 .status-popover.hidden { display: none; }
@@ -1200,7 +1221,7 @@ body.modal-open { overflow: hidden; }
   font-size: 12px; font-weight: 500; padding: 3px 12px; border-radius: var(--radius-sm);
   border: 1px solid var(--border); background: var(--surface); color: var(--text-2);
   cursor: pointer; font-family: inherit; display: inline-flex; align-items: center; gap: 4px;
-  transition: all .15s;
+  transition: background .15s, color .15s, border-color .15s;
 }
 .batch-toggle-btn:hover { background: var(--bg); color: var(--text); }
 .batch-toggle-btn.active { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
@@ -1235,7 +1256,7 @@ body.modal-open { overflow: hidden; }
   position: fixed; bottom: 18px; left: 50%; transform: translateX(-50%); z-index: 95;
   display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
   background: var(--surface); border: 1px solid var(--border); border-radius: 999px;
-  padding: 8px 14px; box-shadow: 0 6px 24px rgba(0,0,0,.18);
+  padding: 8px 14px; box-shadow: var(--shadow-lg);
 }
 .batch-bar.hidden { display: none; }
 .batch-count { font-size: 13px; font-weight: 600; color: var(--text); margin-right: 4px; white-space: nowrap; }
@@ -1243,7 +1264,8 @@ body.modal-open { overflow: hidden; }
 .batch-bar button {
   border: 1px solid var(--border); background: var(--surface); color: var(--text-2);
   font-size: 12px; font-weight: 500; padding: 4px 12px; border-radius: 999px;
-  cursor: pointer; font-family: inherit; transition: all .12s;
+  cursor: pointer; font-family: inherit;
+  transition: background .12s, color .12s, border-color .12s;
 }
 .batch-bar button:hover { background: var(--bg); color: var(--text); }
 .batch-bar .batch-danger { color: var(--danger); border-color: var(--danger); }
@@ -1255,7 +1277,8 @@ body.modal-open { overflow: hidden; }
 .load-more-btn {
   padding: 7px 26px; border-radius: 999px; border: 1px solid var(--border);
   background: var(--surface); color: var(--text-2); font-size: 13px; font-weight: 500;
-  cursor: pointer; font-family: inherit; transition: all .12s;
+  cursor: pointer; font-family: inherit;
+  transition: background .12s, color .12s, border-color .12s, opacity .12s;
 }
 .load-more-btn:hover { background: var(--bg); color: var(--text); border-color: var(--accent); }
 .load-more-btn:disabled { opacity: .6; cursor: default; }
@@ -1266,7 +1289,7 @@ body.modal-open { overflow: hidden; }
   position: absolute; top: 40px; right: 22px; z-index: 30;
   display: flex; flex-direction: column; min-width: 120px;
   background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-sm);
-  box-shadow: 0 6px 20px rgba(0,0,0,.15); padding: 4px; max-height: 240px; overflow-y: auto;
+  box-shadow: var(--shadow-lg); padding: 4px; max-height: 240px; overflow-y: auto;
 }
 .card-recat-menu.hidden { display: none; }
 /* 分类菜单锚定到「修改分类」按钮处：包裹容器为定位上下文，菜单出现在按钮正上方且左对齐 */
@@ -1377,7 +1400,7 @@ body.modal-open { overflow: hidden; }
   position: absolute; top: calc(100% + 4px); left: 0; z-index: 50;
   width: 100%; box-sizing: border-box;
   background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-sm);
-  box-shadow: 0 6px 20px rgba(0,0,0,.15); padding: 4px;
+  box-shadow: var(--shadow-lg); padding: 4px;
 }
 .search-history-dropdown.hidden { display: none; }
 .search-history-head {
@@ -1454,7 +1477,7 @@ body.modal-open { overflow: hidden; }
   position: absolute; top: auto; bottom: calc(100% + 6px); left: 0; right: auto;
   z-index: 30; display: flex; flex-direction: column; min-width: 150px;
   background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-sm);
-  box-shadow: 0 6px 20px rgba(0,0,0,.15); padding: 4px; max-height: 260px; overflow-y: auto;
+  box-shadow: var(--shadow-lg); padding: 4px; max-height: 260px; overflow-y: auto;
 }
 .card-more-menu.hidden { display: none; }
 .more-option {
@@ -1624,7 +1647,7 @@ body.modal-open { overflow: hidden; }
   padding: 6px 16px; border-radius: 999px;
   border: 1px solid var(--border); background: var(--surface); color: var(--text-2);
   font-size: 13px; cursor: pointer; font-family: inherit;
-  transition: all .12s; margin-bottom: 0; user-select: none;
+  transition: background .12s, color .12s; margin-bottom: 0; user-select: none;
 }
 .env-chip input { display: none; }
 .env-row label.env-chip:hover { background: var(--bg); color: var(--text); }

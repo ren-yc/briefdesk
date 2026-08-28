@@ -193,3 +193,51 @@ def test_no_stale_warning_alias_or_legacy_accent_fallback() -> None:
     assert "--warning" not in css, "--warning 是未定义令牌，请使用 --warn"
     stale = re.findall(r"var\(\s*--accent\s*,\s*#[0-9A-Fa-f]{3,6}\s*\)", css)
     assert not stale, f"--accent 不应带旧主题色回退: {stale}"
+
+def test_elevation_shadows_are_tokenised_and_theme_aware() -> None:
+    """浮层阴影必须走 --shadow* 令牌，且深浅两套都定义。
+
+    背景：核心曾有 11 处浮层各自写死 ``rgba(0,0,0,…)``。深色模式下
+    黑影叠在深色背景上几乎不可见，菜单/弹窗与底层糊成一片——这类回归
+    不会报错，只会"看起来怪"，所以用测试钉住。
+
+    唯一豁免 ``#lightbox-img``：它浮在自带的 ``rgba(0,0,0,.88)`` 遮罩上，
+    不随主题变化，固定深色投影才是正确的。
+    """
+    light, dark = _tokens()
+    for token in ("--shadow", "--shadow-md", "--shadow-lg", "--shadow-xl"):
+        assert token in light, f":root 缺少 {token}"
+        assert token in dark, f"深色块缺少 {token}（浮层在深色下会失去层次）"
+
+    css = STYLE.read_text(encoding="utf-8")
+    body = _strip_comments(css)
+    offenders: list[str] = []
+    for match in re.finditer(r"box-shadow:\s*([^;}]+)", body):
+        value = match.group(1)
+        if "rgba(0,0,0" not in value.replace(" ", ""):
+            continue
+        # 定位所属选择器：向前找最近的 "{" 前的选择器文本
+        head = body.rfind("{", 0, match.start())
+        selector = body[body.rfind("}", 0, head) + 1 : head].strip().splitlines()[-1]
+        if "#lightbox-img" in selector:
+            continue
+        offenders.append(f"{selector.strip()} → {value.strip()[:48]}")
+    assert not offenders, (
+        "以下浮层写死了黑色阴影，深色模式下会失去层次，请改用 "
+        "--shadow / --shadow-md / --shadow-lg / --shadow-xl:\n"
+        + "\n".join(offenders)
+    )
+
+
+def test_brand_coloured_shadows_follow_accent_token() -> None:
+    """带品牌色的阴影不得写死旧主题色字面值。
+
+    ``.seg-pill`` 与 ``.new-items-bar`` 曾写死 ``rgba(27,94,65,…)``
+    （旧墨绿的字面值）：改主题色时这两处不跟随，且深色模式下依然是暗绿。
+    """
+    css = _strip_comments(STYLE.read_text(encoding="utf-8"))
+    literal = re.findall(r"rgba\(\s*27\s*,\s*94\s*,\s*65", css)
+    assert not literal, (
+        "发现写死的旧主题色 rgba(27,94,65,…)，请改用 "
+        "color-mix(in srgb, var(--accent) N%, transparent)"
+    )
