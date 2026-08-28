@@ -71,7 +71,7 @@ class Settings(BaseSettings):
         default=180000, alias="REALTIME_BATCH_TIMEOUT_MS", gt=0
     )
     backfill_batch_max_count: int = Field(
-        default=20, alias="BACKFILL_BATCH_MAX_COUNT", gt=0
+        default=10, alias="BACKFILL_BATCH_MAX_COUNT", gt=0
     )
 
     poll_overlap_seconds: int = Field(default=300, alias="POLL_OVERLAP_SECONDS", ge=0)

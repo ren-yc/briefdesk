@@ -2062,6 +2062,38 @@ class DefaultCategoriesUpgradeTest(_InMemoryDbTest):
         row = await cursor.fetchone()
         self.assertEqual(row["cnt"], 0, "迁移完成后用户的删除必须被尊重")
 
+    async def test_activity_notice_prompt_migrates_once_respecting_edits(self):
+        # C3：活动通知口径 v1→v2——旧版原文才更新、已编辑行不动、只跑一次
+        from briefdesk.db import (
+            _ACTIVITY_NOTICE_NEW_PROMPT,
+            _ACTIVITY_NOTICE_OLD_PROMPT,
+        )
+
+        async def _notice_prompt() -> str:
+            cursor = await self.db.execute(
+                "SELECT prompt FROM categories WHERE name = '活动通知'"
+            )
+            row = await cursor.fetchone()
+            return row["prompt"]
+
+        await self.db.execute("PRAGMA user_version = 1")
+        await self.db.execute(
+            "UPDATE categories SET prompt = ? WHERE name = '活动通知'",
+            (_ACTIVITY_NOTICE_OLD_PROMPT,),
+        )
+        await self.db.commit()
+        await init_schema(self.db)
+        self.assertEqual(await _notice_prompt(), _ACTIVITY_NOTICE_NEW_PROMPT)
+
+        # 只跑一次：此后（含用户改回旧文案）不再被覆盖
+        await self.db.execute(
+            "UPDATE categories SET prompt = ? WHERE name = '活动通知'",
+            (_ACTIVITY_NOTICE_OLD_PROMPT,),
+        )
+        await self.db.commit()
+        await init_schema(self.db)
+        self.assertEqual(await _notice_prompt(), _ACTIVITY_NOTICE_OLD_PROMPT)
+
 
 if __name__ == "__main__":
     unittest.main()

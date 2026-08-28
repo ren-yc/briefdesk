@@ -618,6 +618,14 @@ class RagRetrieveTest(_MemoryEngineBase):
         self.assertEqual([h.chunk.msg_id for h in hits], ["m1"])
         self.assertTrue(hits[0].has_fts)
 
+    async def test_query_embed_failure_degrades_to_fts_only(self):
+        # F4：查询嵌入失败不再整体拒答——降级 FTS-only，可命中问题仍可回答
+        self.provider.embed_texts = AsyncMock(side_effect=RuntimeError("端点不可达"))
+        hits = await self.engine.retrieve("开会有通知")
+        assert hits is not None
+        self.assertEqual([h.chunk.msg_id for h in hits], ["m1"])
+        self.assertTrue(hits[0].has_fts)
+
     async def test_session_filter_scopes_both_legs(self):
         hits = await self.engine.retrieve("周六6点开会有通知", session_id="s2")
         assert hits is not None
@@ -763,6 +771,22 @@ class PromptFlattenTest(unittest.TestCase):
         self.assertIn("对话历史：", user)
         self.assertIn("xx活动周六吗", user)
         self.assertIn("周六6点 [1]。", user)
+
+    def test_history_trimmed_over_cap(self):
+        # P7：长历史裁剪——只保留最近 6 轮，并标注省略条数
+        from datetime import UTC, datetime
+
+        from briefdesk.plugins.rag.prompts import build_answer_prompt
+
+        history = [{"role": "user", "content": "第%d轮的历史消息内容" % i}
+                   for i in range(10)]
+        messages = build_answer_prompt(
+            datetime(2026, 1, 1, 12, 0, tzinfo=UTC), "问题？", [], history,
+        )
+        user = messages[1]["content"]
+        self.assertIn("更早的 4 条对话已省略", user)
+        self.assertNotIn("第0轮", user)
+        self.assertIn("第9轮", user)
 
 
     def test_evidence_truncated_over_cap(self):

@@ -12,6 +12,7 @@
 
 import json
 import logging
+import re
 
 from briefdesk.ai_ports import chat, loads_json
 
@@ -137,12 +138,25 @@ _TITLE_USER_TEMPLATE = """原标题：{old_title}
 内容：{quote}"""
 
 
+_TITLE_PLACEHOLDER_RE = re.compile(r"\{([a-z_]+)\}")
+
+
+def _fill_template(template: str, mapping: dict[str, str]) -> str:
+    """单遍占位符填充：数据值里的字面量占位符不会被二次替换（P6）。
+
+    顺序 replace 链在 old_title 含 "{key_info}" 之类的字面量时会误替换；
+    单遍正则只命中模板自身的占位符，数据值不再扫描。
+    """
+    return _TITLE_PLACEHOLDER_RE.sub(
+        lambda m: mapping.get(m.group(1), m.group(0)), template
+    )
+
+
 def _build_title_user_message(old_title: str, key_info: str, quote: str) -> str:
-    """填充重拟标题 user 消息（用 replace 而非 format：数据可能含花括号）。"""
-    return (
-        _TITLE_USER_TEMPLATE.replace("{old_title}", old_title)
-        .replace("{key_info}", key_info)
-        .replace("{quote}", quote)
+    """填充重拟标题 user 消息（单遍替换，数据含占位符字面量也不误伤）。"""
+    return _fill_template(
+        _TITLE_USER_TEMPLATE,
+        {"old_title": old_title, "key_info": key_info, "quote": quote},
     )
 
 

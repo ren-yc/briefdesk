@@ -447,11 +447,15 @@ class RagEngine:
         cleaned = question.strip()
         if not cleaned:
             return None
+        q_vec: list[float] | None = None
         try:
             q_vec = (await ai_ports.embed_texts([cleaned]))[0]
         except Exception:
-            logger.exception("rag: 查询嵌入失败")
-            return None
+            # F4：嵌入端点故障不应连坐关键词问答——降级 FTS-only，仍可回答可命中问题
+            logger.warning(
+                "rag: 查询嵌入失败，降级为 FTS-only 检索（仅关键词可命中）",
+                exc_info=True,
+            )
         db = await self._ensure_db_ready()
         async with self._refresh_lock:
             await self._refresh_vector_cache()
@@ -472,7 +476,7 @@ class RagEngine:
         # 向量腿：预组 float32 矩阵上做作用域/收窄过滤（会话元组判定，
         # 跨源撞名安全；缓存填充时已按白名单过滤，这里再按查询参数收窄）
         vec_hits: list[tuple[ChunkRow, float]] = []
-        if self._matrix is not None and self._matrix_keys:
+        if q_vec is not None and self._matrix is not None and self._matrix_keys:
             idxs = [
                 i
                 for i, sess in enumerate(self._matrix_sessions)

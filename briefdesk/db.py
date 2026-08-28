@@ -47,7 +47,7 @@ logger = logging.getLogger(__name__)
 DEFAULT_CATEGORIES: list[tuple[str, str, str, int]] = [
     (
         "活动通知",
-        "宣布一场可到场参加的具体事件、教学日程或其变更声明。收录：①事件性内容（讲座、比赛、演出、聚会、社团活动、展览、运动会、课程安排、考试等）②具体时间③地点或线上平台④主题名称——①②必须满足，③④至少满足其一；原事件的改期、延期、取消声明即使新时间未定也收录。排除：各类找人召集（纳新成员、志愿者或工作人员、同伴拼团组队）、物品买卖转让求购、交材料申领资金的申报机会、零对价赠送领取、寻物寻主启事。判别：读者到场参与即完成参与→本类；比赛奖金只是诱因属性进关键词；含现场投递的宣讲会、义卖市集、招观众充场均按本类处理。",
+        "宣布一场可到场参加的具体事件、教学日程或其变更声明。收录：①事件性内容（讲座、比赛、演出、聚会、社团活动、展览、运动会、课程安排、考试等）②具体时间③地点或线上平台④主题名称——①②必须满足，③④至少满足其一；原事件的改期、延期、取消声明即使新时间未定也收录。排除：各类找人召集（纳新成员、志愿者或工作人员、同伴拼团组队）、物品买卖转让求购、交材料申领资金的申报机会、零对价赠送领取、寻物寻主启事。判别：读者到场参与即完成参与→本类；比赛奖金只是诱因属性进关键词；含现场投递的宣讲会、义卖市集、招观众充场均按本类处理。；面向全群的多项任务/材料提交截止通知（含各项截止日期）按本类收录。",
         "#2563EB",
         1,
     ),
@@ -729,6 +729,7 @@ async def init_schema(db: aiosqlite.Connection) -> None:
 
     await _seed_default_categories(db)
     await _backfill_default_categories(db)
+    await _migrate_activity_notice_prompt(db)
     await db.commit()
 
 
@@ -750,6 +751,28 @@ async def _seed_default_categories(db: aiosqlite.Connection) -> None:
         ],
     )
     await cursor.close()
+
+
+# C3：活动通知口径修订（user_version 1→2）。仅当现有行仍是旧版原文时更新——
+# 用户已自行编辑过该分类则尊重，绝不覆盖；幂等由 PRAGMA user_version 门控。
+_ACTIVITY_NOTICE_OLD_PROMPT = "宣布一场可到场参加的具体事件、教学日程或其变更声明。收录：①事件性内容（讲座、比赛、演出、聚会、社团活动、展览、运动会、课程安排、考试等）②具体时间③地点或线上平台④主题名称——①②必须满足，③④至少满足其一；原事件的改期、延期、取消声明即使新时间未定也收录。排除：各类找人召集（纳新成员、志愿者或工作人员、同伴拼团组队）、物品买卖转让求购、交材料申领资金的申报机会、零对价赠送领取、寻物寻主启事。判别：读者到场参与即完成参与→本类；比赛奖金只是诱因属性进关键词；含现场投递的宣讲会、义卖市集、招观众充场均按本类处理。"
+_ACTIVITY_NOTICE_NEW_PROMPT = "宣布一场可到场参加的具体事件、教学日程或其变更声明。收录：①事件性内容（讲座、比赛、演出、聚会、社团活动、展览、运动会、课程安排、考试等）②具体时间③地点或线上平台④主题名称——①②必须满足，③④至少满足其一；原事件的改期、延期、取消声明即使新时间未定也收录。排除：各类找人召集（纳新成员、志愿者或工作人员、同伴拼团组队）、物品买卖转让求购、交材料申领资金的申报机会、零对价赠送领取、寻物寻主启事。判别：读者到场参与即完成参与→本类；比赛奖金只是诱因属性进关键词；含现场投递的宣讲会、义卖市集、招观众充场均按本类处理。；面向全群的多项任务/材料提交截止通知（含各项截止日期）按本类收录。"
+
+
+async def _migrate_activity_notice_prompt(db: aiosqlite.Connection) -> None:
+    """一次性升级迁移（user_version 1→2）：活动通知口径追加多任务/材料截止收录。"""
+    row = await _fetchone(db, "PRAGMA user_version")
+    version = 0
+    if row is not None:
+        raw: Any = row[0] if not isinstance(row, dict) else row.get("user_version")
+        version = raw or 0
+    if version >= 2:
+        return
+    await db.execute(
+        "UPDATE categories SET prompt = ? WHERE name = ? AND prompt = ?",
+        (_ACTIVITY_NOTICE_NEW_PROMPT, "活动通知", _ACTIVITY_NOTICE_OLD_PROMPT),
+    )
+    await db.execute("PRAGMA user_version = 2")
 
 
 async def _backfill_default_categories(db: aiosqlite.Connection) -> None:

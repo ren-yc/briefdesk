@@ -21,7 +21,9 @@ from briefdesk.realtime import publish_items_updated
 from briefdesk.server.app import app
 
 _NAME_MAX = 20
-_PROMPT_MAX = 50
+# F5: 50 字上限与默认类别 prompt（均 >50 字，含"①…②…"细则）矛盾，导致现有类别
+# 无法经 UI 编辑（任何整句重写要么超限被拒、要么丢失细则）。放宽为 200。
+_PROMPT_MAX = 200
 _COLOR_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
 
 

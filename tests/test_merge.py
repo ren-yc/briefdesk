@@ -151,6 +151,13 @@ class TitleRegenerationTest(unittest.TestCase):
         self.assertIn("45, 运费AA", p)
         self.assertIn("团购\n面交", p)
 
+    def test_title_data_with_literal_placeholder_not_double_replaced(self):
+        # P6：数据值的占位符字面量不得被后续 replace 二次替换（单遍填充）
+        p = _build_title_user_message("{key_info}", "{quote}", "旧标题 {old_title}")
+        self.assertIn("原标题：{key_info}", p)
+        self.assertIn("关键信息：{quote}", p)
+        self.assertIn("内容：旧标题 {old_title}", p)
+
     def test_system_prompt_rules_only(self):
         self.assertIn('{"title":"新标题"}', TITLE_PROMPT)
         self.assertNotIn("原标题：", TITLE_PROMPT)

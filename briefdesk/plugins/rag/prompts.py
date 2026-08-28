@@ -9,6 +9,11 @@ if TYPE_CHECKING:
     from briefdesk.plugins.rag.engine import Hit
 
 
+# P7：对话历史裁剪（保留最近轮数 / 单条字符上限）
+_HISTORY_MAX_MESSAGES = 6
+_HISTORY_MAX_CHARS = 200
+
+
 def build_answer_prompt(
     now: datetime,
     question: str,
@@ -53,9 +58,18 @@ def build_answer_prompt(
         "7. 证据行以「…」结尾表示该条原文较长、已被截断；不要臆测未显示的部分。"
     )
     now_stamp = now.strftime("%Y-%m-%d %H:%M")
+    # P7 防长历史推高输入：只保留最近若干轮，单条超长截断（证据块已有上限，历史缺）
+    raw_history = history or []
+    kept = raw_history[-_HISTORY_MAX_MESSAGES:]
+    dropped = len(raw_history) - len(kept)
     history_block = "\n".join(
-        f"{h.get('role', 'user')}: {h.get('content', '')}" for h in (history or [])
+        f"{h.get('role', 'user')}: {(h.get('content', '') or '')[: _HISTORY_MAX_CHARS]}"
+        for h in kept
     )
+    if dropped:
+        history_block = (
+            f"……（更早的 {dropped} 条对话已省略）\n" + history_block
+        )
     user = (
         f"当前时间：{now_stamp}\n\n"
         + (f"对话历史：\n{history_block}\n\n" if history else "")
