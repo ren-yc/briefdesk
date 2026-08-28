@@ -4116,15 +4116,48 @@ function collectAllOps() {
   return ops;
 }
 
-// 通用 POST JSON 辅助：body 为 undefined 时不带请求体；非 2xx 抛错
-async function postJson(url, body) {
+// ── HTTP 单源：全部 JSON 接口调用只走这一层 ──
+// 此前 30+ 个站点各自手抄 fetch + res.ok 判断，错误形状分裂成 6 种
+// （`HTTP ${status}` / "HTTP " + status / 静默 return / 置 null / 只 console /
+// 什么都不查），同一个 500 在不同入口表现不同，排障时无从对齐。现在错误形状
+// 只有一种：非 2xx 抛 `HTTP <code>`。「失败静默降级」的调用点写
+// `.catch(() => null)`——把降级意图摊在调用点上，而非藏进各自的 res.ok 分支。
+async function reqJson(url, { method = "GET", body } = {}) {
   const res = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
+    method,
+    // 无体请求显式不带 Content-Type（GET/DELETE 及纯触发式 POST）
+    headers: body === undefined ? undefined : { "Content-Type": "application/json" },
     body: body === undefined ? undefined : JSON.stringify(body),
   });
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   return res.json();
+}
+
+// 以下薄封装刻意用 function 声明而非 const 箭头：插件前端以同源 classic script
+// 注入、共享全局作用域，function 声明会挂到 window 上（const 不会），插件既可
+// 裸名调用也可 window.postJson 取用。收敛内部实现不该顺手收窄这层对外契约。
+function getJson(url) {
+  return reqJson(url);
+}
+
+// body 为 undefined 时不带请求体（部分接口是纯触发式 POST）
+function postJson(url, body) {
+  return reqJson(url, { method: "POST", body });
+}
+
+function putJson(url, body) {
+  return reqJson(url, { method: "PUT", body });
+}
+
+function deleteJson(url) {
+  return reqJson(url, { method: "DELETE" });
+}
+
+// 卡片标记（备忘录 1 / 忽略 -1 / 未处理 0）的唯一写入口：4 处调用点
+// （单卡 verifyItem、撤销 undoVerify、批量撤销 restoreBatch、时间线
+// timelineVerify）曾各自手抄同一 POST，其中 3 处漏了 id 的 encodeURIComponent。
+function postVerify(id, value) {
+  return postJson("/api/items/" + encodeURIComponent(id) + "/verify", { verified: value });
 }
 
 // 执行设置变更操作列表（保存时或同步完成后共用）；失败抛错由调用方处理
