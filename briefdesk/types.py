@@ -241,11 +241,9 @@ class BatchContext:
     messages: list[InternalMessage]
     client: SourceClient  # OCR 等需下载媒体的阶段使用（TYPE_CHECKING 引用，避免环）
     outcomes: ClassifyOutcome | None = None  # classify 阶段填充
-    rows: list[
-        tuple[InternalMessage, ClassifyResult, str, str, list[float] | None]
-    ] = field(
+    rows: list[tuple[InternalMessage, ClassifyResult, str, list[float] | None]] = field(
         default_factory=list
-    )  # dedup 阶段锁外规划：（消息/结果/标题/描述/预嵌入向量）
+    )  # dedup 阶段锁外规划：（消息/结果/标题/预嵌入向量）；原文取 msg.content，不另存副本
     inserted: list[InsertedRow] = field(default_factory=list)  # dedup 阶段入库行
     dupes: int = 0  # 判重命中数（dedup 阶段累加）
     skipped: int = 0  # 闲聊跳过数（骨架标记 processed 时累加）

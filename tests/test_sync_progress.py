@@ -33,7 +33,12 @@ from briefdesk.status import (
     note_sync_batch_start,
     reset_sync_progress,
 )
-from briefdesk.types import ClassifyOutcome, ClassifyResult, InternalMessage
+from briefdesk.types import (
+    ClassifyOutcome,
+    ClassifyResult,
+    DedupResult,
+    InternalMessage,
+)
 
 # ── 复用的测试小工具（与 test_pipeline.py 保持一致的装配方式）──
 
@@ -94,12 +99,12 @@ def _install_merge_stage():
 
 
 def _dedup_engine_mock():
-    from types import SimpleNamespace
     from unittest.mock import Mock
 
     return Mock(
         preembed_batch=AsyncMock(return_value=None),
-        check_dedup=AsyncMock(return_value=SimpleNamespace(is_duplicate=False)),
+        # 用真实契约类型而非 SimpleNamespace：假引擎缺字段应当在此暴露
+        check_dedup=AsyncMock(return_value=DedupResult(is_duplicate=False)),
         add_to_cache=Mock(),
         flush_pending_embeddings=AsyncMock(),
     )

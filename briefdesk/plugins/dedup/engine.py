@@ -5,9 +5,11 @@
 「核心模块」；每步的就地依据见对应方法内注释。DedupResult 契约类型定义在
 briefdesk/types.py。模块级单例与包装函数保留（实验脚本兼容，见文件尾）。
 
-加权多数票容错：单候选请求异常剔除出计权（既无 SAME 票也不占分母，全部
-失败退化为保守不判重——远程审计 S1 语义）并打 WARNING，不中止整批；
-weak 全员一致复核中失败候选按反对票计（语义等效）。
+批量判定容错：`_collect_verdicts` 是唯一的并行判定入口，异常整形为 None 并打
+WARNING、不中止整批；策略差异留在调用点——加权多数票把 None 剔除出计权
+（既无 SAME 票也不占分母，全部失败退化为保守不判重——远程审计 S1 语义），
+weak 全员一致复核把 None 当反对票（语义等效）。判重命中统一走 `_hit`，
+「判 SAME 却漏合并 source_group」在结构上不可能发生。
 """
 
 import asyncio
@@ -67,13 +69,17 @@ class CachedItem:
     source_quote: str = ""  # 原文（与 build_item_input 的 source_quote 同源）；空 = 未知（不参与原文短路）
 
 
-def _parse_images(raw: str) -> frozenset[str]:
-    """DB 的 image_urls（JSON 数组字符串或空串）→ 图片路径集合。
+def _parse_images(raw: str | list[str] | None) -> frozenset[str]:
+    """image_urls → 图片路径集合（图片精确短路的唯一入口）。
 
-    解析失败/非数组一律返回空集合（安全降级：不参与图片短路，不抛错）。
+    两类来源同一口径：DB 列的 JSON 数组字符串（缓存装载），以及调用方直接
+    传入的列表（消息/合并产物）。解析失败/非数组一律返回空集合（安全降级：
+    不参与图片短路，不抛错）。
     """
     if not raw:
         return frozenset()
+    if isinstance(raw, list):
+        return frozenset(str(u) for u in raw if u)
     try:
         data = json.loads(raw)
     except Exception:  # noqa: BLE001 — 脏数据统一降级为空集合
@@ -81,13 +87,6 @@ def _parse_images(raw: str) -> frozenset[str]:
     if not isinstance(data, list):
         return frozenset()
     return frozenset(str(u) for u in data if u)
-
-
-def _norm_images(image_urls: list[str] | None) -> frozenset[str]:
-    """调用方传入的 image_urls（消息/合并产物）→ 图片路径集合。"""
-    if not image_urls:
-        return frozenset()
-    return frozenset(image_urls)
 
 
 def build_item_input(
@@ -236,7 +235,7 @@ class DedupEngine(DedupService):
         未传入/为空时该条不参与。
         同 id 重复追加（并发/唯一键冲突路径）幂等：更新已有条目而非叠加。
         """
-        images = _norm_images(image_urls)
+        images = _parse_images(image_urls)
         for it in self._cache:
             if it.id == item_id:
                 it.title = title
@@ -367,26 +366,30 @@ class DedupEngine(DedupService):
         same = data.get("same")
         return same if isinstance(same, bool) else None
 
-    @staticmethod
-    def _flatten_verdicts(
+    async def _collect_verdicts(
+        self,
         candidates: list[tuple[CachedItem, float]],
-        raw_verdicts: list[bool | BaseException],
-    ) -> list[bool]:
-        """gather(return_exceptions=True) 结果整形（仅用于 weak 全员一致复核）。
+        title: str,
+        source_quote: str,
+        fail_note: str,
+    ) -> list[bool | None]:
+        """并行判定全部候选，异常整形为 None（唯一的批量判定入口）。
 
-        weak 复核要求全员判 SAME 才命中：失败候选取 False 等价投反对票，
-        异常不抛穿、不中止整批判定。加权多数票路径不走本方法——其失败
-        候选按「剔除计权」处理（见 check_dedup 内注释与模块 docstring）。
+        `gather(return_exceptions=True)` 隔离单候选失败：异常不抛穿、不中止
+        整批判定，只在返回列表中留下 None，由调用方按各自门禁施加策略——
+        weak 复核把 None 当反对票（要求全员 SAME），加权多数票把 None 剔除
+        出计权（既无 SAME 票也不占分母）。两条策略差异保留在调用点，收集与
+        异常整形只有这一处，fail_note 说明本次的降级口径。
         """
-        out: list[bool] = []
-        for (cand, _score), res in zip(candidates, raw_verdicts):
+        raw = await asyncio.gather(
+            *[self._ask_ai(cand, title, source_quote) for cand, _ in candidates],
+            return_exceptions=True,
+        )
+        out: list[bool | None] = []
+        for (cand, _score), res in zip(candidates, raw):
             if isinstance(res, BaseException):
-                logger.warning(
-                    '候选 "%s" 判重请求异常，按反对票计: %r',
-                    cand.title,
-                    res,
-                )
-                out.append(False)
+                logger.warning(f'  "{cand.title}" 判定失败，{fail_note}: {res!r}')
+                out.append(None)
             else:
                 out.append(bool(res))
         return out
@@ -439,6 +442,64 @@ class DedupEngine(DedupService):
             image_urls=sorted(item.image_urls),
         )
 
+    @staticmethod
+    async def _hit(
+        target: CachedItem, source_group: str, note: str
+    ) -> DedupResult:
+        """判重命中的唯一出口：合并 source_group 后返回结果。
+
+        五条命中路径（图片短路/哈希短路/weak 全员一致/同文本短路/加权多数票）
+        共用本方法，令「判 SAME 却漏调 merge_source_group」在结构上不可能发生。
+        note 标注命中路径，进日志便于回溯是哪条门禁放行的。
+        """
+        logger.info(f'{note} → merging source "{source_group}" into {target.id}')
+        await merge_source_group(target.id, source_group)
+        return DedupResult(
+            is_duplicate=True,
+            similar_to_id=target.id,
+            candidate=DedupEngine._snapshot(target),
+        )
+
+    def _exact_shortcut(
+        self,
+        image_urls: list[str] | None,
+        source: str,
+        source_quote: str,
+    ) -> CachedItem | None:
+        """零 AI 的精确短路：命中返回缓存条目，未命中返回 None。
+
+        两条确定性重复证据，纯内存比较、不触网，故与需要 await 的判定阶段分开。
+        """
+        # ── 图片精确短路：同属限定源的 image_urls 集合完全一致 → 判重，零 AI ──
+        # 同图重发是确定性重复证据：图片消息原文为占位符（哈希短路对其显式跳过）、
+        # 余弦可能擦边未召回、单候选 AI 判定不稳定，而图片路径（上游内容寻址）
+        # 在重发场景逐字节一致。仅当双方都有图时参与，集合相等而非子集，
+        # 防多图卡片共享装饰图误判。源限定理由见 _IMAGE_SHORTCUT_SOURCES 处注释。
+        q_images = _parse_images(image_urls)
+        if q_images and source in _IMAGE_SHORTCUT_SOURCES:
+            for it in self._cache:
+                if it.source == source and it.image_urls == q_images:
+                    logger.info(
+                        f'[image] "{it.title}" 图片完全一致 → SAME (image_urls)'
+                    )
+                    return it
+
+        # ── 原文哈希精确短路：仅对原文取哈希 ──
+        # 同一条原文被上游重复投递（processed 按 msg_id 拦不住）时是确定性重复
+        # 证据：AI 概括的标题不稳定会让余弦擦边、单候选 AI 判定不稳定。哈希全等
+        # 等价于逐字节全等，不误伤相似但不同文。占位符原文排除的理由见
+        # masking.PLACEHOLDER_ONLY_RE 处注释。
+        if source_quote and not PLACEHOLDER_ONLY_RE.match(source_quote):
+            q_hash = self._content_hash(source_quote)
+            for it in self._cache:
+                if it.content_hash and it.content_hash == q_hash:
+                    logger.info(
+                        f'[hash] "{it.title}" 原文完全一致 → SAME (source_quote hash)'
+                    )
+                    return it
+
+        return None
+
     async def check_dedup(
         self,
         title: str,
@@ -460,46 +521,37 @@ class DedupEngine(DedupService):
         # setup 预热规避，勿在此新增其它远程调用。
         await self.ensure_cache()
 
-        # ── 图片精确短路：同属限定源的 image_urls 集合完全一致 → 判重，零 AI ──
-        # 同图重发是确定性重复证据：图片消息原文为占位符（哈希短路对其显式跳过）、
-        # 余弦可能擦边未召回、单候选 AI 判定不稳定，而图片路径（上游内容寻址）
-        # 在重发场景逐字节一致。仅当双方都有图时参与，集合相等而非子集，
-        # 防多图卡片共享装饰图误判。源限定理由见 _IMAGE_SHORTCUT_SOURCES 处注释。
-        q_images = _norm_images(image_urls)
-        if q_images and source in _IMAGE_SHORTCUT_SOURCES:
-            for it in self._cache:
-                if (
-                    it.source == source
-                    and it.image_urls == q_images
-                ):
-                    logger.info(f'[image] "{it.title}" 图片完全一致 → SAME (image_urls)')
-                    logger.info(f'SAME → merging source "{source_group}" into {it.id}')
-                    await merge_source_group(it.id, source_group)
-                    return DedupResult(
-                        is_duplicate=True,
-                        similar_to_id=it.id,
-                        candidate=self._snapshot(it),
-                    )
+        exact = self._exact_shortcut(image_urls, source, source_quote)
+        if exact is not None:
+            return await self._hit(exact, source_group, "SAME")
 
-        # ── 原文哈希精确短路：仅对原文取哈希 ──
-        # 同一条原文被上游重复投递（processed 按 msg_id 拦不住）时是确定性重复
-        # 证据：AI 概括的标题不稳定会让余弦擦边、单候选 AI 判定不稳定。哈希全等
-        # 等价于逐字节全等，不误伤相似但不同文。占位符原文排除的理由见
-        # masking.PLACEHOLDER_ONLY_RE 处注释。
-        if source_quote and not PLACEHOLDER_ONLY_RE.match(source_quote):
-            q_hash = self._content_hash(source_quote)
-            for it in self._cache:
-                if it.content_hash and it.content_hash == q_hash:
-                    logger.info(f'[hash] "{it.title}" 原文完全一致 → SAME (source_quote hash)')
-                    logger.info(f'SAME → merging source "{source_group}" into {it.id}')
-                    await merge_source_group(it.id, source_group)
-                    return DedupResult(
-                        is_duplicate=True,
-                        similar_to_id=it.id,
-                        candidate=self._snapshot(it),
-                    )
+        candidates, metric = self._select_candidates(title, q_emb)
+        if not candidates:
+            return DedupResult(is_duplicate=False)
 
-        # ── 候选选择：嵌入余弦 Top-K（启用且加载成功）或字符重叠单候选（回退/兜底）──
+        # ② 门禁分级：normal（≥ DEDUP_EMBED_THRESHOLD）走 strong 短路/多数票；
+        # weak（[fallback, threshold)）仅在无 normal 候选时参与——低置信复核：
+        # 全员判 SAME 才判重，既不稀释多数票，也不被弱票抬高误判。
+        if metric == "cosine":
+            normal = [c for c in candidates if c[1] >= config.dedup_embed_threshold]
+            if not normal:
+                return await self._judge_weak(
+                    candidates, title, source_group, source_quote
+                )
+            candidates = normal
+
+        return await self._judge_normal(
+            candidates, metric, title, source_group, source_quote
+        )
+
+    def _select_candidates(
+        self, title: str, q_emb: list[float] | None
+    ) -> tuple[list[tuple[CachedItem, float]], str]:
+        """候选选取：嵌入余弦 Top-K（启用且加载成功）或字符重叠单候选（回退/兜底）。
+
+        返回 (候选列表, 度量名)；空列表表示已打无候选 WARNING 诊断、调用方直接
+        判不重复。纯内存计算，不触网（理由见下方 P1 注释）。
+        """
         # 余弦以 fallback 阈值召回（含弱候选区间 [fallback, threshold)），
         # normal/weak 分层在判定前拆分；字符重叠在余弦零候选时兜底。
         # P1 修复：check_dedup 运行于 pipeline 存储锁内，此处严禁远程嵌入——
@@ -595,55 +647,52 @@ class DedupEngine(DedupService):
             else:
                 diag.append("缓存为空")
             logger.warning("；".join(diag))
-            return DedupResult(is_duplicate=False)
+            return [], metric
 
         for candidate, score in candidates:
             logger.info(
                 f'Candidate: "{candidate.title}" vs "{title}" ({metric}: {score * 100:.0f}%)'
             )
+        return candidates, metric
 
-        # ② 门禁分级：normal（≥ DEDUP_EMBED_THRESHOLD）走 strong 短路/多数票；
-        # weak（[fallback, threshold)）仅在无 normal 候选时参与——低置信复核：
-        # 全员判 SAME 才判重，既不稀释多数票，也不被弱票抬高误判。
-        weak_mode = False
-        if metric == "cosine":
-            normal = [c for c in candidates if c[1] >= config.dedup_embed_threshold]
-            if normal:
-                candidates = normal
-            else:
-                weak_mode = True
+    async def _judge_weak(
+        self,
+        candidates: list[tuple[CachedItem, float]],
+        title: str,
+        source_group: str,
+        source_quote: str,
+    ) -> DedupResult:
+        """弱候选低置信复核（②）：全部候选一致判 SAME 才命中。
 
-        # 弱候选低置信复核（②）：全部候选一致判 SAME 才命中
-        if weak_mode:
-            verdicts = self._flatten_verdicts(
-                candidates,
-                await asyncio.gather(
-                    *[
-                        self._ask_ai(cand, title, source_quote)
-                        for cand, _ in candidates
-                    ],
-                    return_exceptions=True,
-                ),
-            )
-            for (cand, _score), same in zip(candidates, verdicts):
-                logger.info(f'  [weak] "{cand.title}": {"SAME" if same else "DIFFERENT"}')
-            if all(verdicts):
-                target = candidates[0][0]
-                logger.info(
-                    f'[weak] 全员 SAME → merging source "{source_group}" into {target.id}'
-                )
-                await merge_source_group(target.id, source_group)
-                return DedupResult(
-                    is_duplicate=True,
-                    similar_to_id=target.id,
-                    candidate=self._snapshot(target),
-                )
-            logger.info("[weak] 存在 DIFFERENT 票 → 保守不判重")
-            return DedupResult(
-                is_duplicate=False,
-                candidate=self._snapshot(candidates[0][0]),
-            )
+        判定失败的候选按反对票计（_collect_verdicts 的 None），语义等效于
+        「不满足全员一致」——异常不抛穿、不中止整批。
+        """
+        verdicts = await self._collect_verdicts(
+            candidates, title, source_quote, "按反对票计"
+        )
+        for (cand, _score), same in zip(candidates, verdicts):
+            logger.info(f'  [weak] "{cand.title}": {"SAME" if same else "DIFFERENT"}')
+        if all(verdicts):
+            return await self._hit(candidates[0][0], source_group, "[weak] 全员 SAME")
+        logger.info("[weak] 存在 DIFFERENT 票 → 保守不判重")
+        return DedupResult(
+            is_duplicate=False,
+            candidate=self._snapshot(candidates[0][0]),
+        )
 
+    async def _judge_normal(
+        self,
+        candidates: list[tuple[CachedItem, float]],
+        metric: str,
+        title: str,
+        source_group: str,
+        source_quote: str,
+    ) -> DedupResult:
+        """normal 候选判定：同文本短路 → 加权多数票。
+
+        两段同处一地是因为耦合：strong 判 DIFFERENT 时只剔除该候选、其余候选
+        继续落到多数票，判定失败时该候选也保留参与多数票。
+        """
         # 同文本短路：score ≥ dedup_strong_threshold 的候选几乎必然同文本
         # （同标题跨群重复），AI 判 SAME 即直接判重，不参与多数票——避免被其余
         # 高相似但不同话题的候选（如"羽毛球社招新" vs "篮球社招新" 80%）稀释成
@@ -665,15 +714,7 @@ class DedupEngine(DedupService):
                     f'{"SAME" if verdict else "DIFFERENT"}'
                 )
                 if verdict:
-                    logger.info(
-                        f'SAME → merging source "{source_group}" into {strong_cand.id}'
-                    )
-                    await merge_source_group(strong_cand.id, source_group)
-                    return DedupResult(
-                        is_duplicate=True,
-                        similar_to_id=strong_cand.id,
-                        candidate=self._snapshot(strong_cand),
-                    )
+                    return await self._hit(strong_cand, source_group, "SAME")
                 # 强候选判 DIFFERENT（同文本但内容不同，罕见）：只剔除已判定的
                 # 该候选（④），其余 ≥threshold 候选保留参与多数票——避免连带
                 # 作废其它可能判 SAME 的同文本候选
@@ -688,30 +729,22 @@ class DedupEngine(DedupService):
         # 判定更可信——SAME 权重和 > 总权重一半才命中，抑制低置信票的干扰
         # （实验：串行「任一候选 same 即命中」会把相似但不同信息的噪声放大成
         # 误判）；等权时退化为原 >K/2 规则，单候选退化为一次判定。
-        raw = await asyncio.gather(
-            *[self._ask_ai(cand, title, source_quote) for cand, _ in candidates],
-            return_exceptions=True,
+        # S1 容错：失败候选剔除出计权（既无 SAME 票也不占分母），
+        # 全部失败时退化为保守不判重——异常绝不抛穿中止整轮管道
+        verdicts = await self._collect_verdicts(
+            candidates, title, source_quote, "剔除该候选票"
         )
         voted: list[tuple[CachedItem, float, bool]] = []
-        for (cand, score), r in zip(candidates, raw):
-            if isinstance(r, BaseException):
-                # S1 容错：失败候选剔除出计权（既无 SAME 票也不占分母），
-                # 全部失败时退化为保守不判重——异常绝不抛穿中止整轮管道
-                logger.warning(f'  "{cand.title}" 判定失败，剔除该候选票: {r}')
+        for (cand, score), same in zip(candidates, verdicts):
+            if same is None:
                 continue
-            voted.append((cand, score, r))
-            logger.info(f'  "{cand.title}": {"SAME" if r else "DIFFERENT"}')
+            voted.append((cand, score, same))
+            logger.info(f'  "{cand.title}": {"SAME" if same else "DIFFERENT"}')
         total_weight = sum(score for _cand, score, _ in voted)
         same_weight = sum(score for _cand, score, same in voted if same)
         if total_weight and same_weight > total_weight / 2:
             target = next(cand for cand, _score, same in voted if same)
-            logger.info(f'SAME → merging source "{source_group}" into {target.id}')
-            await merge_source_group(target.id, source_group)
-            return DedupResult(
-                is_duplicate=True,
-                similar_to_id=target.id,
-                candidate=self._snapshot(target),
-            )
+            return await self._hit(target, source_group, "SAME")
 
         return DedupResult(
             is_duplicate=False,
@@ -723,4 +756,3 @@ class DedupEngine(DedupService):
 dedup_engine = DedupEngine()
 check_dedup = dedup_engine.check_dedup
 add_to_cache = dedup_engine.add_to_cache
-remove_items_from_cache = dedup_engine.remove_items

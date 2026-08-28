@@ -378,7 +378,7 @@ class CheckDedupShortCircuitTest(unittest.IsolatedAsyncioTestCase):
 
 
 class ParseImagesTest(unittest.TestCase):
-    """image_urls 归一化助手：DB JSON 字符串 → 图片路径集合。"""
+    """image_urls 归一化助手：DB JSON 字符串 / 调用方列表 → 图片路径集合。"""
 
     def test_parses_json_array(self):
         self.assertEqual(
@@ -394,6 +394,19 @@ class ParseImagesTest(unittest.TestCase):
     def test_garbage_is_empty(self):
         self.assertEqual(_parse_images("not json"), frozenset())
         self.assertEqual(_parse_images("{}"), frozenset())
+
+    def test_accepts_list_input(self):
+        """调用方直传的列表（消息/合并产物）与 DB JSON 同口径。"""
+        self.assertEqual(
+            _parse_images(["a.jpg", "b.jpg"]), frozenset({"a.jpg", "b.jpg"})
+        )
+
+    def test_list_filters_empty_entries(self):
+        self.assertEqual(_parse_images(["a.jpg", ""]), frozenset({"a.jpg"}))
+
+    def test_none_is_empty(self):
+        self.assertEqual(_parse_images(None), frozenset())
+        self.assertEqual(_parse_images([]), frozenset())
 
 
 class ImageUrlShortCircuitTest(unittest.IsolatedAsyncioTestCase):

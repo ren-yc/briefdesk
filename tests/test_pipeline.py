@@ -1,7 +1,6 @@
 """pipeline 骨架与阶段插件测试：不触发真实 AI，DB 用内存库/桩。"""
 
 import unittest
-from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
 import aiosqlite
@@ -31,6 +30,7 @@ from briefdesk.types import (
     BatchContext,
     ClassifyOutcome,
     ClassifyResult,
+    DedupResult,
     InsertedRow,
     InternalMessage,
 )
@@ -93,7 +93,9 @@ def _dedup_engine_mock():
     """行为与 DedupEngine 端口一致的最小假引擎。"""
     return Mock(
         preembed_batch=AsyncMock(return_value=None),
-        check_dedup=AsyncMock(return_value=SimpleNamespace(is_duplicate=False)),
+        # 用真实契约类型而非 SimpleNamespace：假引擎缺字段应当在此暴露，
+        # 不该由生产侧 getattr 兜住
+        check_dedup=AsyncMock(return_value=DedupResult(is_duplicate=False)),
         add_to_cache=Mock(),
         flush_pending_embeddings=AsyncMock(),
     )

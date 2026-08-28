@@ -69,7 +69,7 @@ class DedupPlugin(StagePlugin):
         outcome = batch.outcomes
         if outcome is None or not outcome.results:
             return
-        rows: list[tuple[InternalMessage, ClassifyResult, str, str]] = []
+        planned: list[tuple[InternalMessage, ClassifyResult, str]] = []
         for result in outcome.results:
             msg = (
                 batch.messages[result.msg_index]
@@ -79,22 +79,22 @@ class DedupPlugin(StagePlugin):
             if msg is None:
                 continue
             title = result.summary or msg.content[:50]
-            content = msg.content  # 原文：去重判定/入库/缓存统一使用（替代原 description）
             logger.info(f'[{result.category}] "{title}" — {msg.group_name}')
-            rows.append((msg, result, title, content))
+            planned.append((msg, result, title))
+        # 预嵌入文本用原文 msg.content（去重判定/入库/缓存统一口径，替代原 description）
         embs = await self._engine.preembed_batch(
-            [(t, c) for _m, _r, t, c in rows]
+            [(t, m.content) for m, _r, t in planned]
         )
         batch.rows = [
-            (m, r, t, c, (embs[i] if embs is not None else None))
-            for i, (m, r, t, c) in enumerate(rows)
+            (m, r, t, (embs[i] if embs is not None else None))
+            for i, (m, r, t) in enumerate(planned)
         ]
 
     async def run(self, batch: BatchContext, ctx: PluginContext) -> None:
         """锁内（骨架持有 _storage_lock）：判重 → 入库/标记重复 → 缓存追加。"""
         if self._engine is None:
             return
-        for msg, result, title, _content, q_emb in batch.rows:
+        for msg, result, title, q_emb in batch.rows:
             dedup_result = await self._engine.check_dedup(
                 title,
                 msg.group_name,
@@ -106,7 +106,7 @@ class DedupPlugin(StagePlugin):
             # 判定观察记录：仅记录发生了实际比较的判定（命中候选或候选被判定
             # 为不同）；无候选（未比较）不记录——供观察型阶段插件（benchmark）
             # 在真实处理时点导出基准用例（如判重命中的 same=true 对）
-            candidate = getattr(dedup_result, "candidate", None)
+            candidate = dedup_result.candidate
             if candidate is not None:
                 batch.dedup_checks.append(
                     DedupCheck(
