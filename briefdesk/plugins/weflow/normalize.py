@@ -4,7 +4,9 @@
   （普通消息 1 条；公众号文章卡片按 mmreader 拆为多条，见 parse_appmsg_xml）
 - pre_filter_sse / pre_filter_rest 丢弃撤回、非文本、空/短内容与附件
   占位符；图片消息放行：SSE [图片] 交由 normalize_sse 回查 REST 获取
-  媒体路径，REST localType=3 且带 media.url 时直接放行（供 OCR）
+  媒体路径（上游 v0.3.0 推送携带 media 元数据 {type, fileName, md5}，
+  type 非 image 时跳过无效回查、元数据缺失时保持回查），REST
+  localType=3 且带 media.url 时直接放行（供 OCR）
 - 文章卡片（localType=0x500000031）放行并解析：weflow-server 的 REST 消息
   content 为 [消息] 占位、rawContent 为原始 <msg><appmsg> XML（无需像
   weflow-legacy 那样回查 media=False）；SSE 事件无 rawContent，按内容形状
@@ -181,16 +183,27 @@ async def normalize_sse(
     timestamp = event.get("timestamp", 0)
     rawid = event.get("rawid", "")
 
-    # SSE 不提供媒体信息，需通过 REST 回查
+    # [图片] 回查预检：推送携带的 media 元数据（v0.3.0 起）不含 url，字节
+    # 仍需 REST media=1 导出回填，但 type 明确非 image（语音/视频/表情/
+    # 文件）时回查必无图片 URL，跳过省一次本机 HTTP；元数据缺失/null 视为
+    # 未知，保持原回查（边缘情形：SSE 解析失败但 REST 可导出）
+    media_meta = event.get("media")
     if content.strip() == "[图片]" and client is not None:
-        path = await client.fetch_message_media(session_id, rawid, timestamp)
-        if path:
-            image_urls.append(path)
-        logger.debug(
-            "SSE rawid=%s: 图片回查%s",
-            rawid,
-            "成功" if image_urls else "无可用媒体路径",
-        )
+        if media_meta is not None and media_meta.get("type") != "image":
+            logger.debug(
+                "SSE rawid=%s: media.type=%s 非图片，跳过图片回查",
+                rawid,
+                media_meta.get("type"),
+            )
+        else:
+            path = await client.fetch_message_media(session_id, rawid, timestamp)
+            if path:
+                image_urls.append(path)
+            logger.debug(
+                "SSE rawid=%s: 图片回查%s",
+                rawid,
+                "成功" if image_urls else "无可用媒体路径",
+            )
 
     # 文章卡片：拆条解析（公众号推送与群聊转发同格式）
     if _is_appmsg_content(content):

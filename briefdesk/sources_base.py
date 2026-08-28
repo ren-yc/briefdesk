@@ -113,8 +113,11 @@ async def fetch_all_pages(
     page_size: int = LIST_PAGE_SIZE,
     extra_params: dict[str, Any] | None = None,
     upstream_version: str | None = None,
-) -> list[dict[str, Any]]:
+) -> list[Any]:
     """按 offset 翻页取完整列表（跨源共享，勿在插件包另立副本）。
+
+    元素类型由调用方的上游契约决定（TypedDict 等），故返回 `list[Any]`；
+    各调用方按其 TypedDict 形状消费（JSON 边界风格，与 `_get -> Any` 一致）。
 
     上游列表端点（contacts / sessions）的 `limit` 默认值很小（100），不翻页
     就只能拿到前 100 条且**没有任何错误提示**——截断外的联系人在下游退化为

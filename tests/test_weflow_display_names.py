@@ -11,8 +11,9 @@ Default::default()。实测最近活跃 5 群 208 名成员 groupNickname 非空
 
 import time
 import unittest
+from unittest.mock import AsyncMock
 
-from briefdesk.plugins.weflow.normalize import normalize_rest
+from briefdesk.plugins.weflow.normalize import normalize_rest, normalize_sse
 from briefdesk.plugins.weflow.poller import poll
 from briefdesk.types import SessionInfo
 
@@ -66,6 +67,55 @@ class NormalizeRestDisplayNameTest(unittest.TestCase):
     def test_missing_names_fall_back_to_wxid(self):
         msgs = normalize_rest(self._msg("wxid_a"), "s1", "项目群", {})
         self.assertEqual(msgs[0].sender_name, "wxid_a")
+
+
+class NormalizeSseImageLookupTest(unittest.IsolatedAsyncioTestCase):
+    """[图片] 的 REST 回查预检（上游 v0.3.0 推送携带 media 元数据）三态保守语义。
+
+    - media.type == "image" → 回查（元数据无 url，字节需 REST 导出回填）
+    - media.type != "image" → 跳过回查（必无图片 URL，省一次本机 HTTP）
+    - 元数据缺失/null → 保持回查（边缘情形：SSE 解析失败但 REST 可导出）
+    """
+
+    def _event(self, **extra: object) -> dict:
+        return {
+            "event": "message.new",
+            "sessionId": "wxid_test_0001",
+            "sessionType": "private",
+            "sourceName": "张三",
+            "rawid": "1001",
+            "content": "[图片]",
+            "timestamp": 1700000000,
+            **extra,
+        }
+
+    async def test_image_type_triggers_lookup(self):
+        client = _FakeClient(contacts={}, messages=[])
+        client.fetch_message_media = AsyncMock(  # type: ignore[method-assign]
+            return_value="wxid_test_0001/images/abc.jpg"
+        )
+        msgs = await normalize_sse(
+            self._event(media={"type": "image", "fileName": "abc.jpg", "md5": "a" * 32}),
+            client,
+        )
+        client.fetch_message_media.assert_awaited_once()  # type: ignore[attr-defined]
+        self.assertEqual(msgs[0].image_urls, ["wxid_test_0001/images/abc.jpg"])
+
+    async def test_non_image_type_skips_lookup(self):
+        client = _FakeClient(contacts={}, messages=[])
+        client.fetch_message_media = AsyncMock()  # type: ignore[method-assign]
+        msgs = await normalize_sse(
+            self._event(media={"type": "voice", "fileName": "v.silk", "md5": "b" * 32}),
+            client,
+        )
+        client.fetch_message_media.assert_not_awaited()  # type: ignore[attr-defined]
+        self.assertEqual(msgs[0].image_urls, [])
+
+    async def test_absent_media_keeps_lookup(self):
+        client = _FakeClient(contacts={}, messages=[])
+        client.fetch_message_media = AsyncMock(return_value=None)  # type: ignore[method-assign]
+        await normalize_sse(self._event(), client)
+        client.fetch_message_media.assert_awaited_once()  # type: ignore[attr-defined]
 
 
 class _FakeClient:

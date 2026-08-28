@@ -46,9 +46,14 @@ class WeFlowEvent(TypedDict):
     - ready：连接基线，载荷实测为 `{"status":"ok"}`——**不含 event 键**
       （事件名只在 SSE 的 `event:` 帧头，本客户端只解析 data 行故读不到），
       因此在 pre_filter_sse 的事件类型分支被丢弃；
-    - sync：水位重基通知（`{event, watermarks[]}`；订阅端滞后时为
-      `{"rebased":true}`），无消息体；
+    - sync：水位基线/重基通知（`{event, watermarks[]}`），无消息体；订阅端
+      滞后（broadcast 缓冲被覆盖）时服务端补发一帧携带**当前真实水位**的
+      sync（不占用总线序号，避免其他客户端跳号），客户端可据此重新增量拉取；
     - message.revoke：撤回，显式丢弃。
+
+    v0.3.0 起 message.new 另携带 `media` 元数据（见下），本客户端只取消息
+    字段，媒体字节仍走 REST `media=1` 导出回查（normalize_sse 按
+    `media.type` 预检跳过非图片类型的无效回查）。
     """
 
     event: Literal["ready", "message.new", "message.revoke", "sync"]
@@ -61,6 +66,10 @@ class WeFlowEvent(TypedDict):
     sourceName: str  # 发送者昵称；缺失时省略
     content: str
     timestamp: int  # 秒级 Unix
+    media: dict | None  # v0.3.0 起：媒体元数据 {type, fileName, md5}，仅图片/语音/
+    # 视频/表情消息携带，否则 null 或缺键。**纯元数据**——不含 url/localPath
+    # （字节走 REST `/api/v1/messages?media=1` 导出），也绝不含解密密钥；
+    # normalize_sse 用它预检 [图片] 回查（type != "image" 时跳过）
 
 
 class WeFlowSession(TypedDict):
@@ -134,10 +143,6 @@ class WeFlowMessagesResponse(TypedDict):
     hasMore: bool
     messages: list[WeFlowMessage]
     media: dict | None  # {count, enabled, exportPath}
-
-
-class WeFlowSessionsResponse(TypedDict):
-    sessions: list[WeFlowSession]
 
 
 class WeFlowContactsResponse(TypedDict):
@@ -335,9 +340,12 @@ class WeFlowClient(SourceClient):
         """确保服务端有就绪账号（健康检查驱动，记忆化，可强制重检）。
 
         先查 /health 的 accounts[].state（上游 v0.3.0 起下发每账号状态）：
-        已有 ready / indexing 账号即记忆化返回，**不重复注册**；只有零账号
-        （或账号处于 error / awaiting_key）时才注册。注册后进入索引期，业务
-        接口的 503 由 WeFlowNotReadyError 瞬态处理兜底，不在此阻塞等待。
+        已有 ready / indexing 账号即记忆化返回，**不重复注册**；只有零已注册
+        账号（或账号处于 error / awaiting_key）时才注册。accounts[] 除已注册
+        账号外还含启动扫描发现但未注册的账号（awaiting_key）——它们不参与
+        就绪判定（也不计入上面的良性/被拒分支，awaiting_key 会落到注册分支，
+        与「我们的账号未注册」语义一致），列表按 wxid 升序。注册后进入索引期，
+        业务接口的 503 由 WeFlowNotReadyError 瞬态处理兜底，不在此阻塞等待。
 
         force=True 时忽略记忆化标志重新健康检查（SSE 重连后服务端可能已重启，
         内存态账号注册表丢失，需重新注册）。良性态（_BENIGN_REGISTER_STATES /
@@ -443,17 +451,26 @@ class WeFlowClient(SourceClient):
     # index.rs 的算法逐字相同。实测 974 条消息两者 974 条同值，纯冗余。
 
     async def fetch_sessions(self) -> list[WeFlowSession]:
-        """获取所有会话列表（原生格式，sessionType 权威）。
+        """获取所有会话列表（原生格式，sessionType 权威，按 offset 翻页取尽）。
 
-        显式传大 limit：上游默认 limit=100 会截断会话发现（实测仅回最近
-        活跃的少数会话），不传参只会发现最近活跃的 100 个会话。
+        上游 limit 默认 100，不翻页只会发现最近活跃的 100 个会话；上游
+        v0.3.0 提供 offset 与 (lastTimestamp, username) 全序稳定排序，故经
+        fetch_all_pages 翻页取尽（与 fetch_contacts 同模式）。
+        page_size=10000 = 上游 limit 硬上限：典型规模（<10000 会话）一个
+        请求即取尽，与旧「显式大 limit」实现请求数相同；旧上游若忽略
+        offset，共享「本页无新增」防御立即告警终止，停在 10000 条——
+        即旧实现行为，零回退。
         chatlab 格式的 type 实测不可靠（official 会话也返回 private），
         故用原生格式的 sessionType 判定会话类型。
         """
-        data: WeFlowSessionsResponse = await self._get(
-            "/api/v1/sessions", params={"limit": 10000}
+        return await fetch_all_pages(
+            lambda path, params: self._get(path, params=params),
+            "/api/v1/sessions",
+            key="sessions",
+            dedup_key="username",
+            page_size=10000,
+            upstream_version=self._logged_version,
         )
-        return data["sessions"]
 
     async def fetch_messages(
         self,

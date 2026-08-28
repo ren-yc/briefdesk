@@ -35,8 +35,12 @@ from briefdesk.types import ContactInfo, PollResult, SessionInfo
 
 logger = logging.getLogger(__name__)
 
-# 翻页守卫：单页条数 × 页数上限，防异常状态下的无界循环
-_PAGE_LIMIT = 500
+# 翻页页大小：与上游单请求媒体导出上限（200 项）对齐——轮询恒 media=True，
+# 上游文档明示「超出部分保持未导出，可缩小 limit 分批取」；200 条/页保证单页
+# 图片消息全部可导出（超出部分 media.url 为空，会被 pre_filter_rest 整条
+# 丢弃，不进 OCR 也不入库）
+_PAGE_LIMIT = 200
+# 翻页守卫：单页条数 × 页数上限，防异常状态下的无界循环（总消息上限 40 万）
 _MAX_PAGES = 2000
 
 

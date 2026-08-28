@@ -238,7 +238,7 @@ class ReadyGateTest(unittest.IsolatedAsyncioTestCase):
 
 
 class ListPaginationTest(unittest.IsolatedAsyncioTestCase):
-    """列表端点分页：contacts 按 offset 翻页取全量，sessions 传大 limit。"""
+    """列表端点分页：contacts 与 sessions 均按 offset 翻页取全量。"""
 
     async def test_contacts_paginate_until_exhausted(self):
         """contacts 按 offset 翻页直到 hasMore=false，合并所有页。
@@ -272,15 +272,57 @@ class ListPaginationTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(offsets, [0, 1000])
         self.assertEqual(contacts["wxid_1499"], "联系人1499")
 
-    async def test_sessions_still_requests_large_limit(self):
-        """sessions 端点上游无 offset，只能显式传大 limit。"""
+    async def test_sessions_first_page_uses_max_page_size(self):
+        """sessions 按 offset 翻页，page_size=10000 = 上游 limit 硬上限。
+
+        上游 sessions 实际信封不含 hasMore：短页（无 hasMore 且条数 <
+        page_size）即末页终止——典型规模一个请求取尽。
+        """
         client = _client()
+        page = {
+            "sessions": [
+                {"username": f"wxid_{i:04d}", "displayName": f"会话{i}"}
+                for i in range(3)
+            ]
+        }
         with patch.object(
-            client, "_get", AsyncMock(return_value={"sessions": []})
+            client, "_get", AsyncMock(return_value=page)
         ) as get:
-            await client.fetch_sessions()
+            sessions = await client.fetch_sessions()
+        self.assertEqual(len(sessions), 3)
+        self.assertEqual(get.await_count, 1)
         self.assertEqual(get.await_args.args[0], "/api/v1/sessions")
-        self.assertEqual(get.await_args.kwargs["params"]["limit"], 10000)
+        self.assertEqual(get.await_args.kwargs["params"], {"limit": 10000, "offset": 0})
+
+    async def test_sessions_paginate_until_exhausted(self):
+        """sessions 按 offset 翻页取尽：多页合并、username 去重、hasMore=false 终止。
+
+        实际 sessions 信封虽不含 hasMore，fetch_all_pages 在 hasMore 存在时
+        优先以它为准（共享分页契约，与 contacts 一致）。
+        """
+        client = _client()
+        page1 = {
+            "sessions": [
+                {"username": f"wxid_{i:04d}", "displayName": f"会话{i}"}
+                for i in range(1000)
+            ],
+            "hasMore": True,
+        }
+        page2 = {
+            "sessions": [
+                {"username": f"wxid_{i:04d}", "displayName": f"会话{i}"}
+                for i in range(1000, 1200)
+            ],
+            "hasMore": False,
+        }
+        with patch.object(
+            client, "_get", AsyncMock(side_effect=[page1, page2])
+        ) as get:
+            sessions = await client.fetch_sessions()
+        self.assertEqual(len(sessions), 1200)
+        offsets = [c.kwargs["params"]["offset"] for c in get.await_args_list]
+        self.assertEqual(offsets, [0, 1000])
+        self.assertEqual(sessions[1199]["username"], "wxid_1199")
 
 
 class ControlEventStatsTest(unittest.IsolatedAsyncioTestCase):
