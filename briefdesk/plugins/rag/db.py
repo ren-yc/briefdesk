@@ -24,6 +24,30 @@ import numpy as np
 _BS = chr(92)
 
 
+async def fetch_all(
+    db: aiosqlite.Connection, sql: str, params: object = ()
+) -> list[aiosqlite.Row]:
+    """查全部行并保证关闭游标（收敛 try/finally 样板，游标纪律单点保障）。"""
+
+    cursor = await db.execute(sql, params)
+    try:
+        return list(await cursor.fetchall())
+    finally:
+        await cursor.close()
+
+
+async def fetch_one(
+    db: aiosqlite.Connection, sql: str, params: object = ()
+) -> aiosqlite.Row | None:
+    """查首行并保证关闭游标（无行返回 None）。"""
+
+    cursor = await db.execute(sql, params)
+    try:
+        return await cursor.fetchone()
+    finally:
+        await cursor.close()
+
+
 @dataclass
 class ChunkRow:
     """一条已索引消息（与 raw_messages 行同源，item_id 为产出的卡片可空）。"""
@@ -77,11 +101,7 @@ async def ensure_rag_schema(db: aiosqlite.Connection) -> None:
 
 
 async def get_meta(db: aiosqlite.Connection, key: str) -> str | None:
-    cursor = await db.execute("SELECT value FROM rag_meta WHERE key = ?", (key,))
-    try:
-        row = await cursor.fetchone()
-    finally:
-        await cursor.close()
+    row = await fetch_one(db, "SELECT value FROM rag_meta WHERE key = ?", (key,))
     return row["value"] if row is not None else None
 
 
@@ -114,13 +134,9 @@ async def ensure_fts(db: aiosqlite.Connection) -> bool:
     会短路 CREATE，历史 unicode61 表不能被误报成 trigram（口径失真）。
     """
 
-    cursor = await db.execute(
-        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'rag_fts'"
+    existing = await fetch_one(
+        db, "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'rag_fts'"
     )
-    try:
-        existing = await cursor.fetchone()
-    finally:
-        await cursor.close()
     if existing is not None:
         m = re.search(r"tokenize='([^']+)'", existing["sql"] or "")
         tok = m.group(1) if m else "default"
@@ -146,36 +162,47 @@ def _like_escape(text: str) -> str:
     )
 
 
-def _fts_query(query: str) -> str:
-    """构建 MATCH 词元：按空白切词、各自双引号包裹并转义内部引号。"""
+def _tokens(query: str) -> list[str]:
+    """查询串切词（单源）：按空白切分；无空白时整串作单词元。
+
+    MATCH 构建、trigram 路由判据与 LIKE 兜底三处共用同一口径，避免各自
+    切词导致「按 A 切分路由、按 B 切分检索」的错配。
+    """
 
     parts = [p for p in query.split() if p]
-    if not parts:
-        parts = [query.strip()] if query.strip() else []
-    return " ".join('"' + p.replace('"', '""') + '"' for p in parts)
+    if parts:
+        return parts
+    stripped = query.strip()
+    return [stripped] if stripped else []
+
+
+def _fts_query(query: str) -> str:
+    """构建 MATCH 词元：切词后各自双引号包裹并转义内部引号。"""
+
+    return " ".join('"' + p.replace('"', '""') + '"' for p in _tokens(query))
 
 
 def _min_token_len(query: str) -> int:
-    """查询串按空白切词后的最短词元长度（trigram 路由判据）。"""
+    """查询串切词后的最短词元长度（trigram 路由判据）。"""
 
-    parts = [p for p in query.split() if p]
-    if not parts:
-        parts = [query.strip()] if query.strip() else []
-    return min((len(p) for p in parts), default=0)
+    return min((len(p) for p in _tokens(query)), default=0)
 
 
-def _scope_sql(
-    enabled_group_only: bool, session_id: str | None
+def scope_sql(
+    enabled_group_only: bool,
+    session_id: str | None = None,
+    alias: str = "c",
 ) -> tuple[str, list[object]]:
-    """检索侧会话白名单过滤片段（对别名 c 的 chunks 行生效）。
+    """会话白名单过滤片段（单源；alias 指定被过滤行的表别名）。
 
     启用会话恒为前提；group_only 追加 is_group=1。session_id 进一步收窄。
-    返回 (SQL 片段, 绑定参数)。
+    检索侧作用于 chunks（别名 c），回填侧作用于 raw_messages（别名 r）——
+    两条路径共用本函数，隐私边界只有一处定义。返回 (SQL 片段, 绑定参数)。
     """
 
     clause = (
-        " AND EXISTS (SELECT 1 FROM sessions s WHERE s.source = c.source"
-        " AND s.session_id = c.session_id AND s.enabled = 1"
+        f" AND EXISTS (SELECT 1 FROM sessions s WHERE s.source = {alias}.source"
+        f" AND s.session_id = {alias}.session_id AND s.enabled = 1"
     )
     params: list[object] = []
     if enabled_group_only:
@@ -236,7 +263,7 @@ async def fts_search(
         )
         params = [_fts_query(cleaned)]
     else:
-        tokens = [p for p in cleaned.split() if p] or [cleaned]
+        tokens = _tokens(cleaned)
         like_clause = " AND ".join(
             "c.content LIKE '%' || ? || '%' ESCAPE ?" for _ in tokens
         )
@@ -245,16 +272,12 @@ async def fts_search(
         for tok in tokens:
             params.extend([_like_escape(tok), _BS])
         order = " ORDER BY c.msg_time DESC LIMIT ?"
-    scope_sql, scope_params = _scope_sql(enabled_group_only, session_id)
-    sql += scope_sql
+    scope_clause, scope_params = scope_sql(enabled_group_only, session_id)
+    sql += scope_clause
     params.extend(scope_params)
     sql += order
     params.append(limit)
-    cursor = await db.execute(sql, params)
-    try:
-        rows = await cursor.fetchall()
-    finally:
-        await cursor.close()
+    rows = await fetch_all(db, sql, params)
     return [ChunkRow(**dict(r)) for r in rows]
 
 
@@ -333,14 +356,10 @@ async def fetch_new_embeddings(
         " WHERE e.model = ? AND e.created_at >= ?"
     )
     params: list[object] = [model, since_created_at]
-    scope_sql, scope_params = _scope_sql(enabled_group_only, None)
-    sql += scope_sql
+    scope_clause, scope_params = scope_sql(enabled_group_only)
+    sql += scope_clause
     params.extend(scope_params)
-    cursor = await db.execute(sql, params)
-    try:
-        rows = [dict(r) for r in await cursor.fetchall()]
-    finally:
-        await cursor.close()
+    rows = [dict(r) for r in await fetch_all(db, sql, params)]
     max_created = max((r["created_at"] for r in rows), default=since_created_at)
     return rows, max_created
 
@@ -385,11 +404,7 @@ async def count_status(db: aiosqlite.Connection) -> dict[str, object]:
 
     out: dict[str, object] = {}
     for table in ("rag_chunks", "rag_chunk_embeddings"):
-        cursor = await db.execute("SELECT COUNT(*) AS c FROM " + table)
-        try:
-            row = await cursor.fetchone()
-        finally:
-            await cursor.close()
+        row = await fetch_one(db, "SELECT COUNT(*) AS c FROM " + table)
         out[table] = row["c"] if row else 0
     out["fts_tokenizer"] = await get_meta(db, "fts_tokenizer") or ""
     return out
@@ -407,15 +422,12 @@ async def gc_orphans(
     """
 
     before = db.total_changes
-    for ddl in (
-        (
-            "DELETE FROM rag_chunks WHERE NOT EXISTS ("
-            "SELECT 1 FROM raw_messages r WHERE r.source = rag_chunks.source "
-            "AND r.msg_id = rag_chunks.msg_id)"
-        ),
-    ):
-        cursor = await db.execute(ddl)
-        await cursor.close()
+    cursor = await db.execute(
+        "DELETE FROM rag_chunks WHERE NOT EXISTS ("
+        "SELECT 1 FROM raw_messages r WHERE r.source = rag_chunks.source "
+        "AND r.msg_id = rag_chunks.msg_id)"
+    )
+    await cursor.close()
     # FTS 表惰性可选（纯向量模式下不存在），GC 先探测再清理
     if await get_meta(db, "fts_tokenizer"):
         cursor = await db.execute(

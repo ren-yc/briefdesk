@@ -28,8 +28,8 @@ from briefdesk.plugin.base import (
     WebPlugin,
 )
 from briefdesk.plugins.rag.engine import (
-    _EMBED_FAIL_BACKOFF_BASE,
     RagEngine,
+    embed_fail_backoff,
     set_engine,
 )
 from briefdesk.settings_schema import build_settings_schema
@@ -133,42 +133,34 @@ class RagPlugin(StagePlugin, WebPlugin):
         """
 
         backoff_step = 0
-        try:
-            while self._engine is not None:
-                processed = 0
-                failed = False
-                try:
-                    processed = await self._engine.backfill_step(int(time.time()))
-                    failed = self._engine.last_cycle_embed_failed
-                except asyncio.CancelledError:
-                    raise
-                except Exception:
-                    logger.exception("rag: 回填轮异常，退避续跑")
-                    failed = True
-                if failed:
-                    wait = min(
-                        _EMBED_FAIL_BACKOFF_BASE * (2**backoff_step), 600.0
-                    )
-                    backoff_step += 1
-                    logger.warning("rag: 回填嵌入失败，%.0fs 后重试", wait)
-                    await asyncio.sleep(wait)
-                    continue
-                backoff_step = 0
-                if processed > 0:
-                    continue  # 仍有存量，立即继续排空
-                try:
-                    await self._engine.maintenance_gc()
-                    await self._engine.warm_vectors(force_full=True)
-                except asyncio.CancelledError:
-                    raise
-                except Exception:
-                    logger.exception("rag: GC/预热异常，下周期重试")
-                await asyncio.sleep(
-                    self._engine.settings.maintenance_interval_seconds
-                )
-
-        except asyncio.CancelledError:  # noqa: TRY203 — 保持维护任务取消语义
-            raise
+        while self._engine is not None:
+            processed = 0
+            failed = False
+            try:
+                processed = await self._engine.backfill_step(int(time.time()))
+                failed = self._engine.last_cycle_embed_failed
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("rag: 回填轮异常，退避续跑")
+                failed = True
+            if failed:
+                wait = embed_fail_backoff(backoff_step)
+                backoff_step += 1
+                logger.warning("rag: 回填嵌入失败，%.0fs 后重试", wait)
+                await asyncio.sleep(wait)
+                continue
+            backoff_step = 0
+            if processed > 0:
+                continue  # 仍有存量，立即继续排空
+            try:
+                await self._engine.maintenance_gc()
+                await self._engine.warm_vectors(force_full=True)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("rag: GC/预热异常，下周期重试")
+            await asyncio.sleep(self._engine.settings.maintenance_interval_seconds)
 
     async def teardown(self) -> None:
         if self._backfill_task is not None:

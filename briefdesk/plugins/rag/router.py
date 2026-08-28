@@ -78,7 +78,8 @@ async def rag_ask(req: AskRequest) -> AskResponse:
     """检索式问答：带原文引用、低置信诚实拒答。"""
 
     engine = _require_engine()
-    result = await engine.ask(req.question.strip(), req.session_id, req.history)
+    # question 已由 _question_not_blank 校验器 strip 过，无需再 strip
+    result = await engine.ask(req.question, req.session_id, req.history)
     return AskResponse(
         refused=result.refused,
         answer=result.answer,

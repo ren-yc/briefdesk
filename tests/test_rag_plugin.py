@@ -460,16 +460,24 @@ class RagIndexTest(_MemoryEngineBase):
         self.assertEqual(kicks, [1])
 
     async def test_placeholder_content_not_indexed(self):
+        """纯占位符不入索引，口径与 pipeline 入口同源（多片段/非白名单变体）。"""
+
         await self._index([
             _msg("p1", "[图片]"),
             _msg("p2", "正常消息"),
+            # 以下三条此前是七词白名单的漏网：多片段拼接与白名单外词条
+            _msg("p3", "[图片][图片]"),
+            _msg("p4", "[语音通话]"),
+            _msg("p5", "  [文件]  "),
+            # 占位符 + 真实文字的混合消息仍有信息价值，照常入索引
+            _msg("p6", "[图片] 明天六点开会"),
         ])
         cursor = await self.db.execute("SELECT msg_id FROM rag_chunks")
         try:
             ids = {r["msg_id"] for r in await cursor.fetchall()}
         finally:
             await cursor.close()
-        self.assertEqual(ids, {"p2"})
+        self.assertEqual(ids, {"p2", "p6"})
 
     async def test_scope_excludes_disabled_session_at_ingest(self):
         await _seed_session(self.db, "weflow-legacy", "off", enabled=0, is_group=1)
@@ -520,6 +528,33 @@ class RagBackfillTest(_MemoryEngineBase):
         finally:
             await cursor.close()
         return out
+
+    async def test_scope_excludes_disabled_session_at_backfill(self):
+        """回填侧作用域（隐私边界）：停用会话的历史消息不得进索引。
+
+        与入库侧共用 `scope_sql` 单源（回填过滤 raw_messages，别名 r）。
+        """
+
+        from briefdesk.plugins.rag.config import RagSettings as RS
+
+        self.engine.settings = RS(backfill_days=-1)
+        await _seed_session(self.db, "weflow-legacy", "off", enabled=0, is_group=1)
+        await self._seed("on1", 1, session_id="s1")
+        await self._seed("off1", 1, session_id="off")
+        await self.engine.backfill_step(self.now)
+        self.assertEqual(await self._chunk_ids(), ["on1"])
+
+    async def test_group_only_excludes_private_at_backfill(self):
+        """RAG_GROUP_ONLY 开启时私聊历史不入索引（回填侧 group_only 分支）。"""
+
+        from briefdesk.plugins.rag.config import RagSettings as RS
+
+        self.engine.settings = RS(backfill_days=-1, group_only=True)
+        await _seed_session(self.db, "weflow-legacy", "priv", enabled=1, is_group=0)
+        await self._seed("g1", 1, session_id="s1")
+        await self._seed("p1", 1, session_id="priv")
+        await self.engine.backfill_step(self.now)
+        self.assertEqual(await self._chunk_ids(), ["g1"])
 
     async def test_window_budget_resume_and_blank_exclusion(self):
         from briefdesk.plugins.rag.config import RagSettings as RS

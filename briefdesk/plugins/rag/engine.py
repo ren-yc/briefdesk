@@ -25,15 +25,19 @@ import numpy as np
 
 from briefdesk import ai_ports
 from briefdesk.db import get_db, get_embed_db
+from briefdesk.masking import PLACEHOLDER_ONLY_RE
 from briefdesk.plugins.rag.config import RagSettings
 from briefdesk.plugins.rag.db import (
     ChunkRow,
     ensure_fts,
     ensure_rag_schema,
+    fetch_all,
     fetch_new_embeddings,
+    fetch_one,
     fts_search,
     gc_orphans,
     parse_embedding_rows,
+    scope_sql,
     sync_fts,
     upsert_chunks,
     upsert_embeddings,
@@ -44,17 +48,29 @@ logger = logging.getLogger(__name__)
 
 _RRF_K = 60  # RRF 平滑常数（论文默认，抑制单路名次噪声）
 _VEC_MIN_COS = 0.05  # 向量路最低余弦：低于此视为噪声不入融合
-_EMBED_FAIL_BACKOFF_BASE = 60.0  # 回填失败退避基数（秒），指数封顶 600
+_EMBED_FAIL_BACKOFF_BASE = 60.0  # 回填失败退避基数（秒）
+_EMBED_FAIL_BACKOFF_CAP = 600.0  # 退避封顶（秒）
 
-# OCR 失败/附件占位符不入检索索引（对齐 pipeline 入口的占位符图片屏蔽口径）
-_PLACEHOLDER_RE = re.compile(
-    r"^\[(?:图片|image|视频|视频号|文件|链接|语音)\]$", re.IGNORECASE
-)
+
+def embed_fail_backoff(step: int) -> float:
+    """回填嵌入失败的指数退避秒数（基数 60、封顶 600）。
+
+    基数与封顶同处一地：维护循环只按轮次问本函数，不各自持有一半策略。
+    """
+
+    return min(_EMBED_FAIL_BACKOFF_BASE * (2**step), _EMBED_FAIL_BACKOFF_CAP)
 
 
 def _indexable(content: str) -> bool:
+    """OCR 失败/附件占位符不入检索索引。
+
+    判定复用 pipeline 入口同一单源 `masking.PLACEHOLDER_ONLY_RE`（整条仅由
+    方括号片段构成），吃的同样是原始 content —— `[图片][图片]`、`[语音通话]`
+    等此前漏网的变体一并挡下，不再是七词白名单。
+    """
+
     text = content.strip()
-    return bool(text) and not _PLACEHOLDER_RE.match(text)
+    return bool(text) and not PLACEHOLDER_ONLY_RE.match(text)
 
 
 @dataclass
@@ -159,11 +175,7 @@ class RagEngine:
         if session_id is not None:
             sql += " AND session_id = ?"
             params.append(session_id)
-        cursor = await db.execute(sql, params)
-        try:
-            rows = await cursor.fetchall()
-        finally:
-            await cursor.close()
+        rows = await fetch_all(db, sql, params)
         return {(r["source"], r["session_id"]) for r in rows}
 
     # ------------------------------------------------------------ 索引路径 --
@@ -205,7 +217,7 @@ class RagEngine:
         for msg in batch.messages:
             if not _indexable(msg.content):
                 continue
-            if allowed is not None and (msg.source, msg.session_id) not in allowed:
+            if (msg.source, msg.session_id) not in allowed:
                 continue
             row = ChunkRow(
                 source=msg.source,
@@ -254,13 +266,8 @@ class RagEngine:
         if self.settings.backfill_days == 0:
             return 0
         model = ai_ports.embed_model_name()
-        scope = (
-            " AND EXISTS (SELECT 1 FROM sessions s WHERE s.source = r.source"
-            " AND s.session_id = r.session_id AND s.enabled = 1"
-        )
-        if self.settings.group_only:
-            scope += " AND s.is_group = 1"
-        scope += ")"
+        # 作用域谓词与检索侧共用单源（这里过滤 raw_messages，别名 r）
+        scope, scope_params = scope_sql(self.settings.group_only, alias="r")
         sql = (
             "SELECT r.source, r.msg_id, r.session_id, r.group_name, "
             "r.sender_name, r.timestamp AS msg_time, r.content "
@@ -272,17 +279,14 @@ class RagEngine:
             " AND trim(r.content, ' ' || char(9)) <> ''"
             + scope
         )
-        params: list[object] = [model]
+        # 绑定顺序须随 SQL 文本顺序：model → scope（当前无参）→ 窗口 → LIMIT
+        params: list[object] = [model, *scope_params]
         if self.settings.backfill_days > 0:
             sql += " AND r.timestamp >= ?"
             params.append(now_ts - self.settings.backfill_days * 86400)
         sql += " ORDER BY r.timestamp DESC LIMIT ?"
         params.append(self.settings.backfill_budget_per_cycle)
-        cursor = await db.execute(sql, params)
-        try:
-            raw_rows = await cursor.fetchall()
-        finally:
-            await cursor.close()
+        raw_rows = await fetch_all(db, sql, params)
         rows = [
             ChunkRow(
                 source=r["source"], msg_id=r["msg_id"],
@@ -389,11 +393,7 @@ class RagEngine:
             self._vec_cache_clear()
             self._vec_model = model
         edb = await self._embed_factory()
-        cursor = await edb.execute("SELECT COUNT(*) AS c FROM rag_chunk_embeddings")
-        try:
-            row = await cursor.fetchone()
-        finally:
-            await cursor.close()
+        row = await fetch_one(edb, "SELECT COUNT(*) AS c FROM rag_chunk_embeddings")
         total = int(row["c"]) if row is not None else 0
         if total < self._vec_count_seen:
             self._vec_cache_clear()  # 有删除（GC），水位失效，整表重建
@@ -478,9 +478,7 @@ class RagEngine:
         vec_hits: list[tuple[ChunkRow, float]] = []
         if q_vec is not None and self._matrix is not None and self._matrix_keys:
             idxs = [
-                i
-                for i, sess in enumerate(self._matrix_sessions)
-                if allowed is None or sess in allowed
+                i for i, sess in enumerate(self._matrix_sessions) if sess in allowed
             ]
             if idxs:
                 mats = (
