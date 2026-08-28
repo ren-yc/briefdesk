@@ -18,7 +18,10 @@ export const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "
 
 const ESC_MAP = { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" };
 
-export function makeElement() {
+// selectorMap: { ".card-quote-context": el } —— 只给需要"按选择器取到真实子元素"的
+// 测试用；不传时 querySelector 恒为 null，与此前行为一致。
+export function makeElement(selectorMap = null) {
+  const classes = new Set();
   return {
     innerHTML: "",
     textContent: "",
@@ -29,15 +32,22 @@ export function makeElement() {
     hidden: false,
     checked: false,
     indeterminate: false,
+    // classList 真实记账：app.js 大量使用 add("hidden") 后再 contains("hidden") 判定
+    // 幂等（如"已展开就不重复请求上下文"）。恒返回 false 的桩会让这类分支永远走
+    // "首次"路径，把幂等缺陷测成通过。
     classList: {
-      add() {},
-      remove() {},
-      contains() { return false; },
-      toggle() {},
+      add: (...names) => names.forEach((n) => classes.add(n)),
+      remove: (...names) => names.forEach((n) => classes.delete(n)),
+      contains: (name) => classes.has(name),
+      toggle: (name, force) => {
+        const on = force === undefined ? !classes.has(name) : force;
+        if (on) classes.add(name); else classes.delete(name);
+        return on;
+      },
     },
     addEventListener() {},
     removeEventListener() {},
-    querySelector() { return null; },
+    querySelector(sel) { return (selectorMap && selectorMap[sel]) || null; },
     querySelectorAll() { return []; },
     closest() { return null; },
     setAttribute() {},

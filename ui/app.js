@@ -735,22 +735,7 @@ function setupEvents() {
       if (isOpen) currentExpandedIds.add(card.dataset.id);
       else currentExpandedIds.delete(card.dataset.id);
 
-      // Fetch context on first expand
-      if (isOpen) {
-        const ctxDiv = card.querySelector(".card-quote-context");
-        if (ctxDiv && ctxDiv.classList.contains("hidden")) {
-          ctxDiv.classList.remove("hidden");
-          const source = card.dataset.source;
-          const sessionId = card.dataset.sessionId;
-          const msgTime = card.dataset.msgtime;
-          const msgId = card.dataset.msgid;
-          if (source && sessionId) {
-            fetchContext(ctxDiv, source, sessionId, parseInt(msgTime) || 0, msgId);
-          } else {
-            ctxDiv.innerHTML = '<p class="text-muted">缺少会话ID，无法加载上下文（旧数据不支持）</p>';
-          }
-        }
-      }
+      if (isOpen) expandQuoteContext(card); // 首次展开才装载上下文
       return;
     }
 
@@ -2246,19 +2231,7 @@ function applyExpandedState() {
     if (quote && !quote.classList.contains("open")) {
       quote.classList.add("open");
       if (toggle) { toggle.setAttribute("aria-expanded", "true"); setQuoteToggleLabel(toggle, true); }
-      const ctxDiv = card.querySelector(".card-quote-context");
-      if (ctxDiv && ctxDiv.classList.contains("hidden")) {
-        ctxDiv.classList.remove("hidden");
-        const source = card.dataset.source;
-        const sessionId = card.dataset.sessionId;
-        const msgTime = card.dataset.msgtime;
-        const msgId = card.dataset.msgid;
-        if (source && sessionId) {
-          fetchContext(ctxDiv, source, sessionId, parseInt(msgTime) || 0, msgId);
-        } else {
-          ctxDiv.innerHTML = '<p class="text-muted">缺少会话ID，无法加载上下文（旧数据不支持）</p>';
-        }
-      }
+      expandQuoteContext(card);
     }
   }
 }
@@ -2706,19 +2679,8 @@ function renderOverlayList(key) {
     if (!row) continue;
     const detail = row.querySelector(".ov-detail");
     if (detail) detail.classList.remove("hidden");
-    const ctxDiv = detail && detail.querySelector(".card-quote-context");
-    if (ctxDiv && ctxDiv.classList.contains("hidden")) {
-      ctxDiv.classList.remove("hidden");
-      const source = row.dataset.source;
-      const sessionId = row.dataset.sessionId;
-      const msgTime = row.dataset.msgtime;
-      const msgId = row.dataset.msgid;
-      if (source && sessionId) {
-        fetchContext(ctxDiv, source, sessionId, parseInt(msgTime) || 0, msgId);
-      } else {
-        ctxDiv.innerHTML = '<p class="text-muted">缺少会话ID，无法加载上下文（旧数据不支持）</p>';
-      }
-    }
+    // 浮层行的 ctxDiv 在 .ov-detail 里，data-source 等在 .ov-row 上，故传两个参数
+    if (detail) expandQuoteContext(detail, row);
   }
 }
 
@@ -2959,21 +2921,24 @@ function toggleRowDetail(row, expandedIds) {
   detail.classList.toggle("hidden");
   if (!isOpen) expandedIds.add(row.dataset.id);
   else expandedIds.delete(row.dataset.id);
-  if (!isOpen) {
-    const ctxDiv = detail.querySelector(".card-quote-context");
-    if (ctxDiv && ctxDiv.classList.contains("hidden")) {
-      ctxDiv.classList.remove("hidden");
-      const source = row.dataset.source;
-      const sessionId = row.dataset.sessionId;
-      const msgTime = row.dataset.msgtime;
-      const msgId = row.dataset.msgid;
-      if (source && sessionId) {
-        fetchContext(ctxDiv, source, sessionId, parseInt(msgTime) || 0, msgId);
-      } else {
-        ctxDiv.innerHTML = '<p class="text-muted">缺少会话ID，无法加载上下文（旧数据不支持）</p>';
-      }
-    }
+  // 展开时才装载上下文；ctxDiv 在 detail 里，dataset 在 row 上
+  if (!isOpen) expandQuoteContext(detail, row);
+}
+
+// 首次展开原文引用时装载上下文：主列表卡片、键盘定位、浮层行、时间线行四处共用。
+// scope 是含 .card-quote-context 的容器，srcEl 是带 data-source/session-id/msgtime/
+// msgid 的元素——浮层行两者不同（ctxDiv 在 .ov-detail 里，dataset 在 .ov-row 上）。
+// 已可见即直接返回（幂等，重复展开不重复请求）。
+function expandQuoteContext(scope, srcEl = scope) {
+  const ctxDiv = scope && scope.querySelector(".card-quote-context");
+  if (!ctxDiv || !ctxDiv.classList.contains("hidden")) return;
+  ctxDiv.classList.remove("hidden");
+  const { source, sessionId, msgtime, msgid } = srcEl.dataset;
+  if (!source || !sessionId) {
+    ctxDiv.innerHTML = '<p class="text-muted">缺少会话ID，无法加载上下文（旧数据不支持）</p>';
+    return;
   }
+  fetchContext(ctxDiv, source, sessionId, parseInt(msgtime) || 0, msgid);
 }
 
 // 文章卡片原文链接：仅渲染合法 http(s) 链接，新窗口打开（url 来自 items/raw_messages.article_url）
