@@ -422,7 +422,7 @@ class QqFlowClient(SourceClient):
             )
         except Exception as e:
             # 调用方（SSE 监听器）fail-open 处理并记 WARNING，此处仅 DEBUG 免双重日志
-            logger.debug(f"回查消息失败: {e}")
+            logger.warning(f"回查消息失败: {e}")
             raise
         window = 120
         for m in resp.get("messages", []):

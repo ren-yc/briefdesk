@@ -107,10 +107,10 @@ class WeFlowSettings(BaseSettings):
             try:
                 data = json.loads(raw)
             except json.JSONDecodeError:
-                logger.warning("[weflow] %s 非法 JSON，按未配置处理", key_name)
+                logger.warning("%s 非法 JSON，按未配置处理", key_name)
                 continue
             if not isinstance(data, dict):
-                logger.warning("[weflow] %s 应为 JSON 对象，按未配置处理", key_name)
+                logger.warning("%s 应为 JSON 对象，按未配置处理", key_name)
                 continue
             for key, value in data.items():
                 if not isinstance(key, str) or not isinstance(value, str):

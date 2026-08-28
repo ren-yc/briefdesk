@@ -69,7 +69,7 @@ async def poll(
 
     if pull_all:
         logger.warning(
-            "[qqflow] BACKFILL_HOURS=-1：将拉取全部历史消息，每次同步都会全量扫描，"
+            "BACKFILL_HOURS=-1：将拉取全部历史消息，每次同步都会全量扫描，"
             "消息量大时非常耗时且 AI 调用量激增；建议全量拉取完成后改回正常小时数"
         )
     backfill_count = 0
@@ -82,10 +82,6 @@ async def poll(
     window_desc = "全量" if pull_all else (
         f"按会话窗口（{backfill_count} 会话回填）" if backfill_count else "按会话窗口"
     )
-    logger.info(
-        f"[qqflow] poll 开始: 窗口 {window_desc}, {len(enabled_sessions)} 个启用会话"
-    )
-
     # 503 就绪门控（索引期）是启动期预期瞬态：静默跳过本轮，不污染 lastError
     try:
         await client.ensure_ready()
@@ -105,7 +101,7 @@ async def poll(
             ContactInfo(source=client.name, sender_id=username, display_name=name)
             for username, name in contacts.items()
         ]
-        logger.info(f"Loaded {len(contacts)} contacts")
+        logger.info("联系人加载完成: %d 名", len(contacts))
 
         result.sessions = [
             SessionInfo(
@@ -120,7 +116,7 @@ async def poll(
             if s.get("username")
         ]
     except QqFlowNotReadyError:
-        logger.info("qqflow-server 正在建立索引（503），本轮轮询跳过")
+        logger.info("qqflow-server 未就绪（503），本轮轮询跳过")
         # 发现阶段即不可用：全部传入的启用会话都视为未成功拉取，
         # 应用层（poll_cycle）据此跳过它们的水位推进，防窗口消息永久漏拉
         result.failed_sessions = {s.session_id for s in enabled_sessions}
@@ -128,17 +124,17 @@ async def poll(
 
     result.session_count = len(enabled_sessions)
 
-    if not enabled_sessions:
-        logger.info(
-            f"No enabled sessions — discovered {len(result.sessions)} total, "
-            "enable groups in settings"
-        )
-        return result
-
+    # 会话发现之后才打：此时 result.sessions 已填充，「共发现」才有值
     logger.info(
-        f"Polling {len(enabled_sessions)} enabled sessions "
-        f"({len(result.sessions)} total discovered)"
+        "poll 开始: 窗口 %s, %d 个启用会话（共发现 %d 个）",
+        window_desc,
+        len(enabled_sessions),
+        len(result.sessions),
     )
+
+    if not enabled_sessions:
+        logger.info("无启用会话（共发现 %d 个），请在设置中启用群组", len(result.sessions))
+        return result
 
     total_raw = 0
     total_skipped = 0
@@ -281,7 +277,7 @@ async def poll(
             raise
 
     summary = (
-        f"[qqflow] poll 完成: {len(result.messages)} 条新消息 "
+        f"poll 完成: {len(result.messages)} 条新消息 "
         f"(原始 {total_raw}, 预过滤 {total_skipped}, "
         f"{len(enabled_sessions)} 会话, {fmt_dur(time_module.perf_counter() - poll_start)})"
     )

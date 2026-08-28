@@ -103,7 +103,7 @@ class QqFlowSource(SourceRuntime[QqFlowClient]):
             if s.get("username")
         ]
         logger.info(
-            "[qqflow] 会话刷新完成: %d 个会话 (%s)",
+            "会话刷新完成: %d 个会话 (%s)",
             len(result),
             fmt_dur(time_module.perf_counter() - start),
         )
@@ -111,7 +111,7 @@ class QqFlowSource(SourceRuntime[QqFlowClient]):
 
     def start(self, on_batch: BatchHandler) -> None:
         """创建并启动 SSE 实时监听。"""
-        logger.info("[qqflow] 启动 SSE 实时监听")
+        logger.info("启动 SSE 实时监听")
         self.listener = QqFlowSseClient(self.client, on_batch, settings=self._settings)
         self.listener.start()
 
@@ -133,4 +133,4 @@ class QqFlowSource(SourceRuntime[QqFlowClient]):
                 await drain()
             self.listener = None
         await self.client.close()
-        logger.info("[qqflow] 已关闭")
+        logger.info("已关闭")

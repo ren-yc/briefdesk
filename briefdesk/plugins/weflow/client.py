@@ -536,7 +536,7 @@ class WeFlowClient(SourceClient):
                 retry_on_empty=False,
             )
         except Exception as e:
-            logger.error(f"回查消息失败: {e}")
+            logger.warning(f"回查消息失败: {e}")
             raise
 
         window = 120

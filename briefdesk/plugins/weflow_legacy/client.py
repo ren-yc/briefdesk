@@ -285,7 +285,7 @@ class WeFlowLegacyClient(SourceClient):
                 retry_on_empty=False,
             )
         except Exception as e:
-            logger.error(f"回查消息失败: {e}")
+            logger.warning(f"回查消息失败: {e}")
             raise
 
         # 时间窗口过滤 + 匹配 serverId

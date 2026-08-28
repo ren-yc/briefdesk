@@ -88,7 +88,7 @@ class WeFlowLegacySource(SourceRuntime[WeFlowLegacyClient]):
             for s in sessions
         ]
         logger.info(
-            "[weflow-legacy] 会话刷新完成: %d 个会话 (%s)",
+            "会话刷新完成: %d 个会话 (%s)",
             len(result),
             fmt_dur(time_module.perf_counter() - start),
         )
@@ -96,7 +96,7 @@ class WeFlowLegacySource(SourceRuntime[WeFlowLegacyClient]):
 
     def start(self, on_batch: BatchHandler) -> None:
         """创建并启动 SSE 实时监听。"""
-        logger.info("[weflow-legacy] 启动 SSE 实时监听")
+        logger.info("启动 SSE 实时监听")
         self.listener = WeFlowLegacySseClient(
             self.client, on_batch, settings=self._settings
         )
@@ -120,4 +120,4 @@ class WeFlowLegacySource(SourceRuntime[WeFlowLegacyClient]):
                 await drain()
             self.listener = None
         await self.client.close()
-        logger.info("[weflow-legacy] 已关闭")
+        logger.info("已关闭")
