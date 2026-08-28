@@ -134,13 +134,14 @@ class SseReadTimeoutTest(unittest.TestCase):
 class EnsureReadyRejectedStateTest(unittest.IsolatedAsyncioTestCase):
     """【4·P2】ensure_ready 注册被拒（invalid_key 等）不得记忆化，下轮须重试。"""
 
-    def _make_client(self, state: str, calls: list):
+    def _make_client(self, state: str, calls: list, phase: str = "unregistered"):
         client = QqFlowClient(
             "http://127.0.0.1:5032", "tok", qq="123", key="bad-key"
         )
 
         async def fake_health():
-            return {"accounts": []}
+            # 标量形状：/health 只给一个 account 阶段，不再列账号。
+            return {"status": "starting", "version": "0.5.0", "account": phase}
 
         async def fake_register(qq, key, db_path):
             calls.append(state)
@@ -163,6 +164,41 @@ class EnsureReadyRejectedStateTest(unittest.IsolatedAsyncioTestCase):
         await client.ensure_ready()
         await client.ensure_ready()
         self.assertEqual(len(calls), 1, "良性状态应记忆化避免重复注册")
+
+    async def test_account_conflict_is_not_memoized(self):
+        """服务端被另一个账号占用：不记忆化，配置修正/对方注销后可自愈。"""
+        calls: list = []
+        client = self._make_client("account_conflict", calls)
+        await client.ensure_ready()
+        await client.ensure_ready()
+        self.assertEqual(len(calls), 2, "占用冲突后必须再次尝试")
+
+    async def test_indexing_phase_skips_registration(self):
+        """服务端已在建索引：跳过注册并记忆化。
+
+        回归防护：这条优化此前从未生效 —— 代码拿**注册结果**的词表
+        (accepted/in_progress/...) 去比对 /health 的账号状态
+        (awaiting_key/indexing/...)，两套枚举不相交，分支恒为假，
+        于是索引期内每一轮 poll 都会重复注册一次。
+        """
+        calls: list = []
+        client = self._make_client("accepted", calls, phase="indexing")
+        await client.ensure_ready()
+        await client.ensure_ready()
+        self.assertEqual(len(calls), 0, "索引期不应发起注册")
+
+    async def test_ready_phase_skips_registration(self):
+        calls: list = []
+        client = self._make_client("accepted", calls, phase="ready")
+        await client.ensure_ready()
+        self.assertEqual(len(calls), 0, "已就绪不应发起注册")
+
+    async def test_error_phase_retries_registration(self):
+        """error 阶段仍要注册：服务端的 error 不释放绑定，但同一账号可重试恢复。"""
+        calls: list = []
+        client = self._make_client("accepted", calls, phase="error")
+        await client.ensure_ready()
+        self.assertEqual(len(calls), 1, "error 阶段应尝试重新注册以恢复")
 
 
 class LookupLimitTest(unittest.IsolatedAsyncioTestCase):

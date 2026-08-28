@@ -122,8 +122,14 @@ logger = logging.getLogger(__name__)
 # 媒体下载大小上限：防止异常/恶意上游返回超大文件造成内存放大
 _MAX_MEDIA_BYTES = 20 * 1024 * 1024
 
-# 账号引导的良性状态：已受理/引导中，视为可记忆，索引期内不重复注册
+# 注册接口（POST /api/v1/accounts）返回的良性 state：已受理/引导中，视为可
+# 记忆，索引期内不重复注册。这是**注册结果**的词表，与 /health 的 account
+# 阶段值（unregistered/indexing/ready/error）是两套不相交的枚举 —— 曾经把它
+# 拿去比对健康状态，那个分支恒为假，"索引中不重复注册"的优化从未生效。
 _BENIGN_STATES = ("accepted", "in_progress", "already_ready")
+
+# /health 的 account 阶段值中，代表"服务端已在引导、无需再注册"的那些。
+_BOOTSTRAPPING_PHASES = ("indexing",)
 
 # 按消息回查 REST（IGNORE_SELF 方向判定）的单页条数：倒序响应下目标消息
 # 之后 120s 窗口内的新消息会把它挤出首页，50 条在刷屏场景不够，
@@ -262,7 +268,7 @@ class QqFlowClient(SourceClient):
         """POST /api/v1/accounts 注册账号，返回 state。
 
         state: accepted / invalid_key / invalid_db_path / unknown_qq /
-        already_ready / in_progress
+        already_ready / in_progress / account_conflict
         """
         client = self._get_client()
         resp = await with_connect_retry(
@@ -288,6 +294,11 @@ class QqFlowClient(SourceClient):
         索引期，业务接口的 503 由 QqFlowNotReadyError 瞬态处理兜底，不在此
         阻塞等待。引导中（_BENIGN_STATES）视为良性状态并记忆，索引期内不
         重复注册；网络失败不记忆，下轮重试。
+
+        `/health` 只给一个标量 `account` 阶段（`unregistered` / `indexing` /
+        `ready` / `error`），不再列出账号 —— 该接口免鉴权，账号清单会向任何
+        调用方泄露本机存在哪些账号。明细在需鉴权的 `GET /api/v1/accounts`
+        （见 fetch_accounts）。
         """
         if self._ready_checked and not force:
             return
@@ -301,19 +312,21 @@ class QqFlowClient(SourceClient):
             except Exception:
                 self._ready_checked = False
                 raise
-            accounts = health.get("accounts", [])
-            states = [a.get("state") for a in accounts]
-            logger.debug("qqflow 健康检查: 账号状态 %s", states or "（无账号）")
-            if any(a.get("state") == "ready" for a in accounts):
+            phase = health.get("account", "unregistered")
+            logger.debug("qqflow 健康检查: 账号阶段 %s", phase)
+            if phase == "ready":
                 self._ready_checked = True
                 logger.debug("qqflow 已有就绪账号，跳过引导")
                 return
-            if any(a.get("state") in _BENIGN_STATES for a in accounts):
+            if phase in _BOOTSTRAPPING_PHASES:
                 self._ready_checked = True
-                logger.debug("qqflow 账号引导中（良性状态），不再重复注册")
+                logger.debug("qqflow 账号引导中（%s），不再重复注册", phase)
                 return
+            # `error` 落到这里是有意的：服务端的 error 状态不释放绑定，但同一
+            # 账号可以直接重试注册来恢复（密钥修正后即生效）。
             logger.info(
-                "qqflow 无就绪账号，尝试引导注册 (qq=%s, db_path=%s)",
+                "qqflow 无就绪账号（阶段 %s），尝试引导注册 (qq=%s, db_path=%s)",
+                phase,
                 self._qq,
                 self._db_path or "<默认>",
             )
@@ -321,11 +334,37 @@ class QqFlowClient(SourceClient):
             if state in _BENIGN_STATES:
                 self._ready_checked = True
                 logger.info(f"qqflow 账号引导中: {state}")
+            elif state == "account_conflict":
+                # 服务端已被**另一个** QQ 占用（内存索引没有账号维度，同时只能
+                # 绑定一个账号）。重试不会自愈：得由人去注销那个账号或改配置，
+                # 所以按 ERROR 报而不是 warning，且不记忆化以便配置修正后自愈。
+                logger.error(
+                    "qqflow 注册被拒：服务端已绑定另一个账号（本地配置 qq=%s）。"
+                    "需先注销：DELETE /api/v1/accounts/{占用方qq}",
+                    self._qq,
+                )
             else:
                 # 被拒态（invalid_key/invalid_db_path/unknown_qq 等）不记忆化：
                 # 保持未检查标志让下一轮 poll 的 ensure_ready 再次尝试注册；
                 # 否则零账号部署下没有业务 503 兜底复位标志，引导失败后永不自愈
                 logger.warning(f"qqflow 账号引导被拒: {state}（下轮重试）")
+
+    async def fetch_accounts(self) -> list[dict]:
+        """GET /api/v1/accounts —— 账号明细（诊断用，需鉴权）。
+
+        `/health` 只报一个标量阶段；出错时的具体原因（`error` 字段）、消息数
+        与服务端实际读取的 `db_path` 只在这里。不参与就绪判定，仅供排查。
+        """
+        client = self._get_client()
+        resp = await with_connect_retry(
+            lambda: client.get("/api/v1/accounts", headers=self._auth_headers())
+        )
+        if not resp.is_success:
+            raise RuntimeError(
+                f"QqFlow API error: {resp.status_code} on /api/v1/accounts — "
+                f"{resp.text[:200]}"
+            )
+        return resp.json().get("accounts", [])
 
     # ── REST API ──
 

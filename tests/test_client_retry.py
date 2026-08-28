@@ -109,11 +109,14 @@ class QqFlowClientRetryTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(fake.get.call_count, 3)
 
     async def test_fetch_health_retries_connect_errors(self):
+        # /health 是标量形状：status + version + account（单个阶段值），
+        # 不再下发账号数组 —— 该接口免鉴权，账号清单等于枚举本机账号。
+        health = {"status": "starting", "version": "0.5.0", "account": "unregistered"}
         client, fake = self._client_with_get(
-            [httpx.ConnectError("refused"), _FakeResp(200, {"accounts": []})]
+            [httpx.ConnectError("refused"), _FakeResp(200, health)]
         )
         result = await client.fetch_health()
-        self.assertEqual(result, {"accounts": []})
+        self.assertEqual(result, health)
         self.assertEqual(fake.get.call_count, 2)
 
     async def test_503_semantics_preserved_after_connect_retry(self):

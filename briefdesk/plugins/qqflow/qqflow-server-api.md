@@ -11,7 +11,7 @@ qqflow-server 提供本地 HTTP API（已支持 GET 和 POST 请求），便于�
 - 基础地址：`http://127.0.0.1:5032`
 - **账号为客户端驱动**：启动时仅做平台路径扫描，发现的账号列为 `awaiting_key`（零账号启动合法）；由客户端调用 `POST /api/v1/accounts` 传入 `{qq, key, db_path}` 注册账号后，服务在后台以只读直连方式打开源库（偏移 VFS 虚拟剥离自定义头）、解密并构建索引（见 §1.1）
 - API Token：首次启动自动生成（32 字节随机数的 64 字符十六进制）并持久化到系统凭据库（`--show-token` 获取）（启动日志仅打印保存路径，不打印 token 值）
-- 索引就绪前（存在 `awaiting_key` / `indexing` / `error` 账号时），业务接口返回 `503`（见 §8 错误）；`/health` 返回 `starting` 状态。例外：SSE 接口 `/api/v1/push/messages` 与 `/api/v1/accounts` 不检查就绪状态，可随时调用
+- 索引就绪前（账号处于 `indexing` / `error` 时），业务接口返回 `503`（见 §8 错误）；`/health` 返回 `starting` 状态。例外：SSE 接口 `/api/v1/push/messages` 与 `/api/v1/accounts`（含明细、注销）不检查就绪状态，可随时调用
 - 新消息检测：后台以**文件系统事件**驱动（Windows ReadDirectoryChangesW / Linux inotify / macOS FSEvents，`--watch-debounce-ms` 默认 350ms 防抖，辅以 `--watch-fallback-ms` 默认 30s 慢速兜底轮询防事件丢失），源数据库文件变化时执行完整同步（直连活库的增量读取，零拷贝），经 `GET /api/v1/push/messages` 推送 SSE；客户端亦可主动调用 `POST /api/v1/sync` 立即同步
 
 ## 鉴权规范
@@ -29,6 +29,9 @@ qqflow-server 提供本地 HTTP API（已支持 GET 和 POST 请求），便于�
 - `GET|POST /health`（免鉴权）
 - `GET|POST /api/v1/health`（免鉴权）
 - `POST /api/v1/accounts`（注册账号：qq + key + db_path）
+- `GET /api/v1/accounts`（账号明细，需鉴权，见 §1.2）
+- `DELETE /api/v1/accounts/{qq}`（注销账号，见 §1.3）
+- `POST /api/v1/accounts/{qq}/deregister`（注销别名，同一处理器）
 - `GET|POST /api/v1/messages`
 - `GET /api/v1/media/{id}`（媒体直服，自本地缓存）
 - `GET|POST /api/v1/media/{talker}/{mediaType}/{file}`（媒体导出文件服务，见 §3.2）
@@ -65,22 +68,69 @@ GET /api/v1/health
 {
   "status": "ok",
   "version": "<version>",
+  "account": "ready"
+}
+```
+
+| 字段 | 说明 |
+| ---- | ---- |
+| `status` | `ok`（索引就绪）或 `starting`（未就绪） |
+| `version` | 服务版本号 |
+| `account` | 单个标量阶段值 ∈ `unregistered \| indexing \| ready \| error` |
+
+`account` 的取值：
+
+| 值 | 说明 |
+| -- | ---- |
+| `unregistered` | 无账号注册（含"启动扫描发现了账号但尚未注册密钥"，见下） |
+| `indexing` | 已注册，正在构建索引 |
+| `ready` | 索引就绪，业务接口可用 |
+| `error` | 初始化失败（如密钥错误）；账号仍占用绑定 |
+
+**本接口刻意不列出账号。** 它免鉴权，而启动扫描会为本机每个 QQ 目录建立一条记录，因此把账号数组（乃至它的长度）放在这里，等于向任何未鉴权的调用方泄露本机存在哪些账号、各自进行到哪一步。账号号码、消息数、数据库路径、错误详情改由需鉴权的 `GET /api/v1/accounts`（§1.2）提供。
+
+同理，`awaiting_key` 不会出现在这里：账号进入该状态的唯一途径就是启动扫描发现了它，所以对外一律折叠为 `unregistered`。
+
+> 说明：`error` 表示初始化失败（如密钥错误），客户端重新调用 `POST /api/v1/accounts` 传入正确参数即可恢复，进程不会退出。
+
+---
+
+## 1.2 账号明细（GET /api/v1/accounts）
+
+`/health` 不再披露的账号明细。Token 保护（五通道，但 GET 建议走 Header——查询串会进代理日志与 shell 历史）；**不受就绪门控**，因为客户端正是在账号还在 `indexing`（即服务尚未就绪）时轮询它。
+
+**请求**
+
+```http
+GET /api/v1/accounts
+Authorization: Bearer YOUR_TOKEN
+```
+
+**响应**
+
+```json
+{
+  "success": true,
   "accounts": [
-    { "qq": "123456789", "state": "ready", "message_count": 28314 }
+    {
+      "qq": "1234567890",
+      "state": "ready",
+      "message_count": 28314,
+      "db_path": "C:\\Users\\<用户名>\\Documents\\Tencent Files\\1234567890\\nt_qq\\nt_db\\nt_msg.db"
+    }
   ]
 }
 ```
 
 | 字段 | 说明 |
 | ---- | ---- |
-| `status` | `ok`（全部账号索引就绪）或 `starting`（存在未就绪账号） |
-| `version` | 服务版本号 |
 | `accounts[].qq` | 账号 |
-| `accounts[].state` | `awaiting_key` / `indexing` / `ready` / `error` |
+| `accounts[].state` | `awaiting_key` / `indexing` / `ready` / `error`（完整状态机，不折叠） |
 | `accounts[].message_count` | 已索引消息数（仅 ready 后有效） |
-| `accounts[].error` | 出错时的错误信息（仅 error 状态） |
+| `accounts[].error` | 出错时的错误信息（仅 `error` 状态；否则该键省略） |
+| `accounts[].db_path` | 服务端解析到的 `nt_msg.db` 路径；未知时该键省略 |
 
-> 说明：`error` 表示初始化失败（如密钥错误），客户端重新调用 `POST /api/v1/accounts` 传入正确参数即可恢复，进程不会退出。
+数组里可能有多条，但**最多一条处于 `indexing` / `ready` / `error`**（即"绑定"）。其余条目是启动扫描发现、但从未注册密钥的账号，恒为 `awaiting_key`；它们不参与就绪判定，也不构成绑定（见 §10）。
 
 ---
 
@@ -124,27 +174,107 @@ POST /api/v1/accounts
 | 字段 | 说明 |
 | ---- | ---- |
 | `state` | **本次注册请求的结果**（见下表） |
-| `status` | **账号当前状态机值** ∈ `awaiting_key \| indexing \| ready \| error`，与 `/health` 的 `accounts[].state` 同一枚举；账号此前从未出现过时省略 |
+| `status` | **账号当前状态机值** ∈ `awaiting_key \| indexing \| ready \| error`，与 `GET /api/v1/accounts` 的 `accounts[].state` 同一枚举；账号此前从未出现过时省略 |
 | `db_path` | 服务端**实际解析到的** `nt_msg.db` 路径；无法解析时省略 |
 
 | `state` | 说明 | 伴随的 `status` |
 | ------- | ---- | ---- |
-| `accepted` | 参数合法，后台开始初始化（`/health` 可见 `indexing` → `ready`） | `indexing` |
+| `accepted` | 参数合法，后台开始初始化（`GET /api/v1/accounts` 可见 `indexing` → `ready`） | `indexing` |
 | `invalid_key` | 密钥未通过校验（非 16 字节可打印 ASCII）；**仅在账号/路径解析通过后评估** | 账号原状态（未变） |
 | `invalid_db_path` | `db_path` 不存在或目录下无 `nt_msg.db` | 账号原状态（未变） |
 | `unknown_qq` | 未扫描到该账号且未提供 `db_path` | 账号原状态（未变） |
 | `already_ready` | 账号已就绪（幂等无操作） | `ready` |
 | `in_progress` | 账号正在索引 | `indexing` |
+| `account_conflict` | **已有另一个账号占用绑定**，本次注册被拒；额外返回 `occupied_by`（占用方 qq）与 `occupied_status`（占用方状态） | 省略（本次请求的 qq 未变化） |
 
-**判定顺序**（与实现一致）：① 幂等守卫——账号已 `ready`/`indexing` 时直接返回 `already_ready`/`in_progress`（优先于路径解析）；② 账号/库路径解析——未扫描到该账号且未提供 `db_path` → `unknown_qq`；提供了 `db_path` 但无法解析 → `invalid_db_path`；③ 路径解析通过后才校验密钥格式 → `invalid_key`。因此对未扫描到的账号传任何 key 都只会得到 `unknown_qq`（`invalid_key` 在该分支不可达）；`invalid_key` 只出现在账号已存在（扫描到或路径已解析）但密钥格式错误的情形。
+**判定顺序**（与实现一致）：① 参数与密钥格式；② 幂等/占用守卫——同一 qq 已 `ready`/`indexing` 时返回 `already_ready`/`in_progress`，**不同** qq 已持有绑定则返回 `account_conflict`；③ 账号/库路径解析——未扫描到该账号且未提供 `db_path` → `unknown_qq`；提供了 `db_path` 但无法解析 → `invalid_db_path`；④ 路径解析通过后才校验密钥格式 → `invalid_key`。因此对未扫描到的账号传任何 key 都只会得到 `unknown_qq`（`invalid_key` 在该分支不可达）；`invalid_key` 只出现在账号已存在（扫描到或路径已解析）但密钥格式错误的情形。
 
-`status` 的用途是免去注册后立刻再打一次 `/health`：拒绝类响应（`invalid_key` / `invalid_db_path` / `unknown_qq`）不改变账号状态，`status` 因此告诉客户端账号**此刻仍处于什么状态**——例如密钥填错重注册一个此前失败的账号，会得到 `state=invalid_key` + `status=error`，即"这次被拒且账号仍然坏着"。
+`account_conflict` 示例：
 
-**`status: "indexing"` 不代表密钥正确**：本接口在账号/路径解析通过后只校验密钥格式，真正的解密验证在后台初始化中完成（失败 → `error`）。客户端仍需轮询 `/health` 等到 `ready`。
+```json
+{
+  "success": true,
+  "qq": "10002",
+  "state": "account_conflict",
+  "occupied_by": "10001",
+  "occupied_status": "ready"
+}
+```
+
+**重复注册不再覆写。** 内存索引没有账号维度，第二个账号写进来会污染第一个账号的数据，所以换账号必须先调用 §1.3 注销。`error` 状态**不释放绑定**——一次瞬时解密失败不应把服务交给另一个账号；同一个 qq 可以直接重试注册来恢复。
+
+`status` 的用途是免去注册后立刻再打一次 `GET /api/v1/accounts`：拒绝类响应（`invalid_key` / `invalid_db_path` / `unknown_qq`）不改变账号状态，`status` 因此告诉客户端账号**此刻仍处于什么状态**——例如密钥填错重注册一个此前失败的账号，会得到 `state=invalid_key` + `status=error`，即"这次被拒且账号仍然坏着"。
+
+**`status: "indexing"` 不代表密钥正确**：本接口在账号/路径解析通过后只校验密钥格式，真正的解密验证在后台初始化中完成（失败 → `error`）。客户端仍需轮询 `/health`（或 §1.2）等到 `ready`。
 
 `db_path` 回显的是解析结果而非请求原值：请求里的 `db_path` 可以是文件、可以是 Tencent Files 风格根目录、也可以省略（走启动扫描），回显让客户端确认服务端最终读的是哪个库。幂等分支（`already_ready` / `in_progress`）回显的是**运行中账号当初使用的路径**，本次请求携带的 `db_path` 在这些分支下被忽略。
 
-密钥仅保存在内存中，**不持久化**；进程退出后需重新注册。密钥错误时账号进入 `error` 状态（`/health` 的 `accounts[].error` 给出原因），重新调用本接口传入正确参数即可恢复。
+密钥仅保存在内存中，**不持久化**；进程退出后需重新注册。密钥错误时账号进入 `error` 状态（`GET /api/v1/accounts` 的 `accounts[].error` 给出原因），重新调用本接口传入正确参数即可恢复。
+
+---
+
+## 1.3 注销账号（DELETE /api/v1/accounts/{qq}）
+
+撤销注册，把服务恢复到刚启动时的未注册状态：停止同步与文件监听、丢弃内存索引、清空 SSE 重放缓冲并广播一条归零的 `sync` 基线事件。Token 保护；**不受就绪门控**——卡在 `error` 的账号正是最需要清掉的。
+
+**请求**
+
+```http
+DELETE /api/v1/accounts/1234567890?purge_media=1
+Authorization: Bearer YOUR_TOKEN
+```
+
+不能发 `DELETE` 的客户端或代理可用等价别名（同一处理器，参数可走 JSON Body）：
+
+```http
+POST /api/v1/accounts/1234567890/deregister
+```
+
+| 参数 | 类型 | 必填 | 说明 |
+| ---- | ---- | ---- | ---- |
+| `qq` | string(path) | 是 | **安全联锁**，非选择器（见下） |
+| `purge_media` | bool(`1`/`0`/`true`/`false`) | 否 | 是否同时删除已导出的媒体文件，**默认 `false`** |
+
+**响应**
+
+```json
+{
+  "success": true,
+  "qq": "1234567890",
+  "state": "deregistered",
+  "previous_status": "ready",
+  "index_cleared": true,
+  "purged_media": true,
+  "purged_dirs": 3
+}
+```
+
+| 字段 | 说明 |
+| ---- | ---- |
+| `state` | `deregistered` / `not_registered` / `qq_mismatch` |
+| `previous_status` | 请求到达时账号所处的状态（仅 `deregistered`）——用于区分"取消了一次进行中的构建"与"解绑了一个就绪账号" |
+| `index_cleared` | 是否真的丢弃了一份索引（`indexing` 中途注销时为 `false`） |
+| `purged_media` | 本次是否**请求**了清理媒体（回显入参） |
+| `purged_dirs` | 实际删除的导出目录数；`purged_media=false` 时恒为 `0` |
+| `occupied_by` / `occupied_status` | 占用绑定的账号及其状态（仅 `qq_mismatch`） |
+
+| `state` | 语义 | 副作用 |
+| ------- | ---- | ---- |
+| `deregistered` | 注销成功 | 索引、同步、监听、SSE 缓冲均已清理 |
+| `not_registered` | 当前无账号绑定 | 无（**幂等**：重试一次已完成的注销得到 200，而非报错） |
+| `qq_mismatch` | 另一个账号持有绑定，路径里的 qq 不是它 | **无，占用方完全不受影响** |
+
+三种结果**一律返回 HTTP 200**，判定写在 `state` 里，与 §1.1 的拒绝态报告方式一致。
+
+**路径里的 `qq` 是联锁而不是选择器**：绑定全局只有一个，所以传错账号说明客户端状态和服务端不一致，值得报 `qq_mismatch` 让它发现，而不是顺手把当前绑定的那个注销掉。
+
+**`purge_media` 默认 false，且只删已知布局。** 导出媒体是派生数据，客户端可能还在用自己的缓存对外提供服务，而删文件不可撤销，所以必须显式索取。开启后也只删 `<exportPath>/<talker>/<kind>`（`kind` ∈ `images` / `voices` / `videos` / `emojis`，即服务自己写的四类），talker 目录本身仅在变空后以"非空即拒"的方式移除；`--media-export-dir` 可能指向操作员另有他用的目录，因此**递归删除导出根目录从来不是选项**，根目录自身永不删除。
+
+**索引中途注销是允许的。** 不必等 `ready`：注销会作废进行中的初始化（`indexing` 的构建完成后不会把索引装回来，账号也不会"复活"）。
+
+注销**不阻止**持有 token 的客户端立刻重新注册（这是恢复手段，不是锁）；注销后 `state=not_registered` 的幂等语义也意味着并发的两次注销不会互相报错。
+
+**已扫描账号与客户端注册账号的差别**：启动扫描发现过的账号，注销后条目**保留**并回到 `awaiting_key`、`db_path` 仍在（下次启动扫描还会找到它，声称它不存在是假话）；纯客户端引入的账号（靠请求里的 `db_path` 才知道）条目**整条移除**，路径一并遗忘。
 
 ---
 
@@ -657,6 +787,11 @@ TOKEN=$(Get-Content "$env:LOCALAPPDATA\qqflow-server\系统凭据库（--show-to
 curl -X POST http://127.0.0.1:5032/api/v1/accounts \
   -H "Content-Type: application/json" \
   -d "{\"qq\": \"1234567890\", \"key\": \"<16字节密钥>\", \"db_path\": \"C:\\\\Users\\\\<用户名>\\\\Documents\\\\Tencent Files\", \"access_token\": \"$TOKEN\"}"
+# 账号明细（需鉴权；/health 只给标量 account 阶段）
+curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:5032/api/v1/accounts
+# 注销账号（恢复未注册状态；加 purge_media=1 才删导出媒体）
+curl -X DELETE -H "Authorization: Bearer $TOKEN" \
+  "http://127.0.0.1:5032/api/v1/accounts/1234567890?purge_media=1"
 # GET 带 Token Header
 curl -H "Authorization: Bearer $TOKEN" "http://127.0.0.1:5032/api/v1/messages?talker=10001&limit=20"
 # POST 带 JSON Body（参数走 Body，token 亦可走 Body）
@@ -696,3 +831,6 @@ sessions = requests.get(f"{BASE_URL}/api/v1/sessions", params={"limit": 20}, hea
 6. 撤回消息 `localType=6`，content 保留原文（含"你猜猜撤回了什么"提示行）。
 7. 媒体交付双通道：`/api/v1/media/{id}` 直服本地缓存（常开）；`media=1` 按需导出（§3.2，WeFlow 形状）。v1 未实现：朋友圈（SNS）、未读数（`unreadCount`）。
 8. 端口：默认 `127.0.0.1:5032`（WeFlow 为 5031；`--port` 可改）——与 WeFlow 的差异为既定决策。
+9. **单账号绑定**：内存索引没有账号维度，同时只能有一个账号处于 `indexing` / `ready` / `error`。第二个账号注册被拒（`account_conflict`，见 §1.1）而**不是覆写**；换账号必须先调 `DELETE /api/v1/accounts/{qq}`（§1.3）。`error` 不释放绑定，但同一 qq 可直接重试。
+10. **注销不是锁**：它只是把服务恢复到未注册状态，持有 token 的客户端可以立刻重新注册。要真正阻止访问请轮换 token 或停止进程。
+11. **密钥在内存中未做 `zeroize`**：`key` 仅存活于进程内存、不落盘，但注销/进程退出时不做显式擦除，因此仍可能残留在内存或崩溃转储中。威胁模型假定本机可信（服务默认只监听 `127.0.0.1`）。
