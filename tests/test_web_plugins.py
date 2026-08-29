@@ -275,6 +275,36 @@ class PluginFrontendCoreHelperTest(unittest.TestCase):
                 f"插件前端调用了 {name}，但 app.js 顶层没有该声明",
             )
 
+    def test_core_row_containers_anchor_plugin_row_menus(self):
+        """核心行容器须是定位上下文：插件行内菜单用 position:absolute 锚在其上。
+
+        `renderItemRowMenus()` 把插件菜单注入为行容器的直接子元素，菜单自带
+        `position:absolute`（样式随插件包分发）。核心少了 `position: relative`，
+        菜单就会锚到更外层祖先——位置错到别处，但核心测试与插件测试都全绿。
+        """
+        root = Path(__file__).resolve().parents[1]
+        css = (root / "ui" / "style.css").read_text(encoding="utf-8")
+        for selector in (".ov-row", ".item-card"):
+            blocks = re.findall(
+                rf"(?m)^{re.escape(selector)}\s*\{{(.*?)\}}", css, re.DOTALL
+            )
+            self.assertTrue(blocks, f"style.css 未找到 {selector} 规则块")
+            self.assertTrue(
+                any("position: relative" in b for b in blocks),
+                f"{selector} 须声明 position: relative（插件行内菜单的定位锚点）",
+            )
+
+    def test_plugin_row_menus_are_absolutely_positioned(self):
+        """与上一条配对：插件菜单确实依赖绝对定位，否则那条守卫就是空的。"""
+        root = Path(__file__).resolve().parents[1]
+        found = False
+        for path in sorted((root / "briefdesk" / "plugins").glob("*/ui/ui.css")):
+            text = path.read_text(encoding="utf-8")
+            for block in re.findall(r"\{([^}]*)\}", text):
+                if "position: absolute" in block:
+                    found = True
+        self.assertTrue(found, "没有插件菜单用绝对定位，核心的定位锚点守卫需重新评估")
+
     def test_plugin_frontends_do_not_touch_localstorage_directly(self):
         """插件不得裸用 localStorage：异常会中断事件处理函数（见 lsGet/lsSet 注释）。"""
         root = Path(__file__).resolve().parents[1]

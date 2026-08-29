@@ -1030,6 +1030,9 @@ body.modal-open { overflow: hidden; }
   border: 1px solid var(--border); border-radius: var(--radius-sm);
   padding: 12px 14px; background: var(--surface);
   border-left: 3px solid var(--cat, var(--cat-default));
+  /* 定位上下文：行内扩展菜单由 renderItemRowMenus() 注入为本元素的直接子元素，
+     其样式随插件包分发且用 position:absolute，锚点在此 */
+  position: relative;
 }
 .ov-row.memo { border-left-color: var(--memo); }
 .ov-row.ignored { border-left-color: var(--border); }
@@ -1438,30 +1441,6 @@ body.modal-open { overflow: hidden; }
 .load-more-btn:hover { background: var(--bg); color: var(--text); border-color: var(--accent); }
 .load-more-btn:disabled { opacity: .6; cursor: default; }
 
-/* ── 修正分类菜单 ── */
-.ov-row { position: relative; }
-.card-recat-menu {
-  position: absolute; top: 40px; right: 22px; z-index: 30;
-  display: flex; flex-direction: column; min-width: 120px;
-  background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-sm);
-  box-shadow: var(--shadow-lg); padding: 4px; max-height: 240px; overflow-y: auto;
-}
-.card-recat-menu.hidden { display: none; }
-/* 分类菜单锚定到「修改分类」按钮处：包裹容器为定位上下文，菜单出现在按钮正上方且左对齐 */
-.btn-recat-wrap { position: relative; display: inline-flex; }
-.btn-recat-wrap .card-recat-menu {
-  top: auto; bottom: calc(100% + 6px);
-  left: 0; right: auto;
-}
-.recat-option {
-  border: none; background: none; text-align: left;
-  min-height: var(--ctl-h-md); padding: var(--space-3) var(--space-5);
-  font-size: var(--text-sm); color: var(--text); cursor: pointer; font-family: inherit;
-  border-radius: var(--radius-sm);
-}
-.recat-option:hover { background: var(--hover-bg); color: var(--accent); }
-.recat-option.current { font-weight: 600; color: var(--accent); }
-
 /* ── 订阅 ── */
 .item-card.card-subscribed {
   box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent) 40%, transparent), var(--shadow);
@@ -1530,7 +1509,6 @@ body.modal-open { overflow: hidden; }
 #timeline-list { display: flex; flex-direction: column; gap: 8px; }
 #timeline-load-more-wrap { display: flex; justify-content: center; padding: 12px 0 2px; }
 .tl-row .ov-detail { cursor: default; }
-.tl-date { font-size: 11px; color: var(--text-3); flex-shrink: 0; }
 .tl-meta { font-size: 12px; color: var(--text-3); margin-bottom: 6px; }
 #timeline-title { cursor: pointer; }
 #timeline-title:hover { text-decoration: underline; }
@@ -1656,7 +1634,6 @@ body.modal-open { overflow: hidden; }
 .more-option:hover { background: var(--hover-bg); color: var(--accent); }
 .more-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
 .more-current { margin-left: auto; color: var(--accent); font-weight: 700; }
-.more-sep { height: 1px; background: var(--border); margin: 4px 6px; }
 .more-group-label {
   font-size: 11px; color: var(--text-3); padding: 4px 10px 2px;
   font-weight: 600;

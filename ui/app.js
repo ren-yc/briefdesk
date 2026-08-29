@@ -776,7 +776,7 @@ function setupEvents() {
 
     if (handleRowAction(e, {
       rowOf: () => card,
-      closeBothOnRecat: true, // 列表卡：修正分类/提醒菜单互斥收起（保持原行为）
+      closeRowMenusOnMore: true, // 列表卡：开「⋯」时一并收起插件行内菜单（提醒等）
       copyItemOf: () => currentItems.find(x => String(x.id) === card.dataset.id),
       recatOption: (id, cat) => doRecategorize(id, cat),
       verify: (id, btn, row) => {
@@ -874,7 +874,7 @@ function setupEvents() {
     if (btn) {
       handleRowAction(e, {
         rowOf: (b) => b.closest(".ov-row"),
-        closeBothOnRecat: false, // 浮层：修正分类只收起同类菜单（保持原行为）
+        closeRowMenusOnMore: false, // 浮层：开「⋯」只收起同类菜单，插件菜单不动
         copyItemOf: (row) => currentItems.find(x => String(x.id) === row.dataset.id),
         recatOption: (id, cat) => doRecategorize(id, cat),
         verify: (id, btn, row) => {
@@ -1180,13 +1180,10 @@ function setupEvents() {
     if (expanding) quoteExpandedIds.add(id); else quoteExpandedIds.delete(id);
   });
 
-  // ── 更多/修正分类菜单：点击其它区域关闭；插件行内菜单（提醒等）一并委托 ──
+  // ── 「⋯」菜单：点击其它区域关闭；插件行内菜单（提醒等）一并委托 ──
   document.addEventListener("click", (e) => {
     if (!e.target.closest(".btn-more") && !e.target.closest(".card-more-menu")) {
       document.querySelectorAll(".card-more-menu").forEach(m => m.classList.add("hidden"));
-    }
-    if (!e.target.closest(".btn-recat") && !e.target.closest(".card-recat-menu")) {
-      document.querySelectorAll(".card-recat-menu").forEach(m => m.classList.add("hidden"));
     }
     closeItemRowMenus(e);
   });
@@ -1259,7 +1256,7 @@ function setupEvents() {
     if (btn) {
       handleRowAction(e, {
         rowOf: (b) => b.closest(".tl-row"),
-        closeBothOnRecat: false, // 时间线：修正分类只收起同类菜单（保持原行为）
+        closeRowMenusOnMore: false, // 时间线：开「⋯」只收起同类菜单，插件菜单不动
         copyItemOf: (row) => (timeline ? timeline.items : []).find(x => String(x.id) === row.dataset.id),
         recatOption: (id, cat) => { doRecategorize(id, cat); if (timeline) loadTimelinePage(); },
         verify: (id, btn, row) => {
@@ -2786,7 +2783,7 @@ function renderItemRow(item, { cls = "", showSubject = false, showSubscribed = f
 }
 
 // ── 统一行内动作处理（分类/复制/提醒/备忘/忽略），四个上下文共用 ──
-// ctx: { rowOf(btn), closeBothOnRecat, copyItemOf(row), recatOption(id, cat), verify(id, btn, row) }
+// ctx: { rowOf(btn), closeRowMenusOnMore, copyItemOf(row), recatOption(id, cat), verify(id, btn, row) }
 // 返回 true 表示已处理按钮（调用方应停止后续行展开等逻辑）。
 function handleRowAction(e, ctx) {
   const btn = e.target.closest("button");
@@ -2802,7 +2799,7 @@ function handleRowAction(e, ctx) {
     if (!menu) return true;
     const wasHidden = menu.classList.contains("hidden");
     document.querySelectorAll(".card-more-menu").forEach(m => m.classList.add("hidden"));
-    if (ctx.closeBothOnRecat) closeItemRowMenus(e); // 插件行内菜单（提醒等）
+    if (ctx.closeRowMenusOnMore) closeItemRowMenus(e); // 插件行内菜单（提醒等）
     menu.classList.toggle("hidden", !wasHidden);
     return true;
   }
@@ -2821,21 +2818,6 @@ function handleRowAction(e, ctx) {
     if (!row) return true;
     const it = ctx.copyItemOf(row);
     if (it) copyItem(it);
-    return true;
-  }
-  if (btn.classList.contains("btn-recat")) {
-    if (!row) return true;
-    const menu = row.querySelector(".card-recat-menu");
-    if (!menu) return true;
-    const wasHidden = menu.classList.contains("hidden");
-    document.querySelectorAll(".card-recat-menu").forEach(m => m.classList.add("hidden"));
-    if (ctx.closeBothOnRecat) closeItemRowMenus(e); // 插件行内菜单（提醒等）
-    menu.classList.toggle("hidden", !wasHidden);
-    return true;
-  }
-  if (btn.classList.contains("recat-option")) {
-    if (!row) return true;
-    ctx.recatOption(id, btn.dataset.cat);
     return true;
   }
   if (btn.classList.contains("btn-memo") || btn.classList.contains("btn-ignore")) {
@@ -5011,14 +4993,6 @@ async function copyItem(item) {  const lines = [];
 }
 
 // ── 手动修正分类 ──
-function renderRecatMenu(item) {
-  const cats = Array.from(catColor.keys());
-  if (!cats.length) return "";
-  return '<div class="card-recat-menu hidden">' +
-    cats.map(c => `<button class="recat-option${c === item.category ? " current" : ""}" data-cat="${escAttr(c)}">${esc(c)}</button>`).join("") +
-    '</div>';
-}
-
 // 操作区收纳：「⋯」菜单内容 = 复制 + 分类列表（主操作备忘录/忽略仍在动作区直显）
 function renderMoreMenu(item) {
   const cats = Array.from(catColor.keys());

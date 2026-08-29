@@ -379,7 +379,7 @@
       if (btn) {
         handleRowAction(e, {
           rowOf: () => $calDetailBody.querySelector(".cal-detail-row"),
-          closeBothOnRecat: false, // 日历详情：修正分类只收起同类菜单（保持原行为）
+          closeRowMenusOnMore: false, // 日历详情：开「⋯」只收起同类菜单，插件菜单不动
           copyItemOf: () => calDetailItem || {},
           recatOption: (id, cat) => { calDetailDirty = true; doRecategorize(id, cat); },
           verify: (id, btn, row) => {

@@ -126,7 +126,8 @@
       if (!menu) return true;
       const wasHidden = menu.classList.contains("hidden");
       document.querySelectorAll(".card-remind-menu").forEach(m => m.classList.add("hidden"));
-      document.querySelectorAll(".card-recat-menu").forEach(m => m.classList.add("hidden"));
+      // 核心「⋯」菜单不用在此关：本次点击落在 .btn-remind 上，既不命中 .btn-more
+      // 也不命中 .card-more-menu，核心的 document click 处理会把它关掉。
       menu.classList.toggle("hidden", !wasHidden);
       return true;
     }
