@@ -65,7 +65,7 @@ async def _refresh_all(sources: list[SourceRuntime]) -> None:
     )
     for source, sessions in zip(sources, results):
         if isinstance(sessions, BaseException):
-            logger.error(f"刷新消息源 {source.name} 会话失败: {sessions}")
+            logger.error("[%s] 会话刷新失败: %s", source.name, sessions)
             continue
         for s in sessions:
             await upsert_session(
@@ -133,7 +133,7 @@ async def _cancel_pending_tasks() -> None:
             t.cancel()
         await asyncio.gather(*pending, return_exceptions=True)
     remaining = [t for t in asyncio.all_tasks() if not t.done()]
-    logger.warning(f"5 轮后仍有未完成任务: {[t.get_name() for t in remaining]}")
+    logger.warning("5 轮后仍有未完成任务: %s", [t.get_name() for t in remaining])
 
 
 async def _reap_task(task: asyncio.Task[None] | None, timeout: float = 5.0) -> None:

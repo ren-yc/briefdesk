@@ -285,7 +285,7 @@ class WeFlowLegacyClient(SourceClient):
                 retry_on_empty=False,
             )
         except Exception as e:
-            logger.warning(f"回查消息失败: {e}")
+            logger.warning("回查消息失败: %s", e)
             raise
 
         # 时间窗口过滤 + 匹配 serverId
@@ -450,7 +450,7 @@ class WeFlowLegacyClient(SourceClient):
             not_found_ok=True,
         )
         if not data:
-            logger.warning(f"群成员接口 404（群可能不存在）: {chatroom_id}")
+            logger.warning("群成员接口 404（群可能不存在）: %s", chatroom_id)
             return {}
 
         members: dict[str, str] = {}
@@ -553,7 +553,7 @@ class WeFlowLegacyClient(SourceClient):
                     },
                 ) as resp:
                     if not resp.is_success:
-                        logger.warning(f"SSE 连接失败: {resp.status_code}")
+                        logger.warning("SSE 连接失败: %s", resp.status_code)
                         self.connection_status = "offline"
                         return
 
@@ -579,7 +579,7 @@ class WeFlowLegacyClient(SourceClient):
                                         logger.debug("SSE 数据行 JSON 解析失败，跳过")
 
             except httpx.RequestError as e:
-                logger.warning(f"SSE 连接错误: {e}")
+                logger.warning("SSE 连接错误: %s", e)
                 self.connection_status = "offline"
             except asyncio.CancelledError:
                 self.connection_status = "offline"

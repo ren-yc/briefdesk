@@ -4,6 +4,11 @@
 INFO）：DEBUG 开启逐条细节（每条事件、每次请求、每条过滤决策），INFO 只保留
 阶段与汇总行。级别经 briefdesk.config.Settings 读取（与全项目配置同源），
 直接读 os.environ 看不到 .env 内容。
+
+行格式为 `时间戳 LEVEL: 来源 message`，其中「来源」是定宽的 logger 短名
+（见 short_logger_name）。来源既然已占一列，消息体内不应再重复写源名——
+唯一例外是 logger 名本身不含源的通用模块（poll_cycle/pipeline 代某个源
+干活），那里以 `[源名] ` 前缀标注。
 """
 
 import http
@@ -18,6 +23,33 @@ from briefdesk.config import config
 # （无时间戳）且 propagate=False，输出到 stderr。统一改为传播到根 logger，
 # 由本模块的 _BriefFormatter 输出（时间戳 + 模块名 + 彩色级别）。
 _UVICORN_LOGGERS = ("uvicorn", "uvicorn.error", "uvicorn.access", "uvicorn.asgi")
+
+# ── 显示名（短名）──
+#
+# logger 名一律由 logging.getLogger(__name__) 产生，故实际值形如
+# briefdesk.plugins.weflow_legacy.normalize（41 字符）。其中
+# "briefdesk." 与 "plugins." 共 18 字符在每一行重复且零信息量，且各模块
+# 名长不齐（12~41）会让消息起始位置逐行漂移。这里只改**显示**：剥掉这两段
+# 公共前缀、定宽补齐，令首列成为稳定可扫的「来源」列。
+#
+# 关键：不改真实 logger 名（record.name）。测试以 assertLogs(
+# "briefdesk.plugins.qqflow.client") 匹配真实名，且 briefdesk.* 层级要能
+# 整树设级别——两者都依赖真实名不变。
+_NAME_STRIP_PREFIXES = ("briefdesk.", "plugins.")
+
+# 短名首段的别名：模块名用下划线（Python 标识符限制），而插件名/DB
+# sessions.source 列/poll_cycle 的 "[%s]" 用连字符。不归一的话同一个源在
+# 日志里有两种拼写（weflow_legacy.client 与 [weflow-legacy]），按源名 grep
+# 会漏掉一半。
+_NAME_ALIASES = {"weflow_legacy": "weflow-legacy"}
+
+# 短名列宽：取全项目最长短名（weflow-legacy.normalize = 23）。超宽不截断
+# （截断会毁掉 grep），只是那一行的消息起点右移。
+_NAME_WIDTH = 23
+
+# 行格式：来源列用 %(shortname)s（本模块在 format() 里注入）而非 %(name)s。
+# 提为模块常量供测试钉住，防止重构时退回不定宽的全限定名。
+_LOG_FORMAT = "%(asctime)s %(levelprefix)s %(shortname)s %(message)s"
 
 # ANSI 颜色码
 _RESET = "\033[0m"
@@ -64,6 +96,21 @@ def redact_query_string(path: str) -> str:
     return _QUERY_SECRET_PARAM_RE.sub(r"\1***", path)
 
 
+def short_logger_name(name: str) -> str:
+    """logger 真实名 → 显示用短名（不含补齐）。
+
+    仅处理本项目的 logger（`briefdesk.` 开头）：剥掉 `briefdesk.`/`plugins.`
+    公共前缀并按 `_NAME_ALIASES` 归一首段。第三方 logger（uvicorn/httpx/PIL
+    等）原样返回——它们的名字本就是用户识别来源的依据。
+    """
+    if not name.startswith(_NAME_STRIP_PREFIXES[0]):
+        return name
+    for prefix in _NAME_STRIP_PREFIXES:
+        name = name.removeprefix(prefix)
+    head, sep, rest = name.partition(".")
+    return _NAME_ALIASES.get(head, head) + sep + rest
+
+
 def _status_text(status_code: int) -> str:
     """状态码 + HTTP 状态短语（如 "200 OK"），按百位分组着色。"""
     try:
@@ -80,12 +127,15 @@ class _BriefFormatter(logging.Formatter):
 
     对 uvicorn.access 记录额外还原 HTTP 状态短语（uvicorn AccessFormatter 的
     行为，如 "200 OK"），其余格式（时间戳/级别/模块名）与普通日志一致。
+
+    额外提供 `%(shortname)s`：定宽的显示用 logger 名（见 short_logger_name）。
     """
 
     def format(self, record: logging.LogRecord) -> str:
         lvl = record.levelname
         color = _COLORS.get(lvl, "")
         record.levelprefix = f"{color}{_LEVEL_PREFIX.get(lvl, lvl + _RESET + ':')}"
+        record.shortname = short_logger_name(record.name).ljust(_NAME_WIDTH)
         return super().format(record)
 
     def formatMessage(self, record: logging.LogRecord) -> str:
@@ -137,10 +187,7 @@ def setup_logging(level: int | None = None) -> None:
     if not any(isinstance(h, logging.StreamHandler) for h in root.handlers):
         handler = logging.StreamHandler(sys.stdout)
         handler.setFormatter(
-            _BriefFormatter(
-                "%(asctime)s %(levelprefix)s %(name)s: %(message)s",
-                datefmt="%H:%M:%S",
-            )
+            _BriefFormatter(_LOG_FORMAT, datefmt="%H:%M:%S")
         )
         root.addHandler(handler)
 

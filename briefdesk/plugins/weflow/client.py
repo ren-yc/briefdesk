@@ -376,17 +376,17 @@ class WeFlowClient(SourceClient):
                 raise
             version = health.get("version")
             if version and version != self._logged_version:
-                logger.info("[weflow] weflow-server 版本: %s", version)
+                logger.info("weflow-server 版本: %s", version)
                 self._logged_version = str(version)
             phase = health.get("account", "unregistered")
-            logger.debug("[weflow] 健康检查: 账号阶段 %s", phase)
+            logger.debug("健康检查: 账号阶段 %s", phase)
             if phase == "ready":
                 self._ready_checked = True
-                logger.debug("[weflow] 已有就绪账号，跳过注册")
+                logger.debug("已有就绪账号，跳过注册")
                 return
             if phase in _BOOTSTRAPPING_PHASES:
                 self._ready_checked = True
-                logger.debug("[weflow] 账号建索引中（%s），不再重复注册", phase)
+                logger.debug("账号建索引中（%s），不再重复注册", phase)
                 return
             if phase == "error":
                 # /health 只给标量，根因（密钥/路径填错的 error 字符串）只在需
@@ -396,7 +396,7 @@ class WeFlowClient(SourceClient):
             # `error` 落到注册分支是有意的：服务端的 error 状态不释放绑定，但同一
             # 账号可以直接重试注册来恢复（密钥修正后即生效）。
             logger.info(
-                "[weflow] 无就绪账号（阶段 %s），注册账号 wxid=%s "
+                "无就绪账号（阶段 %s），注册账号 wxid=%s "
                 "(db_path=%s, keys=%d 个库)",
                 phase,
                 self._wxid,
@@ -406,13 +406,13 @@ class WeFlowClient(SourceClient):
             state, status = await self.register_account()
             if state in _BENIGN_REGISTER_STATES or status in _BOOTSTRAPPING_PHASES:
                 self._ready_checked = True
-                logger.info("[weflow] 账号注册: state=%s, status=%s", state, status)
+                logger.info("账号注册: state=%s, status=%s", state, status)
             elif state == "account_conflict":
                 # 服务端已被**另一个** wxid 占用（v0.5.0 起强制单账号）。重试不会
                 # 自愈：得由人去注销那个账号或改配置，所以按 ERROR 报而非 warning，
                 # 且不记忆化以便配置修正后自愈。
                 logger.error(
-                    "[weflow] 注册被拒：服务端已绑定另一个账号（本地配置 wxid=%s）。"
+                    "注册被拒：服务端已绑定另一个账号（本地配置 wxid=%s）。"
                     "需先注销：DELETE /api/v1/accounts/{占用方wxid}",
                     self._wxid,
                 )
@@ -421,7 +421,7 @@ class WeFlowClient(SourceClient):
                 # 下一轮重试；否则零账号部署下没有业务 503 兜底复位标志，
                 # 注册失败后永不自愈
                 logger.warning(
-                    "[weflow] 账号注册被拒: state=%s, status=%s（下轮重试）",
+                    "账号注册被拒: state=%s, status=%s（下轮重试）",
                     state,
                     status,
                 )
@@ -431,12 +431,12 @@ class WeFlowClient(SourceClient):
         try:
             accounts = await self.fetch_accounts()
         except Exception as exc:  # noqa: BLE001 —— 诊断路径不得影响注册重试
-            logger.debug("[weflow] 账号明细拉取失败（跳过根因诊断）: %s", exc)
+            logger.debug("账号明细拉取失败（跳过根因诊断）: %s", exc)
             return
         for a in accounts:
             if a.get("state") == "error" and a.get("error"):
                 logger.warning(
-                    "[weflow] 账号 %s 初始化失败: %s",
+                    "账号 %s 初始化失败: %s",
                     a.get("wxid") or "<未知>",
                     a["error"],
                 )
@@ -583,7 +583,7 @@ class WeFlowClient(SourceClient):
                 retry_on_empty=False,
             )
         except Exception as e:
-            logger.warning(f"回查消息失败: {e}")
+            logger.warning("回查消息失败: %s", e)
             raise
 
         window = 120
@@ -723,7 +723,7 @@ class WeFlowClient(SourceClient):
                     },
                 ) as resp:
                     if not resp.is_success:
-                        logger.warning(f"SSE 连接失败: {resp.status_code}")
+                        logger.warning("SSE 连接失败: %s", resp.status_code)
                         self.connection_status = "offline"
                         return
 
@@ -737,7 +737,7 @@ class WeFlowClient(SourceClient):
                     try:
                         await self.ensure_ready(force=True)
                     except Exception as e:  # noqa: BLE001 — 自愈尽力而为，失败不阻断流
-                        logger.warning(f"SSE 就绪自愈检查失败: {e}")
+                        logger.warning("SSE 就绪自愈检查失败: %s", e)
 
                     buffer = ""
                     async for line in resp.aiter_lines():
@@ -758,7 +758,7 @@ class WeFlowClient(SourceClient):
                                         logger.debug("SSE 数据行 JSON 解析失败，跳过")
 
             except httpx.RequestError as e:
-                logger.warning(f"SSE 连接错误: {e}")
+                logger.warning("SSE 连接错误: %s", e)
                 self.connection_status = "offline"
             except asyncio.CancelledError:
                 self.connection_status = "offline"

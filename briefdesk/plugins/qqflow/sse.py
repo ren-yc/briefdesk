@@ -139,7 +139,7 @@ class QqFlowSseClient(DrainableListenerMixin, RealtimeListener[QqFlowClient]):
             await asyncio.sleep(jitter / 1000)
 
     async def _listen(self) -> None:
-        logger.info(f"连接中... (第 {self._reconnect_attempt + 1} 次)")
+        logger.info("SSE 连接中... (第 %d 次)", self._reconnect_attempt + 1)
 
         async for event in self._qqflow.stream_events():
             if not self._running:

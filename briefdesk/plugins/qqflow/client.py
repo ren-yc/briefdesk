@@ -321,19 +321,19 @@ class QqFlowClient(SourceClient):
                 logger.info("qqflow-server 版本: %s", version)
                 self._logged_version = str(version)
             phase = health.get("account", "unregistered")
-            logger.debug("qqflow 健康检查: 账号阶段 %s", phase)
+            logger.debug("健康检查: 账号阶段 %s", phase)
             if phase == "ready":
                 self._ready_checked = True
-                logger.debug("qqflow 已有就绪账号，跳过引导")
+                logger.debug("已有就绪账号，跳过注册")
                 return
             if phase in _BOOTSTRAPPING_PHASES:
                 self._ready_checked = True
-                logger.debug("qqflow 账号引导中（%s），不再重复注册", phase)
+                logger.debug("账号建索引中（%s），不再重复注册", phase)
                 return
             # `error` 落到这里是有意的：服务端的 error 状态不释放绑定，但同一
             # 账号可以直接重试注册来恢复（密钥修正后即生效）。
             logger.info(
-                "qqflow 无就绪账号（阶段 %s），尝试引导注册 (qq=%s, db_path=%s)",
+                "无就绪账号（阶段 %s），注册账号 qq=%s (db_path=%s)",
                 phase,
                 self._qq,
                 self._db_path or "<默认>",
@@ -341,13 +341,13 @@ class QqFlowClient(SourceClient):
             state = await self.register_account(self._qq, self._key, self._db_path)
             if state in _BENIGN_STATES:
                 self._ready_checked = True
-                logger.info(f"qqflow 账号引导中: {state}")
+                logger.info("账号注册: state=%s", state)
             elif state == "account_conflict":
                 # 服务端已被**另一个** QQ 占用（内存索引没有账号维度，同时只能
                 # 绑定一个账号）。重试不会自愈：得由人去注销那个账号或改配置，
                 # 所以按 ERROR 报而不是 warning，且不记忆化以便配置修正后自愈。
                 logger.error(
-                    "qqflow 注册被拒：服务端已绑定另一个账号（本地配置 qq=%s）。"
+                    "注册被拒：服务端已绑定另一个账号（本地配置 qq=%s）。"
                     "需先注销：DELETE /api/v1/accounts/{占用方qq}",
                     self._qq,
                 )
@@ -355,7 +355,7 @@ class QqFlowClient(SourceClient):
                 # 被拒态（invalid_key/invalid_db_path/unknown_qq 等）不记忆化：
                 # 保持未检查标志让下一轮 poll 的 ensure_ready 再次尝试注册；
                 # 否则零账号部署下没有业务 503 兜底复位标志，引导失败后永不自愈
-                logger.warning(f"qqflow 账号引导被拒: {state}（下轮重试）")
+                logger.warning("账号注册被拒: state=%s（下轮重试）", state)
 
     async def fetch_accounts(self) -> list[dict]:
         """GET /api/v1/accounts —— 账号明细（诊断用，需鉴权）。
@@ -471,7 +471,7 @@ class QqFlowClient(SourceClient):
             )
         except Exception as e:
             # 调用方（SSE 监听器）fail-open 处理并记 WARNING，此处仅 DEBUG 免双重日志
-            logger.warning(f"回查消息失败: {e}")
+            logger.warning("回查消息失败: %s", e)
             raise
         window = 120
         for m in resp.get("messages", []):
@@ -518,7 +518,7 @@ class QqFlowClient(SourceClient):
                     },
                 ) as resp:
                     if not resp.is_success:
-                        logger.warning(f"SSE 连接失败: {resp.status_code}")
+                        logger.warning("SSE 连接失败: %s", resp.status_code)
                         self.connection_status = "offline"
                         return
 
@@ -532,7 +532,7 @@ class QqFlowClient(SourceClient):
                     try:
                         await self.ensure_ready(force=True)
                     except Exception as e:  # noqa: BLE001 — 自愈尽力而为，失败不阻断流
-                        logger.warning(f"SSE 就绪自愈检查失败: {e}")
+                        logger.warning("SSE 就绪自愈检查失败: %s", e)
 
                     buffer = ""
                     async for line in resp.aiter_lines():
@@ -553,7 +553,7 @@ class QqFlowClient(SourceClient):
                                         logger.debug("SSE 数据行 JSON 解析失败，跳过")
 
             except httpx.RequestError as e:
-                logger.warning(f"SSE 连接错误: {e}")
+                logger.warning("SSE 连接错误: %s", e)
                 self.connection_status = "offline"
             except asyncio.CancelledError:
                 self.connection_status = "offline"

@@ -31,7 +31,7 @@ from briefdesk.plugins.weflow_legacy.normalize import (
     parse_appmsg_xml,
     pre_filter_rest,
 )
-from briefdesk.sources_base import ProcessedQuery
+from briefdesk.sources_base import ProcessedQuery, session_log_prefix
 from briefdesk.types import ContactInfo, PollResult, SessionInfo
 
 logger = logging.getLogger(__name__)
@@ -160,6 +160,7 @@ async def poll(
         session_idx += 1
         session_id = session.session_id
         label = session.name or session_id
+        log_prefix = session_log_prefix(session_idx, len(enabled_sessions), label)
         session_start = time_module.perf_counter()
         try:
             if pull_all:
@@ -179,10 +180,7 @@ async def poll(
                 else:
                     session_mode = "增量"
             cutoff = start_ts if start_ts is not None else 0
-            logger.debug(
-                f"  [{session_idx}/{len(enabled_sessions)}] {label}: "
-                f"拉取中 ({session_mode}, media=True)"
-            )
+            logger.debug("%s拉取中 (%s, media=True)", log_prefix, session_mode)
             # 统一翻页：所有模式都按 offset 递增直至 hasMore=False / 空页，
             # 单会话不再有"每轮最多 500 条"的硬顶；_MAX_PAGES 仅为防异常
             # 状态下的无界循环守卫（全量/异常时打 WARNING）。
@@ -205,8 +203,9 @@ async def poll(
                     break
             else:
                 logger.warning(
-                    f"  [{session_idx}/{len(enabled_sessions)}] {label}: "
-                    f"达到翻页守卫上限 {_MAX_PAGES} 页，可能未拉完窗口内消息"
+                    "%s达到翻页守卫上限 %d 页，可能未拉完窗口内消息",
+                    log_prefix,
+                    _MAX_PAGES,
                 )
             total_raw += len(messages)
 
@@ -280,9 +279,7 @@ async def poll(
                         session_id
                     )
                 else:
-                    logger.debug(
-                        f"  [{session_idx}/{len(enabled_sessions)}] {label}: 群成员命中本轮缓存"
-                    )
+                    logger.debug("%s群成员命中本轮缓存", log_prefix)
                 group_members = group_members_cache[session_id]
 
             for msg in candidates:
@@ -345,16 +342,11 @@ async def poll(
             parts.append(f"{session_processed} 已处理")
             parts.append(f"窗口={session_mode}")
             parts.append(fmt_dur(time_module.perf_counter() - session_start))
-            logger.info(
-                f"  [{session_idx}/{len(enabled_sessions)}] {label}: "
-                + ", ".join(parts)
-            )
+            logger.info("%s%s", log_prefix, ", ".join(parts))
             total_self += session_self
 
         except Exception as e:
-            logger.error(
-                f"  [{session_idx}/{len(enabled_sessions)}] {label}: 失败 — {e}"
-            )
+            logger.error("%s失败 — %s", log_prefix, e)
             raise
 
     if config.ignore_self and total_raw and not saw_is_send_field:

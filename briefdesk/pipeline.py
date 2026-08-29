@@ -114,9 +114,9 @@ async def process_all_batches(
     if _processing_paused:
         if not _paused_logged_once:
             _paused_logged_once = True
-            logger.info("[pipeline] 处理已暂停（benchmark），后续批次静默保留待回填")
+            logger.info("处理已暂停（benchmark），后续批次静默保留待回填")
         logger.debug(
-            "[pipeline] 处理已暂停（benchmark），本批 %d 条保留待回填",
+            "处理已暂停（benchmark），本批 %d 条保留待回填",
             len(messages),
         )
         return False
@@ -145,7 +145,7 @@ async def process_all_batches(
         self_filtered = sum(1 for m in messages if m.is_self)
         if self_filtered:
             messages = [m for m in messages if not m.is_self]
-            logger.info("[pipeline] %s 过滤自己发送: %d 条", origin, self_filtered)
+            logger.info("%s 过滤自己发送: %d 条", origin, self_filtered)
 
     # OCR 未启用（enrich 槽位为空）时纯占位符图片消息无信息价值：不落 raw、
     # 不进分类、不标记 processed——OCR 重新启用后回填窗口内自动重拉重处理
@@ -167,13 +167,13 @@ async def process_all_batches(
                 if not (m.image_urls and PLACEHOLDER_ONLY_RE.match(m.content))
             ]
             logger.info(
-                "[pipeline] %s 屏蔽纯占位符图片消息（OCR 未启用）: %d 条",
+                "%s 屏蔽纯占位符图片消息（OCR 未启用）: %d 条",
                 origin,
                 images_filtered,
             )
 
     # 过滤后计数：日志中的「处理 N 条」即真正进入分类的消息数（自消息已剔除）
-    logger.info("[pipeline] %s 处理: %d 条 (源 %s)", origin, len(messages), source)
+    logger.info("%s 处理: %d 条 (源 %s)", origin, len(messages), source)
     enabled_rows = await get_enabled_sessions(source)
     enabled_ids = {r["session_id"] for r in enabled_rows}
     enabled_filtered = len(messages)
@@ -266,7 +266,7 @@ async def process_all_batches(
             await stage.run(bctx, ctx)
         return batch_index, bctx
 
-    logger.info(f"并行分类 {len(batches)} 批 (共 {len(messages)} 条)...")
+    logger.info("并行分类 %d 批 (共 %d 条)...", len(batches), len(messages))
     classify_start = time_module.time()
     classify_tasks = [
         asyncio.create_task(_run_front(i, batch)) for i, batch in enumerate(batches)
@@ -350,10 +350,14 @@ async def process_all_batches(
             note_sync_batch_done(remaining)
             await publish_sync_progress(get_sync_progress())
 
-    logger.info(f"分类完成 ({int((time_module.time() - classify_start) * 1000)}ms)")
+    logger.info("分类完成 (%s)", fmt_dur(time_module.time() - classify_start))
     logger.info(
-        f"总计: {total_inserted} 入库, {total_dupes} 重复, {total_skipped} 闲聊, "
-        f"{total_merged} 合并, {total_failed} 失败待回填"
+        "总计: %d 入库, %d 重复, %d 闲聊, %d 合并, %d 失败待回填",
+        total_inserted,
+        total_dupes,
+        total_skipped,
+        total_merged,
+        total_failed,
     )
 
     if total_inserted + total_dupes + total_skipped > 0:
@@ -368,9 +372,7 @@ async def process_all_batches(
             }
         )
     else:
-        logger.warning(
-            f"本轮零产出：{total_failed} 条失败待回填，不刷新 lastSync"
-        )
+        logger.warning("本轮零产出：%d 条失败待回填，不刷新 lastSync", total_failed)
     # 返回值语义（审计 #1）：零产出（全部消息分类失败）返回 False——
     # poll_cycle 据此跳过本轮水位推进，失败待回填的消息由
     # "最早未处理消息钉窗"机制在后续轮次找回；实时路径忽略返回值。

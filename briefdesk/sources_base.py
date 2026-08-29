@@ -206,6 +206,21 @@ async def fetch_all_pages(
     return items
 
 
+def session_log_prefix(index: int, total: int, label: str) -> str:
+    """会话级日志行首（形如 `  [3/12] 技术交流群: `）。
+
+    三个轮询器（weflow/weflow-legacy/qqflow）都在会话循环里逐条打进度，
+    行首的"第几个/共几个 + 群名"是它们唯一的定位信息，此前各自以 f-string
+    重复拼接（5 处 × 3 个轮询器 = 15 份），缩进宽度与分隔符改一处就会漂移。
+    收敛到此处后由调用方在会话循环开头算一次，作为 `%s` 首参传入——既保持
+    日志惰性求值（见 pyproject 的 ruff G 组），也让 15 处共享同一份定义。
+
+    行首两空格是有意的：它把会话明细压在所属轮询周期的摘要行之下，
+    终端里形成一层可视缩进。
+    """
+    return f"  [{index}/{total}] {label}: "
+
+
 class BatchBuffer:
     """按数量或超时批量刷新消息的缓冲区。
 

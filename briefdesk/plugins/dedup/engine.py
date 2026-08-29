@@ -393,7 +393,9 @@ class DedupEngine(DedupService):
         out: list[bool | None] = []
         for (cand, _score), res in zip(candidates, raw):
             if isinstance(res, BaseException):
-                logger.warning(f'  "{cand.title}" 判定失败，{fail_note}: {res!r}')
+                logger.warning(
+                    '  "%s" 判定失败，%s: %r', cand.title, fail_note, res
+                )
                 out.append(None)
             else:
                 out.append(bool(res))
@@ -414,7 +416,7 @@ class DedupEngine(DedupService):
                     max_tokens=128,
                 )
             except Exception as e:
-                logger.error(f"AI API error: {e}")
+                logger.error("AI API error: %s", e)
                 raise
 
             content = (
@@ -471,7 +473,9 @@ class DedupEngine(DedupService):
         共用本方法，令「判 SAME 却漏调 merge_source_group」在结构上不可能发生。
         note 标注命中路径，进日志便于回溯是哪条门禁放行的。
         """
-        logger.info(f'{note} → merging source "{source_group}" into {target.id}')
+        logger.info(
+            '%s → merging source "%s" into %s', note, source_group, target.id
+        )
         await merge_source_group(target.id, source_group)
         return DedupResult(
             is_duplicate=True,
@@ -499,7 +503,7 @@ class DedupEngine(DedupService):
             for it in self._cache:
                 if it.source == source and it.image_urls == q_images:
                     logger.info(
-                        f'[image] "{it.title}" 图片完全一致 → SAME (image_urls)'
+                        '[image] "%s" 图片完全一致 → SAME (image_urls)', it.title
                     )
                     return it
 
@@ -513,7 +517,8 @@ class DedupEngine(DedupService):
             for it in self._cache:
                 if it.content_hash and it.content_hash == q_hash:
                     logger.info(
-                        f'[hash] "{it.title}" 原文完全一致 → SAME (source_quote hash)'
+                        '[hash] "%s" 原文完全一致 → SAME (source_quote hash)',
+                        it.title,
                     )
                     return it
 
@@ -624,8 +629,9 @@ class DedupEngine(DedupService):
                     )
             elif emb_matrix:
                 logger.warning(
-                    f"嵌入维度不一致（query={len(q_emb)} vs 缓存={len(emb_matrix[0])}），"
-                    "回退到字符重叠预过滤"
+                    "嵌入维度不一致（query=%d vs 缓存=%d），回退到字符重叠预过滤",
+                    len(q_emb),
+                    len(emb_matrix[0]),
                 )
             else:
                 logger.info("缓存无嵌入向量，回退到字符重叠预过滤")
@@ -646,8 +652,9 @@ class DedupEngine(DedupService):
                 metric = "overlap"
                 if cosine_active:
                     logger.info(
-                        f'余弦零候选，重叠兜底命中: "{overlap_cand[0].title}" '
-                        f"(overlap {overlap_cand[1] * 100:.0f}%)"
+                        '余弦零候选，重叠兜底命中: "%s" (overlap %.0f%%)',
+                        overlap_cand[0].title,
+                        overlap_cand[1] * 100,
                     )
 
         # ⑥ 无候选 → 打 WARNING 诊断（含低于门禁的差距），避免静默漏判
@@ -678,7 +685,11 @@ class DedupEngine(DedupService):
 
         for candidate, score in candidates:
             logger.info(
-                f'Candidate: "{candidate.title}" vs "{title}" ({metric}: {score * 100:.0f}%)'
+                'Candidate: "%s" vs "%s" (%s: %.0f%%)',
+                candidate.title,
+                title,
+                metric,
+                score * 100,
             )
         return candidates, metric
 
@@ -698,7 +709,9 @@ class DedupEngine(DedupService):
             candidates, title, source_quote, "按反对票计"
         )
         for (cand, _score), same in zip(candidates, verdicts):
-            logger.info(f'  [weak] "{cand.title}": {"SAME" if same else "DIFFERENT"}')
+            logger.info(
+                '  [weak] "%s": %s', cand.title, "SAME" if same else "DIFFERENT"
+            )
         if all(verdicts):
             return await self._hit(candidates[0][0], source_group, "[weak] 全员 SAME")
         logger.info("[weak] 存在 DIFFERENT 票 → 保守不判重")
@@ -728,14 +741,18 @@ class DedupEngine(DedupService):
                 verdict = await self._ask_ai(strong_cand, title, source_quote)
             except Exception as e:  # noqa: BLE001 — S1 容错：短路判定失败降级参与多数票
                 logger.warning(
-                    f'  [strong] "{strong_cand.title}" 判定失败（{e}），'
-                    "该候选保留参与后续多数票"
+                    '  [strong] "%s" 判定失败（%s），该候选保留参与后续多数票',
+                    strong_cand.title,
+                    e,
                 )
                 verdict = None
             if verdict is not None:
                 logger.info(
-                    f'  [strong] "{strong_cand.title}" ({metric}: {strong_score * 100:.0f}%): '
-                    f'{"SAME" if verdict else "DIFFERENT"}'
+                    '  [strong] "%s" (%s: %.0f%%): %s',
+                    strong_cand.title,
+                    metric,
+                    strong_score * 100,
+                    "SAME" if verdict else "DIFFERENT",
                 )
                 if verdict:
                     return await self._hit(strong_cand, source_group, "SAME")
@@ -761,7 +778,7 @@ class DedupEngine(DedupService):
             if same is None:
                 continue
             voted.append((cand, score, same))
-            logger.info(f'  "{cand.title}": {"SAME" if same else "DIFFERENT"}')
+            logger.info('  "%s": %s', cand.title, "SAME" if same else "DIFFERENT")
         total_weight = sum(score for _cand, score, _ in voted)
         same_weight = sum(score for _cand, score, same in voted if same)
         if total_weight and same_weight > total_weight / 2:

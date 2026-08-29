@@ -101,7 +101,7 @@ async def judge_merge(
                 max_tokens=64,
             )
         except Exception as e:  # noqa: BLE001 — 判官失败应保守不合并，不能中断管道
-            logger.warning(f"合并判官请求失败（保守不合并）: {e}")
+            logger.warning("合并判官请求失败（保守不合并）: %s", e)
             return None
         content = (
             (resp.choices[0].message.content or "") if resp.choices else ""
@@ -204,7 +204,7 @@ async def summarize_title(old_title: str, key_info: str, quote: str) -> str | No
             max_tokens=64,
         )
     except Exception as e:  # noqa: BLE001 — 标题重拟失败应回退原标题，不能中断合并
-        logger.warning(f"重拟标题请求失败（回退原标题）: {e}")
+        logger.warning("重拟标题请求失败（回退原标题）: %s", e)
         return None
     content = (
         (resp.choices[0].message.content or "") if resp.choices else ""

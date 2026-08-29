@@ -79,7 +79,7 @@ async def ocr_image_bytes(content: bytes) -> str:
         logger.debug("图片无文字，返回空结果 (%d bytes)", len(content))
         return ""
     except Exception as e:
-        logger.error(f"OCR failed ({len(content)} bytes): {e}")
+        logger.error("OCR failed (%d bytes): %s", len(content), e)
         raise
 
 

@@ -79,7 +79,7 @@ class DedupPlugin(StagePlugin):
             if msg is None:
                 continue
             title = result.summary or msg.content[:50]
-            logger.info(f'[{result.category}] "{title}" — {msg.group_name}')
+            logger.info('[%s] "%s" — %s', result.category, title, msg.group_name)
             planned.append((msg, result, title))
         # 预嵌入文本用原文 msg.content（去重判定/入库/缓存统一口径，替代原 description）
         embs = await self._engine.preembed_batch(

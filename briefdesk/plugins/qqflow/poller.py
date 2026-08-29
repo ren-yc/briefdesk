@@ -28,7 +28,7 @@ from briefdesk.plugins.qqflow.normalize import (
     normalize_rest,
     pre_filter_rest,
 )
-from briefdesk.sources_base import ProcessedQuery
+from briefdesk.sources_base import ProcessedQuery, session_log_prefix
 from briefdesk.types import ContactInfo, PollResult, SessionInfo
 
 logger = logging.getLogger(__name__)
@@ -148,6 +148,7 @@ async def poll(
         session_idx += 1
         session_id = session.session_id
         label = session.name or session_id
+        log_prefix = session_log_prefix(session_idx, len(enabled_sessions), label)
         session_start = time_module.perf_counter()
         try:
             if pull_all:
@@ -186,8 +187,11 @@ async def poll(
                 session_raw += len(msgs)
                 total_raw += len(msgs)
                 logger.debug(
-                    f"  [{session_idx}/{len(enabled_sessions)}] {label}: "
-                    f"第 {page + 1} 页 → {len(msgs)} 条 (hasMore={resp.get('hasMore')})"
+                    "%s第 %d 页 → %d 条 (hasMore=%s)",
+                    log_prefix,
+                    page + 1,
+                    len(msgs),
+                    resp.get("hasMore"),
                 )
                 if not msgs:
                     break
@@ -212,8 +216,9 @@ async def poll(
                     break
             else:
                 logger.warning(
-                    f"  [{session_idx}/{len(enabled_sessions)}] {label}: "
-                    f"达到翻页守卫上限 {max_pages} 页，可能未拉完窗口内消息"
+                    "%s达到翻页守卫上限 %d 页，可能未拉完窗口内消息",
+                    log_prefix,
+                    max_pages,
                 )
 
             session_new = session_processed = 0
@@ -254,10 +259,7 @@ async def poll(
                     parts.append(f"{session_old} 超窗口")
             parts.append(f"窗口={session_mode}")
             parts.append(fmt_dur(time_module.perf_counter() - session_start))
-            logger.info(
-                f"  [{session_idx}/{len(enabled_sessions)}] {label}: "
-                + ", ".join(parts)
-            )
+            logger.info("%s%s", log_prefix, ", ".join(parts))
             total_self += session_self
 
         except QqFlowNotReadyError:
@@ -265,15 +267,10 @@ async def poll(
             # failed_sessions 让应用层跳过该会话的水位推进（防永久漏拉）
             not_ready_skips += 1
             result.failed_sessions.add(session_id)
-            logger.info(
-                f"  [{session_idx}/{len(enabled_sessions)}] {label}: "
-                "qqflow-server 索引期 503，跳过"
-            )
+            logger.info("%sqqflow-server 索引期 503，跳过", log_prefix)
             continue
         except Exception as e:
-            logger.error(
-                f"  [{session_idx}/{len(enabled_sessions)}] {label}: 失败 — {e}"
-            )
+            logger.error("%s失败 — %s", log_prefix, e)
             raise
 
     summary = (

@@ -207,7 +207,7 @@ def _clean_time(value: object) -> str:
     """
     if not isinstance(value, str):
         if value is not None:
-            logger.warning(f"AI 返回非字符串时间（忽略）: {value!r}")
+            logger.warning("AI 返回非字符串时间（忽略）: %r", value)
         return ""
     s = value.strip()
     if not s:
@@ -218,10 +218,10 @@ def _clean_time(value: object) -> str:
             # 而非 datetime.strptime：本链路时间为 naive 本地墙钟，避免 DTZ007
             time.strptime(s, "%Y-%m-%d %H:%M" if " " in s else "%Y-%m-%d")
         except ValueError:
-            logger.warning(f"AI 返回不存在的日期（忽略）: {s!r}")
+            logger.warning("AI 返回不存在的日期（忽略）: %r", s)
             return ""
         return s
-    logger.warning(f"AI 返回非法时间格式（忽略）: {s!r}")
+    logger.warning("AI 返回非法时间格式（忽略）: %r", s)
     return ""
 
 
@@ -239,10 +239,12 @@ def _parse_extra_times(
     """
     if not isinstance(raw, list):
         if raw is not None:
-            logger.warning(f"AI 返回非数组 times（忽略）: {raw!r}")
+            logger.warning("AI 返回非数组 times（忽略）: %r", raw)
         return []
     if len(raw) > _MAX_EXTRA_TIMES:
-        logger.warning(f"times 超上限（{len(raw)} 项），截断前 {_MAX_EXTRA_TIMES} 项")
+        logger.warning(
+            "times 超上限（%d 项），截断前 %d 项", len(raw), _MAX_EXTRA_TIMES
+        )
     seen: set[tuple[str, str]] = {
         (t, v)
         for t, v in (("start", primary_start), ("end", primary_end))
@@ -254,7 +256,7 @@ def _parse_extra_times(
             continue
         t = item.get("type")
         if t not in ("start", "end"):
-            logger.warning(f"AI 返回非法 times.type（忽略）: {t!r}")
+            logger.warning("AI 返回非法 times.type（忽略）: %r", t)
             continue
         time_val = _clean_time(item.get("time"))
         if not time_val:
@@ -491,7 +493,9 @@ def _parse_response(
             # 越界 index 会误用 batch[-1]（负值）或落入未选中跳过逻辑造成丢消息；
             # 抛错保持该批未标记 processed，由下一轮回填重试（同未知类别路径）
             logger.warning(
-                f"AI 返回越界 index {msg_index}（批次大小 {count}），该批保留待下轮重试"
+                "AI 返回越界 index %d（批次大小 %d），该批保留待下轮重试",
+                msg_index,
+                count,
             )
             raise TypeError(
                 f"AI response item #{idx} has out-of-range index: {msg_index}"
@@ -718,7 +722,7 @@ async def summarize_results(
         if got["subject"]:
             r.subject = got["subject"]
         filled += 1
-    logger.info(f"标题概括: {filled}/{len(results)} 条")
+    logger.info("标题概括: %d/%d 条", filled, len(results))
 
 
 # ── 时间提取（sysb+sysc 两阶段：分类只标记 time，本阶段按 sysc 提取 start/end/times）──
@@ -898,7 +902,9 @@ async def _extract_times_core(
         return
     times_map = _parse_times_response(content)
     filled = _apply_times_to_results(results, times_map)
-    logger.info(f"时间提取: {filled}/{len(time_indexes)} 条（深度剩余 {depth}）")
+    logger.info(
+        "时间提取: %d/%d 条（深度剩余 %d）", filled, len(time_indexes), depth
+    )
 
 
 async def extract_times(
@@ -952,7 +958,9 @@ async def _classify_once(
     groups = _group_messages(messages)
     user_message, budget_dropped = _build_user_message_ex(groups)
 
-    logger.info(f"Sending {len(messages)} msgs in {len(groups)} groups to AI...")
+    logger.info(
+        "Sending %d msgs in %d groups to AI...", len(messages), len(groups)
+    )
 
     try:
         resp = await chat(
@@ -966,7 +974,7 @@ async def _classify_once(
     except Exception as e:  # noqa: BLE001 — 传输层失败统一按"本轮抛弃"处理，不拆半
         # SDK 内置重试已覆盖传输层失败；仍失败说明上游持续不可用，
         # 拆半无益且会成倍放大请求量——整段消息本轮抛弃，下轮回填重试。
-        logger.warning(f"分类请求失败（本轮抛弃，下轮回填）: {e}")
+        logger.warning("分类请求失败（本轮抛弃，下轮回填）: %s", e)
         return ClassifyOutcome([], [offset + i for i in range(len(messages))])
 
     if not resp.choices:
@@ -993,7 +1001,7 @@ async def _classify_once(
         )
     except (RuntimeError, TypeError) as e:
         # 结构错误/越界 index/task 不匹配等：拆半无益，本轮抛弃，下轮回填
-        logger.warning(f"AI 响应解析失败（本轮抛弃，下轮回填）: {e}")
+        logger.warning("AI 响应解析失败（本轮抛弃，下轮回填）: %s", e)
         return ClassifyOutcome([], [offset + i for i in range(len(messages))])
 
     # F2 索引漂移守卫（第二关·语义）：字面模糊条目交嵌入余弦复核。
@@ -1021,7 +1029,7 @@ async def _classify_once(
             budget_dropped,
         )
         retry_indexes = sorted(set(retry_indexes) | {offset + i for i in budget_dropped})
-    logger.info(f"Got {len(results)} relevant, {len(retry_indexes)} retry")
+    logger.info("Got %d relevant, %d retry", len(results), len(retry_indexes))
     return ClassifyOutcome(results, retry_indexes, time_indexes)
 
 
@@ -1045,7 +1053,10 @@ async def _split_retry(
 
     mid = len(messages) // 2
     logger.info(
-        f"length 截断：{len(messages)} 条拆为 {mid}+{len(messages) - mid} 独立重试"
+        "length 截断：%d 条拆为 %d+%d 独立重试",
+        len(messages),
+        mid,
+        len(messages) - mid,
     )
     left = await _classify_once(messages[:mid], cats, offset, depth - 1)
     right = await _classify_once(messages[mid:], cats, offset + mid, depth - 1)

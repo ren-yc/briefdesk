@@ -42,7 +42,7 @@ async def run_poll_cycle(source: SourceRuntime) -> None:
     global _polling
     async with _poll_lock:
         if _polling:
-            logger.info("轮询跳过（%s）: 上一轮仍在进行", source.name)
+            logger.info("[%s] 轮询跳过: 上一轮仍在进行", source.name)
             return
         _polling = True
 

@@ -73,3 +73,14 @@ plugins = ["pydantic.mypy"]
 # fetchone() 可空值直接索引等），修齐需先给测试引入共享夹具与 Protocol 桩，
 # 属独立重构；briefdesk/ 维持默认严格度不变。
 # 若后续要深化，从此处放开并按错误码逐类收敛。
+
+[tool.ruff.lint]
+# 在 ruff 默认规则（E/F）之上追加日志相关两组：
+#   G   flake8-logging-format —— 禁 f-string/`+`/`.format()` 拼日志（G004/G003/G001）。
+#       日志的参数应交给 logging 惰性求值：被 level 过滤掉的行不该付格式化代价，
+#       且 `%s` 形态让同一条日志在不同参数下仍是同一个可 grep 的模板。
+#   LOG flake8-logging —— 抓 logger 用法本身的坑（如 `logging.warn`、
+#       exception 处理器里误用 `logger.error` 而丢掉 traceback）。
+# 这两组是本次日志格式一致化的「防回归闸门」：没有它，新增的 f-string 日志
+# 只能靠 review 发现。
+extend-select = ["G", "LOG"]

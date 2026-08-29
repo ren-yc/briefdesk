@@ -65,13 +65,13 @@ class OcrPlugin(StagePlugin):
             except MediaError as e:
                 # 单条图片下载失败不应拖垮整批（图片过期/源离线时跳过 OCR，
                 # 卡片仍以原文内容入库并保留 image_urls 供前端代理显示）
-                logger.warning(f"图片下载失败，跳过 OCR（消息 {msg.msg_id}）: {e}")
+                logger.warning("图片下载失败，跳过 OCR（消息 %s）: %s", msg.msg_id, e)
                 continue
             try:
                 ocr_text = await self._ocr_image_bytes(contents)
             except Exception as e:  # noqa: BLE001 — OCR 失败不应拖垮整批
                 # 引擎故障等非预期异常：跳过 OCR，卡片仍以原文内容入库
-                logger.warning(f"OCR 识别失败，跳过（消息 {msg.msg_id}）: {e}")
+                logger.warning("OCR 识别失败，跳过（消息 %s）: %s", msg.msg_id, e)
                 continue
             if ocr_text:
                 # OCR 文本是构造后替换进 content 的，需在替换前单独脱敏
