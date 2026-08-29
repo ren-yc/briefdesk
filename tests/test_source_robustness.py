@@ -134,7 +134,13 @@ class SseReadTimeoutTest(unittest.TestCase):
 class EnsureReadyRejectedStateTest(unittest.IsolatedAsyncioTestCase):
     """【4·P2】ensure_ready 注册被拒（invalid_key 等）不得记忆化，下轮须重试。"""
 
-    def _make_client(self, state: str, calls: list, phase: str = "unregistered"):
+    def _make_client(
+        self,
+        state: str,
+        calls: list,
+        phase: str = "unregistered",
+        accounts: list | None = None,
+    ):
         client = QqFlowClient(
             "http://127.0.0.1:5032", "tok", qq="123", key="bad-key"
         )
@@ -147,8 +153,13 @@ class EnsureReadyRejectedStateTest(unittest.IsolatedAsyncioTestCase):
             calls.append(state)
             return state
 
+        async def fake_accounts():
+            # error 阶段会走根因诊断；不打桩就会真发一次 HTTP 请求。
+            return accounts or []
+
         client.fetch_health = fake_health  # type: ignore[method-assign]
         client.register_account = fake_register  # type: ignore[method-assign]
+        client.fetch_accounts = fake_accounts  # type: ignore[method-assign]
         return client
 
     async def test_rejected_state_is_not_memoized(self):
@@ -199,6 +210,35 @@ class EnsureReadyRejectedStateTest(unittest.IsolatedAsyncioTestCase):
         client = self._make_client("accepted", calls, phase="error")
         await client.ensure_ready()
         self.assertEqual(len(calls), 1, "error 阶段应尝试重新注册以恢复")
+
+    async def test_error_phase_logs_root_cause_from_detail_endpoint(self):
+        """error 阶段：/health 只给标量，根因须从需鉴权的明细接口捞出并告警。
+
+        与 weflow 客户端同形（test_weflow_contract 有对应用例）：没有这一条，
+        用户只能看到业务接口持续 503，看不到「密钥错误」这类真正的原因。
+        """
+        calls: list = []
+        detail = [{"qq": "123", "state": "error", "error": "密钥校验失败"}]
+        client = self._make_client(
+            "accepted", calls, phase="error", accounts=detail
+        )
+        with self.assertLogs("briefdesk.plugins.qqflow.client", "WARNING") as logs:
+            await client.ensure_ready()
+        self.assertTrue(any("密钥校验失败" in m for m in logs.output))
+        self.assertTrue(any("123" in m for m in logs.output))
+        self.assertEqual(len(calls), 1, "诊断不得挡住注册重试")
+
+    async def test_detail_endpoint_failure_does_not_block_registration(self):
+        """明细接口不可用（鉴权/网络）：仅降级为 debug，注册照常发起。"""
+        calls: list = []
+        client = self._make_client("accepted", calls, phase="error")
+
+        async def boom():
+            raise RuntimeError("401")
+
+        client.fetch_accounts = boom  # type: ignore[method-assign]
+        await client.ensure_ready()
+        self.assertEqual(len(calls), 1, "诊断失败不得挡住注册重试")
 
     async def test_version_logged_once_per_change(self):
         """/health 的 version 记入 _logged_version 并只在变化时打印。

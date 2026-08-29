@@ -701,8 +701,10 @@ async def summarize_results(
             temperature=0.1,
             max_tokens=_SUMMARY_MAX_TOKENS,
         )
-    except Exception:  # noqa: BLE001 — 概括失败回退，不中断管道
-        logger.warning("标题概括请求失败（回退默认标题）")
+    except Exception as e:  # noqa: BLE001 — 概括失败回退，不中断管道
+        # 带原因（不带栈）：上游故障多为 401/额度/超时，异常文本已足够自助排查；
+        # 与本文件分类请求失败的写法一致。
+        logger.warning("标题概括请求失败（回退默认标题）: %s", e)
         return
     if not resp.choices:  # 异常响应（空 choices）防御
         logger.warning("标题概括返回空 choices（回退默认标题）")
@@ -878,8 +880,9 @@ async def _extract_times_core(
             temperature=0.1,
             max_tokens=_TIME_MAX_TOKENS,
         )
-    except Exception:  # noqa: BLE001 — 时间提取失败回退，不中断管道
-        logger.warning("时间提取请求失败（start/end/times 留空）")
+    except Exception as e:  # noqa: BLE001 — 时间提取失败回退，不中断管道
+        # 带原因，同 _summarize_titles：AI 侧故障需要在默认级别可自助定位。
+        logger.warning("时间提取请求失败（start/end/times 留空）: %s", e)
         return
     if not resp.choices:  # 异常响应（空 choices）防御
         logger.warning("时间提取返回空 choices（start/end/times 留空）")

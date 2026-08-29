@@ -270,8 +270,9 @@ async def poll(
             logger.info("%sqqflow-server 索引期 503，跳过", log_prefix)
             continue
         except Exception as e:
-            logger.error("%s失败 — %s", log_prefix, e)
-            raise
+            # 同 weflow：失败只由 run_poll_cycle 记一条带栈 ERROR，会话标签
+            # 走异常链（顺带进 status.lastError），原因文本保留在末尾。
+            raise RuntimeError(f"会话「{label}」拉取失败: {e}") from e
 
     summary = (
         f"poll 完成: {len(result.messages)} 条新消息 "

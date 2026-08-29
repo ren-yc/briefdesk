@@ -17,6 +17,12 @@ _subscribers_lock = asyncio.Lock()
 # 队列满导致的累计丢弃事件数（诊断只读：客户端漏事件时先查这里）
 _dropped_count = 0
 
+# 丢弃告警的降噪闸门：首次丢弃打 WARNING（默认 LOG_LEVEL=INFO 下可见），
+# 之后同一进程内只打 DEBUG。丢弃是真实的前端状态不同步，必须至少可见一次；
+# 但慢客户端会连续触发，每条都 WARNING 会刷屏——首条足以引向
+# get_dropped_count() 这个累计口径。
+_drop_warned = False
+
 # 服务关闭事件：置位后所有 /api/stream 流主动结束。
 # 若流不结束，uvicorn 优雅退出会无限等待这些常驻 ASGI 任务
 # （timeout_graceful_shutdown 默认 None）。
@@ -55,16 +61,26 @@ async def unsubscribe(q: asyncio.Queue[tuple[str, str]]) -> None:
 
 
 async def _publish(name: str, payload: dict | None = None) -> None:
-    global _dropped_count
+    global _dropped_count, _drop_warned
     data = json.dumps(payload or {}, ensure_ascii=False)
     async with _subscribers_lock:
         subscribers = list(_subscribers)
     for q in subscribers:
         if q.full():
             # 慢客户端积压超限：丢弃并计数（前端靠轮询兜底收敛），
-            # 不静默——否则客户端状态不同步无从排查
+            # 不静默——否则客户端状态不同步无从排查。DEBUG 在默认
+            # LOG_LEVEL=INFO 下恰恰是静默的，故首条走 WARNING（见 _drop_warned）。
             _dropped_count += 1
-            logger.debug("SSE 订阅队列已满，丢弃事件（累计丢弃 %d）", _dropped_count)
+            if not _drop_warned:
+                _drop_warned = True
+                logger.warning(
+                    "SSE 订阅队列已满，开始丢弃事件（前端可能状态不同步，"
+                    "靠轮询兜底收敛；累计数见 get_dropped_count()）"
+                )
+            else:
+                logger.debug(
+                    "SSE 订阅队列已满，丢弃事件（累计丢弃 %d）", _dropped_count
+                )
             continue
         q.put_nowait((name, data))
 

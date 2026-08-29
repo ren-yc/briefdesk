@@ -285,7 +285,9 @@ class WeFlowLegacyClient(SourceClient):
                 retry_on_empty=False,
             )
         except Exception as e:
-            logger.warning("回查消息失败: %s", e)
+            # 仅 DEBUG：调用方 fail-open 并记 WARNING，避免双重同级日志
+            # （与 weflow / qqflow 客户端一致）。
+            logger.debug("回查消息失败: %s", e)
             raise
 
         # 时间窗口过滤 + 匹配 serverId

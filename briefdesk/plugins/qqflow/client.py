@@ -330,6 +330,11 @@ class QqFlowClient(SourceClient):
                 self._ready_checked = True
                 logger.debug("账号建索引中（%s），不再重复注册", phase)
                 return
+            if phase == "error":
+                # /health 只给标量，根因（密钥/路径填错的 error 字符串）只在需
+                # 鉴权的明细接口里。仍显式告警——否则用户只能看到业务接口持续
+                # 503，看不到原因。诊断失败不能挡住下面的注册重试。
+                await self._log_account_errors()
             # `error` 落到这里是有意的：服务端的 error 状态不释放绑定，但同一
             # 账号可以直接重试注册来恢复（密钥修正后即生效）。
             logger.info(
@@ -356,6 +361,21 @@ class QqFlowClient(SourceClient):
                 # 保持未检查标志让下一轮 poll 的 ensure_ready 再次尝试注册；
                 # 否则零账号部署下没有业务 503 兜底复位标志，引导失败后永不自愈
                 logger.warning("账号注册被拒: state=%s（下轮重试）", state)
+
+    async def _log_account_errors(self) -> None:
+        """拉明细接口把 error 根因打出来（诊断专用，失败仅降级为 debug）。"""
+        try:
+            accounts = await self.fetch_accounts()
+        except Exception as exc:  # noqa: BLE001 —— 诊断路径不得影响注册重试
+            logger.debug("账号明细拉取失败（跳过根因诊断）: %s", exc)
+            return
+        for a in accounts:
+            if a.get("state") == "error" and a.get("error"):
+                logger.warning(
+                    "账号 %s 初始化失败: %s",
+                    a.get("qq") or "<未知>",
+                    a["error"],
+                )
 
     async def fetch_accounts(self) -> list[dict]:
         """GET /api/v1/accounts —— 账号明细（诊断用，需鉴权）。
@@ -471,7 +491,7 @@ class QqFlowClient(SourceClient):
             )
         except Exception as e:
             # 调用方（SSE 监听器）fail-open 处理并记 WARNING，此处仅 DEBUG 免双重日志
-            logger.warning("回查消息失败: %s", e)
+            logger.debug("回查消息失败: %s", e)
             raise
         window = 120
         for m in resp.get("messages", []):

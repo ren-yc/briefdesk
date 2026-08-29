@@ -36,6 +36,10 @@ _MAX_CASES_PER_FEATURE = 5000
 
 _enabled = False
 _cases: dict[str, list[dict[str, Any]]] = {f: [] for f in FEATURES}
+# 超限告警的降噪闸门（按功能各记一次）：达上限后每条记录都会命中，
+# 每条一行 WARNING 会刷屏，而首条已足够说明"该功能的样本不再增长"。
+# 按功能分别记——各功能的上限是独立触发的。
+_cap_warned: set[str] = set()
 
 
 def reset() -> None:
@@ -44,6 +48,7 @@ def reset() -> None:
     _enabled = False
     for f in FEATURES:
         _cases[f] = []
+    _cap_warned.clear()
 
 
 def set_enabled(enabled: bool) -> None:
@@ -59,9 +64,15 @@ def is_enabled() -> bool:
 def _add(feature: str, case: dict[str, Any]) -> None:
     bucket = _cases[feature]
     if len(bucket) >= _MAX_CASES_PER_FEATURE:
-        logger.warning(
-            "基准记录已达上限（%d 条/%s），丢弃新记录", _MAX_CASES_PER_FEATURE, feature
-        )
+        if feature not in _cap_warned:
+            _cap_warned.add(feature)
+            logger.warning(
+                "基准记录已达上限（%d 条/%s），后续记录不再入库（本告警仅首次）",
+                _MAX_CASES_PER_FEATURE,
+                feature,
+            )
+        else:
+            logger.debug("基准记录已达上限（%s），丢弃新记录", feature)
         return
     bucket.append(case)
 
