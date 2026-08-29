@@ -846,8 +846,8 @@ class DedupTieredCandidateTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.similar_to_id, "o1")
         merge_mock.assert_awaited_once_with("o1", "新生2群")
 
-    async def test_no_candidates_logs_warning(self):
-        """⑥：余弦零候选且重叠低于阈值 → WARNING 诊断（含 cosine top-1 差距）+ 不判重。
+    async def test_no_candidates_logs_diagnosis(self):
+        """⑥：余弦零候选且重叠低于阈值 → DEBUG 诊断（含 cosine top-1 差距）+ 不判重。
 
         同时钉住重叠扫描只做一次：兜底采纳与诊断展示共用同一个结果。
         _best_overlap_candidate 是全缓存 O(n) 扫描，而「无候选」是每条不重复
@@ -878,7 +878,8 @@ class DedupTieredCandidateTest(unittest.IsolatedAsyncioTestCase):
             patch(
                 "briefdesk.plugins.dedup.engine.merge_source_group", new=AsyncMock()
             ) as merge_mock,
-            self.assertLogs("briefdesk.plugins.dedup.engine", level="WARNING") as logs,
+            # 无候选是常规路径，诊断记在 DEBUG（不占 WARNING，见 _select_candidates）
+            self.assertLogs("briefdesk.plugins.dedup.engine", level="DEBUG") as logs,
         ):
             # 与缓存共 1 字（"新"），overlap = 1/5 = 0.20 < 阈值 0.30：
             # 落在"有候选但不够格"分支，诊断才报得出差距
@@ -901,7 +902,7 @@ class DedupTieredCandidateTest(unittest.IsolatedAsyncioTestCase):
         """
         engine = self._engine([("x1", "篮球社招新", "欢迎加入篮球社")])
         with self.assertLogs(
-            "briefdesk.plugins.dedup.engine", level="WARNING"
+            "briefdesk.plugins.dedup.engine", level="DEBUG"
         ) as logs:
             # 与"篮球社招新"零共同字符
             result = await engine.check_dedup("明天下午停电通知", "新生2群")
@@ -920,7 +921,7 @@ class DedupTieredCandidateTest(unittest.IsolatedAsyncioTestCase):
         engine._cache_loaded = True
         engine._cache = []
         with self.assertLogs(
-            "briefdesk.plugins.dedup.engine", level="WARNING"
+            "briefdesk.plugins.dedup.engine", level="DEBUG"
         ) as logs:
             result = await engine.check_dedup("任意标题", "新生2群")
         self.assertFalse(result.is_duplicate)
