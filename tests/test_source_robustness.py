@@ -200,6 +200,28 @@ class EnsureReadyRejectedStateTest(unittest.IsolatedAsyncioTestCase):
         await client.ensure_ready()
         self.assertEqual(len(calls), 1, "error 阶段应尝试重新注册以恢复")
 
+    async def test_version_logged_once_per_change(self):
+        """/health 的 version 记入 _logged_version 并只在变化时打印。
+
+        它有第二个用途：fetch_all_pages 的「上游可能不支持 offset」告警要靠
+        upstream_version 补版本号（sources_base.py），而 qqflow 的两处调用
+        此前都没传 —— 最需要版本号定位的场景反而拿不到。与 weflow 客户端同形。
+        """
+        calls: list = []
+        client = self._make_client("accepted", calls, phase="ready")
+
+        with self.assertLogs("briefdesk.plugins.qqflow.client", "INFO") as cm:
+            await client.ensure_ready()
+        self.assertEqual(client._logged_version, "0.5.0")
+        version_lines = [ln for ln in cm.output if "qqflow-server 版本" in ln]
+        self.assertEqual(len(version_lines), 1, f"版本应恰好打印一行: {cm.output}")
+        self.assertIn("0.5.0", version_lines[0])
+
+        # 同版本重检（force 绕过记忆化）不重复打印
+        with self.assertNoLogs("briefdesk.plugins.qqflow.client", "INFO"):
+            await client.ensure_ready(force=True)
+        self.assertEqual(client._logged_version, "0.5.0")
+
 
 class LookupLimitTest(unittest.IsolatedAsyncioTestCase):
     """【5·P2】回查链路 limit 提升为 _LOOKUP_LIMIT=200 且显式关闭空结果重试。"""
@@ -325,6 +347,11 @@ class QqFlowControlEventStatsTest(unittest.IsolatedAsyncioTestCase):
     """【9·P3】sync/ping 心跳不计入事件数与预过滤丢弃数。"""
 
     async def test_sync_and_ping_not_counted_as_events(self):
+        """ping 喂的是手工构造帧：上游保活为注释行 `:ping`，而
+        client.stream_events 只解析 `data: ` 行，故心跳当前永不成为事件。
+        这里守的是「上游改用 data 帧时不污染统计」这条前瞻契约（与 weflow
+        监听器同形，见 test_weflow_contract.ControlEventStatsTest）。
+        """
         client = QqFlowClient("http://127.0.0.1:5032", "tok", qq="1", key="k")
         client.lookup_message = AsyncMock(return_value=None)  # type: ignore[method-assign]
         received: list = []

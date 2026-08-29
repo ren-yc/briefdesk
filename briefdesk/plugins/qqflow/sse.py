@@ -150,8 +150,15 @@ class QqFlowSseClient(DrainableListenerMixin, RealtimeListener[QqFlowClient]):
     async def _handle_event(self, event: QqFlowEvent) -> None:
         # 控制事件不计入消息事件/预过滤统计（无消息静默语义），亦无需计数：
         # ready（连接基线，载荷 {"status":"ok"} 不含 event 键故 etype 为空串，
-        # 与 weflow 监听器同一兜底）/ sync（水位对齐）/ ping（KeepAlive）直接
-        # 跳过，否则每次重连的基线帧与每 25s 心跳会让「无消息静默」统计失效
+        # 与 weflow 监听器同一兜底）与 sync（水位对齐）都不是消息，计进统计会
+        # 让「预过滤丢弃」虚增——每次重连这两类帧都会出现。
+        #
+        # ping 当前不可达，列在这里是为对称与前瞻：上游保活是
+        # `KeepAlive::new().interval(25s).text("ping")`，线上字节为注释行
+        # `:ping`，而 client.stream_events 只解析 `data: ` 行，故心跳永不成为
+        # 事件。若上游哪天把保活改成 data 帧，缺这一项会让每 25s 一次的心跳
+        # 同时虚增「事件」与「预过滤丢弃」（+144/小时），"无消息即静默"的统计
+        # 行随之常亮——那才是这个统计最有用的性质。与 weflow 监听器一致。
         etype = event.get("event", "")
         if etype in ("ready", "sync", "ping") or not etype:
             return

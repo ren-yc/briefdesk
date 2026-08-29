@@ -2,6 +2,8 @@
 
 qqflow-server 提供本地 HTTP API（已支持 GET 和 POST 请求），便于外部脚本或工具读取 QQ NT 本地聊天记录（会话、消息、联系人、群成员）；也支持通过固定 SSE 地址推送新消息事件。接口形态参考 WeFlow HTTP API，字段与语义以本文档为准（v1 实现差异见各节"说明"）。
 
+> **术语**：**本文中 "WeFlow" 一律指安装版 WeFlow HTTP API（默认端口 5031）**，不是同族的 weflow-server（默认 5033，另有独立 API 文档）——下文所有「与 WeFlow 的差异」均以前者为基线。
+
 ## 启用方式
 
 **无配置文件**；运行参数全部由命令行指定（均有默认值）：`--port`（5032）/ `--host`（127.0.0.1）/ `--log`（info）/ `--watch-debounce-ms`（350）/ `--watch-fallback-ms`（30000），`qqflow-server.exe` 直接启动即为默认状态。
@@ -295,7 +297,7 @@ GET /api/v1/push/messages
 - 响应类型为 `text/event-stream`
 - 连接建立后**先收到一个 `ready` 事件**（`{"status":"ok"}`，表示流已就绪，对齐 WeFlow 契约），随后重放断线期间错过的事件（见下），再收到 `sync` 事件（qqflow-server 扩展，携带当前 rowid 水位线），之后是 `message.new` / `message.revoke`
 - **断线续传（Last-Event-ID 重放）**：每个 `message.new` / `message.revoke` 帧都带 `id:`（服务端单调递增序号）。客户端重连时携带 `Last-Event-ID: <序号>` 请求头（或 `?last_event_id=<序号>` 查询参数——浏览器 `EventSource` 无法设置自定义头），服务端重放序号之后、10 分钟 TTL 窗口内的历史事件；窗口外/无序号则从当前水位线重新开始。事件缓冲上限 1000 条
-- KeepAlive 每 25 秒发送 `ping`
+- KeepAlive 每 25 秒发送 `ping` **注释帧**（线上字节为 `:ping`，非 `data:` 帧）保活——只解析 `data:` 行的客户端收不到它，事件分派无需处理 `ping` 类型
 - 订阅端落后于广播缓冲（1024 条）时会重新收到 `sync` 事件对齐
 - 进程收到退出信号（Ctrl+C）时，服务端主动结束所有 SSE 流——客户端看到连接正常关闭，不会等到 3 秒宽限期超时
 - 建议接收端按 `event + rawid` 去重
@@ -499,7 +501,7 @@ GET /api/v1/media/{id}?access_token=YOUR_TOKEN
 
 **获取导出文件**：`GET|POST /api/v1/media/{talker}/{mediaType}/{file}?access_token=YOUR_TOKEN`（`mediaType` ∈ `images|voices|videos|emojis`；遍历防护：路径段拒绝 `..`/分隔符 + canonicalize 前缀校验；文件缺失或类型未知 → 404）。注意：链接仅在 `media=1` 导出过对应消息后可访问（WeFlow 同语义）。
 
-**与 WeFlow 的已知差异**（不可避免，文档化）：① `emoji` 开关接受但不产生导出（QQ 表情仅有显示文本，无文件；gif 图片走 `images/`）；② 语音导出**原始** `.silk`/`.amr` 文件（未转码为 wav）；③ `mediaUrl` 的 base 默认取 `http://{host}:{port}`（默认 127.0.0.1:5032，WeFlow 为 5031）——绑定 `0.0.0.0`/`::` 时该地址不可达，自动回退 `127.0.0.1` 并告警；局域网/容器部署请用 `--base-url http://<可达地址>:<port>` 显式指定；④ 导出根默认 `<data-dir>/api-media`（可 `--media-export-dir` 覆盖）；⑤ 文件名按内容键派生（`<md5|uuid>.<源扩展名>`，如 `9f2a1c...4d.png`）而非保留 QQ 原始 `fileName`——同名不同内容的文件因此永不冲突，跨页重复导出幂等（无键可派生时才保留 QQ 原始名）；⑥ 404 错误体为统一 envelope 而非 WeFlow 的 `{"error":"Media not found"}`。`mediaId` 直服（§3.1）与 `media` 元数据对象为 qqflow 扩展，导出后仍可用。
+**与 WeFlow 的已知差异**（不可避免，文档化）：① `emoji` 开关接受但不产生导出（QQ 表情仅有显示文本，无文件；gif 图片走 `images/`）；② 语音导出**原始** `.silk`/`.amr` 文件（未转码为 wav）；③ `mediaUrl` 的 base 默认取 `http://{host}:{port}`（默认 127.0.0.1:5032，WeFlow 为 5031）——绑定 `0.0.0.0`/`::` 时该地址不可达，自动回退 `127.0.0.1` 并告警；局域网/容器部署请用 `--base-url http://<可达地址>:<port>` 显式指定；④ 导出根默认 `<data-dir>/api-media`（可 `--media-export-dir` 覆盖）；⑤ 文件名按内容键派生（`<md5|uuid>.<源扩展名>`，如 `9f2a1c...4d.png`）而非保留 QQ 原始 `fileName`——同名不同内容的文件因此永不冲突，跨页重复导出幂等（无键可派生时才保留 QQ 原始名）；⑥ 404 错误体为统一 envelope，而安装版 WeFlow 为 `{"error":"Media not found"}`（注：weflow-server 自其 0.5.0 起亦已统一为 envelope，此项差异仅对安装版 WeFlow 成立）。`mediaId` 直服（§3.1）与 `media` 元数据对象为 qqflow 扩展，导出后仍可用。
 
 ## 4. 获取会话列表
 

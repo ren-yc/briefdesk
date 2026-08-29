@@ -173,6 +173,10 @@ class QqFlowClient(SourceClient):
         self._sse_read_timeout_s = sse_read_timeout_ms / 1000
         self._client: httpx.AsyncClient | None = None
         self._ready_checked = False
+        # 首次见到的上游版本号（/health 的 version 字段）：仅用于版本日志与
+        # 「上游可能不支持 offset」告警的文案（sources_base 的 upstream_version），
+        # 不参与任何行为判定
+        self._logged_version: str | None = None
         # 串行化健康检查 + 引导注册（SSE 强制重检与轮询检查并发竞争时避免重复注册）
         self._ready_lock = asyncio.Lock()
         self.connection_status = "offline"
@@ -312,6 +316,10 @@ class QqFlowClient(SourceClient):
             except Exception:
                 self._ready_checked = False
                 raise
+            version = health.get("version")
+            if version and version != self._logged_version:
+                logger.info("qqflow-server 版本: %s", version)
+                self._logged_version = str(version)
             phase = health.get("account", "unregistered")
             logger.debug("qqflow 健康检查: 账号阶段 %s", phase)
             if phase == "ready":
@@ -385,6 +393,7 @@ class QqFlowClient(SourceClient):
             "/api/v1/contacts",
             key="contacts",
             dedup_key="username",
+            upstream_version=self._logged_version,
         )
         contacts: dict[str, str] = {}
         for c in rows:
@@ -415,6 +424,7 @@ class QqFlowClient(SourceClient):
             key="sessions",
             dedup_key="username",
             page_size=10000,
+            upstream_version=self._logged_version,
         )
 
     async def fetch_messages(
