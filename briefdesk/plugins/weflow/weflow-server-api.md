@@ -200,6 +200,8 @@ DELETE 的客户端用。
   "localId": 1,
   "serverId": "8280000000000000001",
   "localType": 1,
+  "baseType": 1,
+  "appmsgSubtype": null,
   "createTime": 1700000100,
   "sortSeq": 0,
   "isSend": 0,
@@ -218,6 +220,31 @@ DELETE 的客户端用。
 - `isSend` 为数字 `0`（对方/系统）或 `1`（自己），不是布尔。
 - `media` 只要消息可解析出媒体就存在（与 WeFlow 形状一致），与 `media=1` 无关；未导出时
   `url` / `localPath` 为**空字符串**而非缺键，客户端可稳定取字段。
+
+#### `localType` 是打包字段：`baseType` / `appmsgSubtype`
+
+微信 4.x 把两个值塞进同一列：
+
+```
+localType = (appmsgSubtype << 32) | baseType
+```
+
+一条文件附件存的是 `(6 << 32) | 49` = `25769803825`，**不是 49**。真库 218558 条里
+62494 条（28.6%）的高 32 位非零，全是 appmsg；另有 6 条是 `(17 << 32) | 11000`，所以
+掩码是无条件的，不能写成"仅当 base 是 49 时才掩"。
+
+- `localType`：**原样输出打包值，永不改动**。下游已按它分支（例如按
+  `21474836529` 认链接卡片），改成掩码后的值会让这些判断全部落空。
+- `baseType`：低 32 位，就是常规的 `1/3/34/43/47/49/…`。
+- `appmsgSubtype`：高 32 位，**仅当 `baseType == 49` 时给值**，否则为 `null`。
+  11000 的高位 17 不是 appmsg 子类型，当成子类型发出去会诱导下游误读。
+
+新增这两个字段是为了让下游不必硬编码 12 位打包常数：判链接卡片写
+`baseType == 49 && appmsgSubtype == 5`，比 `localType == 21474836529` 可读得多。
+两个字段都是**只读派生值**，不进任何 ChatLab 面（那边有自己的 `type` 枚举）。
+
+常见 `appmsgSubtype`（真库计数）：5 链接卡片 36629、57 引用回复 17005、6 文件 3530、
+19 合并转发 991、51 视频号 919、33/36 小程序 284、4 图文 384、2001 支付 269。
 
 响应：
 
@@ -248,13 +275,14 @@ DELETE 的客户端用。
 
 > 文件附件（`file`）暂不参与导出：与 WeFlow 官方契约一致，媒体导出仅覆盖图片/语音/视频/表情四类。
 
-`local_type=49` 的文件附件会带 `media` 对象（`type: "file"`），但 `exported` **恒为假**
-—— 这类消息没有 md5，被上面第一条的闸门跳过。SSE 推送的 `media` 元数据同形。判断字节
-是否可取始终看 `exported`，不要看 `media` 是否存在。
+`appmsgSubtype == 6` 的文件附件会带 `media` 对象（`type: "file"`，含真实
+`fileName` 与 `md5`），但 `exported` **恒为假** —— 文件类被导出闸门显式拒绝，不是因为
+缺字段。SSE 推送的 `media` 元数据同形。判断字节是否可取始终看 `exported`，不要看
+`media` 是否存在。
 
-> 注意 `media.fileName` 对文件类**目前恒为 `file_<localId>` 这样的回落名**，取不到真实
-> 文件名：`title` 只按属性形式读取，而微信写的是元素形式且带 CDATA 包裹。这是已知缺口，
-> 与 `type` 的识别是同一类问题但独立修复（`fileName` 是下游可见字段）。
+`media.fileName` 取自 appmsg 的 `<title>`（自动剥离 CDATA 包裹），并按 Windows
+非法字符表做净化；`<title>` 缺失或为空时回落 `file_<localId>`。真库 3530 条文件里
+回落 0 条。`md5` 3528 条有值 —— 另 2 条的 `<md5>` 元素存在但内容为空，属源数据缺失。
 
 `format=chatlab` / `chatlab=1` 时改为输出 ChatLab 信封（消息按时间**正序**）：
 `chatlab` / `meta`（含 `ownerId`）/ `members` / `messages`，外层保留
@@ -342,8 +370,12 @@ qqflow-server 的 `type` 取值为 `1` 私聊 / `2` 群聊，数值含义与本�
 
 **标准中 `6` 未分配，任何情况下都不会出现。** 映射要点：
 
-- `local_type` 49（appmsg）按载荷细分：带 `refermsg` → `25` REPLY，`<type>6</type>`
-  文件 → `4` FILE，其余 → `7` LINK；
+- 映射先对 `local_type` **掩码取低 32 位**（打包语义见
+  [`localType` 是打包字段](#localtype-是打包字段basetype--appmsgsubtype)）。不掩码则
+  所有 appmsg 行都匹配不上、全部落 `99` OTHER —— 真库里那是 28.6% 的消息；
+- `local_type` 49（appmsg）按载荷细分：带 `refermsg` → `25` REPLY，子类型 6
+  文件 → `4` FILE，其余 → `7` LINK。子类型优先取打包高 32 位，其次取 XML `<type>`：
+  真库 62494 条里两者一致 62493 条、高位从不缺失，XML 反而错一条；
 - `local_type` 10000/10002 按是否真正解出撤回载荷细分：是 → `81` RECALL，
   否（普通系统通知）→ `80` SYSTEM。仅看 `local_type` 会把非撤回的 10002 误判成撤回；
 - ⚠️ 与 `/api/v1/messages` 的 `localType` 是**两套独立编码**：同一张图片在这里是
@@ -467,9 +499,12 @@ qqflow-server 的 `type` 取值为 `1` 私聊 / `2` 群聊，数值含义与本�
 - 帧携带 `id:` 序号；`Last-Event-ID` 头（或查询参数）可回放最近 **1000 条 / 10 分钟**
   （序号为总线级单调值，跨账号注册保持连续）
 - 每 25 秒发送 `ping` 注释帧保活
-- `message.new` 的 `media` 仅在消息含图片/语音/视频/表情时出现，否则为 `null`。
+- `message.new` 的 `media` 仅在消息含图片/语音/视频/表情/文件时出现，否则为 `null`。
   它是**元数据**：不含 `url` / `localPath`（字节走 REST `/api/v1/messages?media=1` 导出），
   也绝不含解密用的 `aes_key`。推空占位链接只会让客户端误以为有可取地址。
+  `type: "file"` 只表示识别出了文件附件，文件类**不参与导出**，REST 侧也取不到字节。
+- SSE 事件**不带 `localType` / `baseType` / `appmsgSubtype`**，需要类型分支请按
+  `content` 与 `media.type`，或用 `sessionId` 回查 `/api/v1/messages`。
 - 订阅端滞后（broadcast 缓冲被覆盖）时补发一帧 `sync`，携带**当前真实水位**，客户端可据此
   重新增量拉取。该帧不占用总线序号（它只针对这一个滞后订阅者，占号会导致其他客户端跳号）。
 - 进程收到退出信号时，服务端主动结束所有 SSE 流（不等宽限期超时），客户端会看到连接正常关闭。
