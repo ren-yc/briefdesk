@@ -1,9 +1,11 @@
 """weflow 就绪链路测试（健康检查驱动的账号引导注册）。
 
-覆盖 weflow-server v0.3.0 的契约：/health 下发每账号状态列表、
-POST /api/v1/accounts 注册幂等且返回真实 state/status。断言下游据此
-避免重复注册、被拒态不记忆化（下轮自愈）、业务 503 复位记忆化标志，
-以及会话类型判定的数字 type 兜底。
+覆盖 weflow-server v0.5.0 的契约：/health 只下发标量 account 阶段
+（unregistered / indexing / ready / error，刻意不列账号——该接口免鉴权）、
+POST /api/v1/accounts 强制单账号且注册幂等、账号明细改由需鉴权的
+GET /api/v1/accounts 提供。断言下游据此避免重复注册、被拒态与占用冲突
+不记忆化（下轮自愈）、error 阶段仍能从明细接口打出根因、业务 503 复位
+记忆化标志，以及会话类型判定的数字 type 兜底。
 
 全部使用虚构 wxid / token / 密钥，不含任何真实凭据或聊天内容。
 """
@@ -30,15 +32,12 @@ def _client() -> WeFlowClient:
     )
 
 
-def _health(*states: str, version: str = "0.3.0") -> dict:
-    """构造 /health 响应（每账号一个 state）。"""
+def _health(phase: str = "unregistered", version: str = "0.5.0") -> dict:
+    """构造 /health 响应（标量 account 阶段，不含账号清单）。"""
     return {
-        "status": "ok" if states and all(s == "ready" for s in states) else "starting",
+        "status": "ok" if phase == "ready" else "starting",
         "version": version,
-        "accounts": [
-            {"wxid": f"wxid_test_{i:04d}", "state": s, "message_count": 100}
-            for i, s in enumerate(states, start=1)
-        ],
+        "account": phase,
     }
 
 
@@ -101,12 +100,13 @@ class EnsureReadyTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(client._ready_checked)
 
     async def test_error_account_registers_and_rejection_not_memoized(self):
-        """error 态账号：重新注册（上游允许替换重建）；被拒态不记忆化。"""
+        """error 阶段：重新注册（error 不释放绑定但可原地重试）；被拒态不记忆化。"""
         client = _client()
         with (
             patch.object(
                 client, "fetch_health", AsyncMock(return_value=_health("error"))
             ),
+            patch.object(client, "fetch_accounts", AsyncMock(return_value=[])),
             patch.object(
                 client,
                 "register_account",
@@ -118,12 +118,48 @@ class EnsureReadyTest(unittest.IsolatedAsyncioTestCase):
             await client.ensure_ready()  # 未记忆化 → 下轮重试
         self.assertEqual(register.await_count, 2)
 
-    async def test_awaiting_key_account_triggers_registration(self):
-        """awaiting_key 态：非良性，应尝试注册（密钥补齐后自愈）。"""
+    async def test_error_phase_logs_root_cause_from_detail_endpoint(self):
+        """error 阶段：/health 只给标量，根因须从需鉴权的明细接口捞出并告警。
+
+        回归防护：标量化 /health 之前，根因来自 accounts[].error；若只是删掉
+        那段告警，用户就只能看到业务接口持续 503，看不到「密钥错误」。
+        """
+        client = _client()
+        detail = [
+            {
+                "wxid": "wxid_test_0001",
+                "state": "error",
+                "error": "页 1 HMAC 校验失败",
+            }
+        ]
+        with (
+            patch.object(
+                client, "fetch_health", AsyncMock(return_value=_health("error"))
+            ),
+            patch.object(
+                client, "fetch_accounts", AsyncMock(return_value=detail)
+            ) as accounts,
+            patch.object(
+                client,
+                "register_account",
+                AsyncMock(return_value=("accepted", "indexing")),
+            ) as register,
+            self.assertLogs("briefdesk.plugins.weflow.client", "WARNING") as logs,
+        ):
+            await client.ensure_ready()
+        accounts.assert_awaited_once()
+        register.assert_awaited_once()  # 诊断不得挡住注册重试
+        self.assertTrue(any("页 1 HMAC 校验失败" in m for m in logs.output))
+
+    async def test_detail_endpoint_failure_does_not_block_registration(self):
+        """明细接口不可用（鉴权/网络）：仅降级，注册照常发起。"""
         client = _client()
         with (
             patch.object(
-                client, "fetch_health", AsyncMock(return_value=_health("awaiting_key"))
+                client, "fetch_health", AsyncMock(return_value=_health("error"))
+            ),
+            patch.object(
+                client, "fetch_accounts", AsyncMock(side_effect=RuntimeError("401"))
             ),
             patch.object(
                 client,
@@ -133,6 +169,25 @@ class EnsureReadyTest(unittest.IsolatedAsyncioTestCase):
         ):
             await client.ensure_ready()
         register.assert_awaited_once()
+        self.assertTrue(client._ready_checked)
+
+    async def test_account_conflict_is_not_memoized(self):
+        """服务端已绑定另一个 wxid：不记忆化（人工注销/改配置后自愈），按 ERROR 报。"""
+        client = _client()
+        with (
+            patch.object(client, "fetch_health", AsyncMock(return_value=_health())),
+            patch.object(
+                client,
+                "register_account",
+                AsyncMock(return_value=("account_conflict", "unknown")),
+            ) as register,
+            self.assertLogs("briefdesk.plugins.weflow.client", "ERROR") as logs,
+        ):
+            await client.ensure_ready()
+            self.assertFalse(client._ready_checked)
+            await client.ensure_ready()  # 未记忆化 → 下轮重试
+        self.assertEqual(register.await_count, 2)
+        self.assertTrue(any("已绑定另一个账号" in m for m in logs.output))
 
     async def test_health_failure_not_memoized(self):
         """健康检查失败（服务未起）：上抛且不记忆化，下轮重试。"""
@@ -180,6 +235,70 @@ class EnsureReadyTest(unittest.IsolatedAsyncioTestCase):
             register.assert_not_called()
             await client.ensure_ready(force=True)
         register.assert_awaited_once()
+
+
+class AccountDetailTest(unittest.IsolatedAsyncioTestCase):
+    """GET /api/v1/accounts —— 需鉴权的账号明细（/health 标量化后的去处）。"""
+
+    async def test_fetch_accounts_sends_token_and_unwraps_list(self):
+        """走 /api/v1/accounts、带鉴权头、返回 accounts 数组本身。"""
+        client = _client()
+        captured: dict = {}
+
+        class _Resp:
+            status_code = 200
+            is_success = True
+            text = ""
+            url = httpx.URL("http://127.0.0.1:5033/api/v1/accounts")
+
+            def json(self) -> dict:
+                return {
+                    "success": True,
+                    "accounts": [
+                        {
+                            "wxid": "wxid_test_0001",
+                            "state": "ready",
+                            "message_count": 42,
+                            "db_storage": "C:\\x\\db_storage",
+                        }
+                    ],
+                }
+
+        real_client = client._get_client()
+
+        async def fake_get(path, **kwargs):
+            captured["path"] = path
+            captured["headers"] = kwargs.get("headers")
+            return _Resp()
+
+        with patch.object(real_client, "get", fake_get):
+            accounts = await client.fetch_accounts()
+        self.assertEqual(captured["path"], "/api/v1/accounts")
+        self.assertIn("Authorization", captured["headers"])
+        self.assertEqual(len(accounts), 1)
+        self.assertEqual(accounts[0]["message_count"], 42)
+
+    async def test_fetch_accounts_raises_on_http_error(self):
+        """非 2xx（如 401）上抛 RuntimeError，由调用方决定是否降级。"""
+        client = _client()
+
+        class _Resp:
+            status_code = 401
+            is_success = False
+            text = '{"success":false,"code":401,"message":"unauthorized"}'
+            url = httpx.URL("http://127.0.0.1:5033/api/v1/accounts")
+
+            def json(self) -> dict:
+                return {}
+
+        with (
+            patch(
+                "briefdesk.plugins.weflow.client.with_connect_retry",
+                AsyncMock(return_value=_Resp()),
+            ),
+            self.assertRaises(RuntimeError),
+        ):
+            await client.fetch_accounts()
 
 
 class ReadyGateTest(unittest.IsolatedAsyncioTestCase):
@@ -326,7 +445,7 @@ class ListPaginationTest(unittest.IsolatedAsyncioTestCase):
 
 
 class ControlEventStatsTest(unittest.IsolatedAsyncioTestCase):
-    """控制事件（ready / sync）不进管道、也不计入监听统计。"""
+    """控制事件（ready / sync / ping）不进管道、也不计入监听统计。"""
 
     async def test_control_events_skipped_without_inflating_stats(self):
         """上游无就绪门控后每次重连都会带 ready（+可能 sync）基线帧。
@@ -334,6 +453,11 @@ class ControlEventStatsTest(unittest.IsolatedAsyncioTestCase):
         它们不是消息：既不该进管道，也不该计入「事件」或「预过滤丢弃」——
         否则「无消息静默」统计失效（与 qqflow 监听器一致）。
         ready 帧的载荷实测为 {"status":"ok"}，不含 event 键。
+
+        ping 一并断言：上游保活为注释行 `:ping`，而 stream_events 只解析
+        `data: ` 行，故心跳当前永不成为事件——这里喂的是手工构造帧，守的是
+        「上游改用 data 帧时不污染统计」这条前瞻契约（与 qqflow 监听器同形，
+        见 test_source_robustness.QqFlowControlEventStatsTest）。
         """
         from briefdesk.plugins.weflow.sse import WeFlowSseClient
 
@@ -351,6 +475,7 @@ class ControlEventStatsTest(unittest.IsolatedAsyncioTestCase):
         await listener._handle_event(  # type: ignore[arg-type]
             {"event": "ready", "status": "ok"}
         )
+        await listener._handle_event({"event": "ping"})  # type: ignore[arg-type]
         self.assertEqual(listener._stats_events, 0)
         self.assertEqual(listener._stats_filtered, 0)
         self.assertEqual(batches, [])

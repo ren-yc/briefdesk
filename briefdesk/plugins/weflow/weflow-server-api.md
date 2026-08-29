@@ -46,26 +46,54 @@
 
 ### GET/POST `/health`、`/api/v1/health`（免鉴权）
 
-全局就绪状态 + 每账号状态列表（客户端可据此健康检查，无需轮询注册端点）：
+就绪状态 + 单个账号阶段（客户端可据此健康检查，无需轮询注册端点）：
 
 ```json
 {
   "status": "ok",
   "version": "<version>",
+  "account": "ready"
+}
+```
+
+- `status`：`ok`（已绑定账号且 `ready`）或 `starting`（未注册 / 仍在 indexing / error）。
+- `account` ∈ `unregistered | indexing | ready | error`：
+  - `unregistered`——从未注册，或已被注销；
+  - 其余三值即绑定账号的状态机值。
+
+**本接口刻意不列出账号。** 它免鉴权，而启动扫描会为本机每个 `xwechat_files` 账号目录建一个
+条目，因此账号数组——乃至它的长度——本身就在告诉任意未鉴权调用方：这台机器上有哪些账号、
+各自进展到哪一步。账号身份、消息数、库路径与错误原因一律改由需鉴权的
+[`GET /api/v1/accounts`](#get-apiv1accounts--账号明细需鉴权) 提供。
+
+注意 `awaiting_key` **不会**出现在这里：启动扫描发现但未注册的账号不构成绑定，`account` 仍是
+`unregistered`（它们在账号明细接口里可见）。
+
+### GET `/api/v1/accounts` — 账号明细（需鉴权）
+
+`/health` 不再承载的账号信息：
+
+```json
+{
+  "success": true,
   "accounts": [
-    { "wxid": "wxid_xxxx_1234", "state": "ready", "message_count": 217272 }
+    {
+      "wxid": "wxid_xxxx_1234",
+      "state": "ready",
+      "message_count": 217272,
+      "db_storage": "D:\\AppData\\xwechat_files\\wxid_xxxx_1234\\db_storage"
+    }
   ]
 }
 ```
 
-- `status`：`ok`（**已注册**账号至少一个且全部 `ready`）或 `starting`（无已注册账号 /
-  仍在 indexing / 有 error）。
-- `accounts[]` 除已注册账号外，还包含启动扫描发现但**尚未注册**的账号（`awaiting_key`）。
-  这些条目**不参与** `status` 判定：本机存在未注册的账号目录属正常状态，若让它们拉低
-  就绪判定，`status` 会永远停在 `starting`。已注册账号为空时 `status` 也是 `starting`。
-- `accounts[].state` ∈ `awaiting_key | indexing | ready | error`（与账号状态机一致）；
-  账号处于 `error` 时附 `error` 字符串（错误原因），`ready` 时不含该键。
+- `state` ∈ `awaiting_key | indexing | ready | error`（与账号状态机一致）；账号处于 `error` 时
+  附 `error` 字符串（错误原因），其余状态不含该键。
+- 除绑定账号外，还包含启动扫描发现但**尚未注册**的账号（`awaiting_key`），客户端可据此在注册
+  之前看到本机存在哪些账号。
 - 列表按 `wxid` 升序，便于客户端做稳定 diff。
+- **不受就绪门控**：账号 `indexing` 时服务器正是「未就绪」，而那恰好是客户端要轮询本接口的
+  时候。GET 无 body，token 走请求头或查询串。
 
 ### POST `/api/v1/accounts` — 注册账号（客户端驱动启动）
 
@@ -96,15 +124,69 @@
 { "success": true, "wxid": "wxid_xxxx_1234", "state": "accepted", "status": "indexing", "db_storage": "D:\\AppData\\xwechat_files\\wxid_xxxx_1234\\db_storage" }
 ```
 
-- `state`：注册结果语义（qqflow-server 风格）——`accepted`（已接受，开始后台构建）/ `already_ready`（重复注册，账号已就绪）/ `in_progress`（重复注册，正在构建中）；
+- `state`：注册结果语义（qqflow-server 风格）——`accepted`（已接受，开始后台构建）/ `already_ready`（重复注册，账号已就绪）/ `in_progress`（重复注册，正在构建中）/ `account_conflict`（本服务已绑定**另一个** wxid，拒绝注册）；
 - `status`：账号当前状态机值 ∈ `awaiting_key | indexing | ready | error`；
 - `db_storage`：实际使用的库目录。
 
+`account_conflict` 时不含 `status` / `db_storage`，改附在位账号信息（HTTP 仍为 `200`，`success`
+仍为 `true`——请求本身合法，只是被策略拒绝）：
+
+```json
+{ "success": true, "wxid": "wxid_new_5678", "state": "account_conflict",
+  "occupied_by": "wxid_xxxx_1234", "occupied_status": "ready" }
+```
+
 行为契约：
+- **强制单账号**：一个进程同时只绑定一个 wxid。要换账号必须先注销（见下节），服务器不会为你
+  静默顶掉在位账号——它可能正在被另一个客户端使用。
+- **判定顺序**：冲突检查在密钥校验**之前**。占用中的服务器对携带别的 wxid 的注册一律回
+  `account_conflict`，不会因为顺序颠倒而先返回 `400 密钥错误`，从而把「这个密钥对不对」告诉
+  一个本来就无权注册的调用方。
 - **密钥仅存进程内存，不落盘**；服务重启后需重新注册。
 - 注册时对目标库做页 1 HMAC 预校验（`wcdb::verify_page1`），错钥立即拒绝（`400`）。
 - 成功后启动阻塞式全量构建 + 文件事件监视任务；构建完成前账号状态为 `indexing`。
-- **注册幂等**（对齐 qqflow-server）：重复注册已 `ready`/`indexing` 的账号**不会重建索引**、不会中止 watcher，直接返回现有句柄（`state` 为 `already_ready`/`in_progress`）；仅 `error`（或 `awaiting_key`）状态的账号会被替换重建——密钥 / 路径填错后重新注册即可自愈。
+- **注册幂等**：重复注册**同一** wxid 且其状态为 `ready`/`indexing` 时**不会重建索引**、不会中止
+  watcher，直接返回现有句柄（`state` 为 `already_ready`/`in_progress`）；仅 `error`（或
+  `awaiting_key`）状态会被替换重建——密钥 / 路径填错后重新注册即可自愈。`error` 账号**仍持有
+  绑定**，别的 wxid 依然会撞 `account_conflict`。
+
+### DELETE `/api/v1/accounts/{wxid}` — 注销账号（需鉴权）
+
+释放绑定、清空内存索引、退场后台任务，服务器回到未注册状态（`/health` 的 `account` 变回
+`unregistered`）。别名 `POST /api/v1/accounts/{wxid}/deregister`，语义完全相同——给不便发
+DELETE 的客户端用。
+
+| 参数 | 说明 |
+|---|---|
+| `{wxid}` | 路径参数：要注销的账号。**安全联锁**——与在位账号不一致时什么都不做 |
+| `purge_media` | 可选，默认 `false`。同时删除本账号会话的媒体导出目录 |
+
+响应（三种结果，HTTP 均为 `200`）：
+
+```json
+{ "success": true, "wxid": "wxid_xxxx_1234", "state": "deregistered",
+  "previous_status": "ready", "index_cleared": true,
+  "purged_media": false, "purged_dirs": 0 }
+```
+
+- `state: "deregistered"`——已注销。`previous_status` 是注销前的状态机值，`index_cleared` 表示
+  内存索引确有内容被清空。
+- `state: "not_registered"`——本就没有绑定账号。**幂等**：重复注销不报错。
+- `state: "wxid_mismatch"`——路径里的 wxid 不是在位账号，附 `occupied_by` / `occupied_status`，
+  **在位账号毫发无损**。这是防误注销的联锁：客户端以为自己在注销自己的账号，实际上服务器绑的
+  是别人的。
+
+行为契约：
+- 允许在 `indexing` 中途注销。正在跑的全量构建会看到退场标志并丢弃结果，不会把数据写回已
+  释放的索引。
+- **SSE `history` 不清空**。事件总线与历史缓冲是进程级的、`id` 单调递增，清空会破坏无关订阅者的
+  `Last-Event-ID` 重放。取而代之：注销后广播一条空的 `sync` 基线事件，订阅者据此得知水位归零。
+- 启动扫描发现的账号注销后**退回 `awaiting_key`**（仍在账号明细里，可再次注册）；纯客户端指定
+  路径的账号注销后彻底消失。
+- `purge_media=true` 只删已知布局 `<media_export_dir>/<talker>/{images,voices,videos,emojis}`，
+  随后仅在会话目录已空时删除它；导出根目录本身永不触碰，异常 talker 名（空、`.`、`..`、含路径
+  分隔符）一律跳过。`purged_dirs` 是实际删除的会话目录数。
+- **不注销**不会释放绑定：进程重启同样回到未注册状态，但那会丢掉所有内存索引与密钥。
 
 ### GET/POST `/api/v1/messages` — 消息查询 + 媒体导出
 
@@ -224,12 +306,13 @@ qqflow-server 的 `type` 取值为 `1` 私聊 / `2` 群聊，数值含义与本�
 ```json
 { "success": true, "count": 100, "total": 4533, "hasMore": true, "contacts": [
   { "username": "wxid_friend_a", "displayName": "客户张三", "nickname": "...",
-    "remark": "客户张三", "alias": null, "avatarUrl": null, "type": "friend" }
+    "remark": "客户张三", "alias": "", "avatarUrl": "", "type": "friend" }
 ] }
 ```
 
 `displayName` 按 `remark > nickname > username` 解析，恒为字符串；`nickname`、`remark`、
-`alias`、`avatarUrl` 源自联系人行，缺值时为 `null`（非空字符串）。
+`alias`、`avatarUrl` 源自联系人行，**缺值时为空字符串 `""`（不是 `null`）**，与
+`/api/v1/group-members`、ChatLab Pull 一致。
 
 **必须翻页**：`limit` 默认 100，不传就只拿到前 100 条（实测真实账号 4533 条），
 截断外的联系人在下游会退化为显示 UID。按 `offset` 递增直到 `hasMore=false`：
@@ -259,7 +342,11 @@ qqflow-server 的 `type` 取值为 `1` 私聊 / `2` 群聊，数值含义与本�
 
 - `media_type` ∈ `images|voices|videos|emojis`
 - 双重防穿越：路径段拒绝 `..`/`./`/`\`，且 `canonicalize` 后必须落在导出目录内
-- 404 信封返回 `{ "error": "Media not found" }`；内容按扩展名推断 MIME 输出
+- 404 走统一错误信封 `{ "success": false, "code": 404, "message": "media not found" }`；
+  内容按扩展名推断 MIME 输出
+- **无就绪门控**（与 qqflow-server 不同，后者此端点要求就绪）：导出文件已在磁盘上，
+  其可读性与当前是否有账号绑定无关。因此注销后若未带 `purge_media=1`，此前导出的
+  文件仍可访问；要一并清除须在注销时显式请求。
 
 ### GET/POST `/api/v1/push/messages` — SSE 事件流（免轮询推送）
 
@@ -271,8 +358,11 @@ qqflow-server 的 `type` 取值为 `1` 私聊 / `2` 群聊，数值含义与本�
 - **替换 `error` 态账号不会孤儿化订阅者**：改正密钥后重注册，已连接的客户端继续收到
   新账号的事件（旧实现每次注册新建总线，订阅者会静默失聪且不断线）；
 - 业务端点（`messages`/`sessions`/…）**仍有** 503 门控——索引未建完确实无法查询，
-  与此处语义不同；
+  与此处语义不同；账号面三个端点（注册 / 明细 / 注销）同样无门控，否则未就绪时客户端连
+  「为什么没就绪」都查不到，也无法清掉一个卡在 `error` 的账号；
 - `wxid` 查询参数仅作语义提示，不影响订阅内容（总线为进程级，非按账号隔离）。
+- **注销后不断线**：注销不清空重放历史（`id` 是总线级单调序列，清空会破坏无关订阅者的
+  `Last-Event-ID` 重放），而是广播一条空的 `sync` 基线，订阅者据此得知水位归零。
 
 事件（`event:` 名）：
 
@@ -333,5 +423,7 @@ feeds 条目字段（以源码 `sns.rs` 为准）：`tid/userName/content(明文
 weflow-server.exe --port 5033 --watch-fallback-ms 5000 --log info
 ```
 
-参数：`--port`、`--host`、`--data-dir`、`--log`、`--watch-debounce-ms`、`--watch-fallback-ms`、
-`--media-export-dir`、`--base-url`（全部仅命令行，无配置文件）。
+参数：`--show-token`、`--port`、`--host`、`--log`、`--watch-debounce-ms`、
+`--watch-fallback-ms`、`--media-export-dir`、`--base-url`（全部仅命令行，无配置文件）。
+数据目录不可配置：Windows `%LOCALAPPDATA%\weflow-server`；媒体导出默认落在其下的
+`api-media`，仅 `--media-export-dir` 可改。

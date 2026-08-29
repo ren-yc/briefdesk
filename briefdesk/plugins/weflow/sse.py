@@ -143,8 +143,15 @@ class WeFlowSseClient(DrainableListenerMixin, RealtimeListener[WeFlowClient]):
         # ready（连接基线，载荷 {"status":"ok"} 无 event 键）与 sync（水位基线/
         # 重基）都不是消息，计进统计会让「预过滤丢弃」虚增——上游无就绪门控后
         # 冷启动即连上，这两类帧在每次重连时都会出现。与 qqflow 监听器一致。
+        #
+        # ping 当前不可达，列在这里是为对称与前瞻：上游保活是
+        # `KeepAlive::new().interval(25s).text("ping")`，线上字节为注释行
+        # `:ping`，而 stream_events 只解析 `data: ` 行，故心跳永不成为事件。
+        # 若上游哪天把保活改成 data 帧，缺这一项会让每 25s 一次的心跳同时
+        # 虚增「事件」与「预过滤丢弃」（+144/小时），"无消息即静默"的统计
+        # 行随之常亮——那才是这个统计最有用的性质。
         etype = event.get("event", "")
-        if etype in ("ready", "sync") or not etype:
+        if etype in ("ready", "sync", "ping") or not etype:
             return
         self._stats_events += 1
         if not pre_filter_sse(event):

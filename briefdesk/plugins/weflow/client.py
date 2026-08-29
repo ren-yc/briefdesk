@@ -160,10 +160,14 @@ _LOOKUP_LIMIT = 200
 
 # 注册响应的两套词表（weflow-server v0.3.0 起分离，勿混用）：
 # - state：本次注册的结果语义（qqflow-server 风格）
-# - status：账号状态机当前值，同时也是 /health 的 accounts[].state 取值
+# - status：账号状态机当前值（awaiting_key / indexing / ready / error）
 # 良性 = 已受理或已就绪，可记忆化，索引期内不重复注册。
 _BENIGN_REGISTER_STATES = ("accepted", "already_ready", "in_progress")
-_BENIGN_ACCOUNT_STATUSES = ("indexing", "ready")
+
+# /health 的标量 account 阶段中「引导中」的取值（v0.5.0 起）。ready 单独判定，
+# unregistered / error 落到注册分支。注意与上面的 status 词表不是一回事：
+# awaiting_key 不会出现在 account 阶段里（未注册即 unregistered）。
+_BOOTSTRAPPING_PHASES = ("indexing",)
 
 
 class WeFlowNotReadyError(SourceError):
@@ -287,10 +291,13 @@ class WeFlowClient(SourceClient):
     async def fetch_health(self) -> dict[str, Any]:
         """健康检查（免鉴权）。
 
-        返回 {status, version, accounts:[{wxid, state, message_count, error?}]}：
-        - status：ok（至少一个账号且全部 ready）/ starting（无账号或仍在建索引）；
-        - accounts[].state：awaiting_key / indexing / ready / error。
-        零账号时也返回 200（status=starting，accounts 为空数组）。
+        返回 {status, version, account}：
+        - status：ok（已绑定账号且 ready）/ starting（未注册 / 建索引中 / error）；
+        - account：标量阶段 unregistered / indexing / ready / error。
+        未注册时也返回 200（status=starting，account=unregistered）。
+
+        本接口**不列出账号**（v0.5.0 起）：它免鉴权，账号清单会向任意调用方泄露
+        本机存在哪些账号。明细在需鉴权的 GET /api/v1/accounts（见 fetch_accounts）。
         """
         client = self._get_client()
         resp = await with_connect_retry(lambda: client.get("/health"))
@@ -304,12 +311,15 @@ class WeFlowClient(SourceClient):
         """POST /api/v1/accounts 注册账号（客户端驱动启动），返回 (state, status)。
 
         - state：本次注册结果 —— accepted（已受理，开始后台构建）/
-          already_ready（账号已就绪）/ in_progress（正在构建中）；
+          already_ready（账号已就绪）/ in_progress（正在构建中）/
+          account_conflict（服务端已绑定另一个 wxid，被拒）；
         - status：账号状态机值 —— awaiting_key / indexing / ready / error。
+          account_conflict 时上游不下发 status，此处为 "unknown"。
 
-        注册幂等（上游 v0.3.0 起）：重复注册已 ready/indexing 的账号不会重建
-        索引、不中止 watcher，直接返回现有句柄；仅 error/awaiting_key 会被
-        替换重建（密钥或路径填错后重新注册即可自愈）。
+        注册幂等（上游 v0.3.0 起）：重复注册**同一** wxid 且已 ready/indexing 时
+        不会重建索引、不中止 watcher，直接返回现有句柄；仅 error/awaiting_key 会
+        被替换重建（密钥或路径填错后重新注册即可自愈）。上游 v0.5.0 起强制单账号：
+        换 wxid 必须先注销，否则回 account_conflict（冲突判定在密钥校验之前）。
         """
         client = self._get_client()
         payload: dict[str, Any] = {"wxid": self._wxid}
@@ -339,22 +349,18 @@ class WeFlowClient(SourceClient):
     async def ensure_ready(self, force: bool = False) -> None:
         """确保服务端有就绪账号（健康检查驱动，记忆化，可强制重检）。
 
-        先查 /health 的 accounts[].state（上游 v0.3.0 起下发每账号状态）：
-        已有 ready / indexing 账号即记忆化返回，**不重复注册**；只有零已注册
-        账号（或账号处于 error / awaiting_key）时才注册。accounts[] 除已注册
-        账号外还含启动扫描发现但未注册的账号（awaiting_key）——它们不参与
-        就绪判定（也不计入上面的良性/被拒分支，awaiting_key 会落到注册分支，
-        与「我们的账号未注册」语义一致），列表按 wxid 升序。注册后进入索引期，
-        业务接口的 503 由 WeFlowNotReadyError 瞬态处理兜底，不在此阻塞等待。
+        先查 /health 的标量 account 阶段（上游 v0.5.0 起）：ready 与 indexing
+        即记忆化返回，**不重复注册**；unregistered / error 才注册。注册后进入
+        索引期，业务接口的 503 由 WeFlowNotReadyError 瞬态处理兜底，不在此
+        阻塞等待。
 
         force=True 时忽略记忆化标志重新健康检查（SSE 重连后服务端可能已重启，
         内存态账号注册表丢失，需重新注册）。良性态（_BENIGN_REGISTER_STATES /
-        _BENIGN_ACCOUNT_STATUSES）记忆；被拒态与网络失败不记忆，下轮重试（自愈）。
+        _BOOTSTRAPPING_PHASES）记忆；被拒态与网络失败不记忆，下轮重试（自愈）。
 
-        单账号假设（与 qqflow 同）：状态判定不按 wxid 过滤——本仓库只配一个
-        WEFLOW_WXID，且业务端点不传 wxid 时上游取「第一个 ready 账号」，故
-        「有任一账号就绪」与「我们的账号就绪」在本部署形态下等价。若将来支持
-        多账号，需按 self._wxid 过滤 accounts 并在业务请求上带 wxid 参数。
+        单账号（上游 v0.5.0 起为强制）：阶段判定不按 wxid 过滤——本仓库只配一个
+        WEFLOW_WXID，而服务端同时只绑定一个账号，故「服务端就绪」与「我们的账号
+        就绪」等价。若配错 wxid，注册会回 account_conflict 而不是静默顶掉在位账号。
         """
         if self._ready_checked and not force:
             return
@@ -372,36 +378,44 @@ class WeFlowClient(SourceClient):
             if version and version != self._logged_version:
                 logger.info("[weflow] weflow-server 版本: %s", version)
                 self._logged_version = str(version)
-            accounts = health.get("accounts", [])
-            states = [a.get("state") for a in accounts]
-            logger.debug("[weflow] 健康检查: 账号状态 %s", states or "（无账号）")
-            # error 态账号带 error 字符串（密钥/路径填错的原因），显式告警——
-            # 否则用户只能看到业务接口持续 503，看不到根因
-            for a in accounts:
-                if a.get("state") == "error" and a.get("error"):
-                    logger.warning(
-                        "[weflow] 账号 %s 初始化失败: %s",
-                        a.get("wxid") or "<未知>",
-                        a["error"],
-                    )
-            if any(a.get("state") == "ready" for a in accounts):
+            phase = health.get("account", "unregistered")
+            logger.debug("[weflow] 健康检查: 账号阶段 %s", phase)
+            if phase == "ready":
                 self._ready_checked = True
                 logger.debug("[weflow] 已有就绪账号，跳过注册")
                 return
-            if any(a.get("state") in _BENIGN_ACCOUNT_STATUSES for a in accounts):
+            if phase in _BOOTSTRAPPING_PHASES:
                 self._ready_checked = True
-                logger.debug("[weflow] 账号建索引中（良性状态），不再重复注册")
+                logger.debug("[weflow] 账号建索引中（%s），不再重复注册", phase)
                 return
+            if phase == "error":
+                # /health 只给标量，根因（密钥/路径填错的 error 字符串）只在需
+                # 鉴权的明细接口里。仍显式告警——否则用户只能看到业务接口持续
+                # 503，看不到原因。诊断失败不能挡住下面的注册重试。
+                await self._log_account_errors()
+            # `error` 落到注册分支是有意的：服务端的 error 状态不释放绑定，但同一
+            # 账号可以直接重试注册来恢复（密钥修正后即生效）。
             logger.info(
-                "[weflow] 无就绪账号，注册账号 wxid=%s (db_path=%s, keys=%d 个库)",
+                "[weflow] 无就绪账号（阶段 %s），注册账号 wxid=%s "
+                "(db_path=%s, keys=%d 个库)",
+                phase,
                 self._wxid,
                 self._db_path or "<默认>",
                 len(self._db_keys),
             )
             state, status = await self.register_account()
-            if state in _BENIGN_REGISTER_STATES or status in _BENIGN_ACCOUNT_STATUSES:
+            if state in _BENIGN_REGISTER_STATES or status in _BOOTSTRAPPING_PHASES:
                 self._ready_checked = True
                 logger.info("[weflow] 账号注册: state=%s, status=%s", state, status)
+            elif state == "account_conflict":
+                # 服务端已被**另一个** wxid 占用（v0.5.0 起强制单账号）。重试不会
+                # 自愈：得由人去注销那个账号或改配置，所以按 ERROR 报而非 warning，
+                # 且不记忆化以便配置修正后自愈。
+                logger.error(
+                    "[weflow] 注册被拒：服务端已绑定另一个账号（本地配置 wxid=%s）。"
+                    "需先注销：DELETE /api/v1/accounts/{占用方wxid}",
+                    self._wxid,
+                )
             else:
                 # 被拒态（error / awaiting_key 等）不记忆化：保持未检查标志让
                 # 下一轮重试；否则零账号部署下没有业务 503 兜底复位标志，
@@ -411,6 +425,39 @@ class WeFlowClient(SourceClient):
                     state,
                     status,
                 )
+
+    async def _log_account_errors(self) -> None:
+        """拉明细接口把 error 根因打出来（诊断专用，失败仅降级为 debug）。"""
+        try:
+            accounts = await self.fetch_accounts()
+        except Exception as exc:  # noqa: BLE001 —— 诊断路径不得影响注册重试
+            logger.debug("[weflow] 账号明细拉取失败（跳过根因诊断）: %s", exc)
+            return
+        for a in accounts:
+            if a.get("state") == "error" and a.get("error"):
+                logger.warning(
+                    "[weflow] 账号 %s 初始化失败: %s",
+                    a.get("wxid") or "<未知>",
+                    a["error"],
+                )
+
+    async def fetch_accounts(self) -> list[dict]:
+        """GET /api/v1/accounts —— 账号明细（诊断用，需鉴权）。
+
+        /health 只报一个标量阶段；出错的具体原因（error 字段）、消息数与服务端
+        实际读取的 db_storage 只在这里。除绑定账号外还含启动扫描发现但未注册的
+        账号（awaiting_key）。不参与就绪判定，仅供排查。
+        """
+        client = self._get_client()
+        resp = await with_connect_retry(
+            lambda: client.get("/api/v1/accounts", headers=self._auth_headers())
+        )
+        if not resp.is_success:
+            raise RuntimeError(
+                f"WeFlow API error: {resp.status_code} on /api/v1/accounts — "
+                f"{resp.text[:200]}"
+            )
+        return resp.json().get("accounts", [])
 
     # ── REST API ──
 
