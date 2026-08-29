@@ -236,29 +236,34 @@ class DedupEngine(DedupService):
         同 id 重复追加（并发/唯一键冲突路径）幂等：更新已有条目而非叠加。
         """
         images = _parse_images(image_urls)
+        content_hash = self._content_hash(source_quote)
+        target: CachedItem | None = None
         for it in self._cache:
             if it.id == item_id:
-                it.title = title
-                it.content_hash = self._content_hash(source_quote)
-                it.image_urls = images
-                it.source = source
-                it.source_quote = source_quote
-                if embedding is not None and self._embed_cache_ok:
-                    it.embedding = embedding
-                    self._pending_embeds.append((item_id, embed_model_name(), embedding))
-                return
-        item = CachedItem(
-            id=item_id,
-            source=source,
-            title=title,
-            content_hash=self._content_hash(source_quote),
-            image_urls=images,
-            source_quote=source_quote,
-        )
+                target = it
+                break
+        if target is not None:
+            # 幂等更新分支：字段全覆盖（缓存条目不做部分更新，避免新旧字段混搭）
+            target.title = title
+            target.content_hash = content_hash
+            target.image_urls = images
+            target.source = source
+            target.source_quote = source_quote
+        else:
+            target = CachedItem(
+                id=item_id,
+                source=source,
+                title=title,
+                content_hash=content_hash,
+                image_urls=images,
+                source_quote=source_quote,
+            )
+            self._cache.append(target)
+        # 向量登记对新建/更新同口径：合成一处，令「更新分支忘记登记待落库向量」
+        # 这类只在并发重试路径上才现形的漏登记在结构上不可能发生
         if embedding is not None and self._embed_cache_ok:
-            item.embedding = embedding
+            target.embedding = embedding
             self._pending_embeds.append((item_id, embed_model_name(), embedding))
-        self._cache.append(item)
 
     def remove_items(self, item_ids: list[str]) -> None:
         """从内存去重缓存移除条目（级联删除类别后调用）。
@@ -443,6 +448,20 @@ class DedupEngine(DedupService):
         )
 
     @staticmethod
+    def _miss(compared: CachedItem) -> DedupResult:
+        """判不重复但「确实比较过」的出口：带候选快照，供 benchmark 记录负例。
+
+        与 _hit 配对。传入的是本次实际参与比较的候选（多数票路径为最高分候选，
+        强候选判 DIFFERENT 后候选清空的路径为该强候选本身），不是固定的
+        candidates[0] —— 快照错了不会报错，只会让基准用例记成另一条的负例。
+        无候选（未发生比较）的路径不走这里，由 check_dedup 返回裸 False。
+        """
+        return DedupResult(
+            is_duplicate=False,
+            candidate=DedupEngine._snapshot(compared),
+        )
+
+    @staticmethod
     async def _hit(
         target: CachedItem, source_group: str, note: str
     ) -> DedupResult:
@@ -611,6 +630,10 @@ class DedupEngine(DedupService):
             else:
                 logger.info("缓存无嵌入向量，回退到字符重叠预过滤")
 
+        # 全局最高重叠候选：兜底采纳与无候选诊断共用这一次扫描（_best_overlap_candidate
+        # 是全缓存 O(n) 扫描，而「无候选」是每条不重复消息的常规路径，算两遍纯属浪费）。
+        # 只有 candidates 为空才会进下面两个 block，故诊断处引用时必然已赋值。
+        overlap_cand: tuple[CachedItem, float] | None = None
         if not candidates:
             # ① 字符重叠兜底：余弦门禁拒绝（如余弦略低于阈值但标题逐字相同）
             # 或嵌入整体不可用时，取全局最高重叠单候选兜回
@@ -638,12 +661,16 @@ class DedupEngine(DedupService):
                     )
                 else:
                     diag.append("cosine 无向量可比较")
-            ov = self._best_overlap_candidate(title)
-            if ov is not None:
+            if overlap_cand is not None:
                 diag.append(
-                    f"overlap top-1={ov[1]:.2f} < 阈值 "
+                    f"overlap top-1={overlap_cand[1]:.2f} < 阈值 "
                     f"{config.dedup_similarity_threshold:.2f}"
                 )
+            elif self._cache:
+                # _best_overlap_candidate 返回 None 有两种成因：缓存空，或全部
+                # 候选重叠为 0（严格 > best_score 起始值 0.0 才会被选中）。
+                # 缓存非空时归因为"缓存为空"会把排查引向错误方向
+                diag.append(f"overlap 全零（缓存 {len(self._cache)} 条无共同字符）")
             else:
                 diag.append("缓存为空")
             logger.warning("；".join(diag))
@@ -675,10 +702,7 @@ class DedupEngine(DedupService):
         if all(verdicts):
             return await self._hit(candidates[0][0], source_group, "[weak] 全员 SAME")
         logger.info("[weak] 存在 DIFFERENT 票 → 保守不判重")
-        return DedupResult(
-            is_duplicate=False,
-            candidate=self._snapshot(candidates[0][0]),
-        )
+        return self._miss(candidates[0][0])
 
     async def _judge_normal(
         self,
@@ -720,10 +744,8 @@ class DedupEngine(DedupService):
                 # 作废其它可能判 SAME 的同文本候选
                 candidates.remove((strong_cand, strong_score))
                 if not candidates:
-                    return DedupResult(
-                        is_duplicate=False,
-                        candidate=self._snapshot(strong_cand),
-                    )
+                    # 快照是被剔除的强候选本身：它就是本次唯一比较过的对象
+                    return self._miss(strong_cand)
 
         # 并行判定全部候选，加权多数票（⑦）：票权 = 候选相似度，高相似候选的
         # 判定更可信——SAME 权重和 > 总权重一半才命中，抑制低置信票的干扰
@@ -746,10 +768,7 @@ class DedupEngine(DedupService):
             target = next(cand for cand, _score, same in voted if same)
             return await self._hit(target, source_group, "SAME")
 
-        return DedupResult(
-            is_duplicate=False,
-            candidate=self._snapshot(candidates[0][0]),
-        )
+        return self._miss(candidates[0][0])
 
 
 # 模块级单例，保留现有 import API 向后兼容

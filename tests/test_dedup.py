@@ -143,6 +143,42 @@ class RemoveItemsTest(unittest.TestCase):
         self.assertTrue(all(row[0] != "del" for row in engine._pending_embeds))
         self.assertTrue(any(it.id == "keep" for it in engine._cache))
 
+    def test_readd_same_id_updates_in_place_and_registers_embedding(self):
+        """同 id 重复追加（并发/唯一键冲突路径）：更新而非叠加，且向量照样登记。
+
+        新建与更新两条分支共用同一段向量登记代码，此处钉住更新分支——
+        它只在重试路径上才走到，漏登记的后果是该条永远不落库向量、
+        重启后才由缓存加载补齐，期间静默不参与余弦候选。
+        """
+        engine = DedupEngine()
+        engine._embed_cache_ok = True
+        engine.add_to_cache("dup", "旧标题", source_quote="旧原文")
+        self.assertEqual(engine._pending_embeds, [])
+
+        engine.add_to_cache("dup", "新标题", [0.3, 0.4], source_quote="新原文")
+
+        self.assertEqual(len(engine._cache), 1)  # 更新而非叠加
+        item = engine._cache[0]
+        self.assertEqual(item.title, "新标题")
+        self.assertEqual(item.source_quote, "新原文")
+        self.assertEqual(item.content_hash, DedupEngine._content_hash("新原文"))
+        self.assertEqual(item.embedding, [0.3, 0.4])
+        self.assertEqual([row[0] for row in engine._pending_embeds], ["dup"])
+        self.assertEqual(engine._pending_embeds[0][2], [0.3, 0.4])
+
+    def test_embedding_not_registered_when_cache_degraded(self):
+        """_embed_cache_ok=False（向量加载失败降级）时不登记待落库向量。
+
+        与上一条配对：证明那段登记代码确实受这个开关管，
+        合并新建/更新两分支没有把降级判断丢掉。
+        """
+        engine = DedupEngine()
+        engine._embed_cache_ok = False
+        engine.add_to_cache("a", "标题", [0.1], source_quote="原文")   # 新建分支
+        engine.add_to_cache("a", "标题2", [0.2], source_quote="原文2")  # 更新分支
+        self.assertEqual(engine._pending_embeds, [])
+        self.assertIsNone(engine._cache[0].embedding)
+
     def test_remove_unknown_ids_is_harmless_noop(self):
         """路由层 ignore 改发 EVENT_ITEMS_DELETED 后，处理器会对不在缓存的 id
         触发 remove_items：缺失 id 必须幂等无害（不抛错、不动现有条目）。"""
@@ -346,6 +382,35 @@ class CheckDedupShortCircuitTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result.is_duplicate)
         self.assertEqual(result.similar_to_id, "b1")
         merge_mock.assert_awaited_once_with("b1", "新生2群")
+
+    async def test_strong_different_sole_candidate_snapshots_itself(self):
+        """strong 判 DIFFERENT 且无其余候选 → 快照是被剔除的强候选自己。
+
+        这条路径的候选列表已被 remove 清空，快照若误取 candidates[0] 会
+        IndexError；取成别的条目则不报错但 benchmark 的负例会记到另一条上。
+        """
+        engine = self._engine([("only", "篮球社招新", "内容甲")])
+        with (
+            patch(
+                "briefdesk.plugins.dedup.engine.top_k_similar",
+                return_value=[(0, 1.0)],
+            ),
+            patch(
+                "briefdesk.plugins.dedup.engine.chat",
+                new=AsyncMock(return_value=self._resp(False)),
+            ),
+            patch(
+                "briefdesk.plugins.dedup.engine.merge_source_group", new=AsyncMock()
+            ) as merge_mock,
+        ):
+            result = await engine.check_dedup(
+                "篮球社招新", "新生2群", q_emb=[0.5, 0.6]
+            )
+        self.assertFalse(result.is_duplicate)
+        merge_mock.assert_not_awaited()
+        self.assertIsNotNone(result.candidate)
+        self.assertEqual(result.candidate.item_id, "only")
+        self.assertEqual(result.candidate.source_quote, "内容甲")
 
     async def test_non_strong_still_uses_majority(self):
         """无 ≥0.99 候选（不同标题高相似）→ 维持原多数票语义，不误判。"""
@@ -782,30 +847,85 @@ class DedupTieredCandidateTest(unittest.IsolatedAsyncioTestCase):
         merge_mock.assert_awaited_once_with("o1", "新生2群")
 
     async def test_no_candidates_logs_warning(self):
-        """⑥：余弦零候选且重叠低于阈值 → WARNING 诊断（含 cosine top-1 差距）+ 不判重。"""
+        """⑥：余弦零候选且重叠低于阈值 → WARNING 诊断（含 cosine top-1 差距）+ 不判重。
+
+        同时钉住重叠扫描只做一次：兜底采纳与诊断展示共用同一个结果。
+        _best_overlap_candidate 是全缓存 O(n) 扫描，而「无候选」是每条不重复
+        消息的常规路径——算两遍不会有任何可观测的错误，只会白烧一倍 CPU，
+        所以只能靠调用计数钉住。
+        """
         engine = self._engine([("x1", "篮球社招新", "欢迎加入篮球社")])
 
         def fake_topk(_q, _m, top_k, threshold):
             # 阈值 0 的 top-1 诊断调用返回最高余弦；正常召回返回空（全部低于 fallback）
             return [(0, 0.50)] if threshold == 0 else []
 
+        overlap_calls = []
+        real_overlap = DedupEngine._best_overlap_candidate
+
+        def counting_overlap(self_, title):
+            overlap_calls.append(title)
+            return real_overlap(self_, title)
+
         with (
             patch(
                 "briefdesk.plugins.dedup.engine.top_k_similar",
                 side_effect=fake_topk,
+            ),
+            patch.object(
+                DedupEngine, "_best_overlap_candidate", counting_overlap
             ),
             patch(
                 "briefdesk.plugins.dedup.engine.merge_source_group", new=AsyncMock()
             ) as merge_mock,
             self.assertLogs("briefdesk.plugins.dedup.engine", level="WARNING") as logs,
         ):
+            # 与缓存共 1 字（"新"），overlap = 1/5 = 0.20 < 阈值 0.30：
+            # 落在"有候选但不够格"分支，诊断才报得出差距
             result = await engine.check_dedup(
-                "我想转让一台自行车", "新生2群", q_emb=[0.5, 0.6]
+                "转让一台全新自行车", "新生2群", q_emb=[0.5, 0.6]
             )
         self.assertFalse(result.is_duplicate)
         merge_mock.assert_not_awaited()
         self.assertTrue(any("判重无候选" in line for line in logs.output))
         self.assertTrue(any("cosine top-1=" in line for line in logs.output))
+        # 诊断里仍要报出重叠差距（复用的是兜底那次扫描的结果，不是省掉了信息）
+        self.assertTrue(any("overlap top-1=0.20" in line for line in logs.output))
+        self.assertEqual(overlap_calls, ["转让一台全新自行车"])
+
+    async def test_zero_overlap_diagnosed_apart_from_empty_cache(self):
+        """重叠全零（缓存非空但无共同字符）不得归因为「缓存为空」。
+
+        两种成因都让 _best_overlap_candidate 返回 None（它要求严格 > 0），
+        混为一谈会把排查引向"缓存没预热"的错误方向。
+        """
+        engine = self._engine([("x1", "篮球社招新", "欢迎加入篮球社")])
+        with self.assertLogs(
+            "briefdesk.plugins.dedup.engine", level="WARNING"
+        ) as logs:
+            # 与"篮球社招新"零共同字符
+            result = await engine.check_dedup("明天下午停电通知", "新生2群")
+        self.assertFalse(result.is_duplicate)
+        joined = "\n".join(logs.output)
+        self.assertIn("overlap 全零", joined)
+        self.assertIn("缓存 1 条", joined)
+        self.assertNotIn("缓存为空", joined)
+
+    async def test_empty_cache_diagnoses_cache_empty(self):
+        """⑥ 的另一支：缓存为空时重叠候选为 None → 诊断报「缓存为空」。
+
+        与上一条配对，确保复用 overlap_cand 后 None 分支仍然走得到。
+        """
+        engine = DedupEngine()
+        engine._cache_loaded = True
+        engine._cache = []
+        with self.assertLogs(
+            "briefdesk.plugins.dedup.engine", level="WARNING"
+        ) as logs:
+            result = await engine.check_dedup("任意标题", "新生2群")
+        self.assertFalse(result.is_duplicate)
+        self.assertIsNone(result.candidate)
+        self.assertTrue(any("缓存为空" in line for line in logs.output))
 
     async def test_strong_different_removes_only_judged(self):
         """④：两个 ≥0.99 候选，判 DIFFERENT 的只剔除自身，另一 SAME 候选仍命中。"""

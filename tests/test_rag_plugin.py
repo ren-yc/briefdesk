@@ -595,6 +595,48 @@ class RagBackfillTest(_MemoryEngineBase):
         counts = await self._embed_count_by_model()
         self.assertEqual(counts.get("test-model"), 2)
 
+    async def _fts_ids(self):
+        cursor = await self.db.execute("SELECT msg_id FROM rag_fts ORDER BY msg_id")
+        try:
+            return [r["msg_id"] for r in await cursor.fetchall()]
+        finally:
+            await cursor.close()
+
+    async def test_backfill_syncs_fts_not_only_chunks(self):
+        """回填必须同步 FTS，且回填进来的内容能被关键词检索命中。
+
+        漏同步不会报任何错：rag_chunks 有数据、向量也有，只有 FTS 索引与
+        chunks 静默分叉，检索少一条腿。维护循环的反连接也补不回来——它只看
+        向量缺失，不看 FTS。所以入库与回填共用 _persist_chunks 单一出口。
+        """
+        from briefdesk.plugins.rag.config import RagSettings as RS
+
+        self.engine.settings = RS(backfill_days=-1)
+        await self._seed("h1", 1, content="羽毛球社周三训练")
+        await self._seed("h2", 2, content="辩论社周五例会")
+
+        self.assertEqual(await self.engine.backfill_step(self.now), 2)
+        # _fts_enabled 由 _ensure_db_ready 建表时定，故在回填之后断言
+        self.assertTrue(self.engine._fts_enabled, "本用例需要 FTS 可用")
+        self.assertEqual(await self._chunk_ids(), ["h1", "h2"])
+        self.assertEqual(await self._fts_ids(), ["h1", "h2"])
+
+        # 端到端：只有 FTS 真的写进去了，纯关键词问题才检索得到
+        hits = await self.engine.retrieve("辩论社")
+        self.assertIsNotNone(hits)
+        self.assertIn("h2", [h.chunk.msg_id for h in hits])
+
+    async def test_backfill_without_fts_still_indexes_chunks(self):
+        """FTS 不可用（降级纯向量）时回填照常入 chunks，不因缺 FTS 中断。"""
+        from briefdesk.plugins.rag.config import RagSettings as RS
+
+        self.engine._fts_enabled = False
+        self.engine.settings = RS(backfill_days=-1)
+        await self._seed("n1", 1)
+        self.assertEqual(await self.engine.backfill_step(self.now), 1)
+        self.assertEqual(await self._chunk_ids(), ["n1"])
+        self.assertEqual(await self._embed_count_by_model(), {"test-model": 1})
+
     async def test_full_off_and_model_switch(self):
         from briefdesk.plugins.rag.config import RagSettings as RS
 

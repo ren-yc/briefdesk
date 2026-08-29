@@ -180,6 +180,33 @@ class RagEngine:
 
     # ------------------------------------------------------------ 索引路径 --
 
+    async def _persist_chunks(
+        self,
+        db: aiosqlite.Connection,
+        rows: list[ChunkRow],
+        emb_items: list[tuple[str, str]],
+        emb_vecs: list[list[float]],
+        model: str,
+    ) -> bool:
+        """落库唯一出口：chunks → FTS 同步 → 向量（专用连接）。
+
+        实时批次与历史回填共用本方法，令「入了 chunks 却漏同步 FTS」在结构上
+        不可能发生——那种漏同步不会报错，只会让检索静默少一条腿（FTS 索引与
+        rag_chunks 分叉，且反连接补不回来，它只看向量缺失）。
+        model 由调用方传入而非在此现取：回填的反连接谓词已按某个 model 值筛过
+        行，落库必须写同一个值，否则下一轮又把这批选回来（空转死循环）。
+        返回是否写入了向量，供调用方决定要不要触发自愈回填。
+        """
+        await upsert_chunks(db, rows)
+        if self._fts_enabled:
+            await sync_fts(db, rows)
+        if not emb_items:
+            return False
+        now_iso = datetime.now(UTC).isoformat(timespec="seconds")
+        edb = await self._embed_factory()
+        await upsert_embeddings(edb, emb_items, emb_vecs, model, now_iso)
+        return True
+
     async def before_run(self, batch: BatchContext) -> None:
         """锁外预嵌入：只允许在这里发生网络调用。"""
 
@@ -213,7 +240,6 @@ class RagEngine:
         emb_items: list[tuple[str, str]] = []
         emb_vecs: list[list[float]] = []
         model = ai_ports.embed_model_name()
-        now_iso = datetime.now(UTC).isoformat(timespec="seconds")
         for msg in batch.messages:
             if not _indexable(msg.content):
                 continue
@@ -236,17 +262,16 @@ class RagEngine:
                 emb_vecs.append(vec)
         if not rows:
             return
-        await upsert_chunks(db, rows)
-        if self._fts_enabled:
-            await sync_fts(db, rows)
-        if emb_items:
-            edb = await self._embed_factory()
-            await upsert_embeddings(edb, emb_items, emb_vecs, model, now_iso)
-        elif ai_ports.is_embedding_enabled() and not self._kicked_since_embed_ok:
-            # 内容已入索引但零向量：嵌入能力在而预嵌入没发生 → 自愈踢一次
-            if self.request_backfill():
-                self._kicked_since_embed_ok = True
-                logger.warning("rag: 实时批次缺向量，已触发补齐回填")
+        embedded = await self._persist_chunks(db, rows, emb_items, emb_vecs, model)
+        # 内容已入索引但零向量：嵌入能力在而预嵌入没发生 → 自愈踢一次
+        if (
+            not embedded
+            and ai_ports.is_embedding_enabled()
+            and not self._kicked_since_embed_ok
+            and self.request_backfill()
+        ):
+            self._kicked_since_embed_ok = True
+            logger.warning("rag: 实时批次缺向量，已触发补齐回填")
         # 未被消费的 pending（如整批被作用域过滤）直接丢弃，避免跨批串味
         self._pending.clear()
 
@@ -320,20 +345,16 @@ class RagEngine:
                 failed = True
                 break
             vectors.extend(part_vecs)
-        now_iso = datetime.now(UTC).isoformat(timespec="seconds")
-        await upsert_chunks(db, rows)
-        if self._fts_enabled:
-            await sync_fts(db, rows)
+        # 截断到已对齐前缀：向量少于行数时只登记配对上的那部分，
+        # 其余行仍入 chunks（反连接下轮按缺向量重新选回）
         paired = min(len(vectors), len(rows))
-        if paired:
-            edb = await self._embed_factory()
-            await upsert_embeddings(
-                edb,
-                [(r.source, r.msg_id) for r in rows[:paired]],
-                vectors[:paired],
-                model,
-                now_iso,
-            )
+        await self._persist_chunks(
+            db,
+            rows,
+            [(r.source, r.msg_id) for r in rows[:paired]],
+            vectors[:paired],
+            model,
+        )
         self.last_cycle_embed_failed = failed
         logger.info("rag: 回填本轮处理 %d 条（含向量 %d 条）", len(rows), paired)
         return len(rows)
