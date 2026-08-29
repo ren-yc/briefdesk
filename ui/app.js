@@ -111,8 +111,7 @@ let pageLoading = false;        // “加载更多”请求互斥/按钮状态
 let listRefreshing = false;     // 自动/SSE 刷新多页期间禁止并发加载下一页
 let activeItemQuery = null;     // 最近成功列表查询的参数快照（加载更多必须复用）
 let searchFilterGroup = "";     // 搜索模式下的来源群过滤（"" = 全部来源）
-let subscriptions = [];         // 关键词订阅 [{id, keywords, enabled}]
-let blocklist = [];             // 降噪黑名单 [{id, keywords, enabled}]（命中卡片渲染时隐藏）
+// 订阅 / 黑名单的条目状态在 subsList / blockList 实例内（createKeywordList）
 let notifyMode = "off";         // 桌面通知模式：off | all | keywords
 let lastNotifyAt = 0;           // 通知节流时间戳
 
@@ -194,14 +193,8 @@ const $loadMoreWrap = document.getElementById("load-more-wrap");
 const $statusPopover = document.getElementById("status-popover");
 const $themeToggle = document.getElementById("theme-toggle");
 const $notifyMode = document.getElementById("notify-mode");
-const $subsList = document.getElementById("subs-list");
-const $subsAdd = document.getElementById("subs-add");
-const $subsAddForm = document.getElementById("subs-add-form");
-const $subsAddKw = document.getElementById("subs-add-kw");
-const $blockList = document.getElementById("block-list");
-const $blockAdd = document.getElementById("block-add");
-const $blockAddForm = document.getElementById("block-add-form");
-const $blockAddKw = document.getElementById("block-add-kw");
+// 订阅/黑名单的 8 个控件不在此取：两侧都由 createKeywordList 按 id 前缀现取，
+// 避免同一控件两处引用各自漂移（同 createSessionFilter 的取法）
 const $hideExpiredToggle = document.getElementById("hide-expired-toggle");
 const $timelineModal = document.getElementById("subject-timeline-modal");
 const $timelineTitle = document.getElementById("timeline-title");
@@ -1223,95 +1216,9 @@ function setupEvents() {
     }
   });
 
-  // ── 关键词订阅管理（立即生效并持久化）──
-  $subsAdd.addEventListener("click", () => {
-    $subsAddForm.classList.remove("hidden");
-    $subsAdd.classList.add("hidden");
-    $subsAddKw.focus();
-  });
-  $subsAddForm.addEventListener("click", (e) => {
-    const btn = e.target.closest("button");
-    if (!btn) return;
-    if (btn.id === "subs-add-save") {
-      const kw = $subsAddKw.value.trim();
-      if (!kw) { showToast("请输入关键词", { type: "error", duration: 4000 }); return; }
-      subscriptions.push({ id: "s" + Date.now(), keywords: kw, enabled: true });
-      saveSubscriptions();
-      renderSubsList();
-      $subsAddKw.value = "";
-      $subsAddForm.classList.add("hidden");
-      $subsAdd.classList.remove("hidden");
-      showToast("订阅已添加", { type: "success", duration: 2000 });
-      fetchData(); // 重新标记订阅命中卡片
-    } else if (btn.id === "subs-add-cancel") {
-      $subsAddForm.classList.add("hidden");
-      $subsAdd.classList.remove("hidden");
-    }
-  });
-  $subsList.addEventListener("change", (e) => {
-    if (!e.target.classList.contains("subs-enabled")) return;
-    const row = e.target.closest(".subs-row");
-    const sub = row && subscriptions.find(s => s.id === row.dataset.id);
-    if (sub) {
-      sub.enabled = e.target.checked;
-      saveSubscriptions();
-      fetchData();
-    }
-  });
-  $subsList.addEventListener("click", (e) => {
-    const btn = e.target.closest(".subs-del");
-    if (!btn) return;
-    const row = btn.closest(".subs-row");
-    subscriptions = subscriptions.filter(s => s.id !== row.dataset.id);
-    saveSubscriptions();
-    renderSubsList();
-    fetchData();
-  });
-
-  // ── 降噪黑名单（与订阅同构的添加/启停/删除）──
-  $blockAdd.addEventListener("click", () => {
-    $blockAddForm.classList.remove("hidden");
-    $blockAdd.classList.add("hidden");
-    $blockAddKw.focus();
-  });
-  $blockAddForm.addEventListener("click", (e) => {
-    const btn = e.target.closest("button");
-    if (!btn) return;
-    if (btn.id === "block-add-save") {
-      const kw = $blockAddKw.value.trim();
-      if (!kw) { showToast("请输入关键词", { type: "error", duration: 4000 }); return; }
-      blocklist.push({ id: "b" + Date.now(), keywords: kw, enabled: true });
-      saveBlocklist();
-      renderBlocklist();
-      $blockAddKw.value = "";
-      $blockAddForm.classList.add("hidden");
-      $blockAdd.classList.remove("hidden");
-      showToast("黑名单已添加，命中卡片将隐藏", { type: "success", duration: 2000 });
-      fetchData();
-    } else if (btn.id === "block-add-cancel") {
-      $blockAddForm.classList.add("hidden");
-      $blockAdd.classList.remove("hidden");
-    }
-  });
-  $blockList.addEventListener("change", (e) => {
-    if (!e.target.classList.contains("block-enabled")) return;
-    const row = e.target.closest(".subs-row");
-    const bl = row && blocklist.find(s => s.id === row.dataset.id);
-    if (bl) {
-      bl.enabled = e.target.checked;
-      saveBlocklist();
-      fetchData();
-    }
-  });
-  $blockList.addEventListener("click", (e) => {
-    const btn = e.target.closest(".block-del");
-    if (!btn) return;
-    const row = btn.closest(".subs-row");
-    blocklist = blocklist.filter(s => s.id !== row.dataset.id);
-    saveBlocklist();
-    renderBlocklist();
-    fetchData();
-  });
+  // ── 关键词订阅 / 降噪黑名单（同一套添加·启停·删除，均立即生效并持久化）──
+  subsList.bindEvents();
+  blockList.bindEvents();
 
   // 隐藏已截止开关（持久化 + 重渲染）
   $hideExpiredToggle.addEventListener("click", () => {
@@ -4891,50 +4798,154 @@ function notifyNewItems(items) {
   } catch { /* 忽略通知失败 */ }
 }
 
-// ── 关键词订阅 ──
-function loadSubscriptions() {
-  const saved = lsGetJson("briefdesk.subscriptions", []);
-  subscriptions = Array.isArray(saved)
-    ? saved.filter(s => s && typeof s.keywords === "string")
-    : [];
-  renderSubsList();
-}
+// ── 关键词清单控制器工厂（订阅 / 降噪黑名单）──
+// 两侧本是同一套东西：localStorage 存 [{id, keywords, enabled}]、渲染同款 .subs-row、
+// 添加/启停/删除三组事件、命中判定都是"启用组的空格分词 OR 命中即真"。此前各写一份
+// load/save/matches/render + 三个事件处理，共 8 函数 6 处理，改一处漏一处。
+// 差异全部收进选项：
+//   key        localStorage 键
+//   ids        DOM id 前缀（订阅 subs / 黑名单 block，index.html 里两套 id 严格平行）
+//   idPrefix   新条目 id 前缀（s / b，仅为可读性）
+//   fields     命中判定读哪些字段——黑名单多读 sender_name（按发送人降噪），订阅不读
+//   emptyHtml / addedToast  空态与添加成功的文案
+// matches 的空集语义：无任何启用组即恒 false（不筛选），与 sessionRowMatches 一致。
+function createKeywordList({ key, ids, idPrefix, fields, emptyHtml, addedToast }) {
+  const $ = (suffix) => document.getElementById(ids + suffix);
+  // items 引用全程稳定：删除走 splice 原地改，不重新赋值，故外部持有的引用不会失效
+  const items = [];
 
-function saveSubscriptions() {
-  lsSetJson("briefdesk.subscriptions", subscriptions);
-}
+  const load = () => {
+    const saved = lsGetJson(key, []);
+    items.length = 0;
+    if (Array.isArray(saved)) {
+      items.push(...saved.filter(s => s && typeof s.keywords === "string"));
+    }
+    render();
+  };
 
-function enabledSubKeywords() {
-  return subscriptions
+  const save = () => lsSetJson(key, items);
+
+  const enabledKeywords = () => items
     .filter(s => s.enabled && (s.keywords || "").trim())
     .map(s => s.keywords.trim())
     .join(" ");
-}
 
-function isSubscribed(item) {
-  if (!subscriptions.some(s => s.enabled)) return false;
-  const text = [item.title, item.key_info, item.subject, item.source_quote]
-    .join("\n").toLowerCase();
-  for (const s of subscriptions) {
-    if (!s.enabled) continue;
-    const kws = (s.keywords || "").toLowerCase().split(/\s+/).filter(Boolean);
-    if (kws.some(k => text.includes(k))) return true;
-  }
-  return false;
-}
+  const matches = (item) => {
+    if (!items.some(s => s.enabled)) return false;
+    const text = fields.map(f => item[f]).join("\n").toLowerCase();
+    for (const s of items) {
+      if (!s.enabled) continue;
+      const kws = (s.keywords || "").toLowerCase().split(/\s+/).filter(Boolean);
+      if (kws.some(k => text.includes(k))) return true;
+    }
+    return false;
+  };
 
-function renderSubsList() {
-  if (!$subsList) return;
-  if (!subscriptions.length) {
-    $subsList.innerHTML = '<p class="text-muted">暂无订阅，点击上方添加</p>';
-    return;
-  }
-  $subsList.innerHTML = subscriptions.map(s => `
+  function render() {
+    const $list = $("-list");
+    if (!$list) return;
+    if (!items.length) {
+      $list.innerHTML = emptyHtml;
+      return;
+    }
+    // 两侧共用 .subs-row 类名（样式一致），仅复选框/删除按钮的类名按前缀区分
+    $list.innerHTML = items.map(s => `
     <div class="subs-row" data-id="${escAttr(s.id)}">
-      <label><input type="checkbox" class="subs-enabled" ${s.enabled ? "checked" : ""}> <span>${esc(s.keywords)}</span></label>
-      <button class="subs-del">删除</button>
+      <label><input type="checkbox" class="${ids}-enabled" ${s.enabled ? "checked" : ""}> <span>${esc(s.keywords)}</span></label>
+      <button class="${ids}-del">删除</button>
     </div>`).join("");
+  }
+
+  const bindEvents = () => {
+    const $add = $("-add");
+    const $form = $("-add-form");
+    const $kw = $("-add-kw");
+    const $list = $("-list");
+    if (!$add || !$form || !$kw || !$list) return;
+
+    const closeForm = () => {
+      $form.classList.add("hidden");
+      $add.classList.remove("hidden");
+    };
+
+    $add.addEventListener("click", () => {
+      $form.classList.remove("hidden");
+      $add.classList.add("hidden");
+      $kw.focus();
+    });
+
+    $form.addEventListener("click", (e) => {
+      const btn = e.target.closest("button");
+      if (!btn) return;
+      if (btn.id === ids + "-add-save") {
+        const kw = $kw.value.trim();
+        if (!kw) { showToast("请输入关键词", { type: "error", duration: 4000 }); return; }
+        items.push({ id: idPrefix + Date.now(), keywords: kw, enabled: true });
+        save();
+        render();
+        $kw.value = "";
+        closeForm();
+        showToast(addedToast, { type: "success", duration: 2000 });
+        fetchData(); // 重新标记命中卡片
+      } else if (btn.id === ids + "-add-cancel") {
+        closeForm();
+      }
+    });
+
+    $list.addEventListener("change", (e) => {
+      if (!e.target.classList.contains(ids + "-enabled")) return;
+      const row = e.target.closest(".subs-row");
+      const entry = row && items.find(s => s.id === row.dataset.id);
+      if (!entry) return;
+      entry.enabled = e.target.checked;
+      save();
+      fetchData();
+    });
+
+    $list.addEventListener("click", (e) => {
+      const btn = e.target.closest("." + ids + "-del");
+      if (!btn) return;
+      const row = btn.closest(".subs-row");
+      const i = items.findIndex(s => s.id === row.dataset.id);
+      if (i === -1) return;
+      items.splice(i, 1); // 原地删，保持 items 引用稳定
+      save();
+      render();
+      fetchData();
+    });
+  };
+
+  return { items, load, save, matches, render, bindEvents, enabledKeywords };
 }
+
+// 关键词订阅：命中卡片打「已订阅」徽章，并可在订阅视图单独查看
+const subsList = createKeywordList({
+  key: "briefdesk.subscriptions",
+  ids: "subs",
+  idPrefix: "s",
+  fields: ["title", "key_info", "subject", "source_quote"],
+  emptyHtml: '<p class="text-muted">暂无订阅，点击上方添加</p>',
+  addedToast: "订阅已添加",
+});
+
+// 降噪黑名单：命中卡片在渲染层隐藏，不触碰后端。
+// 比订阅多读 sender_name——按发送人降噪是黑名单的主要用法，订阅按发送人则无意义。
+const blockList = createKeywordList({
+  key: "briefdesk.blocklist",
+  ids: "block",
+  idPrefix: "b",
+  fields: ["title", "key_info", "subject", "source_quote", "sender_name"],
+  emptyHtml: '<p class="text-muted">暂无黑名单，命中关键词的卡片将在列表中隐藏</p>',
+  addedToast: "黑名单已添加，命中卡片将隐藏",
+});
+
+// 以下四个保持 function 声明：渲染路径（renderCard/renderItemRow）与查询构造大量调用，
+// 且顶层 function 才挂 window，供插件前端复用（见 docs/architecture.md 的形态约束）
+function enabledSubKeywords() { return subsList.enabledKeywords(); }
+function isSubscribed(item) { return subsList.matches(item); }
+function isBlocked(item) { return blockList.matches(item); }
+function loadSubscriptions() { subsList.load(); }
+function loadBlocklist() { blockList.load(); }
 
 // 订阅徽章：当前列表内命中订阅的卡片数
 function updateSubsBadge() {
@@ -4943,48 +4954,10 @@ function updateSubsBadge() {
   // 导航徽章是"目的地路标"：此前显示当前视图内命中数（随视图漂移，
   // "交易"分类里显示 0 但点进去非 0，制造"订阅坏了"错觉）。改显启用的
   // 订阅关键词组数——订阅视图的稳定规模，与备忘录/已忽略的全局口径一致。
-  const enabled = subscriptions.filter(s => s.enabled).length;
+  const enabled = subsList.items.filter(s => s.enabled).length;
   $c.textContent = enabled;
   const $link = document.getElementById("subs-link");
   if ($link) $link.title = enabled ? `${enabled} 组订阅关键词生效中` : "查看订阅关键词命中的卡片";
-}
-
-// ── 降噪黑名单（与订阅同构；命中卡片在渲染层隐藏，不触碰后端）──
-function loadBlocklist() {
-  const saved = lsGetJson("briefdesk.blocklist", []);
-  blocklist = Array.isArray(saved)
-    ? saved.filter(s => s && typeof s.keywords === "string")
-    : [];
-  renderBlocklist();
-}
-
-function saveBlocklist() {
-  lsSetJson("briefdesk.blocklist", blocklist);
-}
-
-function isBlocked(item) {
-  if (!blocklist.some(s => s.enabled)) return false;
-  const text = [item.title, item.key_info, item.subject, item.source_quote, item.sender_name]
-    .join("\n").toLowerCase();
-  for (const s of blocklist) {
-    if (!s.enabled) continue;
-    const kws = (s.keywords || "").toLowerCase().split(/\s+/).filter(Boolean);
-    if (kws.some(k => text.includes(k))) return true;
-  }
-  return false;
-}
-
-function renderBlocklist() {
-  if (!$blockList) return;
-  if (!blocklist.length) {
-    $blockList.innerHTML = '<p class="text-muted">暂无黑名单，命中关键词的卡片将在列表中隐藏</p>';
-    return;
-  }
-  $blockList.innerHTML = blocklist.map(s => `
-    <div class="subs-row" data-id="${escAttr(s.id)}">
-      <label><input type="checkbox" class="block-enabled" ${s.enabled ? "checked" : ""}> <span>${esc(s.keywords)}</span></label>
-      <button class="block-del">删除</button>
-    </div>`).join("");
 }
 
 // ── 数据导出下载（Content-Disposition 文件名）──
