@@ -25,7 +25,12 @@ from briefdesk.db import (
     upsert_session,
 )
 from briefdesk.events import event_bus
-from briefdesk.logger import fmt_dur, setup_logging, uvicorn_log_level
+from briefdesk.logger import (
+    access_log_enabled,
+    fmt_dur,
+    setup_logging,
+    uvicorn_log_level,
+)
 from briefdesk.pipeline import process_all_batches
 from briefdesk.plugin.base import PluginContext
 from briefdesk.plugin.manager import PluginManager
@@ -241,6 +246,10 @@ async def _run() -> None:
         # log_config=None：禁用 uvicorn 默认 LOGGING_CONFIG（其 formatter 无时间戳
         # 且 propagate=False），uvicorn/FastAPI 日志统一由 setup_logging 的根
         # handler 输出（时间戳 + 模块名）；log_level 跟随 LOG_LEVEL 环境变量。
+        # access_log：请求日志仅 DEBUG 输出（判据见 logger.access_log_enabled）。
+        # 传 False 时 uvicorn 清空 uvicorn.access 的 handler 并断 propagate，协议层
+        # 据 hasHandlers() 连 LogRecord 都不构造——比事后 filter 丢弃更省；
+        # logger.setup_logging 里的 _AccessLogGate 是绕过本路径时的第二道防线。
         server = uvicorn.Server(
             uvicorn.Config(
                 app,
@@ -248,6 +257,7 @@ async def _run() -> None:
                 port=config.server_port,
                 log_level=uvicorn_log_level(),
                 log_config=None,
+                access_log=access_log_enabled(),
                 timeout_graceful_shutdown=5,
             )
         )

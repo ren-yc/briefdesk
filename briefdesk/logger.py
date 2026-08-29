@@ -1,9 +1,10 @@
 """日志配置 — 使用标准 logging 模块，格式对齐 uvicorn/FastAPI（彩色、10 字符级别）。
 
-支持 LOG_LEVEL 配置（.env 或环境变量，DEBUG / INFO / WARNING / ERROR，默认
-INFO）：DEBUG 开启逐条细节（每条事件、每次请求、每条过滤决策），INFO 只保留
-阶段与汇总行。级别经 briefdesk.config.Settings 读取（与全项目配置同源），
-直接读 os.environ 看不到 .env 内容。
+支持 LOG_LEVEL 配置（.env 或环境变量，DEBUG / INFO / WARNING / ERROR，另接受
+uvicorn 的 TRACE，默认 INFO）：DEBUG 开启逐条细节（每条事件、每条过滤决策，以及
+uvicorn/FastAPI 的每次 HTTP 请求——见 _AccessLogGate），INFO 只保留阶段与汇总行。
+级别经 briefdesk.config.Settings 读取（与全项目配置同源），直接读 os.environ
+看不到 .env 内容。
 
 行格式为 `时间戳 LEVEL: 来源 message`，其中「来源」是定宽的 logger 短名
 （见 short_logger_name）。来源既然已占一列，消息体内不应再重复写源名——
@@ -22,7 +23,14 @@ from briefdesk.config import config
 # uvicorn 相关 logger：默认被 uvicorn 的 LOGGING_CONFIG 挂上自己的 formatter
 # （无时间戳）且 propagate=False，输出到 stderr。统一改为传播到根 logger，
 # 由本模块的 _BriefFormatter 输出（时间戳 + 模块名 + 彩色级别）。
-_UVICORN_LOGGERS = ("uvicorn", "uvicorn.error", "uvicorn.access", "uvicorn.asgi")
+_ACCESS_LOGGER = "uvicorn.access"
+_UVICORN_LOGGERS = ("uvicorn", "uvicorn.error", _ACCESS_LOGGER, "uvicorn.asgi")
+
+# uvicorn 自定义的 TRACE 级别值（uvicorn.config.TRACE_LOG_LEVEL）。标准
+# logging 没有 TRACE，getattr(logging, "TRACE") 取不到——但 uvicorn_log_level()
+# 接受 "trace"，故本模块的级别解析必须认得它，否则 LOG_LEVEL=TRACE 下
+# 根级别会回退 INFO，比 DEBUG 更细的意图反而丢了。
+_TRACE_LEVEL = 5
 
 # ── 显示名（短名）──
 #
@@ -171,6 +179,23 @@ class _MessageFilter(logging.Filter):
         return not any(s in msg for s in self._substrings)
 
 
+class _AccessLogGate(logging.Filter):
+    """仅在 LOG_LEVEL 为 DEBUG/TRACE 时放行 uvicorn.access 记录。
+
+    访问日志本身是 INFO 级记录（uvicorn 硬编码 `access_logger.info(...)`），
+    而本项目是单用户本机服务：Host 白名单只放 localhost/127.0.0.1，请求行里
+    client_addr 恒为本机、状态码绝大多数是 200，逐请求刷屏会把同步/去重/分类
+    等真正的业务行冲散。故默认静默，DEBUG 才放出——排查「前端到底发了什么请求」
+    时按需开启。
+
+    级别现取（而非构造时固化）：filter 每条记录都问一次 `access_log_enabled()`，
+    因此与 setup_logging / uvicorn.Config 的调用先后无关。
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return access_log_enabled()
+
+
 def setup_logging(level: int | None = None) -> None:
     """配置根 logger，所有子 logger 自动继承此格式。
 
@@ -178,9 +203,7 @@ def setup_logging(level: int | None = None) -> None:
     """
     root = logging.getLogger()
     if level is None:
-        raw = config.log_level.upper()
-        level = getattr(logging, raw, logging.INFO)
-    assert level is not None
+        level = configured_level()
     root.setLevel(level)
 
     # 避免重复添加 handler
@@ -198,6 +221,21 @@ def setup_logging(level: int | None = None) -> None:
         lg = logging.getLogger(name)
         lg.handlers.clear()
         lg.propagate = True
+
+    # 访问日志闸门（DEBUG 才放行，见 _AccessLogGate）。
+    #
+    # 与 main.py 传给 uvicorn.Config 的 access_log=access_log_enabled() 是两道
+    # 独立防线，都要留：
+    #   * Config 那道更省——access_log=False 时 uvicorn 清空 uvicorn.access 的
+    #     handler 并置 propagate=False，协议层 `hasHandlers()` 取假，连
+    #     LogRecord 都不构造，逐请求零开销；
+    #   * 但上面这个循环无条件把 propagate 重置为 True，任何在 Config 之后再次
+    #     调用 setup_logging 的路径（测试、未来的重配）都会把 uvicorn 关掉的
+    #     访问日志复活；直接 `uvicorn` CLI 起服务时也绕过 Config 那道。
+    #     filter 挂在 logger 上（不随 handlers.clear() 掉），兜住这些路径。
+    access_logger = logging.getLogger(_ACCESS_LOGGER)
+    if not any(isinstance(f, _AccessLogGate) for f in access_logger.filters):
+        access_logger.addFilter(_AccessLogGate())
 
     # 降低第三方库的日志噪音
     logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -225,6 +263,28 @@ def fmt_dur(seconds: float) -> str:
     if seconds < 1:
         return f"{seconds * 1000:.0f}ms"
     return f"{seconds:.1f}s"
+
+
+def configured_level() -> int:
+    """config.log_level（LOG_LEVEL）→ 数值级别；非法值回退 INFO。
+
+    额外认得 uvicorn 的 TRACE（=5）——标准 logging 无此级别，而
+    `uvicorn_log_level()` 会把它透给 uvicorn，两处必须同解。
+    """
+    raw = config.log_level.upper()
+    if raw == "TRACE":
+        return _TRACE_LEVEL
+    level = getattr(logging, raw, logging.INFO)
+    return level if isinstance(level, int) else logging.INFO
+
+
+def access_log_enabled() -> bool:
+    """uvicorn/FastAPI 的请求（access）日志是否输出：仅 DEBUG 及更细级别。
+
+    同时供 `_AccessLogGate` 与 main.py 的 `uvicorn.Config(access_log=...)` 取用，
+    确保两道防线判据同源。
+    """
+    return configured_level() <= logging.DEBUG
 
 
 def uvicorn_log_level() -> str:
