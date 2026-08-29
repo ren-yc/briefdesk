@@ -336,7 +336,49 @@ document.addEventListener("visibilitychange", () => {
 });
 
 // ── Events ──
+// 接线按区块拆成 bindXxxEvents()，setupEvents 只做派发。三条纪律：
+// 1) 必须是顶层 function 声明。app.js 是同源 classic script，插件前端注入后与它
+//    共享同一全局作用域，不能 ESM 化也不能 IIFE 包裹（见 docs/architecture.md）；
+//    嵌套定义等于没拆，而顶层 const 不挂 window，与文件内既有 200+ 个顶层
+//    function 不同口径。
+// 2) setupEvents 里的调用顺序 = 注册顺序 = 同 target 同事件类型的触发顺序。
+//    document 上有多个 click/keydown（状态面板、引用折叠、「⋯」菜单、Esc、
+//    搜索历史 mousedown），换顺序会改行为，且没有任何 gate 能发现：
+//    tests/ui_harness.mjs 的 addEventListener 是空函数，pytest 不启浏览器。
+//    新增区块只往后追加，不要插队。
+// 3) 区块局部的 $元素常量留在各自函数内，不要提到顶层。跨区块引用就该报
+//    ReferenceError —— 这是拆分换来的唯一结构性保证。
 function setupEvents() {
+  bindNavEvents();
+  bindSidebarSearchEvents();
+  bindSettingsEntryEvents();
+  bindCategoryEvents();
+  bindSessionEvents();
+  bindSettingsFormEvents();
+  bindSyncButtonEvents();
+  bindItemActionEvents();
+  bindLightboxEvents();
+  bindCollapseToggleEvents();
+  bindGroupOverlayEvents();
+  bindEscapeEvents();
+  bindKbShortcutEvents();
+  bindHashRouteEvents();
+  bindStatusRetryEvents();
+  bindAboutPanelEvents();
+  bindOnboardingEvents();
+  bindNewItemsBarEvents();
+  bindFilterBarEvents();
+  bindSubsLinkEvents();
+  bindStatusPanelEvents();
+  bindBatchEvents();
+  bindQuoteExpandEvents();
+  bindMoreMenuEvents();
+  bindPreferenceEvents();
+  bindKeywordListEvents();
+  bindTimelineEvents();
+}
+
+function bindNavEvents() {
   $nav.addEventListener("click", (e) => {
     const link = e.target.closest(".cat-link");
     if (!link) return;
@@ -385,7 +427,9 @@ function setupEvents() {
     syncHash();
     fetchData();
   });
+}
 
+function bindSidebarSearchEvents() {
   // ── Sidebar search ──
   $itemSearch.addEventListener("input", () => {
     if (searchDebounceTimer) clearTimeout(searchDebounceTimer);
@@ -442,7 +486,9 @@ function setupEvents() {
     $itemSearch.value = "";
     applySearch("");
   });
+}
 
+function bindSettingsEntryEvents() {
   function openSettings(e) {
     e.preventDefault();
     settingsDirtyFlag = false; // 全新打开：草稿尚未改动（弹窗打开后会重载草稿）
@@ -469,7 +515,9 @@ function setupEvents() {
   });
 
   $settingsLinkTop.addEventListener("click", openSettings);
+}
 
+function bindCategoryEvents() {
   // ── Category management (delegation on #category-toggles) ──
   // 草稿模式：勾选只改本地草稿（catDraft），点设置弹窗"保存"后才调 API
   $categoryToggles.addEventListener("change", (e) => {
@@ -551,7 +599,9 @@ function setupEvents() {
       s.classList.toggle("selected", s === swatch);
     });
   });
+}
 
+function bindSessionEvents() {
   // Session toggle (draft mode): 勾选只改本地 checkbox 状态，不调 API；
   // 点设置弹窗"保存"后按 sessionOriginal 快照 diff 统一应用
   $sessionList.addEventListener("change", (e) => {
@@ -587,7 +637,9 @@ function setupEvents() {
 
   // 群聊筛选（名称搜索 / 类型多选 / 消息源多选 / 时间窗口，四者 AND 叠加，仅显示层）
   sessionFilter.bindEvents();
+}
 
+function bindSettingsFormEvents() {
   // "保存"统一应用三类更改：刷新间隔（localStorage）+ 类别草稿 + 会话草稿。
   // 同步进行中时延迟到同步完成后应用（本次同步按旧配置跑，避免数据与配置不一致）。
   $settingsSave.addEventListener("click", async () => {
@@ -662,7 +714,9 @@ function setupEvents() {
   // 设置草稿脏检查：任何输入/变更即标记（input 捕获文本框，change 捕获勾选/下拉）
   $settingsModal.addEventListener("input", () => { settingsDirtyFlag = true; });
   $settingsModal.addEventListener("change", () => { settingsDirtyFlag = true; });
+}
 
+function bindSyncButtonEvents() {
   // 立即同步：接后端真实状态——409 提示已在同步；成功则等 synced SSE 事件
   // （或 120s 兜底超时）恢复按钮，不再假装转 2 秒
   $syncBtn.addEventListener("click", async () => {
@@ -690,7 +744,9 @@ function setupEvents() {
       showToast("同步失败，请检查后端状态后重试", { type: "error", duration: 5000 });
     }
   });
+}
 
+function bindItemActionEvents() {
   // Item actions delegation
   $itemsContainer.addEventListener("click", (e) => {
     // 批量模式：折叠组 = 整组选择单元（点组头或代表卡任意位置切换整组）；
@@ -781,7 +837,9 @@ function setupEvents() {
       },
     })) return;
   });
+}
 
+function bindLightboxEvents() {
   // Lightbox controls
   $lightboxClose.addEventListener("click", closeLightbox);
   $lightboxPrev.addEventListener("click", () => lightboxStep(-1));
@@ -822,7 +880,9 @@ function setupEvents() {
   };
   $lightboxImg.addEventListener("mouseup", endLightboxDrag);
   $lightboxImg.addEventListener("mouseleave", endLightboxDrag);
+}
 
+function bindCollapseToggleEvents() {
   // Collapse toggle（折叠/展开分段控制，状态存 localStorage）
   $collapseToggle.addEventListener("click", (e) => {
     const segBtn = e.target.closest(".seg-btn");
@@ -835,7 +895,9 @@ function setupEvents() {
     animateOnNextRender = true; // 模式切换 → 列表错落浮现
     renderItems(viewSourceItems, { full: true });
   });
+}
 
+function bindGroupOverlayEvents() {
   // Group overlay（同主体卡片浮层）
   document.getElementById("group-overlay-close").addEventListener("click", closeGroupOverlay);
   $groupOverlay.addEventListener("click", (e) => {
@@ -887,7 +949,9 @@ function setupEvents() {
   $groupOverlayContent.addEventListener("scroll", () => {
     if (overlayKey) overlayScrolls.set(overlayKey, $groupOverlayContent.scrollTop || 0);
   });
+}
 
+function bindEscapeEvents() {
   // ── Esc 统一关闭：灯箱 → 快捷键帮助 → 批量确认 → 同主体浮层 → 时间线 → 插件浮层（日历等）→ 设置弹窗 → 状态面板 → 搜索历史 → 清空搜索 ──
   document.addEventListener("keydown", (e) => {
     if (e.key !== "Escape") return;
@@ -907,14 +971,18 @@ function setupEvents() {
       applySearch("");
     }
   });
+}
 
+function bindKbShortcutEvents() {
   // ── 键盘快捷键（j/k 导航、m/i/u/c/Enter 操作、/ 搜索、? 帮助）──
   document.addEventListener("keydown", handleKbShortcut);
   const $kbHelpClose = document.getElementById("kb-help-close");
   if ($kbHelpClose) $kbHelpClose.addEventListener("click", closeKbHelp);
   const $kbHelpBtn = document.getElementById("kb-help-btn");
   if ($kbHelpBtn) $kbHelpBtn.addEventListener("click", openKbHelp);
+}
 
+function bindHashRouteEvents() {
   // ── Hash 路由：前进/后退或手动改地址栏时同步视图 ──
   window.addEventListener("hashchange", () => {
     const v = parseHash();
@@ -946,12 +1014,16 @@ function setupEvents() {
     }
     fetchData();
   });
+}
 
+function bindStatusRetryEvents() {
   // 连接失败时的"重试"按钮（status-text 由 updateStatus 频繁重写，事件委托在容器上）
   $statusText.addEventListener("click", (e) => {
     if (e.target.closest(".status-retry")) fetchData();
   });
+}
 
+function bindAboutPanelEvents() {
   // ── 数据导出（关于面板）──
   const $exportItems = document.getElementById("export-items-btn");
   const $exportRecat = document.getElementById("export-recat-btn");
@@ -990,7 +1062,9 @@ function setupEvents() {
       showToast("恢复上传失败，请重试", { type: "error", duration: 5000 });
     }
   });
+}
 
+function bindOnboardingEvents() {
   // ── 首次使用向导：按钮与步骤流转 ──
   const $onbSkip = document.getElementById("onboard-skip");
   const $onb1Next = document.getElementById("onboard-1-next");
@@ -1047,7 +1121,9 @@ function setupEvents() {
     }
     onboardFilter.updateSelectAll();
   });
+}
 
+function bindNewItemsBarEvents() {
   // 新消息浮条：点击滚动回顶部并确认新卡片
   $newItemsBarBtn.addEventListener("click", () => {
     confirmNewItems();
@@ -1066,7 +1142,9 @@ function setupEvents() {
     if (top < 150) confirmNewItems();
     else updateNewItemsBar();
   });
+}
 
+function bindFilterBarEvents() {
   // 搜索过滤条：类别 chips + 时间范围
   $filterBar.addEventListener("click", (e) => {
     const chip = e.target.closest(".filter-chip");
@@ -1083,7 +1161,9 @@ function setupEvents() {
       fetchData();
     }
   });
+}
 
+function bindSubsLinkEvents() {
   // ── 订阅入口：以全部启用关键词发起跨分类搜索 ──
   $subsLink.addEventListener("click", (e) => {
     e.preventDefault();
@@ -1095,7 +1175,9 @@ function setupEvents() {
     $itemSearch.value = kws;
     applySearch(kws);
   });
+}
 
+function bindStatusPanelEvents() {
   // ── 状态指示器：点击展开运行状态详情面板 ──
   $statusIndicator.addEventListener("click", (e) => {
     if (e.target.closest(".status-retry")) return; // 重试按钮不触发面板
@@ -1110,7 +1192,9 @@ function setupEvents() {
     if ($statusPopover.classList.contains("hidden")) return;
     if (!e.target.closest("#status-popover") && !e.target.closest("#status-indicator")) closeStatusPanel();
   });
+}
 
+function bindBatchEvents() {
   // ── 批量操作控制 ──
   $batchToggle.addEventListener("click", () => {
     if (batchMode) exitBatchMode(); else enterBatchMode();
@@ -1148,7 +1232,9 @@ function setupEvents() {
     syncBatchGroupStates(); // 成员卡变化会联动组头半选态
     updateBatchBar();
   });
+}
 
+function bindQuoteExpandEvents() {
   // ── 原文引用折叠/展开（主列表/浮层/时间线通用）──
   // 折叠态由 .quote-text.is-collapsed 单一状态类控制（CSS 显隐 preview/full），
   // 避免多个 hidden class 切换不一致导致的"点击无效"。
@@ -1167,7 +1253,9 @@ function setupEvents() {
     btn.textContent = expanding ? btn.dataset.labelExpanded : btn.dataset.labelCollapsed;
     if (expanding) quoteExpandedIds.add(id); else quoteExpandedIds.delete(id);
   });
+}
 
+function bindMoreMenuEvents() {
   // ── 「⋯」菜单：点击其它区域关闭；插件行内菜单（提醒等）一并委托 ──
   document.addEventListener("click", (e) => {
     if (!e.target.closest(".btn-more") && !e.target.closest(".card-more-menu")) {
@@ -1175,7 +1263,9 @@ function setupEvents() {
     }
     closeItemRowMenus(e);
   });
+}
 
+function bindPreferenceEvents() {
   // ── 外观模式切换（立即生效并持久化）──
   $themeToggle.addEventListener("click", (e) => {
     const chip = e.target.closest(".filter-chip");
@@ -1200,7 +1290,9 @@ function setupEvents() {
       });
     }
   });
+}
 
+function bindKeywordListEvents() {
   // ── 关键词订阅 / 降噪黑名单（同一套添加·启停·删除，均立即生效并持久化）──
   subsList.bindEvents();
   blockList.bindEvents();
@@ -1213,7 +1305,9 @@ function setupEvents() {
     $hideExpiredToggle.setAttribute("aria-pressed", String(hideExpired));
     fetchData();
   });
+}
 
+function bindTimelineEvents() {
   // ── 主体时间线浮层 ──
   document.getElementById("timeline-close").addEventListener("click", () => closeSubjectTimeline());
   $timelineModal.addEventListener("click", (e) => {
