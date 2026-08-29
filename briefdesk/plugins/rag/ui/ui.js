@@ -49,7 +49,9 @@
       '<div class="rag-drawer-head">'
       + '<h2 class="rag-drawer-title">问一问</h2>'
       + '<button id="rag-clear" class="rag-drawer-btn" title="清空对话">清空</button>'
-      + '<button id="rag-close" class="rag-drawer-btn rag-drawer-x" title="关闭 (Esc)">×</button>'
+      // 保留 chip 形态（与抽屉里其他 .rag-drawer-btn 成套），只把字面 × 换成内联图标
+      + '<button id="rag-close" class="rag-drawer-btn rag-drawer-x" title="关闭 (Esc)" aria-label="关闭">'
+      + '<img src="/icons/x.svg" class="icon-sm" alt=""></button>'
       + "</div>"
       // 回答异步流入，无 aria-live 时读屏用户不会被告知任何新消息
       + '<div id="rag-msgs" class="rag-msgs" role="log" aria-live="polite" aria-label="对话记录"></div>'
@@ -72,7 +74,8 @@
       '<div class="modal-content detail-content">'
       + '<div class="group-overlay-head">'
       + '<h2 id="rag-ctx-title">引用上下文</h2>'
-      + '<button id="rag-ctx-close" title="关闭 (Esc)">×</button>'
+      + '<button id="rag-ctx-close" class="modal-close" title="关闭 (Esc)" aria-label="关闭">'
+      + '<img src="/icons/x.svg" class="icon" alt=""></button>'
       + "</div>"
       + '<div id="rag-ctx-body"></div>'
       + "</div>";

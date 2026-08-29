@@ -121,13 +121,18 @@
   outline-offset: 2px;
   border-radius: var(--radius-sm);
 }
-/* 贴边或裁切容器内的控件用内描边，避免外环被 overflow 裁掉 */
+/* 焦点环向外伸 4px（outline 2 + offset 2）。滚动容器内二选一，漏掉两者
+   环就会被 overflow 切成断线：
+   ① 容器每侧内边距 ≥ 6px（如 .settings-panels / .onboard-step）；
+   ② 贴边控件改用下面的内描边（插件内的贴边控件同理，但按前端边界规则
+      写在各自的 plugins/*/ui/ui.css 里，不进核心）。 */
 .item-card:focus-visible,
 .cat-link:focus-visible,
 .settings-menu-item:focus-visible,
 .filter-chip:focus-visible,
 .card-actions button:focus-visible,
-.ov-actions button:focus-visible {
+.ov-actions button:focus-visible,
+.more-option:focus-visible {  /* .card-more-menu padding 仅 4px，恰好齐平无余量 */
   outline-offset: -2px;
 }
 
@@ -579,8 +584,12 @@ body.modal-open { overflow: hidden; }
 }
 .modal.hidden { display: none; }
 .modal-content {
+  /* 内边距 token 化：sticky 头（.group-overlay-head）要用它反向铺出遮挡幕布，
+     见 .group-overlay-head::before */
+  --modal-pad-y: 24px;
+  --modal-pad-x: 28px;
   background: var(--surface); border-radius: var(--radius);
-  padding: 24px 28px; width: 440px; max-width: calc(100vw - 32px); max-height: 80vh; overflow-y: auto;
+  padding: var(--modal-pad-y) var(--modal-pad-x); width: 440px; max-width: calc(100vw - 32px); max-height: 80vh; overflow-y: auto;
   box-shadow: var(--shadow-xl);
   animation: modal-in var(--dur-3) var(--ease-out);
 }
@@ -601,7 +610,9 @@ body.modal-open { overflow: hidden; }
   display: flex; flex-direction: column; overflow: hidden;
 }
 .settings-layout {
-  display: flex; gap: 20px; flex: 1; min-height: 0; overflow: hidden;
+  /* gap 14 + .settings-panels 的 padding-left 6 = 原来的 20px 观感；
+     那 6px 是让给焦点环的（outline 2 + offset 2 = 外伸 4px） */
+  display: flex; gap: 14px; flex: 1; min-height: 0; overflow: hidden;
 }
 .settings-menu {
   width: 168px; flex-shrink: 0; display: flex; flex-direction: column; gap: 2px;
@@ -617,7 +628,9 @@ body.modal-open { overflow: hidden; }
   background: color-mix(in srgb, var(--accent) 14%, var(--surface));
   color: var(--accent); font-weight: 600;
 }
-.settings-panels { flex: 1; min-width: 0; overflow-y: auto; padding-right: 4px; }
+/* 左右各 6px：滚动容器的裁切边是自身 padding box，padding-left 为 0 时
+   长条输入框的焦点环左侧会被整整切掉 4px（观感上像被 1 级菜单压住） */
+.settings-panels { flex: 1; min-width: 0; overflow-y: auto; padding: 0 6px; }
 .settings-panels .settings-section { margin-top: 0; padding-top: 0; border-top: none; }
 .settings-actions {
   margin-top: 16px; padding-top: 14px; border-top: 1px solid var(--border);
@@ -997,33 +1010,51 @@ body.modal-open { overflow: hidden; }
 @media (prefers-reduced-motion: reduce) { .group-overlay-content { animation: none; } }
 .group-overlay-head {
   display: flex; align-items: center; justify-content: space-between;
-  margin-bottom: 14px; gap: 12px;
+  gap: 12px;
   /* 标题与关闭键固定于浮窗顶部，不随列表滚动（sticky 相对 .modal-content 滚动容器） */
   position: sticky;
   top: 0;
   z-index: 5;
   padding-top: 2px;
+  /* 原为 margin-bottom：透明外边距挡不住滚过的内容，标题下方会漏出一条 14px 的字。
+     改 padding 后这段间隙纳入不透明区（含 ::before 幕布的 bottom:0 边界） */
+  padding-bottom: 14px;
   background: var(--surface); /* 不透明背景遮住下方滚过的内容 */
 }
+/* overflow 的裁切边是 padding box，滚动内容会在 .modal-content 顶部那条
+   padding-top 里正常绘制；而 sticky 盒被钳制在包含块（content box）内，
+   升不进那条 padding，于是内容从标题上方穿过去。
+   伪元素向上/左右反向铺满补上这块：头自身 z-index:5 已建立层叠上下文，
+   z-index:-1 只在头内部生效（沉到 h2/按钮之下），整块仍盖在滚动内容之上。
+   左右也外扩，覆盖子元素负 margin 顶到 padding 区的情况（如 .onboard-step）。 */
+.group-overlay-head::before {
+  content: "";
+  position: absolute;
+  z-index: -1;
+  top: calc(-1 * var(--modal-pad-y, 24px));
+  left: calc(-1 * var(--modal-pad-x, 28px));
+  right: calc(-1 * var(--modal-pad-x, 28px));
+  bottom: 0;
+  background: var(--surface);
+}
 .group-overlay-head h2 { font-size: 15px; font-weight: 600; margin: 0; color: var(--text); }
-/* 浮层关闭按钮统一样式：此前 #timeline-close / #kb-help-close 无任何 CSS，
-   渲染为浏览器原生按钮，与已美化的另两个并列时观感断裂。
+/* 浮层关闭按钮统一样式。
+   原先是 ID 枚举（#group-overlay-close, #status-popover-close, ...），插件注入的
+   浮层用新 ID 就一条样式都吃不到，直接渲染成原生按钮（11.6×18.6 / Arial /
+   2px outset）——#rag-ctx-close、#cal-detail-close、#cal-day-close 都栽在这上面。
+   改成语义类：新浮层（含插件）挂 .modal-close 即自动继承，不必回来改名单。
    min-width/height 40px 同时满足 WCAG 2.5.8 的 24px 下限并留出舒适点击区。 */
-#group-overlay-close,
-#status-popover-close,
-#timeline-close,
-#kb-help-close {
-  border: none; background: none; font-size: 22px; line-height: 1;
+.modal-close {
+  border: none; background: none; line-height: 1;
   color: var(--text-3); cursor: pointer; font-family: inherit;
   display: inline-flex; align-items: center; justify-content: center;
   min-width: 40px; min-height: 40px; margin: -8px -10px -8px 0;
   border-radius: var(--radius-sm); flex-shrink: 0;
   transition: color .12s, background .12s;
 }
-#group-overlay-close:hover,
-#status-popover-close:hover,
-#timeline-close:hover,
-#kb-help-close:hover { color: var(--text); background: var(--bg); }
+.modal-close:hover { color: var(--text); background: var(--bg); }
+/* 图标居中撑满 40px 命中区，不要 .icon 的基础右边距 */
+.modal-close .icon, .modal-close .icon-sm { margin-right: 0; }
 #group-overlay-list { display: flex; flex-direction: column; gap: 8px; }
 
 .ov-row {
@@ -1096,14 +1127,15 @@ body.modal-open { overflow: hidden; }
 /* 窄屏：设置弹窗降级为「上菜单（横向滚动）+ 下面板」 */
 @media (max-width: 640px) {
   .settings-modal-content { width: 100%; max-height: 86vh; }
-  .settings-layout { flex-direction: column; overflow: visible; }
+  /* 列向后 gap 变成上下间距，恢复 20px；此时不裁切，面板也不需要让位内边距 */
+  .settings-layout { flex-direction: column; gap: 20px; overflow: visible; }
   .settings-menu {
     width: 100%; flex-direction: row; overflow-x: auto; gap: 4px;
     border-right: none; border-bottom: 1px solid var(--border);
     padding: 0 0 8px; flex-shrink: 0;
   }
   .settings-menu-item { white-space: nowrap; }
-  .settings-panels { overflow-y: visible; }
+  .settings-panels { overflow-y: visible; padding: 0; }
 }
 
 /* ── Toast ── */
@@ -1130,10 +1162,15 @@ body.modal-open { overflow: hidden; }
   font-family: inherit; white-space: nowrap; flex-shrink: 0;
 }
 .toast-action:hover { background: var(--accent); color: var(--on-accent); }
+/* WCAG 2.5.8：原为 15×16。min-* 撑命中区 + 负 margin 抵消占位（同 .search-clear 做法） */
 .toast-close {
   border: none; background: none; color: var(--text-3);
-  font-size: 16px; line-height: 1; cursor: pointer; padding: 0 2px; font-family: inherit;
+  line-height: 1; cursor: pointer; font-family: inherit;
+  display: inline-flex; align-items: center; justify-content: center;
+  min-width: 24px; min-height: 24px; margin: -4px -2px -4px 0; padding: 0;
+  border-radius: var(--radius-sm);
 }
+.toast-close .icon-sm { margin-right: 0; }
 .toast-close:hover { color: var(--text); }
 .toast-out { opacity: 0; transform: translateY(6px); transition: opacity var(--dur-1) var(--ease-out), transform var(--dur-1) var(--ease-out); }
 @keyframes toastIn {
@@ -1157,7 +1194,11 @@ body.modal-open { overflow: hidden; }
   cursor: pointer; font-family: inherit;
 }
 .new-items-bar button:hover { background: rgba(255,255,255,.3); }
-#new-items-bar-dismiss { min-width: 24px; min-height: 24px; padding: 2px 10px; font-size: 14px; line-height: 1; }
+#new-items-bar-dismiss {
+  min-width: 24px; min-height: 24px; padding: 2px 10px; line-height: 1;
+  display: inline-flex; align-items: center; justify-content: center;
+}
+#new-items-bar-dismiss .icon-sm { margin-right: 0; }
 @keyframes newBarIn {
   from { opacity: 0; transform: translate(-50%, -8px); }
   to   { opacity: 1; transform: translate(-50%, 0); }
@@ -1594,10 +1635,15 @@ body.modal-open { overflow: hidden; }
   background: var(--warn);
   color: var(--on-accent);
 }
+/* WCAG 2.5.8：原为 19×21。color: inherit 让图标随横幅的 error/warning 色走 */
 .error-banner-close {
-  border: none; background: none; color: inherit; font-size: 16px; cursor: pointer;
-  padding: 0 4px; opacity: .7; font-family: inherit;
+  border: none; background: none; color: inherit; cursor: pointer;
+  opacity: .7; font-family: inherit;
+  display: inline-flex; align-items: center; justify-content: center;
+  min-width: 24px; min-height: 24px; margin: -4px 0; padding: 0;
+  border-radius: var(--radius-sm); flex-shrink: 0;
 }
+.error-banner-close .icon-sm { margin-right: 0; }
 .error-banner-close:hover { opacity: 1; }
 
 /* ── 键盘焦点卡片（无操作几秒后淡出） ── */
@@ -1701,6 +1747,10 @@ body.modal-open { overflow: hidden; }
   flex: 1;
   min-height: 0;
   overflow-y: auto;
+  /* 负 margin + 等量 padding：正文与标题的对齐不变，但焦点环有 6px 可坐
+     （外扩落在 .onboard-content 自己的 28px 内边距里，不会被裁） */
+  margin: 0 -6px;
+  padding: 0 6px;
 }
 .onboard-content .group-overlay-head {
   flex-shrink: 0;

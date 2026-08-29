@@ -305,7 +305,9 @@
     <div class="modal-content group-overlay-content">
       <div class="group-overlay-head">
         <h2 id="group-overlay-title"></h2>
-        <button id="group-overlay-close" title="关闭 (Esc)">×</button>
+        <button id="group-overlay-close" class="modal-close" title="关闭 (Esc)" aria-label="关闭">
+          <img src="/icons/x.svg" class="icon" alt="">
+        </button>
       </div>
       <div id="group-overlay-list"></div>
     </div>
@@ -316,7 +318,9 @@
     <div class="modal-content timeline-content">
       <div class="group-overlay-head">
         <h2 id="timeline-title"></h2>
-        <button id="timeline-close" title="关闭 (Esc)">×</button>
+        <button id="timeline-close" class="modal-close" title="关闭 (Esc)" aria-label="关闭">
+          <img src="/icons/x.svg" class="icon" alt="">
+        </button>
       </div>
       <div id="timeline-list"></div>
       <div id="timeline-load-more-wrap"></div>
@@ -431,7 +435,9 @@
     <div class="modal-content kb-help-content">
       <div class="group-overlay-head">
         <h2>键盘快捷键</h2>
-        <button id="kb-help-close" title="关闭 (Esc)">×</button>
+        <button id="kb-help-close" class="modal-close" title="关闭 (Esc)" aria-label="关闭">
+          <img src="/icons/x.svg" class="icon" alt="">
+        </button>
       </div>
       <div class="kb-help-grid">
         <div><kbd>j</kbd><kbd>k</kbd><span>上 / 下移动焦点卡片</span></div>
@@ -454,7 +460,9 @@
   <div id="new-items-bar" class="new-items-bar hidden" role="status">
     <span id="new-items-bar-text">有 0 条新信息</span>
     <button id="new-items-bar-btn">回到顶部查看</button>
-    <button id="new-items-bar-dismiss" aria-label="暂不查看，关闭提醒" title="暂不查看">×</button>
+    <button id="new-items-bar-dismiss" aria-label="暂不查看，关闭提醒" title="暂不查看">
+      <img src="/icons/x.svg" class="icon-sm" alt="">
+    </button>
   </div>
 
   <!-- defer：脚本已在 body 末尾（不阻塞解析），defer 让它与 HTML 解析并行下载，

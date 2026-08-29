@@ -3317,7 +3317,8 @@ function renderStatusBanner(status) {
   banner.className = "error-banner " + (isErr ? "error" : "warning");
   banner.innerHTML =
     '<span class="error-banner-text">' + esc(text) + '</span>' + action +
-    '<button type="button" class="error-banner-close" title="关闭" aria-label="关闭">×</button>';
+    '<button type="button" class="error-banner-close" title="关闭" aria-label="关闭">'
+    + '<img src="/icons/x.svg" class="icon-sm" alt=""></button>';
   banner.querySelector(".error-banner-close").addEventListener("click", () => {
     banner.classList.add("hidden");
     banner.innerHTML = "";
@@ -3355,7 +3356,8 @@ function renderAnnouncements(announcements) {
   box.innerHTML = list.map(a =>
     '<div class="error-banner warning" data-code="' + esc(a.code || "") + '">' +
     '<span class="error-banner-text">' + esc(a.message) + '</span>' +
-    '<button type="button" class="error-banner-close" title="关闭" aria-label="关闭">×</button>' +
+    '<button type="button" class="error-banner-close" title="关闭" aria-label="关闭">' +
+    '<img src="/icons/x.svg" class="icon-sm" alt=""></button>' +
     '</div>'
   ).join("");
   box.querySelectorAll(".error-banner-close").forEach(btn => {
@@ -4342,7 +4344,9 @@ function showToast(message, { type = "info", duration = 3500, actionLabel = "", 
   close.className = "toast-close";
   close.type = "button";
   close.setAttribute("aria-label", "关闭");
-  close.textContent = "×";
+  close.title = "关闭";
+  // 图标形态与全站一致；MutationObserver 会把它内联成跟随主题色的 SVG
+  close.innerHTML = '<img src="/icons/x.svg" class="icon-sm" alt="">';
   close.addEventListener("click", () => dismissToast(el));
   el.appendChild(close);
   $toastContainer.appendChild(el);
@@ -5303,7 +5307,9 @@ async function openStatusPanel() {
     ? '<div class="status-error">' + esc(status.lastError) + '</div>'
     : "";
   $statusPopover.innerHTML =
-    '<div class="status-popover-head"><span>运行状态</span><button id="status-popover-close" title="关闭 (Esc)">×</button></div>' +
+    '<div class="status-popover-head"><span>运行状态</span>'
+    + '<button id="status-popover-close" class="modal-close" title="关闭 (Esc)" aria-label="关闭">'
+    + '<img src="/icons/x.svg" class="icon" alt=""></button></div>' +
     (rows || '<div class="text-muted">未连接消息源</div>') +
     '<div class="status-line">上次同步：' + esc(syncRelativeText(status.lastSync)) + (lastAbs ? '（' + esc(lastAbs) + '）' : '') + '</div>' +
     warnHtml +

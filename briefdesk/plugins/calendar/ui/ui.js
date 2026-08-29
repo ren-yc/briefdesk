@@ -64,7 +64,8 @@
       '<div class="modal-content detail-content">'
       + '<div class="group-overlay-head">'
       + "<h2>卡片详情</h2>"
-      + '<button id="cal-detail-close" title="关闭 (Esc)">×</button>'
+      + '<button id="cal-detail-close" class="modal-close" title="关闭 (Esc)" aria-label="关闭">'
+      + '<img src="/icons/x.svg" class="icon" alt=""></button>'
       + "</div>"
       + '<div id="cal-detail-body"></div>'
       + "</div>";
@@ -80,7 +81,8 @@
       '<div class="modal-content detail-content">'
       + '<div class="group-overlay-head">'
       + '<h2 id="cal-day-title"></h2>'
-      + '<button id="cal-day-close" title="关闭 (Esc)">×</button>'
+      + '<button id="cal-day-close" class="modal-close" title="关闭 (Esc)" aria-label="关闭">'
+      + '<img src="/icons/x.svg" class="icon" alt=""></button>'
       + "</div>"
       + '<div id="cal-day-list"></div>'
       + "</div>";

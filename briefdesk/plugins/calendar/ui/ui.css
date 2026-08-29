@@ -116,6 +116,9 @@ body.calendar-mode #loading-state { display: none !important; }
   display: flex; flex-direction: column; gap: 6px;
   max-height: 60vh; overflow-y: auto;
 }
+/* 焦点环外伸 4px，而 #cal-day-list / .cal-chips 都无内边距，外环会被 overflow
+   裁成断线。改内描边（核心 style.css 对贴边控件的同款做法）。 */
+.cal-chip:focus-visible { outline-offset: -2px; }
 #cal-day-list .cal-chip {
   font-size: 12px; padding: 6px 10px;
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;

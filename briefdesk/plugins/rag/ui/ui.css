@@ -115,10 +115,15 @@ body.rag-open .main-layout {
 }
 
 #rag-drawer .rag-drawer-x {
-  font-size: 17px;
   line-height: 1;
   padding: 3px 8px;
+  /* 图标居中；min-height 补足 WCAG 2.5.8 的 24px 下限 */
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 24px;
 }
+#rag-drawer .rag-drawer-x .icon-sm { margin-right: 0; }
 
 /* ── 消息区 ── */
 #rag-drawer .rag-msgs {
