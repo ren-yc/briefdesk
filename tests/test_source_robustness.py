@@ -24,6 +24,7 @@ from briefdesk.config import config
 from briefdesk.plugins.qqflow.client import QqFlowClient
 from briefdesk.plugins.qqflow.config import QqFlowSettings
 from briefdesk.plugins.qqflow.sse import QqFlowSseClient
+from briefdesk.plugins.weflow.config import WeFlowSettings
 from briefdesk.plugins.weflow_legacy.client import WeFlowLegacyClient
 from briefdesk.plugins.weflow_legacy.config import WeFlowLegacySettings
 from briefdesk.plugins.weflow_legacy.sse import WeFlowLegacySseClient
@@ -88,12 +89,24 @@ class SseReadTimeoutTest(unittest.TestCase):
     显式传参验证（不隐式依赖进程环境/.env 的当前值）。
     """
 
-    def test_weflow_config_default(self):
+    def test_weflow_legacy_config_default(self):
+        # weflow-legacy 上游无心跳：只能靠 5 分钟兜住半开连接
         with patch.dict(os.environ, {}, clear=False):
             os.environ.pop("WEFLOW_LEGACY_SSE_READ_TIMEOUT_MS", None)
             os.environ.pop("QQFLOW_SSE_READ_TIMEOUT_MS", None)
             settings = WeFlowLegacySettings(_env_file=None)
         self.assertEqual(settings.sse_read_timeout_ms, 300000)
+
+    def test_weflow_config_default_matches_heartbeat(self):
+        """weflow-server 每 25s 发 ping → 60s（≈2.4 周期），与 qqflow 同口径。
+
+        这里曾经是 300000：从无心跳的 weflow-legacy 抄来的默认值，在有心跳
+        的 weflow 上等于白等 4 分半才发现连接已死。
+        """
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("WEFLOW_SSE_READ_TIMEOUT_MS", None)
+            settings = WeFlowSettings(_env_file=None)
+        self.assertEqual(settings.sse_read_timeout_ms, 60000)
 
     def test_qqflow_config_default(self):
         with patch.dict(os.environ, {}, clear=False):
