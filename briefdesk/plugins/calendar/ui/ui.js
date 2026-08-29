@@ -357,15 +357,9 @@
       if (e.target === $calDetailModal) { closeCalDetail(); return; }
       const catChip = e.target.closest(".card-category");
       if (catChip && catChip.dataset.cat) {
-        const cat = catChip.dataset.cat;
         closeCalDetail();
         exitCalendarMode({ syncHash: false });
-        clearSearch();
-        currentCategory = cat;
-        currentVerified = "unverified";
-        updateActiveNav();
-        syncHash();
-        fetchData();
+        gotoCategory(catChip.dataset.cat); // 核心入口，勿直接改核心的 currentCategory
         return;
       }
       const subjLink = e.target.closest(".subject-link");

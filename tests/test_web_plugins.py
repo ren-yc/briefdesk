@@ -248,7 +248,7 @@ class PluginFrontendCoreHelperTest(unittest.TestCase):
             "esc", "escAttr", "showToast", "reqJson", "getJson", "postJson", "putJson",
             "deleteJson", "postVerify", "lsGet", "lsSet", "lsGetJson", "lsSetJson",
             "makeItemQuery", "catColor", "renderItemRow", "registerPluginView",
-            "registerItemRowExtension",
+            "registerItemRowExtension", "gotoCategory",
         ]
         for name in exported:
             if f"function {name}(" in app_js:
@@ -274,6 +274,29 @@ class PluginFrontendCoreHelperTest(unittest.TestCase):
                 rf"(?m)^(?:let|var|function)\s+{name}\b",
                 f"插件前端调用了 {name}，但 app.js 顶层没有该声明",
             )
+
+    def test_plugin_frontends_do_not_assign_core_view_state(self):
+        """插件不得直写核心视图状态：共享全局作用域让这种赋值语法上完全合法。
+
+        calendar 原先自己改 `currentCategory` / `currentVerified` 再手动补
+        `updateActiveNav()`/`syncHash()`/`fetchData()`——核心哪天多一步就漏，且
+        改名后只在用户点到日历里的类别标签时才炸。改分类一律走 `gotoCategory()`。
+        """
+        root = Path(__file__).resolve().parents[1]
+        core_state = [
+            "currentCategory", "currentVerified", "currentSearch",
+            "preSearchCategory", "currentItems",
+        ]
+        for path in sorted((root / "briefdesk" / "plugins").glob("*/ui/ui.js")):
+            text = path.read_text(encoding="utf-8")
+            for name in core_state:
+                # 赋值（含复合赋值）而非比较：`=` 后不接 `=`，前不接 `=!<>+-*/`
+                hit = re.search(rf"(?<![=!<>+\-*/])\b{name}\s*=(?!=)", text)
+                self.assertIsNone(
+                    hit,
+                    f"{path.relative_to(root)} 直接赋值核心状态 {name}，"
+                    f"应改走核心入口（分类跳转用 gotoCategory）",
+                )
 
     def test_core_row_containers_anchor_plugin_row_menus(self):
         """核心行容器须是定位上下文：插件行内菜单用 position:absolute 锚在其上。

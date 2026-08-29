@@ -718,13 +718,7 @@ function setupEvents() {
     // 类别标签 → 跳转到该分类视图（chip 样式暗示可点）
     const catChip = e.target.closest(".card-category");
     if (catChip && catChip.dataset.cat) {
-      const cat = catChip.dataset.cat;
-      clearSearch();
-      currentCategory = cat;
-      currentVerified = "unverified";
-      updateActiveNav();
-      syncHash();
-      fetchData();
+      gotoCategory(catChip.dataset.cat);
       return;
     }
 
@@ -852,14 +846,8 @@ function setupEvents() {
     // 类别标签 → 关闭浮层并跳转到该分类
     const catChip = e.target.closest(".card-category");
     if (catChip && catChip.dataset.cat) {
-      const cat = catChip.dataset.cat;
       closeGroupOverlay();
-      clearSearch();
-      currentCategory = cat;
-      currentVerified = "unverified";
-      updateActiveNav();
-      syncHash();
-      fetchData();
+      gotoCategory(catChip.dataset.cat);
       return;
     }
     // 图片 → 放大查看
@@ -1235,14 +1223,8 @@ function setupEvents() {
     }
     const catChip = e.target.closest(".card-category");
     if (catChip && catChip.dataset.cat) {
-      const cat = catChip.dataset.cat;
       closeSubjectTimeline();
-      clearSearch();
-      currentCategory = cat;
-      currentVerified = "unverified";
-      updateActiveNav();
-      syncHash();
-      fetchData();
+      gotoCategory(catChip.dataset.cat);
       return;
     }
     const imgBtn = e.target.closest(".card-img-btn");
@@ -1361,6 +1343,24 @@ function clearSearch() {
   searchFilterRange = "";
   searchFilterGroup = "";
   $itemSearchClear.classList.add("hidden");
+}
+
+// ── 点类别标签跳转到该分类视图（单源）──
+// 主列表卡片、组浮层行、主体时间线行、calendar 详情浮层四处的类别标签都可点，
+// 落到同一套动作：清搜索 → 切分类 → 回「未处理」→ 同步导航态/hash → 重拉。
+// 各处的「先关掉自己」（closeGroupOverlay / closeSubjectTimeline / closeCalDetail
+// 等）留在调用点，因为关什么只有调用点知道。
+// 写成 function 声明供插件前端复用：calendar 原先直接改核心的 currentCategory /
+// currentVerified 两个模块级 let，这层耦合没有任何守卫兜底（改名只在用户点到
+// 日历里的类别标签时才炸），改为经此入口。见 docs/architecture.md 的形态约束。
+function gotoCategory(cat) {
+  if (!cat) return;
+  clearSearch();
+  currentCategory = cat;
+  currentVerified = "unverified";
+  updateActiveNav();
+  syncHash();
+  fetchData();
 }
 
 function connectRealtimeStream() {
