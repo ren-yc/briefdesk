@@ -1,5 +1,6 @@
 """Web 插件扩展测试：/api/plugins 元数据、plugin-assets 静态资源、WebPlugin 装配。"""
 
+import re
 import tempfile
 import unittest
 from pathlib import Path
@@ -225,6 +226,65 @@ class CoreFrontendBoundaryTest(unittest.TestCase):
             text = (ui_dir / fname).read_text(encoding="utf-8")
             for marker in markers:
                 self.assertNotIn(marker, text, f"{fname} 不应再包含 {marker}（插件前端已随插件分发）")
+
+
+class PluginFrontendCoreHelperTest(unittest.TestCase):
+    """反向边界守卫：插件前端复用的核心助手必须在 app.js 里以 `function` 声明存在。
+
+    插件前端以同源 classic script 注入、与 app.js 共享全局作用域，因此可直接调用
+    app.js 的顶层 `function`（顶层 `const` 箭头不挂 window，不可用）。这层耦合没有
+    模块系统兜底：app.js 里改名或改成 const 箭头，插件只会在用户点到那个控件时才
+    炸，且核心测试全绿。故此处按名字对账。
+    """
+
+    def test_helpers_used_by_plugins_are_declared_in_app_js(self):
+        root = Path(__file__).resolve().parents[1]
+        app_js = (root / "ui" / "app.js").read_text(encoding="utf-8")
+        plugin_js = sorted((root / "briefdesk" / "plugins").glob("*/ui/ui.js"))
+        self.assertTrue(plugin_js, "未找到任何插件前端，守卫失效")
+
+        # 核心提供给插件的助手全集（新增复用时同步此表）
+        exported = [
+            "esc", "escAttr", "showToast", "reqJson", "getJson", "postJson", "putJson",
+            "deleteJson", "postVerify", "lsGet", "lsSet", "lsGetJson", "lsSetJson",
+            "makeItemQuery", "catColor", "renderItemRow", "registerPluginView",
+            "registerItemRowExtension",
+        ]
+        for name in exported:
+            if f"function {name}(" in app_js:
+                continue
+            # catColor 是顶层 let（Map），非函数：只要求存在同名顶层声明
+            self.assertRegex(
+                app_js,
+                rf"(?m)^(?:let|var|function)\s+{name}\b",
+                f"app.js 应保留顶层声明 {name}（插件前端依赖）",
+            )
+
+        # 插件实际用到的名字必须落在上表内，且在 app.js 里真的有声明
+        used = set()
+        for path in plugin_js:
+            text = path.read_text(encoding="utf-8")
+            for name in exported:
+                if re.search(rf"\b{name}\s*\(", text):
+                    used.add(name)
+        self.assertIn("lsSet", used, "calendar/reminders 应经 lsSet 写 localStorage")
+        for name in sorted(used):
+            self.assertRegex(
+                app_js,
+                rf"(?m)^(?:let|var|function)\s+{name}\b",
+                f"插件前端调用了 {name}，但 app.js 顶层没有该声明",
+            )
+
+    def test_plugin_frontends_do_not_touch_localstorage_directly(self):
+        """插件不得裸用 localStorage：异常会中断事件处理函数（见 lsGet/lsSet 注释）。"""
+        root = Path(__file__).resolve().parents[1]
+        for path in sorted((root / "briefdesk" / "plugins").glob("*/ui/ui.js")):
+            text = path.read_text(encoding="utf-8")
+            self.assertNotIn(
+                "localStorage.",
+                text,
+                f"{path.relative_to(root)} 应改用核心 lsGet/lsSet/lsGetJson/lsSetJson",
+            )
 
 
 class IncludeRouterIdempotentTest(unittest.TestCase):

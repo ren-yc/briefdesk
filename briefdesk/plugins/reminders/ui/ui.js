@@ -31,11 +31,12 @@
       + '<p class="text-muted settings-hint">提醒在本应用运行期间生效；关闭期间错过的提醒不补发。</p>';
     const $autoRemind = document.getElementById("auto-remind");
     if ($autoRemind) {
-      autoRemindOffset = localStorage.getItem("briefdesk.autoRemind") || "off";
+      // 走核心 lsGet/lsSet：此前裸 setItem 在隐私模式下会抛，中断 change 处理函数
+      autoRemindOffset = lsGet("briefdesk.autoRemind", "off");
       $autoRemind.value = autoRemindOffset;
       $autoRemind.addEventListener("change", () => {
         autoRemindOffset = $autoRemind.value;
-        localStorage.setItem("briefdesk.autoRemind", autoRemindOffset);
+        lsSet("briefdesk.autoRemind", autoRemindOffset);
       });
     }
   }

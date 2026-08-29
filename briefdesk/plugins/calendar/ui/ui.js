@@ -327,7 +327,7 @@
       }
       if (e.target.closest(".cal-memo-toggle")) {
         calMemoOnly = !calMemoOnly;
-        try { localStorage.setItem("briefdesk.calMemoOnly", calMemoOnly ? "1" : "0"); } catch { /* ignore */ }
+        lsSet("briefdesk.calMemoOnly", calMemoOnly ? "1" : "0"); // 核心助手，写失败自吞
         $calendarView.classList.add("cal-filter-anim"); // 触发 chip 错落浮现动画
         renderCalendar(calAllItems); // 本地过滤重渲染，不重新请求
         setTimeout(() => $calendarView.classList.remove("cal-filter-anim"), 600);
@@ -430,7 +430,7 @@
   // ── 入口：核心加载器注入本脚本后调用 ──
   function init(api) {
     if (!api || typeof api.isLoaded !== "function" || !api.isLoaded(PLUGIN)) return;
-    try { calMemoOnly = localStorage.getItem("briefdesk.calMemoOnly") === "1"; } catch { /* ignore */ }
+    calMemoOnly = lsGet("briefdesk.calMemoOnly") === "1"; // 核心助手（app.js 先于插件加载）
     buildDom();
     bindEvents();
     registerViewHook();

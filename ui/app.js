@@ -1,3 +1,33 @@
+// ── localStorage 单源 ──
+// 隐私模式/配额耗尽/站点存储被策略禁用时，localStorage 的读写都会抛异常。此前
+// 24 个调用点里只有一半带 try——未包的那些一旦抛出会中断整个事件处理函数，导致
+// 「持久化失败」升级成「功能不响应」：主题芯片不再调 applyTheme()、折叠开关不重
+// 渲染、隐藏已截止开关连按钮态都不更新。故读写一律经此四个助手，异常在此吞掉，
+// 调用点只需处理"取不到值"这一种情况（返回 fallback）。
+// 写成 function 声明（非 const 箭头）以便插件前端复用，见 docs/architecture.md。
+function lsGet(key, fallback = null) {
+  try {
+    const v = localStorage.getItem(key);
+    return v === null ? fallback : v;
+  } catch { return fallback; }
+}
+
+function lsSet(key, value) {
+  try { localStorage.setItem(key, value); return true; } catch { return false; }
+}
+
+// JSON 形态：解析失败与读取失败同样退回 fallback（坏数据不该让功能崩掉）。
+// fallback 按值返回，调用点若要改写请自行传新对象。
+function lsGetJson(key, fallback = null) {
+  const raw = lsGet(key, null);
+  if (raw === null) return fallback;
+  try { return JSON.parse(raw); } catch { return fallback; }
+}
+
+function lsSetJson(key, value) {
+  try { return lsSet(key, JSON.stringify(value)); } catch { return false; }
+}
+
 // ── State ──
 let currentCategory = "全部";
 let currentVerified = "unverified"; // "all" | "unverified" | "memo" | "ignored"
@@ -16,7 +46,7 @@ let stream = null;
 let streamReconnectTimer = null;
 let sseBackoffMs = 2000;        // 重连退避：2s 指数增长至 30s，连接成功即复位
 let streamRefreshDebounceTimer = null;
-let collapseGroups = localStorage.getItem("briefdesk.collapseGroups") !== "expanded"; // 默认折叠
+let collapseGroups = lsGet("briefdesk.collapseGroups") !== "expanded"; // 默认折叠
 let lastVisibleItems = []; // 最近一次渲染的可见卡（折叠开关切换时重渲染）
 let viewSourceItems = [];   // 当前查询已加载的全部卡片（分页追加/模式切换的渲染基准）
 let groupMap = new Map(); // subject+category → members（当前响应，浮层数据源）
@@ -304,7 +334,7 @@ window.addEventListener("beforeunload", () => {
 
 // ── 深色模式：跟随系统时监听系统主题变化 ──
 window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => {
-  if ((localStorage.getItem("briefdesk.theme") || "light") === "system") applyTheme();
+  if (lsGet("briefdesk.theme", "light") === "system") applyTheme();
 });
 
 // ── 标签页重新可见：恢复标题（保留新卡片高亮，待用户滚动确认）──
@@ -813,7 +843,7 @@ function setupEvents() {
     const wantCollapsed = segBtn.dataset.mode === "collapsed";
     if (wantCollapsed === collapseGroups) return;
     collapseGroups = wantCollapsed;
-    localStorage.setItem("briefdesk.collapseGroups", collapseGroups ? "collapsed" : "expanded");
+    lsSet("briefdesk.collapseGroups", collapseGroups ? "collapsed" : "expanded");
     updateCollapseToggle(); // 立即同步按钮选中态（不依赖渲染路径，空视图/异常时也即时响应）
     animateOnNextRender = true; // 模式切换 → 列表错落浮现
     renderItems(viewSourceItems, { full: true });
@@ -1172,20 +1202,20 @@ function setupEvents() {
   $themeToggle.addEventListener("click", (e) => {
     const chip = e.target.closest(".filter-chip");
     if (!chip || !chip.dataset.mode) return;
-    localStorage.setItem("briefdesk.theme", chip.dataset.mode);
+    lsSet("briefdesk.theme", chip.dataset.mode);
     applyTheme();
   });
 
   // ── 桌面通知模式（立即生效并持久化；授权在切换时请求）──
   $notifyMode.addEventListener("change", () => {
     const mode = $notifyMode.value;
-    localStorage.setItem("briefdesk.notifyMode", mode);
+    lsSet("briefdesk.notifyMode", mode);
     notifyMode = mode;
     if (mode !== "off" && "Notification" in window && Notification.permission === "default") {
       Notification.requestPermission().then((p) => {
         if (p === "denied") {
           $notifyMode.value = "off";
-          localStorage.setItem("briefdesk.notifyMode", "off");
+          lsSet("briefdesk.notifyMode", "off");
           notifyMode = "off";
           showToast("通知权限被拒绝，请在浏览器设置中开启", { type: "error", duration: 6000 });
         }
@@ -1286,7 +1316,7 @@ function setupEvents() {
   // 隐藏已截止开关（持久化 + 重渲染）
   $hideExpiredToggle.addEventListener("click", () => {
     hideExpired = !hideExpired;
-    localStorage.setItem("briefdesk.hideExpired", hideExpired ? "1" : "0");
+    lsSet("briefdesk.hideExpired", hideExpired ? "1" : "0");
     $hideExpiredToggle.classList.toggle("active", hideExpired);
     $hideExpiredToggle.setAttribute("aria-pressed", String(hideExpired));
     fetchData();
@@ -1354,16 +1384,12 @@ const SEARCH_HISTORY_MAX = 10;
 const $searchHistoryDropdown = document.getElementById("search-history-dropdown");
 
 function loadSearchHistory() {
-  try {
-    const saved = JSON.parse(localStorage.getItem("briefdesk.searchHistory") || "[]");
-    searchHistory = Array.isArray(saved) ? saved.filter(t => typeof t === "string" && t.trim()).slice(0, SEARCH_HISTORY_MAX) : [];
-  } catch { searchHistory = []; }
+  const saved = lsGetJson("briefdesk.searchHistory", []);
+  searchHistory = Array.isArray(saved) ? saved.filter(t => typeof t === "string" && t.trim()).slice(0, SEARCH_HISTORY_MAX) : [];
 }
 
 function saveSearchHistory() {
-  try {
-    localStorage.setItem("briefdesk.searchHistory", JSON.stringify(searchHistory));
-  } catch { /* 忽略存储失败 */ }
+  lsSetJson("briefdesk.searchHistory", searchHistory);
 }
 
 function addSearchHistory(term) {
@@ -1868,11 +1894,11 @@ function closeKbHelp() {
 // （renderOnboardSessions 拉取时缓存；缺失时由 fillOnboardBackfill 补拉）
 let onboardBackfillHours = null;
 function markOnboarded() {
-  try { localStorage.setItem("briefdesk.onboarded", "1"); } catch { }
+  lsSet("briefdesk.onboarded", "1");
 }
 
 async function initOnboarding() {
-  if (localStorage.getItem("briefdesk.onboarded")) return;
+  if (lsGet("briefdesk.onboarded")) return;
   // 已有启用会话 → 视为已使用，不再打扰
   try {
     const data = await getJson("/api/sessions"); // 抛错落进下方 catch，同为"不弹"
@@ -3409,7 +3435,7 @@ async function fetchContext(ctxDiv, source, sessionId, aroundTime, sourceMsgId) 
 // 设置侧时间档位初始值：localStorage 存值优先，否则服务端默认
 // （BACKFILL_HOURS；<=0 视为“全部”）。向导侧不持久化，进入时直接 reset() 回 'all'。
 function initSessionTimeFilter() {
-  const saved = localStorage.getItem("briefdesk.sessionTimeFilter");
+  const saved = lsGet("briefdesk.sessionTimeFilter");
   const raw = saved !== null ? saved : (sessionDefaultBackfill > 0 ? sessionDefaultBackfill : "all");
   sessionFilter.setTime(raw);
 }
@@ -3603,7 +3629,7 @@ function createSessionFilter({ ids, storageKey = null, emptyHint = null, pruneSo
   function setTime(v) {
     state.time = normalizeTime(v);
     if (storageKey) {
-      try { localStorage.setItem(storageKey, state.time); } catch { /* 隐私模式等写入失败可忽略 */ }
+      lsSet(storageKey, state.time);
     }
     syncTimeControls();
     apply();
@@ -4048,14 +4074,13 @@ async function runSettingsOps(ops) {
 // ── Settings ──
 // 类别启用/停用已由后端持久化（categories.enabled），localStorage 只存刷新间隔
 function loadSettings() {
-  try {
-    const saved = JSON.parse(localStorage.getItem("briefdesk-settings") || "{}");
-    refreshIntervalSec = Math.max(30, parseInt(saved.refreshInterval, 10) || 300);
-  } catch { /* ignore */ }
+  // 存值可能是任意 JSON（含 null/数组/标量），故 || {} 兜住非对象后再取字段
+  const saved = lsGetJson("briefdesk-settings", {}) || {};
+  refreshIntervalSec = Math.max(30, parseInt(saved.refreshInterval, 10) || 300);
   $refreshInterval.value = refreshIntervalSec;
-  notifyMode = localStorage.getItem("briefdesk.notifyMode") || "off";
+  notifyMode = lsGet("briefdesk.notifyMode", "off");
   if ($notifyMode) $notifyMode.value = notifyMode;
-  hideExpired = localStorage.getItem("briefdesk.hideExpired") === "1";
+  hideExpired = lsGet("briefdesk.hideExpired") === "1";
   if ($hideExpiredToggle) {
     $hideExpiredToggle.classList.toggle("active", hideExpired);
     $hideExpiredToggle.setAttribute("aria-pressed", String(hideExpired));
@@ -4065,9 +4090,7 @@ function loadSettings() {
 function saveSettings() {
   refreshIntervalSec = Math.max(30, parseInt($refreshInterval.value) || 300);
   $refreshInterval.value = refreshIntervalSec;
-  localStorage.setItem("briefdesk-settings", JSON.stringify({
-    refreshInterval: refreshIntervalSec,
-  }));
+  lsSetJson("briefdesk-settings", { refreshInterval: refreshIntervalSec });
 }
 
 // ── 启动配置（.env 暂存）──
@@ -4478,7 +4501,7 @@ function syncHash(mode = "push") {
   history[mode + "State"](null, "", location.pathname + location.search + h);
   if (!currentSearch) {
     try {
-      localStorage.setItem("briefdesk.lastView", JSON.stringify({ category: currentCategory, verified: currentVerified }));
+      lsSetJson("briefdesk.lastView", { category: currentCategory, verified: currentVerified });
     } catch { /* ignore */ }
   }
 }
@@ -4506,18 +4529,16 @@ function initViewFromHash() {
     return;
   }
   // 无 hash：回退 localStorage 记忆的上次视图
-  try {
-    const last = JSON.parse(localStorage.getItem("briefdesk.lastView") || "null");
-    if (last) {
-      if (last.verified === "memo" || last.verified === "ignored") {
-        currentCategory = "全部";
-        currentVerified = last.verified;
-      } else if (last.category && last.category !== "全部") {
-        currentCategory = last.category;
-        currentVerified = "unverified";
-      }
+  const last = lsGetJson("briefdesk.lastView");
+  if (last && typeof last === "object") {
+    if (last.verified === "memo" || last.verified === "ignored") {
+      currentCategory = "全部";
+      currentVerified = last.verified;
+    } else if (last.category && last.category !== "全部") {
+      currentCategory = last.category;
+      currentVerified = "unverified";
     }
-  } catch { /* ignore */ }
+  }
   syncHash("replace");
 }
 
@@ -4827,14 +4848,14 @@ function resolveTheme(mode) {
 }
 
 function applyTheme() {
-  const mode = localStorage.getItem("briefdesk.theme") || "light";
+  const mode = lsGet("briefdesk.theme", "light");
   document.documentElement.dataset.theme = resolveTheme(mode);
   updateThemeChips();
 }
 
 function updateThemeChips() {
   if (!$themeToggle) return;
-  const mode = localStorage.getItem("briefdesk.theme") || "light";
+  const mode = lsGet("briefdesk.theme", "light");
   // 三档互斥 ⇒ 语义是单选组而非独立开关，用 role=radio + aria-checked
   $themeToggle.setAttribute("role", "radiogroup");
   $themeToggle.querySelectorAll(".filter-chip").forEach(c => {
@@ -4872,17 +4893,15 @@ function notifyNewItems(items) {
 
 // ── 关键词订阅 ──
 function loadSubscriptions() {
-  try {
-    const saved = JSON.parse(localStorage.getItem("briefdesk.subscriptions") || "[]");
-    subscriptions = Array.isArray(saved)
-      ? saved.filter(s => s && typeof s.keywords === "string")
-      : [];
-  } catch { subscriptions = []; }
+  const saved = lsGetJson("briefdesk.subscriptions", []);
+  subscriptions = Array.isArray(saved)
+    ? saved.filter(s => s && typeof s.keywords === "string")
+    : [];
   renderSubsList();
 }
 
 function saveSubscriptions() {
-  try { localStorage.setItem("briefdesk.subscriptions", JSON.stringify(subscriptions)); } catch { }
+  lsSetJson("briefdesk.subscriptions", subscriptions);
 }
 
 function enabledSubKeywords() {
@@ -4932,17 +4951,15 @@ function updateSubsBadge() {
 
 // ── 降噪黑名单（与订阅同构；命中卡片在渲染层隐藏，不触碰后端）──
 function loadBlocklist() {
-  try {
-    const saved = JSON.parse(localStorage.getItem("briefdesk.blocklist") || "[]");
-    blocklist = Array.isArray(saved)
-      ? saved.filter(s => s && typeof s.keywords === "string")
-      : [];
-  } catch { blocklist = []; }
+  const saved = lsGetJson("briefdesk.blocklist", []);
+  blocklist = Array.isArray(saved)
+    ? saved.filter(s => s && typeof s.keywords === "string")
+    : [];
   renderBlocklist();
 }
 
 function saveBlocklist() {
-  try { localStorage.setItem("briefdesk.blocklist", JSON.stringify(blocklist)); } catch { }
+  lsSetJson("briefdesk.blocklist", blocklist);
 }
 
 function isBlocked(item) {
