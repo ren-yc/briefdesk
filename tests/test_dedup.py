@@ -1505,5 +1505,99 @@ class AskAiFailureIsolationTest(unittest.IsolatedAsyncioTestCase):
             result = await engine.check_dedup("羽毛球社招新", "新生2群", q_emb=[1.0, 0.0])
         self.assertFalse(result.is_duplicate)
 
+class DegradedChannelLogGateTest(unittest.IsolatedAsyncioTestCase):
+    """检索通道降级的三个一次性闸门：首条 WARNING/INFO 可见，其后降 DEBUG。
+
+    三者都是配置/数据态，对进程内**每条消息**恒成立。不加闸门就是每条消息
+    一行告警，批次里的阶段行与真正的告警全被挤出屏幕；但完全静默又会让
+    「判重悄悄退化成字面匹配」无从发现——故首条保留在默认级别。
+
+    这里同时钉住文案里的持续性表述：维度不一致在向量重建前不会自愈
+    （load_embeddings 按模型名取，模型名不变而维度变了则永不重嵌），
+    唯一那行 WARNING 若读起来像瞬态抖动就会被放过去。
+    """
+
+    _LOGGER = "briefdesk.plugins.dedup.engine"
+
+    @staticmethod
+    def _engine(embedding):
+        """构造只含一条缓存的引擎（embedding 决定走哪条降级分支）。"""
+        engine = DedupEngine()
+        engine._cache_loaded = True
+        engine._embed_cache_ok = True
+        engine._cache = [
+            CachedItem(
+                id="c1", title="部门工作提醒", source_quote="原文甲", embedding=embedding
+            )
+        ]
+        return engine
+
+    async def _check(self, engine, q_emb):
+        with patch(
+            "briefdesk.plugins.dedup.engine.merge_source_group", new=AsyncMock()
+        ):
+            return await engine.check_dedup("其它标题", "群", q_emb=q_emb)
+
+    async def test_dim_mismatch_warns_once_then_debug(self):
+        # 缓存 2 维、query 3 维 → 走「维度不一致」分支
+        engine = self._engine([0.1, 0.2])
+        with self.assertLogs(self._LOGGER, level="WARNING") as logs:
+            result = await self._check(engine, [0.1, 0.2, 0.3])
+        self.assertFalse(result.is_duplicate, "降级不改判定：回退重叠后仍不重复")
+        joined = "\n".join(logs.output)
+        self.assertIn("query=3", joined)
+        self.assertIn("缓存=2", joined)
+        self.assertIn("需重建 item_embeddings", joined, "文案须说清不会自愈")
+
+        # 第二条同状态消息：WARNING 不再出现，信息仍完整保留在 DEBUG
+        with self.assertNoLogs(self._LOGGER, level="WARNING"):
+            await self._check(engine, [0.1, 0.2, 0.3])
+        with self.assertLogs(self._LOGGER, level="DEBUG") as logs2:
+            await self._check(engine, [0.1, 0.2, 0.3])
+        self.assertTrue(
+            any("维度不一致" in m for m in logs2.output), logs2.output
+        )
+
+    async def test_cosine_failure_warns_once_with_stack_then_debug(self):
+        """余弦异常：首条带栈（真 numpy 异常靠它定位），其后降 DEBUG。"""
+        engine = self._engine([0.1, 0.2])
+        boom = Mock(side_effect=ValueError("inhomogeneous shape"))
+        with patch("briefdesk.plugins.dedup.engine.top_k_similar", new=boom):
+            with self.assertLogs(self._LOGGER, level="WARNING") as logs:
+                result = await self._check(engine, [0.3, 0.4])
+            self.assertFalse(result.is_duplicate)
+            self.assertIn("Traceback", "\n".join(logs.output), "首条须带栈")
+
+            with self.assertNoLogs(self._LOGGER, level="WARNING"):
+                await self._check(engine, [0.3, 0.4])
+
+    async def test_empty_cache_embeddings_logs_once_then_debug(self):
+        """缓存无向量（EMBED_* 配错/历史未补齐）：闸门此前无测试，一并钉住。"""
+        engine = self._engine(None)
+        with self.assertLogs(self._LOGGER, level="INFO") as logs:
+            await self._check(engine, [0.1, 0.2])
+        self.assertTrue(
+            any("缓存无嵌入向量" in m for m in logs.output), logs.output
+        )
+        with self.assertNoLogs(self._LOGGER, level="INFO"):
+            await self._check(engine, [0.1, 0.2])
+
+    async def test_gates_are_per_instance(self):
+        """闸门是实例级：另一个引擎（或重建后的实例）仍能看见首条告警。
+
+        先把第一个引擎的闸门推到关闭态（第二次调用必须静默），再验证新实例
+        照样告警——两步都在，才能区分「实例级闸门」与「压根没闸门」。
+        """
+        first = self._engine([0.1, 0.2])
+        with self.assertLogs(self._LOGGER, level="WARNING"):
+            await self._check(first, [0.1, 0.2, 0.3])
+        with self.assertNoLogs(self._LOGGER, level="WARNING"):
+            await self._check(first, [0.1, 0.2, 0.3])
+
+        second = self._engine([0.1, 0.2])
+        with self.assertLogs(self._LOGGER, level="WARNING"):
+            await self._check(second, [0.1, 0.2, 0.3])
+
+
 if __name__ == "__main__":
     unittest.main()

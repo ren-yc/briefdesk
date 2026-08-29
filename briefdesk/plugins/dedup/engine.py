@@ -154,11 +154,17 @@ class DedupEngine(DedupService):
         self._cache_loaded = False
         self._embed_cache_ok = False  # 嵌入启用且缓存向量加载成功
         self._warm_lock = asyncio.Lock()  # 预热与首次判重的并发保护
-        # 「缓存无向量」降噪闸门：这是配置态（可能 EMBED_* 配错或历史向量
-        # 未补齐），首次值得在默认级别看见一次；但它对每条消息都成立，
-        # 每条一行会把批次里的阶段行挤出屏幕，故其后只打 DEBUG。
-        # 与 weflow client 的 _logged_version 同源手法。
+        # 检索通道降级的三个降噪闸门。三者都是**配置/数据态**（对进程内每条
+        # 消息恒成立），首次值得在默认级别看见一次，其后只打 DEBUG——否则每
+        # 条消息一行，批次里的阶段行和真正的告警全被挤出屏幕。与 weflow
+        # client 的 _logged_version 同源手法。
+        #
+        # 三个分开而不共用一个：成因与可操作性都不同（缓存整体无向量 /
+        # query 与缓存维度不一致 / 余弦计算抛异常），共用会让「numpy 真异常」
+        # 也被压成 DEBUG 连栈都看不到。
         self._no_emb_logged = False
+        self._dim_mismatch_logged = False
+        self._cosine_fail_logged = False
         # 待落库向量（由 add_to_cache 登记、flush_pending_embeddings 批量写入）
         self._pending_embeds: list[tuple[str, str, list[float]]] = []
 
@@ -649,16 +655,42 @@ class DedupEngine(DedupService):
                         if top1:
                             top1_cosine = top1[0][1]
                 except Exception:
-                    # 余弦计算异常（如维度不一致）不杀整批，回退字符重叠
-                    logger.warning(
-                        "余弦候选计算失败，回退到字符重叠预过滤", exc_info=True
-                    )
+                    # 余弦计算异常不杀整批，回退字符重叠。最常见的成因是
+                    # **缓存内部混了两种维度**（旧向量按旧维度从库中读出、
+                    # 同批新条目按新维度重嵌）：此时 emb_matrix 是 ragged
+                    # list，np.asarray(dtype=float32) 直接抛 ValueError。
+                    # 首次带栈（真 numpy 异常也靠这一条定位），其后只 DEBUG。
+                    if not self._cosine_fail_logged:
+                        self._cosine_fail_logged = True
+                        logger.warning(
+                            "余弦候选计算失败，本进程判重回退字符重叠通道"
+                            "（语义召回失效、漏判率上升）；若为缓存内混合维度，"
+                            "需重建 item_embeddings 向量",
+                            exc_info=True,
+                        )
+                    else:
+                        logger.debug("余弦候选计算失败，回退字符重叠", exc_info=True)
             elif emb_matrix:
-                logger.warning(
-                    "嵌入维度不一致（query=%d vs 缓存=%d），回退到字符重叠预过滤",
-                    len(q_emb),
-                    len(emb_matrix[0]),
-                )
+                # 维度不一致**不会自己恢复**：load_embeddings 按模型名取，
+                # 模型名不变而维度变了（代理换实现/供应商原地升级/改维度参数）
+                # 时旧向量每次重启都照样读出来、missing 为空、永不重嵌。故文案
+                # 必须自己说清持续性——只打一次的 WARNING 若读起来像瞬态抖动，
+                # 就会被放过去。
+                if not self._dim_mismatch_logged:
+                    self._dim_mismatch_logged = True
+                    logger.warning(
+                        "嵌入维度不一致（query=%d vs 缓存=%d），本进程判重全程"
+                        "回退字符重叠（语义召回失效、漏判率上升）；模型维度已变，"
+                        "需重建 item_embeddings 向量",
+                        len(q_emb),
+                        len(emb_matrix[0]),
+                    )
+                else:
+                    logger.debug(
+                        "嵌入维度不一致（query=%d vs 缓存=%d），回退字符重叠",
+                        len(q_emb),
+                        len(emb_matrix[0]),
+                    )
             elif not self._no_emb_logged:
                 # 首条 INFO（默认级别可见），其后同状态只打 DEBUG（见 __init__）
                 self._no_emb_logged = True
@@ -693,7 +725,8 @@ class DedupEngine(DedupService):
         # 既非异常也无人可介入，故不占 WARNING——否则告警流里每条新消息一行，
         # 真正的告警被淹没。诊断信息（top-1 差多少、归因）一条不少地保留在
         # DEBUG：排查"该判重却没判"时开 LOG_LEVEL=DEBUG 即可看到差距。
-        # 检索**本身**失败/降级（余弦异常、维度不一致）仍是 WARNING，见上方。
+        # 检索**本身**失败/降级（余弦异常、维度不一致、缓存无向量）是 WARNING，
+        # 但同样对每条消息恒成立，故各带一个一次性闸门，其后降 DEBUG（见上方）。
         if not candidates:
             diag = [f'判重无候选: "{title}"']
             if cosine_active:
