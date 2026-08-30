@@ -395,7 +395,9 @@ function bindNavEvents() {
   // "查看全部" link in filtered-empty-state
   $content.addEventListener("click", (e) => {
     const link = e.target.closest(".reset-filter-link");
-    if (!link) return;
+    // fetch-retry-btn 借用本类做样式（fetch 失败态重试），但不得触发清筛选：
+    // 否则点「重试」会静默清空搜索词与分类上下文（复核 P2-27）
+    if (!link || link.id === "fetch-retry-btn") return;
     e.preventDefault();
     exitPluginViews();
     clearSearch();
@@ -4756,19 +4758,18 @@ function setSyncButton(busy) {
 // 在已转义文本中高亮全部匹配的搜索词（多词 OR：每个词的所有出现都高亮）。
 // 搜索词同样先经 esc() 转义再匹配：转义后文本中的 & < > 等实体（&amp;、&lt;）
 // 不会被搜索词命中破坏；正则元字符再单独转义。
+// 全部词必须合并为单个交替正则一次替换：逐词对上一步结果重复 replace 会命中
+// 上一轮插入的字面 <mark> 标签文本，产出 <m<mark>…</mark>rk> 标签汤（实证 bug）。
 function highlight(str) {
   const escaped = esc(str);
   if (!currentSearch) return escaped;
   const terms = currentSearch.toLowerCase().split(/\s+/).filter(Boolean);
-  if (!terms.length) return escaped;
-  let out = escaped;
-  for (const term of terms) {
-    const escapedTerm = esc(term).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    if (!escapedTerm) continue;
-    const re = new RegExp(escapedTerm, "gi");
-    out = out.replace(re, (m) => "<mark>" + m + "</mark>");
-  }
-  return out;
+  const alts = terms
+    .map((t) => esc(t).replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
+    .filter(Boolean);
+  if (!alts.length) return escaped;
+  const re = new RegExp(alts.join("|"), "gi");
+  return escaped.replace(re, (m) => "<mark>" + m + "</mark>");
 }
 
 function esc(str) {
