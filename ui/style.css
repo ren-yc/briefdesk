@@ -832,7 +832,6 @@ body.modal-open { overflow: hidden; }
 .text-muted { color: var(--text-3); font-size: 12px; }
 
 /* 原先写在 index.html 里的两处 style= 内联样式，移入样式表 */
-.env-save-btn { margin-top: 6px; }
 .btn-danger-solid {
   background: var(--danger); color: var(--on-accent); border-color: var(--danger);
 }
@@ -1154,6 +1153,8 @@ body.modal-open { overflow: hidden; }
   }
   .settings-menu-item { white-space: nowrap; }
   .settings-panels { overflow-y: visible; padding: 0; }
+  /* 窄屏面板无 6px 内边距，工具条的负边距回退为 0；sticky 相对弹窗滚动容器 */
+  .env-toolbar { margin: 0; }
 }
 
 /* ── Toast ── */
@@ -1835,10 +1836,55 @@ body.modal-open { overflow: hidden; }
 .quote-expand-btn:hover { text-decoration: underline; }
 
 /* ── 启动配置面板（设置 → 启动配置） ── */
-.env-row { margin: 10px 0; }
-.env-plugin-heading { margin-top: 18px; font-size: 14px; }
+/* sticky 工具条：搜索过滤跟随滚动（「保存」统一在弹窗底部全局操作栏）。
+   负左右 margin 铺满 .settings-panels 的 6px 内边距，内容不会从缝隙钻出 */
+.env-toolbar {
+  position: sticky; top: 0; z-index: 2;
+  display: flex; align-items: center; gap: 8px;
+  margin: 0 -6px; padding: 8px 6px;
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+}
+.env-filter {
+  flex: 1; min-width: 0; padding: 6px 12px;
+  border: 1px solid var(--border); border-radius: var(--radius-sm);
+  font-size: var(--text-base); font-family: inherit;
+  background: var(--bg); color: var(--text); box-sizing: border-box;
+}
+
+/* 配置分组卡片：core 与各插件各一块卡片，折叠交给 <details> 原生行为 */
+.env-group {
+  border: 1px solid var(--border); border-radius: var(--radius-sm);
+  margin: 12px 0 14px; background: var(--surface);
+}
+.env-group-head {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  padding: 9px 12px; font-size: 13px; font-weight: 600; color: var(--text);
+  min-width: 0;
+}
+details.env-group > summary.env-group-head {
+  cursor: pointer; list-style: none; user-select: none;
+}
+details.env-group > summary.env-group-head::-webkit-details-marker { display: none; }
+/* 折叠箭头：纯 CSS 角标，随 open 旋转（收起朝下 / 展开朝上） */
+details.env-group > summary.env-group-head::after {
+  content: ""; flex-shrink: 0; margin-left: auto; margin-right: 2px;
+  width: 7px; height: 7px;
+  border-right: 1.5px solid var(--text-3); border-bottom: 1.5px solid var(--text-3);
+  transform: rotate(45deg);
+  transition: transform var(--dur-2) var(--ease-out);
+}
+details.env-group[open] > summary.env-group-head::after { transform: rotate(-45deg); }
+.env-group-count { font-size: var(--text-xs); font-weight: 400; color: var(--text-3); }
+/* 未启用插件组：只折叠 + 头部徽章示意，正文不做容器级 opacity 调光
+   （对比度守卫：容器调光会连 token 层一起失效） */
+.env-group-body { padding: 0 12px 12px; }
+
+.env-row { margin: 12px 0; }
 .env-row-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 4px; }
 .env-label { font-weight: 600; }
+/* 「恢复默认」固定在行头右端，不再随内容流漂移 */
+.env-row-head .env-restore { margin-left: auto; }
 .env-badge {
   font-size: var(--text-xs); padding: 1px 8px; border-radius: 999px;
   background: var(--surface); border: 1px solid var(--border); color: var(--text-2);
@@ -1847,16 +1893,12 @@ body.modal-open { overflow: hidden; }
   color: var(--state-warn); border-color: color-mix(in srgb, var(--state-warn) 55%, transparent);
   background: color-mix(in srgb, var(--state-warn) 12%, var(--surface));
 }
-.env-badge-env {
-  color: var(--state-info); border-color: color-mix(in srgb, var(--state-info) 55%, transparent);
-  background: color-mix(in srgb, var(--state-info) 10%, var(--surface));
-}
 .env-badge-ok {
   color: var(--state-ok); border-color: color-mix(in srgb, var(--state-ok) 55%, transparent);
   background: color-mix(in srgb, var(--state-ok) 12%, var(--surface));
 }
 .env-multi { display: flex; flex-wrap: wrap; gap: 8px 10px; margin: 2px 0 4px; }
-/* 插件多选/布尔开关：胶囊大按钮（对齐 .filter-chip 观感，选中态高亮）。
+/* 插件多选：胶囊大按钮（对齐 .filter-chip 观感，选中态高亮）。
    用 .env-row label.env-chip 提高特异性，压过全局 .modal-content label 的
    display:block + margin-bottom（否则胶囊被拉成整行） */
 .env-row label.env-chip {
@@ -1872,6 +1914,31 @@ body.modal-open { overflow: hidden; }
 .env-row label.env-chip:has(input:checked) {
   background: var(--accent); border-color: var(--accent); color: var(--on-accent);
 }
+/* 布尔开关：appearance:none 复选框自绘轨道，滑块用 ::before；
+   焦点环走全站 :focus-visible（画在轨道上），键盘可达性不丢 */
+.env-row label.env-switch {
+  display: inline-flex; align-items: center; gap: 8px;
+  margin-bottom: 0; cursor: pointer; user-select: none;
+  font-size: 13px; color: var(--text-2);
+}
+label.env-switch input[type="checkbox"] {
+  appearance: none; -webkit-appearance: none;
+  box-sizing: border-box; margin: 0; flex-shrink: 0; position: relative;
+  width: 36px; height: 20px; border-radius: 999px;
+  background: var(--surface-1); border: 1px solid var(--border-strong);
+  cursor: pointer;
+  transition: background var(--dur-2) var(--ease-out), border-color var(--dur-2) var(--ease-out);
+}
+label.env-switch input[type="checkbox"]::before {
+  content: ""; position: absolute; top: 2px; left: 2px;
+  width: 14px; height: 14px; border-radius: 50%;
+  background: var(--surface); box-shadow: var(--shadow);
+  transition: transform var(--dur-2) var(--ease-out);
+}
+label.env-switch input[type="checkbox"]:checked {
+  background: var(--accent); border-color: var(--accent);
+}
+label.env-switch input[type="checkbox"]:checked::before { transform: translateX(16px); }
 .env-secret-input { display: flex; gap: 6px; margin: 4px 0 8px; }
 /* 输入控件对齐现有表单风格（.cat-edit-form input / .modal-content input[type=number]）；
    margin-bottom 显式归零：间距由行内 .env-row .settings-hint 统一控制 */
@@ -1883,27 +1950,24 @@ body.modal-open { overflow: hidden; }
   font-size: 13px; font-family: inherit; background: var(--bg);
   box-sizing: border-box; color: var(--text);
 }
-/* 数值类输入收敛为短框（DB_PATH 等长文本保持全宽） */
-.env-row input[type="number"] { max-width: 180px; }
+/* 短值控件统一 200px（数字与下拉同一宽度，列表左缘节奏一致）；
+   DB_PATH 等长文本保持全宽 */
+.env-row input[type="number"] { max-width: 200px; }
 .env-secret-input input[type="password"] { flex: 1; min-width: 240px; width: auto; }
-/* 行内下拉不叠全局 .settings-select 的大下边距；宽度收敛（全宽过长） */
-.env-row .settings-select { margin-bottom: 0; width: auto; min-width: 240px; }
+/* 行内下拉不叠全局 .settings-select 的大下边距 */
+.env-row .settings-select { margin-bottom: 0; width: 200px; min-width: 0; }
 /* 行内说明不叠全局 .settings-hint 的负上边距（避免与下拉框/输入框重叠） */
 .env-row .settings-hint { margin: 6px 0 10px; }
 /* 密钥区按钮复用轮廓按钮，不随行内输入拉伸 */
 .env-secret-input .settings-outline-btn { flex-shrink: 0; }
-/* 「暂存更改」主按钮：绿色实心，与底部全局「保存」同款强调样式 */
-#env-save {
-  font-size: 13px; padding: 7px 22px; font-weight: 500;
-  background: var(--accent); color: var(--on-accent); border-color: var(--accent);
-}
-#env-save:hover { background: var(--accent-hover); }
 .env-restore {
   margin-top: 6px; font-size: 12px; padding: 2px 10px;
   background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-sm);
   color: var(--text-2); cursor: pointer; font-family: inherit;
 }
 .env-restore:hover { color: var(--accent); border-color: var(--accent); }
+/* 行头内的恢复/替换/清除按钮自带行高，无需上边距 */
+.env-row-head .env-restore { margin-top: 0; }
 
 /* ── 跳到主内容（键盘/读屏用户绕过侧栏导航）── */
 .skip-link {

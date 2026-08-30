@@ -653,6 +653,10 @@ function bindSettingsFormEvents() {
   // "保存"统一应用三类更改：刷新间隔（localStorage）+ 类别草稿 + 会话草稿。
   // 同步进行中时延迟到同步完成后应用（本次同步按旧配置跑，避免数据与配置不一致）。
   $settingsSave.addEventListener("click", async () => {
+    // 「启动配置」面板共用此按钮：语义是写 .env 暂存文件（重启生效），
+    // 不走刷新间隔/类别/会话草稿的保存链路
+    const envActive = !document.querySelector('.settings-panel[data-panel="env"]')?.classList.contains("hidden");
+    if (envActive) { await saveEnvConfig(); return; }
     if (saveBusy) return;
     saveBusy = true;
     $settingsSave.disabled = true;
@@ -691,10 +695,11 @@ function bindSettingsFormEvents() {
 
   $settingsClose.addEventListener("click", closeSettingsModal);
 
-  // 「启动配置」面板：暂存/恢复默认/密钥读写（委托在面板容器上）
+  // 「启动配置」面板：恢复默认/密钥读写/搜索过滤（委托在面板容器上）；
+  // 「保存」复用弹窗底部全局按钮（见 $settingsSave 的面板分流）
   const $envItems = document.getElementById("env-items");
   const $envSecrets = document.getElementById("env-secrets");
-  const $envSave = document.getElementById("env-save");
+  const $envFilter = document.getElementById("env-filter");
   if ($envItems) {
     $envItems.addEventListener("click", (e) => {
       const restore = e.target.closest("[data-env-restore]");
@@ -707,6 +712,9 @@ function bindSettingsFormEvents() {
       const chip = e.target.closest(".env-chip");
       if (chip) chip.classList.toggle("checked", e.target.checked);
     });
+    // 任意控件输入/变更 → 刷新「暂存更改」的差异计数与高亮态
+    $envItems.addEventListener("input", _updateEnvSaveButton);
+    $envItems.addEventListener("change", _updateEnvSaveButton);
   }
   if ($envSecrets) {
     $envSecrets.addEventListener("click", (e) => {
@@ -714,9 +722,21 @@ function bindSettingsFormEvents() {
       if (setBtn) { setEnvSecret(setBtn.dataset.secSet); return; }
       const clearBtn = e.target.closest("[data-sec-clear]");
       if (clearBtn) clearEnvSecret(clearBtn.dataset.secClear);
+      // 「替换」：展开已配置密钥的隐藏输入框（换 key 不必先清除）
+      const replaceBtn = e.target.closest("[data-sec-replace]");
+      if (replaceBtn) {
+        const row = replaceBtn.closest(".env-row");
+        const box = row ? row.querySelector(".env-secret-input") : null;
+        if (box) {
+          box.classList.remove("hidden");
+          const input = box.querySelector("input");
+          if (input) input.focus();
+        }
+        replaceBtn.classList.add("hidden");
+      }
     });
   }
-  if ($envSave) $envSave.addEventListener("click", saveEnvConfig);
+  if ($envFilter) $envFilter.addEventListener("input", _applyEnvFilter);
 
   $settingsModal.addEventListener("click", (e) => {
     if (e.target === $settingsModal) closeSettingsModal();
@@ -4226,15 +4246,18 @@ async function loadEnvConfig() {
   renderEnvConfig();
 }
 
-function _envBadges(item) {
+function _envBadges(item, { skipPluginBadge = false } = {}) {
   const badges = [];
   if (item.staged !== null && item.staged !== undefined) {
     badges.push('<span class="env-badge env-badge-staged">已暂存 · 重启生效</span>');
   }
+  // 「环境变量优先」走默认灰徽章（.env-badge-env 不再有专属配色）：
+  // 它是底层技术细节，不应与「已暂存」这类必须关注的状态抢注意力
   if (item.source === "env") {
     badges.push('<span class="env-badge env-badge-env">环境变量优先</span>');
   }
-  if (item.plugin && item.pluginStatus && item.pluginStatus !== "loaded") {
+  // 组级「未启用」已在分组标题上展示时，行内不再重复
+  if (!skipPluginBadge && item.plugin && item.pluginStatus && item.pluginStatus !== "loaded") {
     badges.push('<span class="env-badge">插件' + esc(item.pluginStatus === "disabled" ? "未启用" : "不可用") + '</span>');
   }
   return badges.join("");
@@ -4246,8 +4269,9 @@ function _envControl(item) {
   const cur = _envInputValue(item);
   const displayValue = cur === null || cur === undefined ? "" : cur;
   if (item.type === "boolean") {
-    return '<label class="env-chip"><input type="checkbox" data-env-key="' + keyAttr + '"'
-      + (cur ? " checked" : "") + "><span>启用</span></label>";
+    // 开关形态：checkbox appearance:none 自绘轨道（CSS），原生勾选状态不丢
+    return '<label class="env-switch"><input type="checkbox" data-env-key="' + keyAttr + '"'
+      + (cur ? " checked" : "") + '><span class="env-switch-text">启用</span></label>';
   }
   if (item.type === "select") {
     const options = Array.isArray(item.options) ? item.options : [];
@@ -4265,7 +4289,8 @@ function _envControl(item) {
     }
     if (!opts.includes("*")) opts.unshift("*");
     return '<div class="env-multi" data-env-key="' + keyAttr + '">'
-      + opts.map(o => '<label class="env-chip"><input type="checkbox" value="' + escAttr(o) + '"'
+      + opts.map(o => '<label class="env-chip' + (current.includes(o) ? " checked" : "") + '">'
+        + '<input type="checkbox" value="' + escAttr(o) + '"'
         + (current.includes(o) ? " checked" : "") + "><span>" + esc(o) + "</span></label>").join("")
       + "</div>";
   }
@@ -4286,84 +4311,140 @@ function _envInputValue(item) {
   return item.staged;
 }
 
+function _groupByPlugin(entries) {
+  const groups = [];
+  const groupMap = new Map();
+  for (const entry of entries) {
+    const group = entry.plugin || "core";
+    if (!groupMap.has(group)) {
+      const item = { name: group, items: [] };
+      groupMap.set(group, item);
+      groups.push(item);
+    }
+    groupMap.get(group).items.push(entry);
+  }
+  return groups;
+}
+
+function _envGroupHead(name, count, { disabled = false } = {}) {
+  const label = name === "core" ? "核心配置" : "插件：" + esc(name);
+  const disabledBadge = disabled ? '<span class="env-badge">未启用</span>' : "";
+  return '<span class="env-group-title">' + label + "</span>" + disabledBadge
+    + '<span class="env-group-count">' + count + " 项</span>";
+}
+
+function _envRowHtml(item, groupDisabled) {
+  const restore = item.staged !== null && item.staged !== undefined
+    ? '<button type="button" class="env-restore" data-env-restore="' + escAttr(item.key) + '">恢复默认</button>'
+    : "";
+  // label 的 title 放原始 ENV KEY，方便对照 .env 文件而不占版面
+  return '<div class="env-row" data-env-key="' + escAttr(item.key) + '">'
+    + '<div class="env-row-head"><label class="env-label" title="' + escAttr(item.key) + '">' + esc(item.label) + "</label>"
+    + _envBadges(item, { skipPluginBadge: groupDisabled }) + restore + "</div>"
+    + _envControl(item)
+    + (item.hint ? '<p class="text-muted settings-hint">' + esc(item.hint) + "</p>" : "")
+    + "</div>";
+}
+
+function _envItemsHtml() {
+  return _groupByPlugin(envData.items).map(group => {
+    // 插件整组未加载/未启用 → 默认折叠（仍可展开预配置），头部徽章示意；
+    // 正文不做容器级 opacity 调光（对比度守卫测试禁止）
+    const disabled = group.name !== "core"
+      && group.items.every(i => i.pluginStatus && i.pluginStatus !== "loaded");
+    return '<details class="env-group"' + (disabled ? "" : " open")
+      + ' data-env-default-open="' + (disabled ? "0" : "1") + '">'
+      // summary 必须挂 env-group-head：挂上后 display:flex 会同时干掉 UA 默认的
+      // list-item 三角标记（漏挂时标记回退到文字左侧、叠在卡片边界上）
+      + '<summary class="env-group-head">' + _envGroupHead(group.name, group.items.length, { disabled }) + "</summary>"
+      + '<div class="env-group-body">'
+      + group.items.map(item => _envRowHtml(item, disabled)).join("")
+      + "</div></details>";
+  }).join("");
+}
+
+function _envSecretRowHtml(s) {
+  const keyringConfigured = s.keyringConfigured !== undefined
+    ? !!s.keyringConfigured
+    : !!s.configured;
+  const state = keyringConfigured
+    ? '<span class="env-badge env-badge-ok">已配置（钥匙串）</span>'
+    : s.configured
+      ? '<span class="env-badge">已配置（环境变量/.env）</span>'
+      : '<span class="env-badge">未配置</span>';
+  // 已配置时输入框藏起但不销毁：「替换」展开它，免去「先清除再输入」的断层
+  const input = '<div class="env-secret-input' + (keyringConfigured ? " hidden" : "") + '">'
+    + '<input type="password" class="env-input" data-sec-input="' + escAttr(s.name) + '" placeholder="输入 ' + esc(s.label) + '" autocomplete="off">'
+    + '<button type="button" class="settings-outline-btn" data-sec-set="' + escAttr(s.name) + '">保存</button></div>';
+  const managed = keyringConfigured
+    ? '<button type="button" class="env-restore" data-sec-replace="' + escAttr(s.name) + '">替换</button>'
+      + '<button type="button" class="env-restore" data-sec-clear="' + escAttr(s.name) + '">清除</button>'
+    : "";
+  return '<div class="env-row"><div class="env-row-head">'
+    + '<label class="env-label">' + esc(s.label) + "</label>" + state + managed + "</div>"
+    + input + "</div>";
+}
+
+function _envSecretsHtml() {
+  return _groupByPlugin(envData.secrets || []).map(group => {
+    // 密钥组无需折叠（每组仅 1-3 项），但同样包卡片并参与搜索过滤的整组显隐
+    return '<div class="env-group">'
+      + '<div class="env-group-head">' + _envGroupHead(group.name, group.items.length) + "</div>"
+      + '<div class="env-group-body">'
+      + group.items.map(_envSecretRowHtml).join("")
+      + "</div></div>";
+  }).join("") || '<p class="text-muted">无</p>';
+}
+
 function renderEnvConfig() {
   const $path = document.getElementById("env-file-path");
   const $items = document.getElementById("env-items");
   const $secrets = document.getElementById("env-secrets");
-  const $save = document.getElementById("env-save");
   if (!envData) {
     if ($items) $items.innerHTML = '<p class="text-muted">加载失败，请刷新页面重试</p>';
-    if ($save) $save.disabled = true;
+    // 全局「保存」无需禁用：saveEnvConfig 对 envData 为空时直接返回
     return;
   }
   if ($path) $path.textContent = "暂存文件：" + envData.filePath;
-  if ($items) {
-    const groups = [];
-    const groupMap = new Map();
-    for (const item of envData.items) {
-      const group = item.plugin || "core";
-      if (!groupMap.has(group)) {
-        const entry = { name: group, items: [] };
-        groupMap.set(group, entry);
-        groups.push(entry);
+  if ($items) $items.innerHTML = _envItemsHtml();
+  if ($secrets) $secrets.innerHTML = _envSecretsHtml();
+  _updateEnvSaveButton();
+}
+
+// 搜索过滤：行级显隐 + 组级整组显隐；details 组在过滤时自动展开命中组，
+// 清空搜索后恢复渲染时的默认展开态
+function _applyEnvFilter() {
+  const $filter = document.getElementById("env-filter");
+  const q = (($filter && $filter.value) || "").trim().toLowerCase();
+  for (const root of [document.getElementById("env-items"), document.getElementById("env-secrets")]) {
+    if (!root) continue;
+    for (const group of root.querySelectorAll(".env-group")) {
+      let visible = 0;
+      for (const row of group.querySelectorAll(".env-row")) {
+        const hit = q === "" || row.textContent.toLowerCase().includes(q);
+        row.classList.toggle("hidden", !hit);
+        if (hit) visible++;
       }
-      groupMap.get(group).items.push(item);
-    }
-    $items.innerHTML = groups.map(group => {
-      const heading = group.name === "core"
-        ? ""
-        : '<h3 class="settings-section env-plugin-heading">插件：' + esc(group.name) + "</h3>";
-      return heading + group.items.map(item => {
-      const restore = item.staged !== null && item.staged !== undefined
-        ? '<button type="button" class="env-restore" data-env-restore="' + escAttr(item.key) + '">恢复默认</button>'
-        : "";
-      return '<div class="env-row" data-env-key="' + escAttr(item.key) + '">'
-        + '<div class="env-row-head"><label class="env-label">' + esc(item.label) + "</label>"
-        + _envBadges(item) + "</div>"
-        + _envControl(item)
-        + (item.hint ? '<p class="text-muted settings-hint">' + esc(item.hint) + "</p>" : "")
-        + restore
-        + "</div>";
-      }).join("");
-    }).join("");
-  }
-  if ($secrets) {
-    const secretGroups = [];
-    const secretGroupMap = new Map();
-    for (const secret of (envData.secrets || [])) {
-      const group = secret.plugin || "core";
-      if (!secretGroupMap.has(group)) {
-        const entry = { name: group, items: [] };
-        secretGroupMap.set(group, entry);
-        secretGroups.push(entry);
+      group.classList.toggle("hidden", visible === 0);
+      if (group instanceof HTMLDetailsElement) {
+        group.open = q === "" ? group.dataset.envDefaultOpen === "1" : visible > 0;
       }
-      secretGroupMap.get(group).items.push(secret);
     }
-    $secrets.innerHTML = secretGroups.map(group => {
-      const heading = group.name === "core"
-        ? ""
-        : '<h3 class="settings-section env-plugin-heading">插件：' + esc(group.name) + "</h3>";
-      return heading + group.items.map(s => {
-      const keyringConfigured = s.keyringConfigured !== undefined
-        ? !!s.keyringConfigured
-        : !!s.configured;
-      const state = keyringConfigured
-        ? '<span class="env-badge env-badge-ok">已配置（钥匙串）</span>'
-        : s.configured
-          ? '<span class="env-badge env-badge-env">已配置（环境变量/.env）</span>'
-          : '<span class="env-badge">未配置</span>';
-      const input = keyringConfigured ? "" : '<div class="env-secret-input">'
-        + '<input type="password" class="env-input" data-sec-input="' + escAttr(s.name) + '" placeholder="输入 ' + esc(s.label) + '" autocomplete="off"> '
-        + '<button type="button" class="settings-outline-btn" data-sec-set="' + escAttr(s.name) + '">保存</button></div>';
-      const clear = keyringConfigured
-        ? '<button type="button" class="env-restore" data-sec-clear="' + escAttr(s.name) + '">清除</button>'
-        : "";
-      return '<div class="env-row"><div class="env-row-head">'
-        + '<label class="env-label">' + esc(s.label) + "</label>" + state + "</div>"
-        + input + clear + "</div>";
-      }).join("");
-    }).join("") || '<p class="text-muted">无</p>';
   }
+}
+
+// 底部全局「保存」按钮的差异数联动：env 面板激活时把未暂存差异追加到文案
+// （保存（N 项））；切到其他面板或无差异时还原为纯「保存」
+function _updateEnvSaveButton() {
+  const $save = document.getElementById("settings-save");
+  if (!$save) return;
+  const envActive = !document.querySelector('.settings-panel[data-panel="env"]')?.classList.contains("hidden");
+  if (!envActive || !envData) {
+    if ($save.textContent !== "保存") $save.textContent = "保存";
+    return;
+  }
+  const n = Object.keys(_collectEnvChanges()).length;
+  $save.textContent = n > 0 ? "保存（" + n + " 项）" : "保存";
 }
 
 function _collectEnvChanges() {
@@ -4381,6 +4462,10 @@ function _collectEnvChanges() {
       if (!el) continue;
       newVal = el.checked;
       oldVal = !!_envInputValue(item);
+      // 与 text/multi 分支对齐：未变化的布尔项不算差异。
+      // 此前缺失该检查——每次「暂存更改」都会把所有布尔项重写进暂存文件，
+      // 且「没有需要暂存的更改」永远不会触发；差异计数也会常驻虚高。
+      if (newVal === oldVal) continue;
     } else if (item.type === "multi") {
       newVal = [...row.querySelectorAll("input:checked")].map(c => c.value);
       const current = _envInputValue(item);
@@ -4756,9 +4841,10 @@ function setSettingsPanel(name) {
   $settingsModal.querySelectorAll(".settings-panel").forEach(p => {
     p.classList.toggle("hidden", p.dataset.panel !== name);
   });
-  // 「启动配置」面板有自己的「暂存更改」按钮（写暂存文件、重启生效），
-  // 与底部全局「保存」（刷新间隔 + 类别/会话草稿）语义不同——隐藏避免误操作
-  document.querySelector(".settings-actions")?.classList.toggle("hidden", name === "env");
+  // 「启动配置」与其他面板共用底部全局「保存」按钮；点击语义按当前面板分流
+  // （env → 写暂存文件，其余 → 刷新间隔 + 类别/会话草稿），差异数由
+  // _updateEnvSaveButton 追加到按钮文案上
+  _updateEnvSaveButton();
 }
 
 async function loadAboutSources() {

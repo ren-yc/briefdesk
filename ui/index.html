@@ -266,7 +266,10 @@
             <h3 class="settings-section">启动配置（.env 暂存）</h3>
             <p class="text-muted settings-hint">修改将暂存到本机配置文件，<strong>重启应用后生效</strong>；密钥走系统钥匙串（见下方），不写入文件。环境变量级配置优先于暂存值。</p>
             <p class="text-muted settings-hint" id="env-file-path"></p>
-            <button id="env-save" class="settings-outline-btn env-save-btn">暂存更改</button>
+            <!-- sticky 工具条：搜索过滤跟随滚动；「保存」统一走弹窗底部全局操作栏 -->
+            <div class="env-toolbar">
+              <input type="search" id="env-filter" class="env-filter" placeholder="搜索配置项…" aria-label="搜索启动配置项">
+            </div>
             <div id="env-items"></div>
             <h3 class="settings-section settings-subsection">密钥（系统钥匙串）</h3>
             <p class="text-muted settings-hint">写入后<strong>重启应用生效</strong>；密钥只存系统钥匙串，服务端不会回传明文。</p>
