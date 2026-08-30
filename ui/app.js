@@ -46,10 +46,17 @@ let stream = null;
 let streamReconnectTimer = null;
 let sseBackoffMs = 2000;        // 重连退避：2s 指数增长至 30s，连接成功即复位
 let streamRefreshDebounceTimer = null;
-let collapseGroups = lsGet("briefdesk.collapseGroups") !== "expanded"; // 默认折叠
-let lastVisibleItems = []; // 最近一次渲染的可见卡（折叠开关切换时重渲染）
+// 列表显示模式：merged=同主体折叠 / group=按来源群聊折叠 / flat=平铺。
+// 旧两态键 briefdesk.collapseGroups（collapsed/expanded）迁移读取后不再写入；
+// 不删除旧键，回滚旧版本时仍能读到上次的折叠偏好
+const legacyCollapseGroups = lsGet("briefdesk.collapseGroups");
+let listMode = lsGet("briefdesk.listMode");
+if (listMode !== "merged" && listMode !== "group" && listMode !== "flat") {
+  listMode = legacyCollapseGroups === "expanded" ? "flat" : "merged"; // 历史默认=折叠
+}
+let lastVisibleItems = []; // 最近一次渲染的可见卡（显示模式切换时重渲染）
 let viewSourceItems = [];   // 当前查询已加载的全部卡片（分页追加/模式切换的渲染基准）
-let groupMap = new Map(); // subject+category → members（当前响应，浮层数据源）
+let groupMap = new Map(); // 合并模式=subject\x01category、按群模式=群名 → members（当前响应，浮层/批量/组高亮数据源）
 let animateOnNextRender = false; // 折叠/展开切换后列表错落浮现（非切换刷新不做动画）
 
 // ── 增量渲染与交互状态 ──
@@ -251,6 +258,7 @@ function preloadSvgIcons() {
   paths.add("/icons/alarm-clock.svg");    // 卡片"提醒"按钮（动态渲染）
   paths.add("/icons/calendar-days.svg");   // 侧边栏"日历"入口（calendar 插件动态注入）
   paths.add("/icons/message-circle.svg");  // 侧边栏"问一问"入口（rag 插件动态注入）
+  paths.add("/icons/users.svg");   // 按群聊折叠块组头图标（动态渲染）
   for (const src of paths) {
     if (_svgCache.has(src)) continue;
     fetch(src)
@@ -817,8 +825,12 @@ function bindItemActionEvents() {
     const btn = e.target.closest("button");
     if (!btn) return;
 
-    // 折叠组入口：打开同主体浮层
+    // 折叠组入口：打开同主体浮层（按群块组头带 data-chat → 打开按群浮层）
     if (btn.classList.contains("group-more-btn")) {
+      if (btn.dataset.chat) {
+        openChatOverlay(btn.dataset.chat);
+        return;
+      }
       openGroupOverlay(btn.dataset.subject, btn.dataset.cat);
       return;
     }
@@ -885,14 +897,14 @@ function bindLightboxEvents() {
 }
 
 function bindCollapseToggleEvents() {
-  // Collapse toggle（折叠/展开分段控制，状态存 localStorage）
+  // Collapse toggle（合并/按群聊/平铺三态分段控制，状态存 localStorage）
   $collapseToggle.addEventListener("click", (e) => {
     const segBtn = e.target.closest(".seg-btn");
     if (!segBtn) return;
-    const wantCollapsed = segBtn.dataset.mode === "collapsed";
-    if (wantCollapsed === collapseGroups) return;
-    collapseGroups = wantCollapsed;
-    lsSet("briefdesk.collapseGroups", collapseGroups ? "collapsed" : "expanded");
+    const wantMode = segBtn.dataset.mode;
+    if (!wantMode || wantMode === listMode) return;
+    listMode = wantMode;
+    lsSet("briefdesk.listMode", listMode);
     updateCollapseToggle(); // 立即同步按钮选中态（不依赖渲染路径，空视图/异常时也即时响应）
     animateOnNextRender = true; // 模式切换 → 列表错落浮现
     renderItems(viewSourceItems, { full: true });
@@ -1514,8 +1526,9 @@ function connectRealtimeStream() {
 }
 
 // ── Fetch ──
-// 当前完整查询的服务端计数，不受前端已加载页数影响。
-let viewCounts = { total: 0, groups: 0 };
+// total/groups 是当前完整查询的服务端计数（不受已加载页数影响）；
+// chatGroups 是按群模式渲染时由前端统计的来源群数（口径=已加载卡片，后端无对应计数）
+let viewCounts = { total: 0, groups: 0, chatGroups: 0 };
 
 // 消费 /api/items 响应中的侧边栏/颜色/状态数据（fetchData 正常路径与
 // 日历模式补拉共用；先设 catColor 再 renderNav——图标派生依赖颜色）
@@ -1779,7 +1792,12 @@ function renderItems(items, { full = false } = {}) {
   updateBlockedHint(blockedVisible.length);
 
   // /api/items 已按全部有效条件分页；此处不再做会改变 offset/总数口径的二次过滤。
-  const out = full ? fullRenderItems(items) : incrementalRenderItems(items);
+  // 按群模式走 full 渲染（多群卡多份渲染 + 群键组块使主体组增量 diff 失效），
+  // 新卡提示链路由 renderByChat 补齐；其余模式维持增量渲染不打断阅读
+  let out;
+  if (full) out = fullRenderItems(items);
+  else if (listMode === "group") out = renderByChat(items);
+  else out = incrementalRenderItems(items);
   updateListCount();
   updateLoadMore();
   updateSubsBadge();
@@ -1796,15 +1814,23 @@ function updateBlockedHint(n) {
   $hint.textContent = `已隐藏 ${n} 条（黑名单）`;
 }
 
-// 头部计数始终是当前完整查询的服务端总数，与已加载页数无关。
+// 头部计数：merged/flat 用当前完整查询的服务端总数（与已加载页数无关）；
+// group 模式无服务端组数口径，用渲染时统计的已加载卡片来源群数
 function updateListCount() {
   if (currentSearch) {
-    const n = collapseGroups ? viewCounts.groups + " 组" : viewCounts.total + " 条";
+    let n;
+    if (listMode === "merged") n = viewCounts.groups + " 组";
+    else if (listMode === "group") n = viewCounts.chatGroups + " 群";
+    else n = viewCounts.total + " 条";
     $listCount.textContent = `关键词「${currentSearch}」命中 ${n}`;
     return;
   }
-  if (collapseGroups) {
+  if (listMode === "merged") {
     $listCount.textContent = "共 " + viewCounts.groups + " 组";
+    return;
+  }
+  if (listMode === "group") {
+    $listCount.textContent = "共 " + viewCounts.chatGroups + " 群";
     return;
   }
   $listCount.textContent = "共 " + viewCounts.total + " 条";
@@ -2203,6 +2229,7 @@ function fullRenderItems(visible) {
   if (visible.length === 0) {
     showEmptyState();
     groupMap.clear(); // 空视图：清陈旧分组，避免浮层打开时渲染已不属于当前视图的成员
+    viewCounts.chatGroups = 0; // 按群口径同步归零，防「共 N 群」读到陈旧值
     updateCollapseToggle(); // 空视图也要同步折叠/平铺按钮态（否则无数据时按钮点击无响应）
     syncOverlayWithData();
     return [];
@@ -2233,6 +2260,27 @@ function viewKeyNow() {
   return JSON.stringify([currentCategory, currentVerified, currentSearch]);
 }
 
+// 按群模式渲染：强制全量重建（多群卡多份渲染 + 群键组块令主体组增量 diff 失效）。
+// fullRenderItems 内部 confirmNewItems 会清空新卡集合 → 渲染后按渲染前 diff 重建
+// 新卡提示链路（组块高亮 / 浮条 / 后台标签页计数与通知），对齐增量渲染路径的体验
+function renderByChat(items) {
+  const oldIds = new Set(currentItems.map(it => String(it.id)));
+  const added = items.filter(it => !oldIds.has(String(it.id)));
+  const addedIds = added.map(it => String(it.id));
+  fullRenderItems(items);
+  if (addedIds.length) {
+    newItemIds = new Set([...newItemIds, ...addedIds]);
+    markNewCards(addedIds); // groupMap 已按群填充 → 多群卡的每一份与所在群块都高亮
+    if (document.hidden) {
+      document.title = "(" + newItemIds.size + ") BRIEFDESK";
+      const addedSet = new Set(addedIds);
+      notifyNewItems(items.filter(it => addedSet.has(String(it.id))));
+    }
+    updateNewItemsBar();
+  }
+  return items;
+}
+
 function saveViewState() {
   if (!currentViewKey) return; // 首次渲染无旧视图
   // 只保存滚动位置：展开状态是卡片的属性（currentExpandedIds 全局共享，跨视图保留）
@@ -2250,14 +2298,16 @@ function restoreScroll() {
 // 恢复本视图此前展开的卡片（引用 + 已缓存的上下文）
 function applyExpandedState() {
   for (const id of currentExpandedIds) {
-    const card = $itemsContainer.querySelector('.item-card[data-id="' + CSS.escape(id) + '"]');
-    if (!card) continue;
-    const quote = card.querySelector(".card-quote");
-    const toggle = card.querySelector(".card-quote-toggle");
-    if (quote && !quote.classList.contains("open")) {
-      quote.classList.add("open");
-      if (toggle) { toggle.setAttribute("aria-expanded", "true"); setQuoteToggleLabel(toggle, true); }
-      expandQuoteContext(card);
+    // 按群模式下同一卡在其每个来源群各渲染一份（data-id 重复）→ 全部恢复
+    const cards = $itemsContainer.querySelectorAll('.item-card[data-id="' + CSS.escape(id) + '"]');
+    for (const card of cards) {
+      const quote = card.querySelector(".card-quote");
+      const toggle = card.querySelector(".card-quote-toggle");
+      if (quote && !quote.classList.contains("open")) {
+        quote.classList.add("open");
+        if (toggle) { toggle.setAttribute("aria-expanded", "true"); setQuoteToggleLabel(toggle, true); }
+        expandQuoteContext(card);
+      }
     }
   }
 }
@@ -2273,6 +2323,7 @@ function syncOverlayWithData() {
 // 列表 HTML：单卡与分组统一按时间倒序排列（时间线单调，日期分隔条才有意义），
 // 插入日期分隔条
 function buildListHtml(visible) {
+  if (listMode === "group") return buildListHtmlByChat(visible);
   const { groups, singles } = groupVisibleItems(visible);
   groupMap.clear();
   const blocks = [];
@@ -2285,12 +2336,17 @@ function buildListHtml(visible) {
     // 只剩一张 → 直接平铺单卡，不显示折叠/分组头 UI
     if (group.members.length < 2) {
       blocks.push({ t: itemTime(rep), html: renderCard(rep, group.key) });
-    } else if (collapseGroups) {
+    } else if (listMode === "merged") {
       blocks.push({ t: itemTime(rep), html: renderCollapsedGroup(group) });
     } else {
       blocks.push({ t: itemTime(rep), html: renderGroupHeader(group) + group.members.map(m => renderCard(m, group.key)).join("") });
     }
   }
+  return renderBlocksHtml(blocks);
+}
+
+// 块按时间降序排序 + 插入日期分隔条（合并/按群两种列表的共用收尾）
+function renderBlocksHtml(blocks) {
   blocks.sort((a, b) => b.t - a.t);
   let html = "";
   let lastLabel = "";
@@ -2352,7 +2408,7 @@ function incrementalRenderItems(visible) {
       insertBlockAtTime(renderCard(g.members[0], g.key), itemTime(g.members[0]));
       addedIds.push(String(g.members[0].id));
     } else {
-      const html = collapseGroups
+      const html = listMode === "merged"
         ? renderCollapsedGroup(g)
         : renderGroupHeader(g) + g.members.map(m => renderCard(m, g.key)).join("");
       insertBlockAtTime(html, itemTime(g.members[0]));
@@ -2458,7 +2514,7 @@ function rebuildGroup(key) {
     insertBlockAtTime(renderCard(g.members[0], key), itemTime(g.members[0]));
     return;
   }
-  const html = collapseGroups
+  const html = listMode === "merged"
     ? renderCollapsedGroup(g)
     : renderGroupHeader(g) + g.members.map(m => renderCard(m, key)).join("");
   insertBlockAtTime(html, itemTime(g.members[0]));
@@ -2648,9 +2704,70 @@ function renderGroupHeader(group) {
     </div>`;
 }
 
+// ── Group by chat（按来源群聊折叠）──
+// 卡片可来自多个群（去重合并，source_group 为 ", " 拼接串）→ 按「每个来源群各出现一次」
+// 展开：同一张卡在其每个来源群的组内各渲染一份，操作同一张卡。分组键 = 群名显示串：
+// 多群卡的第二个群只有显示名、没有会话标识，这是该语义下唯一可行口径（跨源同名群会并组）；
+// 私聊卡的 source_group 是对方昵称，按会话名统一成组（实为"按会话折叠"）。
+function chatGroupsOfSourceGroup(item) {
+  const names = String(item.source_group || "").split(",").map(s => s.trim()).filter(Boolean);
+  return names.length ? names : ["未知来源"];
+}
+
+function groupVisibleItemsByChat(items) {
+  const map = new Map();
+  for (const item of items) {
+    for (const name of chatGroupsOfSourceGroup(item)) {
+      if (!map.has(name)) map.set(name, { key: name, name, members: [] });
+      map.get(name).members.push(item);
+    }
+  }
+  // items 已按 msg_time DESC 排序 → members[0] 即组内最新；组块按组内最新成员时间降序
+  const groups = Array.from(map.values());
+  groups.sort((a, b) => itemTime(b.members[0]) - itemTime(a.members[0]));
+  return groups;
+}
+
+// 按群模式列表 HTML：组内 ≥2 张 → 折叠块（群组头 + 代表卡），单卡群平铺不显组头。
+// groupMap 以群名为键填充 → 浮层/批量整组选择/新卡组高亮/组头半选与合并模式共用同一数据源
+function buildListHtmlByChat(visible) {
+  const groups = groupVisibleItemsByChat(visible);
+  groupMap.clear();
+  const blocks = [];
+  for (const group of groups) {
+    groupMap.set(group.key, group.members);
+    const rep = group.members[0];
+    if (group.members.length < 2) {
+      blocks.push({ t: itemTime(rep), html: renderCard(rep, group.key) });
+    } else {
+      blocks.push({ t: itemTime(rep), html: renderCollapsedGroupByChat(group) });
+    }
+  }
+  viewCounts.chatGroups = groups.length;
+  return renderBlocksHtml(blocks);
+}
+
+function renderCollapsedGroupByChat(group) {
+  const rep = group.members[0];
+  const n = group.members.length;
+  // 批量模式：组是不可分的选择单元，初始渲染即还原整组选中态
+  const allSelected = batchMode && group.members.every(m => selectedIds.has(String(m.id)));
+  // 跨类别组无单一类别色 → 不设 --cat，组块整体回退默认强调色
+  return `
+    <div class="group-collapsed by-chat${allSelected ? " selected" : ""}" data-key="${escAttr(group.key)}" data-msgtime="${itemTime(rep)}" data-chat="${escAttr(group.name)}">
+      <button class="group-more-btn group-head" data-chat="${escAttr(group.name)}" title="${batchMode ? "选择 / 取消选择该群全部卡片（" + n + " 张）" : "查看该群全部卡片"}" aria-label="${escAttr(group.name)}，共 ${n} 条，${batchMode ? "选择或取消选择整组" : "查看全部"}">
+        <img src="/icons/users.svg" class="icon-sm" alt="">
+        <span class="group-subject">${esc(group.name)}</span>
+        <span class="group-count">${n} 条</span>
+        <span class="group-more">${batchMode ? "选择整组" : "查看全部"}<img src="/icons/chevron-right.svg" class="icon-sm chev" alt=""></span>
+      </button>
+      ${renderCard(rep, group.key)}
+    </div>`;
+}
+
 function updateCollapseToggle() {
   if (!$collapseToggle) return;
-  const mode = collapseGroups ? "collapsed" : "expanded";
+  const mode = listMode; // "merged" | "group" | "flat"，与 seg-btn 的 data-mode 同值域
   $collapseToggle.dataset.active = mode; // 驱动 .seg-pill 滑动
   $collapseToggle.querySelectorAll(".seg-btn").forEach((b) => {
     const sel = b.dataset.mode === mode;
@@ -2675,6 +2792,25 @@ function openGroupOverlay(subject, category) {
   pushModalFocus($groupOverlay, { initialFocus: document.getElementById("group-overlay-close") });
   // 恢复上次关闭时的滚动位置
   const saved = overlayScrolls.get(key);
+  if ($groupOverlayContent && saved) $groupOverlayContent.scrollTop = saved;
+}
+
+// 按群浮层：与主体浮层共用 #group-overlay 与 renderOverlayList（overlayKey=群名，
+// groupMap 按群模式下即以群名为键）。群名不是主体 → 标题不带 subject-link、
+// 不设 dataset.subject，标题点击进主体时间线的分支因无 subject 自然跳过
+function openChatOverlay(name) {
+  const members = groupMap.get(name) || [];
+  if (members.length < 2) return;
+  overlayKey = name;
+  overlayNeedsSync = false;
+  $groupOverlayTitle.textContent = name;
+  delete $groupOverlayTitle.dataset.subject; // 对称清理：主体浮层可能先开过
+  $groupOverlayTitle.classList.remove("subject-link");
+  renderOverlayList(name);
+  $groupOverlay.classList.remove("hidden");
+  syncBodyScrollLock();
+  pushModalFocus($groupOverlay, { initialFocus: document.getElementById("group-overlay-close") });
+  const saved = overlayScrolls.get(name);
   if ($groupOverlayContent && saved) $groupOverlayContent.scrollTop = saved;
 }
 

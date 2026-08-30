@@ -884,7 +884,7 @@ body.modal-open { overflow: hidden; }
   padding: var(--space-1) var(--space-6); border-radius: 999px;
 }
 
-/* ── View toggle（折叠/展开分段控制 + 弹性滑动胶囊）── */
+/* ── View toggle（合并/按群聊/平铺三态分段控制 + 弹性滑动胶囊）── */
 .seg {
   position: relative;
   display: inline-flex;
@@ -895,14 +895,15 @@ body.modal-open { overflow: hidden; }
 }
 .seg-pill {
   position: absolute; top: 2px; left: 2px;
-  width: calc(50% - 2px); height: calc(100% - 4px);
+  width: calc(33.333% - 2px); height: calc(100% - 4px); /* 三档位等宽 */
   border-radius: 999px;
   background: var(--accent);
   /* 原写死 rgba(27,94,65,…) 即旧墨绿字面值：主题色一变就不跟随 */
   box-shadow: 0 1px 4px color-mix(in srgb, var(--accent) 28%, transparent);
   transition: transform var(--dur-3) var(--ease-out);
 }
-.seg[data-active="expanded"] .seg-pill { transform: translateX(100%); }
+.seg[data-active="group"] .seg-pill { transform: translateX(100%); }
+.seg[data-active="flat"] .seg-pill { transform: translateX(200%); }
 .seg-btn {
   position: relative; z-index: 1;
   flex: 1 1 0;
@@ -993,6 +994,10 @@ body.modal-open { overflow: hidden; }
 }
 .group-header .group-subject { font-size: 12px; }
 .group-header .group-count { margin-left: auto; }
+
+/* 按群聊折叠块（.by-chat）：跨类别组无单一类别色 → 色条/头底色/文字色
+   均经 --cat 回退链落到默认强调色，无需覆写；仅约束组头图标不被挤压 */
+.group-collapsed.by-chat .group-head img { flex-shrink: 0; }
 
 /* ── 列表切换动画：折叠/展开时卡片错落浮现 ── */
 .rising > * {
