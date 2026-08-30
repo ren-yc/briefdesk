@@ -409,10 +409,15 @@ class DedupEngine(DedupService):
                 )
                 out.append(None)
             else:
-                out.append(bool(res))
+                out.append(None if res is None else bool(res))
         return out
 
-    async def _ask_ai(self, a: CachedItem, b_title: str, b_quote: str) -> bool:
+    async def _ask_ai(self, a: CachedItem, b_title: str, b_quote: str) -> bool | None:
+        """单候选判定；传输异常向上抛（调用方按失败降级），两次输出均
+        无法解析返回 None——None 语义 = 「判定未知」，与 `_parse_same` 的
+        None 及 `_collect_verdicts` 的异常整形一致。绝不能返回 False 冒充
+        明确 DIFF 判定：strong 短路路径会据此剔除候选，把"最强证据从未
+        成立"伪装成"已否证"，令多数票的分母悄然变小（审查回归）。"""
         for attempt in (1, 2):
             try:
                 resp = await chat(
@@ -450,7 +455,7 @@ class DedupEngine(DedupService):
                 resp.choices[0].finish_reason if resp.choices else "empty-choices",
                 content[:200],
             )
-        return False
+        return None
 
     @staticmethod
     def _snapshot(item: CachedItem) -> DedupCandidate:

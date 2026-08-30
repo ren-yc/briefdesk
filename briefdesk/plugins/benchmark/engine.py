@@ -79,7 +79,7 @@ class _ProbeDedupEngine(DedupEngine):
         super().__init__()
         self.ai_calls = 0
 
-    async def _ask_ai(self, a: CachedItem, b_title: str, b_quote: str) -> bool:
+    async def _ask_ai(self, a: CachedItem, b_title: str, b_quote: str) -> bool | None:
         self.ai_calls += 1
         return await super()._ask_ai(a, b_title, b_quote)
 

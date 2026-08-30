@@ -14,7 +14,7 @@ import asyncio
 import json
 import logging
 import time as time_module
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from datetime import UTC, datetime, timedelta
 from typing import Any, Literal, TypedDict
 
@@ -260,8 +260,15 @@ class WeFlowLegacyClient(SourceClient):
                     resp.status_code,
                     fmt_dur(time_module.perf_counter() - start),
                 )
-                if resp.is_success:
-                    data = resp.json()
+                if not resp.is_success:
+                    # 重试响应失败必须走与主路径相同的错误出口：静默保留
+                    # 首次的空 data 会让调用方拿到"成功"的空结果，把上游
+                    # 4xx/5xx 伪装成正常翻页终止（审查回归）
+                    raise RuntimeError(
+                        f"WeFlow API error: {resp.status_code} on {path} (retry)"
+                        f" — {resp.text[:200]}"
+                    )
+                data = resp.json()
 
         return data
 
@@ -512,25 +519,36 @@ class WeFlowLegacyClient(SourceClient):
             media: 是否导出媒体（图片等），为 True 时附加 media=1&image=1
             retry_on_empty: 空结果是否 500ms 后重试一次（回查链路应传 False；
                 轮询首页保留默认 True 以维持既有「刚入库查不到」竞态兜底）
+
+        查询参数经 params= 由 httpx 编码（与 weflow/qqflow 客户端一致）：
+        会话 ID 拼进查询串时若含保留字符（&、=、# 等）手拼会产生错误请求。
         """
-        qs = f"talker={talker}&limit={limit}&offset={offset}"
+        params: dict[str, Any] = {"talker": talker, "limit": limit, "offset": offset}
         if start_ts is not None:
-            qs += f"&start={start_ts}"
+            params["start"] = start_ts
         if media:
-            qs += "&media=1&image=1"
+            params["media"] = 1
+            params["image"] = 1
         data: WeFlowLegacyMessagesResponse = await self._get(
-            f"/api/v1/messages?{qs}", retry_on_empty=retry_on_empty
+            "/api/v1/messages", params=params, retry_on_empty=retry_on_empty
         )
         return data
 
     # ── SSE 流 ──
 
-    async def stream_events(self) -> AsyncIterator[WeFlowLegacyEvent]:
+    async def stream_events(
+        self, on_connected: Callable[[], None] | None = None
+    ) -> AsyncIterator[WeFlowLegacyEvent]:
         """SSE 实时消息流 — 异步迭代器，持续产出解析后的 JSON 事件。
 
         用法:
             async for event in client.stream_events():
                 process(event)
+
+        Args:
+            on_connected: 连接建立（HTTP 响应就绪）即调用——legacy 上游无
+                ready 帧，监听器的重连退避计数复位依赖此回调而非首个事件
+                （空闲群可能长时间无事件）。
         """
         logger.debug("SSE 连接中...")
         self.connection_status = "reconnecting"
@@ -561,6 +579,8 @@ class WeFlowLegacyClient(SourceClient):
 
                     logger.info("SSE 已连接")
                     self.connection_status = "online"
+                    if on_connected is not None:
+                        on_connected()
 
                     buffer = ""
                     async for line in resp.aiter_lines():

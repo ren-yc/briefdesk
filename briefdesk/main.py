@@ -6,6 +6,7 @@ briefdesk/plugin/manager.py —— 消息源为内置插件（weflow-legacy/qqfl
 """
 
 import asyncio
+import contextlib
 import logging
 import signal
 import sys
@@ -22,6 +23,7 @@ from briefdesk.db import (
     close_db,
     get_db,
     purge_expired_ignored,
+    storage_lock,
     upsert_session,
 )
 from briefdesk.events import event_bus
@@ -64,6 +66,9 @@ async def _refresh_all(sources: list[SourceRuntime]) -> None:
     """并行刷新全部消息源会话；结果统一落库（源不写库）。
 
     单个源刷新失败不影响其它源的会话结果落库。
+    网络拉取（refresh_sessions）在存储锁外；会话落库与全应用写路径共用
+    storage_lock 串行化——单连接隐式事务下锁外 commit 会把管道未完成的
+    多步写一并提交（部分写入提前可见），见 db.storage_lock 注释。
     """
     results = await asyncio.gather(
         *(s.refresh_sessions() for s in sources), return_exceptions=True
@@ -72,15 +77,16 @@ async def _refresh_all(sources: list[SourceRuntime]) -> None:
         if isinstance(sessions, BaseException):
             logger.error("[%s] 会话刷新失败: %s", source.name, sessions)
             continue
-        for s in sessions:
-            await upsert_session(
-                s.source,
-                s.session_id,
-                s.name,
-                s.is_group,
-                s.is_official,
-                last_active_at=s.last_active_at or None,
-            )
+        async with storage_lock:
+            for s in sessions:
+                await upsert_session(
+                    s.source,
+                    s.session_id,
+                    s.name,
+                    s.is_group,
+                    s.is_official,
+                    last_active_at=s.last_active_at or None,
+                )
 
 
 def _start_listener(s: SourceRuntime) -> None:
@@ -286,8 +292,9 @@ async def _run() -> None:
 
         # 6. 注册优雅关闭信号
         # Ctrl+C 触发优雅关闭（SSE 流结束 → should_exit），uvicorn 正常收尾后
-        # await server_task 返回。若信号处理未生效（如异常路径），
-        # KeyboardInterrupt 由顶层兜底。
+        # await server_task 返回。安装前的启动窗口期若按 Ctrl+C，KeyboardInterrupt
+        # 从 run_until_complete 逃逸，由 main() 取消 main_task 并驱动事件循环
+        # 把本函数的 finally（唯一清理点）跑完。
 
         def _shutdown() -> None:
             """Ctrl+C 优雅关闭：让 SSE 流主动结束，再让 uvicorn 走正式退出通道。
@@ -314,6 +321,14 @@ async def _run() -> None:
         # 正常退出与异常路径都必达，顺序见 finally 内注释）。
         await server_task
     finally:
+        # uvicorn 的 capture_signals 在 serve() 退出时把信号 handler 还原为
+        # serve 前的默认值——清理阶段（本 finally）再按 Ctrl+C 会以
+        # KeyboardInterrupt 打断清理 await（close_db 未执行完 → aiosqlite
+        # 非 daemon worker 线程挂死）。清理期间忽略 SIGINT/SIGTERM 保证
+        # 跑完；确需强杀可关终端 / 任务管理器。
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            with contextlib.suppress(OSError, ValueError):  # 非主线程等场景防御
+                signal.signal(sig, signal.SIG_IGN)
         shutdown_start = time_module.perf_counter()
         # 清理顺序即下方语句序：server → initial_sync → 插件逆序 → DB → 残留兜底。
         # cancel 不同步等待、aiosqlite 非 daemon 线程等陷阱见 docs/architecture.md
@@ -344,9 +359,21 @@ def main() -> None:
     setup_logging()
     loop = asyncio.new_event_loop()
     try:
-        loop.run_until_complete(_run())
-    except KeyboardInterrupt:
-        pass
+        main_task = loop.create_task(_run(), name="briefdesk-main")
+        try:
+            loop.run_until_complete(main_task)
+        except KeyboardInterrupt:
+            # 启动窗口期（信号 handler 在 server.started 后才安装）的 Ctrl+C：
+            # _run 协程仍挂在 await 点上，直接退出会跳过其 finally（teardown_all
+            # / close_db 是唯一清理点），aiosqlite 非 daemon worker 线程令解释器
+            # 退出挂死。取消任务并继续驱动事件循环，让清理跑完；循环以
+            # main_task.done() 收口，清理中途再按 Ctrl+C 也不丢清理。
+            main_task.cancel()
+            while not main_task.done():
+                try:
+                    loop.run_until_complete(main_task)
+                except (KeyboardInterrupt, asyncio.CancelledError):
+                    pass
     finally:
         loop.close()
 

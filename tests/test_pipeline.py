@@ -1080,6 +1080,33 @@ class ConversationMergeStageTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("运费aa", rows[0]["source_quote"])
         self.assertEqual(rows[0]["msg_time"], 180)
 
+    async def test_merge_inherits_article_url_from_absorbed_card(self):
+        # 审查回归：被吸收卡的原文链接不得随合并消失（存活卡无链接时继承）
+        await self._seed_cand("c1", 100, title="讲座预告", quote="讲座预告")
+        msg = InternalMessage(
+            msg_id="m2",
+            content="讲座地点在B栋",
+            sender_name="A",
+            sender_id="u",
+            session_id="s1",
+            group_name="g",
+            timestamp=180,
+            source="weflow-legacy",
+            article_url="https://example.com/b",
+        )
+        result = ClassifyResult(
+            msg_index=0, category="交易", summary="讲座地点",
+            key_info="", quote="讲座地点在B栋",
+        )
+        merged, _ = await self._store(msg, result, True)
+        self.assertEqual(merged, 1)
+        cursor = await self.db.execute("SELECT id, article_url FROM items")
+        rows = await cursor.fetchall()
+        self.assertEqual(len(rows), 1)
+        # 存活卡 = 最早头卡 c1；其自身无链接时继承被吸收卡的链接
+        self.assertEqual(rows[0]["id"], "c1")
+        self.assertEqual(rows[0]["article_url"], "https://example.com/b")
+
     async def test_judge_false_keeps_both(self):
         await self._seed_cand("c1", 100, title="塔卡沙a6方格40页团购")
         msg = self._msg("m2", 180, "5本小红书现拍，45")

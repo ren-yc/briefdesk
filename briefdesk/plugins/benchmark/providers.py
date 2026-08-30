@@ -19,6 +19,7 @@ get_embed_db 两个模块级入口临时替换为指向临时库的连接（引�
 from __future__ import annotations
 
 import asyncio
+import logging
 import shutil
 import uuid
 from collections.abc import AsyncIterator
@@ -27,10 +28,12 @@ from pathlib import Path
 
 import aiosqlite
 
-from briefdesk import ai_ports
+from briefdesk import ai_ports, announcements
 from briefdesk.db import init_schema
 from briefdesk.plugins.ai_provider.engine import Provider
 from briefdesk.plugins.benchmark.schema import CategoryDef
+
+logger = logging.getLogger(__name__)
 
 # 临时库根目录：插件包内 .tmp（gitignore），沙箱/受限环境可写；每次运行在其
 # 下建唯一子目录，退出只删子目录。
@@ -87,6 +90,16 @@ async def bench_environment(
         # 实时消息不入库也不标 processed，延后到下轮回填自然恢复。
         # 置于 try 内保证任何后续失败都走 finally 的复位与子目录清理。
         pipeline.set_processing_paused(True)
+        try:
+            await announcements.announce(
+                "benchmark_running",
+                "warning",
+                "基准运行中：生产管道已暂停，UI 写操作（备忘/忽略/改分类/"
+                "提醒等）将落在临时基准库并在运行结束后丢弃，请勿在此期间"
+                "操作界面。",
+            )
+        except Exception:  # 公告失败不阻断基准运行
+            logger.debug("基准公告发布失败", exc_info=True)
         if categories:
             await _replace_categories(main_conn, categories)
 
@@ -104,6 +117,10 @@ async def bench_environment(
     finally:
         # 顺序约束：先复位管道标志，再还原 DB 入口补丁（两者之间无 await 点，
         # 事件循环内原子，不存在"管道已放行而补丁未还原"的窗口）。
+        try:
+            await announcements.revoke("benchmark_running")
+        except Exception:  # 撤销失败不影响环境还原
+            logger.debug("基准公告撤销失败", exc_info=True)
         pipeline.set_processing_paused(False)
         briefdesk_db.get_db = old_get_db  # type: ignore[assignment]
         briefdesk_db.get_embed_db = old_get_embed_db  # type: ignore[assignment]

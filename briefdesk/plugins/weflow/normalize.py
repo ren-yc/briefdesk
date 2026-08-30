@@ -205,6 +205,13 @@ async def normalize_sse(
                 "成功" if image_urls else "无可用媒体路径",
             )
 
+    # 回查未命中/媒体元数据非图片：纯占位符消息无信息价值，整条丢弃——
+    # 与 REST 路径「无 media.url 的图片消息整条丢弃」及 qqflow pre_filter
+    # 语义对齐；旧实现放行为纯文本 "[图片]"，会产生噪音卡片（审查回归）
+    if content.strip() == "[图片]" and not image_urls:
+        logger.debug("SSE rawid=%s: 图片回查未命中，丢弃纯占位符消息", rawid)
+        return []
+
     # 文章卡片：拆条解析（公众号推送与群聊转发同格式）
     if _is_appmsg_content(content):
         articles = parse_appmsg_xml(content)

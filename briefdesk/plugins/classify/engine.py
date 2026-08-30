@@ -224,19 +224,26 @@ def _image_data_url(data: bytes) -> str:
     return "data:image/jpeg;base64," + base64.b64encode(data).decode("ascii")
 
 
-def _build_image_parts(groups: list[dict]) -> list[dict]:
+def _build_image_parts(groups: list[dict], excluded: set[int] | None = None) -> list[dict]:
     """为含图消息构建多模态 content parts（追加在文本 part 之后的图片段）。
 
     每条含图消息前插入标注 text part 显式关联输入行 index；单条消息按
     AI_VISION_MAX_IMAGES 截断，整批按 _MAX_IMAGES_PER_REQUEST 截断（超预算
-    的消息该轮只发 OCR 文本）。全批无可用图片返回空列表，调用方据此维持
-    纯文本 str 请求（字节级行为不变）。
+    的消息该轮只发 OCR 文本）。`excluded` 为字符预算剔除的消息 index 集合：
+    这些消息不在文本数据区里，附图并标注「消息 N 附图」会邀请 AI 对一个
+    不存在的输入行分类——该 index 已在调用方并入 failed 重试，图文同发会
+    产生 index 同时出现在 results 与 failed 的矛盾结果（审查回归），必须
+    一并跳过。全批无可用图片返回空列表，调用方据此维持纯文本 str 请求
+    （字节级行为不变）。
     """
     per_msg_cap = config.ai_vision_max_images
     budget = _MAX_IMAGES_PER_REQUEST
+    dropped = excluded or set()
     parts: list[dict] = []
     for group in groups:
         for msg in group["messages"]:
+            if msg["index"] in dropped:
+                continue
             images = msg.get("images") or []
             if not images:
                 continue
@@ -1036,7 +1043,7 @@ async def _classify_once(
 ) -> ClassifyOutcome:
     groups = _group_messages(messages, vision_images)
     user_message, budget_dropped = _build_user_message_ex(groups)
-    image_parts = _build_image_parts(groups)
+    image_parts = _build_image_parts(groups, set(budget_dropped))
     had_images = bool(image_parts)
     fell_back = False
 

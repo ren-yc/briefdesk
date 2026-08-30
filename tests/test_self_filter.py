@@ -284,7 +284,8 @@ class WeflowPollerSelfDropTest(unittest.IsolatedAsyncioTestCase):
             return [{"id": "g1", "name": "群", "type": "group"}]
 
         async def fetch_messages(
-            self, talker, start_ts, limit=500, offset=0, media=False
+            self, talker, start_ts, limit=500, offset=0, media=False,
+            retry_on_empty=True,
         ):
             return {"messages": self._messages, "hasMore": False}
 

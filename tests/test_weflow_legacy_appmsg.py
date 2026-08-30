@@ -364,5 +364,51 @@ class PollerPlaceholderLookbackTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(result.messages), 2, "部分处理仍产出全部拆条，由 pipeline 过滤")
 
 
+class NormalizeSseImageDropTest(unittest.IsolatedAsyncioTestCase):
+    """审查回归：SSE [图片] 回查未命中时整条丢弃——旧实现放行纯文本
+    "[图片]" 进 AI 分类产生噪音卡，与 REST 路径「无 media.url 丢弃」
+    语义不对齐。命中时剥离查询串（旧 access_token 不入 image_urls）。"""
+
+    async def test_lookup_miss_drops_placeholder(self):
+        class _NoMediaClient:
+            async def fetch_message_media(self, session_id, rawid, ts):
+                return None
+
+        msgs = await normalize_sse(
+            {
+                "event": "message.new",
+                "rawid": "r1",
+                "sessionId": "g",
+                "sourceName": "张三",
+                "content": "[图片]",
+                "timestamp": 1,
+            },
+            _NoMediaClient(),
+        )
+        self.assertEqual(msgs, [])
+
+    async def test_lookup_hit_keeps_image_and_strips_query(self):
+        class _HitClient:
+            async def fetch_message_media(self, session_id, rawid, ts):
+                return (
+                    "http://127.0.0.1:5031/api/v1/media/g/images/abc.jpg"
+                    "?access_token=stale-token"
+                )
+
+        msgs = await normalize_sse(
+            {
+                "event": "message.new",
+                "rawid": "r1",
+                "sessionId": "g",
+                "sourceName": "张三",
+                "content": "[图片]",
+                "timestamp": 1,
+            },
+            _HitClient(),
+        )
+        self.assertEqual(len(msgs), 1)
+        self.assertEqual(msgs[0].image_urls, ["g/images/abc.jpg"])
+
+
 if __name__ == "__main__":
     unittest.main()

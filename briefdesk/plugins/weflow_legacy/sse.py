@@ -137,11 +137,18 @@ class WeFlowLegacySseClient(
     async def _listen(self) -> None:
         logger.info("SSE 连接中... (第 %d 次)", self._reconnect_attempt + 1)
 
-        async for event in self._weflow.stream_events():
+        async for event in self._weflow.stream_events(
+            on_connected=self._on_connected
+        ):
             if not self._running:
                 break
-            self._reconnect_attempt = 0
             await self._handle_event(event)
+
+    def _on_connected(self) -> None:
+        # 退避计数在连接成功时复位（经 stream_events 的 on_connected 回调）：
+        # legacy 上游无 ready 帧，复位挂在首个事件上会让空闲群每次成功重连
+        # 后退避再翻倍，实时恢复延迟逐次爬到 reconnect_max（审查回归）
+        self._reconnect_attempt = 0
 
     async def _handle_event(self, event: WeFlowLegacyEvent) -> None:
         self._stats_events += 1

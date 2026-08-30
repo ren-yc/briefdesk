@@ -192,6 +192,9 @@ async def poll(
                     limit=_PAGE_LIMIT,
                     offset=offset,
                     media=True,
+                    # 首页保留「刚入库查不到」竞态兜底；翻页空结果即末页，
+                    # 再重试只会给每个空闲会话固定加 500ms 串行延迟
+                    retry_on_empty=page == 0,
                 )
                 page_msgs = resp.get("messages", [])
                 if not page_msgs:

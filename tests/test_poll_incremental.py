@@ -70,7 +70,7 @@ class _WeFlowLegacyClient:
 
     async def fetch_messages(
         self, talker: str, start_ts: int | None, limit: int = 500, offset: int = 0,
-        media: bool = False,
+        media: bool = False, retry_on_empty: bool = True,
     ) -> dict:
         self.calls.append((talker, start_ts, offset, media))
         page = self._messages[offset : offset + limit]

@@ -67,7 +67,8 @@ def _split_batches(
 async def _mark_skipped(bctx: BatchContext, failed_set: set[int]) -> None:
     """未选中且非失败的消息标记 processed（闲聊跳过）；无分类结果时全批标记。
 
-    被滤自消息不标记 processed（回填窗口内每轮重滤、关闭 IGNORE_SELF 可恢复）。
+    被滤自消息不标记 processed（与纯占位符图片同语义，见下方入口过滤注释
+    ——可恢复需重新停用/启用会话清水位或调大回填窗口，而非"自动重拉"）。
     """
     outcome = bctx.outcomes
     if outcome is None or not outcome.results:
@@ -149,9 +150,12 @@ async def process_all_batches(
             logger.info("%s 过滤自己发送: %d 条", origin, self_filtered)
 
     # OCR 未启用（enrich 槽位为空）时纯占位符图片消息无信息价值：不落 raw、
-    # 不进分类、不标记 processed——OCR 重新启用后回填窗口内自动重拉重处理
-    # （与 IGNORE_SELF 过滤同语义，可逆）。图片+文字混合消息（content 非
-    # 占位符）不受影响：文字仍有信息价值，照常处理。
+    # 不进分类、不标记 processed。图片+文字混合消息（content 非占位符）不受
+    # 影响：文字仍有信息价值，照常处理。
+    # ⚠️ 可恢复性的真实边界：这些消息不落 raw_messages，钉窗机制看不到它们，
+    # 而本轮全滤后水位照常推进——重新启用 OCR 并不会"自动重拉"；要找回这批
+    # 消息需重新停用/启用会话（清水位触发 BACKFILL_HOURS 回填）或临时将
+    # BACKFILL_HOURS 设为 -1 全量回填。
     # 判定正则单源见 briefdesk.masking.PLACEHOLDER_ONLY_RE。
     enrich_stages = get_stages("enrich")
     images_filtered = 0

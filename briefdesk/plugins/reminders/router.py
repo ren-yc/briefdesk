@@ -10,6 +10,7 @@ from briefdesk.db import (
     get_due_reminders,
     get_items_verified_flags,
     set_item_reminder,
+    storage_lock,
 )
 
 router = APIRouter()
@@ -43,7 +44,11 @@ async def set_reminder(item_id: str, body: dict):
         remind_at = dt.strftime("%Y-%m-%d %H:%M")
     else:
         raise HTTPException(400, "at must be a string or null")
-    if not await set_item_reminder(item_id, remind_at):
+    # 写路径与 pipeline 共用存储锁串行化：set_item_reminder 是 UPDATE+commit，
+    # 锁外 commit 会把管道未完成的多步写一并提交（部分写入提前可见）
+    async with storage_lock:
+        updated = await set_item_reminder(item_id, remind_at)
+    if not updated:
         raise HTTPException(404, "Item not found")
     return {"success": True, "remind_at": remind_at}
 

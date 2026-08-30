@@ -278,7 +278,14 @@ class BatchBuffer:
             batch = self._buffer[:]
             self._buffer.clear()
             self._log_flush(batch)
-            await self._on_flush(batch)
+            try:
+                await self._on_flush(batch)
+            except Exception:
+                # 与 _safe_flush 同口径：异常记日志不上抛（残余消息未标
+                # processed，由回填窗口重试恢复）。若上抛，下方 in-flight
+                # 等待会被跳过——teardown 继续推进（close_db 等），先前
+                # in-flight 批可能撞上已关闭的 DB（审查回归）
+                logger.exception("关停冲刷失败（%d 条，下轮回填重试）", len(batch))
         pending = [t for t in self._inflight if not t.done()]
         if pending:
             await asyncio.gather(*pending, return_exceptions=True)

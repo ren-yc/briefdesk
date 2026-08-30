@@ -144,7 +144,7 @@ def _export_attachment(content: str, media_type: str, filename: str) -> Response
 
 # 公式注入前缀：Excel/LibreOffice 会把以此开头的单元格当公式执行（CSV injection；
 # 审计 #9 补充：\r 开头同样可能被表格应用解释，一并纳入）
-_CSV_FORMULA_PREFIXES = ("=", "+", "-", "@", "\t", "\r")
+_CSV_FORMULA_PREFIXES = ("=", "+", "-", "@", "\t", "\r", "\n")
 
 
 def _csv_cell(value: object) -> object:
@@ -292,7 +292,11 @@ async def api_restore(file: Annotated[UploadFile, File()]):
     采用"重启生效"而非运行中热替换：避免 dedup 内存缓存 / processed
     状态与新文件不一致，实现与安全都最简。
     """
-    fd, tmp = tempfile.mkstemp(suffix=".sqlite")
+    # 临时文件必须落在库文件同目录：os.replace 不允许跨文件系统，系统临时目录
+    # 与 DB_PATH 跨盘（Windows 上典型）时必然 WinError 17，恢复功能整体不可用
+    fd, tmp = tempfile.mkstemp(
+        suffix=".sqlite", dir=os.path.dirname(os.path.abspath(str(config.db_path)))
+    )
     os.close(fd)
     total = 0
     chunks: list[bytes] = []
@@ -354,7 +358,11 @@ async def api_recategorize(item_id: str, body: dict):
         raise HTTPException(400, "category is required")
     if not await category_exists(category):
         raise HTTPException(400, f"未知或未启用的类别: {category}")
-    row = await update_item_category(item_id, category)
+    # 与 pipeline 共用存储锁：update_item_category 是读-改-写多步事务
+    # （UPDATE items + INSERT recat_log），锁外 commit 会把管道未完成的
+    # 多步写一并提交（部分写入提前可见）——与 api_verify 同理由
+    async with storage_lock:
+        row = await update_item_category(item_id, category)
     if row is None:
         raise HTTPException(404, "Item not found")
     return {"success": True, "item": row}
@@ -423,7 +431,10 @@ async def api_toggle_session(source: str, session_id: str):
 
 @app.post("/api/sessions/refresh")
 async def api_refresh_sessions():
-    """刷新群聊列表：重新从消息源拉取会话并写库。"""
+    """刷新群聊列表：重新从消息源拉取会话并写库。
+
+    会话落库在回调内部持存储锁执行（网络拉取在锁外），与 pipeline 写路径串行化。
+    """
     cb = _callbacks._refresh_sessions_callback
     if cb is None:
         raise HTTPException(503, "Refresh sessions callback not registered")

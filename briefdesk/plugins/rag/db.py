@@ -1,6 +1,6 @@
-"""RAG 库层 — rag_chunks / rag_chunk_embeddings / rag_fts 三表数据访问。
+"""RAG 库层 — rag_chunks / rag_chunk_embeddings / rag_fts / rag_skipped 四表数据访问。
 
-rag 三表是 raw_messages 的派生索引：插件自管建表（不在核心 EXPECTED_SCHEMA
+rag 表是 raw_messages 的派生索引：插件自管建表（不在核心 EXPECTED_SCHEMA
 内，validate_schema 取交集校验不受影响），不复制事实源语义，可随时重建。
 所有函数接受显式连接（生产传核心 get_db()/get_embed_db()，测试传内存库）；
 游标纪律：try/finally close、executemany 后必须 close 再继续。
@@ -86,6 +86,15 @@ _SCHEMA = [
         key   TEXT PRIMARY KEY,
         value TEXT NOT NULL
     )""",
+    # 「永不入索引」记账（纯占位符内容）：这些行永远满足回填反连接
+    # （rag_chunks 无对应行）却永远不被消费，不记账会让它们每轮重新
+    # 占满 LIMIT 预算窗口，令更早的真实消息饿死（审查回归）。
+    # raw_messages 内容不可变，跳过判定跨模型/重建恒成立，无需失效机制。
+    """CREATE TABLE IF NOT EXISTS rag_skipped (
+        source     TEXT NOT NULL,
+        msg_id     TEXT NOT NULL,
+        PRIMARY KEY (source, msg_id)
+    )""",
 ]
 
 
@@ -110,6 +119,25 @@ async def set_meta(db: aiosqlite.Connection, key: str, value: str) -> None:
         "INSERT INTO rag_meta(key, value) VALUES(?, ?) "
         "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
         (key, value),
+    )
+    await cursor.close()
+    await db.commit()
+
+
+# ---------------------------------------------------------------- skipped --
+
+
+async def mark_skipped(db: aiosqlite.Connection, keys: list[tuple[str, str]]) -> None:
+    """登记「永不入索引」的行（纯占位符内容），令回填反连接跳过它们。
+
+    跳过判定由引擎 `_indexable`（masking.PLACEHOLDER_ONLY_RE 单源）作出；
+    raw_messages 内容不可变，登记恒成立。
+    """
+
+    if not keys:
+        return
+    cursor = await db.executemany(
+        "INSERT OR IGNORE INTO rag_skipped(source, msg_id) VALUES(?, ?)", keys
     )
     await cursor.close()
     await db.commit()
@@ -413,34 +441,64 @@ async def count_status(db: aiosqlite.Connection) -> dict[str, object]:
 async def gc_orphans(
     db: aiosqlite.Connection, embed_db: aiosqlite.Connection | None = None
 ) -> int:
-    """三表对账清理：不在 raw_messages 中的索引行级联清除。
+    """对账清理：不在 raw_messages/chunks 中的索引行级联清除。
 
     类别删除会级联清 raw_messages 但不发事件（最终一致），维护循环与
     reindex 经此对账。embed_db 提供时向量表在专用连接上清理（与核心
     get_embed_db 隔离约定一致；跨连接子查询读的是同库已提交快照，安全）。
-    返回清理的总行数。
+    rag_skipped 一并对账（其宿主 raw 行消失后登记失去意义）。
+    返回清理的总行数：先 COUNT 后 DELETE 显式计数——total_changes 差值
+    会把共享连接上其它协程的无关写入一并计入，显著夸大返回值（审查回归）。
     """
 
-    before = db.total_changes
-    cursor = await db.execute(
-        "DELETE FROM rag_chunks WHERE NOT EXISTS ("
+    removed = 0
+    orphan_pred_chunks = (
+        " WHERE NOT EXISTS ("
         "SELECT 1 FROM raw_messages r WHERE r.source = rag_chunks.source "
         "AND r.msg_id = rag_chunks.msg_id)"
     )
+    row = await fetch_one(db, "SELECT COUNT(*) AS c FROM rag_chunks" + orphan_pred_chunks)
+    removed += int(row["c"]) if row else 0
+    cursor = await db.execute("DELETE FROM rag_chunks" + orphan_pred_chunks)
     await cursor.close()
     # FTS 表惰性可选（纯向量模式下不存在），GC 先探测再清理
     if await get_meta(db, "fts_tokenizer"):
+        row = await fetch_one(
+            db,
+            "SELECT COUNT(*) AS c FROM rag_fts WHERE NOT EXISTS ("
+            "SELECT 1 FROM rag_chunks c WHERE c.source = rag_fts.source "
+            "AND c.msg_id = rag_fts.msg_id)",
+        )
+        removed += int(row["c"]) if row else 0
         cursor = await db.execute(
             "DELETE FROM rag_fts WHERE NOT EXISTS ("
             "SELECT 1 FROM rag_chunks c WHERE c.source = rag_fts.source "
             "AND c.msg_id = rag_fts.msg_id)"
         )
         await cursor.close()
+    row = await fetch_one(
+        db,
+        "SELECT COUNT(*) AS c FROM rag_skipped WHERE NOT EXISTS ("
+        "SELECT 1 FROM raw_messages r WHERE r.source = rag_skipped.source "
+        "AND r.msg_id = rag_skipped.msg_id)",
+    )
+    removed += int(row["c"]) if row else 0
+    cursor = await db.execute(
+        "DELETE FROM rag_skipped WHERE NOT EXISTS ("
+        "SELECT 1 FROM raw_messages r WHERE r.source = rag_skipped.source "
+        "AND r.msg_id = rag_skipped.msg_id)"
+    )
+    await cursor.close()
     await db.commit()
-    removed = db.total_changes - before
     if embed_db is not None:
         # 向量表在专用连接清理：不与主连接上管道/删除路径的半程事务互相提交
-        embed_before = embed_db.total_changes
+        row = await fetch_one(
+            embed_db,
+            "SELECT COUNT(*) AS c FROM rag_chunk_embeddings WHERE NOT EXISTS ("
+            "SELECT 1 FROM rag_chunks c WHERE c.source = rag_chunk_embeddings.source "
+            "AND c.msg_id = rag_chunk_embeddings.msg_id)",
+        )
+        removed += int(row["c"]) if row else 0
         cursor = await embed_db.execute(
             "DELETE FROM rag_chunk_embeddings WHERE NOT EXISTS ("
             "SELECT 1 FROM rag_chunks c WHERE c.source = rag_chunk_embeddings.source "
@@ -448,5 +506,4 @@ async def gc_orphans(
         )
         await cursor.close()
         await embed_db.commit()
-        removed += embed_db.total_changes - embed_before
     return removed

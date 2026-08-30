@@ -149,6 +149,7 @@ class MergePlugin(StagePlugin):
                         "extra_times": cand.get("extra_times") or "",
                         "msg_time": cand["msg_time"],
                         "image_urls": cand["image_urls"] or "",
+                        "article_url": cand.get("article_url") or "",
                     }
                     absorb = {
                         "id": row.item_id,
@@ -165,6 +166,7 @@ class MergePlugin(StagePlugin):
                             if row.msg.image_urls
                             else ""
                         ),
+                        "article_url": row.msg.article_url or "",
                     }
                 else:
                     survive = {
@@ -183,6 +185,7 @@ class MergePlugin(StagePlugin):
                             if row.msg.image_urls
                             else ""
                         ),
+                        "article_url": row.msg.article_url or "",
                     }
                     absorb = {
                         "id": cand["id"],
@@ -195,6 +198,7 @@ class MergePlugin(StagePlugin):
                         "extra_times": cand.get("extra_times") or "",
                         "msg_time": cand["msg_time"],
                         "image_urls": cand["image_urls"] or "",
+                        "article_url": cand.get("article_url") or "",
                     }
                 merged_quote = _merge_quote([survive["quote"], absorb["quote"]])
                 merged_title = survive["title"]
@@ -241,6 +245,9 @@ class MergePlugin(StagePlugin):
                     msg_time=merged_msg_time,
                     image_urls=merged_images,
                     extra_times=json.dumps(merged_extra) if merged_extra else "",
+                    # 原文链接合并：存活卡优先，缺失则继承被吸收卡——文章卡片
+                    # 拆条的同话题多卡合并后「原文链接」不从卡片上消失
+                    article_url=survive["article_url"] or absorb["article_url"],
                 )
                 # 保留被吸收片段的 raw 行：它们仍属该对话上下文（/api/context 引用）
                 await delete_items([absorb["id"]], keep_raw_messages=True)

@@ -87,12 +87,31 @@ _STATUS_CODE_COLORS = {
 }
 
 
-# 访问日志需要掩码的疑似密钥查询参数键：令牌/密钥经 URL 查询参数传递时
+# 访问日志需要掩码的疑似密钥查询参数：令牌/密钥经 URL 查询参数传递时
 # （如 weflow-legacy SSE 的 ?access_token=）会出现在 uvicorn access log 请求行中。
-_QUERY_SECRET_PARAM_RE = re.compile(
-    r"([?&](?:access[_-]?token|token|api[_-]?key|apikey|key|secret|auth)=)[^&\s]*",
-    re.IGNORECASE,  # 键名大小写不敏感（审计 #11：Token=/APIKey=/AccessToken 变体同样掩码）
+# 按参数键名判定：键名按 [_-] 分段，任一分段命中敏感词即掩码——覆盖
+# auth_token / session_token / secret_key / access_key / api_secret /
+# refresh_token / signature 等常见变体（审查回归），同时不误伤
+# keyword / tokenizer 等整词含敏感词子串的普通参数。
+_QUERY_SECRET_PARAM_RE = re.compile(r"([?&])([a-z0-9_-]+)=([^&\s]*)", re.IGNORECASE)
+_SECRET_KEY_SEGMENTS = frozenset(
+    {"token", "key", "secret", "auth", "sig", "sign", "signature",
+     "password", "passwd", "pwd", "credential"}
 )
+_SECRET_KEY_NAMES = frozenset({"apikey", "apikeytoken", "authorization"})
+
+
+def _is_secret_param(name: str) -> bool:
+    lowered = name.lower()
+    if lowered in _SECRET_KEY_NAMES:
+        return True
+    # CamelCase 连写无分隔符可分段（AccessToken/SecretKey），按去分隔符后的
+    # 整名后缀判定；tokenizer（以 ize 结尾）/keyword（以 word 结尾）不命中
+    compact = re.sub(r"[_-]+", "", lowered)
+    if any(compact.endswith(seg) for seg in _SECRET_KEY_SEGMENTS):
+        return True
+    segments = set(re.split(r"[_-]+", lowered))
+    return bool(segments & _SECRET_KEY_SEGMENTS)
 
 
 def redact_query_string(path: str) -> str:
@@ -101,7 +120,14 @@ def redact_query_string(path: str) -> str:
     按参数键名判定而非按值匹配：无需知道密钥具体内容，命中即掩码，
     因此对任意长度/形态的令牌都生效，且不会误伤正常查询参数。
     """
-    return _QUERY_SECRET_PARAM_RE.sub(r"\1***", path)
+    return _QUERY_SECRET_PARAM_RE.sub(
+        lambda m: (
+            f"{m.group(1)}{m.group(2)}=***"
+            if _is_secret_param(m.group(2))
+            else m.group(0)
+        ),
+        path,
+    )
 
 
 def short_logger_name(name: str) -> str:

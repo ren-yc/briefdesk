@@ -28,7 +28,11 @@ def _same_origin(origin: str, request: Request) -> bool:
         request_port = request.url.port
         if request_port is None:
             request_port = 443 if request.url.scheme == "https" else 80
-        return origin_port == request_port and parts.hostname == request.url.hostname
+        return (
+            parts.scheme == request.url.scheme
+            and origin_port == request_port
+            and parts.hostname == request.url.hostname
+        )
     except ValueError:
         return False
 

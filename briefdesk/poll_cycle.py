@@ -17,6 +17,7 @@ from briefdesk.db import (
     get_enabled_sessions,
     get_oldest_unprocessed_by_session,
     get_session_last_polls,
+    storage_lock,
     update_session_last_polls,
     upsert_session,
 )
@@ -70,19 +71,23 @@ async def run_poll_cycle(source: SourceRuntime) -> None:
             lambda ids: are_messages_processed(source.name, ids),
             window_start_by_session=windows,
         )
-        # 源只产出数据，写库统一在此完成（顺序与重构前一致：contacts 先、sessions 后）
-        await bulk_upsert_contacts(
-            [(c.source, c.sender_id, c.display_name) for c in result.contacts]
-        )
-        for s in result.sessions:
-            await upsert_session(
-                s.source,
-                s.session_id,
-                s.name,
-                s.is_group,
-                s.is_official,
-                last_active_at=s.last_active_at or None,
+        # 源只产出数据，写库统一在此完成（顺序与重构前一致：contacts 先、
+        # sessions 后）。contacts/sessions 批量 upsert 与全应用写路径共用
+        # 存储锁串行化：单连接隐式事务下锁外 commit 会把管道未完成的多步写
+        # 提前提交（部分写入提前可见），见 db.storage_lock。
+        async with storage_lock:
+            await bulk_upsert_contacts(
+                [(c.source, c.sender_id, c.display_name) for c in result.contacts]
             )
+            for s in result.sessions:
+                await upsert_session(
+                    s.source,
+                    s.session_id,
+                    s.name,
+                    s.is_group,
+                    s.is_official,
+                    last_active_at=s.last_active_at or None,
+                )
         ok = await process_all_batches(
             result.messages,
             source.client,
@@ -96,13 +101,14 @@ async def run_poll_cycle(source: SourceRuntime) -> None:
                 s for s in enabled if s.session_id not in result.failed_sessions
             ]
             if advanced:
-                await update_session_last_polls(
-                    source.name,
-                    [
-                        (s.session_id, int(cycle_start.timestamp()))
-                        for s in advanced
-                    ],
-                )
+                async with storage_lock:
+                    await update_session_last_polls(
+                        source.name,
+                        [
+                            (s.session_id, int(cycle_start.timestamp()))
+                            for s in advanced
+                        ],
+                    )
             elif enabled:
                 logger.info(
                     "[%s] 本轮 %d 个启用会话均未成功拉取，水位不推进",

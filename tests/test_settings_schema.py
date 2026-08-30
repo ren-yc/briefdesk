@@ -74,6 +74,22 @@ class SettingsSchemaTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             normalize_setting(by_key["EXAMPLE_ENABLED"], "maybe")
 
+    def test_text_value_rejects_newlines_and_inline_comment(self) -> None:
+        # 审查回归：text 型暂存值含 CR/LF 时会向暂存文件注入任意 KEY=VALUE 行
+        # （绕过键白名单与「密钥只走 keyring」分层）；「 #」是 dotenv 行内
+        # 注释起点，回读被截断，一并拒绝
+        meta = {"type": "text"}
+        self.assertEqual(
+            normalize_setting(meta, "http://127.0.0.1:5033"),
+            "http://127.0.0.1:5033",
+        )
+        with self.assertRaises(ValueError):
+            normalize_setting(meta, "x\nAI_API_KEY=sk-attacker")
+        with self.assertRaises(ValueError):
+            normalize_setting(meta, "x\r\nAI_API_KEY=sk-attacker")
+        with self.assertRaises(ValueError):
+            normalize_setting(meta, "value # inline comment")
+
     def test_unwraps_optional_and_annotated_field_types(self) -> None:
         schema = build_settings_schema(AdvancedSettings)
         by_key = {item["key"]: item for item in schema}

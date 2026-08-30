@@ -37,6 +37,24 @@ class RedactQueryStringTest(unittest.TestCase):
             self.assertNotIn("super-secret-value", out, msg=f"param {name}")
             self.assertIn(f"{name}=***", out)
 
+    def test_masks_compound_key_variants(self) -> None:
+        # 审查回归：auth_token / session_token / secret_key 等复合变体此前
+        # 不命中（token/key/secret 必须是键首），令牌以明文进访问日志
+        for name in (
+            "auth_token", "session_token", "refresh_token", "secret_key",
+            "access_key", "api_secret", "signature", "password",
+            "AccessToken", "SecretKey",
+        ):
+            out = redact_query_string(f"/api/x?{name}=leak-me")
+            self.assertNotIn("leak-me", out, msg=f"param {name}")
+            self.assertTrue(out.endswith("=***"), msg=f"param {name}")
+
+    def test_keeps_params_containing_sensitive_substring(self) -> None:
+        # 分段/后缀判据不得误伤整词含敏感子串的普通参数（tokenizer 以
+        # "ize" 结尾、keyword 以 "word" 结尾，均不命中后缀判据）
+        path = "/api/x?tokenizer=trigram&keyword=hello"
+        self.assertEqual(redact_query_string(path), path)
+
     def test_keeps_innocent_params(self) -> None:
         path = "/api/items?talker=wxid_123&format=chatlab&limit=20&offset=0"
         self.assertEqual(redact_query_string(path), path)

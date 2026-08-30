@@ -100,6 +100,35 @@ class ExportItemsCsvInjectionTest(unittest.TestCase):
         self.assertEqual(data["title"], "摄影社招新")
         self.assertEqual(data["source_quote"], "正常引用文本")
 
+    def test_newline_prefix_cell_neutralized(self):
+        # \n 前缀与 \r 同层防御（OWASP CSV 注入清单）
+        item = {
+            "id": "i1",
+            "category": "活动通知",
+            "title": "\n=1+1",
+            "key_info": "",
+            "sender_name": "李四",
+            "source_group": "社团群",
+            "subject": "",
+            "source": "weflow-legacy",
+            "source_msg_id": "m1",
+            "session_id": "s1",
+            "msg_time": "2026-01-01 10:00:00",
+            "start": "",
+            "end": "",
+            "extra_times": "",
+            "article_url": "",
+            "source_quote": "正常文本",
+            "is_verified": 0,
+        }
+        with patch.object(
+            routes_items, "get_items_page", new=AsyncMock(return_value=_page([item]))
+        ):
+            resp = self.client.get("/api/export/items")
+        self.assertEqual(resp.status_code, 200)
+        data = self._rows(resp.text)[0]
+        self.assertEqual(data["title"], "'\n=1+1")
+
 
 class ExportRecatSamplesCsvInjectionTest(unittest.TestCase):
     def setUp(self):

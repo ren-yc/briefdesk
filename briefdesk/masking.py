@@ -19,22 +19,23 @@ BANKCARD_PLACEHOLDER = "[BANKCARD]"
 PHONE_PLACEHOLDER = "[PHONE]"
 
 # 单次扫描、命名组区分类型。顺序重要：
-#  - email 优先：邮箱内 11 位数字不会被当作手机号单独脱敏
+#  - email 优先：邮箱内 11 位数字不会被当作手机号单独脱敏（@ 同时覆盖全角＠）
 #  - ID 先于银行卡：18 位纯数字按身份证处理（规格歧义的确定性选择）；
 #    15 位一代身份证紧随其后（<16 位，不与银行卡区间重叠）
+#  - phone 支持可选 +86/86 国家码前缀（86 + 11 位 = 13 位，含全角＋/８６）
 #  - 数字类同时覆盖全角数字（０-９）：全角手机号/证件号/银行卡同样脱敏，
 #    邻接断言把全角数字视同数字，全角长串不会被部分命中
 #
-# 用 (?<![0-9]) / (?![0-9]) 数字邻接断言而非 \b：Python re 的 \w 含中文，
+# 用 (?<![0-9０-９]) / (?![0-9０-９]) 数字邻接断言而非 \b：Python re 的 \w 含中文，
 # "电话13800138000联系" 中"话"与数字之间没有词边界，\b\d{11}\b 会漏匹配。
 # 邻接断言只关心数字上下文：中文/字母/标点相邻正常匹配，
 # 且 19 位数字串中的 11 位子串因前后仍是数字而不会被手机号规则部分命中。
 _MASK_RE = re.compile(
-    r"(?P<email>[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,})"
+    r"(?P<email>[A-Za-z0-9._%+\-]+[@＠][A-Za-z0-9.\-]+\.[A-Za-z]{2,})"
     r"|(?P<id>(?<![0-9０-９])[0-9０-９]{17}[0-9０-９Xx](?![0-9０-９]))"
     r"|(?P<id15>(?<![0-9０-９])[0-9０-９]{15}(?![0-9０-９]))"
     r"|(?P<bankcard>(?<![0-9０-９])[0-9０-９]{16,19}(?![0-9０-９]))"
-    r"|(?P<phone>(?<![0-9０-９])[0-9０-９]{11}(?![0-9０-９]))"
+    r"|(?P<phone>(?<![0-9０-９])[＋+]?(?:86|８６)?[0-9０-９]{11}(?![0-9０-９]))"
 )
 
 _PLACEHOLDER_BY_GROUP = {
@@ -53,46 +54,68 @@ def _replace(match: re.Match[str]) -> str:
 
 # 分隔符容错二次扫描：主正则要求连续数字，命中不了 "138-0013-8000"、
 # "6222 0202 0000 0000 000" 这类带分隔符写法。此处捕获「数字+分隔符」候选串
-# （分隔符仅半/全角连字符与空格；不含点号/冒号，避免误伤 IP、时间、版本号），
-# 去掉分隔符后按长度分类；不构成任何已知 PII 形态则原样保留
-# （日期 2024-01-15、房间号 301-302 等去分隔符后不足 11 位，不受影响）。
+# （分隔符仅半/全角连字符与空格；不含点号/冒号，避免误伤 IP、时间、版本号）。
+#
+# 判定规则：候选串按分隔符切段后，**段数 ≤ 5** 且去分隔符总位数构成已知
+# PII 形态才整体替换，否则原样保留。段数守卫防「数字列表/日期范围按总位数
+# 撞型」的聚合误伤——真实 PII 分组至多 5 段（手机号 3 段、银行卡 ≤5 段），
+# 而 12 13 … 19（8 段）、301-302-…-306（6 段）、2024-01-15 - 2024-01-20
+# （6 段）这类非 PII 写法段数必然更多。
+# 整段不构成 PII 时再按空白切分逐段独立判定（空格几乎总是语义边界，
+# 「日期␣138-0013-8000」里段内连字符分隔的真手机号依赖此路径救回），
+# 空白分隔符以捕获组原样回填——不丢失任何字符，保证幂等。
 _SEP_RUN_RE = re.compile(
-    r"(?<![0-9０-９])[0-9０-９][0-9０-９\- －　]*[0-9０-９](?![0-9０-９])"
+    r"(?<![0-9０-９])[＋+]?[0-9０-９][0-9０-９\- －　]*[0-9０-９](?![0-9０-９])"
 )
 
+# 候选串切段：连字符与空格（半/全角）都是分组分隔符
+_RUN_SEG_SPLIT_RE = re.compile(r"[\-－ 　]+")
 
-def _classify_digit_count(n: int) -> str | None:
-    """去分隔符后的纯数字位数 → 占位符；非已知 PII 形态返回 None。"""
+# 空白切分（捕获组保留分隔符，供逐段判定后原样回填）
+_RUN_WS_SPLIT_RE = re.compile(r"([ －　]+)")
+
+
+def _classify_digits(digits: str) -> str | None:
+    """去分隔符后的纯数字串 → 占位符；非已知 PII 形态返回 None。"""
+    n = len(digits)
     if n == 11:
         return PHONE_PLACEHOLDER
     if n == 15:
         return ID_PLACEHOLDER
     if 16 <= n <= 19:
         return BANKCARD_PLACEHOLDER
+    # 中国大陆手机号国家码前缀写法：86 + 11 位（如 +86 138 0013 8000 的
+    # 候选串部分 "86 138 0013 8000"）；86 打头的 13 位数字在群聊里几乎
+    # 只见于带国家码的手机号，宁可脱敏
+    if n == 13 and digits.startswith("86"):
+        return PHONE_PLACEHOLDER
     return None
+
+
+def _classify_run(run: str) -> str | None:
+    """分隔符候选串整体判定：切段数 ≤ 5 且总位数构成已知 PII 形态。"""
+    segments = _RUN_SEG_SPLIT_RE.split(run)
+    if len(segments) > 5:
+        return None
+    # 只统计数字字符：候选串可能以 +/- 前缀开头（+86 国家码），不入位数
+    digits = "".join(c for c in "".join(segments) if c.isdigit())
+    return _classify_digits(digits)
 
 
 def _sep_run_repl(match: re.Match[str]) -> str:
     run = match.group()
-    seps = {c for c in run if not c.isdigit()}
-    # 单一分隔符形态（含空格连写）：整段去分隔符后按长度分类——
-    # 「138 0013 8000」「6222 0202 …」等合法写法依赖此路径
-    if len(seps) <= 1:
-        placeholder = _classify_digit_count(sum(c.isdigit() for c in run))
-        return placeholder if placeholder else run
-    # 混合分隔符（如「日期␣空格␣分隔符手机号」）：按空白切分后逐段独立判定
-    # ——空格几乎总是语义边界，跨空格拼接无判定意义。此前混合即整段放弃，
-    # 段内真 PII 漏脱敏（审查 A1）；段内仍混排分隔符时保留原文（保险丝）。
+    placeholder = _classify_run(run)
+    if placeholder:
+        return placeholder
+    # 整段不构成 PII：按空白切分逐段独立判定，空白分隔符原样回填
     out: list[str] = []
-    for chunk in re.split(r"[ －　]+", run):
-        if not chunk:
+    for part in _RUN_WS_SPLIT_RE.split(run):
+        if not part:
             continue
-        chunk_seps = {c for c in chunk if not c.isdigit()}
-        if len(chunk_seps) > 1:
-            out.append(chunk)
+        if part[0] in " －　":  # 捕获的空白分隔符：原样保留
+            out.append(part)
             continue
-        placeholder = _classify_digit_count(sum(c.isdigit() for c in chunk))
-        out.append(placeholder if placeholder else chunk)
+        out.append(_classify_run(part) or part)
     return "".join(out)
 
 
