@@ -24,7 +24,10 @@ from briefdesk.db import (
     mark_message_processed,
     update_session_last_polls,
 )
-from briefdesk.plugins.qqflow.client import QqFlowNotReadyError
+from briefdesk.plugins.qqflow.client import (
+    QqFlowAccountMismatchError,
+    QqFlowNotReadyError,
+)
 from briefdesk.plugins.qqflow.poller import poll as qq_poll
 from briefdesk.plugins.weflow.poller import _PAGE_LIMIT as WF_PAGE_LIMIT
 from briefdesk.plugins.weflow.poller import poll as wf_poll
@@ -692,6 +695,70 @@ class QqFlowNotReadyFailureTest(unittest.IsolatedAsyncioTestCase):
         client = _QqFlowClient([_qqflow_msg(1, now - 10)])
         result = await qq_poll(client, _enabled("qqflow", "g1"), _no_processed)
         self.assertEqual(result.failed_sessions, set())
+
+
+class AccountMismatchCycleTest(unittest.IsolatedAsyncioTestCase):
+    """账号不符必须走「整轮中止 + lastError + 不推水位」，与 503 的静默跳过相反。
+
+    这条守的是修复的最终收益：不符错误得真正抵达 lastError（前端可见）。
+    poller 只 `except *NotReadyError`，不符不继承它（见
+    test_source_robustness.test_mismatch_error_is_not_a_not_ready_error），
+    因此会穿到 run_poll_cycle 的兜底出口——这里端到端钉住整条链路。
+    """
+
+    async def _run(self, exc: BaseException):
+        # 关键：fetch_history 走**真** poller（只桩掉 client 的 ensure_ready），
+        # 否则测不到「poller 的 except 子句没把不符一起吞掉」这一层——
+        # 直接桩 fetch_history 等于从 poller 边界之外注入异常，形同空转。
+        client = _QqFlowClient([])
+        client.ensure_ready = AsyncMock(side_effect=exc)  # type: ignore[method-assign]
+        source = Mock()
+        source.name = "qqflow"
+        source.client = client
+        # client 是本文件通用的轻量桩，非真 QqFlowClient
+        source.fetch_history = lambda enabled, is_processed, **kw: qq_poll(
+            client,  # type: ignore[arg-type]
+            enabled,
+            is_processed,
+            **kw,
+        )
+        status: list[dict] = []
+        with patch(
+            "briefdesk.poll_cycle.get_enabled_sessions",
+            new=AsyncMock(
+                return_value=[
+                    {
+                        "source": "qqflow",
+                        "session_id": "g1",
+                        "name": "g",
+                        "is_group": 1,
+                        "is_official": 0,
+                    }
+                ]
+            ),
+        ), patch(
+            "briefdesk.poll_cycle._compute_session_windows",
+            new=AsyncMock(return_value={"g1": 0}),
+        ), patch(
+            "briefdesk.poll_cycle.set_status", side_effect=status.append
+        ), patch(
+            "briefdesk.poll_cycle.update_session_last_polls", new=AsyncMock()
+        ) as upd:
+            await run_poll_cycle(source)
+        return status, upd
+
+    async def test_mismatch_lands_in_last_error_and_blocks_watermark(self):
+        status, upd = await self._run(
+            QqFlowAccountMismatchError("qqflow-server 已绑定另一个账号 999")
+        )
+        upd.assert_not_awaited()  # 水位不推进
+        errors = [d["lastError"] for d in status if "lastError" in d]
+        self.assertEqual(len(errors), 1, "必须恰好写一次 lastError")
+        self.assertIn("999", errors[0], "前端要能看到占用方账号")
+
+    async def test_cycle_does_not_crash_out(self):
+        """兜底出口吞掉异常本身：不符不该让调度协程整个死掉。"""
+        await self._run(QqFlowAccountMismatchError("绑定不符"))  # 不抛即通过
 
 
 class SessionFailureIsolationTest(unittest.IsolatedAsyncioTestCase):

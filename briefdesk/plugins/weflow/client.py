@@ -169,11 +169,25 @@ _BENIGN_REGISTER_STATES = ("accepted", "already_ready", "in_progress")
 # awaiting_key 不会出现在 account 阶段里（未注册即 unregistered）。
 _BOOTSTRAPPING_PHASES = ("indexing",)
 
+# /health 的标量 account 阶段中，代表「服务端已被某个账号占用」的取值。上游
+# account_phase() 走 bound_account()，而注册表里只放已绑定账号，扫描发现的
+# 账号不在其中 —— 所以这三个就是「有绑定」的全部取值。
+_BOUND_PHASES = ("indexing", "ready", "error")
+
 
 class WeFlowNotReadyError(SourceError):
     """weflow-server 尚未就绪（503 就绪门控：无账号或正在建索引），瞬态。
 
     调用方（poller/runtime）捕获后应静默跳过，不视为错误。
+    """
+
+
+class WeFlowAccountMismatchError(SourceError):
+    """weflow-server 绑定的是**另一个** wxid，不是本地配置的那个。
+
+    刻意不继承 WeFlowNotReadyError：后者是启动期瞬态、poller 会静默跳过本轮，
+    而账号不符是稳态故障 —— 得有人去改配置或注销占用方，必须冒泡到
+    lastError 让前端可见，否则会静默入库他人的消息。
     """
 
 
@@ -320,6 +334,9 @@ class WeFlowClient(SourceClient):
         不会重建索引、不中止 watcher，直接返回现有句柄；仅 error/awaiting_key 会
         被替换重建（密钥或路径填错后重新注册即可自愈）。上游 v0.5.0 起强制单账号：
         换 wxid 必须先注销，否则回 account_conflict（冲突判定在密钥校验之前）。
+
+        `account_conflict` 在此就地抛 WeFlowAccountMismatchError —— 这里本来就
+        持有整个响应 JSON，能把 occupied_by 一并带进错误消息；返回值形状不变。
         """
         client = self._get_client()
         payload: dict[str, Any] = {"wxid": self._wxid}
@@ -344,7 +361,49 @@ class WeFlowClient(SourceClient):
                 f"{resp.text[:200]}"
             )
         data = resp.json()
-        return data.get("state", "unknown"), data.get("status", "unknown")
+        state = data.get("state", "unknown")
+        if state == "account_conflict":
+            # 上游强制单账号绑定；重试不会自愈，得由人去注销占用方或改配置。
+            raise WeFlowAccountMismatchError(
+                f"注册被拒：weflow-server 已绑定 "
+                f"{data.get('occupied_by') or '另一个账号'}"
+                f"（状态 {data.get('occupied_status') or '未知'}），"
+                f"本地配置为 {self._wxid}；"
+                f"请修正 WEFLOW_WXID，或 DELETE /api/v1/accounts/{{占用方wxid}} 后重试"
+            )
+        return state, data.get("status", "unknown")
+
+    def _bound_account(self, accounts: list[dict]) -> dict | None:
+        """取持有绑定的那条账号明细；上游强制单账号，最多一条。
+
+        判据与上游 bound_account() 一致：**排除** awaiting_key —— weflow 的
+        account_views() 会把启动扫描发现但未注册的账号也合成进明细列表
+        （state=awaiting_key），那些不代表绑定。上游若新增状态值，这种写法
+        默认把它当"已占用"，是保守的那一侧。
+        """
+        for acc in accounts:
+            if acc.get("state") != "awaiting_key":
+                return acc
+        return None
+
+    def _check_bound_identity(self, accounts: list[dict]) -> bool:
+        """比对绑定账号与本地配置，确认不符时抛错。
+
+        返回 True 表示已确认是自有账号，调用方可安全短路；False 表示**无法
+        确认**（明细为空或只有 awaiting_key 条目），调用方应继续走注册，
+        由上游的 account_conflict 守卫定夺。
+        """
+        bound = self._bound_account(accounts)
+        if bound is None:
+            return False
+        bound_wxid = str(bound.get("wxid", ""))
+        if bound_wxid == str(self._wxid):
+            return True
+        raise WeFlowAccountMismatchError(
+            f"weflow-server 已绑定另一个账号 {bound_wxid or '<未知>'}"
+            f"（状态 {bound.get('state')}），本地配置为 {self._wxid}；"
+            f"请修正 WEFLOW_WXID，或注销占用方后重启服务端"
+        )
 
     async def ensure_ready(self, force: bool = False) -> None:
         """确保服务端有就绪账号（健康检查驱动，记忆化，可强制重检）。
@@ -358,9 +417,14 @@ class WeFlowClient(SourceClient):
         内存态账号注册表丢失，需重新注册）。良性态（_BENIGN_REGISTER_STATES /
         _BOOTSTRAPPING_PHASES）记忆；被拒态与网络失败不记忆，下轮重试（自愈）。
 
-        单账号（上游 v0.5.0 起为强制）：阶段判定不按 wxid 过滤——本仓库只配一个
-        WEFLOW_WXID，而服务端同时只绑定一个账号，故「服务端就绪」与「我们的账号
-        就绪」等价。若配错 wxid，注册会回 account_conflict 而不是静默顶掉在位账号。
+        单账号（上游 v0.5.0 起为强制）意味着服务端同时只绑定一个账号，但**不
+        意味着那个账号一定是我们的**：`/health` 的标量阶段刻意不含身份（免鉴权
+        端点列账号 = 允许枚举本机账号），绑着别人的账号时阶段照样报 ready。
+        所以短路前必须先确认身份 —— 双层判定：
+        1. 快路：从鉴权明细端点比对绑定账号（`_check_bound_identity`）；
+        2. 兜底：明细取不到（401/抖动）时不硬失败，照常走注册，由上游的
+           `account_conflict` 定夺（该守卫在密钥校验**之前**，是可靠的身份预言机）。
+        确认不符即抛 WeFlowAccountMismatchError，不记忆化。
         """
         if self._ready_checked and not force:
             return
@@ -380,19 +444,35 @@ class WeFlowClient(SourceClient):
                 self._logged_version = str(version)
             phase = health.get("account", "unregistered")
             logger.debug("健康检查: 账号阶段 %s", phase)
-            if phase == "ready":
+
+            # 身份闸门：阶段说「有绑定」时，先确认绑的是不是自己的账号。
+            accounts: list[dict] = []
+            identity_ok = False
+            if phase in _BOUND_PHASES:
+                try:
+                    accounts = await self.fetch_accounts()
+                except Exception as e:  # noqa: BLE001 —— 取不到身份不硬失败
+                    logger.warning("账号明细不可用（%s），改由注册结果判定身份", e)
+                else:
+                    # 比对必须留在 else：else 不受上面 except 保护，
+                    # _check_bound_identity 的不符错误才能原样冒泡。挪进 try
+                    # 就会被那条宽 except 吞成一行 warning —— 正是本次要修的病。
+                    identity_ok = self._check_bound_identity(accounts)
+
+            if identity_ok and phase == "ready":
                 self._ready_checked = True
-                logger.debug("已有就绪账号，跳过注册")
+                logger.debug("已确认自有账号就绪，跳过注册")
                 return
-            if phase in _BOOTSTRAPPING_PHASES:
+            if identity_ok and phase in _BOOTSTRAPPING_PHASES:
                 self._ready_checked = True
-                logger.debug("账号建索引中（%s），不再重复注册", phase)
+                logger.debug("自有账号建索引中（%s），不再重复注册", phase)
                 return
             if phase == "error":
                 # /health 只给标量，根因（密钥/路径填错的 error 字符串）只在需
                 # 鉴权的明细接口里。仍显式告警——否则用户只能看到业务接口持续
                 # 503，看不到原因。诊断失败不能挡住下面的注册重试。
-                await self._log_account_errors()
+                # 明细已在上面取过就复用，避免对同一个 GET 打两次。
+                await self._log_account_errors(accounts)
             # `error` 落到注册分支是有意的：服务端的 error 状态不释放绑定，但同一
             # 账号可以直接重试注册来恢复（密钥修正后即生效）。
             logger.info(
@@ -403,19 +483,12 @@ class WeFlowClient(SourceClient):
                 self._db_path or "<默认>",
                 len(self._db_keys),
             )
+            # account_conflict 由 register_account 就地抛 WeFlowAccountMismatchError
+            # （与 qqflow 同形），不在此处分支。
             state, status = await self.register_account()
             if state in _BENIGN_REGISTER_STATES or status in _BOOTSTRAPPING_PHASES:
                 self._ready_checked = True
                 logger.info("账号注册: state=%s, status=%s", state, status)
-            elif state == "account_conflict":
-                # 服务端已被**另一个** wxid 占用（v0.5.0 起强制单账号）。重试不会
-                # 自愈：得由人去注销那个账号或改配置，所以按 ERROR 报而非 warning，
-                # 且不记忆化以便配置修正后自愈。
-                logger.error(
-                    "注册被拒：服务端已绑定另一个账号（本地配置 wxid=%s）。"
-                    "需先注销：DELETE /api/v1/accounts/{占用方wxid}",
-                    self._wxid,
-                )
             else:
                 # 被拒态（error / awaiting_key 等）不记忆化：保持未检查标志让
                 # 下一轮重试；否则零账号部署下没有业务 503 兜底复位标志，
@@ -426,13 +499,18 @@ class WeFlowClient(SourceClient):
                     status,
                 )
 
-    async def _log_account_errors(self) -> None:
-        """拉明细接口把 error 根因打出来（诊断专用，失败仅降级为 debug）。"""
-        try:
-            accounts = await self.fetch_accounts()
-        except Exception as exc:  # noqa: BLE001 —— 诊断路径不得影响注册重试
-            logger.debug("账号明细拉取失败（跳过根因诊断）: %s", exc)
-            return
+    async def _log_account_errors(self, accounts: list[dict] | None = None) -> None:
+        """把 error 根因打出来（诊断专用，失败仅降级为 debug）。
+
+        accounts 传了就复用（ensure_ready 的身份闸门刚取过），避免对同一个
+        GET 打两次；没传或为空才自己拉。
+        """
+        if not accounts:
+            try:
+                accounts = await self.fetch_accounts()
+            except Exception as exc:  # noqa: BLE001 —— 诊断路径不得影响注册重试
+                logger.debug("账号明细拉取失败（跳过根因诊断）: %s", exc)
+                return
         for a in accounts:
             if a.get("state") == "error" and a.get("error"):
                 logger.warning(
@@ -446,7 +524,11 @@ class WeFlowClient(SourceClient):
 
         /health 只报一个标量阶段；出错的具体原因（error 字段）、消息数与服务端
         实际读取的 db_storage 只在这里。除绑定账号外还含启动扫描发现但未注册的
-        账号（awaiting_key）。不参与就绪判定，仅供排查。
+        账号（awaiting_key），故判定绑定方须排除该状态（见 _bound_account）。
+
+        **也是身份判定的快路**：/health 刻意不含账号身份，要确认服务端绑的是不是
+        本地配置的账号，只能靠这里的 wxid 字段（见 ensure_ready 的身份闸门）。
+        取不到时不阻断，退化为由注册结果判定。
         """
         client = self._get_client()
         resp = await with_connect_retry(
@@ -738,6 +820,10 @@ class WeFlowClient(SourceClient):
                     # 退避循环兜底。
                     try:
                         await self.ensure_ready(force=True)
+                    except WeFlowAccountMismatchError:
+                        # 账号不符不是「自愈尽力而为」能兜的：继续读流就是在收他人
+                        # 的消息。必须冒泡中止本次监听。
+                        raise
                     except Exception as e:  # noqa: BLE001 — 自愈尽力而为，失败不阻断流
                         logger.warning("SSE 就绪自愈检查失败: %s", e)
 

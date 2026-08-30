@@ -21,7 +21,11 @@ from unittest.mock import AsyncMock, Mock, patch
 import httpx
 
 from briefdesk.config import config
-from briefdesk.plugins.qqflow.client import QqFlowClient
+from briefdesk.plugins.qqflow.client import (
+    QqFlowAccountMismatchError,
+    QqFlowClient,
+    QqFlowNotReadyError,
+)
 from briefdesk.plugins.qqflow.config import QqFlowSettings
 from briefdesk.plugins.qqflow.sse import QqFlowSseClient
 from briefdesk.plugins.weflow.config import WeFlowSettings
@@ -29,6 +33,7 @@ from briefdesk.plugins.weflow.sse import WeFlowSseClient
 from briefdesk.plugins.weflow_legacy.client import WeFlowLegacyClient
 from briefdesk.plugins.weflow_legacy.config import WeFlowLegacySettings
 from briefdesk.plugins.weflow_legacy.sse import WeFlowLegacySseClient
+from briefdesk.sources_base import SourceError
 
 
 def _wf_event(rawid: str = "r1", content: str = "今天下午三点开会讨论") -> dict:
@@ -190,13 +195,42 @@ class EnsureReadyRejectedStateTest(unittest.IsolatedAsyncioTestCase):
         await client.ensure_ready()
         self.assertEqual(len(calls), 1, "良性状态应记忆化避免重复注册")
 
-    async def test_account_conflict_is_not_memoized(self):
-        """服务端被另一个账号占用：不记忆化，配置修正/对方注销后可自愈。"""
+    async def test_account_conflict_propagates_from_register(self):
+        """注册回 account_conflict：冒泡为账号不符，且不记忆化。
+
+        取代旧的「不记忆化后正常返回」用例 —— 静默返回会让 poller 继续跑，
+        而服务端绑的是别人的账号，继续跑就是在入库他人消息。
+
+        注意这里只测**传播**：真正的抛出点在 register_account 内部
+        （HTTP 层用例见 RegisterConflictHttpTest），本用例的桩自己抛。
+        """
         calls: list = []
         client = self._make_client("account_conflict", calls)
-        await client.ensure_ready()
-        await client.ensure_ready()
-        self.assertEqual(len(calls), 2, "占用冲突后必须再次尝试")
+
+        async def conflicting_register(qq, key, db_path):
+            calls.append("account_conflict")
+            raise QqFlowAccountMismatchError("服务端已绑定 999，本地配置为 123")
+
+        client.register_account = conflicting_register  # type: ignore[method-assign]
+        with self.assertRaises(QqFlowAccountMismatchError):
+            await client.ensure_ready()
+        self.assertFalse(client._ready_checked, "账号不符不得记忆化")
+        with self.assertRaises(QqFlowAccountMismatchError):
+            await client.ensure_ready()
+        self.assertEqual(len(calls), 2, "未记忆化 → 下轮仍会重试（改配置后可自愈）")
+
+    async def test_mismatch_error_is_not_a_not_ready_error(self):
+        """最关键的防回归：账号不符**不能**被当成瞬态未就绪。
+
+        QqFlowNotReadyError 会被 poller/runtime 静默跳过本轮（poller.py:120 等），
+        若不符错误继承了它，这个修复就完全失效 —— 用户看不到 lastError，
+        他人消息继续静默入库。
+        """
+        self.assertTrue(issubclass(QqFlowAccountMismatchError, SourceError))
+        self.assertFalse(
+            issubclass(QqFlowAccountMismatchError, QqFlowNotReadyError),
+            "不符是稳态故障，必须冒泡，不能走瞬态静默跳过的路径",
+        )
 
     async def test_indexing_phase_skips_registration(self):
         """服务端已在建索引：跳过注册并记忆化。
@@ -207,14 +241,24 @@ class EnsureReadyRejectedStateTest(unittest.IsolatedAsyncioTestCase):
         于是索引期内每一轮 poll 都会重复注册一次。
         """
         calls: list = []
-        client = self._make_client("accepted", calls, phase="indexing")
+        client = self._make_client(
+            "accepted",
+            calls,
+            phase="indexing",
+            accounts=[{"qq": "123", "state": "indexing"}],
+        )
         await client.ensure_ready()
         await client.ensure_ready()
         self.assertEqual(len(calls), 0, "索引期不应发起注册")
 
     async def test_ready_phase_skips_registration(self):
         calls: list = []
-        client = self._make_client("accepted", calls, phase="ready")
+        client = self._make_client(
+            "accepted",
+            calls,
+            phase="ready",
+            accounts=[{"qq": "123", "state": "ready"}],
+        )
         await client.ensure_ready()
         self.assertEqual(len(calls), 0, "已就绪不应发起注册")
 
@@ -254,6 +298,98 @@ class EnsureReadyRejectedStateTest(unittest.IsolatedAsyncioTestCase):
         await client.ensure_ready()
         self.assertEqual(len(calls), 1, "诊断失败不得挡住注册重试")
 
+    # ── 身份闸门：/health 的标量阶段不含身份，短路前必须比对账号 ──
+
+    async def test_ready_phase_with_foreign_account_raises(self):
+        """服务端 ready 但绑的是别人的账号：抛错，不短路、不注册、不记忆化。
+
+        这是本组用例的核心 —— 修复前 phase=="ready" 直接记忆化返回，poller
+        随后就开始把他人的消息当自己的入库，全程无任何告警。
+        """
+        calls: list = []
+        client = self._make_client(
+            "accepted",
+            calls,
+            phase="ready",
+            accounts=[{"qq": "999", "state": "ready"}],
+        )
+        with self.assertRaises(QqFlowAccountMismatchError) as cm:
+            await client.ensure_ready()
+        self.assertIn("999", str(cm.exception))
+        self.assertIn("123", str(cm.exception), "错误消息要同时给出本地配置值")
+        self.assertEqual(len(calls), 0, "快路已确认不符，不该再浪费一次注册")
+        self.assertFalse(client._ready_checked)
+
+    async def test_indexing_phase_with_foreign_account_raises(self):
+        """indexing 阶段同样要比对身份（别人的账号正在建索引）。"""
+        calls: list = []
+        client = self._make_client(
+            "accepted",
+            calls,
+            phase="indexing",
+            accounts=[{"qq": "999", "state": "indexing"}],
+        )
+        with self.assertRaises(QqFlowAccountMismatchError):
+            await client.ensure_ready()
+        self.assertEqual(len(calls), 0)
+
+    async def test_error_phase_with_foreign_account_raises(self):
+        """error 阶段也要比对：上游的 error 不释放绑定，占用仍然成立。"""
+        calls: list = []
+        client = self._make_client(
+            "accepted",
+            calls,
+            phase="error",
+            accounts=[{"qq": "999", "state": "error", "error": "密钥校验失败"}],
+        )
+        with self.assertRaises(QqFlowAccountMismatchError):
+            await client.ensure_ready()
+        self.assertEqual(len(calls), 0, "别人的账号出错不该由我们去重试注册")
+
+    async def test_ready_phase_with_own_account_skips_registration(self):
+        """绑的就是自有账号：行为与修复前一致（短路 + 记忆化）。"""
+        calls: list = []
+        client = self._make_client(
+            "accepted",
+            calls,
+            phase="ready",
+            accounts=[{"qq": "123", "state": "ready"}],
+        )
+        await client.ensure_ready()
+        await client.ensure_ready()
+        self.assertEqual(len(calls), 0)
+        self.assertTrue(client._ready_checked)
+
+    async def test_awaiting_key_entry_is_not_treated_as_bound(self):
+        """只有 awaiting_key 条目 = 无人绑定：不得据此判定不符。
+
+        weflow 的明细会把启动扫描发现但未注册的账号也列进来；qqflow 侧同样
+        按「排除 awaiting_key」判定，避免把扫描结果误当成占用方。
+        """
+        calls: list = []
+        client = self._make_client(
+            "accepted",
+            calls,
+            phase="ready",
+            accounts=[{"qq": "999", "state": "awaiting_key"}],
+        )
+        await client.ensure_ready()  # 不抛
+        self.assertEqual(len(calls), 1, "无法确认身份 → 交给注册守卫定夺")
+
+    async def test_detail_unavailable_falls_through_to_register(self):
+        """明细端点取不到（401/抖动）：不硬失败，退化为由注册结果判定身份。"""
+        calls: list = []
+        client = self._make_client("accepted", calls, phase="ready")
+
+        async def boom():
+            raise RuntimeError("401")
+
+        client.fetch_accounts = boom  # type: ignore[method-assign]
+        with self.assertLogs("briefdesk.plugins.qqflow.client", "WARNING") as logs:
+            await client.ensure_ready()
+        self.assertEqual(len(calls), 1, "兜底层必须仍然发起注册")
+        self.assertTrue(any("账号明细不可用" in m for m in logs.output))
+
     async def test_version_logged_once_per_change(self):
         """/health 的 version 记入 _logged_version 并只在变化时打印。
 
@@ -262,7 +398,12 @@ class EnsureReadyRejectedStateTest(unittest.IsolatedAsyncioTestCase):
         此前都没传 —— 最需要版本号定位的场景反而拿不到。与 weflow 客户端同形。
         """
         calls: list = []
-        client = self._make_client("accepted", calls, phase="ready")
+        client = self._make_client(
+            "accepted",
+            calls,
+            phase="ready",
+            accounts=[{"qq": "123", "state": "ready"}],
+        )
 
         with self.assertLogs("briefdesk.plugins.qqflow.client", "INFO") as cm:
             await client.ensure_ready()
@@ -275,6 +416,75 @@ class EnsureReadyRejectedStateTest(unittest.IsolatedAsyncioTestCase):
         with self.assertNoLogs("briefdesk.plugins.qqflow.client", "INFO"):
             await client.ensure_ready(force=True)
         self.assertEqual(client._logged_version, "0.5.0")
+
+
+class RegisterConflictHttpTest(unittest.IsolatedAsyncioTestCase):
+    """register_account 就地抛账号不符 —— 在 HTTP 层验证（不打桩该方法）。
+
+    必须走 MockTransport：EnsureReadyRejectedStateTest 的 _make_client 会把
+    register_account 整体换成假实现，那条路径上永远碰不到方法内部的 raise。
+    """
+
+    @staticmethod
+    def _client_with(handler) -> QqFlowClient:
+        client = QqFlowClient(
+            "http://127.0.0.1:5032", "tok", qq="123", key="k" * 16
+        )
+        client._client = httpx.AsyncClient(
+            base_url="http://127.0.0.1:5032",
+            transport=httpx.MockTransport(handler),
+        )
+        return client
+
+    async def test_register_conflict_raises_with_occupied_by(self):
+        """account_conflict 响应 → 抛不符，且把占用方写进消息（便于排障）。"""
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                json={
+                    "state": "account_conflict",
+                    "occupied_by": "999",
+                    "occupied_status": "ready",
+                },
+            )
+
+        client = self._client_with(handler)
+        try:
+            with self.assertRaises(QqFlowAccountMismatchError) as cm:
+                await client.register_account("123", "k" * 16, "")
+            self.assertIn("999", str(cm.exception))
+            self.assertIn("123", str(cm.exception))
+        finally:
+            await client.close()
+
+    async def test_benign_state_still_returned_plainly(self):
+        """良性态返回值形状不变（D6 只加抛出，不改签名）。"""
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json={"state": "accepted"})
+
+        client = self._client_with(handler)
+        try:
+            self.assertEqual(
+                await client.register_account("123", "k" * 16, ""), "accepted"
+            )
+        finally:
+            await client.close()
+
+    async def test_http_error_is_not_reported_as_mismatch(self):
+        """非 2xx 仍是 RuntimeError —— 不得与账号不符混为一谈。"""
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(400, json={"error": "invalid key length"})
+
+        client = self._client_with(handler)
+        try:
+            with self.assertRaises(RuntimeError) as cm:
+                await client.register_account("123", "bad", "")
+            self.assertNotIsInstance(cm.exception, QqFlowAccountMismatchError)
+        finally:
+            await client.close()
 
 
 class LookupLimitTest(unittest.IsolatedAsyncioTestCase):
@@ -670,6 +880,49 @@ class SseRawidGuardTest(unittest.TestCase):
             "content": "这条内容长度肯定满足过滤阈值",
         }
         self.assertTrue(pre_filter_sse(ev))
+
+
+class SseSelfHealMismatchTest(unittest.IsolatedAsyncioTestCase):
+    """SSE 自愈检查遇账号不符时必须冒泡中止本轮监听（D5 止漏）。
+
+    这里跑的是 stream_events 真身：它自建 AsyncClient，故按 MockTransport 注入
+    一个假的构造器，才能覆盖到「HTTP 200 之后」那段自愈逻辑。
+    """
+
+    async def _collect(self, client: QqFlowClient) -> list:
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                headers={"content-type": "text/event-stream"},
+                text='data: {"event":"message_new","rawid":"r1"}\n\n',
+            )
+
+        # 真身要提前抓住：patch 之后 httpx.AsyncClient 这个名字就是替身，
+        # 在工厂里再引用它会无限递归。
+        real_cls = httpx.AsyncClient
+
+        with patch(
+            "briefdesk.plugins.qqflow.client.httpx.AsyncClient",
+            lambda **_kw: real_cls(transport=httpx.MockTransport(handler)),
+        ):
+            return [event async for event in client.stream_events()]
+
+    async def test_mismatch_aborts_stream_instead_of_warning(self):
+        client = QqFlowClient("http://127.0.0.1:5032", "tok", qq="123", key="k" * 16)
+        client.ensure_ready = AsyncMock(  # type: ignore[method-assign]
+            side_effect=QqFlowAccountMismatchError("已绑定另一个账号 999")
+        )
+        with self.assertRaises(QqFlowAccountMismatchError):
+            await self._collect(client)
+
+    async def test_other_self_heal_failure_still_swallowed(self):
+        """反向断言：普通自愈失败仍降级为 WARNING，不得连坐掐断实时流。"""
+        client = QqFlowClient("http://127.0.0.1:5032", "tok", qq="123", key="k" * 16)
+        client.ensure_ready = AsyncMock(  # type: ignore[method-assign]
+            side_effect=QqFlowNotReadyError("索引中")
+        )
+        events = await self._collect(client)
+        self.assertEqual([e.get("rawid") for e in events], ["r1"])
 
 
 if __name__ == "__main__":
