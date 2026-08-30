@@ -1,7 +1,7 @@
 """共享文本净化 — PII 脱敏 + 显示名清洗 + 主体名归一化。
 
-- mask_content：手机号 / 身份证 / 邮箱 / 银行卡替换为占位符
-  （含分隔符写法 138-0013-8000 与全角数字；详见 _SEP_RUN_RE 注释）
+- mask_content：手机号 / 身份证 / 邮箱 / 银行卡 / API 密钥（sk- 前缀、JWT）
+  替换为占位符（PII 含分隔符写法 138-0013-8000 与全角数字；详见 _SEP_RUN_RE 注释）
 - clean_display_name：去除显示名中的 C0 控制字符与首尾空白
 - normalize_subject：主体名 NFKC + 空白折叠/首尾 + 小写归一（供时间线跨写法聚合）
 - PLACEHOLDER_ONLY_RE：纯附件占位符判定（pipeline 入口过滤与 dedup 原文短路共用）
@@ -17,13 +17,17 @@ EMAIL_PLACEHOLDER = "[EMAIL]"
 ID_PLACEHOLDER = "[ID]"
 BANKCARD_PLACEHOLDER = "[BANKCARD]"
 PHONE_PLACEHOLDER = "[PHONE]"
+TOKEN_PLACEHOLDER = "[TOKEN]"
 
 # 单次扫描、命名组区分类型。顺序重要：
 #  - email 优先：邮箱内 11 位数字不会被当作手机号单独脱敏
+#  - token/jwt 紧随其后且先于数字类：密钥串（sk-…、eyJ…三段式 JWT）内部
+#    可能含 16-19 位连续数字（时间戳形态的 payload），必须整体先吃掉
 #  - ID 先于银行卡：18 位纯数字按身份证处理（规格歧义的确定性选择）；
 #    15 位一代身份证紧随其后（<16 位，不与银行卡区间重叠）
 #  - 数字类同时覆盖全角数字（０-９）：全角手机号/证件号/银行卡同样脱敏，
 #    邻接断言把全角数字视同数字，全角长串不会被部分命中
+#  - 9-10 位 QQ 号不脱敏：与 10 位 Unix 秒时间戳形态完全冲突，误伤面大于收益
 #
 # 用 (?<![0-9]) / (?![0-9]) 数字邻接断言而非 \b：Python re 的 \w 含中文，
 # "电话13800138000联系" 中"话"与数字之间没有词边界，\b\d{11}\b 会漏匹配。
@@ -31,6 +35,8 @@ PHONE_PLACEHOLDER = "[PHONE]"
 # 且 19 位数字串中的 11 位子串因前后仍是数字而不会被手机号规则部分命中。
 _MASK_RE = re.compile(
     r"(?P<email>[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,})"
+    r"|(?P<token>sk-[A-Za-z0-9_\-]{16,})"
+    r"|(?P<jwt>eyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]+)"
     r"|(?P<id>(?<![0-9０-９])[0-9０-９]{17}[0-9０-９Xx](?![0-9０-９]))"
     r"|(?P<id15>(?<![0-9０-９])[0-9０-９]{15}(?![0-9０-９]))"
     r"|(?P<bankcard>(?<![0-9０-９])[0-9０-９]{16,19}(?![0-9０-９]))"
@@ -39,6 +45,8 @@ _MASK_RE = re.compile(
 
 _PLACEHOLDER_BY_GROUP = {
     "email": EMAIL_PLACEHOLDER,
+    "token": TOKEN_PLACEHOLDER,
+    "jwt": TOKEN_PLACEHOLDER,
     "id": ID_PLACEHOLDER,
     "id15": ID_PLACEHOLDER,
     "bankcard": BANKCARD_PLACEHOLDER,

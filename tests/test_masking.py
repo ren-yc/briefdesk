@@ -7,6 +7,7 @@ from briefdesk.masking import (
     EMAIL_PLACEHOLDER,
     ID_PLACEHOLDER,
     PHONE_PLACEHOLDER,
+    TOKEN_PLACEHOLDER,
     clean_display_name,
     mask_content,
     normalize_subject,
@@ -35,6 +36,28 @@ class MaskContentTest(unittest.TestCase):
     def test_none_and_empty(self):
         self.assertEqual(mask_content(None), "")
         self.assertEqual(mask_content(""), "")
+
+    def test_api_key_token(self):
+        """【复核 P3】sk- 前缀密钥脱敏（群聊贴 key 的常见形态）。
+
+        样例为虚构值且含下划线（`[A-Za-z0-9_\\-]` 字符类允许），避免命中
+        pre-commit 密钥扫描器的纯字母数字连串形态。"""
+        text = "key 是 sk-abc123_456789012345678x 不要泄露"
+        self.assertIn(TOKEN_PLACEHOLDER, mask_content(text))
+        self.assertNotIn("sk-abc", mask_content(text))
+
+    def test_jwt_token(self):
+        """【复核 P3】三段式 JWT 整体脱敏：段内可能含 16-19 位数字（时间戳
+        形态 payload），须先于数字类规则整体命中。"""
+        jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJVadQssw5c"
+        self.assertIn(TOKEN_PLACEHOLDER, mask_content(f"token: {jwt}"))
+        self.assertNotIn("eyJhbGciOiJIUzI1NiJ9", mask_content(f"token: {jwt}"))
+
+    def test_unix_timestamp_and_short_id_not_masked(self):
+        """10 位 Unix 时间戳 / 9-10 位 QQ 号不脱敏：形态完全冲突，误伤面
+        大于收益（设计决策，防回归）。"""
+        self.assertIn("1700000000", mask_content("时间戳 1700000000 保留"))
+        self.assertIn("1234567890", mask_content("QQ 1234567890 找我"))
 
     def test_idempotent(self):
         once = mask_content("电话13800138000 邮箱 a@b.com")

@@ -144,6 +144,20 @@ class KeyringPriorityChainTest(KeyringTestCase):
                 settings = Settings(_env_file=env_file)
             self.assertEqual(settings.ai_api_key.get_secret_value(), "dotenv-value")
 
+    def test_empty_keyring_entry_does_not_shadow_dotenv(self) -> None:
+        """【复核 P3】keyring 空条目与未配置同语义：不得以「已配置」身份
+        压过 .env 的有效值（此前 `secrets set X ""` 的空串会覆盖 .env，
+        对 weflow/qqflow 的直接后果是插件被静默自禁用，且状态面板显示
+        未配置、解析链却采用空串——显示与行为互相矛盾）。"""
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as d:
+            env_file = _env_file(d, "AI_API_KEY=dotenv-value\n")
+            self._seed("AI_API_KEY", "")  # 条目存在但值为空串
+            with patch.dict(os.environ, {}, clear=True):
+                settings = Settings(_env_file=env_file)
+            self.assertEqual(settings.ai_api_key.get_secret_value(), "dotenv-value")
+
     def test_default_when_all_layers_empty(self) -> None:
         import tempfile
 

@@ -278,9 +278,17 @@ class OcrEnrichTest(unittest.IsolatedAsyncioTestCase):
         await self._run(msg, client, AsyncMock(return_value="识别文字"))
         self.assertEqual(msg.content, "原文内容")
 
-    async def test_ocr_success_replaces_content_with_prefix(self):
-        # 以源码为准：识别文本以 [OCR] 前缀替换（而非追加）content
+    async def test_ocr_mixed_message_appends_ocr_section(self):
+        # 图+文混合消息（复核 P2-21）：人工原文保留（信息密度更高），OCR 文本
+        # 作为附加段追加——此前整段替换会丢掉原文，分类/去重也失去该上下文
         msg = self._msg()
+        await self._run(msg, self._client(), AsyncMock(return_value="识别文字"))
+        self.assertEqual(msg.content, "原文内容\n[OCR]\n识别文字")
+
+    async def test_ocr_placeholder_content_replaced(self):
+        # 纯占位符消息（content 为附件占位符）：维持整段替换语义
+        msg = self._msg()
+        msg.content = "[图片]"
         await self._run(msg, self._client(), AsyncMock(return_value="识别文字"))
         self.assertEqual(msg.content, "[OCR]\n识别文字")
 

@@ -7,6 +7,9 @@ Linux=Secret Service。密钥环不可用（无桌面会话 / 无 Secret Service
 
 密钥只写入系统密钥环（CLI `briefdesk secrets set`），绝不回写 .env 明文
 文件；UI/CLI 也只能查询「是否配置」状态，不回传明文。
+
+空条目（值 == ""）与未配置同语义（真值判定）：读取层不会让空串以「已配置」
+身份压过环境变量/.env 的有效值。
 """
 
 import logging
@@ -128,12 +131,17 @@ class KeyringSource(PydanticBaseSettingsSource):
     def get_field_value(
         self, field: FieldInfo, field_name: str
     ) -> tuple[Any, str, bool]:
-        """返回 (值, 键名, 是否有效)；字段不在映射中或未配置返回无效。"""
+        """返回 (值, 键名, 是否有效)；字段不在映射中或未配置/空条目返回无效。
+
+        空条目与未配置同语义（真值判定，与 configured_names 口径一致）：
+        `secrets set X ""` 产生的空串不得以「已配置」身份压过环境变量/.env
+        里的有效值。
+        """
         name = self._field_map.get(field_name)
         if name is None:
             return None, field_name, False
         value = get_secret(name)
-        if value is None:
+        if not value:
             return None, field_name, False
         return SecretStr(value), self._key_for_field(field_name), True
 
@@ -141,5 +149,5 @@ class KeyringSource(PydanticBaseSettingsSource):
         return {
             self._key_for_field(field_name): SecretStr(value)
             for field_name, name in self._field_map.items()
-            if (value := get_secret(name)) is not None
+            if (value := get_secret(name))
         }

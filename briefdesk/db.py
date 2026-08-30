@@ -1137,8 +1137,10 @@ async def get_items_page(
 
 
 # 停用类别的卡片不参与任何侧边栏计数（前端显示层面同样被过滤，两侧一致）；
-# 已删除类别（categories 无行）的遗留卡片同样不计数：侧边栏只统计
-# categories 表中仍存在的分类，避免"删了类别还显示计数"。
+# 已删除类别（categories 无行）的遗留卡片：「全部/备忘/忽略」三个计数与列表
+# 均包含（NOT IN 排除不了无行类别——这是找回/改类的唯一入口，产品语义），
+# 仅类别明细不统计（get_category_counts 靠 c.name IS NOT NULL）——
+# 「全部」计数 ≥ 各类之和是预期口径，勿"修复"。
 _DISABLED_CAT_SQL = (
     " AND category NOT IN (SELECT name FROM categories WHERE enabled = 0)"
 )

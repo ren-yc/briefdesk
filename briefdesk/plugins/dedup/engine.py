@@ -457,7 +457,10 @@ class DedupEngine(DedupService):
                 resp.choices[0].finish_reason if resp.choices else "empty-choices",
                 content[:200],
             )
-        return False
+        # 两次解析均失败：抛错交调用方既有容错（_collect_verdicts 经
+        # return_exceptions 整形为 None 票、strong 路径 except 后降级参与
+        # 多数票）——不得 return False 被当作明确的 DIFFERENT 票计入计权
+        raise RuntimeError("判重输出两次解析失败（截断或 JSON 残缺）")
 
     @staticmethod
     def _snapshot(item: CachedItem) -> DedupCandidate:

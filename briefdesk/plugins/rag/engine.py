@@ -24,7 +24,7 @@ import aiosqlite
 import numpy as np
 
 from briefdesk import ai_ports
-from briefdesk.db import get_db, get_embed_db
+from briefdesk.db import get_db, get_embed_db, storage_lock
 from briefdesk.masking import PLACEHOLDER_ONLY_RE
 from briefdesk.plugins.rag.config import RagSettings
 from briefdesk.plugins.rag.db import (
@@ -362,11 +362,15 @@ class RagEngine:
     # ------------------------------------------------------------ 维护循环 --
 
     async def maintenance_gc(self) -> int:
-        """孤儿对账：chunks/FTS 在主连接清，向量在专用连接清。"""
+        """孤儿对账：chunks/FTS 在主连接清，向量在专用连接清。
 
-        db = await self._db_factory()
-        edb = await self._embed_factory()
-        removed = await gc_orphans(db, edb)
+        全程持存储锁（复核 P2-23）：主连接上的 DELETE+commit 若与管道/删除
+        路径的隐式多语句事务交叉，会把对方半程写入提前提交。
+        """
+        async with storage_lock:
+            db = await self._db_factory()
+            edb = await self._embed_factory()
+            removed = await gc_orphans(db, edb)
         if removed:
             logger.info("rag: GC 清理孤儿索引 %d 行", removed)
         return removed

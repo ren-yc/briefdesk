@@ -13,6 +13,23 @@ from briefdesk.plugins.dedup.engine import (
 )
 
 
+class AskAiParseFailureTest(unittest.IsolatedAsyncioTestCase):
+    """【复核 P2-19】_ask_ai 两次解析失败必须抛错（交调用方既有容错整形为
+    None 票：normal 路径剔除计权、strong 路径降级参与多数票），不得 return
+    False 被当作明确的 DIFFERENT 票计入计权。"""
+
+    async def test_double_parse_failure_raises(self):
+        engine = DedupEngine()
+        item = SimpleNamespace(title="A", source_quote="qa")
+        chat = AsyncMock(return_value=SimpleNamespace(choices=[]))
+        with (
+            patch("briefdesk.plugins.dedup.engine.chat", new=chat),
+            self.assertRaisesRegex(RuntimeError, "两次解析失败"),
+        ):
+            await engine._ask_ai(item, "B", "qb")
+        self.assertEqual(chat.await_count, 2, "两次尝试后才放弃")
+
+
 class JudgePromptTest(unittest.TestCase):
     def test_contains_few_shot_examples(self):
         self.assertIn("示例1：", JUDGE_PROMPT)

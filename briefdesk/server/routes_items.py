@@ -13,7 +13,13 @@ import time
 from typing import Annotated
 
 from fastapi import File, HTTPException, Query, UploadFile
-from fastapi.responses import JSONResponse, Response, StreamingResponse
+from fastapi.responses import (
+    FileResponse,
+    JSONResponse,
+    Response,
+    StreamingResponse,
+)
+from starlette.background import BackgroundTask
 
 import briefdesk.server.callbacks as _callbacks
 from briefdesk.config import config
@@ -251,18 +257,6 @@ async def api_export_recat_samples(fmt: str = Query("jsonl", alias="format")):
 _RESTORE_MAX_BYTES = 1 << 30  # 1GB 上限
 
 
-def _read_file_bytes(path: str) -> bytes:
-    """同步读文件字节（供 asyncio.to_thread 调用，避免阻塞事件循环）。"""
-    with open(path, "rb") as f:
-        return f.read()
-
-
-def _write_file_bytes(path: str, chunks: list[bytes]) -> None:
-    """同步写文件字节（供 asyncio.to_thread 调用，避免阻塞事件循环）。"""
-    with open(path, "wb") as f:
-        f.writelines(chunks)
-
-
 @app.get("/api/backup")
 async def api_backup():
     """下载数据库在线备份（SQLite backup API，WAL 安全，可运行中执行）。"""
@@ -270,17 +264,18 @@ async def api_backup():
     os.close(fd)
     try:
         await backup_db_to(tmp)
-        content = await asyncio.to_thread(_read_file_bytes, tmp)
-    finally:
-        try:
-            os.remove(tmp)
-        except OSError:
-            pass
+    except BaseException:
+        # 响应未建立：清理临时文件（成功路径由 BackgroundTask 兜底删除）
+        os.remove(tmp)
+        raise
     filename = f"briefdesk-backup-{time.strftime('%Y%m%d-%H%M%S')}.sqlite"
-    return Response(
-        content=content,
+    # 流式下发（复核 P2-10）：整库读入内存改为 FileResponse，响应完成后
+    # 由后台任务删除临时文件
+    return FileResponse(
+        tmp,
         media_type="application/octet-stream",
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        background=BackgroundTask(os.remove, tmp),
     )
 
 
@@ -295,14 +290,18 @@ async def api_restore(file: Annotated[UploadFile, File()]):
     fd, tmp = tempfile.mkstemp(suffix=".sqlite")
     os.close(fd)
     total = 0
-    chunks: list[bytes] = []
     try:
-        while chunk := await file.read(1 << 20):
-            total += len(chunk)
-            if total > _RESTORE_MAX_BYTES:
-                raise HTTPException(400, "backup file too large (max 1GB)")
-            chunks.append(chunk)
-        await asyncio.to_thread(_write_file_bytes, tmp, chunks)
+        # 逐块落盘（复核 P2-10）：不再整体攒 chunks 列表，内存占用恒定 chunk 级；
+        # open/close/write 均走 to_thread，避免事件循环线程做阻塞文件操作
+        f = await asyncio.to_thread(open, tmp, "wb")
+        try:
+            while chunk := await file.read(1 << 20):
+                total += len(chunk)
+                if total > _RESTORE_MAX_BYTES:
+                    raise HTTPException(400, "backup file too large (max 1GB)")
+                await asyncio.to_thread(f.write, chunk)
+        finally:
+            await asyncio.to_thread(f.close)
         err = await validate_restore_file(tmp)
         if err:
             raise HTTPException(400, err)
@@ -349,7 +348,12 @@ async def api_verify(item_id: str, body: dict):
 @app.post("/api/items/{item_id}/recategorize")
 async def api_recategorize(item_id: str, body: dict):
     """手动修正卡片分类。只允许改到启用类别（避免改入停用类别后卡片消失）。"""
-    category = (body.get("category") or "").strip()
+    category_raw = body.get("category")
+    # isinstance 防护与 routes_categories 同口径：非字符串直接 400 而非 500
+    # （此前 `123 or ""` 会保留 123 并在 .strip() 抛 AttributeError）
+    if not isinstance(category_raw, str):
+        raise HTTPException(400, "category is required")
+    category = category_raw.strip()
     if not category:
         raise HTTPException(400, "category is required")
     if not await category_exists(category):
@@ -439,9 +443,18 @@ async def api_refresh_sessions():
     }
 
 
+# API 触发的同步任务句柄（覆盖写即可：trigger_sync 内部已防并发重复）。
+# 官方文档要求对 create_task 结果保存引用，否则任务执行中可能被 GC；
+# 同时为关闭路径保留显式句柄（_cancel_pending_tasks 兜底之外的正通道）。
+_last_sync_task: asyncio.Task[None] | None = None
+
+
 @app.post("/api/sync")
 async def api_sync():
-    if trigger_sync(reason="api"):
+    global _last_sync_task
+    task = trigger_sync(reason="api")
+    if task is not None:
+        _last_sync_task = task
         return {"success": True, "message": "Sync started"}
     return JSONResponse(
         {"success": False, "message": "Sync already in progress"}, status_code=409

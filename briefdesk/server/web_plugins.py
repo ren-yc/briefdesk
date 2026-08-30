@@ -13,6 +13,7 @@ from pathlib import Path
 
 from fastapi import APIRouter
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
+from fastapi.routing import APIRoute
 from starlette.routing import Mount
 
 from briefdesk.server.app import app
@@ -87,6 +88,14 @@ def include_plugin_router(router: APIRouter) -> None:
     key = id(router)
     if key in _included_router_ids:
         return
+    # 同源校验契约（复核 P2-11）：middleware 仅对 /api/ 前缀的变更方法做
+    # CSRF 校验——插件路由挂在其它前缀会静默失去防线，装配期硬失败
+    for r in router.routes:
+        if isinstance(r, APIRoute) and not r.path.startswith("/api/"):
+            raise RuntimeError(
+                f"插件路由 {r.path!r} 必须挂在 /api/ 下"
+                "（同源校验契约，见 server/middleware.py）"
+            )
     moved = list(router.routes)
     idx = len(app.routes)
     for i, r in enumerate(app.routes):
