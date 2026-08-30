@@ -179,6 +179,7 @@ async def _run() -> None:
     runtimes: list[SourceRuntime] = []
     server_task: asyncio.Task[None] | None = None
     initial_sync_task: asyncio.Task[None] | None = None
+    periodic_task: asyncio.Task[None] | None = None
 
     try:
         # 1. 应用待恢复备份（上传恢复后重启生效：先替换正式库再开库）
@@ -284,6 +285,17 @@ async def _run() -> None:
         if initial_sync_task is None:
             logger.warning("首轮回填跳过：同步已在进行或未注册回调")
 
+        # 5.1 可选周期同步兜底（POLL_INTERVAL_SECONDS，默认 0 = 禁用）：
+        # SSE 断连/监听死亡窗口的消息此前完全依赖用户手动同步，>0 时按周期
+        # 自动补齐（与 /api/sync 同路径，互斥由 trigger_sync 保证）
+        if config.poll_interval_seconds > 0:
+            periodic_task = asyncio.create_task(
+                _periodic_sync_loop(), name="periodic-sync"
+            )
+            logger.info(
+                "周期同步已启用: 每 %d 秒", config.poll_interval_seconds
+            )
+
         # 6. 注册优雅关闭信号
         # Ctrl+C 触发优雅关闭（SSE 流结束 → should_exit），uvicorn 正常收尾后
         # await server_task 返回。若信号处理未生效（如异常路径），
@@ -315,11 +327,19 @@ async def _run() -> None:
         await server_task
     finally:
         shutdown_start = time_module.perf_counter()
+        # 吸收尚未投递的取消请求（启动窗口 Ctrl+C 经 Runner 取消主任务）：
+        # 保证后续清理 await 不被同一次取消打断（close_db 被跳过 = 退出挂死）；
+        # 清理期间用户再次 Ctrl+C 是硬杀语义，不在此防御范围
+        _task = asyncio.current_task()
+        if _task is not None and _task.cancelling():
+            _task.uncancel()
         # 清理顺序即下方语句序：server → initial_sync → 插件逆序 → DB → 残留兜底。
         # cancel 不同步等待、aiosqlite 非 daemon 线程等陷阱见 docs/architecture.md
         # 「运行时与优雅关闭」小节。
         await _reap_task(server_task)
         await _reap_task(initial_sync_task)
+        if periodic_task is not None:
+            await _reap_task(periodic_task)
         await manager.teardown_all()
         logger.info(
             "插件已关闭 (%s)", fmt_dur(time_module.perf_counter() - shutdown_start)
@@ -334,6 +354,19 @@ async def _run() -> None:
         )
 
 
+async def _periodic_sync_loop() -> None:
+    """周期同步兜底（POLL_INTERVAL_SECONDS > 0 时由 _run 拉起）。
+
+    与手动 /api/sync 共用 trigger_sync 路径：进行中互斥由其返回 None 保证；
+    await 同步任务串行化，上一轮未完成不叠加触发。
+    """
+    while True:
+        await asyncio.sleep(config.poll_interval_seconds)
+        task = trigger_sync(reason="periodic")
+        if task is not None:
+            await task
+
+
 def main() -> None:
     """入口：`briefdesk secrets` 子命令或启动本地服务。"""
     if len(sys.argv) >= 2 and sys.argv[1] == "secrets":
@@ -342,13 +375,17 @@ def main() -> None:
         raise SystemExit(secrets_cli_main(sys.argv[2:]))
 
     setup_logging()
-    loop = asyncio.new_event_loop()
+    # asyncio.Runner：SIGINT 由 Runner 自己的 handler 接管——第一次 Ctrl+C
+    # 取消主任务并等其 finally 跑完再收敛。裸 run_until_complete 下 _run 的
+    # finally 不会执行（aiosqlite 非 daemon worker 线程会让解释器退出挂死），
+    # 启动窗口尤其如此：我们的信号处理器要等 server.started 后才安装。
+    # 清理期间的再次 Ctrl+C 由 Runner 升级为 KeyboardInterrupt 强杀（第二次
+    # 信号语义，不在此防御范围）。
     try:
-        loop.run_until_complete(_run())
+        with asyncio.Runner() as runner:
+            runner.run(_run())
     except KeyboardInterrupt:
         pass
-    finally:
-        loop.close()
 
 
 if __name__ == "__main__":

@@ -14,6 +14,31 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from briefdesk.plugin.base import PluginError
 
 
+class PeriodicSyncLoopTest(unittest.IsolatedAsyncioTestCase):
+    """【复核 P1-4】POLL_INTERVAL_SECONDS > 0 时周期触发 trigger_sync（与
+    /api/sync 同路径；互斥由其返回 None 保证，不叠加触发）。"""
+
+    async def test_loop_triggers_sync_periodically_and_exits_on_cancel(self):
+        from briefdesk import main as main_mod
+
+        reasons: list[str] = []
+
+        def fake_sync(reason: str = "manual"):
+            reasons.append(reason)  # 返回 None = 同步已在进行（互斥），循环不 await
+
+        with (
+            patch.object(main_mod.config, "poll_interval_seconds", 0.01),
+            patch.object(main_mod, "trigger_sync", side_effect=fake_sync),
+        ):
+            task = asyncio.create_task(main_mod._periodic_sync_loop())
+            await asyncio.sleep(0.05)
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+        self.assertGreaterEqual(len(reasons), 1)
+        self.assertEqual(reasons[0], "periodic")
+
+
 class MainRunCleanupOnSetupFailureTest(unittest.IsolatedAsyncioTestCase):
     async def test_required_plugin_failure_still_closes_db(self):
         from briefdesk import main as main_mod

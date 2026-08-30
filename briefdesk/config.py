@@ -41,7 +41,9 @@ class Settings(BaseSettings):
     ai_api_key: SecretStr = Field(default=SecretStr(""), alias="AI_API_KEY")
     ai_api_base: str = Field(default="https://api.deepseek.com", alias="AI_API_BASE")
     ai_model: str = Field(default="deepseek-v4-flash", alias="AI_MODEL")
-    ai_max_concurrency: int = Field(default=0, alias="AI_MAX_CONCURRENCY", ge=0)
+    ai_max_concurrency: int = Field(default=4, alias="AI_MAX_CONCURRENCY", ge=0)
+    """AI 请求最大并发（chat 与嵌入共用），0 = 不限制。默认 4：不设限时大回填
+    会一次性放行全部批次形成请求风暴（429 → 整批 failed → 钉窗重拉放大）。"""
 
     ai_disable_thinking: bool = Field(default=False, alias="AI_DISABLE_THINKING")
     """设为 true 时，AI 请求会附带 reasoning_effort="none"，
@@ -78,6 +80,11 @@ class Settings(BaseSettings):
     """增量轮询窗口与上次水位之间的重叠秒数：吸收边界秒、时钟偏差与
     翻页期间上游插入导致的 offset 漂移；重叠部分由 processed_messages
     去重，无 AI 开销。"""
+
+    poll_interval_seconds: int = Field(default=0, alias="POLL_INTERVAL_SECONDS", ge=0)
+    """周期同步间隔（秒），0 = 禁用（默认，保持纯手动/启动期同步）。
+    SSE 断连/监听死亡窗口的消息补齐兜底：>0 时按该周期自动触发与
+    /api/sync 同路径的同步（进行中互斥）。"""
 
     dedup_similarity_threshold: float = Field(
         default=0.3, alias="DEDUP_SIMILARITY_THRESHOLD", ge=0, le=1
