@@ -5,10 +5,13 @@ rapidocr/onnxruntime 为可选依赖（ocr extra）：未安装时引擎相关�
 """
 
 import builtins
+import io
 import sys
 import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
+
+from PIL import Image
 
 try:
     from rapidocr.main import RapidOCRError
@@ -19,9 +22,11 @@ try:
 except ImportError:  # pragma: no cover — 未安装 OCR extra 时引擎测试跳过
     _OCR_DEPS_AVAILABLE = False
 
-from briefdesk.config import Settings
+from briefdesk.config import Settings, config
 from briefdesk.plugin.base import PluginContext, PluginDisabledError
 from briefdesk.plugins.ocr.plugin import OcrPlugin
+from briefdesk.sources_base import MediaError
+from briefdesk.types import BatchContext, InternalMessage
 
 
 async def _noop_async(*args, **kwargs):
@@ -119,6 +124,79 @@ class OcrPluginSetupTest(unittest.IsolatedAsyncioTestCase):
             self.assertRaises(PluginDisabledError),
         ):
             await OcrPlugin().setup(_ctx())
+
+
+class _FakeMediaClient:
+    """可配置的假媒体客户端：按 URL 返回字节或抛 MediaError。"""
+
+    def __init__(self, payloads=None, error=None):
+        self._payloads = payloads or {}
+        self._error = error
+
+    async def download_media(self, url):
+        if self._error is not None:
+            raise MediaError(self._error)
+        return self._payloads.get(url, b"raw-bytes")
+
+
+def _png_bytes() -> bytes:
+    buf = io.BytesIO()
+    Image.new("RGB", (20, 10), (10, 10, 10)).save(buf, "PNG")
+    return buf.getvalue()
+
+
+def _vision_msg(msg_id="m1", source="weflow-legacy") -> InternalMessage:
+    return InternalMessage(
+        msg_id=msg_id,
+        content="[图片]",
+        sender_name="张三",
+        sender_id="u1",
+        session_id="s1",
+        group_name="社团群",
+        timestamp=1,
+        source=source,
+        image_urls=["p1"],
+    )
+
+
+class OcrPluginVisionStashTest(unittest.IsolatedAsyncioTestCase):
+    """vision 路由：下载成功后把归一化图片字节随批暂存（独立于 OCR 结果）。"""
+
+    async def _run(self, *, vision_enabled, ocr_result="识别文本", ocr_error=None, media_error=None):
+        plugin = OcrPlugin()
+        if ocr_error is not None:
+            plugin._ocr_image_bytes = AsyncMock(side_effect=ocr_error)
+        else:
+            plugin._ocr_image_bytes = AsyncMock(return_value=ocr_result)
+        msg = _vision_msg()
+        batch = BatchContext(
+            messages=[msg],
+            client=_FakeMediaClient(payloads={"p1": _png_bytes()}, error=media_error),
+        )
+        with patch.object(config, "ai_vision_enabled", vision_enabled):
+            await plugin.run(batch, None)
+        return batch, msg
+
+    async def test_vision_on_stashes_normalized_jpeg(self):
+        batch, msg = await self._run(vision_enabled=True)
+        stashed = batch.vision_images[("weflow-legacy", "m1")]
+        self.assertEqual(len(stashed), 1)
+        self.assertTrue(stashed[0].startswith(b"\xff\xd8"))  # 归一化输出为 JPEG
+        self.assertEqual(msg.content, "[OCR]\n识别文本")  # OCR 替换契约不变
+
+    async def test_vision_on_ocr_failure_still_stashes(self):
+        # 暂存独立于 OCR 结果：引擎故障时图片仍可送模型，content 保持原文
+        batch, msg = await self._run(vision_enabled=True, ocr_error=RuntimeError("broken"))
+        self.assertIn(("weflow-legacy", "m1"), batch.vision_images)
+        self.assertEqual(msg.content, "[图片]")
+
+    async def test_vision_off_no_stash(self):
+        batch, _msg = await self._run(vision_enabled=False)
+        self.assertEqual(batch.vision_images, {})
+
+    async def test_media_error_no_stash(self):
+        batch, _msg = await self._run(vision_enabled=True, media_error="404")
+        self.assertEqual(batch.vision_images, {})
 
 
 if __name__ == "__main__":

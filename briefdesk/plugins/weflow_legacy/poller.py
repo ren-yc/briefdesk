@@ -195,6 +195,9 @@ async def poll(
                     media=True,
                     # 脏会话 404 → 空信封，对齐 weflow/qqflow（复核 U1-1）
                     not_found_ok=True,
+                    # 首页保留「刚入库查不到」竞态兜底；翻页空结果即末页，
+                    # 再重试只会给每个空闲会话固定加 500ms 串行延迟
+                    retry_on_empty=page == 0,
                 )
                 page_msgs = resp.get("messages", [])
                 if not page_msgs:

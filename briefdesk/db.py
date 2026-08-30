@@ -429,6 +429,11 @@ async def get_db() -> aiosqlite.Connection:
                     logger.critical("数据库 schema 不匹配，拒绝启动: %s", e)
                     await conn.close()
                     raise SystemExit(1) from e
+                except Exception:
+                    # init 其余异常（磁盘满/库损坏等）：关闭本连接再上抛，
+                    # 否则泄漏的 aiosqlite 连接（非 daemon worker 线程）滞留
+                    await conn.close()
+                    raise
                 _db = conn  # Only assign after full init
     return _db
 
@@ -804,7 +809,7 @@ async def _backfill_default_categories(db: aiosqlite.Connection) -> None:
     if version >= 1:
         return
     now = datetime.now(UTC).isoformat()
-    await db.executemany(
+    cursor = await db.executemany(
         "INSERT OR IGNORE INTO categories (name, prompt, color, enabled, created_at) "
         "VALUES (?, ?, ?, ?, ?)",
         [
@@ -812,6 +817,7 @@ async def _backfill_default_categories(db: aiosqlite.Connection) -> None:
             for name, prompt, color, enabled in DEFAULT_CATEGORIES
         ],
     )
+    await cursor.close()
     await db.execute("PRAGMA user_version = 1")
 
 
@@ -1377,9 +1383,11 @@ async def update_item_merged(
     msg_time: int,
     image_urls: str,
     extra_times: str = "",
+    article_url: str = "",
 ) -> None:
     """合并后回写存活卡的内容字段（含 content_hash 重算）。
 
+    article_url 由调用方按「存活卡优先、缺失则继承被吸收卡」合并后传入；
     不改 is_verified/verified_at/remind_at/category/source 等元数据；
     调用方需同步维护去重内存缓存（删除被吸收卡、按新文本重加存活卡）。
     同步删除该卡的 item_embeddings：合并改写了标题/原文，旧向量语义失效，
@@ -1390,7 +1398,8 @@ async def update_item_merged(
     await db.execute(
         "UPDATE items SET title = ?, key_info = ?, "
         "source_quote = ?, subject = ?, start = ?, end = ?, "
-        "msg_time = ?, image_urls = ?, extra_times = ?, content_hash = ? WHERE id = ?",
+        "msg_time = ?, image_urls = ?, extra_times = ?, content_hash = ?, "
+        "article_url = ? WHERE id = ?",
         (
             title,
             key_info or None,
@@ -1402,12 +1411,19 @@ async def update_item_merged(
             image_urls,
             extra_times,
             content_hash,
+            article_url or "",
             item_id,
         ),
     )
-    await db.execute(
-        "DELETE FROM item_embeddings WHERE item_id = ?", (item_id,)
-    )
+    try:
+        await db.execute(
+            "DELETE FROM item_embeddings WHERE item_id = ?", (item_id,)
+        )
+    except Exception:
+        # 多步写异常路径必须回滚：悬挂事务被后续无关 commit 收尾提交后，
+        # 会留下"合并后新文本配旧向量"的语义漂移（docstring 上述要防的问题）
+        await db.rollback()
+        raise
     await db.commit()
 
 
@@ -1548,6 +1564,8 @@ async def purge_expired_ignored(expiry_hours: int) -> int:
 
 
 _PROCESSED_QUERY_CHUNK = 900  # 单语句占位符预算，远低于 SQLite 变量上限（32766）
+# DELETE ... IN 列表共用同一占位符预算（类别级联删除等大列表场景）
+_SQL_VARS_CHUNK = _PROCESSED_QUERY_CHUNK
 
 
 async def are_messages_processed(source: str, msg_ids: list[str]) -> set[str]:
@@ -1715,24 +1733,30 @@ async def get_enabled_sessions(source: str) -> list[SessionRow]:
 
 async def toggle_session(source: str, session_id: str) -> SessionRow | None:
     db = await get_db()
-    await db.execute(
-        "UPDATE sessions SET enabled = CASE WHEN enabled = 1 THEN 0 ELSE 1 END "
-        "WHERE source = ? AND session_id = ?",
-        (source, session_id),
-    )
-    row = await _fetchone(
-        db,
-        "SELECT * FROM sessions WHERE source = ? AND session_id = ?",
-        (source, session_id),
-    )
-    if row and row["enabled"] == 1:
-        # 启用即回填：清空会话水位（NULL = 待回填），下次 poll 按
-        # BACKFILL_HOURS 窗口回填一次，之后转入增量轮询。
+    try:
         await db.execute(
-            "UPDATE sessions SET last_poll_ts = NULL "
+            "UPDATE sessions SET enabled = CASE WHEN enabled = 1 THEN 0 ELSE 1 END "
             "WHERE source = ? AND session_id = ?",
             (source, session_id),
         )
+        row = await _fetchone(
+            db,
+            "SELECT * FROM sessions WHERE source = ? AND session_id = ?",
+            (source, session_id),
+        )
+        if row and row["enabled"] == 1:
+            # 启用即回填：清空会话水位（NULL = 待回填），下次 poll 按
+            # BACKFILL_HOURS 窗口回填一次，之后转入增量轮询。
+            await db.execute(
+                "UPDATE sessions SET last_poll_ts = NULL "
+                "WHERE source = ? AND session_id = ?",
+                (source, session_id),
+            )
+    except Exception:
+        # 两步写必须原子：若「翻转 enabled」被提前提交而清水位失败，
+        # 该会话会按旧水位增量轮询、跳过旧水位至今的消息（回填窗口丢失）
+        await db.rollback()
+        raise
     await db.commit()
     return cast(SessionRow, dict(row)) if row else None
 
@@ -1879,19 +1903,22 @@ async def delete_category(
                 db, "SELECT id FROM items WHERE category = ?", (row["name"],)
             )
             deleted_ids = [r["id"] for r in rows]
-            if deleted_ids:
-                placeholders = ",".join("?" for _ in deleted_ids)
+            # 按 IN 占位符预算分块：类别下卡片超过 SQLite 变量上限时
+            # 整条 DELETE 会抛 "too many SQL variables"，purge 整体失败
+            for start in range(0, len(deleted_ids), _SQL_VARS_CHUNK):
+                chunk = deleted_ids[start : start + _SQL_VARS_CHUNK]
+                placeholders = ",".join("?" for _ in chunk)
                 await db.execute(
                     f"DELETE FROM item_embeddings WHERE item_id IN ({placeholders})",
-                    tuple(deleted_ids),
+                    tuple(chunk),
                 )
                 await db.execute(
                     f"DELETE FROM raw_messages WHERE (source, msg_id) IN ("
                     f"SELECT source, source_msg_id FROM items WHERE id IN ({placeholders}))",
-                    tuple(deleted_ids),
+                    tuple(chunk),
                 )
                 await db.execute(
-                    f"DELETE FROM items WHERE id IN ({placeholders})", tuple(deleted_ids)
+                    f"DELETE FROM items WHERE id IN ({placeholders})", tuple(chunk)
                 )
         await db.execute("DELETE FROM categories WHERE id = ?", (cat_id,))
     except Exception:
@@ -1948,30 +1975,36 @@ async def bulk_insert_raw_messages(messages: list[RawMsgInput]) -> None:
     if not messages:
         return
     db = await get_db()
-    for start in range(0, len(messages), _RAW_INSERT_CHUNK):
-        chunk = messages[start : start + _RAW_INSERT_CHUNK]
-        params: list[Any] = []
-        for m in chunk:
-            params.extend(
-                [
-                    m["source"],
-                    m["msg_id"],
-                    m["session_id"],
-                    m["group_name"],
-                    m["sender_id"],
-                    m["sender_name"],
-                    m["content"],
-                    m["timestamp"],
-                    m.get("article_url", ""),
-                ]
+    try:
+        for start in range(0, len(messages), _RAW_INSERT_CHUNK):
+            chunk = messages[start : start + _RAW_INSERT_CHUNK]
+            params: list[Any] = []
+            for m in chunk:
+                params.extend(
+                    [
+                        m["source"],
+                        m["msg_id"],
+                        m["session_id"],
+                        m["group_name"],
+                        m["sender_id"],
+                        m["sender_name"],
+                        m["content"],
+                        m["timestamp"],
+                        m.get("article_url", ""),
+                    ]
+                )
+            cursor = await db.executemany(
+                "INSERT OR IGNORE INTO raw_messages "
+                "(source, msg_id, session_id, group_name, sender_id, sender_name, content, timestamp, article_url) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                [params[i : i + 9] for i in range(0, len(params), 9)],
             )
-        cursor = await db.executemany(
-            "INSERT OR IGNORE INTO raw_messages "
-            "(source, msg_id, session_id, group_name, sender_id, sender_name, content, timestamp, article_url) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            [params[i : i + 9] for i in range(0, len(params), 9)],
-        )
-        await cursor.close()
+            await cursor.close()
+    except Exception:
+        # 多块写异常路径统一 rollback：虽 INSERT OR IGNORE 幂等（重拉无损），
+        # 悬挂事务被后续无关 commit 收尾仍会造成部分写入提前可见
+        await db.rollback()
+        raise
     await db.commit()
 
 
@@ -2057,7 +2090,7 @@ async def get_context_messages(
             if len(rows) > 30:
                 farthest = max(
                     (r for r in rows if r["msg_id"] != target_msg_id),
-                    key=lambda r: (abs(r["time"] - around_time), -r["time"]),
+                    key=lambda r: (abs(r["time"] - around_time), r["time"]),
                 )
                 rows.remove(farthest)
             rows.sort(key=lambda r: r["time"])
@@ -2086,7 +2119,9 @@ async def merge_source_group(item_id: str, new_group: str) -> None:
         return
     existing = row["source_group"] or ""
     groups = [g.strip() for g in existing.split(",") if g.strip()]
-    if new_group not in groups:
+    # 空串防御：私有会话 group_name 可能为空，尾随空段虽会在下次拆分时自愈，
+    # 但写库侧不应制造脏数据
+    if new_group and new_group not in groups:
         groups.append(new_group)
         merged = ", ".join(groups)
         await db.execute(
@@ -2181,8 +2216,11 @@ async def upsert_embeddings(rows: list[tuple[str, str, list[float]]]) -> None:
                 await db.commit()
                 return
             except sqlite3.OperationalError as e:
-                if "statements in progress" not in str(e) and "locked" not in str(e):
-                    raise
-                if attempt >= 2:
+                retryable = "statements in progress" in str(e) or "locked" in str(e)
+                if not retryable or attempt >= 2:
+                    # 终结悬挂事务（executemany 已写入未提交），防写锁滞留到
+                    # 下一次 upsert；INSERT OR REPLACE 按 item_id 幂等，
+                    # 可重试路径下一轮重写无损
+                    await db.rollback()
                     raise
         await asyncio.sleep(0.1 * (attempt + 1))

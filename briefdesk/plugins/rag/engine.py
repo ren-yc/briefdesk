@@ -7,8 +7,9 @@
 
 作用域语义（隐私边界，见 architecture.md）：启用会话恒为前提；
 RAG_GROUP_ONLY（默认开）进一步限定群聊——停用会话即时不可问出。
-rag 三表是 raw_messages 的派生索引；向量表走专用连接（get_embed_db 同款
-隔离约定），脏行删除不与主连接上的管道事务互相提交。
+rag 四表（chunks/embeddings/fts/skipped）是 raw_messages 的派生索引；向量表
+走专用连接（get_embed_db 同款隔离约定），脏行删除不与主连接上的管道事务
+互相提交；共享连接上的写统一持 db.get_embed_lock()/pipeline 存储锁。
 """
 
 from __future__ import annotations
@@ -24,7 +25,7 @@ import aiosqlite
 import numpy as np
 
 from briefdesk import ai_ports
-from briefdesk.db import get_db, get_embed_db, storage_lock
+from briefdesk.db import get_db, get_embed_db, get_embed_lock, storage_lock
 from briefdesk.masking import PLACEHOLDER_ONLY_RE
 from briefdesk.plugins.rag.config import RagSettings
 from briefdesk.plugins.rag.db import (
@@ -36,6 +37,7 @@ from briefdesk.plugins.rag.db import (
     fetch_one,
     fts_search,
     gc_orphans,
+    mark_skipped,
     parse_embedding_rows,
     scope_sql,
     sync_fts,
@@ -193,6 +195,11 @@ class RagEngine:
         model 由调用方传入而非在此现取：回填的反连接谓词已按某个 model 值筛过
         行，落库必须写同一个值，否则下一轮又把这批选回来（空转死循环）。
         返回是否写入了向量，供调用方决定要不要触发自愈回填。
+
+        连接纪律：调用方持有 storage_lock 与否由调用路径决定（run 在管道锁内、
+        backfill_step 自行持锁）；本方法对共享 embed 连接的写统一持
+        db.get_embed_lock()——dedup 的向量落库共用同一条连接，语句级互斥
+        防止一方的 commit 把另一方未完成的批量写入提前提交。
         """
         await upsert_chunks(db, rows)
         if self._fts_enabled:
@@ -201,7 +208,8 @@ class RagEngine:
             return False
         now_iso = datetime.now(UTC).isoformat(timespec="seconds")
         edb = await self._embed_factory()
-        await upsert_embeddings(edb, emb_items, emb_vecs, model, now_iso)
+        async with get_embed_lock():
+            await upsert_embeddings(edb, emb_items, emb_vecs, model, now_iso)
         return True
 
     async def before_run(self, batch: BatchContext) -> None:
@@ -283,6 +291,10 @@ class RagEngine:
         反连接条件天然可续跑：嵌入失败或预算截断的行下一轮仍会被选中；
         返回本轮处理条数，0 表示回填完成。backfill_days：>0 窗口天，
         0 关闭，-1 全量。last_cycle_embed_failed 供维护循环做失败退避。
+
+        写路径持 pipeline 存储锁（本方法运行于维护循环、不在锁内）：
+        chunks/FTS/skipped 落主连接，锁外 commit 会把管道未完成的多步写
+        提前提交——与 db.py 事务纪律一致；嵌入（网络）在锁外。
         """
 
         self.last_cycle_embed_failed = False
@@ -291,7 +303,10 @@ class RagEngine:
         if self.settings.backfill_days == 0:
             return 0
         model = ai_ports.embed_model_name()
-        # 作用域谓词与检索侧共用单源（这里过滤 raw_messages，别名 r）
+        # 作用域谓词与检索侧共用单源（这里过滤 raw_messages，别名 r）；
+        # NOT EXISTS 排除已登记 skipped 的「永不入索引」行——占位符消息永远
+        # 满足反连接却永远不被消费，不排除会每轮占满预算窗口，令更早的
+        # 真实消息饿死（审查回归）
         scope, scope_params = scope_sql(self.settings.group_only, alias="r")
         sql = (
             "SELECT r.source, r.msg_id, r.session_id, r.group_name, "
@@ -302,6 +317,8 @@ class RagEngine:
             "AND e.msg_id = r.msg_id "
             "WHERE (c.msg_id IS NULL OR e.msg_id IS NULL OR e.model <> ?)"
             " AND trim(r.content, ' ' || char(9)) <> ''"
+            " AND NOT EXISTS (SELECT 1 FROM rag_skipped k "
+            "WHERE k.source = r.source AND k.msg_id = r.msg_id)"
             + scope
         )
         # 绑定顺序须随 SQL 文本顺序：model → scope（当前无参）→ 窗口 → LIMIT
@@ -322,8 +339,17 @@ class RagEngine:
             for r in raw_rows
             if _indexable(r["content"])
         ]
+        # 被过滤的「永不入索引」行登记 skipped（消费一次即永久出队）。
+        # 登记 commit 与落库同持存储锁，此处仅计算键。
+        skipped_keys = [
+            (r["source"], r["msg_id"])
+            for r in raw_rows
+            if not _indexable(r["content"])
+        ]
         if not rows:
-            return 0
+            async with storage_lock:
+                await mark_skipped(db, skipped_keys)
+            return len(skipped_keys)
         # 分批嵌入 + 逐批数量守卫：供应商短返回时截断到已对齐前缀，
         # 防错位向量静默落库（反连接无法纠正的错误数据）
         vectors: list[list[float]] = []
@@ -348,13 +374,16 @@ class RagEngine:
         # 截断到已对齐前缀：向量少于行数时只登记配对上的那部分，
         # 其余行仍入 chunks（反连接下轮按缺向量重新选回）
         paired = min(len(vectors), len(rows))
-        await self._persist_chunks(
-            db,
-            rows,
-            [(r.source, r.msg_id) for r in rows[:paired]],
-            vectors[:paired],
-            model,
-        )
+        async with storage_lock:
+            if skipped_keys:
+                await mark_skipped(db, skipped_keys)
+            await self._persist_chunks(
+                db,
+                rows,
+                [(r.source, r.msg_id) for r in rows[:paired]],
+                vectors[:paired],
+                model,
+            )
         self.last_cycle_embed_failed = failed
         logger.info("rag: 回填本轮处理 %d 条（含向量 %d 条）", len(rows), paired)
         return len(rows)
@@ -364,24 +393,34 @@ class RagEngine:
     async def maintenance_gc(self) -> int:
         """孤儿对账：chunks/FTS 在主连接清，向量在专用连接清。
 
-        全程持存储锁（复核 P2-23）：主连接上的 DELETE+commit 若与管道/删除
-        路径的隐式多语句事务交叉，会把对方半程写入提前提交。
+        写库持 pipeline 存储锁 + 共享 embed 连接互斥锁（与 backfill_step
+        同一纪律；reindex 端点同样经此方法，锁语义单点收口）。存储锁的必要性：
+        主连接上的 DELETE+commit 若与管道/删除路径的隐式多语句事务交叉，
+        会把对方半程写入提前提交（复核 P2-23）；embed 锁的必要性：
+        gc_orphans 直接在专用连接上写而不自持锁，互斥须由调用方给出。
         """
-        async with storage_lock:
-            db = await self._db_factory()
-            edb = await self._embed_factory()
+
+        db = await self._db_factory()
+        edb = await self._embed_factory()
+        async with storage_lock, get_embed_lock():
             removed = await gc_orphans(db, edb)
         if removed:
             logger.info("rag: GC 清理孤儿索引 %d 行", removed)
         return removed
 
     async def warm_vectors(self, force_full: bool = False) -> None:
-        """填充/刷新向量缓存；force_full 用于维护周期整表重扫（覆盖删除）。"""
+        """填充/刷新向量缓存；force_full 用于维护周期整表重扫（覆盖删除）。
+
+        与 retrieve 的缓存刷新共用 _refresh_lock：维护循环与并发 ask 的
+        水位/整表重建不交错（交错当前是良性的，但锁纪律名存实亡会诱使
+        后续在 _refresh_vector_cache 中加入非幂等步骤）。
+        """
 
         if force_full:
             self._vec_watermark = ""
             self._vec_count_seen = 0
-        await self._refresh_vector_cache()
+        async with self._refresh_lock:
+            await self._refresh_vector_cache()
 
     def _vec_cache_clear(self) -> None:
         self._vec_entries.clear()
@@ -418,16 +457,63 @@ class RagEngine:
             self._vec_cache_clear()
             self._vec_model = model
         edb = await self._embed_factory()
-        row = await fetch_one(edb, "SELECT COUNT(*) AS c FROM rag_chunk_embeddings")
-        total = int(row["c"]) if row is not None else 0
-        if total < self._vec_count_seen:
-            self._vec_cache_clear()  # 有删除（GC），水位失效，整表重建
-        raw_rows, max_created = await fetch_new_embeddings(
-            edb, model, self._vec_watermark, self.settings.group_only
-        )
+        # 共享 embed 连接上的读也持互斥锁：本方法结尾的 bad-key 删除会 commit，
+        # 不持锁的 commit 可能把 dedup 未完成的批量向量写入提前提交
+        async with get_embed_lock():
+            row = await fetch_one(
+                edb, "SELECT COUNT(*) AS c FROM rag_chunk_embeddings"
+            )
+            total = int(row["c"]) if row is not None else 0
+            if total < self._vec_count_seen:
+                self._vec_cache_clear()  # 有删除（GC），水位失效，整表重建
+            raw_rows, max_created = await fetch_new_embeddings(
+                edb, model, self._vec_watermark, self.settings.group_only
+            )
         if not raw_rows:
             return
         entries, bad_keys = await asyncio.to_thread(parse_embedding_rows, raw_rows)
+        # 维度对账（审查回归）：同模型名下供应商原地换维度或历史脏行会让
+        # float32 矩阵重组抛 inhomogeneous shape、/api/rag/ask 持续 500 直到
+        # 人工清表。以现有缓存维度为基准（无缓存取批内多数维度），不一致的
+        # 行按脏行同款删除（回填反连接重嵌入，产出当前模型维度，全表收敛）；
+        # 批内自洽但与缓存基准整体不同 = 供应商全局换维度，视同模型切换
+        # 整表重建。不一致向量绝不进矩阵。
+        full_rebuild = False
+        if entries:
+            batch_dims = {v.shape[0] for _, v in entries}
+            cached_dim = (
+                next(iter(self._vec_entries.values()))[1].shape[0]
+                if self._vec_entries
+                else None
+            )
+            if cached_dim is None:
+                if len(batch_dims) == 1:
+                    ref_dim = next(iter(batch_dims))
+                else:
+                    counts: dict[int, int] = {}
+                    for _, v in entries:
+                        counts[v.shape[0]] = counts.get(v.shape[0], 0) + 1
+                    ref_dim = max(counts, key=lambda d: (counts[d], d))
+            elif batch_dims == {cached_dim}:
+                ref_dim = cached_dim
+            elif len(batch_dims) == 1:
+                logger.warning(
+                    "rag: 向量维度漂移（缓存 %d 维 -> 批内 %d 维，模型名未变），"
+                    "整表重建缓存；旧行由回填按当前维度重嵌入",
+                    cached_dim, next(iter(batch_dims)),
+                )
+                self._vec_cache_clear()
+                ref_dim = next(iter(batch_dims))
+                full_rebuild = True
+            else:
+                ref_dim = cached_dim
+            kept: list[tuple[ChunkRow, np.ndarray]] = []
+            for chunk, vec in entries:
+                if vec.shape[0] == ref_dim:
+                    kept.append((chunk, vec))
+                else:
+                    bad_keys.append((chunk.source, chunk.msg_id))
+            entries = kept
         if bad_keys:
             await self._delete_bad_embeddings(edb, bad_keys)
         for chunk, vec in entries:
@@ -435,19 +521,26 @@ class RagEngine:
         self._vec_watermark = max_created
         self._vec_count_seen = total
         self._rebuild_matrix()
+        if full_rebuild:
+            # 整表重建：水位归零再拉一次全表，把本批之前写入的当前维度行
+            # 收进缓存；递归至多一层——缓存基准已更新，不会再触发重建分支
+            self._vec_watermark = ""
+            await self._refresh_vector_cache()
 
     @staticmethod
     async def _delete_bad_embeddings(
         edb: aiosqlite.Connection, bad_keys: list[tuple[str, str]]
     ) -> None:
-        # 专用连接上逐条原子删除；反连接下一轮自动重嵌入
-        for key in bad_keys:
-            cursor = await edb.execute(
-                "DELETE FROM rag_chunk_embeddings WHERE source = ? AND msg_id = ?",
-                key,
-            )
-            await cursor.close()
-        await edb.commit()
+        # 专用连接上逐条原子删除；反连接下一轮自动重嵌入。
+        # 持共享 embed 连接互斥锁（commit 不与 dedup 的批量写交错）。
+        async with get_embed_lock():
+            for key in bad_keys:
+                cursor = await edb.execute(
+                    "DELETE FROM rag_chunk_embeddings WHERE source = ? AND msg_id = ?",
+                    key,
+                )
+                await cursor.close()
+            await edb.commit()
 
     def request_backfill(self) -> bool:
         """请求拉起一轮回填循环（reindex/降级自愈）；返回是否已触发。"""

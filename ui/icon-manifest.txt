@@ -33,3 +33,5 @@
 /icons/book.svg
 /icons/copy.svg
 /icons/loader-circle.svg
+/icons/calendar-days.svg
+/icons/message-circle.svg

@@ -59,7 +59,9 @@ export function makeElement(selectorMap = null) {
 }
 
 // 建立 sandbox 并执行 ui/app.js；返回的 sandbox 即 window，其上是 app.js 的全局符号。
-export function loadAppJs() {
+// localStorage 可选注入：需要测试「localStorage 初始态 → 模块级初始化」（如 listMode
+// 迁移读取）时传入受控实现；默认桩恒返回 null（首次使用）。
+export function loadAppJs({ localStorage: localStorageStub } = {}) {
   const elements = new Map();
   const getElement = (id) => {
     if (!elements.has(id)) elements.set(id, makeElement());
@@ -95,7 +97,7 @@ export function loadAppJs() {
   const noop = () => {};
   const sandbox = {
     document,
-    localStorage: { getItem: () => null, setItem() {}, removeItem() {} },
+    localStorage: localStorageStub || { getItem: () => null, setItem() {}, removeItem() {} },
     navigator: { clipboard: {} },
     EventSource: class { constructor() { this.readyState = 0; } close() {} },
     MutationObserver: class { constructor() {} observe() {} disconnect() {} takeRecords() { return []; } },

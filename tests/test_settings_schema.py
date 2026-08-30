@@ -91,6 +91,22 @@ class SettingsSchemaTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             normalize_setting(by_key["PLAIN_GREETING"], "hello # comment")
 
+    def test_text_value_rejects_newlines_and_inline_comment(self) -> None:
+        # 审查回归：text 型暂存值含 CR/LF 时会向暂存文件注入任意 KEY=VALUE 行
+        # （绕过键白名单与「密钥只走 keyring」分层）；「 #」是 dotenv 行内
+        # 注释起点，回读被截断，一并拒绝
+        meta = {"type": "text"}
+        self.assertEqual(
+            normalize_setting(meta, "http://127.0.0.1:5033"),
+            "http://127.0.0.1:5033",
+        )
+        with self.assertRaises(ValueError):
+            normalize_setting(meta, "x\nAI_API_KEY=sk-attacker")
+        with self.assertRaises(ValueError):
+            normalize_setting(meta, "x\r\nAI_API_KEY=sk-attacker")
+        with self.assertRaises(ValueError):
+            normalize_setting(meta, "value # inline comment")
+
     def test_unwraps_optional_and_annotated_field_types(self) -> None:
         schema = build_settings_schema(AdvancedSettings)
         by_key = {item["key"]: item for item in schema}
@@ -147,6 +163,23 @@ class SettingsSchemaTest(unittest.TestCase):
         self.assertTrue(qqflow["QQFLOW_KEY"]["secret"])
         self.assertEqual(rag["RAG_GROUP_ONLY"]["type"], "boolean")
         self.assertEqual(rag["RAG_TOP_K"]["min"], 1)
+
+    def test_core_settings_expose_vision_fields(self) -> None:
+        # vision 路由：新配置项自动进入核心设置 schema（设置页白名单表单），
+        # label/hint 经 _CORE_UI 覆盖层按 env key 合入（routes_settings_env.py:95-96）
+        from briefdesk.server.routes_settings_env import _CORE_SCHEMA
+
+        by_key = {item["key"]: item for item in _CORE_SCHEMA}
+        vision = by_key["AI_VISION_ENABLED"]
+        self.assertEqual(vision["type"], "boolean")
+        self.assertEqual(vision["default"], False)
+        self.assertEqual(vision["label"], "AI 支持图片输入（视觉模型）")
+        self.assertIn("ocr 插件", vision["hint"])
+        max_images = by_key["AI_VISION_MAX_IMAGES"]
+        self.assertEqual(max_images["type"], "number")
+        self.assertEqual(max_images["numberKind"], "integer")
+        self.assertEqual(max_images["min"], 1)
+        self.assertEqual(max_images["max"], 20)
 
 
 if __name__ == "__main__":

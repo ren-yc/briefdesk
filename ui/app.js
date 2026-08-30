@@ -46,10 +46,17 @@ let stream = null;
 let streamReconnectTimer = null;
 let sseBackoffMs = 2000;        // 重连退避：2s 指数增长至 30s，连接成功即复位
 let streamRefreshDebounceTimer = null;
-let collapseGroups = lsGet("briefdesk.collapseGroups") !== "expanded"; // 默认折叠
-let lastVisibleItems = []; // 最近一次渲染的可见卡（折叠开关切换时重渲染）
+// 列表显示模式（按钮文案：按主体/按群聊/逐条）：merged=同主体折叠 / group=按来源群聊折叠 / flat=逐条平铺。
+// 旧两态键 briefdesk.collapseGroups（collapsed/expanded）迁移读取后不再写入；
+// 不删除旧键，回滚旧版本时仍能读到上次的折叠偏好
+const legacyCollapseGroups = lsGet("briefdesk.collapseGroups");
+let listMode = lsGet("briefdesk.listMode");
+if (listMode !== "merged" && listMode !== "group" && listMode !== "flat") {
+  listMode = legacyCollapseGroups === "expanded" ? "flat" : "merged"; // 历史默认=折叠
+}
+let lastVisibleItems = []; // 最近一次渲染的可见卡（显示模式切换时重渲染）
 let viewSourceItems = [];   // 当前查询已加载的全部卡片（分页追加/模式切换的渲染基准）
-let groupMap = new Map(); // subject+category → members（当前响应，浮层数据源）
+let groupMap = new Map(); // 按主体模式=subject\x01category、按群模式=群名 → members（当前响应，浮层/批量/组高亮数据源）
 let animateOnNextRender = false; // 折叠/展开切换后列表错落浮现（非切换刷新不做动画）
 
 // ── 增量渲染与交互状态 ──
@@ -141,7 +148,7 @@ const $ignoredLink = document.getElementById("ignored-link");
 const $settingsSave = document.getElementById("settings-save");
 const $settingsClose = document.getElementById("settings-close");
 const $syncBtn = document.getElementById("sync-btn");
-const $settingsLinkTop = document.getElementById("settings-link-top");
+const $settingsLink = document.getElementById("settings-link");
 const $sessionList = document.getElementById("session-list");
 const $onboardSessionList = document.getElementById("onboard-sessions");
 // 筛选控件（搜索框/类型芯片/源芯片/时间下拉+输入框）不在此取：
@@ -249,6 +256,9 @@ function preloadSvgIcons() {
   paths.add("/icons/copy.svg");   // 卡片"复制"按钮（动态渲染）
   paths.add("/icons/arrow-left-right.svg");    // 卡片"修正分类"按钮（动态渲染）
   paths.add("/icons/alarm-clock.svg");    // 卡片"提醒"按钮（动态渲染）
+  paths.add("/icons/calendar-days.svg");   // 侧边栏"日历"入口（calendar 插件动态注入）
+  paths.add("/icons/message-circle.svg");  // 侧边栏"问一问"入口（rag 插件动态注入）
+  paths.add("/icons/users.svg");   // 按群聊折叠块组头图标（动态渲染）
   for (const src of paths) {
     if (_svgCache.has(src)) continue;
     fetch(src)
@@ -516,7 +526,7 @@ function bindSettingsEntryEvents() {
     setSettingsPanel(btn.dataset.panel);
   });
 
-  $settingsLinkTop.addEventListener("click", openSettings);
+  $settingsLink.addEventListener("click", openSettings);
 }
 
 function bindCategoryEvents() {
@@ -645,6 +655,10 @@ function bindSettingsFormEvents() {
   // "保存"统一应用三类更改：刷新间隔（localStorage）+ 类别草稿 + 会话草稿。
   // 同步进行中时延迟到同步完成后应用（本次同步按旧配置跑，避免数据与配置不一致）。
   $settingsSave.addEventListener("click", async () => {
+    // 「启动配置」面板共用此按钮：语义是写 .env 暂存文件（重启生效），
+    // 不走刷新间隔/类别/会话草稿的保存链路
+    const envActive = !document.querySelector('.settings-panel[data-panel="env"]')?.classList.contains("hidden");
+    if (envActive) { await saveEnvConfig(); return; }
     if (saveBusy) return;
     saveBusy = true;
     $settingsSave.disabled = true;
@@ -683,10 +697,11 @@ function bindSettingsFormEvents() {
 
   $settingsClose.addEventListener("click", closeSettingsModal);
 
-  // 「启动配置」面板：暂存/恢复默认/密钥读写（委托在面板容器上）
+  // 「启动配置」面板：恢复默认/密钥读写/搜索过滤（委托在面板容器上）；
+  // 「保存」复用弹窗底部全局按钮（见 $settingsSave 的面板分流）
   const $envItems = document.getElementById("env-items");
   const $envSecrets = document.getElementById("env-secrets");
-  const $envSave = document.getElementById("env-save");
+  const $envFilter = document.getElementById("env-filter");
   if ($envItems) {
     $envItems.addEventListener("click", (e) => {
       const restore = e.target.closest("[data-env-restore]");
@@ -699,6 +714,9 @@ function bindSettingsFormEvents() {
       const chip = e.target.closest(".env-chip");
       if (chip) chip.classList.toggle("checked", e.target.checked);
     });
+    // 任意控件输入/变更 → 刷新「暂存更改」的差异计数与高亮态
+    $envItems.addEventListener("input", _updateEnvSaveButton);
+    $envItems.addEventListener("change", _updateEnvSaveButton);
   }
   if ($envSecrets) {
     $envSecrets.addEventListener("click", (e) => {
@@ -706,9 +724,21 @@ function bindSettingsFormEvents() {
       if (setBtn) { setEnvSecret(setBtn.dataset.secSet); return; }
       const clearBtn = e.target.closest("[data-sec-clear]");
       if (clearBtn) clearEnvSecret(clearBtn.dataset.secClear);
+      // 「替换」：展开已配置密钥的隐藏输入框（换 key 不必先清除）
+      const replaceBtn = e.target.closest("[data-sec-replace]");
+      if (replaceBtn) {
+        const row = replaceBtn.closest(".env-row");
+        const box = row ? row.querySelector(".env-secret-input") : null;
+        if (box) {
+          box.classList.remove("hidden");
+          const input = box.querySelector("input");
+          if (input) input.focus();
+        }
+        replaceBtn.classList.add("hidden");
+      }
     });
   }
-  if ($envSave) $envSave.addEventListener("click", saveEnvConfig);
+  if ($envFilter) $envFilter.addEventListener("input", _applyEnvFilter);
 
   $settingsModal.addEventListener("click", (e) => {
     if (e.target === $settingsModal) closeSettingsModal();
@@ -752,7 +782,7 @@ function bindItemActionEvents() {
   // Item actions delegation
   $itemsContainer.addEventListener("click", (e) => {
     // 批量模式：折叠组 = 整组选择单元（点组头或代表卡任意位置切换整组）；
-    // 平铺/单卡 = 单卡选择；勾选框自身走 change 事件
+    // 逐条/单卡 = 单卡选择；勾选框自身走 change 事件
     if (batchMode) {
       const coll = e.target.closest(".group-collapsed");
       if (coll && coll.dataset.key) {
@@ -780,7 +810,7 @@ function bindItemActionEvents() {
       return;
     }
 
-    // 主体名 → 打开主体时间线（折叠/平铺组头与单卡主体链接）
+    // 主体名 → 打开主体时间线（折叠/逐条组头与单卡主体链接）
     const subjLink = e.target.closest(".subject-link");
     if (subjLink && subjLink.dataset.subject) {
       openSubjectTimeline(subjLink.dataset.subject);
@@ -817,8 +847,12 @@ function bindItemActionEvents() {
     const btn = e.target.closest("button");
     if (!btn) return;
 
-    // 折叠组入口：打开同主体浮层
+    // 折叠组入口：打开同主体浮层（按群块组头带 data-chat → 打开按群浮层）
     if (btn.classList.contains("group-more-btn")) {
+      if (btn.dataset.chat) {
+        openChatOverlay(btn.dataset.chat);
+        return;
+      }
       openGroupOverlay(btn.dataset.subject, btn.dataset.cat);
       return;
     }
@@ -885,14 +919,14 @@ function bindLightboxEvents() {
 }
 
 function bindCollapseToggleEvents() {
-  // Collapse toggle（折叠/展开分段控制，状态存 localStorage）
+  // Collapse toggle（按主体/按群聊/逐条三态分段控制，状态存 localStorage）
   $collapseToggle.addEventListener("click", (e) => {
     const segBtn = e.target.closest(".seg-btn");
     if (!segBtn) return;
-    const wantCollapsed = segBtn.dataset.mode === "collapsed";
-    if (wantCollapsed === collapseGroups) return;
-    collapseGroups = wantCollapsed;
-    lsSet("briefdesk.collapseGroups", collapseGroups ? "collapsed" : "expanded");
+    const wantMode = segBtn.dataset.mode;
+    if (!wantMode || wantMode === listMode) return;
+    listMode = wantMode;
+    lsSet("briefdesk.listMode", listMode);
     updateCollapseToggle(); // 立即同步按钮选中态（不依赖渲染路径，空视图/异常时也即时响应）
     animateOnNextRender = true; // 模式切换 → 列表错落浮现
     renderItems(viewSourceItems, { full: true });
@@ -1213,7 +1247,7 @@ function bindBatchEvents() {
     if (e.target === $batchConfirmModal) closeBatchConfirm();
   });
 
-  // 批量模式：勾选框变更（折叠组 → 整组切换；平铺组头 → 整组切换；单卡 → 单卡）
+  // 批量模式：勾选框变更（折叠组 → 整组切换；逐条组头 → 整组切换；单卡 → 单卡）
   $itemsContainer.addEventListener("change", (e) => {
     if (!e.target.matches(".batch-check input")) return;
     const coll = e.target.closest(".group-collapsed");
@@ -1521,8 +1555,9 @@ function connectRealtimeStream() {
 }
 
 // ── Fetch ──
-// 当前完整查询的服务端计数，不受前端已加载页数影响。
-let viewCounts = { total: 0, groups: 0 };
+// total/groups 是当前完整查询的服务端计数（不受已加载页数影响）；
+// chatGroups 是按群模式渲染时由前端统计的来源群数（口径=已加载卡片，后端无对应计数）
+let viewCounts = { total: 0, groups: 0, chatGroups: 0 };
 
 // 消费 /api/items 响应中的侧边栏/颜色/状态数据（fetchData 正常路径与
 // 日历模式补拉共用；先设 catColor 再 renderNav——图标派生依赖颜色）
@@ -1786,7 +1821,12 @@ function renderItems(items, { full = false } = {}) {
   updateBlockedHint(blockedVisible.length);
 
   // /api/items 已按全部有效条件分页；此处不再做会改变 offset/总数口径的二次过滤。
-  const out = full ? fullRenderItems(items) : incrementalRenderItems(items);
+  // 按群模式走 full 渲染（多群卡多份渲染 + 群键组块使主体组增量 diff 失效），
+  // 新卡提示链路由 renderByChat 补齐；其余模式维持增量渲染不打断阅读
+  let out;
+  if (full) out = fullRenderItems(items);
+  else if (listMode === "group") out = renderByChat(items);
+  else out = incrementalRenderItems(items);
   updateListCount();
   updateLoadMore();
   updateSubsBadge();
@@ -1803,15 +1843,23 @@ function updateBlockedHint(n) {
   $hint.textContent = `已隐藏 ${n} 条（黑名单）`;
 }
 
-// 头部计数始终是当前完整查询的服务端总数，与已加载页数无关。
+// 头部计数：merged/flat 用当前完整查询的服务端总数（与已加载页数无关）；
+// group 模式无服务端组数口径，用渲染时统计的已加载卡片来源群数
 function updateListCount() {
   if (currentSearch) {
-    const n = collapseGroups ? viewCounts.groups + " 组" : viewCounts.total + " 条";
+    let n;
+    if (listMode === "merged") n = viewCounts.groups + " 组";
+    else if (listMode === "group") n = viewCounts.chatGroups + " 群";
+    else n = viewCounts.total + " 条";
     $listCount.textContent = `关键词「${currentSearch}」命中 ${n}`;
     return;
   }
-  if (collapseGroups) {
+  if (listMode === "merged") {
     $listCount.textContent = "共 " + viewCounts.groups + " 组";
+    return;
+  }
+  if (listMode === "group") {
+    $listCount.textContent = "共 " + viewCounts.chatGroups + " 群";
     return;
   }
   $listCount.textContent = "共 " + viewCounts.total + " 条";
@@ -2158,13 +2206,13 @@ async function renderEmptyStateGuide() {
   }
   const openBtn = document.getElementById("empty-open-settings");
   if (openBtn) openBtn.addEventListener("click", () => {
-    const link = document.getElementById("settings-link-top");
+    const link = document.getElementById("settings-link");
     if (link) link.click();
     setSettingsPanel("sessions"); // openSettings 默认进「常规」，这里直达「群聊筛选」
   });
   const refreshBtn = document.getElementById("empty-refresh-sessions");
   if (refreshBtn) refreshBtn.addEventListener("click", () => {
-    const link = document.getElementById("settings-link-top");
+    const link = document.getElementById("settings-link");
     if (link) link.click();
     const btn = document.getElementById("session-refresh");
     if (btn) setTimeout(() => btn.click(), 300); // 等设置弹窗打开后再触发发现
@@ -2210,7 +2258,8 @@ function fullRenderItems(visible) {
   if (visible.length === 0) {
     showEmptyState();
     groupMap.clear(); // 空视图：清陈旧分组，避免浮层打开时渲染已不属于当前视图的成员
-    updateCollapseToggle(); // 空视图也要同步折叠/平铺按钮态（否则无数据时按钮点击无响应）
+    viewCounts.chatGroups = 0; // 按群口径同步归零，防「共 N 群」读到陈旧值
+    updateCollapseToggle(); // 空视图也要同步显示模式按钮态（否则无数据时按钮点击无响应）
     syncOverlayWithData();
     return [];
   }
@@ -2240,6 +2289,27 @@ function viewKeyNow() {
   return JSON.stringify([currentCategory, currentVerified, currentSearch]);
 }
 
+// 按群模式渲染：强制全量重建（多群卡多份渲染 + 群键组块令主体组增量 diff 失效）。
+// fullRenderItems 内部 confirmNewItems 会清空新卡集合 → 渲染后按渲染前 diff 重建
+// 新卡提示链路（组块高亮 / 浮条 / 后台标签页计数与通知），对齐增量渲染路径的体验
+function renderByChat(items) {
+  const oldIds = new Set(currentItems.map(it => String(it.id)));
+  const added = items.filter(it => !oldIds.has(String(it.id)));
+  const addedIds = added.map(it => String(it.id));
+  fullRenderItems(items);
+  if (addedIds.length) {
+    newItemIds = new Set([...newItemIds, ...addedIds]);
+    markNewCards(addedIds); // groupMap 已按群填充 → 多群卡的每一份与所在群块都高亮
+    if (document.hidden) {
+      document.title = "(" + newItemIds.size + ") BRIEFDESK";
+      const addedSet = new Set(addedIds);
+      notifyNewItems(items.filter(it => addedSet.has(String(it.id))));
+    }
+    updateNewItemsBar();
+  }
+  return items;
+}
+
 function saveViewState() {
   if (!currentViewKey) return; // 首次渲染无旧视图
   // 只保存滚动位置：展开状态是卡片的属性（currentExpandedIds 全局共享，跨视图保留）
@@ -2257,14 +2327,16 @@ function restoreScroll() {
 // 恢复本视图此前展开的卡片（引用 + 已缓存的上下文）
 function applyExpandedState() {
   for (const id of currentExpandedIds) {
-    const card = $itemsContainer.querySelector('.item-card[data-id="' + CSS.escape(id) + '"]');
-    if (!card) continue;
-    const quote = card.querySelector(".card-quote");
-    const toggle = card.querySelector(".card-quote-toggle");
-    if (quote && !quote.classList.contains("open")) {
-      quote.classList.add("open");
-      if (toggle) { toggle.setAttribute("aria-expanded", "true"); setQuoteToggleLabel(toggle, true); }
-      expandQuoteContext(card);
+    // 按群模式下同一卡在其每个来源群各渲染一份（data-id 重复）→ 全部恢复
+    const cards = $itemsContainer.querySelectorAll('.item-card[data-id="' + CSS.escape(id) + '"]');
+    for (const card of cards) {
+      const quote = card.querySelector(".card-quote");
+      const toggle = card.querySelector(".card-quote-toggle");
+      if (quote && !quote.classList.contains("open")) {
+        quote.classList.add("open");
+        if (toggle) { toggle.setAttribute("aria-expanded", "true"); setQuoteToggleLabel(toggle, true); }
+        expandQuoteContext(card);
+      }
     }
   }
 }
@@ -2280,6 +2352,7 @@ function syncOverlayWithData() {
 // 列表 HTML：单卡与分组统一按时间倒序排列（时间线单调，日期分隔条才有意义），
 // 插入日期分隔条
 function buildListHtml(visible) {
+  if (listMode === "group") return buildListHtmlByChat(visible);
   const { groups, singles } = groupVisibleItems(visible);
   groupMap.clear();
   const blocks = [];
@@ -2292,12 +2365,17 @@ function buildListHtml(visible) {
     // 只剩一张 → 直接平铺单卡，不显示折叠/分组头 UI
     if (group.members.length < 2) {
       blocks.push({ t: itemTime(rep), html: renderCard(rep, group.key) });
-    } else if (collapseGroups) {
+    } else if (listMode === "merged") {
       blocks.push({ t: itemTime(rep), html: renderCollapsedGroup(group) });
     } else {
       blocks.push({ t: itemTime(rep), html: renderGroupHeader(group) + group.members.map(m => renderCard(m, group.key)).join("") });
     }
   }
+  return renderBlocksHtml(blocks);
+}
+
+// 块按时间降序排序 + 插入日期分隔条（按主体/按群两种列表的共用收尾）
+function renderBlocksHtml(blocks) {
   blocks.sort((a, b) => b.t - a.t);
   let html = "";
   let lastLabel = "";
@@ -2359,7 +2437,7 @@ function incrementalRenderItems(visible) {
       insertBlockAtTime(renderCard(g.members[0], g.key), itemTime(g.members[0]));
       addedIds.push(String(g.members[0].id));
     } else {
-      const html = collapseGroups
+      const html = listMode === "merged"
         ? renderCollapsedGroup(g)
         : renderGroupHeader(g) + g.members.map(m => renderCard(m, g.key)).join("");
       insertBlockAtTime(html, itemTime(g.members[0]));
@@ -2465,7 +2543,7 @@ function rebuildGroup(key) {
     insertBlockAtTime(renderCard(g.members[0], key), itemTime(g.members[0]));
     return;
   }
-  const html = collapseGroups
+  const html = listMode === "merged"
     ? renderCollapsedGroup(g)
     : renderGroupHeader(g) + g.members.map(m => renderCard(m, key)).join("");
   insertBlockAtTime(html, itemTime(g.members[0]));
@@ -2655,9 +2733,70 @@ function renderGroupHeader(group) {
     </div>`;
 }
 
+// ── Group by chat（按来源群聊折叠）──
+// 卡片可来自多个群（去重合并，source_group 为 ", " 拼接串）→ 按「每个来源群各出现一次」
+// 展开：同一张卡在其每个来源群的组内各渲染一份，操作同一张卡。分组键 = 群名显示串：
+// 多群卡的第二个群只有显示名、没有会话标识，这是该语义下唯一可行口径（跨源同名群会并组）；
+// 私聊卡的 source_group 是对方昵称，按会话名统一成组（实为"按会话折叠"）。
+function chatGroupsOfSourceGroup(item) {
+  const names = String(item.source_group || "").split(",").map(s => s.trim()).filter(Boolean);
+  return names.length ? names : ["未知来源"];
+}
+
+function groupVisibleItemsByChat(items) {
+  const map = new Map();
+  for (const item of items) {
+    for (const name of chatGroupsOfSourceGroup(item)) {
+      if (!map.has(name)) map.set(name, { key: name, name, members: [] });
+      map.get(name).members.push(item);
+    }
+  }
+  // items 已按 msg_time DESC 排序 → members[0] 即组内最新；组块按组内最新成员时间降序
+  const groups = Array.from(map.values());
+  groups.sort((a, b) => itemTime(b.members[0]) - itemTime(a.members[0]));
+  return groups;
+}
+
+// 按群模式列表 HTML：组内 ≥2 张 → 折叠块（群组头 + 代表卡），单卡群平铺不显组头。
+// groupMap 以群名为键填充 → 浮层/批量整组选择/新卡组高亮/组头半选与按主体模式共用同一数据源
+function buildListHtmlByChat(visible) {
+  const groups = groupVisibleItemsByChat(visible);
+  groupMap.clear();
+  const blocks = [];
+  for (const group of groups) {
+    groupMap.set(group.key, group.members);
+    const rep = group.members[0];
+    if (group.members.length < 2) {
+      blocks.push({ t: itemTime(rep), html: renderCard(rep, group.key) });
+    } else {
+      blocks.push({ t: itemTime(rep), html: renderCollapsedGroupByChat(group) });
+    }
+  }
+  viewCounts.chatGroups = groups.length;
+  return renderBlocksHtml(blocks);
+}
+
+function renderCollapsedGroupByChat(group) {
+  const rep = group.members[0];
+  const n = group.members.length;
+  // 批量模式：组是不可分的选择单元，初始渲染即还原整组选中态
+  const allSelected = batchMode && group.members.every(m => selectedIds.has(String(m.id)));
+  // 跨类别组无单一类别色 → 不设 --cat，组块整体回退默认强调色
+  return `
+    <div class="group-collapsed by-chat${allSelected ? " selected" : ""}" data-key="${escAttr(group.key)}" data-msgtime="${itemTime(rep)}" data-chat="${escAttr(group.name)}">
+      <button class="group-more-btn group-head" data-chat="${escAttr(group.name)}" title="${batchMode ? "选择 / 取消选择该群全部卡片（" + n + " 张）" : "查看该群全部卡片"}" aria-label="${escAttr(group.name)}，共 ${n} 条，${batchMode ? "选择或取消选择整组" : "查看全部"}">
+        <img src="/icons/users.svg" class="icon-sm" alt="">
+        <span class="group-subject">${esc(group.name)}</span>
+        <span class="group-count">${n} 条</span>
+        <span class="group-more">${batchMode ? "选择整组" : "查看全部"}<img src="/icons/chevron-right.svg" class="icon-sm chev" alt=""></span>
+      </button>
+      ${renderCard(rep, group.key)}
+    </div>`;
+}
+
 function updateCollapseToggle() {
   if (!$collapseToggle) return;
-  const mode = collapseGroups ? "collapsed" : "expanded";
+  const mode = listMode; // "merged" | "group" | "flat"，与 seg-btn 的 data-mode 同值域
   $collapseToggle.dataset.active = mode; // 驱动 .seg-pill 滑动
   $collapseToggle.querySelectorAll(".seg-btn").forEach((b) => {
     const sel = b.dataset.mode === mode;
@@ -2682,6 +2821,25 @@ function openGroupOverlay(subject, category) {
   pushModalFocus($groupOverlay, { initialFocus: document.getElementById("group-overlay-close") });
   // 恢复上次关闭时的滚动位置
   const saved = overlayScrolls.get(key);
+  if ($groupOverlayContent && saved) $groupOverlayContent.scrollTop = saved;
+}
+
+// 按群浮层：与主体浮层共用 #group-overlay 与 renderOverlayList（overlayKey=群名，
+// groupMap 按群模式下即以群名为键）。群名不是主体 → 标题不带 subject-link、
+// 不设 dataset.subject，标题点击进主体时间线的分支因无 subject 自然跳过
+function openChatOverlay(name) {
+  const members = groupMap.get(name) || [];
+  if (members.length < 2) return;
+  overlayKey = name;
+  overlayNeedsSync = false;
+  $groupOverlayTitle.textContent = name;
+  delete $groupOverlayTitle.dataset.subject; // 对称清理：主体浮层可能先开过
+  $groupOverlayTitle.classList.remove("subject-link");
+  renderOverlayList(name);
+  $groupOverlay.classList.remove("hidden");
+  syncBodyScrollLock();
+  pushModalFocus($groupOverlay, { initialFocus: document.getElementById("group-overlay-close") });
+  const saved = overlayScrolls.get(name);
   if ($groupOverlayContent && saved) $groupOverlayContent.scrollTop = saved;
 }
 
@@ -3341,7 +3499,7 @@ function renderStatusBanner(status) {
       const syncBtn = document.getElementById("sync-btn");
       if (syncBtn) syncBtn.click();
     } else {
-      const link = document.getElementById("settings-link-top");
+      const link = document.getElementById("settings-link");
       if (link) link.click();
     }
   });
@@ -4102,15 +4260,18 @@ async function loadEnvConfig() {
   renderEnvConfig();
 }
 
-function _envBadges(item) {
+function _envBadges(item, { skipPluginBadge = false } = {}) {
   const badges = [];
   if (item.staged !== null && item.staged !== undefined) {
     badges.push('<span class="env-badge env-badge-staged">已暂存 · 重启生效</span>');
   }
+  // 「环境变量优先」走默认灰徽章（.env-badge-env 不再有专属配色）：
+  // 它是底层技术细节，不应与「已暂存」这类必须关注的状态抢注意力
   if (item.source === "env") {
     badges.push('<span class="env-badge env-badge-env">环境变量优先</span>');
   }
-  if (item.plugin && item.pluginStatus && item.pluginStatus !== "loaded") {
+  // 组级「未启用」已在分组标题上展示时，行内不再重复
+  if (!skipPluginBadge && item.plugin && item.pluginStatus && item.pluginStatus !== "loaded") {
     badges.push('<span class="env-badge">插件' + esc(item.pluginStatus === "disabled" ? "未启用" : "不可用") + '</span>');
   }
   return badges.join("");
@@ -4122,8 +4283,9 @@ function _envControl(item) {
   const cur = _envInputValue(item);
   const displayValue = cur === null || cur === undefined ? "" : cur;
   if (item.type === "boolean") {
-    return '<label class="env-chip"><input type="checkbox" data-env-key="' + keyAttr + '"'
-      + (cur ? " checked" : "") + "><span>启用</span></label>";
+    // 开关形态：checkbox appearance:none 自绘轨道（CSS），原生勾选状态不丢
+    return '<label class="env-switch"><input type="checkbox" data-env-key="' + keyAttr + '"'
+      + (cur ? " checked" : "") + '><span class="env-switch-text">启用</span></label>';
   }
   if (item.type === "select") {
     const options = Array.isArray(item.options) ? item.options : [];
@@ -4141,7 +4303,8 @@ function _envControl(item) {
     }
     if (!opts.includes("*")) opts.unshift("*");
     return '<div class="env-multi" data-env-key="' + keyAttr + '">'
-      + opts.map(o => '<label class="env-chip"><input type="checkbox" value="' + escAttr(o) + '"'
+      + opts.map(o => '<label class="env-chip' + (current.includes(o) ? " checked" : "") + '">'
+        + '<input type="checkbox" value="' + escAttr(o) + '"'
         + (current.includes(o) ? " checked" : "") + "><span>" + esc(o) + "</span></label>").join("")
       + "</div>";
   }
@@ -4162,84 +4325,140 @@ function _envInputValue(item) {
   return item.staged;
 }
 
+function _groupByPlugin(entries) {
+  const groups = [];
+  const groupMap = new Map();
+  for (const entry of entries) {
+    const group = entry.plugin || "core";
+    if (!groupMap.has(group)) {
+      const item = { name: group, items: [] };
+      groupMap.set(group, item);
+      groups.push(item);
+    }
+    groupMap.get(group).items.push(entry);
+  }
+  return groups;
+}
+
+function _envGroupHead(name, count, { disabled = false } = {}) {
+  const label = name === "core" ? "核心配置" : "插件：" + esc(name);
+  const disabledBadge = disabled ? '<span class="env-badge">未启用</span>' : "";
+  return '<span class="env-group-title">' + label + "</span>" + disabledBadge
+    + '<span class="env-group-count">' + count + " 项</span>";
+}
+
+function _envRowHtml(item, groupDisabled) {
+  const restore = item.staged !== null && item.staged !== undefined
+    ? '<button type="button" class="env-restore" data-env-restore="' + escAttr(item.key) + '">恢复默认</button>'
+    : "";
+  // label 的 title 放原始 ENV KEY，方便对照 .env 文件而不占版面
+  return '<div class="env-row" data-env-key="' + escAttr(item.key) + '">'
+    + '<div class="env-row-head"><label class="env-label" title="' + escAttr(item.key) + '">' + esc(item.label) + "</label>"
+    + _envBadges(item, { skipPluginBadge: groupDisabled }) + restore + "</div>"
+    + _envControl(item)
+    + (item.hint ? '<p class="text-muted settings-hint">' + esc(item.hint) + "</p>" : "")
+    + "</div>";
+}
+
+function _envItemsHtml() {
+  return _groupByPlugin(envData.items).map(group => {
+    // 插件整组未加载/未启用 → 默认折叠（仍可展开预配置），头部徽章示意；
+    // 正文不做容器级 opacity 调光（对比度守卫测试禁止）
+    const disabled = group.name !== "core"
+      && group.items.every(i => i.pluginStatus && i.pluginStatus !== "loaded");
+    return '<details class="env-group"' + (disabled ? "" : " open")
+      + ' data-env-default-open="' + (disabled ? "0" : "1") + '">'
+      // summary 必须挂 env-group-head：挂上后 display:flex 会同时干掉 UA 默认的
+      // list-item 三角标记（漏挂时标记回退到文字左侧、叠在卡片边界上）
+      + '<summary class="env-group-head">' + _envGroupHead(group.name, group.items.length, { disabled }) + "</summary>"
+      + '<div class="env-group-body">'
+      + group.items.map(item => _envRowHtml(item, disabled)).join("")
+      + "</div></details>";
+  }).join("");
+}
+
+function _envSecretRowHtml(s) {
+  const keyringConfigured = s.keyringConfigured !== undefined
+    ? !!s.keyringConfigured
+    : !!s.configured;
+  const state = keyringConfigured
+    ? '<span class="env-badge env-badge-ok">已配置（钥匙串）</span>'
+    : s.configured
+      ? '<span class="env-badge">已配置（环境变量/.env）</span>'
+      : '<span class="env-badge">未配置</span>';
+  // 已配置时输入框藏起但不销毁：「替换」展开它，免去「先清除再输入」的断层
+  const input = '<div class="env-secret-input' + (keyringConfigured ? " hidden" : "") + '">'
+    + '<input type="password" class="env-input" data-sec-input="' + escAttr(s.name) + '" placeholder="输入 ' + esc(s.label) + '" autocomplete="off">'
+    + '<button type="button" class="settings-outline-btn" data-sec-set="' + escAttr(s.name) + '">保存</button></div>';
+  const managed = keyringConfigured
+    ? '<button type="button" class="env-restore" data-sec-replace="' + escAttr(s.name) + '">替换</button>'
+      + '<button type="button" class="env-restore" data-sec-clear="' + escAttr(s.name) + '">清除</button>'
+    : "";
+  return '<div class="env-row"><div class="env-row-head">'
+    + '<label class="env-label">' + esc(s.label) + "</label>" + state + managed + "</div>"
+    + input + "</div>";
+}
+
+function _envSecretsHtml() {
+  return _groupByPlugin(envData.secrets || []).map(group => {
+    // 密钥组无需折叠（每组仅 1-3 项），但同样包卡片并参与搜索过滤的整组显隐
+    return '<div class="env-group">'
+      + '<div class="env-group-head">' + _envGroupHead(group.name, group.items.length) + "</div>"
+      + '<div class="env-group-body">'
+      + group.items.map(_envSecretRowHtml).join("")
+      + "</div></div>";
+  }).join("") || '<p class="text-muted">无</p>';
+}
+
 function renderEnvConfig() {
   const $path = document.getElementById("env-file-path");
   const $items = document.getElementById("env-items");
   const $secrets = document.getElementById("env-secrets");
-  const $save = document.getElementById("env-save");
   if (!envData) {
     if ($items) $items.innerHTML = '<p class="text-muted">加载失败，请刷新页面重试</p>';
-    if ($save) $save.disabled = true;
+    // 全局「保存」无需禁用：saveEnvConfig 对 envData 为空时直接返回
     return;
   }
   if ($path) $path.textContent = "暂存文件：" + envData.filePath;
-  if ($items) {
-    const groups = [];
-    const groupMap = new Map();
-    for (const item of envData.items) {
-      const group = item.plugin || "core";
-      if (!groupMap.has(group)) {
-        const entry = { name: group, items: [] };
-        groupMap.set(group, entry);
-        groups.push(entry);
+  if ($items) $items.innerHTML = _envItemsHtml();
+  if ($secrets) $secrets.innerHTML = _envSecretsHtml();
+  _updateEnvSaveButton();
+}
+
+// 搜索过滤：行级显隐 + 组级整组显隐；details 组在过滤时自动展开命中组，
+// 清空搜索后恢复渲染时的默认展开态
+function _applyEnvFilter() {
+  const $filter = document.getElementById("env-filter");
+  const q = (($filter && $filter.value) || "").trim().toLowerCase();
+  for (const root of [document.getElementById("env-items"), document.getElementById("env-secrets")]) {
+    if (!root) continue;
+    for (const group of root.querySelectorAll(".env-group")) {
+      let visible = 0;
+      for (const row of group.querySelectorAll(".env-row")) {
+        const hit = q === "" || row.textContent.toLowerCase().includes(q);
+        row.classList.toggle("hidden", !hit);
+        if (hit) visible++;
       }
-      groupMap.get(group).items.push(item);
-    }
-    $items.innerHTML = groups.map(group => {
-      const heading = group.name === "core"
-        ? ""
-        : '<h3 class="settings-section env-plugin-heading">插件：' + esc(group.name) + "</h3>";
-      return heading + group.items.map(item => {
-      const restore = item.staged !== null && item.staged !== undefined
-        ? '<button type="button" class="env-restore" data-env-restore="' + escAttr(item.key) + '">恢复默认</button>'
-        : "";
-      return '<div class="env-row" data-env-key="' + escAttr(item.key) + '">'
-        + '<div class="env-row-head"><label class="env-label">' + esc(item.label) + "</label>"
-        + _envBadges(item) + "</div>"
-        + _envControl(item)
-        + (item.hint ? '<p class="text-muted settings-hint">' + esc(item.hint) + "</p>" : "")
-        + restore
-        + "</div>";
-      }).join("");
-    }).join("");
-  }
-  if ($secrets) {
-    const secretGroups = [];
-    const secretGroupMap = new Map();
-    for (const secret of (envData.secrets || [])) {
-      const group = secret.plugin || "core";
-      if (!secretGroupMap.has(group)) {
-        const entry = { name: group, items: [] };
-        secretGroupMap.set(group, entry);
-        secretGroups.push(entry);
+      group.classList.toggle("hidden", visible === 0);
+      if (group instanceof HTMLDetailsElement) {
+        group.open = q === "" ? group.dataset.envDefaultOpen === "1" : visible > 0;
       }
-      secretGroupMap.get(group).items.push(secret);
     }
-    $secrets.innerHTML = secretGroups.map(group => {
-      const heading = group.name === "core"
-        ? ""
-        : '<h3 class="settings-section env-plugin-heading">插件：' + esc(group.name) + "</h3>";
-      return heading + group.items.map(s => {
-      const keyringConfigured = s.keyringConfigured !== undefined
-        ? !!s.keyringConfigured
-        : !!s.configured;
-      const state = keyringConfigured
-        ? '<span class="env-badge env-badge-ok">已配置（钥匙串）</span>'
-        : s.configured
-          ? '<span class="env-badge env-badge-env">已配置（环境变量/.env）</span>'
-          : '<span class="env-badge">未配置</span>';
-      const input = keyringConfigured ? "" : '<div class="env-secret-input">'
-        + '<input type="password" class="env-input" data-sec-input="' + escAttr(s.name) + '" placeholder="输入 ' + esc(s.label) + '" autocomplete="off"> '
-        + '<button type="button" class="settings-outline-btn" data-sec-set="' + escAttr(s.name) + '">保存</button></div>';
-      const clear = keyringConfigured
-        ? '<button type="button" class="env-restore" data-sec-clear="' + escAttr(s.name) + '">清除</button>'
-        : "";
-      return '<div class="env-row"><div class="env-row-head">'
-        + '<label class="env-label">' + esc(s.label) + "</label>" + state + "</div>"
-        + input + clear + "</div>";
-      }).join("");
-    }).join("") || '<p class="text-muted">无</p>';
   }
+}
+
+// 底部全局「保存」按钮的差异数联动：env 面板激活时把未暂存差异追加到文案
+// （保存（N 项））；切到其他面板或无差异时还原为纯「保存」
+function _updateEnvSaveButton() {
+  const $save = document.getElementById("settings-save");
+  if (!$save) return;
+  const envActive = !document.querySelector('.settings-panel[data-panel="env"]')?.classList.contains("hidden");
+  if (!envActive || !envData) {
+    if ($save.textContent !== "保存") $save.textContent = "保存";
+    return;
+  }
+  const n = Object.keys(_collectEnvChanges()).length;
+  $save.textContent = n > 0 ? "保存（" + n + " 项）" : "保存";
 }
 
 function _collectEnvChanges() {
@@ -4257,6 +4476,10 @@ function _collectEnvChanges() {
       if (!el) continue;
       newVal = el.checked;
       oldVal = !!_envInputValue(item);
+      // 与 text/multi 分支对齐：未变化的布尔项不算差异。
+      // 此前缺失该检查——每次「暂存更改」都会把所有布尔项重写进暂存文件，
+      // 且「没有需要暂存的更改」永远不会触发；差异计数也会常驻虚高。
+      if (newVal === oldVal) continue;
     } else if (item.type === "multi") {
       newVal = [...row.querySelectorAll("input:checked")].map(c => c.value);
       const current = _envInputValue(item);
@@ -4632,9 +4855,10 @@ function setSettingsPanel(name) {
   $settingsModal.querySelectorAll(".settings-panel").forEach(p => {
     p.classList.toggle("hidden", p.dataset.panel !== name);
   });
-  // 「启动配置」面板有自己的「暂存更改」按钮（写暂存文件、重启生效），
-  // 与底部全局「保存」（刷新间隔 + 类别/会话草稿）语义不同——隐藏避免误操作
-  document.querySelector(".settings-actions")?.classList.toggle("hidden", name === "env");
+  // 「启动配置」与其他面板共用底部全局「保存」按钮；点击语义按当前面板分流
+  // （env → 写暂存文件，其余 → 刷新间隔 + 类别/会话草稿），差异数由
+  // _updateEnvSaveButton 追加到按钮文案上
+  _updateEnvSaveButton();
 }
 
 async function loadAboutSources() {
@@ -5167,11 +5391,11 @@ function toggleSelect(id, card) {
   const chk = card && card.querySelector(".batch-check input");
   if (chk) chk.checked = selectedIds.has(id);
   if (card) card.classList.toggle("selected", selectedIds.has(id));
-  syncBatchGroupStates(); // 平铺模式：成员变化联动组头半选态
+  syncBatchGroupStates(); // 逐条模式：成员变化联动组头半选态
   updateBatchBar();
 }
 
-// 折叠组/平铺组头 = 组级选择单元：全选 ⇄ 全不选整组成员
+// 折叠组/逐条组头 = 组级选择单元：全选 ⇄ 全不选整组成员
 function toggleGroupSelect(key, containerEl) {
   const members = groupMap.get(key) || [];
   if (!members.length) return;
@@ -5183,7 +5407,7 @@ function toggleGroupSelect(key, containerEl) {
   updateBatchBar();
 }
 
-// 统一组态同步：折叠组整组高亮 + 勾选框全选/半选；平铺组头半选；单卡勾选
+// 统一组态同步：折叠组整组高亮 + 勾选框全选/半选；逐条组头半选；单卡勾选
 function syncBatchGroupStates() {
   if (!batchMode) return;
   $itemsContainer.querySelectorAll(".group-collapsed[data-key]").forEach(el => {

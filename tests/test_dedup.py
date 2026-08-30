@@ -14,20 +14,40 @@ from briefdesk.plugins.dedup.engine import (
 
 
 class AskAiParseFailureTest(unittest.IsolatedAsyncioTestCase):
-    """【复核 P2-19】_ask_ai 两次解析失败必须抛错（交调用方既有容错整形为
-    None 票：normal 路径剔除计权、strong 路径降级参与多数票），不得 return
-    False 被当作明确的 DIFFERENT 票计入计权。"""
+    """【复核 P2-19】_ask_ai 两次解析失败返回 None（「判定未知」），**绝不
+    return False** 被当作明确的 DIFFERENT 票计入计权。调用方 _collect_verdicts
+    按各自门禁处置该 None：normal 路径剔除计权、weak 复核当反对票。"""
 
-    async def test_double_parse_failure_raises(self):
+    async def test_double_parse_failure_returns_none(self):
         engine = DedupEngine()
         item = SimpleNamespace(title="A", source_quote="qa")
         chat = AsyncMock(return_value=SimpleNamespace(choices=[]))
+        with patch("briefdesk.plugins.dedup.engine.chat", new=chat):
+            verdict = await engine._ask_ai(item, "B", "qb")
+        self.assertIsNone(verdict, "解析失败是「未知」，不是 DIFFERENT")
+        self.assertIsNot(verdict, False, "False 会被当作明确反对票计入计权")
+        self.assertEqual(chat.await_count, 2, "两次尝试后才放弃")
+
+    async def test_collect_verdicts_warns_on_unparseable(self):
+        """解析失败的降级必须可见：_collect_verdicts 对 None 与对异常同等记
+        WARNING，否则日志里只剩 _ask_ai 的「重试」提示，看不出该候选最终被
+        按 fail_note 的口径处置掉了。"""
+        engine = DedupEngine()
+        cand = SimpleNamespace(title="候选A", source_quote="qa")
+        chat = AsyncMock(return_value=SimpleNamespace(choices=[]))
         with (
             patch("briefdesk.plugins.dedup.engine.chat", new=chat),
-            self.assertRaisesRegex(RuntimeError, "两次解析失败"),
+            self.assertLogs("briefdesk.plugins.dedup.engine", level="WARNING") as cm,
         ):
-            await engine._ask_ai(item, "B", "qb")
-        self.assertEqual(chat.await_count, 2, "两次尝试后才放弃")
+            out = await engine._collect_verdicts(
+                [(cand, 0.9)], "B", "qb", "按反对票计"
+            )
+        self.assertEqual(out, [None])
+        self.assertTrue(
+            any("判定未知" in m and "候选A" in m and "按反对票计" in m
+                for m in cm.output),
+            f"缺少解析失败的降级 WARNING：{cm.output}",
+        )
 
 
 class JudgePromptTest(unittest.TestCase):
@@ -375,6 +395,37 @@ class CheckDedupShortCircuitTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result.is_duplicate)
         self.assertEqual(result.similar_to_id, "a1")
         merge_mock.assert_awaited_once_with("a1", "新生2群")
+
+    async def test_strong_unparseable_warns_and_falls_through(self):
+        """strong 候选解析失败 → 记 WARNING 并保留参与多数票。
+
+        _ask_ai 两次解析失败返回 None（不再抛错），故走不到短路段的 except；
+        若不在 None 分支补记 WARNING，该候选的降级在日志里无声无息。
+        """
+        engine = self._engine([("a1", "篮球社招新", "内容甲")])
+
+        async def unparseable(messages: list[dict], **kwargs):
+            return SimpleNamespace(choices=[])  # 无 choices → 两次尝试均无法解析
+
+        with (
+            patch(
+                "briefdesk.plugins.dedup.engine.top_k_similar",
+                return_value=[(0, 1.0)],
+            ),
+            patch(
+                "briefdesk.plugins.dedup.engine.chat",
+                new=AsyncMock(side_effect=unparseable),
+            ),
+            self.assertLogs("briefdesk.plugins.dedup.engine", level="WARNING") as cm,
+        ):
+            result = await engine.check_dedup(
+                "篮球社招新", "新生2群", q_emb=[0.5, 0.6]
+            )
+        self.assertFalse(result.is_duplicate, "判定未知不得当作重复")
+        self.assertTrue(
+            any("[strong]" in m and "判定未知" in m for m in cm.output),
+            f"缺少 strong 短路的解析失败 WARNING：{cm.output}",
+        )
 
     async def test_strong_different_falls_through_to_majority(self):
         """strong 候选判 DIFFERENT（同文本但内容不同）→ 剔除后剩余候选走多数票。"""

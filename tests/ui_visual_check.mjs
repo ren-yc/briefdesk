@@ -210,7 +210,7 @@ try {
 if (MEASURE) {
   const SAMPLES = [
     ["主操作按钮", '<button class="sync-btn">同步</button>'],
-    ["顶栏链接", '<a class="top-settings-link">设置</a>'],
+    ["侧边栏入口", '<a class="cat-link"><span class="cat-link-main">设置</span></a>'],
     ["卡片操作", '<div class="card-actions"><button>备忘</button></div>'],
     ["浮层操作", '<div class="ov-actions"><button>确定</button></div>'],
     ["弹窗操作", '<div class="modal-actions"><button>保存</button></div>'],

@@ -4,15 +4,18 @@
 本模块是 classify 阶段插件的引擎实现。
 """
 
+import base64
 import logging
 import re
 import time
 from dataclasses import replace
 from difflib import SequenceMatcher
 
+from briefdesk import announcements
 from briefdesk.ai_ports import chat, embed_texts, is_embedding_enabled, loads_json
 from briefdesk.config import config
 from briefdesk.db import CategoryRow, get_enabled_categories
+from briefdesk.plugin.base import ChatResponse
 from briefdesk.types import ClassifyOutcome, ClassifyResult, InternalMessage
 
 logger = logging.getLogger(__name__)
@@ -117,8 +120,12 @@ def _local_datetime(ts: object) -> str:
         return ""
 
 
-def _group_messages(messages: list[InternalMessage]) -> list[dict]:
+def _group_messages(
+    messages: list[InternalMessage],
+    vision_images: dict[tuple[str, str], list[bytes]] | None = None,
+) -> list[dict]:
     groups: dict[str, dict] = {}
+    images_by_msg = vision_images or {}
     for i, msg in enumerate(messages):
         # 不同源可能有同名群，键加源前缀避免跨源并组
         key = msg.group_name or msg.session_id
@@ -132,6 +139,9 @@ def _group_messages(messages: list[InternalMessage]) -> list[dict]:
                 "senderName": msg.sender_name or "未知",
                 "content": msg.content,
                 "sentAt": _local_datetime(msg.timestamp),
+                # vision 路由：enrich 阶段暂存的归一化图片字节（vision 关闭
+                # 或该图归一化失败时为空列表，该条自动降级纯文本）
+                "images": images_by_msg.get((msg.source or "", msg.msg_id)) or [],
             }
         )
     return list(groups.values())
@@ -192,6 +202,73 @@ def _build_user_message_ex(groups: list[dict]) -> tuple[str, list[int]]:
 def _build_user_message(groups: list[dict]) -> str:
     """兼容包装：仅返回消息文本（测试与既有调用使用）。"""
     return _build_user_message_ex(groups)[0]
+
+
+# ── vision 路由（AI_VISION_ENABLED）：含图消息的多模态请求构建 ──
+# 图片字节由 enrich（ocr 插件）归一化后随批暂存，本模块只做请求形状转换。
+# 降级原则：图片是分类增强信息——单图归一化失败/超预算/请求级失败均只让
+# 该部分退回纯文本，不影响批次内其它消息与既有解析链路。
+
+_MAX_IMAGES_PER_REQUEST = 12  # 单次请求附图总量预算（token/请求体上界兜底）
+
+# vision 请求级失败的降级公告（携带图片的请求成功时撤销，参照 embedding_unreachable）
+_VISION_FALLBACK_CODE = "vision_fallback"
+_VISION_FALLBACK_MESSAGE = (
+    "AI 视觉输入请求失败，已自动降级为纯文本处理（含图消息仅送 OCR 文本）。"
+    "请核对 AI_MODEL / AI_API_BASE 是否真的支持图片输入，或关闭 AI_VISION_ENABLED"
+)
+
+
+def _image_data_url(data: bytes) -> str:
+    """归一化 JPEG 字节 → base64 data URL（imaging.downscale_image 输出恒为 JPEG）。"""
+    return "data:image/jpeg;base64," + base64.b64encode(data).decode("ascii")
+
+
+def _build_image_parts(groups: list[dict], excluded: set[int] | None = None) -> list[dict]:
+    """为含图消息构建多模态 content parts（追加在文本 part 之后的图片段）。
+
+    每条含图消息前插入标注 text part 显式关联输入行 index；单条消息按
+    AI_VISION_MAX_IMAGES 截断，整批按 _MAX_IMAGES_PER_REQUEST 截断（超预算
+    的消息该轮只发 OCR 文本）。`excluded` 为字符预算剔除的消息 index 集合：
+    这些消息不在文本数据区里，附图并标注「消息 N 附图」会邀请 AI 对一个
+    不存在的输入行分类——该 index 已在调用方并入 failed 重试，图文同发会
+    产生 index 同时出现在 results 与 failed 的矛盾结果（审查回归），必须
+    一并跳过。全批无可用图片返回空列表，调用方据此维持纯文本 str 请求
+    （字节级行为不变）。
+    """
+    per_msg_cap = config.ai_vision_max_images
+    budget = _MAX_IMAGES_PER_REQUEST
+    dropped = excluded or set()
+    parts: list[dict] = []
+    for group in groups:
+        for msg in group["messages"]:
+            if msg["index"] in dropped:
+                continue
+            images = msg.get("images") or []
+            if not images:
+                continue
+            if budget <= 0:
+                logger.debug("消息 %s 图片超出单请求预算，本轮只发文本", msg["index"])
+                continue
+            take = images[: min(per_msg_cap, budget)]
+            budget -= len(take)
+            parts.append(
+                {"type": "text", "text": f"【消息 {msg['index']} 附 {len(take)} 张图片】"}
+            )
+            parts.extend(
+                {"type": "image_url", "image_url": {"url": _image_data_url(d)}}
+                for d in take
+            )
+    if not parts:
+        return []
+    parts.insert(
+        0,
+        {
+            "type": "text",
+            "text": "以下图片属于上述对应编号的消息，请结合消息文本与图片内容综合判断。",
+        },
+    )
+    return parts
 
 
 # 允许两种格式：带时刻 "YYYY-MM-DD HH:MM" 或仅日期 "YYYY-MM-DD"（日历/徽章可只按天展示）
@@ -925,7 +1002,10 @@ async def extract_times(
     await _extract_times_core(results, time_indexes, messages, _TIME_SPLIT_DEPTH)
 
 
-async def classify_batch(messages: list[InternalMessage]) -> ClassifyOutcome:
+async def classify_batch(
+    messages: list[InternalMessage],
+    vision_images: dict[tuple[str, str], list[bytes]] | None = None,
+) -> ClassifyOutcome:
     if not messages:
         return ClassifyOutcome([], [])
 
@@ -938,7 +1018,9 @@ async def classify_batch(messages: list[InternalMessage]) -> ClassifyOutcome:
         # 整批标记 processed，即使重新启用类别也无法回填（永久丢失）。
         raise RuntimeError("没有启用的类别，拒绝空分类（避免整批误标记 processed）")
 
-    outcome = await _classify_once(messages, cats, offset=0, depth=_MAX_SPLIT_DEPTH)
+    outcome = await _classify_once(
+        messages, cats, offset=0, depth=_MAX_SPLIT_DEPTH, vision_images=vision_images
+    )
 
     # 第二步：对分类标记 time=true 的消息批量提取 start/end/times（sysc，
     # 尽力而为，失败回退默认不阻塞）。只在顶层调用一次（拆半合并后）。
@@ -957,40 +1039,83 @@ async def _classify_once(
     cats: list[CategoryRow],
     offset: int,
     depth: int,
+    vision_images: dict[tuple[str, str], list[bytes]] | None = None,
 ) -> ClassifyOutcome:
-    groups = _group_messages(messages)
+    groups = _group_messages(messages, vision_images)
     user_message, budget_dropped = _build_user_message_ex(groups)
+    image_parts = _build_image_parts(groups, set(budget_dropped))
+    had_images = bool(image_parts)
+    fell_back = False
 
     logger.info(
         "Sending %d msgs in %d groups to AI...", len(messages), len(groups)
     )
 
-    try:
-        resp = await chat(
+    system_prompt = build_system_prompt(cats)
+    all_failed = ClassifyOutcome([], [offset + i for i in range(len(messages))])
+
+    async def _request(with_images: bool) -> ChatResponse:
+        # vision 路由：有图时 user content 从 str 换成多模态 content parts
+        # （文本 part + 逐条图片段），无图时维持原样 str（字节级兼容）。
+        content: str | list[dict] = user_message
+        if with_images and image_parts:
+            content = [{"type": "text", "text": user_message}, *image_parts]
+        return await chat(
             messages=[
-                {"role": "system", "content": build_system_prompt(cats)},
-                {"role": "user", "content": user_message},
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": content},
             ],
             temperature=0.1,
             max_tokens=config.max_classify_tokens,
         )
+
+    async def _fallback_request(why: str) -> ChatResponse | None:
+        """vision 请求级失败的同批降级：置公告后以纯文本重发一次。
+
+        返回 None 表示重试仍失败（调用方维持"本轮抛弃"语义）。公告由
+        携带图片的请求成功时撤销——降级重试成功不撤销（视觉仍不可用）。
+        """
+        logger.warning("含图分类请求失败（%s），降级纯文本重试", why)
+        await announcements.announce(
+            _VISION_FALLBACK_CODE, "warning", _VISION_FALLBACK_MESSAGE
+        )
+        try:
+            return await _request(False)
+        except Exception as e:  # noqa: BLE001 — 与主请求同语义：本轮抛弃
+            logger.warning("纯文本重试仍失败（本轮抛弃，下轮回填）: %s", e)
+            return None
+
+    resp: ChatResponse | None
+    try:
+        resp = await _request(had_images)
     except Exception as e:  # noqa: BLE001 — 传输层失败统一按"本轮抛弃"处理，不拆半
         # SDK 内置重试已覆盖传输层失败；仍失败说明上游持续不可用，
         # 拆半无益且会成倍放大请求量——整段消息本轮抛弃，下轮回填重试。
-        logger.warning("分类请求失败（本轮抛弃，下轮回填）: %s", e)
-        return ClassifyOutcome([], [offset + i for i in range(len(messages))])
-
+        if not had_images:
+            logger.warning("分类请求失败（本轮抛弃，下轮回填）: %s", e)
+            return all_failed
+        resp = await _fallback_request(str(e))
+        if resp is None:
+            return all_failed
+        fell_back = True
+    if not resp.choices and had_images and not fell_back:
+        # 空 choices（异常响应）与传输失败同级：同样走一次纯文本降级重试
+        resp = await _fallback_request("empty choices")
+        if resp is None:
+            return all_failed
+        fell_back = True
     if not resp.choices:
-        # 空 choices（异常响应）：视为本轮不可用，整段消息下轮回填重试
         logger.warning("AI 返回空 choices（本轮抛弃，下轮回填）")
-        return ClassifyOutcome([], [offset + i for i in range(len(messages))])
+        return all_failed
+    if had_images and not fell_back:
+        await announcements.revoke(_VISION_FALLBACK_CODE)
 
     content = resp.choices[0].message.content
 
     # finish_reason == "length" 表示输出触达 max_tokens 上限被硬截断，
     # 生成的 JSON 大概率不完整：拆半后作为两个独立请求递归重试。
     if resp.choices[0].finish_reason == "length":
-        return await _split_retry(messages, cats, offset, depth)
+        return await _split_retry(messages, cats, offset, depth, vision_images)
 
     if not content:
         logger.warning("AI 返回空响应（本轮抛弃，下轮回填）")
@@ -1041,11 +1166,13 @@ async def _split_retry(
     cats: list[CategoryRow],
     offset: int,
     depth: int,
+    vision_images: dict[tuple[str, str], list[bytes]] | None = None,
 ) -> ClassifyOutcome:
     """length 截断：按数量对半，作为两个独立请求顺序递归重试。
 
     不可再拆（单条消息 / 达深度上限）时本轮抛弃（返回 failed），
     由 pipeline 跳过 processed 标记、回填窗口内自动重试。
+    vision_images 按消息身份作键，切片递归无需搬移，整 dict 透传即可。
     """
     if depth <= 0 or len(messages) <= 1:
         logger.warning(
@@ -1061,8 +1188,10 @@ async def _split_retry(
         mid,
         len(messages) - mid,
     )
-    left = await _classify_once(messages[:mid], cats, offset, depth - 1)
-    right = await _classify_once(messages[mid:], cats, offset + mid, depth - 1)
+    left = await _classify_once(messages[:mid], cats, offset, depth - 1, vision_images)
+    right = await _classify_once(
+        messages[mid:], cats, offset + mid, depth - 1, vision_images
+    )
     return ClassifyOutcome(
         left.results + right.results,
         left.failed + right.failed,

@@ -421,11 +421,24 @@ class DedupEngine(DedupService):
                     '  "%s" 判定失败，%s: %r', cand.title, fail_note, res
                 )
                 out.append(None)
+            elif res is None:
+                # 解析失败（_ask_ai 两次均无法解析）与传输异常同等降级，
+                # 也须同等可见：否则日志里只剩「重试」的 WARNING，看不出
+                # 该候选最终被按 fail_note 的口径处置掉了
+                logger.warning(
+                    '  "%s" 判定未知（输出无法解析），%s', cand.title, fail_note
+                )
+                out.append(None)
             else:
                 out.append(bool(res))
         return out
 
-    async def _ask_ai(self, a: CachedItem, b_title: str, b_quote: str) -> bool:
+    async def _ask_ai(self, a: CachedItem, b_title: str, b_quote: str) -> bool | None:
+        """单候选判定；传输异常向上抛（调用方按失败降级），两次输出均
+        无法解析返回 None——None 语义 = 「判定未知」，与 `_parse_same` 的
+        None 及 `_collect_verdicts` 的异常整形一致。绝不能返回 False 冒充
+        明确 DIFF 判定：strong 短路路径会据此剔除候选，把"最强证据从未
+        成立"伪装成"已否证"，令多数票的分母悄然变小（审查回归）。"""
         for attempt in (1, 2):
             try:
                 resp = await chat(
@@ -464,10 +477,11 @@ class DedupEngine(DedupService):
                 resp.choices[0].finish_reason if resp.choices else "empty-choices",
                 content[:200],
             )
-        # 两次解析均失败：抛错交调用方既有容错（_collect_verdicts 经
-        # return_exceptions 整形为 None 票、strong 路径 except 后降级参与
-        # 多数票）——不得 return False 被当作明确的 DIFFERENT 票计入计权
-        raise RuntimeError("判重输出两次解析失败（截断或 JSON 残缺）")
+        # 两次解析均失败 → None（「判定未知」）：不抛错（异常当控制流会让
+        # strong 短路路径必须 except 兜底），也绝不 return False 被当作明确
+        # 的 DIFFERENT 票计入计权。调用方 _collect_verdicts 会按 fail_note
+        # 的口径记 WARNING 并施加各自门禁。
+        return None
 
     @staticmethod
     def _snapshot(item: CachedItem) -> DedupCandidate:
@@ -846,6 +860,16 @@ class DedupEngine(DedupService):
                     e,
                 )
                 verdict = None
+            else:
+                if verdict is None:
+                    # 解析失败（_ask_ai 两次均无法解析）不抛异常，走不到上面的
+                    # except；此处补记，否则短路候选的降级在日志里无声无息
+                    # （_collect_verdicts 的同款 WARNING 只覆盖多数票路径）
+                    logger.warning(
+                        '  [strong] "%s" 判定未知（输出无法解析），'
+                        "该候选保留参与后续多数票",
+                        strong_cand.title,
+                    )
             if verdict is not None:
                 logger.debug(
                     '  [strong] "%s" (%s: %.0f%%): %s',

@@ -15,6 +15,7 @@ import logging
 import time as time_module
 from datetime import UTC, datetime
 
+from briefdesk import announcements
 from briefdesk.config import config
 from briefdesk.db import (
     RawMsgInput,
@@ -66,7 +67,8 @@ def _split_batches(
 async def _mark_skipped(bctx: BatchContext, failed_set: set[int]) -> None:
     """未选中且非失败的消息批量标记 processed（闲聊跳过）。
 
-    被滤自消息不标记 processed（回填窗口内每轮重滤、关闭 IGNORE_SELF 可恢复）。
+    被滤自消息不标记 processed（与纯占位符图片同语义，见下方入口过滤注释
+    ——可恢复需重新停用/启用会话清水位或调大回填窗口，而非"自动重拉"）。
     outcome is None（classify 阶段运行了但未写 outcomes，属契约违约）不与
     「模型明确全排除」同语义：未知结果整批不标记，本批零产出使 process_all_
     batches 返回 False、poll_cycle 跳过水位推进，由钉窗机制找回——防不合规
@@ -160,13 +162,29 @@ async def process_all_batches(
             logger.info("%s 过滤自己发送: %d 条", origin, self_filtered)
 
     # OCR 未启用（enrich 槽位为空）时纯占位符图片消息无信息价值：不落 raw、
-    # 不进分类、不标记 processed——OCR 重新启用后回填窗口内自动重拉重处理
-    # （与 IGNORE_SELF 过滤同语义，可逆）。图片+文字混合消息（content 非
-    # 占位符）不受影响：文字仍有信息价值，照常处理。
+    # 不进分类、不标记 processed。图片+文字混合消息（content 非占位符）不受
+    # 影响：文字仍有信息价值，照常处理。
+    # ⚠️ 可恢复性的真实边界：这些消息不落 raw_messages，钉窗机制看不到它们，
+    # 而本轮全滤后水位照常推进——重新启用 OCR 并不会"自动重拉"；要找回这批
+    # 消息需重新停用/启用会话（清水位触发 BACKFILL_HOURS 回填）或临时将
+    # BACKFILL_HOURS 设为 -1 全量回填。
     # 判定正则单源见 briefdesk.masking.PLACEHOLDER_ONLY_RE。
     enrich_stages = get_stages("enrich")
     images_filtered = 0
     if not enrich_stages:
+        if config.ai_vision_enabled:
+            # vision 开启但 OCR 缺位：纯占位符图片消息被下行过滤、混合消息
+            # 拿不到图片字节——公告提示修复配置（announce 幂等，不刷屏）。
+            logger.warning(
+                "AI_VISION_ENABLED 已开启但 ocr 插件未启用：图片不会送入模型"
+            )
+            await announcements.announce(
+                "vision_without_ocr",
+                "warning",
+                "AI 视觉输入已开启（AI_VISION_ENABLED）但 ocr 插件未启用："
+                "图片不会送入模型。请在 PLUGINS 启用 ocr（安装 briefdesk[ocr]）"
+                "或关闭 AI_VISION_ENABLED",
+            )
         images_filtered = sum(
             1
             for m in messages

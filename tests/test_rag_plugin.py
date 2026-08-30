@@ -570,6 +570,37 @@ class RagBackfillTest(_MemoryEngineBase):
         self.assertEqual(await self.engine.backfill_step(self.now), 0)  # 排空完成
         self.assertEqual(sorted(await self._chunk_ids()), ["d1", "d3"])
 
+    async def test_placeholder_rows_do_not_starve_budget_window(self):
+        """审查回归：纯占位符行不可索引却永远满足反连接——旧实现中它们每轮
+        占满 LIMIT 预算窗口、rows 为空时 return 0 被当作「回填完成」，比它们
+        更早的真实消息永远得不到索引且无任何告警。现登记 rag_skipped 消费
+        出队，预算窗口逐轮推进到真实消息。"""
+
+        from briefdesk.plugins.rag.config import RagSettings as RS
+
+        self.engine.settings = RS(backfill_days=7, backfill_budget_per_cycle=2,
+                                  backfill_batch=64)
+        # 窗口内两个占位符行比真实消息新（回填按 timestamp DESC 选取，
+        # 越新的行越先占据预算窗口），预算窗口（2）先被它们占满
+        await self._seed("ph1", 1, content="[图片]")
+        await self._seed("ph2", 1, content="[图片][图片]")
+        await self._seed("real", 3)
+        # 第一轮：占位符被消费出队（登记 skipped），不入 chunks
+        self.assertEqual(await self.engine.backfill_step(self.now), 2)
+        self.assertEqual(await self._chunk_ids(), [])
+        cursor = await self.db.execute(
+            "SELECT msg_id FROM rag_skipped ORDER BY msg_id"
+        )
+        try:
+            skipped = [r["msg_id"] for r in await cursor.fetchall()]
+        finally:
+            await cursor.close()
+        self.assertEqual(skipped, ["ph1", "ph2"])
+        # 第二轮：skipped 排除后窗口推进到真实消息
+        self.assertEqual(await self.engine.backfill_step(self.now), 1)
+        self.assertEqual(await self._chunk_ids(), ["real"])
+        self.assertEqual(await self.engine.backfill_step(self.now), 0)
+
     async def test_short_provider_return_guard(self):
         from briefdesk.plugins.rag.config import RagSettings as RS
 

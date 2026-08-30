@@ -28,11 +28,13 @@ from pathlib import Path
 
 import aiosqlite
 
-from briefdesk import ai_ports
+from briefdesk import ai_ports, announcements
 from briefdesk.db import init_schema
 from briefdesk.plugins.ai_provider.engine import Provider
 from briefdesk.plugins.benchmark.schema import CategoryDef
 from briefdesk.status import get_sync_progress
+
+logger = logging.getLogger(__name__)
 
 logger = logging.getLogger(__name__)
 
@@ -110,11 +112,23 @@ async def bench_environment(
         # 实时消息不入库也不标 processed，延后到下轮回填自然恢复。
         # 置于 try 内保证任何后续失败都走 finally 的复位与子目录清理。
         pipeline.set_processing_paused(True)
-        # 等待在途批次排空（复核 P2-22），见 _wait_pipelines_drained
+        # 等待在途批次排空（复核 P2-22），见 _wait_pipelines_drained。
+        # 必须先于下方 DB 入口打补丁：在途批次仍持生产连接，未排空即改
+        # get_db 会让半程批次的后续写落到临时基准库。
         if not await _wait_pipelines_drained():
             logger.warning(
                 "benchmark: 等待在途批次排空超时（120s），基准结果可能污染生产缓存"
             )
+        try:
+            await announcements.announce(
+                "benchmark_running",
+                "warning",
+                "基准运行中：生产管道已暂停，UI 写操作（备忘/忽略/改分类/"
+                "提醒等）将落在临时基准库并在运行结束后丢弃，请勿在此期间"
+                "操作界面。",
+            )
+        except Exception:  # 公告失败不阻断基准运行
+            logger.debug("基准公告发布失败", exc_info=True)
         if categories:
             await _replace_categories(main_conn, categories)
 
@@ -132,6 +146,10 @@ async def bench_environment(
     finally:
         # 顺序约束：先复位管道标志，再还原 DB 入口补丁（两者之间无 await 点，
         # 事件循环内原子，不存在"管道已放行而补丁未还原"的窗口）。
+        try:
+            await announcements.revoke("benchmark_running")
+        except Exception:  # 撤销失败不影响环境还原
+            logger.debug("基准公告撤销失败", exc_info=True)
         pipeline.set_processing_paused(False)
         briefdesk_db.get_db = old_get_db  # type: ignore[assignment]
         briefdesk_db.get_embed_db = old_get_embed_db  # type: ignore[assignment]

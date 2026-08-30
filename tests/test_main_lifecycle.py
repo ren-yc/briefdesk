@@ -8,6 +8,7 @@
 """
 
 import asyncio
+import sys
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -182,6 +183,42 @@ class ReapTaskTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(any("boom-task" in line for line in captured.output))
         self.assertTrue(task.done())
         self.assertFalse(task.cancelled())
+
+
+class StartupInterruptCleanupTest(unittest.TestCase):
+    """启动窗口期 Ctrl+C（审查回归）：信号 handler 在 server.started 之后才
+    安装，此前的 Ctrl+C 以 KeyboardInterrupt 从 run_until_complete 逃逸——
+    旧实现直接退出，_run 的 finally（teardown/close_db 唯一清理点）不执行，
+    aiosqlite 非 daemon worker 线程令解释器退出挂死。现由 main() 取消
+    main_task 并驱动事件循环把清理跑完。"""
+
+    def test_startup_interrupt_runs_finally_cleanup(self):
+        from briefdesk import main as main_mod
+
+        cleaned: list[bool] = []
+
+        async def fake_run() -> None:
+            try:
+                loop = asyncio.get_running_loop()
+
+                def inject_interrupt() -> None:
+                    # 模拟启动窗口期 Ctrl+C：异常从回调逃逸出 run_forever，
+                    # 等价于主线程收到 SIGINT（真线程 interrupt_main 在
+                    # Windows proactor 上无法唤醒阻塞中的 selector，不可用）
+                    raise KeyboardInterrupt
+
+                loop.call_later(0.05, inject_interrupt)
+                await asyncio.sleep(3600)
+            finally:
+                cleaned.append(True)
+
+        with (
+            patch.object(main_mod, "_run", fake_run),
+            patch.object(sys, "argv", ["briefdesk"]),
+        ):
+            main_mod.main()  # 必须返回且不向上抛 KeyboardInterrupt
+
+        self.assertEqual(cleaned, [True], "清理 finally 必须已执行")
 
 
 if __name__ == "__main__":

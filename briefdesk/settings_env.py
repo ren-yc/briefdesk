@@ -78,8 +78,13 @@ def write_staged(updates: dict[str, str | None]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
     lines = "".join(f"{k}={v}\n" for k, v in current.items())
-    tmp.write_text(lines, encoding="utf-8")
-    os.replace(tmp, path)
+    try:
+        tmp.write_text(lines, encoding="utf-8")
+        os.replace(tmp, path)
+    except OSError:
+        # 写入/替换失败时清理残留 .tmp（原文件未被 os.replace 触碰，保持不变）
+        tmp.unlink(missing_ok=True)
+        raise
 
 
 def source_of(alias: str) -> str:

@@ -52,6 +52,9 @@ class RagPlugin(StagePlugin, WebPlugin):
         self._engine: RagEngine | None = None
         self._backfill_task: asyncio.Task[None] | None = None
         self._gc_task: asyncio.Task[None] | None = None
+        # 维护循环的唤醒事件：reindex/降级自愈在循环休眠期踢一脚时立即
+        # 执行回填，而不是干等一个维护间隔（默认 1h）后才生效
+        self._kick_event = asyncio.Event()
 
     def settings_schema(self) -> list[dict[str, Any]]:
         from briefdesk.plugins.rag.config import RagSettings
@@ -122,9 +125,12 @@ class RagPlugin(StagePlugin, WebPlugin):
         self._spawn_backfill()
 
     def _spawn_backfill(self) -> None:
-        # 已有循环在跑则不重复拉起（循环自身会跑到自然结束）
+        # 已有循环在跑则不重复拉起（循环自身会跑到自然结束），但以事件
+        # 唤醒休眠期：reindex/自愈的语义是「立即执行回填」而非「下个间隔」
         if self._backfill_task is not None and not self._backfill_task.done():
+            self._kick_event.set()
             return
+        self._kick_event.clear()
         self._backfill_task = asyncio.create_task(
             self._maintenance_loop(), name="rag-maintenance"
         )
@@ -163,7 +169,16 @@ class RagPlugin(StagePlugin, WebPlugin):
                 raise
             except Exception:
                 logger.exception("rag: GC/预热异常，下周期重试")
-            await asyncio.sleep(self._engine.settings.maintenance_interval_seconds)
+            # 休眠可被 reindex/降级自愈踢醒（_spawn_backfill set 事件），
+            # 立即回到回填排空，而非等满一个维护间隔
+            try:
+                await asyncio.wait_for(
+                    self._kick_event.wait(),
+                    timeout=self._engine.settings.maintenance_interval_seconds,
+                )
+            except TimeoutError:
+                pass
+            self._kick_event.clear()
 
     async def teardown(self) -> None:
         if self._backfill_task is not None:

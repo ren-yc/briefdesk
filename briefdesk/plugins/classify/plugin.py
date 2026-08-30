@@ -7,22 +7,20 @@
 from collections.abc import Awaitable, Callable
 
 from briefdesk.plugin.base import PluginContext, StagePlugin
-from briefdesk.types import BatchContext, ClassifyOutcome, InternalMessage
+from briefdesk.types import BatchContext, ClassifyOutcome
 
 
 class ClassifyPlugin(StagePlugin):
     """分类阶段插件（显式实现 StagePlugin；入口见模块底部 `plugin` 实例）。"""
 
     name = "classify"
-    version = "1.0.0"
+    version = "1.1.0"
     dependencies: tuple[str, ...] = ("ai_provider",)  # 分类依赖 AI 供应商
     slot = "classify"
     priority = 0
 
     def __init__(self) -> None:
-        self._classify_batch: (
-            Callable[[list[InternalMessage]], Awaitable[ClassifyOutcome]] | None
-        ) = None
+        self._classify_batch: Callable[..., Awaitable[ClassifyOutcome]] | None = None
 
     async def setup(self, ctx: PluginContext) -> None:
         # 延迟导入：仅加载本插件依赖，且便于测试替换
@@ -37,7 +35,11 @@ class ClassifyPlugin(StagePlugin):
 
     async def run(self, batch: BatchContext, ctx: PluginContext) -> None:
         if self._classify_batch is not None:
-            batch.outcomes = await self._classify_batch(batch.messages)
+            # vision_images 为 enrich 阶段暂存的归一化图片字节（vision 关闭时
+            # 为空 dict）：引擎对无图消息自动维持纯文本请求
+            batch.outcomes = await self._classify_batch(
+                batch.messages, vision_images=batch.vision_images
+            )
 
 
 plugin = ClassifyPlugin()

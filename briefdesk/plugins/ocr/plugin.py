@@ -4,14 +4,21 @@
 下载 → 识别 → 脱敏 → 替换。单条失败（MediaError / 识别异常）只跳过
 该条 OCR，不拖垮整批。
 
+vision 路由（AI_VISION_ENABLED）：下载成功后把缩放归一的图片字节随批
+暂存（batch.vision_images），供 classify 构建多模态请求；暂存独立于 OCR
+结果——OCR 失败或无文字时图片仍可送模型。vision 关闭时零额外开销。
+
 OCR 依赖（rapidocr / onnxruntime）为可选安装（`pip install briefdesk[ocr]`）：
 未安装时 setup 抛 PluginDisabledError 自禁用，不影响其余插件与核心。
 """
 
+import asyncio
 import logging
 import time as time_module
 from collections.abc import Awaitable, Callable
 
+from briefdesk.config import config
+from briefdesk.imaging import downscale_image
 from briefdesk.logger import fmt_dur
 from briefdesk.masking import PLACEHOLDER_ONLY_RE, mask_content
 from briefdesk.plugin.base import PluginContext, PluginDisabledError, StagePlugin
@@ -51,6 +58,11 @@ class OcrPlugin(StagePlugin):
 
     async def teardown(self) -> None: ...
 
+    @staticmethod
+    def _normalize_vision_bytes(contents: list[bytes]) -> list[bytes | None]:
+        """vision 路由的逐图归一化（CPU 密集，调用方经 asyncio.to_thread 调用）。"""
+        return [downscale_image(c) for c in contents]
+
     async def run(self, batch: BatchContext, ctx: PluginContext) -> None:
         if self._ocr_image_bytes is None:
             return
@@ -67,6 +79,20 @@ class OcrPlugin(StagePlugin):
                 # 卡片仍以原文内容入库并保留 image_urls 供前端代理显示）
                 logger.warning("图片下载失败，跳过 OCR（消息 %s）: %s", msg.msg_id, e)
                 continue
+            if config.ai_vision_enabled:
+                # vision 路由：归一化后的图片字节随批暂存供 classify 构建
+                # 多模态请求。置于 OCR 之前且独立于其结果——OCR 失败或
+                # 无文字时图片仍可送模型；归一化失败逐图跳过（值缺失的图
+                # 不进 stash，classify 对该条自动降级纯文本）。
+                stashed = [
+                    normalized
+                    for normalized in await asyncio.to_thread(
+                        self._normalize_vision_bytes, contents
+                    )
+                    if normalized is not None
+                ]
+                if stashed:
+                    batch.vision_images[(msg.source, msg.msg_id)] = stashed
             try:
                 ocr_text = await self._ocr_image_bytes(contents)
             except Exception as e:  # noqa: BLE001 — OCR 失败不应拖垮整批

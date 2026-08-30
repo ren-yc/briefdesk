@@ -77,6 +77,7 @@ class _WeFlowLegacyClient:
     async def fetch_messages(
         self, talker: str, start_ts: int | None, limit: int = 500, offset: int = 0,
         media: bool = False, not_found_ok: bool = False,
+        retry_on_empty: bool = True,
     ) -> dict:
         self.calls.append((talker, start_ts, offset, media))
         page = self._messages[offset : offset + limit]
@@ -772,12 +773,13 @@ class SessionFailureIsolationTest(unittest.IsolatedAsyncioTestCase):
         class _PartialFailClient(_WeFlowLegacyClient):
             async def fetch_messages(
                 self, talker, start_ts, limit=500, offset=0, media=False,
-                not_found_ok=False,
+                not_found_ok=False, retry_on_empty=True,
             ):
                 if talker == "g2":
                     raise RuntimeError("上游对该会话稳定 5xx")
                 return await super().fetch_messages(
-                    talker, start_ts, limit, offset, media, not_found_ok
+                    talker, start_ts, limit, offset, media, not_found_ok,
+                    retry_on_empty,
                 )
 
         client = _PartialFailClient([_weflow_msg("m1", now - 10)])

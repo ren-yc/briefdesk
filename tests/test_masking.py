@@ -163,5 +163,80 @@ class SeparatorRunEdgeTest(unittest.TestCase):
         self.assertIn("[PHONE]", out)
 
 
+class SeparatorAggregationGuardTest(unittest.TestCase):
+    """段数守卫（审查回归）：数字列表/日期范围按总位数撞型的聚合误伤。
+    旧实现按「去分隔符总位数」分类，8 段 16 位被判银行卡、12 段 15 位被判
+    身份证且永久入库（types.py 构造即脱敏、原文不落盘，损坏不可逆）；
+    现要求切段数 ≤ 5（真实 PII 分组至多 5 段）。"""
+
+    def test_digit_list_not_bankcard(self):
+        raw = "12 13 14 15 16 17 18 19"
+        self.assertEqual(mask_content(raw), raw)
+
+    def test_long_digit_list_not_id(self):
+        raw = "1 2 3 4 5 6 7 8 9 10 11 12"
+        self.assertEqual(mask_content(raw), raw)
+
+    def test_room_number_chain_not_bankcard(self):
+        raw = "会议室 301-302-303-304-305-306"
+        self.assertEqual(mask_content(raw), raw)
+
+    def test_date_range_not_bankcard(self):
+        raw = "2024-01-15 - 2024-01-20"
+        self.assertEqual(mask_content(raw), raw)
+
+    def test_legit_grouped_forms_still_masked(self):
+        self.assertEqual(mask_content("138 0013 8000 找我"), "[PHONE] 找我")
+        self.assertEqual(
+            mask_content("卡号 6222 0202 0000 0000 000 收款"),
+            "卡号 [BANKCARD] 收款",
+        )
+
+
+class MixedSeparatorTest(unittest.TestCase):
+    """混合分隔符路径（审查回归）：旧实现 join 丢空白分隔符篡改文本且非幂等，
+    「138 0013-8000」首遍输出「1380013-8000」（手机号数字仍可见）、二遍才变占位符；
+    现空白分隔符原样回填、整段「86+11 位」国家码形态可整体判定。"""
+
+    def test_mixed_phone_masked_whole(self):
+        self.assertEqual(mask_content("138 0013-8000"), "[PHONE]")
+
+    def test_date_and_mixed_phone_separators_preserved(self):
+        out = mask_content("2024-01-15 138-0013-8000")
+        self.assertEqual(out, "2024-01-15 [PHONE]")
+
+    def test_mixed_idempotent(self):
+        for raw in ("138 0013-8000", "2024-01-15 138-0013-8000", "1-2－3"):
+            once = mask_content(raw)
+            self.assertEqual(mask_content(once), once)
+
+
+class CountryCodePrefixTest(unittest.TestCase):
+    """+86/86 国家码前缀（审查回归）：旧实现 13 位串任何起点都因邻接数字
+    断言失败而原样保留（PII 漏报）。"""
+
+    def test_contiguous_plus86(self):
+        self.assertEqual(mask_content("+8613800138000"), "[PHONE]")
+
+    def test_separated_plus86(self):
+        self.assertEqual(mask_content("电话+86 138 0013 8000"), "电话[PHONE]")
+
+    def test_bare_86_prefix(self):
+        self.assertEqual(mask_content("8613800138000"), "[PHONE]")
+
+    def test_arithmetic_untouched(self):
+        for raw in ("价格 + 23 分", "100 + 86 = 186", "12+34"):
+            self.assertEqual(mask_content(raw), raw)
+
+    def test_non_phone_long_numbers_untouched(self):
+        # 86 打头但位数不构成任何 PII 形态：不脱敏
+        self.assertEqual(mask_content("861380013800"), "861380013800")
+
+
+class FullwidthEmailTest(unittest.TestCase):
+    def test_fullwidth_at_masked(self):
+        self.assertEqual(mask_content("邮箱 foo＠qq.com 收件"), "邮箱 [EMAIL] 收件")
+
+
 if __name__ == "__main__":
     unittest.main()

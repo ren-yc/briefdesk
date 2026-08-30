@@ -6,6 +6,7 @@
 - 时间提取（sysc）：_parse_times_response / extract_times 回填 start/end/extra_times。
 """
 
+import io
 import json
 import time
 import unittest
@@ -13,11 +14,21 @@ from types import SimpleNamespace
 from typing import ClassVar
 from unittest.mock import AsyncMock, patch
 
+from PIL import Image
+
+from briefdesk.announcements import (
+    announce,
+    get_announcements,
+    reset_announcements,
+)
+from briefdesk.config import config
 from briefdesk.plugins.classify.engine import (
     _MAX_BATCH_CHARS,
+    _MAX_IMAGES_PER_REQUEST,
     _MAX_MSG_CHARS,
     _SUMMARY_MAX_MSG_CHARS,
     _SUMMARY_PROMPT_TEMPLATE,
+    _build_image_parts,
     _build_summary_user_message,
     _build_time_user_message,
     _build_user_message,
@@ -1352,6 +1363,207 @@ class ClassifyBatchTruncationFailedTest(unittest.IsolatedAsyncioTestCase):
         # 全部进 failed（回填重试），不得静默标 processed
         self.assertEqual(sorted(outcome.failed), list(range(1, n)))
         self.assertEqual([r.msg_index for r in outcome.results], [0])
+
+
+class VisionClassifyTest(unittest.IsolatedAsyncioTestCase):
+    """vision 路由：多模态 content parts 构建、预算截断与请求级失败降级。"""
+
+    CAT: ClassVar[dict] = {
+        "id": 1,
+        "name": "活动通知",
+        "prompt": "",
+        "color": "",
+        "enabled": 1,
+        "created_at": "",
+    }
+
+    def setUp(self):
+        import asyncio
+
+        self._loop = asyncio.new_event_loop()
+        reset_announcements()
+
+    def tearDown(self):
+        self._loop.close()
+        reset_announcements()
+
+    @staticmethod
+    def _resp(finish_reason="stop", content=""):
+        return SimpleNamespace(
+            choices=[SimpleNamespace(finish_reason=finish_reason, message=SimpleNamespace(content=content))]
+        )
+
+    @staticmethod
+    def _empty_resp():
+        return SimpleNamespace(choices=[])
+
+    @staticmethod
+    def _json(*indices):
+        return json.dumps(
+            {
+                "task": "classify",
+                "data": [
+                    {"index": i, "category": "活动通知", "time": False, "quote": "内容", "key": ["k"]}
+                    for i in indices
+                ],
+            }
+        )
+
+    @staticmethod
+    def _msg(i=0):
+        return InternalMessage(
+            msg_id=f"m{i}",
+            content="内容",
+            sender_name="张三",
+            sender_id="u1",
+            session_id="s1",
+            group_name="社团群",
+            timestamp=i + 1,
+            source="weflow-legacy",
+        )
+
+    @staticmethod
+    def _jpeg() -> bytes:
+        buf = io.BytesIO()
+        Image.new("RGB", (8, 8), (1, 2, 3)).save(buf, "JPEG")
+        return buf.getvalue()
+
+    def _run(self, msgs, chat_side_effect, vision_images=None):
+        chat = AsyncMock(side_effect=chat_side_effect)
+        with patch("briefdesk.plugins.classify.engine.chat", new=chat), patch(
+            "briefdesk.plugins.classify.engine.summarize_results", new=AsyncMock()
+        ), patch(
+            "briefdesk.plugins.classify.engine.extract_times", new=AsyncMock()
+        ), patch(
+            "briefdesk.plugins.classify.engine.get_enabled_categories",
+            new=AsyncMock(return_value=[self.CAT]),
+        ):
+            outcome = self._loop.run_until_complete(
+                classify_batch(msgs, vision_images=vision_images)
+            )
+        return outcome, chat
+
+    def _user_content(self, chat, call_index=0):
+        request = chat.await_args_list[call_index].kwargs["messages"]
+        self.assertEqual(request[0]["role"], "system")
+        user = request[1]
+        self.assertEqual(user["role"], "user")
+        return user["content"]
+
+    def test_build_image_parts_empty_without_images(self):
+        # 全批无可用图片 → 空列表（调用方维持纯文本 str 请求）
+        self.assertEqual(
+            _build_image_parts([{"groupName": "g", "messages": [{"index": 0, "images": []}]}]),
+            [],
+        )
+
+    def test_vision_images_built_into_content_parts(self):
+        outcome, chat = self._run(
+            [self._msg(0)],
+            [self._resp("stop", self._json(0))],
+            vision_images={("weflow-legacy", "m0"): [self._jpeg()]},
+        )
+        self.assertEqual([r.msg_index for r in outcome.results], [0])
+        parts = self._user_content(chat)
+        self.assertIsInstance(parts, list)
+        self.assertIn("群聊消息开始", parts[0]["text"])  # 原 user 文本完整保留
+        self.assertIn("以下图片属于", parts[1]["text"])  # 图片段说明
+        self.assertEqual(parts[2]["text"], "【消息 0 附 1 张图片】")
+        self.assertEqual(parts[3]["type"], "image_url")
+        url = parts[3]["image_url"]["url"]
+        self.assertTrue(url.startswith("data:image/jpeg;base64,"))
+
+    def test_without_images_content_stays_string(self):
+        # vision 开启但批内无暂存图片（无图消息/归一化失败/开关关闭）→ 纯文本 str
+        _outcome, chat = self._run([self._msg(0), self._msg(1)], [self._resp("stop", self._json(0, 1))])
+        self.assertIsInstance(self._user_content(chat), str)
+
+    def test_per_message_cap_truncates_images(self):
+        imgs = [self._jpeg() for _ in range(3)]
+        chat = AsyncMock(return_value=self._resp("stop", self._json(0)))
+        with patch("briefdesk.plugins.classify.engine.chat", new=chat), patch(
+            "briefdesk.plugins.classify.engine.summarize_results", new=AsyncMock()
+        ), patch(
+            "briefdesk.plugins.classify.engine.extract_times", new=AsyncMock()
+        ), patch(
+            "briefdesk.plugins.classify.engine.get_enabled_categories",
+            new=AsyncMock(return_value=[self.CAT]),
+        ), patch.object(config, "ai_vision_max_images", 2):
+            self._loop.run_until_complete(
+                classify_batch(
+                    [self._msg(0)],
+                    vision_images={("weflow-legacy", "m0"): imgs},
+                )
+            )
+        parts = self._user_content(chat)
+        image_parts = [p for p in parts if p["type"] == "image_url"]
+        self.assertEqual(len(image_parts), 2)
+        self.assertIn("【消息 0 附 2 张图片】", [p.get("text") for p in parts])
+
+    def test_request_budget_truncates_images(self):
+        msgs = [self._msg(i) for i in range(_MAX_IMAGES_PER_REQUEST + 1)]
+        vision = {("weflow-legacy", f"m{i}"): [self._jpeg()] for i in range(len(msgs))}
+        outcome, chat = self._run(
+            msgs,
+            [self._resp("stop", self._json(*range(len(msgs))))],
+            vision_images=vision,
+        )
+        self.assertEqual([r.msg_index for r in outcome.results], list(range(len(msgs))))
+        parts = self._user_content(chat)
+        self.assertEqual(sum(1 for p in parts if p["type"] == "image_url"), _MAX_IMAGES_PER_REQUEST)
+        # 超预算的消息本轮只发文本：无图片标注 part
+        self.assertEqual(sum(1 for p in parts if "张图片】" in str(p.get("text", ""))), _MAX_IMAGES_PER_REQUEST)
+
+    def test_request_failure_falls_back_to_text_only(self):
+        # 请求级失败（如端点拒绝图片）→ 同批一次纯文本重试 → 正常解析；
+        # 公告保持置位（视觉仍不可用，不应撤销）
+        outcome, chat = self._run(
+            [self._msg(0)],
+            [RuntimeError("400 image not supported"), self._resp("stop", self._json(0))],
+            vision_images={("weflow-legacy", "m0"): [self._jpeg()]},
+        )
+        self.assertEqual(chat.await_count, 2)
+        self.assertEqual([r.msg_index for r in outcome.results], [0])
+        self.assertIsInstance(self._user_content(chat, call_index=1), str)  # 重试无图片
+        self.assertIn("vision_fallback", [a["code"] for a in get_announcements()])
+
+    def test_fallback_retry_failure_keeps_failed_semantics(self):
+        outcome, chat = self._run(
+            [self._msg(0)],
+            [RuntimeError("a"), RuntimeError("b")],
+            vision_images={("weflow-legacy", "m0"): [self._jpeg()]},
+        )
+        self.assertEqual(chat.await_count, 2)
+        self.assertEqual(outcome.results, [])
+        self.assertEqual(outcome.failed, [0])
+
+    def test_empty_choices_with_images_triggers_fallback(self):
+        # 空 choices（异常响应）与传输失败同级 → 降级重试
+        outcome, chat = self._run(
+            [self._msg(0)],
+            [self._empty_resp(), self._resp("stop", self._json(0))],
+            vision_images={("weflow-legacy", "m0"): [self._jpeg()]},
+        )
+        self.assertEqual(chat.await_count, 2)
+        self.assertEqual([r.msg_index for r in outcome.results], [0])
+        self.assertIn("vision_fallback", [a["code"] for a in get_announcements()])
+
+    def test_vision_success_revokes_fallback_announcement(self):
+        self._loop.run_until_complete(announce("vision_fallback", "warning", "旧公告"))
+        outcome, _chat = self._run(
+            [self._msg(0)],
+            [self._resp("stop", self._json(0))],
+            vision_images={("weflow-legacy", "m0"): [self._jpeg()]},
+        )
+        self.assertEqual([r.msg_index for r in outcome.results], [0])
+        self.assertNotIn("vision_fallback", [a["code"] for a in get_announcements()])
+
+    def test_text_only_failure_no_announcement(self):
+        # 纯文本批次的失败维持既有语义：不降级重试、不置 vision 公告
+        outcome, chat = self._run([self._msg(0)], [RuntimeError("connection reset")])
+        self.assertEqual(chat.await_count, 1)
+        self.assertEqual(outcome.failed, [0])
+        self.assertEqual(get_announcements(), [])
 
 
 if __name__ == "__main__":

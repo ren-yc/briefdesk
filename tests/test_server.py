@@ -1,9 +1,11 @@
 """server 路由层与安全中间件测试（monkeypatch 隔离 DB/AI）。"""
 
 import asyncio
+import tempfile
 import time
 import unittest
 from datetime import datetime
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
@@ -125,6 +127,12 @@ class LocalSecurityGuardTest(unittest.TestCase):
         # 未注册同步回调时该路由返回 409；只要未被中间件 403 即通过
         self.assertEqual(resp.status_code, 409)
 
+    def test_rejects_https_origin_scheme_mismatch(self):
+        # scheme 纳入同源判定（与 _same_origin docstring 一致）：https Origin
+        # 对 http 服务不算同源
+        resp = self.client.post("/api/sync", headers={"Origin": "https://localhost"})
+        self.assertEqual(resp.status_code, 403)
+
     def test_security_headers_present(self):
         resp = self.client.get("/api/status")
         self.assertTrue(resp.headers.get("content-security-policy"))
@@ -134,6 +142,41 @@ class LocalSecurityGuardTest(unittest.TestCase):
         resp = self.client.get("/api/definitely-not-exists")
         self.assertEqual(resp.status_code, 404)
         self.assertEqual(resp.headers.get("content-type"), "application/json")
+
+
+class RestoreTempDirTest(unittest.TestCase):
+    """审查回归：restore 临时文件必须落在库文件同目录——os.replace 不允许
+    跨文件系统，mkstemp 缺省走系统 TEMP 时与 DB_PATH 跨盘（Windows 典型布局）
+    必然 WinError 17，恢复功能整体不可用。"""
+
+    def setUp(self):
+        self.client = _client()
+
+    def tearDown(self):
+        self.client.close()
+
+    def test_tempfile_created_next_to_db_path(self):
+        from briefdesk.server import routes_items as ri
+
+        with tempfile.TemporaryDirectory() as d:
+            captured: dict = {}
+            real_mkstemp = tempfile.mkstemp
+
+            def fake_mkstemp(*args, **kwargs):
+                captured["dir"] = kwargs.get("dir")
+                return real_mkstemp(*args, **kwargs)
+
+            with (
+                patch.object(ri.tempfile, "mkstemp", side_effect=fake_mkstemp),
+                patch.object(ri.config, "db_path", Path(d) / "db.sqlite"),
+            ):
+                resp = self.client.post(
+                    "/api/restore",
+                    files={"file": ("backup.sqlite", b"not a sqlite file")},
+                )
+            # 无效备份被 400 拒绝（证明链路走通、没有先在 replace 上 500）
+            self.assertEqual(resp.status_code, 400)
+            self.assertEqual(captured["dir"], d)
 
 
 class HasMoreTest(unittest.TestCase):

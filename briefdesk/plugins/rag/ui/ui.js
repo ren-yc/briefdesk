@@ -2,14 +2,14 @@
  *
  * 架构决定：不注册插件视图（registerPluginView），不触碰头部按钮区——
  * 日历按钮/视图系统保持原样；本面板是打开时才出现的右侧栏（挂在
- * .main-layout 第三列，推开列表而非覆盖）：侧边栏 nav-special 入口点击
- * 开合，Esc 关闭，会话历史保存在内存中。
+ * .main-layout 第三列，推开列表而非覆盖）：侧边栏 #nav-top 工具容器
+ * 入口点击开合，Esc 关闭，会话历史保存在内存中。
  * 复用核心全局：esc / escAttr / fetchContext / inlineSvgIcons。
  */
 (function () {
   "use strict";
   const PLUGIN = "rag";
-  const ICON = "/icons/search.svg";
+  const ICON = "/icons/message-circle.svg";
 
   let $navLink = null;
   let $drawer = null;
@@ -24,20 +24,28 @@
   const history = [];      // 会话内对话历史 [{role, content}]
 
   function buildDom() {
-    // ── 侧边栏入口（工具类固定排在视图类之后，nav-special 底部）──
-    $navLink = document.createElement("a");
+    // ── 侧边栏入口（注入核心 #nav-top 工具容器末位，排在日历之后；
+    // 旧核心无该容器时回退已忽略后/侧边栏末尾）──
+    // button 而非 <a>：与组内订阅/备忘录/已忽略同款键盘语义；
+    // message-circle 与搜索框的 search 区分（历史撞车见侧边栏图标守卫测试）
+    $navLink = document.createElement("button");
+    $navLink.type = "button";
     $navLink.id = "rag-nav-link";
-    $navLink.href = "#";
     $navLink.className = "cat-link";
     $navLink.title = "问一问（向群聊记录提问，带原文引用）";
     $navLink.innerHTML =
       '<span class="cat-link-main"><img src="' + ICON + '" class="icon-sm cat-icon" alt="">问一问</span>';
-    const $ignored = document.getElementById("ignored-link");
-    if ($ignored && $ignored.parentNode) {
-      $ignored.parentNode.insertBefore($navLink, $ignored.nextSibling);
+    const $navTop = document.getElementById("nav-top");
+    if ($navTop) {
+      $navTop.appendChild($navLink);
     } else {
-      const $aside = document.querySelector("aside.sidebar");
-      if ($aside) $aside.appendChild($navLink);
+      const $ignored = document.getElementById("ignored-link");
+      if ($ignored && $ignored.parentNode) {
+        $ignored.parentNode.insertBefore($navLink, $ignored.nextSibling);
+      } else {
+        const $aside = document.querySelector("aside.sidebar");
+        if ($aside) $aside.appendChild($navLink);
+      }
     }
 
     // ── 右侧聊天抽屉 ──

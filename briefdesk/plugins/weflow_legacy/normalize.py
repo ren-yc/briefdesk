@@ -38,10 +38,14 @@ def _extract_media_path(media_url: str) -> str | None:
 
     "http://127.0.0.1:5031/api/v1/media/xxx@chatroom/images/abc.jpg"
     → "xxx@chatroom/images/abc.jpg"
+
+    剥离查询串（?access_token=… 会过期、下载走 Authorization 头鉴权，
+    不剥会把旧 token 嵌进 download_media 的 URL——与 weflow 版口径一致）。
     """
     idx = media_url.find(_MEDIA_URL_PREFIX)
     if idx >= 0:
-        return media_url[idx + len(_MEDIA_URL_PREFIX) :]
+        path = media_url[idx + len(_MEDIA_URL_PREFIX) :]
+        return path.split("?", 1)[0] or None
     return None
 
 
@@ -196,6 +200,13 @@ async def normalize_sse(
             rawid,
             "成功" if image_urls else "无可用 mediaUrl",
         )
+
+    # 回查未命中：纯占位符消息无信息价值，整条丢弃——与 REST 路径「无
+    # media.url 的图片消息整条丢弃」语义对齐；旧实现放行为纯文本
+    # "[图片]"，会产生噪音卡片（审查回归）
+    if content.strip() == "[图片]" and not image_urls:
+        logger.debug("SSE rawid=%s: 图片回查未命中，丢弃纯占位符消息", rawid)
+        return []
 
     # 文章卡片：拆条解析（公众号推送与群聊转发同格式）
     if _is_appmsg_content(content):

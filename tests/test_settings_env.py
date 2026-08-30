@@ -137,6 +137,18 @@ class SettingsFileTest(StagedFileTestCase):
             write_staged({"LOG_LEVEL": "DEBUG\nAI_API_KEY=sk-evil"})
         self.assertEqual(read_staged(), {"LOG_LEVEL": "DEBUG"})
 
+    def test_write_staged_cleans_tmp_on_failure(self) -> None:
+        # 写入/替换失败时残留 .tmp 必须被清理，原文件保持不变（审查回归）
+        write_staged({"LOG_LEVEL": "DEBUG"})
+        tmp_path = self.staged_path.parent / (self.staged_path.name + ".tmp")
+        with (
+            patch.object(settings_env.os, "replace", side_effect=OSError("boom")),
+            self.assertRaises(OSError),
+        ):
+            write_staged({"LOG_LEVEL": "INFO"})
+        self.assertFalse(tmp_path.exists())
+        self.assertEqual(read_staged(), {"LOG_LEVEL": "DEBUG"})
+
     def test_source_of_priority(self) -> None:
         # 环境变量 > override（暂存文件）> .env > default
         with tempfile.TemporaryDirectory() as d:
