@@ -10,6 +10,7 @@
    `AI_API_KEY=` 不命中）
 """
 
+import argparse
 import re
 import subprocess
 import sys
@@ -60,8 +61,12 @@ def scan_text(diff_text: str) -> list[tuple[int, str, str]]:
 
 
 def _staged_added_diff() -> str:
+    return _git_diff(["--cached"])
+
+
+def _git_diff(rev_args: list[str]) -> str:
     proc = subprocess.run(
-        ["git", "diff", "--cached", "-U0"],
+        ["git", "diff", *rev_args, "-U0"],
         capture_output=True,
         text=True,
         encoding="utf-8",
@@ -77,18 +82,28 @@ def _staged_added_diff() -> str:
     return proc.stdout
 
 
-def main() -> int:
-    diff = _staged_added_diff()
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="预提交密钥扫描")
+    parser.add_argument(
+        "--ref",
+        default=None,
+        help="扫描相对该基线的差异（如 origin/master…HEAD，供 CI 使用）；"
+        "缺省扫描 staged 新增内容（pre-commit 钩子路径）",
+    )
+    args = parser.parse_args(argv)
+
+    diff = _git_diff([f"{args.ref}...HEAD"]) if args.ref else _staged_added_diff()
     hits = scan_text(diff)
     if hits:
-        print("检测到疑似密钥/敏感信息（staged 新增内容），请先移除或脱敏后再提交：")
+        target = f"相对 {args.ref} 的差异" if args.ref else "staged 新增内容"
+        print(f"检测到疑似密钥/敏感信息（{target}），请先移除或脱敏后再提交：")
         for line, label, snippet in hits:
             print(f"  - 第 {line} 行 [{label}]: {snippet}")
         print(
             "\n确认为误报时，请人工复核后使用 `git commit --no-verify` 跳过（谨慎）。"
         )
         return 1
-    print("staged 新增内容未发现疑似密钥")
+    print("未发现疑似密钥")
     return 0
 
 

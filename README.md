@@ -113,7 +113,7 @@ OCR 依赖为**可选**（`pip install -e ".[ocr]"`）：
 | `AI_MAX_CONCURRENCY` | `4` | AI 请求最大并发，`0` = 不限制（本地模型建议设 1） |
 | `AI_DISABLE_THINKING` | `false` | 关闭 Qwen3/Qwen3.5 等模型的思考模式 |
 | `REALTIME_BATCH_MAX_COUNT` / `REALTIME_BATCH_TIMEOUT_MS` | `1` / `180000` | 实时批缓冲（攒够条数 / 超时毫秒触发处理） |
-| `BACKFILL_BATCH_MAX_COUNT` | `20` | 回填时单批 AI 分类的消息条数 |
+| `BACKFILL_BATCH_MAX_COUNT` | `10` | 回填时单批 AI 分类的消息条数（默认已由 20 调为 10：批越大 AI 返回 index 漂移的绝对误差面越大） |
 | `IGNORED_EXPIRY_HOURS` | `0`（禁用） | 启动时清理超过该时长的已忽略条目 |
 | `MERGE_WINDOW_MINUTES` / `MERGE_MAX_CANDIDATES` | `10` / `3` | 会话内同话题片段合并窗口（分钟）/ 候选上限；`0` = 禁用合并 |
 | `EMBED_API_BASE` / `EMBED_MODEL` / `EMBED_API_KEY` | 空（禁用） | 嵌入向量去重：填入嵌入服务地址后启用余弦预筛（留空回退字符重叠预过滤） |

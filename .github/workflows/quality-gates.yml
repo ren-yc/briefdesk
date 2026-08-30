@@ -3,12 +3,19 @@
 # Notes:
 # - windows-latest matches the dev environment (keyring behaves differently on
 #   headless Linux runners; avoids platform-specific noise)
-# - both [dev] and [ocr] extras are installed: rapidocr/onnxruntime are heavy,
-#   but the OCR plugin runs in production and its tests cover real engine wiring;
-#   installing them keeps CI faithful to the dev environment
+# - matrix covers 3.12 (the declared minimum in requires-python) and 3.13
+# - dependencies install from requirements-dev.txt (frozen from the
+#   gate-passing environment) so CI builds are reproducible; the package
+#   itself is installed editable with --no-deps on top of the lockfile
+# - both [dev] and [ocr] extras are covered: rapidocr/onnxruntime are heavy,
+#   but the OCR plugin runs in production and its tests cover real engine
+#   wiring; the lockfile already contains them
 # - mypy checks the package only: test files are covered by ruff + pytest,
 #   and type-checking test-stub idioms is signature-level noise
-#   (see the [tool.mypy] comments in pyproject.toml)
+#   (see the [tool.mypy] comments in pyproject.toml); AGENTS.md notes the
+#   local gate additionally runs mypy over tests/
+# - secret scan runs against the PR diff (--ref origin/master), mirroring the
+#   pre-commit hook (which scans staged content only)
 name: CI
 
 on:
@@ -19,22 +26,36 @@ on:
 
 jobs:
   quality-gates:
-    name: Quality gates (ruff / mypy / pytest)
+    name: Quality gates (ruff / mypy / pytest) — py${{ matrix.python-version }}
     runs-on: windows-latest
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12", "3.13"]
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - name: Set up Python 3.13
+      - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@v5
         with:
-          python-version: "3.13"
+          python-version: ${{ matrix.python-version }}
           cache: pip
-          cache-dependency-path: pyproject.toml
+          cache-dependency-path: requirements-dev.txt
 
-      - name: Install dependencies (editable, dev + ocr extras)
-        run: pip install -e ".[dev,ocr]"
+      - name: Install dependencies (lockfile + editable package)
+        run: |
+          pip install -r requirements-dev.txt
+          pip install -e . --no-deps
+
+      - name: Secret scan (PR diff)
+        if: github.event_name == 'pull_request'
+        run: |
+          git fetch origin master
+          python scripts/secret_scan.py --ref origin/master
 
       - name: Lint (ruff)
         run: python -m ruff check briefdesk/ tests/
