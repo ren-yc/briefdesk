@@ -9,7 +9,7 @@
 (function () {
   "use strict";
   const PLUGIN = "rag";
-  const ICON = "/icons/search.svg";
+  const ICON = "/icons/message-circle.svg";
 
   let $navLink = null;
   let $drawer = null;
@@ -26,9 +26,11 @@
   function buildDom() {
     // ── 侧边栏入口（注入核心 #nav-top 工具容器末位，排在日历之后；
     // 旧核心无该容器时回退已忽略后/侧边栏末尾）──
-    $navLink = document.createElement("a");
+    // button 而非 <a>：与组内订阅/备忘录/已忽略同款键盘语义；
+    // message-circle 与搜索框的 search 区分（历史撞车见侧边栏图标守卫测试）
+    $navLink = document.createElement("button");
+    $navLink.type = "button";
     $navLink.id = "rag-nav-link";
-    $navLink.href = "#";
     $navLink.className = "cat-link";
     $navLink.title = "问一问（向群聊记录提问，带原文引用）";
     $navLink.innerHTML =

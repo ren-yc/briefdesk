@@ -56,12 +56,13 @@
           <!-- 搜索历史下拉（作为 .sidebar-search 子元素，绝对定位锚定更可靠） -->
           <div id="search-history-dropdown" class="search-history-dropdown hidden"></div>
         </div>
-        <!-- 搜索过滤条（与输入框同区，激活搜索时显示） -->
-        <div id="filter-bar" class="filter-bar hidden"></div>
-        <!-- 工具入口（日历/问一问）：由插件 ui.js 注入本容器，固定于分类导航上方；
-             有入口时以横线与分类区隔开（style.css #nav-top:has(.cat-link)），
+        <!-- 工具入口（日历/问一问）：由插件 ui.js 注入本容器，固定于搜索框正下方
+             （过滤条、分类导航之上——搜索态过滤条展开时工具入口仍置顶不漂移）；
+             有入口时以横线与下方区域隔开（style.css #nav-top:has(.cat-link)），
              容器空置（插件全停用）时不出现孤线 -->
         <div id="nav-top"></div>
+        <!-- 搜索过滤条（与输入框同区，激活搜索时显示） -->
+        <div id="filter-bar" class="filter-bar hidden"></div>
         <nav id="category-nav"></nav>
         <!-- 状态筛选/设置：固定位于左侧栏最下部 -->
         <div class="nav-special">
@@ -74,9 +75,9 @@
           <button type="button" id="ignored-link" class="cat-link" data-category="全部" data-verified="ignored" title="已忽略的卡片">
             <span class="cat-link-main"><img src="/icons/ban.svg" class="icon-sm cat-icon" alt="">已忽略<span class="cat-count">0</span></span>
           </button>
-          <a href="#" id="settings-link" class="cat-link" title="打开设置">
+          <button type="button" id="settings-link" class="cat-link" title="打开设置">
             <span class="cat-link-main"><img src="/icons/settings.svg" class="icon-sm cat-icon" alt="">设置</span>
-          </a>
+          </button>
         </div>
       </aside>
       <main id="content">

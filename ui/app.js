@@ -249,6 +249,8 @@ function preloadSvgIcons() {
   paths.add("/icons/copy.svg");   // 卡片"复制"按钮（动态渲染）
   paths.add("/icons/arrow-left-right.svg");    // 卡片"修正分类"按钮（动态渲染）
   paths.add("/icons/alarm-clock.svg");    // 卡片"提醒"按钮（动态渲染）
+  paths.add("/icons/calendar-days.svg");   // 侧边栏"日历"入口（calendar 插件动态注入）
+  paths.add("/icons/message-circle.svg");  // 侧边栏"问一问"入口（rag 插件动态注入）
   for (const src of paths) {
     if (_svgCache.has(src)) continue;
     fetch(src)
