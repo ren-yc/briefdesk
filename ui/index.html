@@ -35,9 +35,6 @@
         <button id="sync-btn" class="sync-btn" title="手动触发一次消息同步">
           <img src="/icons/refresh-cw.svg" class="icon" alt="">同步消息
         </button>
-        <a href="#" id="settings-link-top" class="top-settings-link">
-          <img src="/icons/settings.svg" class="icon" alt="">设置
-        </a>
         <!-- aria-expanded 让读屏用户感知面板开合；进度文本移出按钮可访问名之外
              （见下方 #status-progress 的 aria-live），避免按钮名称随同步进度不断变化 -->
         <div id="status-indicator" class="status offline" title="点击查看运行状态详情"
@@ -61,8 +58,12 @@
         </div>
         <!-- 搜索过滤条（与输入框同区，激活搜索时显示） -->
         <div id="filter-bar" class="filter-bar hidden"></div>
+        <!-- 工具入口（日历/问一问）：由插件 ui.js 注入本容器，固定于分类导航上方；
+             有入口时以横线与分类区隔开（style.css #nav-top:has(.cat-link)），
+             容器空置（插件全停用）时不出现孤线 -->
+        <div id="nav-top"></div>
         <nav id="category-nav"></nav>
-        <!-- 备忘录/已忽略：固定位于左侧栏最下部 -->
+        <!-- 状态筛选/设置：固定位于左侧栏最下部 -->
         <div class="nav-special">
           <button type="button" id="subs-link" class="cat-link" data-category="全部" title="查看订阅关键词命中的卡片">
             <span class="cat-link-main"><img src="/icons/bell-plus.svg" class="icon-sm cat-icon" alt="">订阅<span class="cat-count" id="subs-count">0</span></span>
@@ -73,6 +74,9 @@
           <button type="button" id="ignored-link" class="cat-link" data-category="全部" data-verified="ignored" title="已忽略的卡片">
             <span class="cat-link-main"><img src="/icons/ban.svg" class="icon-sm cat-icon" alt="">已忽略<span class="cat-count">0</span></span>
           </button>
+          <a href="#" id="settings-link" class="cat-link" title="打开设置">
+            <span class="cat-link-main"><img src="/icons/settings.svg" class="icon-sm cat-icon" alt="">设置</span>
+          </a>
         </div>
       </aside>
       <main id="content">

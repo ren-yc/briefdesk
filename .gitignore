@@ -62,6 +62,9 @@ debug*.py
 # FreeBuff agent workspace
 .freebuff/
 
+# ZCode agent workspace
+.zcode/
+
 # Benchmark run artifacts（fromweb 为网页导出用例，含真实聊天内容，禁止入库）
 briefdesk/plugins/benchmark/reports/
 briefdesk/plugins/benchmark/.tmp/

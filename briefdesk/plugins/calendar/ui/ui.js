@@ -34,8 +34,9 @@
   let $calDayTitle = null;
   let $calDayList = null;
 
-  // ── DOM 构建：入口移到侧边栏「订阅」前（与订阅/备忘录/已忽略同组：
-  // 同类——主内容区视图切换——集中在 nav-special）；视图容器进 main；浮层挂 body ──
+  // ── DOM 构建：入口注入核心 #nav-top 工具容器首位（分类导航上方，与问一问同组；
+  // 本插件无论先于/后于 rag 加载都占首位——rag 恒追加在末位——顺序恒为 日历→问一问）；
+  // 旧核心无该容器时回退「订阅」前。视图容器进 main；浮层挂 body ──
   function buildDom() {
     $calendarBtn = document.createElement("a");
     $calendarBtn.id = "calendar-btn";
@@ -44,8 +45,12 @@
     $calendarBtn.title = "日历视图（查看带时间的活动/截止安排）";
     $calendarBtn.innerHTML =
       '<span class="cat-link-main"><img src="/icons/calendar.svg" class="icon-sm cat-icon" alt="">日历</span>';
-    const $subs = document.getElementById("subs-link");
-    if ($subs && $subs.parentNode) $subs.parentNode.insertBefore($calendarBtn, $subs);
+    const $navTop = document.getElementById("nav-top");
+    if ($navTop) $navTop.insertBefore($calendarBtn, $navTop.firstChild);
+    else {
+      const $subs = document.getElementById("subs-link");
+      if ($subs && $subs.parentNode) $subs.parentNode.insertBefore($calendarBtn, $subs);
+    }
 
     $calendarView = document.createElement("div");
     $calendarView.id = "calendar-view";

@@ -141,7 +141,7 @@ const $ignoredLink = document.getElementById("ignored-link");
 const $settingsSave = document.getElementById("settings-save");
 const $settingsClose = document.getElementById("settings-close");
 const $syncBtn = document.getElementById("sync-btn");
-const $settingsLinkTop = document.getElementById("settings-link-top");
+const $settingsLink = document.getElementById("settings-link");
 const $sessionList = document.getElementById("session-list");
 const $onboardSessionList = document.getElementById("onboard-sessions");
 // 筛选控件（搜索框/类型芯片/源芯片/时间下拉+输入框）不在此取：
@@ -514,7 +514,7 @@ function bindSettingsEntryEvents() {
     setSettingsPanel(btn.dataset.panel);
   });
 
-  $settingsLinkTop.addEventListener("click", openSettings);
+  $settingsLink.addEventListener("click", openSettings);
 }
 
 function bindCategoryEvents() {
@@ -2149,13 +2149,13 @@ async function renderEmptyStateGuide() {
   }
   const openBtn = document.getElementById("empty-open-settings");
   if (openBtn) openBtn.addEventListener("click", () => {
-    const link = document.getElementById("settings-link-top");
+    const link = document.getElementById("settings-link");
     if (link) link.click();
     setSettingsPanel("sessions"); // openSettings 默认进「常规」，这里直达「群聊筛选」
   });
   const refreshBtn = document.getElementById("empty-refresh-sessions");
   if (refreshBtn) refreshBtn.addEventListener("click", () => {
-    const link = document.getElementById("settings-link-top");
+    const link = document.getElementById("settings-link");
     if (link) link.click();
     const btn = document.getElementById("session-refresh");
     if (btn) setTimeout(() => btn.click(), 300); // 等设置弹窗打开后再触发发现
@@ -3329,7 +3329,7 @@ function renderStatusBanner(status) {
       const syncBtn = document.getElementById("sync-btn");
       if (syncBtn) syncBtn.click();
     } else {
-      const link = document.getElementById("settings-link-top");
+      const link = document.getElementById("settings-link");
       if (link) link.click();
     }
   });
