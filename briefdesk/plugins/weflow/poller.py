@@ -202,6 +202,7 @@ async def poll(
             # _MAX_PAGES 仅为防异常状态下的无界循环守卫（全量/异常时打 WARNING）
             messages: list[WeFlowMessage] = []
             offset = 0
+            hit_old = False
             for page in range(_MAX_PAGES):
                 resp = await client.fetch_messages(
                     session_id,
@@ -214,9 +215,16 @@ async def poll(
                 page_msgs = resp.get("messages", [])
                 if not page_msgs:
                     break
-                messages.extend(page_msgs)
+                for m in page_msgs:
+                    # 响应按时间倒序：一旦碰到早于窗口的消息，本页其余只会更旧
+                    # ——对齐 qqflow 的 hit_old 早停（复核 P2-12）：防上游无视
+                    # start 参数时深翻历史（上限 40 万条全量驻留内存）
+                    if m.get("createTime", 0) < cutoff:
+                        hit_old = True
+                        break
+                    messages.append(m)
                 offset += len(page_msgs)
-                if not resp.get("hasMore"):
+                if hit_old or not resp.get("hasMore"):
                     break
             else:
                 logger.warning(

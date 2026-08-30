@@ -63,7 +63,8 @@ class QqFlowPlugin(SourcePlugin):
         missing = [name for name, value in required if not value]
         if missing:
             raise PluginDisabledError(
-                f"缺少必填配置 {', '.join(missing)}（在 .env 中配置后重启生效）"
+                f"缺少必填配置 {', '.join(missing)}"
+                "（在 .env / 系统密钥环中配置后重启生效）"
             )
         runtime = qqflow_runtime.QqFlowSource()
         ctx.register_source(runtime)

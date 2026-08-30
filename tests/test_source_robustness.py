@@ -346,6 +346,19 @@ class WeflowSseDedupTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(received), 2)
 
 
+class LegacyMessagesNotFoundTest(unittest.IsolatedAsyncioTestCase):
+    """【复核 U1-1】legacy fetch_messages 暴露 not_found_ok：404 → 空信封
+    （对齐 weflow/qqflow 的脏会话容错），轮询路径传 True。"""
+
+    async def test_not_found_ok_returns_empty_envelope_and_propagates(self):
+        client = WeFlowLegacyClient("http://127.0.0.1:5031", "tok")
+        get_mock = AsyncMock(return_value=None)
+        with patch.object(client, "_get", get_mock):
+            resp = await client.fetch_messages("g1", None, not_found_ok=True)
+        self.assertEqual(resp, {"messages": [], "hasMore": False})
+        self.assertTrue(get_mock.call_args.kwargs.get("not_found_ok"))
+
+
 class SseConnectLoopSurvivesGenericErrorTest(unittest.IsolatedAsyncioTestCase):
     """【复核 P1】_connect_loop 对非取消异常必须自愈：带栈记日志后退避重连。
 

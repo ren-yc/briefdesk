@@ -59,7 +59,7 @@ class _WeFlowPagedClient:
 
     async def fetch_messages(
         self, talker: str, start_ts: int | None, limit: int = 500, offset: int = 0,
-        media: bool = False,
+        media: bool = False, not_found_ok: bool = False,
     ) -> dict:
         self.calls.append((talker, start_ts, offset))
         page = self._messages[offset : offset + 500]

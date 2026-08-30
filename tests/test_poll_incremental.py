@@ -26,6 +26,9 @@ from briefdesk.db import (
 )
 from briefdesk.plugins.qqflow.client import QqFlowNotReadyError
 from briefdesk.plugins.qqflow.poller import poll as qq_poll
+from briefdesk.plugins.weflow.poller import _PAGE_LIMIT as WF_PAGE_LIMIT
+from briefdesk.plugins.weflow.poller import poll as wf_poll
+from briefdesk.plugins.weflow_legacy.poller import _PAGE_LIMIT as WFL_PAGE_LIMIT
 from briefdesk.plugins.weflow_legacy.poller import poll as we_poll
 from briefdesk.poll_cycle import _compute_session_windows, run_poll_cycle
 from briefdesk.types import SessionInfo
@@ -70,7 +73,7 @@ class _WeFlowLegacyClient:
 
     async def fetch_messages(
         self, talker: str, start_ts: int | None, limit: int = 500, offset: int = 0,
-        media: bool = False,
+        media: bool = False, not_found_ok: bool = False,
     ) -> dict:
         self.calls.append((talker, start_ts, offset, media))
         page = self._messages[offset : offset + limit]
@@ -114,6 +117,40 @@ class _QqFlowClient:
             "messages": page,
             "hasMore": offset + len(page) < len(self._messages),
         }
+
+
+class _WeFlowClient:
+    """weflow(new) poller 桩：最小消息形状（serverId/createTime/localType）。"""
+
+    name = "weflow"
+
+    def __init__(self, messages: list[dict]):
+        self._messages = messages
+        self.calls: list[int] = []
+
+    async def ensure_ready(self) -> None:
+        pass
+
+    async def fetch_contacts(self) -> dict[str, str]:
+        return {}
+
+    async def fetch_sessions(self) -> list[dict]:
+        return [{"id": "g1", "name": "项目群", "type": "group"}]
+
+    async def fetch_messages(
+        self, talker: str, start_ts: int | None, limit: int = 500,
+        offset: int = 0, media: bool = False, not_found_ok: bool = False,
+    ) -> dict:
+        self.calls.append(offset)
+        page = self._messages[offset : offset + limit]
+        return {
+            "messages": page,
+            "hasMore": offset + len(page) < len(self._messages),
+        }
+
+
+def _weflow_new_msg(msg_id: str, ts: int) -> dict:
+    return {"serverId": msg_id, "localType": 1, "createTime": ts, "content": "x"}
 
 
 async def _no_processed(ids):
@@ -667,12 +704,13 @@ class SessionFailureIsolationTest(unittest.IsolatedAsyncioTestCase):
 
         class _PartialFailClient(_WeFlowLegacyClient):
             async def fetch_messages(
-                self, talker, start_ts, limit=500, offset=0, media=False
+                self, talker, start_ts, limit=500, offset=0, media=False,
+                not_found_ok=False,
             ):
                 if talker == "g2":
                     raise RuntimeError("上游对该会话稳定 5xx")
                 return await super().fetch_messages(
-                    talker, start_ts, limit, offset, media
+                    talker, start_ts, limit, offset, media, not_found_ok
                 )
 
         client = _PartialFailClient([_weflow_msg("m1", now - 10)])
@@ -688,3 +726,62 @@ class SessionFailureIsolationTest(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(result.failed_sessions, {"g2"})
         self.assertIn("g2", result.session_errors)
+
+
+class PagingAgeEarlyStopTest(unittest.IsolatedAsyncioTestCase):
+    """【复核 P2-12】页内碰到早于窗口的消息即止（响应按时间倒序），不再
+    深翻后续页——防御上游无视 start 参数返回历史全量（weflow 上限 40 万条、
+    legacy 100 万条全量驻留内存）。"""
+
+    def setUp(self):
+        # 固定 BACKFILL_HOURS：本机 .env 可能设 -1（全量模式 start=None、
+        # cutoff=0，早停天然不触发），与现有增量测试同一隔离手法
+        self._hours = config.backfill_hours
+        config.backfill_hours = 24
+
+    def tearDown(self):
+        config.backfill_hours = self._hours
+
+    @staticmethod
+    def _mixed_messages(make_msg, now: int, window: int, page_limit: int) -> list[dict]:
+        # page_limit 条窗口内 + 1 条超窗 + page_limit+100 条更旧：naive 翻页
+        # 恰好 3 页；早停后第 2 页首条即超窗 → 恰好 2 页（页大小取自被测模块
+        # 的 _PAGE_LIMIT，避免硬编码页尺寸随实现漂移）
+        messages = [make_msg(f"m{i}", now - 10) for i in range(page_limit)]
+        messages.append(make_msg("old", window - 1))
+        messages.extend(
+            make_msg(f"o{i}", window - 2 - i) for i in range(page_limit + 100)
+        )
+        return messages
+
+    @staticmethod
+    async def _all_processed(ids):
+        return set(ids)
+
+    async def test_legacy_paging_stops_at_window_edge(self):
+        now = int(time.time())
+        window = now - 3600
+        client = _WeFlowLegacyClient(
+            self._mixed_messages(_weflow_msg, now, window, WFL_PAGE_LIMIT)
+        )
+        await we_poll(
+            client,
+            _enabled("weflow-legacy", "g1"),
+            self._all_processed,
+            window_start_by_session={"g1": window},
+        )
+        self.assertEqual(len(client.calls), 2, "第二页碰到超窗消息后不得再翻第三页")
+
+    async def test_weflow_paging_stops_at_window_edge(self):
+        now = int(time.time())
+        window = now - 3600
+        client = _WeFlowClient(
+            self._mixed_messages(_weflow_new_msg, now, window, WF_PAGE_LIMIT)
+        )
+        await wf_poll(
+            client,
+            _enabled("weflow", "g1"),
+            self._all_processed,
+            window_start_by_session={"g1": window},
+        )
+        self.assertEqual(len(client.calls), 2, "第二页碰到超窗消息后不得再翻第三页")

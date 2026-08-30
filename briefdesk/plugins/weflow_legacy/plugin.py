@@ -57,8 +57,8 @@ class WeFlowLegacyPlugin(SourcePlugin):
         if not settings.api_token.get_secret_value():
             logger.warning(
                 "WEFLOW_LEGACY_API_TOKEN 未配置：实时监听与历史"
-                "回填将在调用期失败。请在 .env 中填入 WeFlow Legacy HTTP API 访问"
-                "令牌后重启。"
+                "回填将在调用期失败。请在 .env / 系统密钥环中配置 WeFlow "
+                "Legacy HTTP API 访问令牌后重启。"
             )
         runtime = wfl_runtime.WeFlowLegacySource()
         ctx.register_source(runtime)

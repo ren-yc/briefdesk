@@ -526,7 +526,6 @@ class WeFlowClient(SourceClient):
         limit: int = 500,
         offset: int = 0,
         media: bool = False,
-        retry_on_empty: bool = True,
         not_found_ok: bool = False,
     ) -> WeFlowMessagesResponse:
         """获取指定会话的历史消息（返回完整信封，含 hasMore）。
@@ -541,10 +540,11 @@ class WeFlowClient(SourceClient):
             offset: 分页偏移
             media: 是否导出媒体（图片等），为 True 时附加 media=1&image=1，
                 消息对象 media 字段携带 url
-            retry_on_empty: 空结果是否 500ms 后重试一次（回查链路应传 False；
-                轮询首页保留默认 True 以维持既有「刚入库查不到」竞态兜底）
             not_found_ok: 会话不存在（404，如 brandsessionholder 等无消息的
                 系统会话）时返回空信封而非抛错；轮询路径应传 True
+
+        无空结果重试：weflow-server 0.5.x 无「刚入库查不到」竞态（该兜底是
+        legacy 上游的历史行为，其 client 保留实现）。
         """
         params: dict[str, Any] = {"talker": talker, "limit": limit, "offset": offset}
         if start_ts is not None:
@@ -572,15 +572,15 @@ class WeFlowClient(SourceClient):
         """按 serverId 回查 REST 获取消息原始对象。
 
         用 timestamp 缩小查询范围（start=ts-120 起，客户端再按 ±120s 过滤），
-        在返回的消息中匹配 serverId == rawid。回查显式 retry_on_empty=False：
-        miss 是常见路径，不应在监听/回填热路径上为空结果白付 500ms 重试。
+        在返回的消息中匹配 serverId == rawid。回查无重试：miss 是常见路径，
+        不应在监听/回填热路径上为空结果白付重试延迟（legacy 上游的
+        retry_on_empty 竞态兜底不适用于 weflow-server 0.5.x）。
         """
         start_ts = int((datetime.fromtimestamp(ts, tz=UTC) - timedelta(seconds=120)).timestamp())
 
         try:
             resp = await self.fetch_messages(
                 talker, start_ts, limit=_LOOKUP_LIMIT, media=media,
-                retry_on_empty=False,
             )
         except Exception as e:
             # 仅 DEBUG：调用方（SSE 监听器）fail-open 并记 WARNING，此处再打
