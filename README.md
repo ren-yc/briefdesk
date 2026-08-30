@@ -107,9 +107,10 @@ OCR 依赖为**可选**（`pip install -e ".[ocr]"`）：
 |---|---|---|
 | `PLUGINS` / `PLUGINS_DISABLED` | `["*"]` / `[]` | 插件启用/禁用（JSON 数组），消息源启用的唯一开关（不再使用 SOURCES） |
 | `POLL_OVERLAP_SECONDS` | `300` | 增量轮询窗口与水位间的重叠秒数（吸收边界秒/时钟偏差/翻页偏移；重叠部分由已处理表去重，无 AI 开销） |
+| `POLL_INTERVAL_SECONDS` | `0`（禁用） | 周期同步间隔（秒）：SSE 断连窗口的消息补齐兜底，>0 时按周期自动触发与「同步消息」同路径的同步（进行中互斥） |
 | `IGNORE_SELF` | `true` | 过滤本账号自己发送的消息（SSE 实时 + REST 回填） |
 | `MAX_CLASSIFY_TOKENS` | `8192` | 单次 AI 分类最大输出 token（触顶截断会破坏 JSON） |
-| `AI_MAX_CONCURRENCY` | `0`（不限） | AI 请求最大并发（本地模型建议设 1） |
+| `AI_MAX_CONCURRENCY` | `4` | AI 请求最大并发，`0` = 不限制（本地模型建议设 1） |
 | `AI_DISABLE_THINKING` | `false` | 关闭 Qwen3/Qwen3.5 等模型的思考模式 |
 | `REALTIME_BATCH_MAX_COUNT` / `REALTIME_BATCH_TIMEOUT_MS` | `1` / `180000` | 实时批缓冲（攒够条数 / 超时毫秒触发处理） |
 | `BACKFILL_BATCH_MAX_COUNT` | `20` | 回填时单批 AI 分类的消息条数 |

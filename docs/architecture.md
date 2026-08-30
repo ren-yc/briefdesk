@@ -171,7 +171,8 @@ All via `.env` file, with an additional UI-staged overlay layer (see 「密钥�
 | `QQFLOW_SSE_READ_TIMEOUT_MS` | `60000` | qqflow SSE 读超时（毫秒）：上游每 25s 发 KeepAlive，默认 ≈2.4 个周期（兼作半开连接自愈检测时限）；超时转化为 ReadTimeout 走监听器既有退避重连路径 |
 | `AI_API_BASE` | `https://api.deepseek.com` | OpenAI-compatible API base |
 | `AI_MODEL` | `deepseek-v4-flash` | Model name for classify/dedup |
-| `AI_MAX_CONCURRENCY` | `0` (unlimited) | Max concurrent AI API requests; set `1` for local models with concurrency limit 1 |
+| `AI_MAX_CONCURRENCY` | `4` | Max concurrent AI API requests, `0` = unlimited; set `1` for local models with concurrency limit 1 |
+| `POLL_INTERVAL_SECONDS` | `0` (disabled) | Periodic sync interval in seconds: fallback to backfill messages missed during SSE outages; >0 triggers the same sync path as `/api/sync` periodically (mutually exclusive) |
 | `AI_DISABLE_THINKING` | `true`（.env.example 默认建议值，代码默认 `false`） | When `true`, chat requests pass `reasoning_effort="none"` to disable thinking mode。⚠️ DeepSeek/思考系模型建议开启：思考输出计入 max_tokens 预算，会挤压时间提取/分类 JSON 造成 length 截断整批丢失（2026-08-28 问题报告 §4）；`.env.example` 已注记 |
 | `MAX_CLASSIFY_TOKENS` | `8192` | Max output tokens per classify call (DeepSeek cap 8192; truncation breaks JSON) |
 | `LOG_LEVEL` | `INFO` | 日志级别（DEBUG / INFO / WARNING / ERROR / CRITICAL，另接受 uvicorn 的 TRACE）。DEBUG 开启逐条细节（事件/请求/过滤决策），INFO 只保留阶段与汇总；同时驱动 uvicorn 自身 logger 的级别门，并决定 **uvicorn.access 请求日志是否输出（仅 DEBUG/TRACE）** |
