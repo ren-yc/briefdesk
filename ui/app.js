@@ -3262,9 +3262,12 @@ const _STATUS_LABELS = { online: "在线", reconnecting: "重连中", offline: "
 // 各消息源在线状态 → { overall, partsHtml }（指示器圆点颜色与文字共用）
 function _statusParts(status) {
   const sources = Object.entries(status.sources || {});
+  if (!sources.length) {
+    // 零源降级启动（决策 ①=1B）：明示采集不可用，替代含混的「未连接」
+    return { overall: "offline", parts: ["无消息源（检查插件配置，降级运行）"] };
+  }
   const states = sources.map(([, s]) => s.status || "offline");
-  const overall = states.length === 0 ? "offline"
-    : states.every(st => st === "online") ? "online"
+  const overall = states.every(st => st === "online") ? "online"
     : states.some(st => st === "reconnecting") ? "reconnecting"
     : "offline";
   const parts = sources.map(([name, s]) => {

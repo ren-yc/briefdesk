@@ -122,7 +122,7 @@ OCR 依赖为**可选**（`pip install -e ".[ocr]"`）：
 | `DB_PATH` / `SERVER_PORT` | `briefdesk.sqlite` / `3000` | SQLite 路径 / Web 端口 |
 
 > 配置说明：`.env` 与默认数据库路径均以项目根目录为基准解析，从任意目录启动（`python main.py` / `python -m briefdesk` / `briefdesk`）都会读取同一份配置（显式配置的相对 `DB_PATH` 仍按当前工作目录解析）。
-> `PLUGINS` 未启用任何消息源插件时启动会报错退出（零源启动是配置错误，不是可运行状态）。
+> `PLUGINS` 未启用任何消息源插件时进入**降级启动**：应用照常运行（UI/设置/向导可用），状态栏明示「无消息源」，消息采集不可用——配置消息源后重启生效。
 
 ## 项目结构
 

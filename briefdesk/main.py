@@ -228,8 +228,13 @@ async def _run() -> None:
         set_plugins_info_callback(manager.infos)
         set_settings_schema_callback(manager.settings_schema)
         if not runtimes:
-            raise ValueError(
-                "没有可用的消息源插件（检查 PLUGINS / PLUGINS_DISABLED 配置与上方插件日志）"
+            # 零源降级启动（决策 ①=1B）：不再中止——UI/设置/向导可用，
+            # 消息采集不可用，状态栏明示；这也是三源统一「缺配置自禁用」
+            # 语义的前提（否则唯一启用的源自禁用会触发零源中止）
+            logger.warning(
+                "没有可用的消息源插件，进入降级启动：UI/设置可用、消息采集"
+                "不可用（检查 PLUGINS / PLUGINS_DISABLED 配置与上方插件日志，"
+                "配置后重启生效）"
             )
         for s in runtimes:
             register_source_client(s.name, s.client)
