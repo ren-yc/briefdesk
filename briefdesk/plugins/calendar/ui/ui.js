@@ -107,12 +107,15 @@
   }
 
   function exitCalendarMode({ syncHash: sh = true } = {}) {
+    const wasActive = calendarMode;
     calendarMode = false;
     document.body.classList.remove("calendar-mode");
     $calendarBtn.classList.remove("active");
     $calendarView.classList.add("hidden");
     if (sh) syncHash("push");
-    fetchData();
+    // 仅日历真正激活过才补拉（进入时已拉取）：未激活的退出不再发请求，
+    // 消除每次导航/搜索的双倍 /api/items 请求（复核 P2-26）
+    if (wasActive) fetchData();
   }
 
   async function loadCalendar() {
@@ -260,6 +263,7 @@
     $calDetailBody.innerHTML = renderItemRow(item, { cls: "cal-detail-row", showSubject: true, collapsible: false, showArticleLink: false });
     $calDetailModal.classList.remove("hidden");
     syncBodyScrollLock();
+    pushModalFocus($calDetailModal); // 与核心模态同一焦点栈：挡快捷键/圈闭 Tab（复核 P2-25）
     const row = $calDetailBody.querySelector(".cal-detail-row");
     if (row) {
       const ctxDiv = row.querySelector(".card-quote-context");
@@ -278,6 +282,7 @@
   function closeCalDetail() {
     $calDetailModal.classList.add("hidden");
     syncBodyScrollLock();
+    popModalFocus($calDetailModal);
     // 只在详情里真的改过数据时才重拉整月
     if (calendarMode && calDetailDirty) loadCalendar();
     calDetailDirty = false;
@@ -299,11 +304,13 @@
       }).join("");
     $calDayModal.classList.remove("hidden");
     syncBodyScrollLock();
+    pushModalFocus($calDayModal);
   }
 
   function closeCalDay() {
     $calDayModal.classList.add("hidden");
     syncBodyScrollLock();
+    popModalFocus($calDayModal);
   }
 
   // ── 事件绑定 ──

@@ -155,7 +155,9 @@
         chip.type = "button";
         chip.className = "rag-cite-chip";
         chip.dataset.n = String(c.n);
-        chip.title = escAttr((c.group_name ? c.group_name + " · " : "") + c.sender_name);
+        // .title 是属性赋值（不走 HTML 解析）：escAttr 的实体会按字面显示，
+        // 直接用原始字符串（复核 P3）
+        chip.title = (c.group_name ? c.group_name + " · " : "") + c.sender_name;
         chip.textContent = "[" + c.n + "] " + c.sender_name;
         chip.addEventListener("click", () => openCtx(c));
         chips.appendChild(chip);
@@ -218,10 +220,12 @@
     const body = document.getElementById("rag-ctx-body");
     body.innerHTML = '<p class="text-muted">加载中…</p>';
     $ctxModal.classList.remove("hidden");
+    pushModalFocus($ctxModal); // 与核心模态同一焦点栈（复核 P2-25）
     fetchContext(body, cite.source, cite.session_id, cite.time, cite.msg_id);
   }
   function hideCtxModal() {
     $ctxModal.classList.add("hidden");
+    popModalFocus($ctxModal);
   }
 
   // ── 入口：核心加载器注入本脚本后调用 ──

@@ -1466,8 +1466,12 @@ function connectRealtimeStream() {
   }
 
   stream = new EventSource("/api/stream");
-  // 连接成功即复位退避（下次断开从 2s 重新开始）
-  stream.addEventListener("open", () => { sseBackoffMs = 2000; });
+  // 连接成功即复位退避（下次断开从 2s 重新开始），并恢复状态栏常规文案
+  // （断线期间被「实时推送已断开」占位，复核 P2-28）
+  stream.addEventListener("open", () => {
+    sseBackoffMs = 2000;
+    updateStatus(lastStatusInfo || {});
+  });
 
   stream.addEventListener("items_updated", (ev) => {
     // 同步完成事件（payload {"synced":true}）：恢复同步按钮；手动触发时给完成提示
@@ -1504,7 +1508,10 @@ function connectRealtimeStream() {
       stream = null;
     }
     if (streamReconnectTimer) return;
-    // 指数退避：后端重启/断网时不再以固定 0.5 QPS 持续敲服务器（SSE 客户端标准实践）
+    // 断线可见性（复核 P2-28）：静默重连会让界面退化成长间隔兜底轮询而
+    // 用户毫不知情；状态栏明示，重连成功的 open 事件复位
+    $statusText.classList.remove("hidden");
+    $statusText.innerHTML = '实时推送已断开，重连中…';
     streamReconnectTimer = setTimeout(() => {
       streamReconnectTimer = null;
       connectRealtimeStream();
@@ -1740,16 +1747,16 @@ function renderNav(categories, ignoredCount, memoCount) {
     html += `
       <button type="button" class="cat-link${isActive ? " active" : ""}"${colorStyle} data-category="${escAttr(cat.key)}" data-verified="unverified">
         ${icon ? `<img src="${icon}" class="icon-sm cat-icon" alt="">` : ""}${esc(cat.key)}
-        <span class="cat-count">${cat.count}</span>
+        <span class="cat-count">${escAttr(cat.count)}</span>
       </button>`;
   }
   $nav.innerHTML = html;
 
   if (memoCount !== undefined) {
-    $memoLink.innerHTML = `<span class="cat-link-main"><img src="/icons/bookmark-check.svg" class="icon-sm cat-icon" alt="">备忘录<span class="cat-count">${memoCount}</span></span>`;
+    $memoLink.innerHTML = `<span class="cat-link-main"><img src="/icons/bookmark-check.svg" class="icon-sm cat-icon" alt="">备忘录<span class="cat-count">${escAttr(memoCount)}</span></span>`;
   }
   if (ignoredCount !== undefined) {
-    $ignoredLink.innerHTML = `<span class="cat-link-main"><img src="/icons/ban.svg" class="icon-sm cat-icon" alt="">已忽略<span class="cat-count">${ignoredCount}</span></span>`;
+    $ignoredLink.innerHTML = `<span class="cat-link-main"><img src="/icons/ban.svg" class="icon-sm cat-icon" alt="">已忽略<span class="cat-count">${escAttr(ignoredCount)}</span></span>`;
   }
 }
 
@@ -2013,7 +2020,7 @@ async function renderOnboardSessions() {
       const kindTag = s.is_official ? '公' : (s.is_group ? '群' : '私');
       const checked = s.is_group ? "checked" : "";
       return `
-      <label class="session-row" data-is-group="${s.is_group ? "1" : "0"}" data-is-official="${s.is_official ? "1" : "0"}" data-source="${escAttr(s.source)}" data-last-active="${s.last_active || ""}">
+      <label class="session-row" data-is-group="${s.is_group ? "1" : "0"}" data-is-official="${s.is_official ? "1" : "0"}" data-source="${escAttr(s.source)}" data-last-active="${escAttr(s.last_active || "")}">
         <input type="checkbox" data-source="${escAttr(s.source)}" data-session-id="${escAttr(s.session_id)}" ${checked}>
         <span class="session-name">${esc(s.name || s.session_id)}</span>
         <span class="text-muted" style="font-size:11px">${esc(kindTag)} · ${esc(s.source)} · ${esc(s.session_id.substring(0, 15))}...</span>
@@ -2853,7 +2860,7 @@ function renderItemRow(item, { cls = "", showSubject = false, showSubscribed = f
     : `${imagesHtml}<div class="quote-meta">${esc(item.sender_name || "未知")} · ${msgTime} · ${sourceGroupChips(item.source_group)}</div>${quoteTextHtml(item)}<div class="card-quote-context"><p class="text-muted">加载上下文中...</p></div>`;
 
   return `
-    <div class="ov-row${cls ? " " + cls : ""} ${verifiedClass}" style="${catColorStyle}" data-id="${escAttr(item.id)}" data-source="${escAttr(item.source || "")}" data-session-id="${escAttr(item.session_id || "")}" data-msgtime="${item.msg_time || ""}" data-msgid="${escAttr(item.source_msg_id || "")}">
+    <div class="ov-row${cls ? " " + cls : ""} ${verifiedClass}" style="${catColorStyle}" data-id="${escAttr(item.id)}" data-source="${escAttr(item.source || "")}" data-session-id="${escAttr(item.session_id || "")}" data-msgtime="${escAttr(item.msg_time || "")}" data-msgid="${escAttr(item.source_msg_id || "")}">
       <div class="ov-row-head">
         <span class="card-category" data-cat="${escAttr(item.category)}">${esc(item.category)}</span>
         ${timeBadgeHtml(item)}
@@ -3040,7 +3047,7 @@ function renderCard(item, groupKey = "") {
   const hasQuote = !!(item.source_quote && item.source_quote.trim());
 
   return `
-    <div tabindex="-1" class="item-card ${verifiedClass}${batchMode ? " batch-selectable" : ""}${batchSel ? " selected" : ""}${subscribed ? " card-subscribed" : ""}${badge && badge.expired ? " card-expired" : ""}" style="${catColorStyle}" data-id="${escAttr(item.id)}" data-key="${escAttr(groupKey)}" data-category="${escAttr(item.category)}" data-source="${escAttr(item.source || "")}" data-session-id="${escAttr(item.session_id || "")}" data-msgtime="${item.msg_time || (item.created_at ? Math.floor(new Date(item.created_at).getTime() / 1000) : "")}" data-msgid="${escAttr(item.source_msg_id || "")}">
+    <div tabindex="-1" class="item-card ${verifiedClass}${batchMode ? " batch-selectable" : ""}${batchSel ? " selected" : ""}${subscribed ? " card-subscribed" : ""}${badge && badge.expired ? " card-expired" : ""}" style="${catColorStyle}" data-id="${escAttr(item.id)}" data-key="${escAttr(groupKey)}" data-category="${escAttr(item.category)}" data-source="${escAttr(item.source || "")}" data-session-id="${escAttr(item.session_id || "")}" data-msgtime="${escAttr(item.msg_time || (item.created_at ? Math.floor(new Date(item.created_at).getTime() / 1000) : ""))}" data-msgid="${escAttr(item.source_msg_id || "")}">
       <div class="card-header">
         ${batchMode ? `<label class="batch-check"><input type="checkbox" aria-label="选择：${escAttr((item.title || "").slice(0, 30))}" ${batchSel ? "checked" : ""}></label>` : ""}
         <span class="card-category" data-cat="${escAttr(item.category)}">${esc(item.category)}</span>
@@ -3471,7 +3478,7 @@ function renderSessions(sessions) {
     ...sessions.map(s => {
       const kindTag = s.is_official ? '公' : (s.is_group ? '群' : '私');
       return `
-      <label class="session-row" data-is-group="${s.is_group ? "1" : "0"}" data-is-official="${s.is_official ? "1" : "0"}" data-source="${escAttr(s.source)}" data-last-active="${s.last_active || ""}">
+      <label class="session-row" data-is-group="${s.is_group ? "1" : "0"}" data-is-official="${s.is_official ? "1" : "0"}" data-source="${escAttr(s.source)}" data-last-active="${escAttr(s.last_active || "")}">
         <input type="checkbox" data-source="${escAttr(s.source)}" data-session-id="${escAttr(s.session_id)}" ${s.enabled ? "checked" : ""}>
         <span class="session-name">${esc(s.name)}</span>
         <span class="text-muted" style="font-size:11px">${esc(kindTag)} · ${esc(s.source)} · ${esc(s.session_id.substring(0, 15))}...</span>
@@ -3807,7 +3814,7 @@ function renderCategoryToggles() {
       <label class="cat-toggle-label">
         <input type="checkbox" data-cat-id="${c.key}" ${c.enabled ? "checked" : ""}>
         <span class="cat-name">${esc(c.name)}${isNew ? ' <em class="cat-new-tag">新增</em>' : ""}</span>
-        <span class="text-muted" style="font-size:11px">(${c.item_count})</span>
+        <span class="text-muted" style="font-size:11px">(${escAttr(c.item_count)})</span>
       </label>
       <button class="cat-edit">编辑</button>
       <button class="cat-del">删除</button>`;
@@ -4064,8 +4071,10 @@ async function runSettingsOps(ops) {
 // ── Settings ──
 // 类别启用/停用已由后端持久化（categories.enabled），localStorage 只存刷新间隔
 function loadSettings() {
-  // 存值可能是任意 JSON（含 null/数组/标量），故 || {} 兜住非对象后再取字段
-  const saved = lsGetJson("briefdesk-settings", {}) || {};
+  // 存值可能是任意 JSON（含 null/数组/标量），故 || {} 兜住非对象后再取字段；
+  // 键名统一为点分风格（复核 P3），旧连字符键一次性搬迁
+  const saved = (lsGetJson("briefdesk.settings", null)
+    ?? lsGetJson("briefdesk-settings", {})) || {};
   refreshIntervalSec = Math.max(30, parseInt(saved.refreshInterval, 10) || 300);
   $refreshInterval.value = refreshIntervalSec;
   notifyMode = lsGet("briefdesk.notifyMode", "off");
@@ -4080,7 +4089,7 @@ function loadSettings() {
 function saveSettings() {
   refreshIntervalSec = Math.max(30, parseInt($refreshInterval.value) || 300);
   $refreshInterval.value = refreshIntervalSec;
-  lsSetJson("briefdesk-settings", { refreshInterval: refreshIntervalSec });
+  lsSetJson("briefdesk.settings", { refreshInterval: refreshIntervalSec });
 }
 
 // ── 启动配置（.env 暂存）──
@@ -4776,7 +4785,9 @@ function highlight(str) {
 }
 
 function esc(str) {
-  if (!str) return "";
+  // 仅 null/undefined 归空（0 等 falsy 值原样转义为 "0"）：数字字段（计数、
+  // 时间戳）也走统一转义口径（复核 P3），esc(0)==="" 的旧守卫会把 0 计数吞掉
+  if (str == null) return "";
   const div = document.createElement("div");
   div.textContent = str;
   return div.innerHTML;
