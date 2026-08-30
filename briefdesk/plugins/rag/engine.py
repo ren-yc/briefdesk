@@ -115,8 +115,6 @@ class RagEngine:
         # 生产用核心连接单例；测试注入内存库工厂（签名兼容 get_db/get_embed_db）
         self._db_factory = db_factory or (lambda: get_db())
         self._embed_factory = embed_factory or (lambda: get_embed_db())
-        # before_run 预嵌入暂存：(source, msg_id) → 向量；run 消费后清空
-        self._pending: dict[tuple[str, str], list[float]] = {}
         # FTS 可用性惰性探测结果（None=未探测；False=纯向量模式）
         self._fts_enabled: bool | None = None
         self._schema_ready = False
@@ -140,7 +138,6 @@ class RagEngine:
         self.on_backfill_kick: Callable[[], None] | None = None
 
     async def teardown(self) -> None:
-        self._pending.clear()
         self._vec_entries.clear()
         self._vec_count_seen = 0
         self._vec_watermark = ""
@@ -208,9 +205,12 @@ class RagEngine:
         return True
 
     async def before_run(self, batch: BatchContext) -> None:
-        """锁外预嵌入：只允许在这里发生网络调用。"""
+        """锁外预嵌入：只允许在这里发生网络调用。
 
-        self._pending.clear()
+        向量写入 batch.preembeddings（批上下文级，每批新建天然隔离）——
+        引擎级共享字典会在并发批次（实时批 flush 与回填同时跑）下互相
+        clear 丢向量（复核 P1-5）。
+        """
         candidates = [m for m in batch.messages if _indexable(m.content)]
         if not candidates:
             return
@@ -227,7 +227,7 @@ class RagEngine:
             )
             return
         for msg, vec in zip(candidates, vectors):
-            self._pending[(msg.source, msg.msg_id)] = vec
+            batch.preembeddings[(msg.source, msg.msg_id)] = vec
         self._kicked_since_embed_ok = False  # 嵌入恢复，允许后续再次降级自愈
 
     async def run(self, batch: BatchContext) -> None:
@@ -256,7 +256,7 @@ class RagEngine:
                 item_id=item_map.get((msg.source, msg.msg_id), ""),
             )
             rows.append(row)
-            vec = self._pending.pop((row.source, row.msg_id), None)
+            vec = batch.preembeddings.pop((row.source, row.msg_id), None)
             if vec is not None:
                 emb_items.append((row.source, row.msg_id))
                 emb_vecs.append(vec)
@@ -272,8 +272,8 @@ class RagEngine:
         ):
             self._kicked_since_embed_ok = True
             logger.warning("rag: 实时批次缺向量，已触发补齐回填")
-        # 未被消费的 pending（如整批被作用域过滤）直接丢弃，避免跨批串味
-        self._pending.clear()
+        # 未被消费的 preembeddings（如整批被作用域过滤）随批上下文丢弃，
+        # 不存在跨批串味：BatchContext 每批新建
 
     # ------------------------------------------------------------ 历史回填 --
 

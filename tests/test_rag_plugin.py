@@ -101,13 +101,13 @@ class RagSetupTest(unittest.IsolatedAsyncioTestCase):
         plugin = RagPlugin()
         await plugin.setup(ctx)
         engine = plugin._engine
-        engine._pending[("weflow-legacy", "m1")] = [0.1]
+        engine._vec_count_seen = 5
         try:
             self.assertIsNotNone(get_engine())
         finally:
             await plugin.teardown()
         self.assertIsNone(get_engine())
-        self.assertEqual(engine._pending, {})  # teardown 链式清理引擎状态
+        self.assertEqual(engine._vec_count_seen, 0)  # teardown 链式清理引擎状态
 
     async def test_hooks_noop_without_engine(self):
         plugin = RagPlugin()
@@ -441,7 +441,7 @@ class RagIndexTest(_MemoryEngineBase):
         finally:
             await cursor.close()
         self.assertEqual(row["c"], 2)
-        self.assertEqual(self.engine._pending, {})  # 消费即清
+        self.assertFalse(batch.preembeddings)  # 本批向量全部被消费
 
     async def test_embed_failure_still_indexes_content_and_kicks_once(self):
         kicks: list[int] = []
