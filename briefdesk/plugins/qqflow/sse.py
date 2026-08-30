@@ -121,6 +121,10 @@ class QqFlowSseClient(DrainableListenerMixin, RealtimeListener[QqFlowClient]):
                 await self._listen()
             except asyncio.CancelledError:
                 break
+            except Exception:
+                # 畸形事件/上游契约漂移（如 data 帧为非对象 JSON）不得终结监听
+                # 任务：带栈记 ERROR 后走既有退避重连，实时通道保持自愈能力
+                logger.exception("SSE 监听循环异常，退避后重连")
 
             if not self._running:
                 break

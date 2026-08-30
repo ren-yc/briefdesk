@@ -101,7 +101,12 @@ class _QqFlowClient:
         return [{"username": "g1", "displayName": "项目群", "type": 2}]
 
     async def fetch_messages(
-        self, talker: str, start: int | None = None, limit: int = 500, offset: int = 0
+        self,
+        talker: str,
+        start: int | None = None,
+        limit: int = 500,
+        offset: int = 0,
+        not_found_ok: bool = False,
     ) -> dict:
         self.calls.append((start, offset))
         page = self._messages[offset : offset + limit]
@@ -317,7 +322,12 @@ class _QqScriptedClient:
         return [{"username": "g1", "displayName": "项目群", "type": 2}]
 
     async def fetch_messages(
-        self, talker: str, start: int | None = None, limit: int = 500, offset: int = 0
+        self,
+        talker: str,
+        start: int | None = None,
+        limit: int = 500,
+        offset: int = 0,
+        not_found_ok: bool = False,
     ) -> dict:
         self.calls.append((start, offset))
         idx = len(self.calls) - 1
@@ -645,3 +655,36 @@ class QqFlowNotReadyFailureTest(unittest.IsolatedAsyncioTestCase):
         client = _QqFlowClient([_qqflow_msg(1, now - 10)])
         result = await qq_poll(client, _enabled("qqflow", "g1"), _no_processed)
         self.assertEqual(result.failed_sessions, set())
+
+
+class SessionFailureIsolationTest(unittest.IsolatedAsyncioTestCase):
+    """【复核 P2-5】单会话拉取失败不再中止整轮：记入 failed_sessions 与
+    session_errors，其余会话照常处理（此前整轮 raise 会让一个持续失败的
+    坏会话饿死同源所有会话——已收集消息作废、全部水位不推进）。"""
+
+    async def test_session_failure_does_not_abort_round(self):
+        now = int(time.time())
+
+        class _PartialFailClient(_WeFlowLegacyClient):
+            async def fetch_messages(
+                self, talker, start_ts, limit=500, offset=0, media=False
+            ):
+                if talker == "g2":
+                    raise RuntimeError("上游对该会话稳定 5xx")
+                return await super().fetch_messages(
+                    talker, start_ts, limit, offset, media
+                )
+
+        client = _PartialFailClient([_weflow_msg("m1", now - 10)])
+        window = now - 3600
+        result = await we_poll(
+            client,
+            _enabled("weflow-legacy", "g1", "g2"),
+            _no_processed,
+            window_start_by_session={"g1": window, "g2": window},
+        )
+        self.assertEqual(
+            [m.msg_id for m in result.messages], ["m1"], "坏会话不得拖垮好会话"
+        )
+        self.assertEqual(result.failed_sessions, {"g2"})
+        self.assertIn("g2", result.session_errors)

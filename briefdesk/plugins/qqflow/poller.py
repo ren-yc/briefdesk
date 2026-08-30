@@ -187,6 +187,9 @@ async def poll(
                     start=start_param,
                     limit=_PAGE_LIMIT,
                     offset=offset,
+                    # 脏会话（被删除/重建）404 → 空信封，对齐 weflow 的
+                    # brandsessionholder 等系统会话容错，避免反复整轮失败
+                    not_found_ok=True,
                 )
                 msgs = resp.get("messages", [])
                 session_raw += len(msgs)
@@ -287,9 +290,13 @@ async def poll(
             logger.info("%sqqflow-server 索引期 503，跳过", log_prefix)
             continue
         except Exception as e:
-            # 同 weflow：失败只由 run_poll_cycle 记一条带栈 ERROR，会话标签
-            # 走异常链（顺带进 status.lastError），原因文本保留在末尾。
-            raise RuntimeError(f"会话「{label}」拉取失败: {e}") from e
+            # 单会话失败不中止整轮（同 weflow，503 分支同构）：记入
+            # failed_sessions 与 session_errors，其余会话照常处理；此处自带
+            # 栈记录，整轮兜底 ERROR 出口不再由本路径触发。
+            result.failed_sessions.add(session_id)
+            result.session_errors[label] = str(e)
+            logger.exception("会话「%s」拉取失败，本轮跳过", label)
+            continue
 
     summary = (
         f"poll 完成: {len(result.messages)} 条新消息 "

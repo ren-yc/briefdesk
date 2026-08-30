@@ -43,9 +43,11 @@ _QQ_RICH_XML_RE = re.compile(r'm_fileName\s*=\s*"[^"]+"\s+m_resid\s*=\s*"[^"]+"'
 def is_self_message(msg: QqFlowMessage, self_uid: str) -> bool:
     """判定消息是否本账号自己发送（IGNORE_SELF 识别谓词）。
 
-    主判据为发送者 UID 等于自身账号 UID（QQ NT UID 约定：u_<QQ号>）；
-    isSend 来自上游 40013 列（部分 QQ 版本缺列或值非 1/2 时恒 0），
-    作为方向信息的优先兜底。self_uid 为空 → 仅按 isSend 兜底（不误杀）。
+    isSend 由 qqflow-server 从原始 40013 方向列归一化为 {0,1}：1/2（均为
+    本人发送，2 为多端同步变体）→ 1，3=系统与未知值 → 0（见上游
+    direction_to_is_send，"never claim self on unverified semantics"），
+    作为快速路径优先判定。senderUsername == self_uid 是 isSend=0 时的
+    兜底（部分 QQ 版本缺 40013 列则 isSend 恒 0）；self_uid 为空时不误杀。
     """
     if bool(msg.get("isSend")):
         return True

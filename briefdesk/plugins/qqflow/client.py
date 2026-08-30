@@ -15,7 +15,7 @@ import json
 import logging
 import time as time_module
 from collections.abc import AsyncIterator
-from typing import Any, Literal, TypedDict
+from typing import Any, Literal, TypedDict, cast
 
 import httpx
 
@@ -86,7 +86,7 @@ class QqFlowMessage(TypedDict):
     serverId: str  # seq 字符串（与 rowid 无关，不使用）
     localType: int  # 0文本 / 1其他 / 3图片 / 4语音 / 5视频 / 6撤回 / 7系统
     createTime: int  # 秒级 Unix
-    isSend: int  # 方向（上游 40013 列）：1=本人发送；QQ 版本缺列或值非 1/2 时恒 0
+    isSend: int  # 方向（上游 40013 列经 direction_to_is_send 归一化，恒 {0,1}）：1=本人发送（原始 1/2 均映射为 1），0=他人/系统/未知
     senderUsername: str  # 发送者 UID（稳定去重键）
     senderName: str  # 上游已解析的发送者显示名：本会话群名片(40090) > 备注
     # (20009) > 最新消息昵称(40093) > 档案昵称(20002) > UID。与 SSE sourceName
@@ -453,6 +453,7 @@ class QqFlowClient(SourceClient):
         start: int | None = None,
         limit: int = 500,
         offset: int = 0,
+        not_found_ok: bool = False,
     ) -> QqFlowMessagesResponse:
         """获取指定会话的历史消息（按时间倒序，返回完整信封）。
 
@@ -461,6 +462,9 @@ class QqFlowClient(SourceClient):
             start: 起始时间（秒级 Unix 时间戳，含该时间），None 为不限
             limit: 单页条数（服务端上限 10000）
             offset: 分页偏移
+            not_found_ok: 会话不存在（404，如已被删除/重建的脏会话）时
+                返回空信封而非抛错；轮询路径应传 True（对齐 weflow
+                brandsessionholder 等系统会话的容错）
 
         Returns:
             QqFlowMessagesResponse: 含 messages 与 hasMore，翻页由调用方驱动
@@ -468,10 +472,18 @@ class QqFlowClient(SourceClient):
         params: dict[str, Any] = {"talker": talker, "limit": limit, "offset": offset}
         if start is not None:
             params["start"] = start
-        data: QqFlowMessagesResponse = await self._get(
-            "/api/v1/messages", params=params
+        data = await self._get(
+            "/api/v1/messages", params=params, not_found_ok=not_found_ok
         )
-        return data
+        if data is None:
+            return {
+                "success": True,
+                "talker": talker,
+                "count": 0,
+                "hasMore": False,
+                "messages": [],
+            }
+        return cast(QqFlowMessagesResponse, data)
 
     async def lookup_message(
         self, talker: str, local_id: str, ts: int

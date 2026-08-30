@@ -513,13 +513,16 @@ class WeFlowLegacyClient(SourceClient):
             retry_on_empty: 空结果是否 500ms 后重试一次（回查链路应传 False；
                 轮询首页保留默认 True 以维持既有「刚入库查不到」竞态兜底）
         """
-        qs = f"talker={talker}&limit={limit}&offset={offset}"
+        params: dict[str, Any] = {"talker": talker, "limit": limit, "offset": offset}
         if start_ts is not None:
-            qs += f"&start={start_ts}"
+            params["start"] = start_ts
         if media:
-            qs += "&media=1&image=1"
+            params["media"] = 1
+            params["image"] = 1
         data: WeFlowLegacyMessagesResponse = await self._get(
-            f"/api/v1/messages?{qs}", retry_on_empty=retry_on_empty
+            "/api/v1/messages",
+            params=params,  # httpx 编码：talker 含 &/%/非 ASCII 时手拼查询串会被截断污染
+            retry_on_empty=retry_on_empty,
         )
         return data
 

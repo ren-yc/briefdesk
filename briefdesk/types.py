@@ -99,6 +99,9 @@ class PollResult:
     # 本轮【未成功拉取】的 session_id 集合（源侧瞬态错误静默跳过，如 qqflow
     # 索引期 503）。poll_cycle 对这些会话跳过水位推进：它们的消息未落
     # raw_messages，钉窗机制看不到，若照常推进水位会造成窗口内消息永久漏拉。
+    # 单会话拉取失败（非 503）同样走此集合 + session_errors 记原因，不再整轮
+    # 上抛——否则一个持续失败的坏会话会饿死同源其它会话。
+    session_errors: dict[str, str] = field(default_factory=dict)
 
 
 # ── 管道跨插件契约（由各阶段插件实现/消费，定义在核心）──
@@ -250,3 +253,7 @@ class BatchContext:
     merged: int = 0  # 合并次数（merge 阶段累加）
     dedup_checks: list[DedupCheck] = field(default_factory=list)
     merge_checks: list[MergeCheck] = field(default_factory=list)
+    preembeddings: dict[tuple[str, str], list[float]] = field(default_factory=dict)
+    # 锁外阶段（before_run）写入的本批预嵌入向量，存储相按 (source, msg_id)
+    # 消费。挂批上下文而非引擎实例：BatchContext 每批新建、天然隔离——
+    # rag 曾用引擎级共享字典，实时批与回填并发时互相 clear 丢向量（复核 P1-5）

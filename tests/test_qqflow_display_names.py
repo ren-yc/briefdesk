@@ -379,7 +379,9 @@ class PollerDisplayNameTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(result.messages), 1)
         self.assertEqual(client.group_members_calls, [])
 
-    async def test_messages_failure_aborts_poll(self):
+    async def test_messages_failure_isolated_to_session(self):
+        """【复核 P2-5】单会话拉取失败不再中止整轮：该会话记入
+        failed_sessions/session_errors（消息不入库），不再整轮 raise。"""
         client = _FailingMessagesClient(
             contacts={},
             sessions=[{"username": "10001", "displayName": "项目群", "type": 2}],
@@ -389,8 +391,10 @@ class PollerDisplayNameTest(unittest.IsolatedAsyncioTestCase):
         async def no_processed(ids):
             return set()
 
-        with self.assertRaisesRegex(RuntimeError, "messages down"):
-            await poll(client, self._enabled(), no_processed)
+        result = await poll(client, self._enabled(), no_processed)
+        self.assertEqual(result.messages, [])
+        self.assertEqual(result.failed_sessions, {"10001"})
+        self.assertIn("messages down", result.session_errors["项目群"])
 
     async def test_messages_503_skips_session(self):
         client = _NotReadyMessagesClient(

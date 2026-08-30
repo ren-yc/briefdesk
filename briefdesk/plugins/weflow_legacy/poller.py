@@ -345,9 +345,13 @@ async def poll(
             total_self += session_self
 
         except Exception as e:
-            # 同 weflow：失败只由 run_poll_cycle 记一条带栈 ERROR，会话标签
-            # 走异常链（顺带进 status.lastError），原因文本保留在末尾。
-            raise RuntimeError(f"会话「{label}」拉取失败: {e}") from e
+            # 单会话失败不中止整轮（同 weflow）：记入 failed_sessions 与
+            # session_errors，其余会话照常处理；此处自带栈记录，整轮兜底
+            # ERROR 出口不再由本路径触发。
+            result.failed_sessions.add(session_id)
+            result.session_errors[label] = str(e)
+            logger.exception("会话「%s」拉取失败，本轮跳过", label)
+            continue
 
     if config.ignore_self and total_raw and not saw_is_send_field:
         logger.warning(

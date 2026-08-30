@@ -109,6 +109,17 @@ async def run_poll_cycle(source: SourceRuntime) -> None:
                     source.name,
                     len(enabled),
                 )
+        if result.session_errors:
+            # 会话级失败已隔离（不再整轮 raise）：UI 侧保留可见性——详细
+            # 原因带栈记录在 poller 日志，lastError 仍专属整轮失败
+            set_status(
+                {
+                    "lastWarning": (
+                        f"{len(result.session_errors)} 个会话本轮拉取失败"
+                        "（水位未推进，下轮自动重试）"
+                    )
+                }
+            )
         logger.info(
             "[%s] 轮询周期完成: %d 新消息, %d 会话, %d 联系人 (%s)",
             source.name,

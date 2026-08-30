@@ -339,12 +339,16 @@ async def poll(
             logger.info("%sweflow-server 未就绪 503，跳过", log_prefix)
             continue
         except Exception as e:
-            # 不在此处打日志：唯一出口 run_poll_cycle 会以 logger.exception
-            # 记一条带栈的 ERROR，这里再打就是同一次失败的第二条 ERROR。
-            # 会话标签改由异常链承载——它同时进入日志和 status.lastError，
-            # 比只存在于日志里的 log_prefix 更有用；原因文本保留在末尾，
-            # 供上层与测试按上游报错定位。
-            raise RuntimeError(f"会话「{label}」拉取失败: {e}") from e
+            # 单会话失败不中止整轮：此前整轮 raise 会把已收集的其它会话消息
+            # 一并作废、全部水位不推进——一个持续失败的坏会话即饿死同源所有
+            # 会话（可用性归零）。记入 failed_sessions（该会话水位不推进：
+            # 消息未落 raw，钉窗机制看不到，防永久漏拉）与 session_errors
+            # （应用层汇总进 lastWarning），其余会话照常处理。此处自带栈
+            # 记录：整轮兜底 ERROR 出口不再由本路径触发。
+            result.failed_sessions.add(session_id)
+            result.session_errors[label] = str(e)
+            logger.exception("会话「%s」拉取失败，本轮跳过", label)
+            continue
 
     if config.ignore_self and total_raw and not saw_is_send_field:
         logger.warning(

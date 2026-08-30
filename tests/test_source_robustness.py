@@ -16,7 +16,7 @@
 import asyncio
 import os
 import unittest
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import httpx
 
@@ -25,6 +25,7 @@ from briefdesk.plugins.qqflow.client import QqFlowClient
 from briefdesk.plugins.qqflow.config import QqFlowSettings
 from briefdesk.plugins.qqflow.sse import QqFlowSseClient
 from briefdesk.plugins.weflow.config import WeFlowSettings
+from briefdesk.plugins.weflow.sse import WeFlowSseClient
 from briefdesk.plugins.weflow_legacy.client import WeFlowLegacyClient
 from briefdesk.plugins.weflow_legacy.config import WeFlowLegacySettings
 from briefdesk.plugins.weflow_legacy.sse import WeFlowLegacySseClient
@@ -343,6 +344,56 @@ class WeflowSseDedupTest(unittest.IsolatedAsyncioTestCase):
         await listener._handle_event(_wf_event(rawid="b"))
         await asyncio.sleep(0)
         self.assertEqual(len(received), 2)
+
+
+class SseConnectLoopSurvivesGenericErrorTest(unittest.IsolatedAsyncioTestCase):
+    """【复核 P1】_connect_loop 对非取消异常必须自愈：带栈记日志后退避重连。
+
+    此前只捕 CancelledError，畸形事件（如 data 帧为合法 JSON 但非对象时
+    event.get 抛 AttributeError）会穿透 _listen 终结监听任务——实时通道
+    静默死亡且永不重连。三源同构，逐一回归。
+    """
+
+    async def _assert_survives(self, listener) -> None:
+        calls = {"n": 0}
+
+        async def fake_listen():
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("模拟畸形事件引发的异常")
+            raise asyncio.CancelledError()
+
+        listener._running = True
+        listener._listen = fake_listen
+        await listener._connect_loop()
+        self.assertEqual(calls["n"], 2, "首次异常后退避重连，第二次取消才退出")
+        self.assertEqual(listener._reconnect_attempt, 1)
+
+    async def test_weflow_connect_loop_survives(self):
+        listener = WeFlowSseClient(
+            Mock(),
+            lambda batch: None,
+            settings=WeFlowSettings(sse_reconnect_initial_ms=1, sse_reconnect_max_ms=2),
+        )
+        await self._assert_survives(listener)
+
+    async def test_weflow_legacy_connect_loop_survives(self):
+        listener = WeFlowLegacySseClient(
+            Mock(),
+            lambda batch: None,
+            settings=WeFlowLegacySettings(
+                sse_reconnect_initial_ms=1, sse_reconnect_max_ms=2
+            ),
+        )
+        await self._assert_survives(listener)
+
+    async def test_qqflow_connect_loop_survives(self):
+        listener = QqFlowSseClient(
+            Mock(),
+            lambda batch: None,
+            settings=QqFlowSettings(sse_reconnect_initial_ms=1, sse_reconnect_max_ms=2),
+        )
+        await self._assert_survives(listener)
 
 
 class StopDrainsBufferTest(unittest.IsolatedAsyncioTestCase):
