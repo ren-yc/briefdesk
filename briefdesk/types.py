@@ -257,3 +257,9 @@ class BatchContext:
     # 锁外阶段（before_run）写入的本批预嵌入向量，存储相按 (source, msg_id)
     # 消费。挂批上下文而非引擎实例：BatchContext 每批新建、天然隔离——
     # rag 曾用引擎级共享字典，实时批与回填并发时互相 clear 丢向量（复核 P1-5）
+    reembed_queue: list[tuple[str, str, str, list[str] | None, str]] = field(
+        default_factory=list
+    )
+    # 阶段插件锁内登记、锁外 after_run 消化的补嵌请求
+    # (item_id, title, quote, image_urls, source)：merge 合并后存活卡文本
+    # 已变需补嵌入回归余弦候选（复核 P2-20）；挂批上下文与 preembeddings 同理

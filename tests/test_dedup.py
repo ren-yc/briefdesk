@@ -217,6 +217,12 @@ class EmbeddingTextTest(unittest.TestCase):
     def test_format(self):
         self.assertEqual(_embedding_text("标题", "内容"), "标题 内容")
 
+    def test_truncates_long_input(self):
+        """【复核 P2-17】超长输入截断至 2000 字符：防单条毒丸文本让嵌入
+        通道整体降级且每次重启确定性复现。"""
+        text = _embedding_text("标题", "x" * 5000)
+        self.assertEqual(len(text), 2000)
+
 
 class CheckDedupShortCircuitTest(unittest.IsolatedAsyncioTestCase):
     """check_dedup 短路回归：同文本短路与原文哈希精确短路。

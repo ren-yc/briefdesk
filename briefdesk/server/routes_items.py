@@ -34,6 +34,7 @@ from briefdesk.db import (
     get_disabled_category_names,
     get_enabled_category_colors,
     get_ignored_count,
+    get_item_texts_by_ids,
     get_items_by_subject,
     get_items_page,
     get_memo_count,
@@ -49,6 +50,7 @@ from briefdesk.db import (
 from briefdesk.events import EVENT_ITEMS_DELETED, event_bus
 from briefdesk.realtime import get_shutdown_event, subscribe, unsubscribe
 from briefdesk.server.app import app
+from briefdesk.stages import get_context as _stage_context
 from briefdesk.status import get_listener, get_status_info
 from briefdesk.sync import trigger_sync
 from briefdesk.types import ContextMsg
@@ -401,6 +403,28 @@ async def api_items_batch(body: dict):
                 # 缓存，否则被忽略卡继续参与判重、相似新消息不再显示
                 # （直到重启重预热），与 delete 的清缓存语义对齐
                 await event_bus.publish(EVENT_ITEMS_DELETED, ids)
+            elif action == "unverify":
+                # 恢复的卡片回归 is_verified >= 0 判重口径：回加去重内存
+                # 缓存，否则相似新消息不再与它判重、重复卡片持续到重启
+                # （复核 P2-18；不带向量，与 merge 登记口径一致，重启补齐）
+                svc_ctx = _stage_context()
+                if svc_ctx is not None and svc_ctx.dedup is not None:
+                    for row in await get_item_texts_by_ids(ids):
+                        try:
+                            imgs = (
+                                json.loads(row["image_urls"])
+                                if row["image_urls"]
+                                else None
+                            )
+                        except json.JSONDecodeError:
+                            imgs = None
+                        svc_ctx.dedup.add_to_cache(
+                            row["id"],
+                            row["title"],
+                            image_urls=imgs,
+                            source=row["source"] or "",
+                            source_quote=row["source_quote"] or "",
+                        )
     return {"success": True, "affected": affected}
 
 

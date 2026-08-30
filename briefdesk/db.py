@@ -2113,6 +2113,29 @@ async def get_all_item_texts() -> list[ItemText]:
     return [cast(ItemText, dict(row)) for row in rows]
 
 
+async def get_item_texts_by_ids(item_ids: list[str]) -> list[ItemText]:
+    """按 id 取卡片文本（形状同 get_all_item_texts），供 unverify 后回加
+    去重缓存（复核 P2-18）。IN 列表按 900 分块防 SQLite 变量上限。"""
+    if not item_ids:
+        return []
+    db = await get_db()
+    out: list[ItemText] = []
+    for i in range(0, len(item_ids), 900):
+        chunk = item_ids[i : i + 900]
+        placeholders = ",".join("?" * len(chunk))
+        rows = await _fetchall(
+            db,
+            "SELECT id, source, title, "
+            "COALESCE(content_hash, '') as content_hash, "
+            "COALESCE(image_urls, '') as image_urls, "
+            "COALESCE(source_quote, '') as source_quote "
+            f"FROM items WHERE id IN ({placeholders})",
+            tuple(chunk),
+        )
+        out.extend(cast(ItemText, dict(row)) for row in rows)
+    return out
+
+
 async def load_embeddings(model: str) -> dict[str, list[float]]:
     """读取指定模型的全部已存向量，返回 {item_id: embedding}。
 

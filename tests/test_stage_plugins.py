@@ -358,3 +358,45 @@ class PluginDisabledNoTeardownTest(unittest.IsolatedAsyncioTestCase):
         await manager.setup_all(ctx)
         self.assertEqual(calls, ["setup"])  # 无 teardown 回收
         self.assertEqual(manager.records()["p"].status, "disabled")
+
+
+class MergeAfterRunReembedTest(unittest.IsolatedAsyncioTestCase):
+    """【复核 P2-20】merge after_run 对存活卡补嵌并带向量重新登记。
+
+    合并改写文本后 DB 侧向量已删，run 的 add_to_cache 不带向量——长驻
+    进程中存活卡就此退出余弦候选集直到重启；after_run 在锁外补嵌修复。
+    """
+
+    async def test_after_run_reembeds_and_reregisters_with_vector(self):
+        from types import SimpleNamespace
+
+        from briefdesk.plugins.dedup.engine import DedupEngine
+        from briefdesk.plugins.merge.plugin import MergePlugin
+        from briefdesk.types import BatchContext
+
+        engine = DedupEngine()
+        engine._embed_cache_ok = True  # 预热已完成态：补嵌向量可登记并落库
+        engine.add_to_cache("i1", "旧标题", source="weflow-legacy", source_quote="旧文")
+        batch = BatchContext(messages=[], client=Mock())
+        batch.reembed_queue.append(
+            ("i1", "合并后标题", "合并后原文", None, "weflow-legacy")
+        )
+        vec = [0.1, 0.2, 0.3]
+        with patch(
+            "briefdesk.ai_ports.embed_texts", AsyncMock(return_value=[vec])
+        ):
+            await MergePlugin().after_run(batch, SimpleNamespace(dedup=engine))
+        self.assertEqual(engine._cache[0].title, "合并后标题")
+        self.assertEqual(engine._cache[0].source_quote, "合并后原文")
+        self.assertEqual(engine._cache[0].embedding, vec)
+
+    async def test_after_run_noop_without_queue_or_service(self):
+        from types import SimpleNamespace
+
+        from briefdesk.plugins.merge.plugin import MergePlugin
+        from briefdesk.types import BatchContext
+
+        batch = BatchContext(messages=[], client=Mock())
+        # 无队列 / 无 dedup 服务（插件禁用）均静默跳过
+        await MergePlugin().after_run(batch, SimpleNamespace(dedup=None))
+        await MergePlugin().after_run(batch, SimpleNamespace(dedup=None))

@@ -260,6 +260,12 @@ class MergePlugin(StagePlugin):
                         source=survive["source"],
                         source_quote=merged_quote,
                     )
+                    # 补嵌请求锁内登记、after_run 锁外消化（复核 P2-20）：
+                    # 合并后文本未嵌入，存活卡否则退出余弦候选直到重启
+                    batch.reembed_queue.append(
+                        (survive["id"], merged_title, merged_quote,
+                         merged_imgs, survive["source"])
+                    )
                 logger.info(
                     '会话合并: "%s" ← 吸收 "%s" (%s)',
                     merged_title,
@@ -269,6 +275,49 @@ class MergePlugin(StagePlugin):
                 merged += 1
                 break  # 每张新卡最多并入一张头卡
         batch.merged = merged
+
+    async def after_run(self, batch: BatchContext, ctx: PluginContext) -> None:
+        """锁外：对合并后的存活卡补嵌入（网络调用不得在存储锁内）。
+
+        run 的 add_to_cache 未带向量（合并后文本尚未嵌入）；此处补嵌后带
+        向量重新登记，存活卡立即回归余弦候选集，不必等重启重预热（复核
+        P2-20）。嵌入失败静默——不劣于旧行为（重启后由缓存加载补齐）。
+        add_to_cache 幂等更新为全字段覆盖，须带上 run 时登记的完整参数，
+        否则图片短路/来源字段会被默认值清空。
+        """
+        if not batch.reembed_queue or ctx.dedup is None:
+            return
+        from briefdesk.ai_ports import embed_texts  # 延迟：依赖 ai_provider 插件
+        from briefdesk.plugins.dedup.engine import _embedding_text
+
+        try:
+            vectors = await embed_texts(
+                [
+                    _embedding_text(title, quote)
+                    for _item_id, title, quote, _imgs, _src in batch.reembed_queue
+                ]
+            )
+        except Exception:
+            logger.debug("merge: 存活卡补嵌失败，重启后由缓存加载补齐", exc_info=True)
+            return
+        if len(vectors) != len(batch.reembed_queue):
+            logger.warning(
+                "merge: 补嵌返回数不符（%d/%d），跳过本轮补嵌",
+                len(vectors),
+                len(batch.reembed_queue),
+            )
+            return
+        for (item_id, title, quote, images, source), vec in zip(
+            batch.reembed_queue, vectors
+        ):
+            ctx.dedup.add_to_cache(
+                item_id,
+                title,
+                embedding=vec,
+                image_urls=images,
+                source=source,
+                source_quote=quote,
+            )
 
 
 plugin = MergePlugin()

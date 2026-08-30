@@ -36,6 +36,7 @@ from briefdesk.db import (
     get_db,
     get_due_reminders,
     get_group_count,
+    get_item_texts_by_ids,
     get_items,
     get_items_by_subject,
     get_items_page,
@@ -976,6 +977,39 @@ class UpsertSessionTest(unittest.IsolatedAsyncioTestCase):
         await asyncio.gather(run(), run(), run())
         rows = await self._all()
         self.assertEqual(len(rows), 1)
+
+
+class GetItemTextsByIdsTest(unittest.IsolatedAsyncioTestCase):
+    """【复核 P2-18】按 id 取卡片文本（unverify 回加去重缓存的数据源）。"""
+
+    async def asyncSetUp(self):
+        self.db = await aiosqlite.connect(":memory:")
+        self.db.row_factory = aiosqlite.Row
+        await init_schema(self.db)
+        for i, title in (("i1", "标题一"), ("i2", "标题二")):
+            await self.db.execute(
+                "INSERT INTO items (id, category, title, source_quote, source_group, "
+                "source, source_msg_id, msg_time, is_verified, created_at) "
+                "VALUES (?, '活动通知', ?, '引文', '项目群', 'weflow-legacy', ?, 100, 0, "
+                "'2026-01-01T00:00:00+00:00')",
+                (i, title, i),
+            )
+        await self.db.commit()
+
+    async def asyncTearDown(self):
+        await self.db.close()
+
+    async def test_returns_rows_in_shape_of_warmup(self):
+        with patch("briefdesk.db.get_db", new=AsyncMock(return_value=self.db)):
+            rows = await get_item_texts_by_ids(["i1", "missing"])
+        self.assertEqual([r["id"] for r in rows], ["i1"], "缺失 id 静默跳过")
+        self.assertEqual(rows[0]["title"], "标题一")
+        self.assertEqual(rows[0]["source"], "weflow-legacy")
+        self.assertEqual(rows[0]["source_quote"], "引文")
+
+    async def test_empty_input_is_noop(self):
+        with patch("briefdesk.db.get_db", new=AsyncMock(return_value=self.db)):
+            self.assertEqual(await get_item_texts_by_ids([]), [])
 
 
 class SessionWatermarkTest(unittest.IsolatedAsyncioTestCase):
