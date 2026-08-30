@@ -46,7 +46,7 @@ let stream = null;
 let streamReconnectTimer = null;
 let sseBackoffMs = 2000;        // 重连退避：2s 指数增长至 30s，连接成功即复位
 let streamRefreshDebounceTimer = null;
-// 列表显示模式：merged=同主体折叠 / group=按来源群聊折叠 / flat=平铺。
+// 列表显示模式（按钮文案：按主体/按群聊/逐条）：merged=同主体折叠 / group=按来源群聊折叠 / flat=逐条平铺。
 // 旧两态键 briefdesk.collapseGroups（collapsed/expanded）迁移读取后不再写入；
 // 不删除旧键，回滚旧版本时仍能读到上次的折叠偏好
 const legacyCollapseGroups = lsGet("briefdesk.collapseGroups");
@@ -56,7 +56,7 @@ if (listMode !== "merged" && listMode !== "group" && listMode !== "flat") {
 }
 let lastVisibleItems = []; // 最近一次渲染的可见卡（显示模式切换时重渲染）
 let viewSourceItems = [];   // 当前查询已加载的全部卡片（分页追加/模式切换的渲染基准）
-let groupMap = new Map(); // 合并模式=subject\x01category、按群模式=群名 → members（当前响应，浮层/批量/组高亮数据源）
+let groupMap = new Map(); // 按主体模式=subject\x01category、按群模式=群名 → members（当前响应，浮层/批量/组高亮数据源）
 let animateOnNextRender = false; // 折叠/展开切换后列表错落浮现（非切换刷新不做动画）
 
 // ── 增量渲染与交互状态 ──
@@ -760,7 +760,7 @@ function bindItemActionEvents() {
   // Item actions delegation
   $itemsContainer.addEventListener("click", (e) => {
     // 批量模式：折叠组 = 整组选择单元（点组头或代表卡任意位置切换整组）；
-    // 平铺/单卡 = 单卡选择；勾选框自身走 change 事件
+    // 逐条/单卡 = 单卡选择；勾选框自身走 change 事件
     if (batchMode) {
       const coll = e.target.closest(".group-collapsed");
       if (coll && coll.dataset.key) {
@@ -788,7 +788,7 @@ function bindItemActionEvents() {
       return;
     }
 
-    // 主体名 → 打开主体时间线（折叠/平铺组头与单卡主体链接）
+    // 主体名 → 打开主体时间线（折叠/逐条组头与单卡主体链接）
     const subjLink = e.target.closest(".subject-link");
     if (subjLink && subjLink.dataset.subject) {
       openSubjectTimeline(subjLink.dataset.subject);
@@ -897,7 +897,7 @@ function bindLightboxEvents() {
 }
 
 function bindCollapseToggleEvents() {
-  // Collapse toggle（合并/按群聊/平铺三态分段控制，状态存 localStorage）
+  // Collapse toggle（按主体/按群聊/逐条三态分段控制，状态存 localStorage）
   $collapseToggle.addEventListener("click", (e) => {
     const segBtn = e.target.closest(".seg-btn");
     if (!segBtn) return;
@@ -1225,7 +1225,7 @@ function bindBatchEvents() {
     if (e.target === $batchConfirmModal) closeBatchConfirm();
   });
 
-  // 批量模式：勾选框变更（折叠组 → 整组切换；平铺组头 → 整组切换；单卡 → 单卡）
+  // 批量模式：勾选框变更（折叠组 → 整组切换；逐条组头 → 整组切换；单卡 → 单卡）
   $itemsContainer.addEventListener("change", (e) => {
     if (!e.target.matches(".batch-check input")) return;
     const coll = e.target.closest(".group-collapsed");
@@ -2230,7 +2230,7 @@ function fullRenderItems(visible) {
     showEmptyState();
     groupMap.clear(); // 空视图：清陈旧分组，避免浮层打开时渲染已不属于当前视图的成员
     viewCounts.chatGroups = 0; // 按群口径同步归零，防「共 N 群」读到陈旧值
-    updateCollapseToggle(); // 空视图也要同步折叠/平铺按钮态（否则无数据时按钮点击无响应）
+    updateCollapseToggle(); // 空视图也要同步显示模式按钮态（否则无数据时按钮点击无响应）
     syncOverlayWithData();
     return [];
   }
@@ -2345,7 +2345,7 @@ function buildListHtml(visible) {
   return renderBlocksHtml(blocks);
 }
 
-// 块按时间降序排序 + 插入日期分隔条（合并/按群两种列表的共用收尾）
+// 块按时间降序排序 + 插入日期分隔条（按主体/按群两种列表的共用收尾）
 function renderBlocksHtml(blocks) {
   blocks.sort((a, b) => b.t - a.t);
   let html = "";
@@ -2729,7 +2729,7 @@ function groupVisibleItemsByChat(items) {
 }
 
 // 按群模式列表 HTML：组内 ≥2 张 → 折叠块（群组头 + 代表卡），单卡群平铺不显组头。
-// groupMap 以群名为键填充 → 浮层/批量整组选择/新卡组高亮/组头半选与合并模式共用同一数据源
+// groupMap 以群名为键填充 → 浮层/批量整组选择/新卡组高亮/组头半选与按主体模式共用同一数据源
 function buildListHtmlByChat(visible) {
   const groups = groupVisibleItemsByChat(visible);
   groupMap.clear();
@@ -5290,11 +5290,11 @@ function toggleSelect(id, card) {
   const chk = card && card.querySelector(".batch-check input");
   if (chk) chk.checked = selectedIds.has(id);
   if (card) card.classList.toggle("selected", selectedIds.has(id));
-  syncBatchGroupStates(); // 平铺模式：成员变化联动组头半选态
+  syncBatchGroupStates(); // 逐条模式：成员变化联动组头半选态
   updateBatchBar();
 }
 
-// 折叠组/平铺组头 = 组级选择单元：全选 ⇄ 全不选整组成员
+// 折叠组/逐条组头 = 组级选择单元：全选 ⇄ 全不选整组成员
 function toggleGroupSelect(key, containerEl) {
   const members = groupMap.get(key) || [];
   if (!members.length) return;
@@ -5306,7 +5306,7 @@ function toggleGroupSelect(key, containerEl) {
   updateBatchBar();
 }
 
-// 统一组态同步：折叠组整组高亮 + 勾选框全选/半选；平铺组头半选；单卡勾选
+// 统一组态同步：折叠组整组高亮 + 勾选框全选/半选；逐条组头半选；单卡勾选
 function syncBatchGroupStates() {
   if (!batchMode) return;
   $itemsContainer.querySelectorAll(".group-collapsed[data-key]").forEach(el => {

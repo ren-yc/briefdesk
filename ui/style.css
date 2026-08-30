@@ -884,7 +884,7 @@ body.modal-open { overflow: hidden; }
   padding: var(--space-1) var(--space-6); border-radius: 999px;
 }
 
-/* ── View toggle（合并/按群聊/平铺三态分段控制 + 弹性滑动胶囊）── */
+/* ── View toggle（按主体/按群聊/逐条三态分段控制 + 弹性滑动胶囊）── */
 .seg {
   position: relative;
   display: inline-flex;
@@ -921,7 +921,7 @@ body.modal-open { overflow: hidden; }
 
 /* ── Collapse group：主体面板（头 + 代表卡连成一体，类别色脊柱贯通）── */
 .group-collapsed {
-  margin-bottom: 12px; /* 与平铺卡片 12px 同节奏，折叠/平铺切换不跳动 */
+  margin-bottom: 12px; /* 与逐条卡片 12px 同节奏，折叠/逐条切换不跳动 */
   /* 连续类别色条：从头贯穿到卡底，建立"头↔正文"的归属关系 */
   border-left: 4px solid var(--cat, var(--accent));
   border-radius: var(--radius);
@@ -1455,14 +1455,14 @@ body.modal-open { overflow: hidden; }
 .group-collapsed.selected .group-head:hover {
   background: color-mix(in srgb, var(--cat, var(--accent)) 28%, var(--surface));
 }
-/* 平铺组头的组级勾选框 */
+/* 逐条组头的组级勾选框 */
 .group-header .batch-check input { width: 16px; height: 16px; }
-/* 平铺组头整组选中态：浅色底高亮，与折叠组 .group-collapsed.selected 呼应 */
+/* 逐条组头整组选中态：浅色底高亮，与折叠组 .group-collapsed.selected 呼应 */
 .group-header.selected {
   background: color-mix(in srgb, var(--cat, var(--accent)) 10%, var(--surface));
   border-radius: var(--radius-sm);
 }
-/* 批量模式下平铺组头整行可点（:has 判定勾选框存在） */
+/* 批量模式下逐条组头整行可点（:has 判定勾选框存在） */
 .group-header:has(.batch-check) { cursor: pointer; }
 .batch-bar {
   position: fixed; bottom: 18px; left: 50%; transform: translateX(-50%); z-index: var(--z-bar);
