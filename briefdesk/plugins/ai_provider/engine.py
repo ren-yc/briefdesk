@@ -27,6 +27,13 @@ _embed_client: AsyncOpenAI | None = None
 _alt_clients: dict[tuple[str, str], AsyncOpenAI] = {}
 
 
+# 上游 SDK 默认 read 超时 600s：AI 端点挂起时单请求可拖满 10 分钟，而 dedup/
+# merge 的判定请求在存储锁内执行，会冻结整条管道——显式收紧；重试次数同样
+# 显式声明（SDK 默认 2），防上游默认变化静默改变行为。
+_REQUEST_TIMEOUT = 120.0
+_REQUEST_MAX_RETRIES = 2
+
+
 def get_ai_client() -> AsyncOpenAI:
     """获取共享的 AsyncOpenAI 实例（延迟初始化）。"""
     global _client
@@ -34,6 +41,8 @@ def get_ai_client() -> AsyncOpenAI:
         _client = AsyncOpenAI(
             api_key=config.ai_api_key.get_secret_value(),
             base_url=config.ai_api_base,
+            timeout=_REQUEST_TIMEOUT,
+            max_retries=_REQUEST_MAX_RETRIES,
         )
     return _client
 
@@ -51,7 +60,12 @@ def get_alt_client(api_base: str = "", api_key: str = "") -> AsyncOpenAI:
         return get_ai_client()
     cached = _alt_clients.get((base, key))
     if cached is None:
-        cached = AsyncOpenAI(api_key=key, base_url=base)
+        cached = AsyncOpenAI(
+            api_key=key,
+            base_url=base,
+            timeout=_REQUEST_TIMEOUT,
+            max_retries=_REQUEST_MAX_RETRIES,
+        )
         _alt_clients[(base, key)] = cached
     return cached
 
@@ -88,9 +102,14 @@ async def chat(
     *,
     temperature: float = 0.3,
     max_tokens: int = 4096,
+    timeout: float | None = None,
 ) -> ChatCompletion:
-    """统一 AI 调用入口，模型名从 config.ai_model 读取。"""
+    """统一 AI 调用入口，模型名从 config.ai_model 读取。
+
+    timeout：单请求超时覆盖（秒），None 用客户端默认（_REQUEST_TIMEOUT）。
+    """
     client = get_ai_client()
+    per_request: dict = {"timeout": timeout} if timeout is not None else {}
 
     async def _create() -> ChatCompletion:
         json_object = _use_json_object()
@@ -103,6 +122,7 @@ async def chat(
                     max_tokens=max_tokens,
                     reasoning_effort="none",
                     response_format={"type": "json_object"},
+                    **per_request,
                 )
             return await client.chat.completions.create(
                 model=config.ai_model,
@@ -110,6 +130,7 @@ async def chat(
                 temperature=temperature,
                 max_tokens=max_tokens,
                 reasoning_effort="none",
+                **per_request,
             )
         if json_object:
             return await client.chat.completions.create(
@@ -118,12 +139,14 @@ async def chat(
                 temperature=temperature,
                 max_tokens=max_tokens,
                 response_format={"type": "json_object"},
+                **per_request,
             )
         return await client.chat.completions.create(
             model=config.ai_model,
             messages=messages,
             temperature=temperature,
             max_tokens=max_tokens,
+            **per_request,
         )
 
     sem = get_ai_semaphore()
@@ -203,6 +226,8 @@ def get_embed_client() -> AsyncOpenAI:
         _embed_client = AsyncOpenAI(
             api_key=embed_api_key(),
             base_url=embed_api_base(),
+            timeout=_REQUEST_TIMEOUT,
+            max_retries=_REQUEST_MAX_RETRIES,
         )
     return _embed_client
 
@@ -302,6 +327,7 @@ class Provider(AIProvider):
         *,
         temperature: float,
         max_tokens: int,
+        timeout: float | None = None,
     ) -> ChatResponse:
         return cast(
             ChatResponse,
@@ -309,6 +335,7 @@ class Provider(AIProvider):
                 cast(list[ChatCompletionMessageParam], messages),
                 temperature=temperature,
                 max_tokens=max_tokens,
+                timeout=timeout,
             ),
         )
 

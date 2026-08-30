@@ -100,6 +100,61 @@ class AltChannelClientTest(unittest.TestCase):
         self.assertIn(("https://main.invalid/v1", "alt-key"), self._engine._alt_clients)
 
 
+class ClientRequestDefaultsTest(unittest.TestCase):
+    """客户端必须显式声明超时与重试：SDK 默认 read 超时 600s，AI 端点挂起时
+    单请求拖满 10 分钟（dedup/merge 判定还在存储锁内执行，会冻结整条管道）；
+    重试次数显式声明防 SDK 默认漂移静默改变行为。"""
+
+    def setUp(self) -> None:
+        from briefdesk.plugins.ai_provider import engine
+
+        self._engine = engine
+        engine._client = None
+        engine._embed_client = None
+        engine._alt_clients.clear()
+        self.addCleanup(engine._alt_clients.clear)
+        self.addCleanup(setattr, engine, "_client", None)
+        self.addCleanup(setattr, engine, "_embed_client", None)
+
+    def test_main_and_embed_clients_have_explicit_defaults(self) -> None:
+        with patch.object(config, "ai_api_key", SecretStr("test-key")), patch.object(
+            config, "embed_api_key", SecretStr("test-key")
+        ):
+            for getter in (self._engine.get_ai_client, self._engine.get_embed_client):
+                client = getter()
+                self.assertEqual(client.timeout, 120.0, getter.__name__)
+                self.assertEqual(client.max_retries, 2, getter.__name__)
+
+    def test_alt_client_has_explicit_defaults(self) -> None:
+        with patch.object(config, "ai_api_key", SecretStr("main-key")), patch.object(
+            config, "ai_api_base", "https://main.invalid/v1"
+        ):
+            client = self._engine.get_alt_client("https://alt.invalid/v1", "alt-key")
+        self.assertEqual(client.timeout, 120.0)
+        self.assertEqual(client.max_retries, 2)
+
+
+class ChatTimeoutPassThroughTest(unittest.IsolatedAsyncioTestCase):
+    """【复核 P1-1】判官类调用（锁内执行）经 chat 端口下传单请求短超时，
+    限制存储锁的最坏持有时间；不传时不得附带 timeout（用客户端默认）。"""
+
+    async def test_chat_forwards_per_request_timeout(self):
+        client, create = _fake_client()
+        with patch(
+            "briefdesk.plugins.ai_provider.engine.get_ai_client", return_value=client
+        ):
+            await chat([{"role": "user", "content": "x"}], timeout=45.0)
+        self.assertEqual(create.call_args.kwargs.get("timeout"), 45.0)
+
+    async def test_chat_without_timeout_omits_kwarg(self):
+        client, create = _fake_client()
+        with patch(
+            "briefdesk.plugins.ai_provider.engine.get_ai_client", return_value=client
+        ):
+            await chat([{"role": "user", "content": "x"}])
+        self.assertNotIn("timeout", create.call_args.kwargs)
+
+
 class RagChatModelFallbackTest(unittest.IsolatedAsyncioTestCase):
     """rag_chat 的 model override：留空回退 ai_model，给值则原样使用。"""
 

@@ -146,6 +146,12 @@ def _embedding_text(title: str, quote: str) -> str:
     return f"{title} {quote}"
 
 
+# 判定请求超时（秒）：判定在存储锁内执行——与入库/add_to_cache 有批内顺序
+# 依赖（先行消息入库后后续判定要能看到）、并发批次也靠锁串行化，不能移出
+# 锁外；以短超时限制锁的最坏持有时间，防上游挂起冻结管道与卡片管理路由
+_JUDGE_TIMEOUT = 45.0
+
+
 class DedupEngine(DedupService):
     """语义去重引擎（显式实现 DedupService 服务端口），封装缓存状态和 AI 判重逻辑。"""
 
@@ -425,6 +431,7 @@ class DedupEngine(DedupService):
                     ],
                     temperature=0.1,
                     max_tokens=128,
+                    timeout=_JUDGE_TIMEOUT,
                 )
             except Exception as e:
                 # 仅 DEBUG：判定失败是被容错的（调用方 _judge_* 按"该候选降级/

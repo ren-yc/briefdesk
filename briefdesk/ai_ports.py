@@ -44,10 +44,16 @@ async def chat(
     *,
     temperature: float = 0.3,
     max_tokens: int = 4096,
+    timeout: float | None = None,
 ) -> ChatResponse:
-    """统一 AI 调用端口（模型/供应商由已注册插件决定）。"""
+    """统一 AI 调用端口（模型/供应商由已注册插件决定）。
+
+    timeout：单请求超时覆盖（秒）。判官类调用（dedup 判票/strong、merge
+    判官/标题）在存储锁内执行，传短超时限制锁的最坏持有时间，防上游挂起
+    冻结整条管道；None 用客户端默认。
+    """
     return await _require_ai().chat(
-        messages, temperature=temperature, max_tokens=max_tokens
+        messages, temperature=temperature, max_tokens=max_tokens, timeout=timeout
     )
 
 
