@@ -134,6 +134,22 @@ class StagePluginSetupTest(unittest.IsolatedAsyncioTestCase):
         handler(["i3"])
         fake_engine.remove_items.assert_called_once()
 
+    async def test_classify_run_passes_vision_images_to_engine(self):
+        # vision 路由：classify 阶段把 enrich 暂存的图片字节随批传给引擎。
+        # 直接向实例注入假引擎函数——engine 模块可能已被其他测试真实导入，
+        # sys.modules patch 会被 package 属性查找绕过（与 OcrPlugin 假引擎
+        # 不同，classify engine 是硬依赖）。
+        from briefdesk.types import BatchContext
+
+        fake_classify = AsyncMock(return_value=None)
+        plugin = ClassifyPlugin()
+        plugin._classify_batch = fake_classify
+        vision = {("weflow-legacy", "m1"): [b"jpeg-bytes"]}
+        batch = BatchContext(messages=[SimpleNamespace()], client=SimpleNamespace())
+        batch.vision_images = vision
+        await plugin.run(batch, _ctx()[0])
+        fake_classify.assert_awaited_once_with(batch.messages, vision_images=vision)
+
 
 class StagePluginMetaTest(unittest.TestCase):
     def test_merge_declares_dedup_dependency(self):

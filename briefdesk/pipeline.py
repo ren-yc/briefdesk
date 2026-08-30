@@ -15,6 +15,7 @@ import logging
 import time as time_module
 from datetime import UTC, datetime
 
+from briefdesk import announcements
 from briefdesk.config import config
 from briefdesk.db import (
     RawMsgInput,
@@ -155,6 +156,19 @@ async def process_all_batches(
     enrich_stages = get_stages("enrich")
     images_filtered = 0
     if not enrich_stages:
+        if config.ai_vision_enabled:
+            # vision 开启但 OCR 缺位：纯占位符图片消息被下行过滤、混合消息
+            # 拿不到图片字节——公告提示修复配置（announce 幂等，不刷屏）。
+            logger.warning(
+                "AI_VISION_ENABLED 已开启但 ocr 插件未启用：图片不会送入模型"
+            )
+            await announcements.announce(
+                "vision_without_ocr",
+                "warning",
+                "AI 视觉输入已开启（AI_VISION_ENABLED）但 ocr 插件未启用："
+                "图片不会送入模型。请在 PLUGINS 启用 ocr（安装 briefdesk[ocr]）"
+                "或关闭 AI_VISION_ENABLED",
+            )
         images_filtered = sum(
             1
             for m in messages

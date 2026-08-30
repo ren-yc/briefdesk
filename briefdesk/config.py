@@ -47,6 +47,18 @@ class Settings(BaseSettings):
     """设为 true 时，AI 请求会附带 reasoning_effort="none"，
     用于关闭 Qwen3 / Qwen3.5 等模型的思考模式。"""
 
+    ai_vision_enabled: bool = Field(default=False, alias="AI_VISION_ENABLED")
+    """主模型支持图片输入（视觉模型）时开启：含图消息将 OCR 文本连同图片
+    一并送入 AI_MODEL 分类（vision 路由）；关闭时维持纯文本 OCR 路径（现状）。
+    图片字节由 enrich（ocr 插件）下载缩放后随批传递——需启用 ocr 插件；
+    请求级失败自动降级纯文本重试并置公告提示。"""
+
+    ai_vision_max_images: int = Field(
+        default=4, alias="AI_VISION_MAX_IMAGES", ge=1, le=20
+    )
+    """单条消息随分类请求附图的上限：多图消息超出部分只发 OCR 文本；
+    单次请求另有图片总量预算兜底（classify 引擎内 _MAX_IMAGES_PER_REQUEST）。"""
+
     # RAG 问答专用模型通道（RAG_MODEL/RAG_API_BASE/RAG_API_KEY）不在此声明：
     # `RAG_` 前缀归 rag 插件所有，三项由 briefdesk/plugins/rag/config.py 承载，
     # 经 ai_ports.rag_chat 的 override 参数下传（见该模块 docstring）。

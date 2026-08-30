@@ -52,6 +52,14 @@ _CORE_UI: dict[str, dict[str, Any]] = {
     "AI_MODEL": {"label": "AI 模型"},
     "AI_MAX_CONCURRENCY": {"label": "AI 请求最大并发", "hint": "0 = 不限制；本地模型建议设为 1"},
     "AI_DISABLE_THINKING": {"label": "禁用 AI 思考模式", "hint": "Qwen3/Qwen3.5 等模型的 thinking 关闭"},
+    "AI_VISION_ENABLED": {
+        "label": "AI 支持图片输入（视觉模型）",
+        "hint": "开启后含图消息将 OCR 文本连同图片一并送入 AI_MODEL；需启用 ocr 插件",
+    },
+    "AI_VISION_MAX_IMAGES": {
+        "label": "单条消息随请求附图上限",
+        "hint": "多图消息超出部分只发 OCR 文本",
+    },
     "MAX_CLASSIFY_TOKENS": {"label": "单次分类最大输出 token"},
     "BACKFILL_HOURS": {"label": "历史回填窗口（小时）", "hint": "-1 = 拉取全部历史（耗时且 AI 调用激增，慎用）"},
     "IGNORED_EXPIRY_HOURS": {"label": "已忽略条目过期（小时）", "hint": "0 = 禁用清理"},

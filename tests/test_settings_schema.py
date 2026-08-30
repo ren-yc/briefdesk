@@ -131,6 +131,23 @@ class SettingsSchemaTest(unittest.TestCase):
         self.assertEqual(rag["RAG_GROUP_ONLY"]["type"], "boolean")
         self.assertEqual(rag["RAG_TOP_K"]["min"], 1)
 
+    def test_core_settings_expose_vision_fields(self) -> None:
+        # vision 路由：新配置项自动进入核心设置 schema（设置页白名单表单），
+        # label/hint 经 _CORE_UI 覆盖层按 env key 合入（routes_settings_env.py:95-96）
+        from briefdesk.server.routes_settings_env import _CORE_SCHEMA
+
+        by_key = {item["key"]: item for item in _CORE_SCHEMA}
+        vision = by_key["AI_VISION_ENABLED"]
+        self.assertEqual(vision["type"], "boolean")
+        self.assertEqual(vision["default"], False)
+        self.assertEqual(vision["label"], "AI 支持图片输入（视觉模型）")
+        self.assertIn("ocr 插件", vision["hint"])
+        max_images = by_key["AI_VISION_MAX_IMAGES"]
+        self.assertEqual(max_images["type"], "number")
+        self.assertEqual(max_images["numberKind"], "integer")
+        self.assertEqual(max_images["min"], 1)
+        self.assertEqual(max_images["max"], 20)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -234,13 +234,19 @@ class BatchContext:
 
     messages 可被 enrich 阶段改写（如 OCR 替换 content）；client 供
     enrich 阶段下载媒体；outcomes/rows/inserted 由各阶段按序填充。
-    dedup_checks/merge_checks 为各阶段的判定观察记录（供观察型
-    阶段插件如 benchmark 消费），在锁内追加、批结束即弃。
+    vision_images 为 vision 路由的运行时图片通道：enrich（OCR）阶段
+    下载并归一化的图片字节按 (source, msg_id) 暂存，classify 构建
+    多模态请求时消费；批结束即弃，不落库。dedup_checks/merge_checks
+    为各阶段的判定观察记录（供观察型阶段插件如 benchmark 消费），
+    在锁内追加、批结束即弃。
     """
 
     messages: list[InternalMessage]
     client: SourceClient  # OCR 等需下载媒体的阶段使用（TYPE_CHECKING 引用，避免环）
     outcomes: ClassifyOutcome | None = None  # classify 阶段填充
+    vision_images: dict[tuple[str, str], list[bytes]] = field(default_factory=dict)
+    # (source, msg_id) → enrich 阶段归一化后的图片字节（vision 开启时填充；
+    # 按消息身份作键，_split_retry 切片递归无需搬移）
     rows: list[tuple[InternalMessage, ClassifyResult, str, list[float] | None]] = field(
         default_factory=list
     )  # dedup 阶段锁外规划：（消息/结果/标题/预嵌入向量）；原文取 msg.content，不另存副本
