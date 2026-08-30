@@ -154,6 +154,17 @@ class DedupEngine(DedupService):
         self._cache_loaded = False
         self._embed_cache_ok = False  # 嵌入启用且缓存向量加载成功
         self._warm_lock = asyncio.Lock()  # 预热与首次判重的并发保护
+        # 检索通道降级的三个降噪闸门。三者都是**配置/数据态**（对进程内每条
+        # 消息恒成立），首次值得在默认级别看见一次，其后只打 DEBUG——否则每
+        # 条消息一行，批次里的阶段行和真正的告警全被挤出屏幕。与 weflow
+        # client 的 _logged_version 同源手法。
+        #
+        # 三个分开而不共用一个：成因与可操作性都不同（缓存整体无向量 /
+        # query 与缓存维度不一致 / 余弦计算抛异常），共用会让「numpy 真异常」
+        # 也被压成 DEBUG 连栈都看不到。
+        self._no_emb_logged = False
+        self._dim_mismatch_logged = False
+        self._cosine_fail_logged = False
         # 待落库向量（由 add_to_cache 登记、flush_pending_embeddings 批量写入）
         self._pending_embeds: list[tuple[str, str, list[float]]] = []
 
@@ -416,7 +427,10 @@ class DedupEngine(DedupService):
                     max_tokens=128,
                 )
             except Exception as e:
-                logger.error("AI API error: %s", e)
+                # 仅 DEBUG：判定失败是被容错的（调用方 _judge_* 按"该候选降级/
+                # 剔除票"记 WARNING 并继续），此处再打 ERROR 会让同一次失败以
+                # 更高的严重度重复出现，与"失败可降级"的实际语义相悖。
+                logger.debug("判重判定请求失败: %s", e)
                 raise
 
             content = (
@@ -450,14 +464,34 @@ class DedupEngine(DedupService):
         )
 
     @staticmethod
-    def _miss(compared: CachedItem) -> DedupResult:
+    def _vote_digest(entries: list[tuple[CachedItem, float, bool | None]]) -> str:
+        """票面摘要（形如 `"篮球社招新" 85%→SAME, "排球社招新" 82%→DIFF`）。
+
+        判定出口的单行 INFO 复用本方法，令逐票明细可以降到 DEBUG 而不丢信息：
+        默认级别下一行给出"比了谁、多少分、判了什么"，DEBUG 下再看逐条展开。
+        None（判定失败）显式渲染为"失败"，比逐票行原先并入 DIFFERENT 更准确。
+        """
+        return ", ".join(
+            f'"{cand.title}" {score * 100:.0f}%→'
+            f"{'失败' if same is None else ('SAME' if same else 'DIFF')}"
+            for cand, score, same in entries
+        )
+
+    @staticmethod
+    def _miss(compared: CachedItem, note: str) -> DedupResult:
         """判不重复但「确实比较过」的出口：带候选快照，供 benchmark 记录负例。
 
-        与 _hit 配对。传入的是本次实际参与比较的候选（多数票路径为最高分候选，
+        与 _hit 配对，包括日志：两者各打恰好一行 INFO，note 说明判定依据。
+        没有这一行时，默认级别上只剩「有候选」而看不到判定结果，恰是最难排查
+        的组合（"这两条明明重复怎么没合并"无从下手）；有了它，逐票明细才能
+        安全地降到 DEBUG。
+
+        传入的是本次实际参与比较的候选（多数票路径为最高分候选，
         强候选判 DIFFERENT 后候选清空的路径为该强候选本身），不是固定的
         candidates[0] —— 快照错了不会报错，只会让基准用例记成另一条的负例。
         无候选（未发生比较）的路径不走这里，由 check_dedup 返回裸 False。
         """
+        logger.info("%s → 判不重复", note)
         return DedupResult(
             is_duplicate=False,
             candidate=DedupEngine._snapshot(compared),
@@ -488,10 +522,14 @@ class DedupEngine(DedupService):
         image_urls: list[str] | None,
         source: str,
         source_quote: str,
-    ) -> CachedItem | None:
-        """零 AI 的精确短路：命中返回缓存条目，未命中返回 None。
+    ) -> tuple[CachedItem, str] | None:
+        """零 AI 的精确短路：命中返回 (缓存条目, 命中路径描述)，未命中返回 None。
 
         两条确定性重复证据，纯内存比较、不触网，故与需要 await 的判定阶段分开。
+
+        路径描述随条目一起返回、交给 _hit 打印，而不在此各打一行 INFO：
+        否则一次命中要两行日志（本处一行 + _hit 一行），且 _hit 收到的 note
+        恒为 "SAME"，等于把它 docstring 承诺的"标注命中路径"丢在了外面。
         """
         # ── 图片精确短路：同属限定源的 image_urls 集合完全一致 → 判重，零 AI ──
         # 同图重发是确定性重复证据：图片消息原文为占位符（哈希短路对其显式跳过）、
@@ -502,10 +540,7 @@ class DedupEngine(DedupService):
         if q_images and source in _IMAGE_SHORTCUT_SOURCES:
             for it in self._cache:
                 if it.source == source and it.image_urls == q_images:
-                    logger.info(
-                        '[image] "%s" 图片完全一致 → SAME (image_urls)', it.title
-                    )
-                    return it
+                    return it, "[image] 图片完全一致 (image_urls)"
 
         # ── 原文哈希精确短路：仅对原文取哈希 ──
         # 同一条原文被上游重复投递（processed 按 msg_id 拦不住）时是确定性重复
@@ -516,11 +551,7 @@ class DedupEngine(DedupService):
             q_hash = self._content_hash(source_quote)
             for it in self._cache:
                 if it.content_hash and it.content_hash == q_hash:
-                    logger.info(
-                        '[hash] "%s" 原文完全一致 → SAME (source_quote hash)',
-                        it.title,
-                    )
-                    return it
+                    return it, "[hash] 原文完全一致 (source_quote hash)"
 
         return None
 
@@ -547,7 +578,8 @@ class DedupEngine(DedupService):
 
         exact = self._exact_shortcut(image_urls, source, source_quote)
         if exact is not None:
-            return await self._hit(exact, source_group, "SAME")
+            exact_item, exact_note = exact
+            return await self._hit(exact_item, source_group, exact_note)
 
         candidates, metric = self._select_candidates(title, q_emb)
         if not candidates:
@@ -573,7 +605,7 @@ class DedupEngine(DedupService):
     ) -> tuple[list[tuple[CachedItem, float]], str]:
         """候选选取：嵌入余弦 Top-K（启用且加载成功）或字符重叠单候选（回退/兜底）。
 
-        返回 (候选列表, 度量名)；空列表表示已打无候选 WARNING 诊断、调用方直接
+        返回 (候选列表, 度量名)；空列表表示已打无候选 DEBUG 诊断、调用方直接
         判不重复。纯内存计算，不触网（理由见下方 P1 注释）。
         """
         # 余弦以 fallback 阈值召回（含弱候选区间 [fallback, threshold)），
@@ -618,23 +650,53 @@ class DedupEngine(DedupService):
                     cosine_active = True
                     if not candidates:
                         # ⑥ 诊断数据：全局最高余弦（阈值 0 取 top-1），供无候选
-                        # WARNING 展示"差多少没判"
+                        # 诊断展示"差多少没判"
                         top1 = top_k_similar(q_emb, emb_matrix, 1, 0.0)
                         if top1:
                             top1_cosine = top1[0][1]
                 except Exception:
-                    # 余弦计算异常（如维度不一致）不杀整批，回退字符重叠
-                    logger.warning(
-                        "余弦候选计算失败，回退到字符重叠预过滤", exc_info=True
-                    )
+                    # 余弦计算异常不杀整批，回退字符重叠。最常见的成因是
+                    # **缓存内部混了两种维度**（旧向量按旧维度从库中读出、
+                    # 同批新条目按新维度重嵌）：此时 emb_matrix 是 ragged
+                    # list，np.asarray(dtype=float32) 直接抛 ValueError。
+                    # 首次带栈（真 numpy 异常也靠这一条定位），其后只 DEBUG。
+                    if not self._cosine_fail_logged:
+                        self._cosine_fail_logged = True
+                        logger.warning(
+                            "余弦候选计算失败，本进程判重回退字符重叠通道"
+                            "（语义召回失效、漏判率上升）；若为缓存内混合维度，"
+                            "需重建 item_embeddings 向量",
+                            exc_info=True,
+                        )
+                    else:
+                        logger.debug("余弦候选计算失败，回退字符重叠", exc_info=True)
             elif emb_matrix:
-                logger.warning(
-                    "嵌入维度不一致（query=%d vs 缓存=%d），回退到字符重叠预过滤",
-                    len(q_emb),
-                    len(emb_matrix[0]),
-                )
-            else:
+                # 维度不一致**不会自己恢复**：load_embeddings 按模型名取，
+                # 模型名不变而维度变了（代理换实现/供应商原地升级/改维度参数）
+                # 时旧向量每次重启都照样读出来、missing 为空、永不重嵌。故文案
+                # 必须自己说清持续性——只打一次的 WARNING 若读起来像瞬态抖动，
+                # 就会被放过去。
+                if not self._dim_mismatch_logged:
+                    self._dim_mismatch_logged = True
+                    logger.warning(
+                        "嵌入维度不一致（query=%d vs 缓存=%d），本进程判重全程"
+                        "回退字符重叠（语义召回失效、漏判率上升）；模型维度已变，"
+                        "需重建 item_embeddings 向量",
+                        len(q_emb),
+                        len(emb_matrix[0]),
+                    )
+                else:
+                    logger.debug(
+                        "嵌入维度不一致（query=%d vs 缓存=%d），回退字符重叠",
+                        len(q_emb),
+                        len(emb_matrix[0]),
+                    )
+            elif not self._no_emb_logged:
+                # 首条 INFO（默认级别可见），其后同状态只打 DEBUG（见 __init__）
+                self._no_emb_logged = True
                 logger.info("缓存无嵌入向量，回退到字符重叠预过滤")
+            else:
+                logger.debug("缓存无嵌入向量，回退到字符重叠预过滤")
 
         # 全局最高重叠候选：兜底采纳与无候选诊断共用这一次扫描（_best_overlap_candidate
         # 是全缓存 O(n) 扫描，而「无候选」是每条不重复消息的常规路径，算两遍纯属浪费）。
@@ -657,7 +719,14 @@ class DedupEngine(DedupService):
                         overlap_cand[1] * 100,
                     )
 
-        # ⑥ 无候选 → 打 WARNING 诊断（含低于门禁的差距），避免静默漏判
+        # ⑥ 无候选 → 打 DEBUG 诊断（含低于门禁的差距）。
+        #
+        # 级别取舍：无候选是**每条全新消息的常规路径**（新条目本就不该有重复），
+        # 既非异常也无人可介入，故不占 WARNING——否则告警流里每条新消息一行，
+        # 真正的告警被淹没。诊断信息（top-1 差多少、归因）一条不少地保留在
+        # DEBUG：排查"该判重却没判"时开 LOG_LEVEL=DEBUG 即可看到差距。
+        # 检索**本身**失败/降级（余弦异常、维度不一致、缓存无向量）是 WARNING，
+        # 但同样对每条消息恒成立，故各带一个一次性闸门，其后降 DEBUG（见上方）。
         if not candidates:
             diag = [f'判重无候选: "{title}"']
             if cosine_active:
@@ -680,11 +749,14 @@ class DedupEngine(DedupService):
                 diag.append(f"overlap 全零（缓存 {len(self._cache)} 条无共同字符）")
             else:
                 diag.append("缓存为空")
-            logger.warning("；".join(diag))
+            logger.debug("；".join(diag))
             return [], metric
 
+        # 逐条候选记 DEBUG：候选本身不是"阶段或汇总"（见 logger 模块约定），
+        # 且判定结果出来前它无法独立解释任何事——判定出口的单行 INFO 已带
+        # 候选标题与分数（见 _vote_digest）。
         for candidate, score in candidates:
-            logger.info(
+            logger.debug(
                 'Candidate: "%s" vs "%s" (%s: %.0f%%)',
                 candidate.title,
                 title,
@@ -709,13 +781,23 @@ class DedupEngine(DedupService):
             candidates, title, source_quote, "按反对票计"
         )
         for (cand, _score), same in zip(candidates, verdicts):
-            logger.info(
+            logger.debug(
                 '  [weak] "%s": %s', cand.title, "SAME" if same else "DIFFERENT"
             )
+        digest = self._vote_digest(
+            [(cand, score, same) for (cand, score), same in zip(candidates, verdicts)]
+        )
         if all(verdicts):
-            return await self._hit(candidates[0][0], source_group, "[weak] 全员 SAME")
-        logger.info("[weak] 存在 DIFFERENT 票 → 保守不判重")
-        return self._miss(candidates[0][0])
+            return await self._hit(
+                candidates[0][0],
+                source_group,
+                f'[weak] "{title}" 全员 SAME（{len(candidates)} 弱候选: {digest}）',
+            )
+        return self._miss(
+            candidates[0][0],
+            f'[weak] "{title}" 存在 DIFFERENT 票，保守处理'
+            f"（{len(candidates)} 弱候选: {digest}）",
+        )
 
     async def _judge_normal(
         self,
@@ -734,6 +816,7 @@ class DedupEngine(DedupService):
         # （同标题跨群重复），AI 判 SAME 即直接判重，不参与多数票——避免被其余
         # 高相似但不同话题的候选（如"羽毛球社招新" vs "篮球社招新" 80%）稀释成
         # 平票而漏判。候选按相似度降序，首个即最高分。
+        strong_excluded = ""  # 非空表示强候选已判 DIFFERENT 被剔出多数票（供日志归因）
         strong = [c for c in candidates if c[1] >= config.dedup_strong_threshold]
         if strong:
             strong_cand, strong_score = strong[0]
@@ -747,22 +830,31 @@ class DedupEngine(DedupService):
                 )
                 verdict = None
             if verdict is not None:
-                logger.info(
+                logger.debug(
                     '  [strong] "%s" (%s: %.0f%%): %s',
                     strong_cand.title,
                     metric,
                     strong_score * 100,
                     "SAME" if verdict else "DIFFERENT",
                 )
+                strong_desc = (
+                    f'[strong] "{strong_cand.title}" '
+                    f"({metric} {strong_score * 100:.0f}%)"
+                )
                 if verdict:
-                    return await self._hit(strong_cand, source_group, "SAME")
+                    return await self._hit(
+                        strong_cand, source_group, f"{strong_desc} 同文本短路 SAME"
+                    )
                 # 强候选判 DIFFERENT（同文本但内容不同，罕见）：只剔除已判定的
                 # 该候选（④），其余 ≥threshold 候选保留参与多数票——避免连带
                 # 作废其它可能判 SAME 的同文本候选
                 candidates.remove((strong_cand, strong_score))
+                strong_excluded = strong_desc
                 if not candidates:
                     # 快照是被剔除的强候选本身：它就是本次唯一比较过的对象
-                    return self._miss(strong_cand)
+                    return self._miss(
+                        strong_cand, f'{strong_desc} 判 DIFFERENT，"{title}" 无其余候选'
+                    )
 
         # 并行判定全部候选，加权多数票（⑦）：票权 = 候选相似度，高相似候选的
         # 判定更可信——SAME 权重和 > 总权重一半才命中，抑制低置信票的干扰
@@ -778,14 +870,30 @@ class DedupEngine(DedupService):
             if same is None:
                 continue
             voted.append((cand, score, same))
-            logger.info('  "%s": %s', cand.title, "SAME" if same else "DIFFERENT")
+            logger.debug('  "%s": %s', cand.title, "SAME" if same else "DIFFERENT")
         total_weight = sum(score for _cand, score, _ in voted)
         same_weight = sum(score for _cand, score, same in voted if same)
+        # 摘要取全部候选（含判定失败的 None），故失败也在单行里可见
+        digest = self._vote_digest(
+            [(cand, score, same) for (cand, score), same in zip(candidates, verdicts)]
+        )
+        prefix = f"{strong_excluded} 判 DIFFERENT 已剔除；" if strong_excluded else ""
+        vote_desc = (
+            f'{prefix}"{title}" 加权多数票 {len(candidates)} 候选'
+            f"（{digest}）SAME 权重 {same_weight:.2f}"
+        )
         if total_weight and same_weight > total_weight / 2:
             target = next(cand for cand, _score, same in voted if same)
-            return await self._hit(target, source_group, "SAME")
+            return await self._hit(
+                target, source_group, f"{vote_desc} > 半数 {total_weight / 2:.2f}"
+            )
 
-        return self._miss(candidates[0][0])
+        return self._miss(
+            candidates[0][0],
+            f"{vote_desc} ≤ 半数 {total_weight / 2:.2f}"
+            if total_weight
+            else f"{prefix}\"{title}\" 全部候选判定失败（{digest}），保守处理",
+        )
 
 
 # 模块级单例，保留现有 import API 向后兼容

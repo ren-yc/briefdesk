@@ -90,8 +90,8 @@ async def poll(
     try:
         contacts: dict[str, str] = await client.fetch_contacts()
     except Exception as e:
-        logger.error("拉取联系人失败: %s", e)
-        raise
+        # 不打日志：run_poll_cycle 已带栈记录，阶段名走异常链（见会话循环末尾）。
+        raise RuntimeError(f"拉取联系人失败: {e}") from e
 
     # 获取会话列表（发现会话的唯一途径，写库由应用层完成）。
     # chatlab 格式：type 权威（group/private/channel），默认 limit=100 会
@@ -100,8 +100,7 @@ async def poll(
     try:
         all_sessions = await client.fetch_sessions()
     except Exception as e:
-        logger.error("拉取会话列表失败: %s", e)
-        raise
+        raise RuntimeError(f"拉取会话列表失败: {e}") from e
 
     # 兜底：私聊/公众号的对端可能不在上游 contacts 集合（数据缺失），
     # 用会话显示名补全映射（仅私聊与公众号；群会话 id 是群号，不能当发送者）。
@@ -346,8 +345,9 @@ async def poll(
             total_self += session_self
 
         except Exception as e:
-            logger.error("%s失败 — %s", log_prefix, e)
-            raise
+            # 同 weflow：失败只由 run_poll_cycle 记一条带栈 ERROR，会话标签
+            # 走异常链（顺带进 status.lastError），原因文本保留在末尾。
+            raise RuntimeError(f"会话「{label}」拉取失败: {e}") from e
 
     if config.ignore_self and total_raw and not saw_is_send_field:
         logger.warning(

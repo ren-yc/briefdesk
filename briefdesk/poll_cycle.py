@@ -117,11 +117,15 @@ async def run_poll_cycle(source: SourceRuntime) -> None:
             len(result.contacts),
             fmt_dur(time_module.perf_counter() - perf_start),
         )
-    except Exception as e:  # noqa: BLE001
-        logger.error(
-            "[%s] 轮询周期失败: %s (%s)",
+    except Exception as e:
+        # exception 而非 error：这是整条轮询链路的唯一兜底出口（下游轮询器
+        # 与客户端都只上抛、不重复记日志），异常可能来自任意深度，没有栈就
+        # 只剩一句文本可看。会话/阶段上下文由下游的异常链带上来。
+        # 消息里不重复 e（栈末行已含，且 ruff TRY401 禁止）——原因文本另经
+        # lastError 进 UI。
+        logger.exception(
+            "[%s] 轮询周期失败 (%s)",
             source.name,
-            e,
             fmt_dur(time_module.perf_counter() - perf_start),
         )
         set_status({"lastError": str(e)})

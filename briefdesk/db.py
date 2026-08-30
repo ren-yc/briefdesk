@@ -1278,8 +1278,15 @@ async def update_item_category(item_id: str, category: str) -> ItemRow | None:
                 datetime.now(UTC).isoformat(),
             ),
         )
-    except Exception:  # noqa: BLE001 — 样本记录失败不应阻断分类修正
-        logger.warning("recat_log 写入失败（不影响分类修正）: item_id=%s", item_id)
+    except Exception:
+        # 样本记录失败不应阻断分类修正，故容错吞掉。
+        # 带栈：失败原因（表缺列/约束冲突/库锁/磁盘满）决定要不要人工介入，
+        # 而这里被吞掉后没有第二处日志可查，栈是唯一线索。
+        logger.warning(
+            "recat_log 写入失败（不影响分类修正）: item_id=%s",
+            item_id,
+            exc_info=True,
+        )
     await db.commit()
     row = await _fetchone(db, "SELECT * FROM items WHERE id = ?", (item_id,))
     return cast(ItemRow, dict(row)) if row else None

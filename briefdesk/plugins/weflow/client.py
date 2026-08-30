@@ -583,7 +583,9 @@ class WeFlowClient(SourceClient):
                 retry_on_empty=False,
             )
         except Exception as e:
-            logger.warning("回查消息失败: %s", e)
+            # 仅 DEBUG：调用方（SSE 监听器）fail-open 并记 WARNING，此处再打
+            # WARNING 就是同一次失败的第二条同级日志。与 qqflow 客户端一致。
+            logger.debug("回查消息失败: %s", e)
             raise
 
         window = 120

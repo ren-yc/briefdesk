@@ -37,7 +37,7 @@
 |---|---|
 | `limit` | 条数上限（默认 100，上限 10000） |
 | `offset` | 偏移量（默认 0） |
-| `start` / `end` | 时间边界（Unix 秒；可用于 `now-3600` 形式相对时间，见 `parse_time_bound`） |
+| `start` / `end` | 时间边界：Unix 秒，或 `YYYYMMDD`（见 `parse_time_bound`）。无法解析时该条件被忽略，不报 400 |
 | `keyword` | 关键词过滤（小写匹配；sessions/contacts/messages 通用） |
 | `format=chatlab` / `chatlab=1` | 输出 ChatLab 风格形状 |
 | 导出开关 | `media=1`（或 `meiti=1`）开启媒体导出；再按类型 `image=1`/`voice=1`/`video=1`/`emoji=1`（兼容拼音别名 `tupian=1`、`vioce=1`） |
@@ -200,6 +200,8 @@ DELETE 的客户端用。
   "localId": 1,
   "serverId": "8280000000000000001",
   "localType": 1,
+  "baseType": 1,
+  "appmsgSubtype": null,
   "createTime": 1700000100,
   "sortSeq": 0,
   "isSend": 0,
@@ -218,6 +220,31 @@ DELETE 的客户端用。
 - `isSend` 为数字 `0`（对方/系统）或 `1`（自己），不是布尔。
 - `media` 只要消息可解析出媒体就存在（与 WeFlow 形状一致），与 `media=1` 无关；未导出时
   `url` / `localPath` 为**空字符串**而非缺键，客户端可稳定取字段。
+
+#### `localType` 是打包字段：`baseType` / `appmsgSubtype`
+
+微信 4.x 把两个值塞进同一列：
+
+```
+localType = (appmsgSubtype << 32) | baseType
+```
+
+一条文件附件存的是 `(6 << 32) | 49` = `25769803825`，**不是 49**。真库 218558 条里
+62494 条（28.6%）的高 32 位非零，全是 appmsg；另有 6 条是 `(17 << 32) | 11000`，所以
+掩码是无条件的，不能写成"仅当 base 是 49 时才掩"。
+
+- `localType`：**原样输出打包值，永不改动**。下游已按它分支（例如按
+  `21474836529` 认链接卡片），改成掩码后的值会让这些判断全部落空。
+- `baseType`：低 32 位，就是常规的 `1/3/34/43/47/49/…`。
+- `appmsgSubtype`：高 32 位，**仅当 `baseType == 49` 时给值**，否则为 `null`。
+  11000 的高位 17 不是 appmsg 子类型，当成子类型发出去会诱导下游误读。
+
+新增这两个字段是为了让下游不必硬编码 12 位打包常数：判链接卡片写
+`baseType == 49 && appmsgSubtype == 5`，比 `localType == 21474836529` 可读得多。
+两个字段都是**只读派生值**，不进任何 ChatLab 面（那边有自己的 `type` 枚举）。
+
+常见 `appmsgSubtype`（真库计数）：5 链接卡片 36629、57 引用回复 17005、6 文件 3530、
+19 合并转发 991、51 视频号 919、33/36 小程序 284、4 图文 384、2001 支付 269。
 
 响应：
 
@@ -248,6 +275,28 @@ DELETE 的客户端用。
 
 > 文件附件（`file`）暂不参与导出：与 WeFlow 官方契约一致，媒体导出仅覆盖图片/语音/视频/表情四类。
 
+`appmsgSubtype == 6` 的文件附件会带 `media` 对象（`type: "file"`，含真实
+`fileName` 与 `md5`），但 `exported` **恒为假** —— 文件类被导出闸门显式拒绝，不是因为
+缺字段。SSE 推送的 `media` 元数据同形。判断字节是否可取始终看 `exported`，不要看
+`media` 是否存在。
+
+`media.fileName` 取自 appmsg 的 `<title>`（自动剥离 CDATA 包裹），并按 Windows
+非法字符表做净化；`<title>` 缺失或为空时回落 `file_<localId>`。真库 3530 条文件里
+回落 0 条。`md5` 3528 条有值 —— 另 2 条的 `<md5>` 元素存在但内容为空，属源数据缺失。
+
+`format=chatlab` / `chatlab=1` 时改为输出 ChatLab 信封（消息按时间**正序**）：
+`chatlab` / `meta`（含 `ownerId`）/ `members` / `messages`，外层保留
+`success` / `talker` / `count` / `hasMore`。字段语义同 ChatLab Pull（见下节），并按
+WeFlow（安装版）契约额外带 `messages[].replyToMessageId`。
+
+安装版契约里的 `messages[].mediaPath` **本项目不输出**（两个 ChatLab 面都不输出）：
+媒体导出由 `media=1` 开关控制且只在原生形状回填，这里给不出有意义的值，恒空的键比
+没有键更容易误导。媒体字节走本接口的 `media` 对象 + `/api/v1/media/{id}`。
+
+两处差异要注意：`accountName`（联系人自己的显示名）与 `groupNickname`（本群群昵称）是
+**两个不同字段**，与原生形状的 `senderName` 语义不同；`messages[].type` 是 ChatLab
+标准枚举，与原生 `localType` 是**两套独立编码**。枚举全表见下节。
+
 ### GET/POST `/api/v1/sessions` — 会话列表
 
 参数：`limit`、`offset`、`keyword`、`format/chatlab`。
@@ -277,9 +326,64 @@ qqflow-server 的 `type` 取值为 `1` 私聊 / `2` 群聊，数值含义与本�
 ```json
 { "chatlab": { "version": "0.0.2", "generator": "weflow-server", "exportedAt": 1700000000 },
   "meta": { "name": "项目群", "platform": "wechat", "type": "group", "groupId": "...@chatroom", "ownerId": "wxid_self" },
-  "members": [], "messages": [],
+  "members": [
+    { "platformId": "wxid_member_b", "accountName": "李四", "groupNickname": "四哥", "avatar": "" }
+  ],
+  "messages": [
+    { "sender": "wxid_member_b", "accountName": "李四", "groupNickname": "四哥",
+      "timestamp": 1700000103, "type": 0, "content": "大家好", "platformMessageId": "8200000000000000000" }
+  ],
   "sync": { "hasMore": true, "nextSince": 1700000103, "nextOffset": 0, "watermark": 1700000200 } }
 ```
+
+`since` / `end` 接受秒级时间戳或 `YYYYMMDD`。`end=YYYYMMDD` 是**包含**上界，解析为
+当天 23:59:59（否则传一个日期会得到空结果）；`since=YYYYMMDD` 取当天 0 点。
+
+`members` 仅含**本页**出现过的发送者，已去重。
+
+本接口**不含** `replyToMessageId`。理由是对齐 WeFlow（安装版）Pull 面的实际行为：该字段
+不在 ChatLab 0.0.2 标准里（标准的 `messages[]` 无此项），属于 WeFlow 的私有扩展，安装版
+只在 `format=chatlab` 面给出、Pull 面不给。需要引用关系请用 `/api/v1/messages`（原生形状
+有 `replyToMessageId` + `quote`，`format=chatlab` 形状也有 `replyToMessageId`）。
+
+对照之下 `messages[].groupNickname` **是**标准字段（语义为"发送时的群昵称"），所以两个面
+都输出 —— 尽管安装版文档的 Pull 示例里没有列出它。判据是标准，不是示例的字段清单。
+
+**`accountName` 与 `groupNickname` 是两个不同的名字**：`accountName` 是联系人自己的
+显示名（`remark > nickname > username`），`groupNickname` 是该成员在**本群**的群昵称
+（群名片）。没有群名片、或私聊会话时 `groupNickname` 为空串 —— 联系人的备注不是群昵称，
+不会填到这里。要显示"群里的称呼"用 `groupNickname` 并回落到 `accountName`。
+
+**`messages[].type` 采用 ChatLab 0.0.2 标准枚举**
+（`docs.chatlab.fun/standard/chatlab-format`），不是微信原生 `local_type`：
+
+| 码 | 含义 | | 码 | 含义 |
+| -- | ---- |-| -- | ---- |
+| 0 | TEXT | | 24 | SHARE |
+| 1 | IMAGE | | 25 | REPLY |
+| 2 | VOICE | | 27 | CONTACT |
+| 3 | VIDEO | | 80 | SYSTEM |
+| 4 | FILE | | 81 | RECALL |
+| 5 | EMOJI | | 99 | OTHER |
+| 7 | LINK | | | |
+| 8 | LOCATION | | | |
+
+**标准中 `6` 未分配，任何情况下都不会出现。** 映射要点：
+
+- 映射先对 `local_type` **掩码取低 32 位**（打包语义见
+  [`localType` 是打包字段](#localtype-是打包字段basetype--appmsgsubtype)）。不掩码则
+  所有 appmsg 行都匹配不上、全部落 `99` OTHER —— 真库里那是 28.6% 的消息；
+- `local_type` 49（appmsg）按载荷细分：带 `refermsg` → `25` REPLY，子类型 6
+  文件 → `4` FILE，其余 → `7` LINK。子类型优先取打包高 32 位，其次取 XML `<type>`：
+  真库 62494 条里两者一致 62493 条、高位从不缺失，XML 反而错一条；
+- `local_type` 10000/10002 按是否真正解出撤回载荷细分：是 → `81` RECALL，
+  否（普通系统通知）→ `80` SYSTEM。仅看 `local_type` 会把非撤回的 10002 误判成撤回；
+- ⚠️ 与 `/api/v1/messages` 的 `localType` 是**两套独立编码**：同一张图片在这里是
+  `type: 1`，在那里是 `localType: 3`。`localType` 是平台原生码、下游已按它分支，
+  两者不可互换。
+
+`meta.type` 按标准只有 `group` / `private` 两个取值，公众号等会归入 `private`；需要更细
+的会话分类请用 `/api/v1/sessions` 的 `sessionType`。
 
 **游标语义**（与 qqflow-server 一致）：
 
@@ -291,13 +395,32 @@ qqflow-server 的 `type` 取值为 `1` 私聊 / `2` 群聊，数值含义与本�
 - `nextSince` 是**本页**最后一条的时间戳，不是整个会话的最大时间戳；
 - `nextOffset` 常为 `0`：`since` 排他 + 整秒组对齐后，重新过滤已经排除了本页全部行，
   下一条未读就在偏移 0。仅当时间戳无法前进的退化情形才返回非 0。**两个游标都应原样
-  回传**；若把 `nextOffset` 当成"累计已读条数"再叠加，会二次跳过同一批行；
+  回传**；若把 `nextOffset` 当成"累计已读条数"再叠加，会二次跳过同一批行。
+  这一点**有意不同于 WeFlow（安装版）文档里示例的 `nextOffset: 5000`**：那个值配合
+  排他的 `nextSince` 回传会 double-skip；
 - `watermark` 是本次拉取的时间上界（`end` 或当前时间），不是最新消息的时间戳；
   排空后（`hasMore=false`）`nextSince` 停在该上界、`nextOffset` 归 0，可作为下次
   增量拉取的起点。
 
 按上述规则循环直到 `hasMore=false`，可完整取回会话全部消息且不重复
 （真库验证：3960 条 / 80 页，无丢无重）。
+
+#### 与标准 / 安装版的已知差异
+
+以下是有意不实现或受数据限制的部分，下游不要依赖这些字段存在：
+
+| 字段 | 标准 | 安装版 | 本项目 | 原因 |
+| ---- | ---- | ------ | ------ | ---- |
+| `meta.groupAvatar` | 可选，要求 Data URL | 字段清单里有 | **不输出** | 库里只有 HTTP 头像 URL，转 Data URL 需要额外下载与转码；给 HTTP URL 会违反标准的 Data URL 约定 |
+| `members[].aliases` | 可选，`string[]` | 未列出 | **不输出** | 原生形状已有 `alias` 单值，需要时从 `/api/v1/contacts` 取 |
+| `members[].avatar` | 可选，要求 Data URL | 真实 URL | HTTP URL 或 `""` | 直接透传联系人行的 `avatar_url`，**不是** Data URL；缺值为空串 |
+| `messages[].mediaPath` | 不在标准 | 字段清单里有 | **两个面都不输出** | 给不出有意义的值（导出受 `media=1` 控制且只回填原生形状）；媒体字节请走 `/api/v1/messages` 的 `media` 对象（`exported: true` 才是可取判据） |
+
+**类型覆盖面与 qqflow-server 不对等。** 本项目能输出
+`0/1/2/3/4/5/7/8/24/25/27/80/81/99`；qqflow-server 只能输出 `0/1/2/3/80/81/99`
+（QQ 侧没有引用关系抽取，也没有名片/位置/链接的细分解析）。同一个逻辑消息在两个平台上
+可能一边是 `25` REPLY、另一边落到 `99` OTHER。下游做类型分支时应把未覆盖码按 `99` 兜底，
+不要假设两个上游的枚举分布一致。
 
 ### GET/POST `/api/v1/contacts` — 联系人
 
@@ -376,9 +499,12 @@ qqflow-server 的 `type` 取值为 `1` 私聊 / `2` 群聊，数值含义与本�
 - 帧携带 `id:` 序号；`Last-Event-ID` 头（或查询参数）可回放最近 **1000 条 / 10 分钟**
   （序号为总线级单调值，跨账号注册保持连续）
 - 每 25 秒发送 `ping` 注释帧保活
-- `message.new` 的 `media` 仅在消息含图片/语音/视频/表情时出现，否则为 `null`。
+- `message.new` 的 `media` 仅在消息含图片/语音/视频/表情/文件时出现，否则为 `null`。
   它是**元数据**：不含 `url` / `localPath`（字节走 REST `/api/v1/messages?media=1` 导出），
   也绝不含解密用的 `aes_key`。推空占位链接只会让客户端误以为有可取地址。
+  `type: "file"` 只表示识别出了文件附件，文件类**不参与导出**，REST 侧也取不到字节。
+- SSE 事件**不带 `localType` / `baseType` / `appmsgSubtype`**，需要类型分支请按
+  `content` 与 `media.type`，或用 `sessionId` 回查 `/api/v1/messages`。
 - 订阅端滞后（broadcast 缓冲被覆盖）时补发一帧 `sync`，携带**当前真实水位**，客户端可据此
   重新增量拉取。该帧不占用总线序号（它只针对这一个滞后订阅者，占号会导致其他客户端跳号）。
 - 进程收到退出信号时，服务端主动结束所有 SSE 流（不等宽限期超时），客户端会看到连接正常关闭。
@@ -391,7 +517,12 @@ qqflow-server 的 `type` 取值为 `1` 私聊 / `2` 群聊，数值含义与本�
 { "success": true, "newMessages": 3, "revokeMessages": 0 }
 ```
 
-撤回计数键为 `revokeMessages`。新消息同时会通过 SSE 推给已订阅的客户端。
+撤回计数键为 `revokeMessages`，不计入 `newMessages`。新消息同时会通过 SSE 推给已订阅
+的客户端。
+
+**这是一个触发器，不返回消息体** —— 消息的唯一读取面是 `/api/v1/messages` 与 ChatLab
+Pull，避免同一批数据出现第二种形状。WeFlow（安装版）没有这个接口，因此它没有可对齐的
+上游契约；qqflow-server 的 `/api/v1/sync` 返回同一形状。
 
 ### SNS（朋友圈，本地缓存只读）
 

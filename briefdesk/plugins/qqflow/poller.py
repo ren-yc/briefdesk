@@ -6,6 +6,8 @@
 表达窗口边界（按会话：增量轮询 cutoff=会话水位-overlap，回退 cutoff=
 now-BACKFILL_HOURS，全量时 start 不传），limit/offset 翻页 + 早停
 （hasMore=False 或本页最旧消息已早于 cutoff——后续页只会更旧），每会话页数有界。
+offset 按实际返回条数累加（非 page*limit 定长，防短页 + hasMore=true 跳行），
+并用 seen_local_ids 挡掉翻页期上游插入造成的跨页重复（同 weflow poller）。
 
 BACKFILL_HOURS=-1 表示拉取全部历史：start 不传（服务端不限时间）、不做
 年龄早停，仅由 hasMore 驱动翻页，翻页守卫上限放宽。
@@ -171,17 +173,20 @@ async def poll(
                     cutoff = start_param
                     session_mode = "增量"
             candidates: list[QqFlowMessage] = []
+            seen_local_ids: set[str] = set()  # 翻页期间上游插入 → offset 漂移产生跨页重复
             session_raw = 0
             session_old = 0
             session_self = 0
+            session_skipped = 0
             hit_old = False
+            offset = 0
 
             for page in range(max_pages):
                 resp = await client.fetch_messages(
                     session_id,
                     start=start_param,
                     limit=_PAGE_LIMIT,
-                    offset=page * _PAGE_LIMIT,
+                    offset=offset,
                 )
                 msgs = resp.get("messages", [])
                 session_raw += len(msgs)
@@ -195,6 +200,9 @@ async def poll(
                 )
                 if not msgs:
                     break
+                # 按实际返回条数步进，而非 page * _PAGE_LIMIT 定长：上游返回
+                # 短页却仍报 hasMore=true 时，定长步进会跳过中间那批行。
+                offset += len(msgs)
 
                 for msg in msgs:
                     # 响应按时间倒序：一旦碰到早于窗口的消息，本页其余只会更旧
@@ -207,9 +215,17 @@ async def poll(
                     if config.ignore_self and is_self_message(msg, client.self_uid):
                         session_self += 1
                         continue
+                    msg_id = str(msg["localId"])
+                    if msg_id in seen_local_ids:
+                        # 同一条消息跨页重复（offset 翻页期间上游插入导致漂移）：
+                        # 只保留先到者，避免重复入管道触发唯一键冲突/重复分类
+                        logger.debug("重复 localId 跳过（翻页漂移）: %s", msg_id)
+                        continue
+                    seen_local_ids.add(msg_id)
                     if pre_filter_rest(msg):
                         candidates.append(msg)
                     else:
+                        session_skipped += 1
                         total_skipped += 1
 
                 if not resp.get("hasMore") or hit_old:
@@ -248,6 +264,7 @@ async def poll(
             # 轮询提前结束的误读；窗口模式随行标注（增量/回填/全量）。
             parts = [
                 f"{session_raw} 条 → {session_new} 新",
+                f"{session_skipped} 过滤",
                 f"{session_processed} 已处理",
             ]
             if session_self:
@@ -270,8 +287,9 @@ async def poll(
             logger.info("%sqqflow-server 索引期 503，跳过", log_prefix)
             continue
         except Exception as e:
-            logger.error("%s失败 — %s", log_prefix, e)
-            raise
+            # 同 weflow：失败只由 run_poll_cycle 记一条带栈 ERROR，会话标签
+            # 走异常链（顺带进 status.lastError），原因文本保留在末尾。
+            raise RuntimeError(f"会话「{label}」拉取失败: {e}") from e
 
     summary = (
         f"poll 完成: {len(result.messages)} 条新消息 "
@@ -279,8 +297,8 @@ async def poll(
         f"{len(enabled_sessions)} 会话, {fmt_dur(time_module.perf_counter() - poll_start)})"
     )
     if total_self:
-        summary += f", 自己 {total_self}"
+        summary = summary[:-1] + f", 自己 {total_self})"
     if not_ready_skips:
-        summary += f", 503 跳过 {not_ready_skips} 会话"
+        summary = summary[:-1] + f", 503 跳过 {not_ready_skips} 会话)"
     logger.info(summary)
     return result

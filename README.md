@@ -117,7 +117,7 @@ OCR 依赖为**可选**（`pip install -e ".[ocr]"`）：
 | `MERGE_WINDOW_MINUTES` / `MERGE_MAX_CANDIDATES` | `10` / `3` | 会话内同话题片段合并窗口（分钟）/ 候选上限；`0` = 禁用合并 |
 | `EMBED_API_BASE` / `EMBED_MODEL` / `EMBED_API_KEY` | 空（禁用） | 嵌入向量去重：填入嵌入服务地址后启用余弦预筛（留空回退字符重叠预过滤） |
 | `DEDUP_SIMILARITY_THRESHOLD` / `DEDUP_EMBED_THRESHOLD` / `DEDUP_EMBED_TOP_K` / `DEDUP_EMBED_FALLBACK_THRESHOLD` / `DEDUP_STRONG_THRESHOLD` | `0.3` / `0.80` / `3` / `0.65` / `0.99` | 去重预筛与 AI 判重门禁阈值 |
-| `LOG_LEVEL` | `INFO` | 日志级别（DEBUG 开逐条细节） |
+| `LOG_LEVEL` | `INFO` | 日志级别（DEBUG 开逐条细节，并放出 uvicorn 的 HTTP 请求日志——默认静默以免逐请求刷屏） |
 | `DB_PATH` / `SERVER_PORT` | `briefdesk.sqlite` / `3000` | SQLite 路径 / Web 端口 |
 
 > 配置说明：`.env` 与默认数据库路径均以项目根目录为基准解析，从任意目录启动（`python main.py` / `python -m briefdesk` / `briefdesk`）都会读取同一份配置（显式配置的相对 `DB_PATH` 仍按当前工作目录解析）。

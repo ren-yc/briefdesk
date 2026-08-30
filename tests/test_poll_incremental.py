@@ -297,6 +297,131 @@ class QqFlowIncrementalTest(unittest.IsolatedAsyncioTestCase):
             config.backfill_hours = original
 
 
+class _QqScriptedClient:
+    """按脚本逐页返回的假客户端（可造跨页重复与「短页 + hasMore=true」）。"""
+
+    name = "qqflow"
+    self_uid = ""
+
+    def __init__(self, pages: list[dict]):
+        self._pages = pages
+        self.calls: list[tuple[int | None, int]] = []
+
+    async def ensure_ready(self) -> None:
+        pass
+
+    async def fetch_contacts(self) -> dict[str, str]:
+        return {"u": "用户"}
+
+    async def fetch_sessions(self) -> list[dict]:
+        return [{"username": "g1", "displayName": "项目群", "type": 2}]
+
+    async def fetch_messages(
+        self, talker: str, start: int | None = None, limit: int = 500, offset: int = 0
+    ) -> dict:
+        self.calls.append((start, offset))
+        idx = len(self.calls) - 1
+        if idx < len(self._pages):
+            return self._pages[idx]
+        return {"messages": [], "hasMore": False}
+
+
+class QqFlowPagingGuardTest(unittest.IsolatedAsyncioTestCase):
+    """qqflow 翻页两道守卫，与 weflow / weflow-legacy poller 同形。
+
+    两者成因同一个：offset 分页期间上游插入新消息导致页窗漂移。
+    """
+
+    def setUp(self):
+        self._hours = config.backfill_hours
+        config.backfill_hours = 24
+
+    def tearDown(self):
+        config.backfill_hours = self._hours
+
+    async def test_cross_page_duplicate_enters_pipeline_once(self):
+        """同一 localId 跨页重复 → 只保留先到者。
+
+        没有这道守卫，重复条目会各自过一遍 AI 分类（白烧 token）并在写库时
+        撞 raw 唯一键。
+        """
+        now = int(time.time())
+        client = _QqScriptedClient(
+            [
+                {"messages": [_qqflow_msg(1, now), _qqflow_msg(2, now)], "hasMore": True},
+                # 第 2 页与第 1 页重叠 1 条（offset 漂移）
+                {"messages": [_qqflow_msg(2, now), _qqflow_msg(3, now)], "hasMore": False},
+            ]
+        )
+
+        result = await qq_poll(
+            client,
+            _enabled("qqflow", "g1"),
+            _no_processed,
+            window_start_by_session={"g1": now - _DAY},
+        )
+
+        ids = [m.msg_id for m in result.messages]
+        self.assertEqual(len(ids), len(set(ids)), f"无重复: {ids}")
+        self.assertEqual(set(ids), {"1", "2", "3"})
+
+    async def test_short_page_with_has_more_does_not_skip_rows(self):
+        """上游回短页却仍报 hasMore=true → offset 按实际条数步进，不跳行。
+
+        定长步进（offset = page * 500）会把第 2 页定位到 500，短页后面那批
+        行就永久取不到了。
+        """
+        now = int(time.time())
+        client = _QqScriptedClient(
+            [
+                {"messages": [_qqflow_msg(1, now)], "hasMore": True},  # 短页
+                {"messages": [_qqflow_msg(2, now)], "hasMore": False},
+            ]
+        )
+
+        result = await qq_poll(
+            client,
+            _enabled("qqflow", "g1"),
+            _no_processed,
+            window_start_by_session={"g1": now - _DAY},
+        )
+
+        self.assertEqual([o for _, o in client.calls], [0, 1], "按实际条数步进")
+        self.assertEqual({m.msg_id for m in result.messages}, {"1", "2"})
+
+    async def test_session_line_carries_filtered_count(self):
+        """每会话 INFO 行带「过滤」计数：区分「预滤掉了」与「本来就没有」。"""
+        now = int(time.time())
+        client = _QqScriptedClient(
+            [
+                {
+                    "messages": [
+                        _qqflow_msg(1, now),
+                        {**_qqflow_msg(2, now), "content": "短"},  # 内容过短 → 预滤
+                    ],
+                    "hasMore": False,
+                }
+            ]
+        )
+
+        with self.assertLogs("briefdesk.plugins.qqflow.poller", level="INFO") as logs:
+            await qq_poll(
+                client,
+                _enabled("qqflow", "g1"),
+                _no_processed,
+                window_start_by_session={"g1": now - _DAY},
+            )
+
+        self.assertTrue(
+            any("1 过滤" in m for m in logs.output),
+            f"会话行应带过滤计数: {logs.output}",
+        )
+        # 汇总行的括号收在末尾，不能是 "...1.2s), 自己 4" 那种断裂形状
+        summary = [m for m in logs.output if "poll 完成" in m]
+        self.assertTrue(summary)
+        self.assertTrue(summary[0].endswith(")"), summary[0])
+
+
 class SessionWindowComputationTest(unittest.IsolatedAsyncioTestCase):
     """_compute_session_windows：会话水位 / 未处理消息按会话钉窗 / 回填起点。"""
 

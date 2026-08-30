@@ -79,7 +79,9 @@ async def ocr_image_bytes(content: bytes) -> str:
         logger.debug("图片无文字，返回空结果 (%d bytes)", len(content))
         return ""
     except Exception as e:
-        logger.error("OCR failed (%d bytes): %s", len(content), e)
+        # 仅 DEBUG：唯一调用方（ocr 插件 enrich）按"跳过 OCR、卡片仍以原文入库"
+        # 记 WARNING。此处再打 ERROR 既重复又抬高了严重度——OCR 失败不阻断管道。
+        logger.debug("OCR 识别失败 (%d bytes): %s", len(content), e)
         raise
 
 

@@ -59,8 +59,12 @@ class WeFlowSettings(BaseSettings):
         default=60000,
         gt=0,  # env: WEFLOW_SSE_RECONNECT_MAX_MS
     )
+    # weflow-server 每 25s 发一个 ping 注释帧保活（weflow-server-api.md），
+    # 60s ≈ 2.4 个周期，与 qqflow 同口径。原先的 300000 是从 weflow-legacy
+    # 抄来的——那个源上游确实无心跳，只能靠 5 分钟兜住半开连接；这里有心跳
+    # 可用，5 分钟等于白等 4 分半才发现连接已死。
     sse_read_timeout_ms: int = Field(
-        default=300000,
+        default=60000,
         gt=0,  # env: WEFLOW_SSE_READ_TIMEOUT_MS
     )
 
