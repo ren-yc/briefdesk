@@ -354,7 +354,10 @@ async def api_recategorize(item_id: str, body: dict):
         raise HTTPException(400, "category is required")
     if not await category_exists(category):
         raise HTTPException(400, f"未知或未启用的类别: {category}")
-    row = await update_item_category(item_id, category)
+    # 与 pipeline 共用存储锁：update_item_category 是 UPDATE+INSERT 两步写，
+    # 锁外 commit 会把管道未完成的多步写一并提交（同 batch/toggle 路由纪律）
+    async with storage_lock:
+        row = await update_item_category(item_id, category)
     if row is None:
         raise HTTPException(404, "Item not found")
     return {"success": True, "item": row}
