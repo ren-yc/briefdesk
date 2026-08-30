@@ -303,9 +303,13 @@ mark { background: var(--accent-lt); color: var(--accent); border-radius: 2px; p
 
 /* 工具入口（日历/问一问，由插件 ui.js 注入）：固定于搜索框正下方，
    过滤条与分类导航之上——搜索态过滤条展开时工具入口不漂移。
+   两项并排一行、内容居中：成对工具读作一个"工具段"，与下方左对齐的
+   分类列表行形成语义区分，同时为分类区省出一行高度。
    横线跟随内容：有入口（.cat-link）才画线，插件全停用时容器空置、
    不留孤线——用 :has 判定而非 :empty，对容器内的空白文本节点免疫 */
-#nav-top { display: flex; flex-direction: column; gap: 1px; }
+#nav-top { display: flex; flex-direction: row; gap: 4px; }
+#nav-top .cat-link { flex: 1; justify-content: center; padding: 7px 8px; }
+#nav-top .cat-link-main { width: auto; }
 #nav-top:has(.cat-link) {
   border-bottom: 1px solid var(--border);
   padding-bottom: 12px;
@@ -1104,7 +1108,10 @@ body.modal-open { overflow: hidden; }
     padding: 10px 14px; gap: 6px; align-items: center;
   }
   #category-nav { flex-direction: row; gap: 4px; flex-shrink: 0; }
-  #nav-top { flex-direction: row; gap: 4px; flex-shrink: 0; }
+  #nav-top { flex-shrink: 0; }
+  /* width:auto 抵消基础 .cat-link 的 width:100%（flex:none 下会以容器宽为基准，
+     把横条里两个小入口撑成等宽大块，挤占分类区的起始视野） */
+  #nav-top .cat-link { flex: none; width: auto; }
   #nav-top:has(.cat-link) { border-bottom: none; padding-bottom: 0; margin-bottom: 0; }
   .cat-link { white-space: nowrap; font-size: 12px; padding: 5px 10px; }
   .nav-special {
