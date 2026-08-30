@@ -44,6 +44,13 @@ powershell -ExecutionPolicy Bypass -File scripts/install-hooks.ps1
 - 新增功能必须补充或更新对应测试
 - 不要为了“让当前任务快速完成”而跳过上述任何一步；若门禁失败，必须先修复再提交
 
+### 依赖锁文件（`requirements-dev.txt`）
+
+- 该文件是 `pyproject.toml` 的 `[dev,ocr]` **依赖闭包**，由 `pip-compile` 生成，**不是** `pip freeze` 的整环境快照。重新生成用文件头部记录的那条命令。
+- 不用 `pip freeze`：整环境快照会把项目从不 import 的包一并钉死（曾因此钉入 yank 版本的 `polars` 与整套 ML 栈），任何无关包的 yank 或平台轮子缺失都会弄红 CI。
+- 升级依赖：`pip-compile --upgrade`（全量）或 `-P <包名>`（单包），随后必须在本地重跑全部门禁；不加 `--upgrade` 时既有 pin 会被复用，仅做闭包收敛。
+- 该文件只服务 CI 的可复现安装，不参与任何测试断言；修改后应在干净虚拟环境中实测 `pip install -r requirements-dev.txt` + `pip install -e . --no-deps` 后跑一遍 pytest，确认闭包足够。
+
 ### 临时文件清理
 
 - 禁止提交调试/临时文件：`tmp_*`、`*.tmp`、`*.bak`、`*_stub*.js`、`debug*.py`、`*.log` 等
