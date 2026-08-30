@@ -9,6 +9,7 @@ from briefdesk import stages
 from briefdesk.config import config
 from briefdesk.db import init_schema
 from briefdesk.pipeline import (
+    _mark_skipped,
     _split_batches,
     process_all_batches,
     set_processing_paused,
@@ -301,6 +302,9 @@ class StoreBatchFailedTest(_StageTestBase):
         async def fake_mark(source, msg_id):
             processed.append(msg_id)
 
+        async def fake_bulk(rows):
+            processed.extend(msg_id for _source, msg_id in rows)
+
         _install_dedup_stage(_dedup_engine_mock())
         _install_merge_stage()
         stages.register_stage(_classify_stage(_outcome_fn(results, failed)))
@@ -309,8 +313,8 @@ class StoreBatchFailedTest(_StageTestBase):
             "briefdesk.plugins.dedup.plugin.mark_message_processed",
             new=AsyncMock(side_effect=fake_mark),
         ), patch(
-            "briefdesk.pipeline.mark_message_processed",
-            new=AsyncMock(side_effect=fake_mark),  # 骨架 _mark_skipped 走 pipeline 名
+            "briefdesk.pipeline.mark_messages_processed",
+            new=AsyncMock(side_effect=fake_bulk),  # 骨架 _mark_skipped 走批量标记
         ), patch(
             "briefdesk.plugins.dedup.plugin.insert_item",
             new=AsyncMock(return_value="new-id"),
@@ -349,9 +353,6 @@ class MissingStageGuardTest(_StageTestBase):
     async def _run(self, install_stages):
         processed: list[str] = []
 
-        async def fake_mark(source, msg_id):
-            processed.append(msg_id)
-
         install_stages()
         with patch(
             "briefdesk.pipeline.get_enabled_sessions",
@@ -364,8 +365,8 @@ class MissingStageGuardTest(_StageTestBase):
         ), patch(
             "briefdesk.pipeline.bulk_insert_raw_messages", new=AsyncMock()
         ), patch(
-            "briefdesk.pipeline.mark_message_processed",
-            new=AsyncMock(side_effect=fake_mark),
+            "briefdesk.pipeline.mark_messages_processed",
+            new=AsyncMock(),
         ), patch("briefdesk.pipeline.publish_items_updated", new=AsyncMock()):
             await process_all_batches(
                 [_pipeline_msg("m1")], _pipeline_client(), batch_size=10, origin="test"
@@ -421,7 +422,7 @@ class ProcessAllBatchesReturnTest(_StageTestBase):
             ), patch(
                 "briefdesk.pipeline.publish_items_updated", new=AsyncMock()
             ), patch(
-                "briefdesk.pipeline.mark_message_processed", new=AsyncMock()
+                "briefdesk.pipeline.mark_messages_processed", new=AsyncMock()
             ), patch(
                 "briefdesk.plugins.dedup.plugin.insert_item",
                 new=AsyncMock(return_value="fake-id"),
@@ -1248,7 +1249,7 @@ class ProcessAllBatchesAllFailedReturnTest(_StageTestBase):
             ), patch(
                 "briefdesk.pipeline.publish_items_updated", new=AsyncMock()
             ), patch(
-                "briefdesk.pipeline.mark_message_processed", new=AsyncMock()
+                "briefdesk.pipeline.mark_messages_processed", new=AsyncMock()
             ), patch(
                 "briefdesk.plugins.dedup.plugin.insert_item",
                 new=AsyncMock(return_value="fake-id"),
@@ -1266,6 +1267,35 @@ class ProcessAllBatchesAllFailedReturnTest(_StageTestBase):
         finally:
             await db.close()
         self.assertFalse(ok)
+
+
+class MarkSkippedContractTest(unittest.IsolatedAsyncioTestCase):
+    """【复核 P2-4】outcome is None（classify 契约违约）不得当全批闲聊：
+    整批不标记，零产出路径使 poll_cycle 跳过水位推进；模型显式全排除
+    （outcome.results 为空但 outcome 非 None）才标记 processed。"""
+
+    async def test_outcome_none_marks_nothing(self):
+        bctx = BatchContext(
+            messages=[_pipeline_msg("m1"), _pipeline_msg("m2")],
+            client=_pipeline_client(),
+        )
+        await _mark_skipped(bctx, failed_set=set())
+        self.assertEqual(bctx.skipped, 0, "契约违约时不得把消息当闲聊标记")
+
+    async def test_explicit_all_excluded_marks_all(self):
+        bctx = BatchContext(
+            messages=[_pipeline_msg("m1"), _pipeline_msg("m2")],
+            client=_pipeline_client(),
+        )
+        bctx.outcomes = ClassifyOutcome(results=[], failed=[])
+        with patch(
+            "briefdesk.pipeline.mark_messages_processed", new=AsyncMock()
+        ) as bulk:
+            await _mark_skipped(bctx, failed_set=set())
+        self.assertEqual(bctx.skipped, 2)
+        bulk.assert_awaited_once_with(
+            [("weflow-legacy", "m1"), ("weflow-legacy", "m2")]
+        )
 
 
 if __name__ == "__main__":

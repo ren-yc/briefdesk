@@ -416,6 +416,11 @@ async def get_db() -> aiosqlite.Connection:
                 # 主连接的写操作短暂等待而非立即抛 "database is locked"
                 cursor = await conn.execute("PRAGMA busy_timeout = 5000")
                 await cursor.close()
+                # WAL 下 NORMAL 仅掉电丢最近一次提交（应用崩溃不丢），消除
+                # 默认 FULL 的每 commit 一次 fsync——逐条小事务回填路径的
+                # 主要写放大来源
+                cursor = await conn.execute("PRAGMA synchronous = NORMAL")
+                await cursor.close()
                 await conn.commit()
                 try:
                     await validate_schema(conn)
@@ -453,6 +458,9 @@ async def get_embed_db() -> aiosqlite.Connection:
                 cursor = await conn.execute("PRAGMA journal_mode = WAL")
                 await cursor.close()
                 cursor = await conn.execute("PRAGMA busy_timeout = 5000")
+                await cursor.close()
+                # 与主连接同步语义一致（WAL + NORMAL），见 get_db 内注释
+                cursor = await conn.execute("PRAGMA synchronous = NORMAL")
                 await cursor.close()
                 await init_schema(conn)  # 幂等：同文件表结构由主连接维护，此处兜底
                 _embed_db = conn
@@ -1568,6 +1576,26 @@ async def mark_message_processed(source: str, msg_id: str) -> None:
         "INSERT OR IGNORE INTO processed_messages (source, msg_id, processed_at) VALUES (?, ?, ?)",
         (source, msg_id, now),
     )
+    await db.commit()
+
+
+async def mark_messages_processed(rows: list[tuple[str, str]]) -> None:
+    """批量标记已处理（闲聊跳过路径）：executemany + 单次 commit，入参
+    [(source, msg_id)]。
+
+    逐条 commit 在大回填时每条一次 fsync（Windows NTFS 单次 5-20ms，数千
+    条串行拉长存储锁窗口、阻塞实时批）；INSERT OR IGNORE 幂等，与逐条
+    语义一致（同 bulk_upsert_contacts 的优化动机）。
+    """
+    if not rows:
+        return
+    db = await get_db()
+    now = datetime.now(UTC).isoformat()
+    cursor = await db.executemany(
+        "INSERT OR IGNORE INTO processed_messages (source, msg_id, processed_at) VALUES (?, ?, ?)",
+        [(source, msg_id, now) for source, msg_id in rows],
+    )
+    await cursor.close()
     await db.commit()
 
 

@@ -22,7 +22,7 @@ from briefdesk.db import (
     bulk_insert_raw_messages,
     get_enabled_categories,
     get_enabled_sessions,
-    mark_message_processed,
+    mark_messages_processed,
 )
 from briefdesk.db import storage_lock as _storage_lock
 from briefdesk.logger import fmt_dur
@@ -64,26 +64,38 @@ def _split_batches(
 
 
 async def _mark_skipped(bctx: BatchContext, failed_set: set[int]) -> None:
-    """未选中且非失败的消息标记 processed（闲聊跳过）；无分类结果时全批标记。
+    """未选中且非失败的消息批量标记 processed（闲聊跳过）。
 
     被滤自消息不标记 processed（回填窗口内每轮重滤、关闭 IGNORE_SELF 可恢复）。
+    outcome is None（classify 阶段运行了但未写 outcomes，属契约违约）不与
+    「模型明确全排除」同语义：未知结果整批不标记，本批零产出使 process_all_
+    batches 返回 False、poll_cycle 跳过水位推进，由钉窗机制找回——防不合规
+    classify 实现静默吞整批。
     """
     outcome = bctx.outcomes
-    if outcome is None or not outcome.results:
-        for i, msg in enumerate(bctx.messages):
-            if i in failed_set:
-                continue
-            await mark_message_processed(msg.source, msg.msg_id)
-            bctx.skipped += 1
+    if outcome is None:
+        logger.warning(
+            "classify 阶段未产出 outcomes（契约违约），%d 条整批保留待回填",
+            len(bctx.messages),
+        )
         return
-    selected = {
-        r.msg_index for r in outcome.results if 0 <= r.msg_index < len(bctx.messages)
-    }
-    for i, msg in enumerate(bctx.messages):
-        if i in selected or i in failed_set:
-            continue
-        await mark_message_processed(msg.source, msg.msg_id)
-        bctx.skipped += 1
+    if not outcome.results:
+        rows = [
+            (msg.source, msg.msg_id)
+            for i, msg in enumerate(bctx.messages)
+            if i not in failed_set
+        ]
+    else:
+        selected = {
+            r.msg_index for r in outcome.results if 0 <= r.msg_index < len(bctx.messages)
+        }
+        rows = [
+            (msg.source, msg.msg_id)
+            for i, msg in enumerate(bctx.messages)
+            if i not in selected and i not in failed_set
+        ]
+    bctx.skipped += len(rows)
+    await mark_messages_processed(rows)
 
 
 async def process_all_batches(
@@ -286,7 +298,11 @@ async def process_all_batches(
             failed_set = set(outcome.failed) if outcome else set()
             # 锁外预计算：存储相阶段（dedup + post_insert）的 before_run——
             # dedup 做行规划/批内预嵌入，rag 等后置阶段做各自的预嵌入；网络调用
-            # 只允许发生在锁外（避免在 _storage_lock 内 await 远程嵌入阻塞管道）
+            # 只允许发生在锁外（避免在 _storage_lock 内 await 远程嵌入阻塞管道）。
+            # 例外是锁内的判官类 chat（dedup 判票/strong、merge 判官/标题）：
+            # 判定与入库/add_to_cache 有批内顺序依赖（先行消息入库后后续判定
+            # 要能看到），且并发批次靠锁串行化防互相漏判——不能移出，以
+            # _JUDGE_TIMEOUT（45s）单请求超时限制锁的最坏持有时间
             for stage in [*dedup_stages, *merge_stages]:
                 before = getattr(stage, "before_run", None)
                 if before is not None:

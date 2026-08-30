@@ -50,6 +50,7 @@ from briefdesk.db import (
     item_is_expired,
     load_embeddings,
     mark_message_processed,
+    mark_messages_processed,
     merge_source_group,
     purge_expired_ignored,
     set_item_reminder,
@@ -1031,6 +1032,23 @@ class SessionWatermarkTest(unittest.IsolatedAsyncioTestCase):
         await mark_message_processed("weflow-legacy", "f1")
         await mark_message_processed("weflow-legacy", "f2")
         self.assertEqual(await get_oldest_unprocessed_by_session("weflow-legacy"), {"g2": 200})
+
+    async def test_mark_messages_processed_bulk(self):
+        await self.db.execute(
+            "INSERT INTO raw_messages (source, msg_id, session_id, group_name, "
+            "sender_id, sender_name, content, timestamp) "
+            "VALUES ('weflow-legacy', 'f1', 'g1', '群', 'u', 'n', 'x', 100), "
+            "('weflow-legacy', 'f2', 'g1', '群', 'u', 'n', 'x', 300)"
+        )
+        await self.db.commit()
+        # 批量标记（含重复项：INSERT OR IGNORE 幂等）；空表 no-op 不抛
+        await mark_messages_processed(
+            [("weflow-legacy", "f1"), ("weflow-legacy", "f2"), ("weflow-legacy", "f2")]
+        )
+        await mark_messages_processed([])
+        self.assertEqual(
+            await get_oldest_unprocessed_by_session("weflow-legacy"), {}
+        )
 
     async def test_toggle_enable_clears_watermark(self):
         await update_session_last_polls("weflow-legacy", [("g1", 100)])

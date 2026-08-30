@@ -319,7 +319,7 @@ class PipelineSyncProgressCountsTest(unittest.IsolatedAsyncioTestCase):
             "briefdesk.plugins.dedup.plugin.mark_message_processed",
             new=AsyncMock(),
         ), patch(
-            "briefdesk.pipeline.mark_message_processed", new=AsyncMock()
+            "briefdesk.pipeline.mark_messages_processed", new=AsyncMock()
         ):
             return await process_all_batches(
                 messages, _pipeline_client(), batch_size=10, origin="test"
