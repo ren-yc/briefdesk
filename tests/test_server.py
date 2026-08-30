@@ -5,7 +5,7 @@ import time
 import unittest
 from datetime import datetime
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 from fastapi import HTTPException
 from starlette.testclient import TestClient
@@ -705,3 +705,194 @@ class IgnoreClearsDedupCacheEventTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RecategorizeRouteTest(unittest.TestCase):
+    """【复核 P2-30/P2-6】recategorize 路由编排：存储锁内两步写、输入校验、404。"""
+
+    def setUp(self):
+        self.client = _client()
+
+    def tearDown(self):
+        self.client.close()
+
+    @staticmethod
+    def _spy_lock():
+        lock = MagicMock()
+        lock.__aenter__ = AsyncMock(return_value=None)
+        lock.__aexit__ = AsyncMock(return_value=False)
+        return lock
+
+    def test_success_updates_within_storage_lock(self):
+        lock = self._spy_lock()
+        row = {"id": "i1", "category": "学术"}
+        with patch.multiple(
+            "briefdesk.server.routes_items",
+            storage_lock=lock,
+            category_exists=AsyncMock(return_value=True),
+            update_item_category=AsyncMock(return_value=row),
+        ):
+            resp = self.client.post(
+                "/api/items/i1/recategorize", json={"category": "学术"}
+            )
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()["item"], row)
+        lock.__aenter__.assert_awaited_once()
+        lock.__aexit__.assert_awaited_once()
+
+    def test_non_string_category_returns_400(self):
+        resp = self.client.post("/api/items/i1/recategorize", json={"category": 123})
+        self.assertEqual(resp.status_code, 400)
+
+    def test_blank_category_returns_400(self):
+        resp = self.client.post("/api/items/i1/recategorize", json={"category": "  "})
+        self.assertEqual(resp.status_code, 400)
+
+    def test_unknown_category_returns_400(self):
+        with patch.multiple(
+            "briefdesk.server.routes_items",
+            category_exists=AsyncMock(return_value=False),
+            storage_lock=asyncio.Lock(),
+        ):
+            resp = self.client.post(
+                "/api/items/i1/recategorize", json={"category": "不存在"}
+            )
+        self.assertEqual(resp.status_code, 400)
+
+    def test_missing_item_returns_404(self):
+        with patch.multiple(
+            "briefdesk.server.routes_items",
+            category_exists=AsyncMock(return_value=True),
+            update_item_category=AsyncMock(return_value=None),
+            storage_lock=asyncio.Lock(),
+        ):
+            resp = self.client.post(
+                "/api/items/i1/recategorize", json={"category": "学术"}
+            )
+        self.assertEqual(resp.status_code, 404)
+
+
+class CategoryDeleteRouteTest(unittest.TestCase):
+    """【复核 P2-30】类别删除路由编排：purge 分支在存储锁内发布 items_deleted。"""
+
+    def setUp(self):
+        self.client = _client()
+
+    def tearDown(self):
+        self.client.close()
+
+    def test_purge_publishes_items_deleted_within_lock(self):
+        lock = MagicMock()
+        lock.__aenter__ = AsyncMock(return_value=None)
+        lock.__aexit__ = AsyncMock(return_value=False)
+        publish = AsyncMock()
+        bus = SimpleNamespace(publish=publish)
+        with patch.multiple(
+            "briefdesk.server.routes_categories",
+            storage_lock=lock,
+            delete_category=AsyncMock(return_value=({"id": 3}, ["a", "b"])),
+            event_bus=bus,
+            publish_items_updated=AsyncMock(),
+        ):
+            resp = self.client.post("/api/categories/3/delete", json={"purgeItems": True})
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()["deletedItems"], 2)
+        publish.assert_awaited_once_with(EVENT_ITEMS_DELETED, ["a", "b"])
+        lock.__aenter__.assert_awaited_once()
+
+    def test_no_purge_skips_event(self):
+        publish = AsyncMock()
+        bus = SimpleNamespace(publish=publish)
+        with patch.multiple(
+            "briefdesk.server.routes_categories",
+            storage_lock=asyncio.Lock(),
+            delete_category=AsyncMock(return_value=({"id": 3}, [])),
+            event_bus=bus,
+            publish_items_updated=AsyncMock(),
+        ):
+            resp = self.client.post("/api/categories/3/delete", json={"purgeItems": False})
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()["deletedItems"], 0)
+        publish.assert_not_awaited()
+
+
+class BackupRestoreRouteTest(unittest.TestCase):
+    """【复核 P2-30/P2-10】备份流式下发与恢复校验路由编排。"""
+
+    def test_backup_streams_file(self):
+        client = _client()
+
+        def fake_backup(path):
+            with open(path, "wb") as f:
+                f.write(b"sqlite-bytes")
+
+        with patch(
+            "briefdesk.server.routes_items.backup_db_to",
+            AsyncMock(side_effect=fake_backup),
+        ):
+            resp = client.get("/api/backup")
+        client.close()
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.content, b"sqlite-bytes")
+        self.assertIn("attachment", resp.headers.get("content-disposition", ""))
+
+    def test_restore_rejects_invalid_file(self):
+        client = _client()
+        with patch(
+            "briefdesk.server.routes_items.validate_restore_file",
+            AsyncMock(return_value="corrupt db"),
+        ):
+            resp = client.post("/api/restore", files={"file": ("b.sqlite", b"xx")})
+        client.close()
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("corrupt", resp.json()["detail"])
+
+    def test_restore_success_stages_pending_file(self):
+        client = _client()
+        replaced: list[str] = []
+        with patch(
+            "briefdesk.server.routes_items.validate_restore_file",
+            AsyncMock(return_value=None),
+        ), patch(
+            "briefdesk.server.routes_items.os.replace",
+            lambda src, dst: replaced.append(dst),
+        ):
+            resp = client.post("/api/restore", files={"file": ("b.sqlite", b"valid")})
+        client.close()
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(len(replaced), 1)
+        self.assertTrue(replaced[0].endswith(".restore-pending"))
+
+
+class SessionToggleRouteTest(unittest.TestCase):
+    """【复核 P2-30】会话开关路由：锁内两步写、404、监听缓存失效。"""
+
+    def setUp(self):
+        self.client = _client()
+
+    def tearDown(self):
+        self.client.close()
+
+    def test_toggle_404_when_missing(self):
+        with patch.multiple(
+            "briefdesk.server.routes_items",
+            storage_lock=asyncio.Lock(),
+            toggle_session=AsyncMock(return_value=None),
+            get_listener=Mock(return_value=None),
+        ):
+            resp = self.client.post("/api/sessions/weflow-legacy/g1/toggle")
+        self.assertEqual(resp.status_code, 404)
+
+    def test_toggle_success_invalidates_listener_cache(self):
+        listener = Mock()
+        row = {"session_id": "g1", "enabled": 1}
+        with patch.multiple(
+            "briefdesk.server.routes_items",
+            storage_lock=asyncio.Lock(),
+            toggle_session=AsyncMock(return_value=row),
+            get_listener=Mock(return_value=listener),
+        ):
+            resp = self.client.post("/api/sessions/weflow-legacy/g1/toggle")
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()["session"], row)
+        listener.invalidate_session_cache.assert_called_once()
