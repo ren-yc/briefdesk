@@ -233,4 +233,9 @@ def normalize_setting(meta: dict[str, Any], raw: str) -> str:
         return str(number_value) if meta.get("numberKind") == "float" else str(int(number_value))
     if not isinstance(raw, str):
         raise TypeError("值须为字符串")
+    if "\r" in raw or "\n" in raw or " #" in raw:
+        # 暂存文件是 KEY=VALUE 行格式：换行会把值拆成伪键（可注入任意配置行，
+        # 含密钥名——路由层白名单只过滤键名，管不住值内注入），" #" 会被
+        # dotenv 当行内注释截断，写入/读回不保真
+        raise ValueError("字符串值不能包含换行或 ' #'")
     return raw

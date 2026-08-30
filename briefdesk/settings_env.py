@@ -59,6 +59,11 @@ def write_staged(updates: dict[str, str | None]) -> None:
     """
     path = get_settings_file()
     current = read_staged()
+    bad = [k for k, v in updates.items() if v is not None and ("\n" in v or "\r" in v)]
+    if bad:
+        # 纵深防御：normalize_setting 已拒绝换行值，此处防其他调用路径回归——
+        # 换行会把 KEY=VALUE 行格式拆出伪键（可注入任意配置行，含密钥名）
+        raise ValueError(f"暂存值不能包含换行: {bad}")
     for key, value in updates.items():
         if value is None:
             current.pop(key, None)

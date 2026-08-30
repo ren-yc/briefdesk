@@ -129,6 +129,14 @@ class SettingsFileTest(StagedFileTestCase):
         write_staged({"DB_PATH": r"C:\data\app.db?x=1"})
         self.assertEqual(read_staged()["DB_PATH"], r"C:\data\app.db?x=1")
 
+    def test_write_rejects_newline_value_and_keeps_file(self) -> None:
+        """【复核 P1-7】写入前断言拒绝换行值：防 KEY=VALUE 行格式被注入
+        伪配置行（含密钥名）；失败时原文件保持不变。"""
+        write_staged({"LOG_LEVEL": "DEBUG"})
+        with self.assertRaises(ValueError):
+            write_staged({"LOG_LEVEL": "DEBUG\nAI_API_KEY=sk-evil"})
+        self.assertEqual(read_staged(), {"LOG_LEVEL": "DEBUG"})
+
     def test_source_of_priority(self) -> None:
         # 环境变量 > override（暂存文件）> .env > default
         with tempfile.TemporaryDirectory() as d:
