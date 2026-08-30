@@ -1266,3 +1266,40 @@ class RagChatRoutingTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(p.kwargs, {"temperature": 0.2, "max_tokens": 1024})
         finally:
             ai_ports.set_ai(None)
+
+
+class DeleteEventGcTest(unittest.IsolatedAsyncioTestCase):
+    """【复核 P2-24】卡片删除事件触发即时孤儿对账（此前最长滞留一个维护
+    周期，已删内容仍可被 /api/rag/ask 引用——与停用会话即时生效不对齐）。"""
+
+    async def test_setup_subscribes_and_handler_runs_gc(self):
+        from briefdesk.events import EVENT_ITEMS_DELETED
+
+        ctx, *_ = _ctx(_embed_provider(True))
+        subscribed: list[str] = []
+        ctx.subscribe_event = lambda ev, handler: subscribed.append(ev)
+        plugin = RagPlugin()
+        await plugin.setup(ctx)
+        plugin._engine.maintenance_gc = AsyncMock()
+        try:
+            self.assertIn(EVENT_ITEMS_DELETED, subscribed)
+            plugin._on_items_deleted(["i1"])
+            self.assertIsNotNone(plugin._gc_task)
+            await plugin._gc_task
+            plugin._engine.maintenance_gc.assert_awaited_once()
+        finally:
+            await plugin.teardown()
+
+    async def test_concurrent_delete_events_spawn_single_gc(self):
+        ctx, *_ = _ctx(_embed_provider(True))
+        plugin = RagPlugin()
+        await plugin.setup(ctx)
+        plugin._engine.maintenance_gc = AsyncMock()
+        try:
+            plugin._on_items_deleted(["i1"])
+            task = plugin._gc_task
+            plugin._on_items_deleted(["i2"])
+            self.assertIs(plugin._gc_task, task, "待跑/在跑 GC 期间不重复 spawn")
+            await plugin._gc_task
+        finally:
+            await plugin.teardown()

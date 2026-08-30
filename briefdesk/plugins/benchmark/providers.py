@@ -19,6 +19,7 @@ get_embed_db 两个模块级入口临时替换为指向临时库的连接（引�
 from __future__ import annotations
 
 import asyncio
+import logging
 import shutil
 import uuid
 from collections.abc import AsyncIterator
@@ -31,10 +32,32 @@ from briefdesk import ai_ports
 from briefdesk.db import init_schema
 from briefdesk.plugins.ai_provider.engine import Provider
 from briefdesk.plugins.benchmark.schema import CategoryDef
+from briefdesk.status import get_sync_progress
+
+logger = logging.getLogger(__name__)
 
 # 临时库根目录：插件包内 .tmp（gitignore），沙箱/受限环境可写；每次运行在其
 # 下建唯一子目录，退出只删子目录。
 _TMP_ROOT = Path(__file__).resolve().parent / ".tmp"
+
+_DRAIN_POLL_INTERVAL = 0.05
+
+
+async def _wait_pipelines_drained(timeout_s: float = 120.0) -> bool:
+    """等待在途批次排空（复核 P2-22）：暂停只拦新批，已在分类阶段的批次仍会
+    进入存储相——不排空就打补丁会把它们的卡片写进临时库，并在生产去重缓存
+    留下指向临时库的幽灵条目（后续相似消息被误吸收）。
+
+    以 sync 进度的 pendingCount 归零为排空信号（暂停批在管道入口直接返回，
+    不进入计数）；返回是否在超时前排空。
+    """
+    deadline = asyncio.get_running_loop().time() + timeout_s
+    while True:
+        if get_sync_progress().get("pendingCount") == 0:
+            return True
+        if asyncio.get_running_loop().time() >= deadline:
+            return False
+        await asyncio.sleep(_DRAIN_POLL_INTERVAL)
 
 
 async def _replace_categories(conn: aiosqlite.Connection, defs: list[CategoryDef]) -> None:
@@ -87,6 +110,11 @@ async def bench_environment(
         # 实时消息不入库也不标 processed，延后到下轮回填自然恢复。
         # 置于 try 内保证任何后续失败都走 finally 的复位与子目录清理。
         pipeline.set_processing_paused(True)
+        # 等待在途批次排空（复核 P2-22），见 _wait_pipelines_drained
+        if not await _wait_pipelines_drained():
+            logger.warning(
+                "benchmark: 等待在途批次排空超时（120s），基准结果可能污染生产缓存"
+            )
         if categories:
             await _replace_categories(main_conn, categories)
 

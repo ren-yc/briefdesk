@@ -114,3 +114,20 @@ class ProviderResourceAcquisitionFailureTest(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DrainWaitTest(unittest.IsolatedAsyncioTestCase):
+    """【复核 P2-22】补丁前等待在途批次排空：pendingCount 归零即通过，
+    超时返回 False（调用方告警后放弃等待，行为可观测）。"""
+
+    async def test_returns_true_when_drained(self):
+        with patch.object(
+            providers, "get_sync_progress", return_value={"pendingCount": 0}
+        ):
+            self.assertTrue(await providers._wait_pipelines_drained(timeout_s=0.1))
+
+    async def test_returns_false_on_timeout(self):
+        with patch.object(
+            providers, "get_sync_progress", return_value={"pendingCount": 3}
+        ):
+            self.assertFalse(await providers._wait_pipelines_drained(timeout_s=0.1))
