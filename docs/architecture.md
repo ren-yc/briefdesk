@@ -110,6 +110,7 @@ weflow-server :5033        WeFlow(legacy) :5031        qqflow-server :5032
 - **双能力插件**：同一插件类可显式继承多个能力协议并同时注册（先例：rag = StagePlugin[post_insert] + WebPlugin，setup 内既 register_stage 又 register_router/register_plugin_assets）。
 - **PluginContext 服务端口**：config、事件总线（`event_bus`，核心删除卡片发布 `EVENT_ITEMS_DELETED`，去重插件订阅清内存缓存）、`register_source`、`register_stage`、`dedup`、`ai`、`register_router`/`register_plugin_assets`（默认 noop，未注入时静默丢弃）。
 - **插件前端随插件包分发**：约定 `ui/ui.js` 以 IIFE 暴露 `window.briefdeskPlugins.<name>.init(api)`，DOM/样式/交互全在插件包内；核心只留通用加载器与两类扩展钩子（详见下方「前端」节）。**图标不随插件分发**：插件前端复用核心 `/icons/` 路径或在 `ui.js` 内联 Lucide SVG（约定与守卫见「前端」节「插件图标通道」）。
+- **三源行为契约（weflow / weflow-legacy / qqflow）**：同构六文件分层，已统一——必填配置缺失/空值即装配期 `PluginDisabledError` 自禁用（零源降级启动兜底，决策 ①=1B）、空发送者消息保留（归一化回退 sender_name="未知"，决策 ②）、会话级拉取失败记入 `PollResult.failed_sessions`/`session_errors` 不中止整轮、翻页 age 早停（`hit_old`）、脏会话 404→空信封（`not_found_ok=True`）、SSE `(event, rawid)` FIFO 去重。**刻意保留的上游契约差异**：SSE 心跳/读超时（weflow/qqflow 上游 25s ping→60s；legacy 上游无心跳→300s）、自消息检测（weflow/legacy 信任上游不推自消息；qqflow 每消息 REST 回查）、`retry_on_empty`（仅 legacy 上游存在「刚入库查不到」竞态）、`WEFLOW_DB_KEYS` 双段拆分（Windows 凭据管理器单条 1280 字节上限）。
 
 ## 数据库
 

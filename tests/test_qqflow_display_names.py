@@ -142,7 +142,9 @@ class NormalizeSseMediaTest(unittest.TestCase):
 
 
 class PrefilterSenderTest(unittest.TestCase):
-    """空发送者消息（含纯 UID/显示名内容的系统事件）应在入口被过滤。"""
+    """qqflow 入口过滤回归（决策 ②=保留未知）：空发送者**不再**入口丢弃
+    （与 weflow/legacy 统一，归一化回退 sender_name="未知"）；纯 UID 内容
+    的系统事件（入群/名片/撤回）仍保留丢弃规则。"""
 
     def test_sse_filters_empty_sender_with_uid_content(self):
         event = {
@@ -168,7 +170,7 @@ class PrefilterSenderTest(unittest.TestCase):
         }
         self.assertFalse(pre_filter_sse(event))
 
-    def test_sse_filters_normal_text_with_empty_sender(self):
+    def test_sse_keeps_normal_text_with_empty_sender(self):
         event = {
             "event": "message.new",
             "rawid": "1",
@@ -178,9 +180,10 @@ class PrefilterSenderTest(unittest.TestCase):
             "content": "hello world",
             "timestamp": 123,
         }
-        self.assertFalse(pre_filter_sse(event))
+        self.assertTrue(pre_filter_sse(event))
 
-    def test_sse_filters_control_only_sender_with_normal_text(self):
+    def test_sse_keeps_control_only_sender_with_normal_text(self):
+        # 控制字符发送者净化后为空 → 回退"未知"，不再入口丢弃
         event = {
             "event": "message.new",
             "rawid": "1",
@@ -190,9 +193,9 @@ class PrefilterSenderTest(unittest.TestCase):
             "content": "hello world",
             "timestamp": 123,
         }
-        self.assertFalse(pre_filter_sse(event))
+        self.assertTrue(pre_filter_sse(event))
 
-    def test_sse_filters_image_with_empty_sender(self):
+    def test_sse_keeps_image_with_empty_sender(self):
         event = {
             "event": "message.new",
             "rawid": "1",
@@ -203,7 +206,7 @@ class PrefilterSenderTest(unittest.TestCase):
             "mediaId": "9f2a1c2d3e4f5a6b7c8d9e0f1a2b3c4d",
             "timestamp": 123,
         }
-        self.assertFalse(pre_filter_sse(event))
+        self.assertTrue(pre_filter_sse(event))
 
     def test_sse_keeps_normal_text_with_sender(self):
         event = {
@@ -248,7 +251,7 @@ class PrefilterSenderTest(unittest.TestCase):
         }
         self.assertFalse(pre_filter_rest(msg))
 
-    def test_rest_filters_normal_text_with_empty_sender(self):
+    def test_rest_keeps_normal_text_with_empty_sender(self):
         msg = {
             "localId": 1,
             "localType": 0,
@@ -256,9 +259,9 @@ class PrefilterSenderTest(unittest.TestCase):
             "senderUsername": "",
             "content": "hello world",
         }
-        self.assertFalse(pre_filter_rest(msg))
+        self.assertTrue(pre_filter_rest(msg))
 
-    def test_rest_filters_image_with_empty_sender(self):
+    def test_rest_keeps_image_with_empty_sender(self):
         msg = {
             "localId": 1,
             "localType": 3,
@@ -267,7 +270,7 @@ class PrefilterSenderTest(unittest.TestCase):
             "content": "[image]",
             "mediaId": "abc123",
         }
-        self.assertFalse(pre_filter_rest(msg))
+        self.assertTrue(pre_filter_rest(msg))
 
     def test_rest_keeps_normal_text_with_sender(self):
         msg = {

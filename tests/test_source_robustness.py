@@ -346,6 +346,22 @@ class WeflowSseDedupTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(received), 2)
 
 
+class QqFlowEmptySenderKeptTest(unittest.TestCase):
+    """【决策 ②=保留未知】qqflow 空发送者不再入口丢弃（与 weflow/legacy
+    统一）：归一化阶段回退 sender_name="未知"。"""
+
+    def test_pre_filter_sse_keeps_empty_sender(self):
+        from briefdesk.plugins.qqflow.normalize import pre_filter_sse
+
+        ev = {
+            "event": "message.new",
+            "rawid": "r9",
+            "sourceName": "",
+            "content": "这条内容长度满足过滤阈值",
+        }
+        self.assertTrue(pre_filter_sse(ev))
+
+
 class LegacyMessagesNotFoundTest(unittest.IsolatedAsyncioTestCase):
     """【复核 U1-1】legacy fetch_messages 暴露 not_found_ok：404 → 空信封
     （对齐 weflow/qqflow 的脏会话容错），轮询路径传 True。"""

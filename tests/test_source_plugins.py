@@ -41,10 +41,24 @@ class WeFlowLegacyPluginTest(unittest.IsolatedAsyncioTestCase):
         fake_runtime = SimpleNamespace(name="weflow-legacy")
         plugin = WeFlowLegacyPlugin()
         with patch(
+            "briefdesk.plugins.weflow_legacy.config.WeFlowLegacySettings",
+            return_value=SimpleNamespace(api_token=SecretStr("t")),
+        ), patch(
             "briefdesk.plugins.weflow_legacy.runtime.WeFlowLegacySource", return_value=fake_runtime
         ):
             await plugin.setup(ctx)
         self.assertEqual(registered, [fake_runtime])
+
+    async def test_missing_token_self_disables(self):
+        """【决策 ①=1B】必填校验与 weflow/qqflow 统一：缺 token 装配期自禁用。"""
+        ctx, _ = _ctx()
+        plugin = WeFlowLegacyPlugin()
+        with patch(
+            "briefdesk.plugins.weflow_legacy.config.WeFlowLegacySettings",
+            return_value=SimpleNamespace(api_token=SecretStr("")),
+        ), self.assertRaises(PluginDisabledError) as cm:
+            await plugin.setup(ctx)
+        self.assertIn("WEFLOW_LEGACY_API_TOKEN", str(cm.exception))
 
     async def test_teardown_closes_runtime(self):
         ctx, _ = _ctx()
@@ -52,6 +66,9 @@ class WeFlowLegacyPluginTest(unittest.IsolatedAsyncioTestCase):
         fake_runtime = SimpleNamespace(name="weflow-legacy", close=close_spy)
         plugin = WeFlowLegacyPlugin()
         with patch(
+            "briefdesk.plugins.weflow_legacy.config.WeFlowLegacySettings",
+            return_value=SimpleNamespace(api_token=SecretStr("t")),
+        ), patch(
             "briefdesk.plugins.weflow_legacy.runtime.WeFlowLegacySource", return_value=fake_runtime
         ):
             await plugin.setup(ctx)

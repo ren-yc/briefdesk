@@ -114,14 +114,9 @@ def pre_filter_sse(event: QqFlowEvent) -> bool:
         # ("message.new","") 碰撞误吞后续正常事件（审查 A5）
         logger.debug("丢弃 SSE: message.new 缺 rawid")
         return False
-    # 任意发送者为空的消息均丢弃：上游可能把入群/名片等系统事件编码成
-    # “无发送者 + 内容为显示名”的形式，这类消息没有可展示/可分类的信息价值。
-    if not clean_display_name(event.get("sourceName")):
-        logger.debug(
-            "丢弃 SSE rawid=%s: 发送者为空",
-            event.get("rawid"),
-        )
-        return False
+    # 发送者为空不再丢弃（决策 ②=保留未知，与 weflow/legacy 统一）：
+    # 归一化阶段回退 sender_name="未知"。此前按「无发送者=系统事件」整类
+    # 丢弃，但也会误伤确实无发送者名而内容有效的消息。
     c: str = event.get("content", "")
     if not c:
         logger.debug("丢弃 SSE rawid=%s: 空内容", event.get("rawid"))
@@ -249,15 +244,8 @@ def pre_filter_rest(msg: QqFlowMessage) -> bool:
             local_type,
         )
         return False
-    # 任意发送者为空的消息均丢弃：上游可能把入群/名片等系统事件编码成
-    # “无发送者 + 内容为显示名”的形式，这类消息没有可展示/可分类的信息价值。
-    if not clean_display_name(msg.get("senderUsername")):
-        logger.debug(
-            "丢弃 REST msg_id=%s: 发送者为空 (localType=%s)",
-            msg.get("localId"),
-            local_type,
-        )
-        return False
+    # 发送者为空不再丢弃（决策 ②=保留未知，与 weflow/legacy 统一，见
+    # pre_filter_sse 同款注释）。
     # 入群/名片/撤回等系统事件：上游可能以“纯 UID 内容”呈现，
     # 没有可展示/可分类的信息价值，入口直接丢弃。
     c: str = msg.get("content") or ""
