@@ -377,6 +377,36 @@ class _QqScriptedClient:
         return {"messages": [], "hasMore": False}
 
 
+class _LegacyScriptedClient:
+    """weflow-legacy 版按脚本逐页返回的假客户端（可造跨页重复）。"""
+
+    name = "weflow-legacy"
+
+    def __init__(self, pages: list[dict]):
+        self._pages = pages
+        self.calls: list[int] = []
+
+    async def fetch_contacts(self) -> dict[str, str]:
+        return {"u": "用户"}
+
+    async def fetch_sessions(self) -> list[dict]:
+        return [{"id": "g1", "name": "项目群", "type": "group"}]
+
+    async def fetch_messages(
+        self, talker: str, start_ts: int | None, limit: int = 500,
+        offset: int = 0, media: bool = False, not_found_ok: bool = False,
+        retry_on_empty: bool = True,
+    ) -> dict:
+        self.calls.append(offset)
+        idx = len(self.calls) - 1
+        if idx < len(self._pages):
+            return self._pages[idx]
+        return {"messages": [], "hasMore": False}
+
+    async def fetch_group_members(self, chatroom_id: str) -> dict[str, str]:
+        return {"u": "用户"}
+
+
 class QqFlowPagingGuardTest(unittest.IsolatedAsyncioTestCase):
     """qqflow 翻页两道守卫，与 weflow / weflow-legacy poller 同形。
 
@@ -795,6 +825,140 @@ class SessionFailureIsolationTest(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(result.failed_sessions, {"g2"})
         self.assertIn("g2", result.session_errors)
+
+    async def test_same_name_sessions_keep_both_errors(self):
+        """【核验 C2】同名群（如多个「通知群」）同轮失败：session_errors 以
+        session_id 为键互不覆盖（此前以显示名为键，后者覆盖前者，令应用层
+        len(session_errors) 的 lastWarning 计数报少、首个失败原因丢失）。"""
+        now = int(time.time())
+
+        class _FailAllClient(_WeFlowLegacyClient):
+            async def fetch_messages(
+                self, talker, start_ts, limit=500, offset=0, media=False,
+                not_found_ok=False, retry_on_empty=True,
+            ):
+                raise RuntimeError(f"fail {talker}")
+
+        client = _FailAllClient([])
+        window = now - 3600
+        sessions = [
+            SessionInfo(
+                source="weflow-legacy", session_id="g1", name="同名群",
+                is_group=True,
+            ),
+            SessionInfo(
+                source="weflow-legacy", session_id="g2", name="同名群",
+                is_group=True,
+            ),
+        ]
+        result = await we_poll(
+            client,
+            sessions,
+            _no_processed,
+            window_start_by_session={"g1": window, "g2": window},
+        )
+        self.assertEqual(result.failed_sessions, {"g1", "g2"})
+        self.assertEqual(
+            set(result.session_errors), {"g1", "g2"}, "同名群不得互相覆盖"
+        )
+
+
+class LegacyPagingGuardTest(unittest.IsolatedAsyncioTestCase):
+    """【核验 H2/A6】weflow-legacy 翻页去重与超窗计数的页内守卫。"""
+
+    def setUp(self):
+        self._hours = config.backfill_hours
+        config.backfill_hours = 24
+
+    def tearDown(self):
+        config.backfill_hours = self._hours
+
+    async def test_cross_page_duplicate_dropped_in_page(self):
+        """同一 serverId 跨页重复 → 页内即滤（对齐 qqflow）：重复条目不得
+        驻留 messages、不得重复进入 is_processed 查询（白烧查询与文章 XML
+        解析）。"""
+        now = int(time.time())
+        client = _LegacyScriptedClient(
+            [
+                {
+                    "messages": [_weflow_msg("m1", now), _weflow_msg("m2", now)],
+                    "hasMore": True,
+                },
+                # 第 2 页与第 1 页重叠 1 条（offset 漂移）
+                {
+                    "messages": [_weflow_msg("m2", now), _weflow_msg("m3", now)],
+                    "hasMore": False,
+                },
+            ]
+        )
+        seen_queries: list[list[str]] = []
+
+        async def tracking_processed(ids):
+            seen_queries.append(list(ids))
+            return set()
+
+        result = await we_poll(
+            client,
+            _enabled("weflow-legacy", "g1"),
+            tracking_processed,
+            window_start_by_session={"g1": now - _DAY},
+        )
+        ids = [m.msg_id for m in result.messages]
+        self.assertEqual(len(ids), len(set(ids)), f"无重复: {ids}")
+        self.assertEqual(set(ids), {"m1", "m2", "m3"})
+        self.assertTrue(seen_queries, "应发生过已处理查询")
+        self.assertTrue(
+            all(len(q) == len(set(q)) for q in seen_queries),
+            f"is_processed 查询不应含重复 id: {seen_queries}",
+        )
+
+    async def test_old_count_includes_full_page_tail(self):
+        """超窗消息同页多条：session_old 全数计入（此前仅首个触窗条计入/
+        候选循环恒 0，INFO「超窗口」计数误导回填诊断）。"""
+        now = int(time.time())
+        window = now - 3600
+        # 3 条窗口内 + 5 条超窗（同页触边后整页尾部全计）
+        messages = [_weflow_msg(f"m{i}", now - 10) for i in range(3)]
+        messages.extend(
+            _weflow_msg(f"o{i}", window - 1 - i) for i in range(5)
+        )
+        client = _WeFlowLegacyClient(messages)
+        with self.assertLogs(
+            "briefdesk.plugins.weflow_legacy.poller", level="INFO"
+        ) as logs:
+            await we_poll(
+                client,
+                _enabled("weflow-legacy", "g1"),
+                _no_processed,
+                window_start_by_session={"g1": window},
+            )
+        self.assertTrue(
+            any("5 超窗口" in m for m in logs.output),
+            f"会话行应含完整超窗计数: {logs.output}",
+        )
+
+    async def test_qqflow_old_count_includes_full_page_tail(self):
+        """qqflow 同款计数（改动与 legacy 同构）。"""
+        now = int(time.time())
+        window = now - 3600
+        messages = [_qqflow_msg(i, now - 10) for i in range(1, 4)]
+        messages.extend(
+            _qqflow_msg(10 + i, window - 1 - i) for i in range(5)
+        )
+        client = _QqFlowClient(messages)
+        with self.assertLogs(
+            "briefdesk.plugins.qqflow.poller", level="INFO"
+        ) as logs:
+            await qq_poll(
+                client,
+                _enabled("qqflow", "g1"),
+                _no_processed,
+                window_start_by_session={"g1": window},
+            )
+        self.assertTrue(
+            any("5 超窗口" in m for m in logs.output),
+            f"会话行应含完整超窗计数: {logs.output}",
+        )
 
 
 class PagingAgeEarlyStopTest(unittest.IsolatedAsyncioTestCase):

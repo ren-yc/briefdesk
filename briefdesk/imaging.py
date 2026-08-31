@@ -41,8 +41,9 @@ def downscale_image(
 
     处理链：解码 → EXIF 方向校正 → RGB 转换（透明通道平铺白底，防透明区
     落黑底干扰识别）→ 超边长等比缩放（LANCZOS）→ JPEG 编码；超 max_bytes
-    先降质量（60）再降边长（减半）各一次，仍超则返回最后一次结果（尽力
-    而为——返回略超预算的图好过整条消息丢失图片上下文）。
+    依次降质量（85→60→40→30）试档，仍超则边长对半缩再试各档，直到缩至
+    max_side/4 仍超才返回 None（逐图降级，与解码失败同语义——单图失败
+    好过超限字节堆满多图请求触发端点 413，令整批 vision_fallback 降级）。
     """
     if not data:
         return None
@@ -64,19 +65,30 @@ def downscale_image(
                     (max(1, round(width * scale)), max(1, round(height * scale))),
                     Image.Resampling.LANCZOS,
                 )
-            encoded = _encode_jpeg(img, quality)
-            if encoded is None:
+
+            def _try_qualities(image: Image.Image) -> bytes | None:
+                for q in (quality, 60, 40, 30):
+                    encoded = _encode_jpeg(image, q)
+                    if encoded is not None and len(encoded) <= max_bytes:
+                        return encoded
                 return None
-            if len(encoded) <= max_bytes:
-                return encoded
-            shrunk = _encode_jpeg(img, quality=60)
-            if shrunk is not None and len(shrunk) <= max_bytes:
-                return shrunk
-            smaller = img.resize(
-                (max(1, img.width // 2), max(1, img.height // 2)),
-                Image.Resampling.LANCZOS,
-            )
-            return _encode_jpeg(smaller, quality=60)
+
+            fitted = _try_qualities(img)
+            if fitted is not None:
+                return fitted
+            # 质量阶梯耗尽仍超预算：边长对半缩（高噪声/高细节图的主要
+            # 超限因素），每档再试质量阶梯；缩至 max_side/4 仍超则放弃
+            side = max(img.size)
+            while side >= max_side // 4:
+                img = img.resize(
+                    (max(1, img.width // 2), max(1, img.height // 2)),
+                    Image.Resampling.LANCZOS,
+                )
+                fitted = _try_qualities(img)
+                if fitted is not None:
+                    return fitted
+                side //= 2
+            return None
     except Exception:  # noqa: BLE001 — 任何解码/处理失败一律降级为 None
         logger.debug("图片归一化失败，跳过该图（%d bytes）", len(data))
         return None

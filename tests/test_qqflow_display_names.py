@@ -397,7 +397,8 @@ class PollerDisplayNameTest(unittest.IsolatedAsyncioTestCase):
         result = await poll(client, self._enabled(), no_processed)
         self.assertEqual(result.messages, [])
         self.assertEqual(result.failed_sessions, {"10001"})
-        self.assertIn("messages down", result.session_errors["项目群"])
+        # session_errors 以 session_id 为键（同名群互不覆盖，核验 C2）
+        self.assertIn("messages down", result.session_errors["10001"])
 
     async def test_messages_503_skips_session(self):
         client = _NotReadyMessagesClient(

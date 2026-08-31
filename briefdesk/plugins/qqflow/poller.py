@@ -207,10 +207,10 @@ async def poll(
                 # 短页却仍报 hasMore=true 时，定长步进会跳过中间那批行。
                 offset += len(msgs)
 
-                for msg in msgs:
+                for idx, msg in enumerate(msgs):
                     # 响应按时间倒序：一旦碰到早于窗口的消息，本页其余只会更旧
                     if msg.get("createTime", 0) < cutoff:
-                        session_old += 1
+                        session_old += len(msgs) - idx
                         hit_old = True
                         break
                     # IGNORE_SELF 预滤：自己发送的消息不进候选（不标记
@@ -294,7 +294,9 @@ async def poll(
             # failed_sessions 与 session_errors，其余会话照常处理；此处自带
             # 栈记录，整轮兜底 ERROR 出口不再由本路径触发。
             result.failed_sessions.add(session_id)
-            result.session_errors[label] = str(e)
+            # 以 session_id 为键：同名群（如多个「通知群」）同轮失败互不覆盖，
+            # 应用层 len(session_errors) 计数才准确（label 仅用于日志）
+            result.session_errors[session_id] = str(e)
             logger.exception("会话「%s」拉取失败，本轮跳过", label)
             continue
 

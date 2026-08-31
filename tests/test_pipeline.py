@@ -747,7 +747,9 @@ class ImageFilterWhenNoEnrichTest(_StageTestBase):
         ), patch("briefdesk.pipeline.set_status"), patch(
             "briefdesk.pipeline.publish_items_updated", new=AsyncMock()
         ):
-            await process_all_batches(messages, _pipeline_client(), origin="test")
+            return await process_all_batches(
+                messages, _pipeline_client(), origin="test"
+            )
 
     @staticmethod
     def _img_msg(mid, content="[图片]", **kw):
@@ -848,6 +850,18 @@ class ImageFilterWhenNoEnrichTest(_StageTestBase):
         classify = AsyncMock()
         raw_rows = []
         await self._run([self._img_msg("m1")], classify, raw_rows)
+        classify.assert_not_called()
+        self.assertEqual(raw_rows, [])
+
+    async def test_all_images_filtered_returns_true(self):
+        """【核验 C1】全滤（纯占位符图片、OCR 未启用）时返回 True——**有意**
+        语义：被滤消息不落 raw、钉窗不可见，推进水位即「终态过滤」（重新启用
+        OCR 不会自动重拉）；与「零产出 return False 保留待回填」语义相反。
+        钉住该契约，防后续重构误改为 False 令水位永不前进。"""
+        classify = AsyncMock()
+        raw_rows = []
+        ok = await self._run([self._img_msg("m1")], classify, raw_rows)
+        self.assertTrue(ok)
         classify.assert_not_called()
         self.assertEqual(raw_rows, [])
 

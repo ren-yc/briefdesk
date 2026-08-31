@@ -1,5 +1,6 @@
 """去重辅助逻辑单元测试（不调用 AI / 不访问 DB）。"""
 
+import asyncio
 import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
@@ -48,6 +49,41 @@ class AskAiParseFailureTest(unittest.IsolatedAsyncioTestCase):
                 for m in cm.output),
             f"缺少解析失败的降级 WARNING：{cm.output}",
         )
+
+
+class CollectVerdictsCancellationTest(unittest.IsolatedAsyncioTestCase):
+    """【核验 H1】_collect_verdicts 遇 CancelledError 必须向上传播，不得整形
+    为 None 当「判定失败」降级——取消是关闭/中断语义，不是判定失败。"""
+
+    async def test_cancelled_child_error_propagates(self):
+        engine = DedupEngine()
+        cand = SimpleNamespace(title="候选A", source_quote="qa")
+
+        async def cancelled_chat(*args, **kwargs):
+            raise asyncio.CancelledError()
+
+        with patch(
+            "briefdesk.plugins.dedup.engine.chat", new=cancelled_chat
+        ), self.assertRaises(asyncio.CancelledError):
+            await engine._collect_verdicts([(cand, 0.9)], "B", "qb", "测试取消")
+
+    async def test_regular_failure_still_degrades_to_none(self):
+        """非取消异常维持既有降级语义：整形为 None + WARNING，不中止整批。"""
+        engine = DedupEngine()
+        cand = SimpleNamespace(title="候选A", source_quote="qa")
+
+        async def failing_chat(*args, **kwargs):
+            raise RuntimeError("上游 5xx")
+
+        with (
+            patch("briefdesk.plugins.dedup.engine.chat", new=failing_chat),
+            self.assertLogs("briefdesk.plugins.dedup.engine", level="WARNING") as cm,
+        ):
+            out = await engine._collect_verdicts(
+                [(cand, 0.9)], "B", "qb", "按反对票计"
+            )
+        self.assertEqual(out, [None])
+        self.assertTrue(any("判定失败" in m for m in cm.output))
 
 
 class JudgePromptTest(unittest.TestCase):

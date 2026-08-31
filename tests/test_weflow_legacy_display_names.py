@@ -382,7 +382,8 @@ class PollerDisplayNameTest(unittest.IsolatedAsyncioTestCase):
         result = await poll(client, enabled, no_processed)
         self.assertEqual(result.messages, [], "失败会话的消息不得入库")
         self.assertEqual(result.failed_sessions, {"g1"})
-        self.assertIn("group members down", result.session_errors["项目群"])
+        # session_errors 以 session_id 为键（同名群互不覆盖，核验 C2）
+        self.assertIn("group members down", result.session_errors["g1"])
 
 
 class RuntimeRefreshSessionsTest(unittest.IsolatedAsyncioTestCase):

@@ -480,15 +480,30 @@ async def close_db() -> None:
 
     aiosqlite 的 worker 线程是非 daemon 的，若不关闭连接，
     它会永久阻塞在队列上，解释器退出 join 该线程时挂死。
+
+    双连接各自 try/finally 关闭：任一连接 close 抛错（如磁盘忙/线程异常）
+    不阻断另一连接——否则残留的非 daemon worker 线程会让解释器退出挂死
+    （与关闭路径要防的故障同源）。
     """
     global _db, _embed_db
+    embed_err: BaseException | None = None
     if _embed_db is not None:
-        await _embed_db.close()
-        _embed_db = None
-    if _db is None:
-        return
-    await _db.close()
-    _db = None
+        try:
+            await _embed_db.close()
+        except Exception as e:  # noqa: BLE001 — 关闭失败不阻断另一连接
+            embed_err = e
+        finally:
+            _embed_db = None
+    if _db is not None:
+        try:
+            await _db.close()
+        except Exception as e:  # noqa: BLE001 — 同上，记录后继续收尾
+            if embed_err is None:
+                embed_err = e
+        finally:
+            _db = None
+    if embed_err is not None:
+        logger.error("关闭数据库连接失败: %r", embed_err)
 
 
 # ── 查询助手（游标纪律：所有游标必须显式关闭，禁止依赖 GC）──

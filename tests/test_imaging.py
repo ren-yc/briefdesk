@@ -62,12 +62,30 @@ class DownscaleImageTest(unittest.TestCase):
         self.assertIsNotNone(capped)
         self.assertLess(len(capped), len(uncapped))
 
-    def test_unreachable_max_bytes_still_returns_jpeg(self):
-        # 尽力而为语义：降级链耗尽仍超预算时返回最后一次结果而非 None
-        out = downscale_image(_png((400, 400)), max_bytes=1)
-        self.assertIsNotNone(out)
-        with Image.open(io.BytesIO(out)) as img:
-            self.assertEqual(img.format, "JPEG")
+    def test_unreachable_max_bytes_returns_none(self):
+        # 降级链（质量 85→60→40→30 → 边长对半缩至 max_side/4）耗尽仍超预算
+        # 时返回 None（逐图降级，与解码失败同语义）——宁可丢一张图，也不让
+        # 超限字节堆满多图请求触发端点 413、令整批 vision_fallback 降级
+        self.assertIsNone(downscale_image(_png((400, 400)), max_bytes=1))
+
+    def test_noisy_image_capped_to_budget(self):
+        # 高噪声图是超预算的主要形态（JPEG 对高频细节压缩率差）：输出必须
+        # ≤ max_bytes，或彻底放弃（None）——绝不能返回超限字节
+        import random
+
+        rng = random.Random(42)
+        noisy = Image.new("RGB", (1200, 1200))
+        noisy.putdata([(rng.randrange(256), rng.randrange(256), rng.randrange(256))
+                       for _ in range(1200 * 1200)])
+        buf = io.BytesIO()
+        noisy.save(buf, "PNG")
+        out = downscale_image(buf.getvalue(), max_bytes=200_000)
+        if out is not None:
+            self.assertLessEqual(len(out), 200_000)
+        # 预算极紧时宁可放弃也不超限
+        out_tight = downscale_image(buf.getvalue(), max_bytes=1_000)
+        if out_tight is not None:
+            self.assertLessEqual(len(out_tight), 1_000)
 
 
 if __name__ == "__main__":

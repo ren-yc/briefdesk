@@ -1735,6 +1735,32 @@ class EmbeddingsDbTest(unittest.IsolatedAsyncioTestCase):
         # 关闭后按需重建新连接，数据仍在（同一库文件）
         self.assertEqual((await load_embeddings("m"))["a"], [1.0])
 
+    async def test_close_db_closes_main_even_if_embed_close_fails(self):
+        """【核验 H3】_embed_db.close 抛错不得阻断 _db.close：残留的非 daemon
+        worker 线程会让解释器退出挂死（与关闭路径要防的故障同源），且两个
+        全局引用都必须置 None，保证后续按需重建不悬挂旧连接。"""
+        import briefdesk.db as db_module
+
+        await get_db()  # 主连接
+        await upsert_embeddings([("a", "m", [1.0])])  # 向量连接
+
+        embed_db = db_module._embed_db
+        main_db = db_module._db
+        self.assertIsNotNone(embed_db)
+        self.assertIsNotNone(main_db)
+
+        with (
+            patch.object(
+                embed_db, "close", side_effect=RuntimeError("模拟 close 失败")
+            ),
+            patch.object(main_db, "close") as main_close_mock,
+        ):
+            await close_db()
+
+        main_close_mock.assert_awaited_once()
+        self.assertIsNone(db_module._embed_db)
+        self.assertIsNone(db_module._db)
+
 
 # ── 审查修复回归测试（内存库，不触碰应用数据库文件）──
 

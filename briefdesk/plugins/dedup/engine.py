@@ -416,6 +416,10 @@ class DedupEngine(DedupService):
         )
         out: list[bool | None] = []
         for (cand, _score), res in zip(candidates, raw):
+            if isinstance(res, asyncio.CancelledError):
+                # 取消必须穿透，不能降级为「判定失败」：关闭/中断语义下
+                # 整形为 None 会掩盖取消信号，令上层误以为只是判定失败
+                raise res
             if isinstance(res, BaseException):
                 logger.warning(
                     '  "%s" 判定失败，%s: %r', cand.title, fail_note, res

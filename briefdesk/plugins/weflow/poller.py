@@ -201,6 +201,8 @@ async def poll(
             # 统一翻页：所有模式都按 offset 递增直至 hasMore=False / 空页；
             # _MAX_PAGES 仅为防异常状态下的无界循环守卫（全量/异常时打 WARNING）
             messages: list[WeFlowMessage] = []
+            seen_server_ids: set[str] = set()  # 翻页期间上游插入 → offset 漂移产生跨页重复
+            session_old = 0
             offset = 0
             hit_old = False
             for page in range(_MAX_PAGES):
@@ -215,13 +217,22 @@ async def poll(
                 page_msgs = resp.get("messages", [])
                 if not page_msgs:
                     break
-                for m in page_msgs:
+                for idx, m in enumerate(page_msgs):
                     # 响应按时间倒序：一旦碰到早于窗口的消息，本页其余只会更旧
                     # ——对齐 qqflow 的 hit_old 早停（复核 P2-12）：防上游无视
                     # start 参数时深翻历史（上限 40 万条全量驻留内存）
                     if m.get("createTime", 0) < cutoff:
+                        session_old += len(page_msgs) - idx
                         hit_old = True
                         break
+                    msg_id = str(m["serverId"])
+                    if msg_id in seen_server_ids:
+                        # 同一条消息跨页重复（offset 翻页期间上游插入导致漂移）：
+                        # 页内即滤（对齐 qqflow），避免重复消息驻留内存、重复
+                        # 查询已处理/重复解析文章 XML
+                        logger.debug("重复 serverId 跳过（翻页漂移）: %s", msg_id)
+                        continue
+                    seen_server_ids.add(msg_id)
                     messages.append(m)
                 offset += len(page_msgs)
                 if hit_old or not resp.get("hasMore"):
@@ -254,19 +265,14 @@ async def poll(
             processed_set = await is_processed(msg_ids)
 
             candidates: list[WeFlowMessage] = []
-            seen_server_ids: set[str] = set()  # 翻页期间上游插入 → offset 漂移产生跨页重复
             session_new = 0
             session_skipped = 0
-            session_old = 0
             session_processed = 0
             session_self = 0
 
             for msg in messages:
                 if "isSend" in msg:
                     saw_is_send_field = True
-                if msg.get("createTime", 0) < cutoff:
-                    session_old += 1
-                    continue
                 if not pre_filter_rest(msg):
                     session_skipped += 1
                     total_skipped += 1
@@ -278,12 +284,8 @@ async def poll(
                     continue
 
                 msg_id = str(msg["serverId"])
-                if msg_id in seen_server_ids:
-                    # 同一条消息跨页重复（offset 翻页期间上游插入导致漂移）：
-                    # 只保留先到者，避免重复入管道触发唯一键冲突/重复分类
-                    logger.debug("重复 serverId 跳过（翻页漂移）: %s", msg_id)
-                    continue
-                seen_server_ids.add(msg_id)
+                # 注：翻页期跨页重复已在页内循环用 seen_server_ids 过滤
+                # （见上），messages 中不存在重复 serverId，此处无需再查
                 if msg_id in processed_set:
                     session_processed += 1
                     continue
@@ -354,7 +356,9 @@ async def poll(
             # （应用层汇总进 lastWarning），其余会话照常处理。此处自带栈
             # 记录：整轮兜底 ERROR 出口不再由本路径触发。
             result.failed_sessions.add(session_id)
-            result.session_errors[label] = str(e)
+            # 以 session_id 为键：同名群（如多个「通知群」）同轮失败互不覆盖，
+            # 应用层 len(session_errors) 计数才准确（label 仅用于日志）
+            result.session_errors[session_id] = str(e)
             logger.exception("会话「%s」拉取失败，本轮跳过", label)
             continue
 

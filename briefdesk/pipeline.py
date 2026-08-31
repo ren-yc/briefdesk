@@ -255,6 +255,14 @@ async def process_all_batches(
             enabled_filtered,
             processed_filtered,
         )
+        # ⚠️ 此处 return True 是**有意**行为，与下方「零产出 return False」语义相反，
+        # 勿改成 False（会令水位永不前进）：
+        #   * True = 本轮到达终态，可推进水位。被滤消息（自消息/纯占位符图片/
+        #     非启用会话/已处理）**均无 raw_messages 行**，钉窗机制看不到它们，
+        #     推进水位即「本次为终态过滤」，重新启用 OCR 也不会自动重拉（需
+        #     停用/启用会话清水位或 BACKFILL_HOURS=-1 全量回填，见上方注释）；
+        #   * False = 消息保留待回填（无启用类别 / 阶段插件缺失 / 分类全失败），
+        #     不得推进水位，下轮回填窗口内自动重试。
         return True
 
     if batch_size is None:
