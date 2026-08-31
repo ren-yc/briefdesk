@@ -195,7 +195,7 @@ async def validate_schema(db: aiosqlite.Connection) -> None:
 
 
 class ItemInput(TypedDict):
-    """`items` 表字段的唯一定义源 — 除 DB 生成的 id/created_at 与两个专用
+    """`items` 表字段的插入定义源 — 除 DB 生成的 id/created_at 与两个专用
     更新列（verified_at 由 update_item_verify 写入、remind_at 由
     set_item_reminder 写入，均不参与 insert）外的全部插入字段。
 
@@ -797,7 +797,7 @@ async def _backfill_default_categories(db: aiosqlite.Connection) -> None:
 
     背景：默认分类从 5 类扩到 13 类，但播种仅在类别表为空时触发——
     升级前创建的库永远见不到新类。本函数对全部默认分类 INSERT OR IGNORE
-    （去重依赖 categories.name 的 UNIQUE 约束）：
+    （去重依赖 categories.name 的 UNIQUE 约束，按 name 去重）：
     只补缺失项且带各自出厂启用态（原五类=1、新增八类=0），绝不改动已有行，
     因此用户对既有分类的禁用/改名不受影响。
 

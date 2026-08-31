@@ -7,7 +7,7 @@
 
 嵌入为硬依赖：ctx.ai 缺失或未启用嵌入（EMBED_* 未配置）时 setup 抛
 PluginDisabledError 自禁用——同 ocr 缺可选依赖、qqflow 缺必填配置的自禁用
-语义。raw_messages 仍是唯一事实源，rag 三表只是派生索引。
+语义。raw_messages 仍是唯一事实源，rag 四表（chunks/embeddings/fts/skipped，另有 rag_meta）只是派生索引。
 """
 
 from __future__ import annotations

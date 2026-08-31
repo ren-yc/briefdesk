@@ -99,7 +99,7 @@ _SCHEMA = [
 
 
 async def ensure_rag_schema(db: aiosqlite.Connection) -> None:
-    """创建 rag 三张基础表（幂等；FTS 表由 ensure_fts 惰性创建）。"""
+    """创建 rag 四张基础表（chunks/embeddings/meta/skipped 幂等；FTS 表由 ensure_fts 惰性创建）。"""
 
     for ddl in _SCHEMA:
         await db.execute(ddl)

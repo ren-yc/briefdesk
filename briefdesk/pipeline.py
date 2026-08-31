@@ -203,8 +203,8 @@ async def process_all_batches(
             )
 
     # 计数日志：仅自消息/纯占位符图片过滤后的数量——启用会话与已处理过滤
-    # 在其下执行（过滤量在末尾 summary 单独汇总），故「处理 N 条」是进入
-    # 分类的上界而非精确值
+    # 随后执行（过滤量在末尾 summary 单独汇总），故「处理 N 条」是进入
+    # 分类的上界而非精确值（非最终进入 classify 的条数）
     logger.info("%s 处理: %d 条 (源 %s)", origin, len(messages), source)
     enabled_rows = await get_enabled_sessions(source)
     enabled_ids = {r["session_id"] for r in enabled_rows}

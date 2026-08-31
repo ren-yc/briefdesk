@@ -30,8 +30,8 @@ _COLOR_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
 def _validate_category_fields(body: dict, *, name_required: bool = False) -> str | None:
     """校验类别字段，非法时返回错误消息（None 表示通过）。
 
-    名称 strip 后非空、≤20 字；提示词 ≤50 字；颜色匹配 #RRGGBB。
-    长度上限与前端输入框 maxlength 保持一致（见 ui/index.html）。
+    名称 strip 后非空、≤20 字；提示词 ≤200 字；颜色匹配 #RRGGBB。
+    名称上限与前端 maxlength 一致；提示词 200 为后端放宽（前端仍 50，见 ui/index.html）。
     """
     name_raw = body.get("name")
     prompt = body.get("prompt")
