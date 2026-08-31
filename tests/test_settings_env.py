@@ -174,7 +174,8 @@ class SettingsFileTest(StagedFileTestCase):
 class PriorityChainTest(unittest.TestCase):
     def test_staged_file_beats_dotenv_and_env_beats_staged(self) -> None:
         # 暂存文件（后加载）优先于 .env；环境变量优先于暂存文件
-        with tempfile.TemporaryDirectory() as d:
+        # 排除宿主环境 LOG_LEVEL 干扰（本地可能预置该变量）
+        with _env_without("LOG_LEVEL"), tempfile.TemporaryDirectory() as d:
             root = Path(d)
             env_a = root / "a.env"
             env_b = root / "b.env"
@@ -230,15 +231,17 @@ class EnvRoutesTest(StagedFileTestCase):
         )
 
     def test_put_stages_and_get_reports_override(self) -> None:
-        res = self.client.put(
-            "/api/settings/env", json={"items": {"LOG_LEVEL": "DEBUG"}}
-        )
-        self.assertEqual(res.status_code, 200)
-        self.assertEqual(read_staged(), {"LOG_LEVEL": "DEBUG"})
-        data = self.client.get("/api/settings/env").json()
-        log_level = next(i for i in data["items"] if i["key"] == "LOG_LEVEL")
-        self.assertEqual(log_level["staged"], "DEBUG")
-        self.assertEqual(log_level["source"], "override")
+        # 宿主环境若预置 LOG_LEVEL，会使 source 判定为 env 而非 override；测试内隔离该变量
+        with _env_without("LOG_LEVEL"):
+            res = self.client.put(
+                "/api/settings/env", json={"items": {"LOG_LEVEL": "DEBUG"}}
+            )
+            self.assertEqual(res.status_code, 200)
+            self.assertEqual(read_staged(), {"LOG_LEVEL": "DEBUG"})
+            data = self.client.get("/api/settings/env").json()
+            log_level = next(i for i in data["items"] if i["key"] == "LOG_LEVEL")
+            self.assertEqual(log_level["staged"], "DEBUG")
+            self.assertEqual(log_level["source"], "override")
 
     def test_put_multi_json_array(self) -> None:
         res = self.client.put(

@@ -19,7 +19,7 @@ import logging
 import time as time_module
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
-from typing import Any, Literal, TypedDict
+from typing import Any, Literal, NotRequired, TypedDict
 
 import httpx
 
@@ -102,7 +102,7 @@ class WeFlowMedia(TypedDict):
 
     上游 `message_json` 恒下发 type/fileName/md5 与空串 url/localPath；
     media=1 且该条导出成功时，导出流水线回填 url/localPath 并补 exported=true
-    （未导出的消息无 exported 键，故用 total=False 语义按 get 访问）。
+    （未导出的消息无 exported 键，故声明为 NotRequired，访问一律按 get）。
     """
 
     type: Literal["image", "voice", "video", "emoji", "file"]
@@ -110,7 +110,7 @@ class WeFlowMedia(TypedDict):
     md5: str
     url: str  # 完整下载 URL（含 ?access_token= 查询参数；未导出时为空串）
     localPath: str  # 导出后的本地绝对路径；未导出时为空串
-    exported: bool  # 仅导出成功时出现
+    exported: NotRequired[bool]  # 仅导出成功时出现
 
 
 class WeFlowMessage(TypedDict):
@@ -164,9 +164,12 @@ _LOOKUP_LIMIT = 200
 # 良性 = 已受理或已就绪，可记忆化，索引期内不重复注册。
 _BENIGN_REGISTER_STATES = ("accepted", "already_ready", "in_progress")
 
-# /health 的标量 account 阶段中「引导中」的取值（v0.5.0 起）。ready 单独判定，
-# unregistered / error 落到注册分支。注意与上面的 status 词表不是一回事：
-# awaiting_key 不会出现在 account 阶段里（未注册即 unregistered）。
+# 「引导中」的取值 indexing：同时存在于两套词表，一个常量服务两处比对——
+# /health 的标量 account 阶段（v0.5.0 起）identity_ok 且 phase == indexing
+# 即服务端已在引导；注册响应的 status（awaiting_key / indexing / ready /
+# error）为 indexing 时同样良性可记忆。ready 单独判定，unregistered /
+# error 落到注册分支。两套词表不是一回事：awaiting_key 只出现在注册
+# status 里（/health 未注册即 unregistered）。
 _BOOTSTRAPPING_PHASES = ("indexing",)
 
 # /health 的标量 account 阶段中，代表「服务端已被某个账号占用」的取值。上游

@@ -99,9 +99,10 @@ class WeFlowSettings(BaseSettings):
         """把 WEFLOW_DB_KEYS / WEFLOW_DB_KEYS_2 的 JSON 字符串合并解析为
         {相对路径: hex} 映射。
 
-        未配置 / 非法 JSON / 形状不符（值非 64 位 hex）时返回空 dict，
-        并记 WARNING——`keys` 是可选增强项，缺失不应阻断其它字段的读取，
-        由上层决定是否据此自禁用。
+        两段各自独立解析后合并：非法 JSON / 非 JSON 对象记 WARNING 并丢弃
+        该段（另一段有效仍返回非空）；键或值非字符串的条目静默跳过；不校验
+        hex 形状，值按原样保留。两段均未配置/无效时返回空 dict——`keys` 是
+        可选增强项，缺失不应阻断其它字段的读取，由上层决定是否据此自禁用。
         """
         result: dict[str, str] = {}
         for field_name, key_name in (("db_keys", "WEFLOW_DB_KEYS"), ("db_keys_2", "WEFLOW_DB_KEYS_2")):

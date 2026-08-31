@@ -51,12 +51,11 @@ _JUDGE_USER_TEMPLATE = """卡片A（先出现）：
 def _build_judge_user_message(
     title_a: str, desc_a: str, title_b: str, desc_b: str
 ) -> str:
-    """填充判官 user 消息（用 replace 而非 format：数据可能含花括号）。"""
-    return (
-        _JUDGE_USER_TEMPLATE.replace("{title_a}", title_a)
-        .replace("{desc_a}", desc_a)
-        .replace("{title_b}", title_b)
-        .replace("{desc_b}", desc_b)
+    """填充判官 user 消息（单遍正则 _fill_template：数据值里的字面量占位符
+    不会被二次替换——顺序 replace 链在数据含 "{desc_b}" 之类字面量时会误替换）。"""
+    return _fill_template(
+        _JUDGE_USER_TEMPLATE,
+        {"title_a": title_a, "desc_a": desc_a, "title_b": title_b, "desc_b": desc_b},
     )
 
 

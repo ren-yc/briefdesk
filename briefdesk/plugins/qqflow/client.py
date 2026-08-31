@@ -550,8 +550,10 @@ class QqFlowClient(SourceClient):
             start: 起始时间（秒级 Unix 时间戳，含该时间），None 为不限
             limit: 单页条数（服务端上限 10000）
             offset: 分页偏移
-            not_found_ok: 会话不存在（404，如已被删除/重建的脏会话）时
-                返回空信封而非抛错；轮询路径应传 True（对齐 weflow
+            not_found_ok: 上游 404 时返回空信封而非抛错。按 v1 契约会话
+                不存在并不 404（返回 success=true 的空信封，见
+                qqflow-server-api.md「JSON 响应字段」），此开关兜底上游
+                版本差异等异常 404；轮询路径应传 True（对齐 weflow
                 brandsessionholder 等系统会话的容错）
 
         Returns:
@@ -580,8 +582,9 @@ class QqFlowClient(SourceClient):
 
         SSE 事件无发送者标识，IGNORE_SELF 开启时需按 rawid（= REST localId）
         回查方向信息；用 timestamp 缩小查询范围（向前 120s），在返回的
-        消息中匹配 localId == rawid。回查失败/未命中返回 None，由调用方
-        fail-open 放行。503 走 QqFlowNotReadyError 瞬态语义。
+        消息中匹配 localId == rawid。回查未命中返回 None；回查失败（异常）
+        向上抛出，由调用方 fail-open 放行并记 WARNING。503 走
+        QqFlowNotReadyError 瞬态语义。
         刷屏场景下目标消息可能被窗口内更新的消息挤出首页，limit 放宽到
         _LOOKUP_LIMIT（200）。
         """

@@ -4,7 +4,7 @@
 实现，经 PluginContext.register_stage 注册到 briefdesk.stages；本模块只做
 编排，不 import 任何具体 AI/OCR 实现：
 
-  盖章 → 过滤（自消息/启用会话/纯占位符图片（OCR 未启用）/已处理）→ raw 落库 → 切批
+  盖章 → 过滤（自消息/纯占位符图片（OCR 未启用）/启用会话/已处理）→ raw 落库 → 切批
   → 并行：enrich + classify（锁外）
   → 串行（_storage_lock 内）：dedup（判重/入库/缓存）→ 跳过标记 → post_insert（合并）
   → 锁外：dedup/post_insert 的 after_run（向量落库等收尾）→ 计数 → 状态 → 实时通知
@@ -202,7 +202,9 @@ async def process_all_batches(
                 images_filtered,
             )
 
-    # 过滤后计数：日志中的「处理 N 条」即真正进入分类的消息数（自消息已剔除）
+    # 计数日志：仅自消息/纯占位符图片过滤后的数量——启用会话与已处理过滤
+    # 在其下执行（过滤量在末尾 summary 单独汇总），故「处理 N 条」是进入
+    # 分类的上界而非精确值
     logger.info("%s 处理: %d 条 (源 %s)", origin, len(messages), source)
     enabled_rows = await get_enabled_sessions(source)
     enabled_ids = {r["session_id"] for r in enabled_rows}

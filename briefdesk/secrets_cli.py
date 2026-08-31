@@ -45,7 +45,9 @@ def _cmd_set(args: argparse.Namespace) -> int:
 def _cmd_get(args: argparse.Namespace) -> int:
     name = _valid_name(args.name)
     value = get_secret(name)
-    if value is None:
+    if not value:
+        # 空条目与未配置同语义（真值判定，见 secrets_store 模块 docstring），
+        # 展示口径与解析层一致
         print(f"{name}: 未配置")
         return 1
     if args.reveal:
@@ -64,7 +66,8 @@ def _cmd_rm(args: argparse.Namespace) -> int:
 
 def _cmd_list(args: argparse.Namespace) -> int:
     for name in SECRET_NAMES:
-        print(f"{name}: {'已配置' if get_secret(name) is not None else '未配置'}")
+        # 真值判定：空条目与未配置同语义（对齐 secrets_store 的解析口径）
+        print(f"{name}: {'已配置' if get_secret(name) else '未配置'}")
     return 0
 
 

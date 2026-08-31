@@ -188,8 +188,12 @@ class PluginManager:
                 continue
             except Exception as e:
                 # 装配失败先 best-effort 回收副作用再标 failed。回收范围以插件
-                # teardown 自身实现为准：内置插件的资源获取严格先于各类注册，
-                # 无可达残留路径；第三方插件需自行保证 teardown 覆盖其注册行为。
+                # teardown 自身实现为准：内置插件大体满足"资源获取先于各类
+                # 注册"，但并非严格无可达残留——ai_provider 的注册（ai_ports/
+                # ctx.ai）先于 setup 内可失败的 announce，失败窗口 teardown
+                # 只清 ai_ports 与 _provider，ctx.ai 残留；dedup 的事件订阅
+                # 同理不退订（窗口仅 setup 抛错时可达，影响面小）。第三方
+                # 插件需自行保证 teardown 覆盖其注册行为。
                 await self._best_effort_teardown(name, plugin)
                 self._mark(name, "failed", f"setup 失败: {e!r}")
                 logger.exception("插件 %s setup 失败", name)

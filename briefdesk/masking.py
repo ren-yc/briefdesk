@@ -7,7 +7,9 @@
 - PLACEHOLDER_ONLY_RE：纯附件占位符判定（pipeline 入口过滤与 dedup 原文短路共用）
 
 模块化设计：纯函数、只依赖标准库 re/unicodedata，被 types.py（构造即
-脱敏/净化）、pipeline.py（OCR 合并/入库）与 db.py（主体时间线查询）调用。
+脱敏/净化）、plugins/ocr（OCR 文本入库前脱敏）、pipeline.py（入口占位符
+判定）、plugins/dedup 与 plugins/merge（主体名归一化的写入侧）与 db.py
+（主体时间线查询）调用。
 """
 
 import re
@@ -69,9 +71,9 @@ def _replace(match: re.Match[str]) -> str:
 # 撞型」的聚合误伤——真实 PII 分组至多 5 段（手机号 3 段、银行卡 ≤5 段），
 # 而 12 13 … 19（8 段）、301-302-…-306（6 段）、2024-01-15 - 2024-01-20
 # （6 段）这类非 PII 写法段数必然更多。
-# 整段不构成 PII 时再按空白切分逐段独立判定（空格几乎总是语义边界，
-# 「日期␣138-0013-8000」里段内连字符分隔的真手机号依赖此路径救回），
-# 空白分隔符以捕获组原样回填——不丢失任何字符，保证幂等。
+# 整段不构成 PII 时再按空白/全角连字符切分逐段独立判定（空白与全角连字符
+# 几乎总是语义边界，「日期␣138-0013-8000」里段内连字符分隔的真手机号依赖
+# 此路径救回），分隔符以捕获组原样回填——不丢失任何字符，保证幂等。
 _SEP_RUN_RE = re.compile(
     r"(?<![0-9０-９])[＋+]?[0-9０-９][0-9０-９\- －　]*[0-9０-９](?![0-9０-９])"
 )
@@ -79,7 +81,9 @@ _SEP_RUN_RE = re.compile(
 # 候选串切段：连字符与空格（半/全角）都是分组分隔符
 _RUN_SEG_SPLIT_RE = re.compile(r"[\-－ 　]+")
 
-# 空白切分（捕获组保留分隔符，供逐段判定后原样回填）
+# 空白/全角连字符切分（捕获组保留分隔符，供逐段判定后原样回填；
+# 刻意不含半角连字符——段内连字符写法的真手机号（138-0013-8000）须整体
+# 参与段级判定，不能在此被拆开）
 _RUN_WS_SPLIT_RE = re.compile(r"([ －　]+)")
 
 
@@ -115,7 +119,7 @@ def _sep_run_repl(match: re.Match[str]) -> str:
     placeholder = _classify_run(run)
     if placeholder:
         return placeholder
-    # 整段不构成 PII：按空白切分逐段独立判定，空白分隔符原样回填
+    # 整段不构成 PII：按空白/全角连字符切分逐段独立判定，分隔符原样回填
     out: list[str] = []
     for part in _RUN_WS_SPLIT_RE.split(run):
         if not part:
@@ -166,8 +170,8 @@ _SPACE_RE = re.compile(r"\s+")
 def normalize_subject(name: str | None) -> str:
     """NFKC + 空白折叠/trip + 小写的主体名归一化；空输入返回 ""。
 
-    写入（pipeline 入库）与查询（db.get_items_by_subject/get_subject_count）
-    共用同一规则，保证双向一致。
+    写入（dedup/merge 插件入库侧）与查询（db.get_items_by_subject/
+    get_subject_count）共用同一规则，保证双向一致。
     """
     if not name:
         return ""

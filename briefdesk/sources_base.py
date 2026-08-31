@@ -136,11 +136,16 @@ async def fetch_all_pages(
     Returns:
         去重后的完整列表（顺序为上游返回顺序）
 
-    终止条件按优先级：
-    1. 响应带 `hasMore` → 以它为准（确定信号）；
-    2. 无 `hasMore` → 本页条数 < page_size 视为末页（旧上游兼容）；
-    3. **本页未带来任何新项** → 立即终止并告警。这一条是防御：上游若忽略
-       `offset`（版本过旧），前两条都不会成立，循环会永远重复取第一页。
+    终止条件按逐页检查顺序：
+    1. 空页 / 缺列表键 → 无数据即止；
+    2. **本页未带来任何新项** → 立即终止并告警。这一条是防御兜底：上游若
+       忽略 `offset`（版本过旧），hasMore 恒 True、页恒满，下面的终止条件
+       永不成立，循环会永远重复取第一页；
+    3. 响应带 `hasMore` → 以它为准（确定信号）；
+    4. 无 `hasMore` → 本页条数 < page_size 视为末页（旧上游兼容）。
+    已知角落：末页恰逢整页重复且 `hasMore=False`（翻页期间上游数据变动
+    把最后一条挤成全重复）会先触发 2 的告警，文案「可能不支持 offset」
+    失真——终止与数据完整性不受影响，属可接受误报。
     """
     items: list[dict[str, Any]] = []
     seen: set[Any] = set()
@@ -224,7 +229,8 @@ def session_log_prefix(index: int, total: int, label: str) -> str:
 class BatchBuffer:
     """按数量或超时批量刷新消息的缓冲区。
 
-    跨源共享（weflow-legacy/qqflow 监听器共用），勿在各插件包另立副本。
+    跨源共享（weflow/weflow-legacy/qqflow 三家监听器共用），勿在各插件包
+    另立副本。
     """
 
     def __init__(self, on_flush: BatchHandler):

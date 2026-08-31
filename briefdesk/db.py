@@ -195,7 +195,9 @@ async def validate_schema(db: aiosqlite.Connection) -> None:
 
 
 class ItemInput(TypedDict):
-    """`items` 表字段的唯一定义源 — 除 DB 生成的 id/created_at 外的全部字段。
+    """`items` 表字段的唯一定义源 — 除 DB 生成的 id/created_at 与两个专用
+    更新列（verified_at 由 update_item_verify 写入、remind_at 由
+    set_item_reminder 写入，均不参与 insert）外的全部插入字段。
 
     可空列声明为 `str | None`（键必在、值可为 None）：insert_item 与
     `SELECT *` 查询行都满足该形状。
@@ -222,7 +224,8 @@ class ItemInput(TypedDict):
 
 
 class ItemRow(ItemInput):
-    """Row from the `items` table — ItemInput 加 DB 生成的 id/created_at/verified_at。"""
+    """Row from the `items` table — ItemInput 加 DB 生成的 id/created_at/
+    verified_at，另加仅查询行携带的 remind_at。"""
 
     id: str
     created_at: str
@@ -749,7 +752,8 @@ async def init_schema(db: aiosqlite.Connection) -> None:
 async def _seed_default_categories(db: aiosqlite.Connection) -> None:
     """类别表为空时播种默认分类（当前 13 类，出厂仅启用原五类；用户删光重启后恢复）。
 
-    与 schema DDL 同事务提交，get_db 是唯一 DB 入口，首次使用时必然播种。
+    与 schema DDL 同事务提交；get_db 与 get_embed_db 两个 DB 入口首次使用时
+    都会执行播种（后者为独立向量连接上的兜底 init_schema），首次使用必然播种。
     """
     row = await _fetchone(db, "SELECT COUNT(*) as cnt FROM categories")
     if row and row["cnt"] > 0:
@@ -792,7 +796,8 @@ async def _backfill_default_categories(db: aiosqlite.Connection) -> None:
     """一次性升级迁移（user_version 0→1）：为存量库补齐缺失的默认分类。
 
     背景：默认分类从 5 类扩到 13 类，但播种仅在类别表为空时触发——
-    升级前创建的库永远见不到新类。本函数按 name 前缀 INSERT OR IGNORE：
+    升级前创建的库永远见不到新类。本函数对全部默认分类 INSERT OR IGNORE
+    （去重依赖 categories.name 的 UNIQUE 约束）：
     只补缺失项且带各自出厂启用态（原五类=1、新增八类=0），绝不改动已有行，
     因此用户对既有分类的禁用/改名不受影响。
 
@@ -1960,17 +1965,17 @@ async def bulk_upsert_contacts(rows: list[tuple[str, str, str]]) -> None:
 # ── Raw Messages ──
 
 
-# raw_messages 单条 SQL 插入的行数上限：SQLite 单语句变量上限 32766，
-# 每行 9 个占位符，500 行 = 4500 参数，远低于上限且留足余量
-# （整批一次拼接在回填超 ~3640 条时会抛 "too many SQL variables"）。
+# raw_messages 分块写入的块大小：executemany 按行绑定（每次执行 9 个参数，
+# 不拼接单条大 SQL），本就不受 SQLite 32766 变量上限约束；500 仅控制单次
+# executemany 调用的参数列表内存，无正确性含义
 _RAW_INSERT_CHUNK = 500
 
 
 async def bulk_insert_raw_messages(messages: list[RawMsgInput]) -> None:
     """批量写入 raw_messages（单事务）；INSERT OR IGNORE 幂等。
 
-    分块 executemany 落库：避免单条 SQL 拼接全部行触发 SQLite 变量上限
-    （32766 个，超过 ~3640 行即报错导致整轮回填失败）。
+    分块 executemany 落库（每行独立绑定参数，非单条 SQL 拼接），块大小
+    仅控制单次调用的参数列表内存。
     """
     if not messages:
         return
@@ -2195,7 +2200,8 @@ async def upsert_embeddings(rows: list[tuple[str, str, list[float]]]) -> None:
     独立 embed 连接 + _embed_lock 串行 + 游标先 close 再 commit：
     杜绝"活动语句未终结就 COMMIT"导致的 OperationalError
     （cannot commit transaction - SQL statements in progress）。
-    跨连接写锁竞争（database is locked）按指数退避重试（最多 3 次）。
+    跨连接写锁竞争（database is locked）按线性退避重试（0.1s 逐次递增，
+    最多 3 次）。
     """
     if not rows:
         return

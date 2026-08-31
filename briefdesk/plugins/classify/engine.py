@@ -958,7 +958,7 @@ async def _extract_times_core(
             max_tokens=_TIME_MAX_TOKENS,
         )
     except Exception as e:  # noqa: BLE001 — 时间提取失败回退，不中断管道
-        # 带原因，同 _summarize_titles：AI 侧故障需要在默认级别可自助定位。
+        # 带原因，同 summarize_results：AI 侧故障需要在默认级别可自助定位。
         logger.warning("时间提取请求失败（start/end/times 留空）: %s", e)
         return
     if not resp.choices:  # 异常响应（空 choices）防御
@@ -1014,7 +1014,7 @@ async def classify_batch(
     cats = await get_enabled_categories()
     if not cats:
         # 正常路径由 pipeline 入口在切批前统一拦截；此处仅兜底"本批检查期间
-        # 类别被全部停用"的竞态。必须抛错而非返回空：空结果会被 _store_batch
+        # 类别被全部停用"的竞态。必须抛错而非返回空：空结果会被 _mark_skipped
         # 整批标记 processed，即使重新启用类别也无法回填（永久丢失）。
         raise RuntimeError("没有启用的类别，拒绝空分类（避免整批误标记 processed）")
 
@@ -1128,7 +1128,7 @@ async def _classify_once(
             [m.content for m in messages], ambiguous,
         )
     except (RuntimeError, TypeError) as e:
-        # 结构错误/越界 index/task 不匹配等：拆半无益，本轮抛弃，下轮回填
+        # 结构错误/越界 index 等：拆半无益，本轮抛弃，下轮回填
         logger.warning("AI 响应解析失败（本轮抛弃，下轮回填）: %s", e)
         return ClassifyOutcome([], [offset + i for i in range(len(messages))])
 
