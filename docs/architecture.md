@@ -2,7 +2,7 @@
 
 > 本文档是 briefdesk 架构细节的单一汇总处，面向需要理解或修改代码的开发者与 AI agent。
 > **同步更新义务**：修改模块职责、插件体系、DB schema、server 路由或配置项时，必须同步更新本文对应小节。
-> 分工：`README.md` 面向使用者的快速上手；`AGENTS.md` 只承载协作规则与质量门禁；本文承载全部架构细节。
+> 分工：`README.md` 面向使用者的快速上手；`docs/USAGE.md` 面向普通用户的日常使用手册；`AGENTS.md` 只承载协作规则与质量门禁；本文承载全部架构细节。
 
 ## 定位
 
@@ -65,7 +65,7 @@ weflow-server :5033        WeFlow(legacy) :5031        qqflow-server :5032
 | `briefdesk/plugins/ocr/engine.py` | RapidOCR（基于 ONNX Runtime，CPU 推理）图片文字识别。只接收图片字节（`ocr_image_bytes`/`ocr_images_bytes`），不接触 URL/HTTP/鉴权；下载归消息源客户端（`SourceClient.download_media`）。无文字图片（rapidocr 抛 `RapidOCRError`）视为“未识别到文字”返回空串，不向调用方抛错；引擎故障等其余异常仍向上抛（pipeline 侧对 OCR 调用有 try 兜底，单条失败不拖垮批次）。OCR 文本经 `mask_content` 脱敏后以 `[OCR]` 前缀**替换** content。懒加载单例引擎。**依赖可选**：rapidocr/onnxruntime 为 `ocr` extra（`pip install briefdesk[ocr]`），未安装时本模块不可导入、OCR 插件自禁用。 |
 | `briefdesk/announcements.py` | 应用级公告注册表——持续性条件的顶部横幅（如嵌入服务未启用/不可用）：`announce(code, level, message)`/`revoke(code)` 仅内容变化时发布 `announcements_updated` SSE 事件（失败重试不刷屏），`get_announcements()` 返回 since 升序快照。快照同时经 `/api/status` 的 `announcements` 字段下发。探测点：ai_provider setup（未配置 → `embedding_disabled`）与 `engine.embed_texts` 唯一咽喉（异常 → `embedding_unreachable`、成功 → 撤销）；vision 路由两个探测点——classify 含图请求级失败（`vision_fallback`，vision 成功撤销）与 pipeline 入口「vision 开启但 enrich 槽为空」（`vision_without_ocr`，配置组合守卫）。与 `lastWarning`（管道成功产出即清空的瞬态提示）互补；前端公告条 `#announcements` 复用 warning 横幅样式，× 关闭仅当次会话。 |
 | `briefdesk/realtime.py` | 进程内发布/订阅：`publish_items_updated()`（列表刷新）与 `publish_sync_progress()`（同步进度事件）把事件推给所有订阅队列（队列项为 `(事件名, data JSON)` 二元组），由 server 的 `/api/stream` SSE 按事件名转发给前端。订阅队列满丢弃事件累计 `_dropped_count`（`get_dropped_count()` 只读诊断口）。 |
-| `briefdesk/status.py` | 应用运行时状态 + 消息源注册表：`set_status`/`get_status_info`/`is_syncing`、`register_source_client`/`get_source_client`、`set_listener`/`get_listener`。pipeline/poll_cycle 与 server 都只依赖本模块（不互相依赖），避免业务层反向依赖 HTTP 层。**相对时间展示在前端**：卡片行 `relativeTime` 与状态面板 `relativeSync` 均由前端按 `msg_time`/`lastSync` 自行计算（`relativeTimeStr`/`itemRelativeTime`/`syncRelativeText`），本模块只下发原始时间数据。**同步进度（新增消息数）**：`SyncProgress` 快照（startedAt/newCount/pendingCount/processedCount/done）+ `note_sync_batch_start`/`note_sync_batch_done` 由 pipeline 入口/出口调用（单事件循环内同步原子，无需加锁），经 `get_status_info().syncProgress` 与 `sync_progress` SSE 事件下发，突发边界按 pending 归零划分。 |
+| `briefdesk/status.py` | 应用运行时状态 + 消息源注册表：`set_status`/`get_status_info`/`is_syncing`、`register_source_client`/`get_source_client`、`set_listener`/`get_listener`。pipeline/poll_cycle 与 server 都只依赖本模块（不互相依赖），避免业务层反向依赖 HTTP 层。**相对时间展示在前端**：卡片行 `relativeTime` 与状态面板 `relativeSync` 均由前端按 `msg_time`/`lastSync` 自行计算（`relativeTimeStr`/`itemRelativeTime`/`syncRelativeText`），本模块只下发原始时间数据。**同步进度（新增消息数）**：`SyncProgress` 快照（startedAt/newCount/pendingCount/processedCount/done）+ `note_sync_batch_start`/`note_sync_batch_done` 由 pipeline 入口/出口调用（单事件循环内同步原子，无需加锁），经 `get_status_info().syncProgress` 与 `sync_progress` SSE 事件下发，突发边界按 pending 归零划分；**startedAt 同突发内严格递增**（同微秒连续触发时 +1µs，`5e85d46`——前端以 startedAt 区分突发，相等时间戳会被误认成同一突发）。 |
 | `briefdesk/sync.py` | 同步服务：`set_sync_callback` + `trigger_sync()`（fire-and-forget 全源轮询任务，syncing 互斥，结束后经 realtime 广播 `synced`）。main 启动与 `/api/sync` 共用。 |
 | `briefdesk/config.py` | `pydantic-settings` from `[.env, UI 暂存文件]`（密钥型字段以 `SecretStr` 持有，repr/序列化自动掩码；密钥解析链见「配置解析链」小节）。含 `plugins`（`PLUGINS`，默认 `["*"]`，JSON 数组，**消息源启用的唯一开关**，weflow-legacy/qqflow 为内置插件）、`plugins_disabled`/`plugins_required`/`plugin_path`、`db_path`（默认 `briefdesk.sqlite`）、`server_port`（3000）、`backfill_hours`（24）、`log_level`（`LOG_LEVEL`，默认 `"INFO"`，logger.py 读取）、`realtime_batch_max_count`/`realtime_batch_timeout_ms`（实时批缓冲，跨源公共）、`backfill_batch_max_count`（回填切批）、AI 模型等。插件专属配置（`WEFLOW_*`/`WEFLOW_LEGACY_*`/`QQFLOW_*`/`RAG_*`）在各插件包的 `config.py`，不占 app 级配置——前缀归插件所有，核心 `Settings` 不得声明同前缀字段（会被 `build_settings_schema` 派生成「核心密钥」抢占插件条目）。 |
 | `briefdesk/settings_env.py` | UI「启动配置」暂存层：`get_settings_file()`（`platformdirs.user_config_dir("briefdesk")/settings.env`，可经 `BRIEFDESK_SETTINGS_FILE` 覆盖）、`read_staged`/`write_staged`（`KEY=VALUE` 行、原子写、空则删文件）、`source_of`（override/env/dotenv/default 判定）。不 import config（config 在 import 期构造 env_file 列表）。 |
@@ -220,7 +220,7 @@ All via `.env` file, with an additional UI-staged overlay layer (see 「密钥�
 - 密钥环不可用（无桌面会话 / 无 Secret Service / 未安装 keyring）或 `BRIEFDESK_KEYRING=0` 时**静默回退**环境变量 → `.env` → 默认值（读路径永不阻断启动）；`.env` 与既有使用方式完全兼容，已配置密钥无需迁移；
 - 密钥**绝不回写 `.env` / 暂存文件明文**；CLI `get` 默认只显示「是否配置 + 长度」，`--reveal` 才打印明文；
 - **Gotcha（pydantic-settings 合并语义）**：各 source 的输出键必须一致——Env 源按**字段别名**输出（`AI_API_KEY`），自定义源若按字段名输出（`ai_api_key`）会出现同字段双键，传给 pydantic 时**别名键总是胜出**，与 source 顺序无关，导致 keyring 层被环境变量静默覆盖。`KeyringSource._key_for_field` 按别名输出键规避此陷阱（守卫测试：`tests/test_secrets_store.py` 的优先级链用例）。
-- **预提交密钥扫描**：`scripts/secret_scan.py` 只扫描 staged 新增行中的密钥形态（`sk-`/`AKIA`/PEM 私钥块/本项目密钥环境变量非空赋值），命中即拒绝提交；经 `scripts/install-hooks.ps1` 安装为 pre-commit 钩子（守卫测试：`tests/test_secret_scan.py`）。
+- **预提交密钥扫描**：`scripts/secret_scan.py` 只扫描 staged 新增行中的密钥形态（`sk-`/`AKIA`/PEM 私钥块/本项目密钥环境变量非空赋值），命中即拒绝提交；经 `scripts/install-hooks.ps1` 安装为 pre-commit 钩子（守卫测试：`tests/test_secret_scan.py`；Windows 控制台 cp1252 下 stdout 重配 utf-8/replace，中文输出不再 UnicodeEncodeError）。
 
 ## 设计要点与陷阱
 
