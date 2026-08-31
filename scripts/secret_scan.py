@@ -15,6 +15,15 @@ import re
 import subprocess
 import sys
 
+# CI Windows runner 默认 stdout 编码为 cp1252，中文输出会 UnicodeEncodeError；
+# 尽早切到 utf-8（失败则静默忽略，由 errors=replace 的 fallback 兜底）
+if hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[union-attr]
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[union-attr]
+    except Exception:  # noqa: BLE001, S110
+        pass
+
 _KNOWN_SECRET_ENV = (
     "AI_API_KEY",
     "EMBED_API_KEY",
