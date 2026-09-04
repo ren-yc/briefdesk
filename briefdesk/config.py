@@ -1,12 +1,11 @@
 """应用配置 — pydantic-settings 从 .env 读取，含默认值。"""
 
 from pathlib import Path
+from typing import ClassVar
 
 from pydantic import Field, SecretStr
-from pydantic_settings import BaseSettings, PydanticBaseSettingsSource
 
-from briefdesk.secrets_store import KeyringSource
-from briefdesk.settings_env import get_settings_file
+from briefdesk.settings_base import KeyringSettingsBase
 
 # 项目根目录（briefdesk/config.py 上溯两级）：.env 与默认 DB 路径均以此为基准，
 # 保证从任意工作目录启动（python main.py / python -m briefdesk / briefdesk）读到同一份配置，
@@ -14,15 +13,15 @@ from briefdesk.settings_env import get_settings_file
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 
-# 密钥解析链（keyring > 环境变量 > .env > 默认值）：
-# 系统密钥环由 CLI `briefdesk secrets set` 写入，见 briefdesk/secrets_store.py
-_KEYRING_FIELDS = {
-    "ai_api_key": "AI_API_KEY",
-    "embed_api_key": "EMBED_API_KEY",
-}
+class Settings(KeyringSettingsBase):
+    """应用配置，从 .env 读取，密钥字段支持系统密钥环。"""
 
-
-class Settings(BaseSettings):
+    # 密钥解析链（keyring > 环境变量 > .env > 默认值）：
+    # 系统密钥环由 CLI `briefdesk secrets set` 写入，见 briefdesk/secrets_store.py
+    KEYRING_FIELDS: ClassVar[dict[str, str]] = {
+        "ai_api_key": "AI_API_KEY",
+        "embed_api_key": "EMBED_API_KEY",
+    }
     plugins: list[str] = Field(default=["*"], alias="PLUGINS")
     """启用的插件名列表（JSON 数组；"*" = 全部发现的插件）。
     消息源启用的唯一开关：weflow-legacy/qqflow 等源插件由本开关控制。"""
@@ -136,29 +135,9 @@ class Settings(BaseSettings):
     """日志级别（DEBUG / INFO / WARNING / ERROR / CRITICAL），由 logger.py 读取。"""
 
     model_config = {
-        "env_file": [PROJECT_ROOT / ".env", get_settings_file()],
-        "env_file_encoding": "utf-8",
+        **KeyringSettingsBase.model_config,
         "populate_by_name": True,
-        "extra": "ignore",
     }
-
-    @classmethod
-    def settings_customise_sources(
-        cls,
-        settings_cls: type[BaseSettings],
-        init_settings: PydanticBaseSettingsSource,
-        env_settings: PydanticBaseSettingsSource,
-        dotenv_settings: PydanticBaseSettingsSource,
-        file_secret_settings: PydanticBaseSettingsSource,
-    ) -> tuple[PydanticBaseSettingsSource, ...]:
-        """来源优先级：init 参数 > 系统密钥环 > 环境变量 > .env > 默认值。"""
-        return (
-            init_settings,
-            KeyringSource(settings_cls, _KEYRING_FIELDS),
-            env_settings,
-            dotenv_settings,
-            file_secret_settings,
-        )
 
 
 config = Settings()

@@ -12,6 +12,7 @@ teardown 关闭 runtime（幂等）。
 from typing import Any
 
 from briefdesk.plugin.base import PluginContext, PluginDisabledError, SourcePlugin
+from briefdesk.plugin.config_helpers import validate_required_config
 from briefdesk.settings_schema import build_settings_schema
 from briefdesk.sources_base import SourceRuntime
 
@@ -60,16 +61,14 @@ class WeFlowPlugin(SourcePlugin):
         from briefdesk.plugins.weflow import runtime as wf_runtime
 
         settings = wf_config.WeFlowSettings()
-        required = (
-            ("WEFLOW_API_TOKEN", settings.api_token.get_secret_value()),
-            ("WEFLOW_WXID", settings.wxid),
-        )
-        missing = [name for name, value in required if not value]
+        validate_required_config(settings, {
+            'api_token': 'WEFLOW_API_TOKEN',
+            'wxid': 'WEFLOW_WXID',
+        })
         if not settings.db_keys_map:
-            missing.append("WEFLOW_DB_KEYS(+WEFLOW_DB_KEYS_2)")
-        if missing:
             raise PluginDisabledError(
-                f"缺少必填配置 {', '.join(missing)}（在 .env / 系统密钥环中配置后重启生效）"
+                "缺少必填配置 WEFLOW_DB_KEYS(+WEFLOW_DB_KEYS_2)"
+                "（在 .env / 系统密钥环中配置后重启生效）"
             )
         runtime = wf_runtime.WeFlowSource()
         ctx.register_source(runtime)

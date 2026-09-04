@@ -539,6 +539,84 @@ async def _fetchall(
 
 
 @asynccontextmanager
+async def atomic_transaction(db: aiosqlite.Connection) -> AsyncIterator[aiosqlite.Connection]:
+    """原子事务上下文管理器：成功提交，失败回滚。
+
+    用于多步数据库操作，确保事务完整性。异常路径自动回滚后重新抛出。
+
+    示例：
+        async with atomic_transaction(db):
+            await db.execute("UPDATE ...")
+            await db.execute("DELETE ...")
+        # 成功则已提交，异常则已回滚
+    """
+    try:
+        yield db
+        await db.commit()
+    except Exception:
+        await db.rollback()
+        raise
+
+
+async def _execute_chunked(
+    db: aiosqlite.Connection,
+    sql_template: str,
+    id_list: list[str],
+    chunk_size: int = 900,
+    *,
+    extra_params: tuple[Any, ...] = (),
+    fetch: bool = True,
+) -> list[aiosqlite.Row]:
+    """分块执行 IN 查询，避免超过 SQLite 变量上限（32766）。
+
+    Args:
+        db: 数据库连接
+        sql_template: SQL模板，必须包含 {placeholders} 占位符
+        id_list: ID列表
+        chunk_size: 每批大小（默认900）
+        extra_params: 额外的固定参数（如 source），会放在 id_list 之前
+        fetch: True=返回查询结果，False=仅执行（用于DELETE/UPDATE）
+
+    Returns:
+        fetch=True 时返回所有行的列表，False 时返回空列表
+
+    示例：
+        # 查询
+        rows = await _execute_chunked(
+            db,
+            "SELECT msg_id FROM processed_messages WHERE source = ? AND msg_id IN ({placeholders})",
+            msg_ids,
+            extra_params=(source,)
+        )
+
+        # 删除
+        await _execute_chunked(
+            db,
+            "DELETE FROM items WHERE id IN ({placeholders})",
+            item_ids,
+            fetch=False
+        )
+    """
+    if not id_list:
+        return []
+
+    results = []
+    for i in range(0, len(id_list), chunk_size):
+        chunk = id_list[i : i + chunk_size]
+        placeholders = ",".join("?" * len(chunk))
+        sql = sql_template.format(placeholders=placeholders)
+        params = (*extra_params, *chunk)
+
+        if fetch:
+            rows = await _fetchall(db, sql, params)
+            results.extend(rows)
+        else:
+            await db.execute(sql, params)
+
+    return results
+
+
+@asynccontextmanager
 async def _cursor(
     db: aiosqlite.Connection,
     sql: str,
@@ -1257,7 +1335,7 @@ async def delete_items(ids: list[str], *, keep_raw_messages: bool = False) -> in
         return 0
     db = await get_db()
     placeholders = ",".join("?" for _ in ids)
-    try:
+    async with atomic_transaction(db):
         await db.execute(
             f"DELETE FROM item_embeddings WHERE item_id IN ({placeholders})", tuple(ids)
         )
@@ -1273,12 +1351,6 @@ async def delete_items(ids: list[str], *, keep_raw_messages: bool = False) -> in
             tuple(ids),
         ) as cursor:
             deleted = cursor.rowcount
-    except Exception:
-        # 多步写异常路径必须回滚：悬挂事务会被下一个不相干写操作的
-        # commit 收尾提交，造成部分写入提前可见
-        await db.rollback()
-        raise
-    await db.commit()
     return deleted
 
 
@@ -1415,36 +1487,30 @@ async def update_item_merged(
     """
     db = await get_db()
     content_hash = hashlib.sha256(source_quote.encode()).hexdigest()[:16]
-    await db.execute(
-        "UPDATE items SET title = ?, key_info = ?, "
-        "source_quote = ?, subject = ?, start = ?, end = ?, "
-        "msg_time = ?, image_urls = ?, extra_times = ?, content_hash = ?, "
-        "article_url = ? WHERE id = ?",
-        (
-            title,
-            key_info or None,
-            source_quote,
-            subject or None,
-            start or None,
-            end or None,
-            msg_time,
-            image_urls,
-            extra_times,
-            content_hash,
-            article_url or "",
-            item_id,
-        ),
-    )
-    try:
+    async with atomic_transaction(db):
+        await db.execute(
+            "UPDATE items SET title = ?, key_info = ?, "
+            "source_quote = ?, subject = ?, start = ?, end = ?, "
+            "msg_time = ?, image_urls = ?, extra_times = ?, content_hash = ?, "
+            "article_url = ? WHERE id = ?",
+            (
+                title,
+                key_info or None,
+                source_quote,
+                subject or None,
+                start or None,
+                end or None,
+                msg_time,
+                image_urls,
+                extra_times,
+                content_hash,
+                article_url or "",
+                item_id,
+            ),
+        )
         await db.execute(
             "DELETE FROM item_embeddings WHERE item_id = ?", (item_id,)
         )
-    except Exception:
-        # 多步写异常路径必须回滚：悬挂事务被后续无关 commit 收尾提交后，
-        # 会留下"合并后新文本配旧向量"的语义漂移（docstring 上述要防的问题）
-        await db.rollback()
-        raise
-    await db.commit()
 
 
 # ── 提醒 / 日历 / 主体时间线 ──
@@ -1552,7 +1618,7 @@ async def purge_expired_ignored(expiry_hours: int) -> int:
     """
     db = await get_db()
     cutoff = (datetime.now(UTC) - timedelta(hours=expiry_hours)).isoformat()
-    try:
+    async with atomic_transaction(db):
         await db.execute(
             "DELETE FROM item_embeddings WHERE item_id IN ("
             "SELECT id FROM items WHERE is_verified = -1 AND verified_at <= ?"
@@ -1571,12 +1637,6 @@ async def purge_expired_ignored(expiry_hours: int) -> int:
             (cutoff,),
         ) as cursor:
             purged = cursor.rowcount
-    except Exception:
-        # 多步写异常路径必须回滚：悬挂事务会被下一个不相干写操作的
-        # commit 收尾提交，造成部分写入提前可见
-        await db.rollback()
-        raise
-    await db.commit()
     return purged
 
 
@@ -1593,20 +1653,14 @@ async def are_messages_processed(source: str, msg_ids: list[str]) -> set[str]:
     if not msg_ids:
         return set()
     db = await get_db()
-    found: set[str] = set()
-    for start in range(0, len(msg_ids), _PROCESSED_QUERY_CHUNK):
-        chunk = msg_ids[start : start + _PROCESSED_QUERY_CHUNK]
-        placeholders = ",".join("?" for _ in chunk)
-        # 物化读取（_fetchall）：流式 async for 会保持活动游标，与实时监听
-        # 管道并发 commit 时触发 "cannot commit transaction - SQL statements in progress"
-        rows = await _fetchall(
-            db,
-            f"SELECT msg_id FROM processed_messages WHERE source = ? "
-            f"AND msg_id IN ({placeholders})",
-            (source, *chunk),
-        )
-        found.update(row["msg_id"] for row in rows)
-    return found
+    rows = await _execute_chunked(
+        db,
+        "SELECT msg_id FROM processed_messages WHERE source = ? AND msg_id IN ({placeholders})",
+        msg_ids,
+        chunk_size=_PROCESSED_QUERY_CHUNK,
+        extra_params=(source,),
+    )
+    return {row["msg_id"] for row in rows}
 
 
 async def mark_message_processed(source: str, msg_id: str) -> None:
@@ -1753,7 +1807,7 @@ async def get_enabled_sessions(source: str) -> list[SessionRow]:
 
 async def toggle_session(source: str, session_id: str) -> SessionRow | None:
     db = await get_db()
-    try:
+    async with atomic_transaction(db):
         await db.execute(
             "UPDATE sessions SET enabled = CASE WHEN enabled = 1 THEN 0 ELSE 1 END "
             "WHERE source = ? AND session_id = ?",
@@ -1772,12 +1826,6 @@ async def toggle_session(source: str, session_id: str) -> SessionRow | None:
                 "WHERE source = ? AND session_id = ?",
                 (source, session_id),
             )
-    except Exception:
-        # 两步写必须原子：若「翻转 enabled」被提前提交而清水位失败，
-        # 该会话会按旧水位增量轮询、跳过旧水位至今的消息（回填窗口丢失）
-        await db.rollback()
-        raise
-    await db.commit()
     return cast(SessionRow, dict(row)) if row else None
 
 
@@ -1863,7 +1911,7 @@ async def update_category(
     if not row:
         return None
     old_name = row["name"]
-    try:
+    async with atomic_transaction(db):
         if name is not None:
             await db.execute("UPDATE categories SET name = ? WHERE id = ?", (name, cat_id))
             if name != old_name:
@@ -1879,12 +1927,6 @@ async def update_category(
             await db.execute(
                 "UPDATE categories SET color = ? WHERE id = ?", (color, cat_id)
             )
-    except Exception:
-        # 改名 + items 同步是两步写：中途失败若不回滚，悬挂事务被后续
-        # commit 收尾后会出现"类别已改、卡片未跟上"的孤儿卡片
-        await db.rollback()
-        raise
-    await db.commit()
     return await _get_category(db, cat_id)
 
 
@@ -1917,36 +1959,38 @@ async def delete_category(
     if not row:
         return None, []
     deleted_ids: list[str] = []
-    try:
+    async with atomic_transaction(db):
         if purge_items:
             rows = await _fetchall(
                 db, "SELECT id FROM items WHERE category = ?", (row["name"],)
             )
             deleted_ids = [r["id"] for r in rows]
-            # 按 IN 占位符预算分块：类别下卡片超过 SQLite 变量上限时
-            # 整条 DELETE 会抛 "too many SQL variables"，purge 整体失败
-            for start in range(0, len(deleted_ids), _SQL_VARS_CHUNK):
-                chunk = deleted_ids[start : start + _SQL_VARS_CHUNK]
-                placeholders = ",".join("?" for _ in chunk)
-                await db.execute(
-                    f"DELETE FROM item_embeddings WHERE item_id IN ({placeholders})",
-                    tuple(chunk),
+            if deleted_ids:
+                # 按 IN 占位符预算分块：类别下卡片超过 SQLite 变量上限时
+                # 整条 DELETE 会抛 "too many SQL variables"，purge 整体失败
+                await _execute_chunked(
+                    db,
+                    "DELETE FROM item_embeddings WHERE item_id IN ({placeholders})",
+                    deleted_ids,
+                    chunk_size=_SQL_VARS_CHUNK,
+                    fetch=False,
                 )
-                await db.execute(
-                    f"DELETE FROM raw_messages WHERE (source, msg_id) IN ("
-                    f"SELECT source, source_msg_id FROM items WHERE id IN ({placeholders}))",
-                    tuple(chunk),
+                await _execute_chunked(
+                    db,
+                    "DELETE FROM raw_messages WHERE (source, msg_id) IN ("
+                    "SELECT source, source_msg_id FROM items WHERE id IN ({placeholders}))",
+                    deleted_ids,
+                    chunk_size=_SQL_VARS_CHUNK,
+                    fetch=False,
                 )
-                await db.execute(
-                    f"DELETE FROM items WHERE id IN ({placeholders})", tuple(chunk)
+                await _execute_chunked(
+                    db,
+                    "DELETE FROM items WHERE id IN ({placeholders})",
+                    deleted_ids,
+                    chunk_size=_SQL_VARS_CHUNK,
+                    fetch=False,
                 )
         await db.execute("DELETE FROM categories WHERE id = ?", (cat_id,))
-    except Exception:
-        # 级联删除是三表多步写：中途失败若不回滚，悬挂事务被后续 commit
-        # 收尾后会留下删了一半的卡片（如 embeddings 删了但 items 还在）
-        await db.rollback()
-        raise
-    await db.commit()
     return cast(CategoryRow, dict(row)), deleted_ids
 
 
@@ -1995,7 +2039,7 @@ async def bulk_insert_raw_messages(messages: list[RawMsgInput]) -> None:
     if not messages:
         return
     db = await get_db()
-    try:
+    async with atomic_transaction(db):
         for start in range(0, len(messages), _RAW_INSERT_CHUNK):
             chunk = messages[start : start + _RAW_INSERT_CHUNK]
             params: list[Any] = []
@@ -2020,12 +2064,6 @@ async def bulk_insert_raw_messages(messages: list[RawMsgInput]) -> None:
                 [params[i : i + 9] for i in range(0, len(params), 9)],
             )
             await cursor.close()
-    except Exception:
-        # 多块写异常路径统一 rollback：虽 INSERT OR IGNORE 幂等（重拉无损），
-        # 悬挂事务被后续无关 commit 收尾仍会造成部分写入提前可见
-        await db.rollback()
-        raise
-    await db.commit()
 
 
 _OCR_MARKER_LINE_RE = re.compile(r"^\[(?:OCR|图片 \d+ OCR 结果)\]$")
@@ -2174,21 +2212,17 @@ async def get_item_texts_by_ids(item_ids: list[str]) -> list[ItemText]:
     if not item_ids:
         return []
     db = await get_db()
-    out: list[ItemText] = []
-    for i in range(0, len(item_ids), 900):
-        chunk = item_ids[i : i + 900]
-        placeholders = ",".join("?" * len(chunk))
-        rows = await _fetchall(
-            db,
-            "SELECT id, source, title, "
-            "COALESCE(content_hash, '') as content_hash, "
-            "COALESCE(image_urls, '') as image_urls, "
-            "COALESCE(source_quote, '') as source_quote "
-            f"FROM items WHERE id IN ({placeholders})",
-            tuple(chunk),
-        )
-        out.extend(cast(ItemText, dict(row)) for row in rows)
-    return out
+    rows = await _execute_chunked(
+        db,
+        "SELECT id, source, title, "
+        "COALESCE(content_hash, '') as content_hash, "
+        "COALESCE(image_urls, '') as image_urls, "
+        "COALESCE(source_quote, '') as source_quote "
+        "FROM items WHERE id IN ({placeholders})",
+        item_ids,
+        chunk_size=900,
+    )
+    return [cast(ItemText, dict(row)) for row in rows]
 
 
 async def load_embeddings(model: str) -> dict[str, list[float]]:

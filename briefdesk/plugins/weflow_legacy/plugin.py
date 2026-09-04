@@ -14,6 +14,7 @@ import logging
 from typing import Any
 
 from briefdesk.plugin.base import PluginContext, PluginDisabledError, SourcePlugin
+from briefdesk.plugin.config_helpers import validate_required_config
 from briefdesk.settings_schema import build_settings_schema
 from briefdesk.sources_base import SourceRuntime
 
@@ -56,11 +57,9 @@ class WeFlowLegacyPlugin(SourcePlugin):
         settings = wfl_config.WeFlowLegacySettings()
         # 必填校验与 weflow/qqflow 统一（决策 ①=1B：零源降级启动后，自禁用
         # 不再引发「唯一源中止启动」；.env.example 标注本项必填）
-        if not settings.api_token.get_secret_value():
-            raise PluginDisabledError(
-                "缺少必填配置 WEFLOW_LEGACY_API_TOKEN"
-                "（在 .env / 系统密钥环中配置后重启生效）"
-            )
+        validate_required_config(settings, {
+            'api_token': 'WEFLOW_LEGACY_API_TOKEN',
+        })
         runtime = wfl_runtime.WeFlowLegacySource()
         ctx.register_source(runtime)
         self._runtime = runtime

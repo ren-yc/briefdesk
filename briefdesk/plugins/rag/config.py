@@ -17,19 +17,21 @@ EMBED_BATCH_SIZE（经 ai_provider 插件注册的端口使用）。
 参考 qqflow / weflow 的同名机制。
 """
 
+from typing import ClassVar
+
 from pydantic import Field, SecretStr
-from pydantic_settings import BaseSettings, PydanticBaseSettingsSource
 
-from briefdesk.secrets_store import KeyringSource
-from briefdesk.settings_env import PROJECT_ROOT, get_settings_file
-
-# 密钥解析链（keyring > 环境变量 > .env > 默认值），见 briefdesk/secrets_store.py
-_KEYRING_FIELDS = {
-    "api_key": "RAG_API_KEY",
-}
+from briefdesk.settings_base import KeyringSettingsBase
 
 
-class RagSettings(BaseSettings):
+class RagSettings(KeyringSettingsBase):
+    """RAG 插件配置，密钥字段支持系统密钥环。"""
+
+    # 密钥解析链（keyring > 环境变量 > .env > 默认值），见 briefdesk/secrets_store.py
+    KEYRING_FIELDS: ClassVar[dict[str, str]] = {
+        "api_key": "RAG_API_KEY",
+    }
+
     top_k: int = Field(default=12, ge=1)  # env: RAG_TOP_K 向量召回条数
     fts_limit: int = Field(default=12, ge=1)  # env: RAG_FTS_LIMIT 关键词召回条数
     max_evidence: int = Field(default=10, ge=1)  # env: RAG_MAX_EVIDENCE 注入 prompt 的证据上限
@@ -52,27 +54,7 @@ class RagSettings(BaseSettings):
     api_key: SecretStr = SecretStr("")
 
     model_config = {
+        **KeyringSettingsBase.model_config,
         "env_prefix": "RAG_",  # top_k → RAG_TOP_K
-        "env_file": [PROJECT_ROOT / ".env", get_settings_file()],
-        "env_file_encoding": "utf-8",
-        # 同一 .env 里还有 app 级与其它插件的字段，忽略未知项
-        "extra": "ignore",
     }
 
-    @classmethod
-    def settings_customise_sources(
-        cls,
-        settings_cls: type[BaseSettings],
-        init_settings: PydanticBaseSettingsSource,
-        env_settings: PydanticBaseSettingsSource,
-        dotenv_settings: PydanticBaseSettingsSource,
-        file_secret_settings: PydanticBaseSettingsSource,
-    ) -> tuple[PydanticBaseSettingsSource, ...]:
-        """来源优先级：init 参数 > 系统密钥环 > 环境变量 > .env > 默认值。"""
-        return (
-            init_settings,
-            KeyringSource(settings_cls, _KEYRING_FIELDS),
-            env_settings,
-            dotenv_settings,
-            file_secret_settings,
-        )

@@ -16,26 +16,26 @@
 
 import json
 import logging
+from typing import ClassVar
 
 from pydantic import Field, SecretStr
-from pydantic_settings import BaseSettings, PydanticBaseSettingsSource
 
-from briefdesk.secrets_store import KeyringSource
-from briefdesk.settings_env import PROJECT_ROOT, get_settings_file
+from briefdesk.settings_base import KeyringSettingsBase
 
 logger = logging.getLogger(__name__)
 
-# 密钥解析链（keyring > 环境变量 > .env > 默认值），见 briefdesk/secrets_store.py
-_KEYRING_FIELDS = {
-    "api_token": "WEFLOW_API_TOKEN",
-    "img_aes_key": "WEFLOW_IMG_AES_KEY",
-    "img_xor_key": "WEFLOW_IMG_XOR_KEY",
-    "db_keys": "WEFLOW_DB_KEYS",
-    "db_keys_2": "WEFLOW_DB_KEYS_2",
-}
 
+class WeFlowSettings(KeyringSettingsBase):
+    """WeFlow 消息源配置，密钥字段支持系统密钥环。"""
 
-class WeFlowSettings(BaseSettings):
+    # 密钥解析链（keyring > 环境变量 > .env > 默认值），见 briefdesk/secrets_store.py
+    KEYRING_FIELDS: ClassVar[dict[str, str]] = {
+        "api_token": "WEFLOW_API_TOKEN",
+        "img_aes_key": "WEFLOW_IMG_AES_KEY",
+        "img_xor_key": "WEFLOW_IMG_XOR_KEY",
+        "db_keys": "WEFLOW_DB_KEYS",
+        "db_keys_2": "WEFLOW_DB_KEYS_2",
+    }
     # ── 非密钥字段（.env） ──
     api_base: str = "http://127.0.0.1:5033"  # env: WEFLOW_API_BASE
     wxid: str = ""  # env: WEFLOW_WXID（微信 ID，参与请求/路径拼装）
@@ -69,30 +69,9 @@ class WeFlowSettings(BaseSettings):
     )
 
     model_config = {
+        **KeyringSettingsBase.model_config,
         "env_prefix": "WEFLOW_",  # api_base → WEFLOW_API_BASE
-        "env_file": [PROJECT_ROOT / ".env", get_settings_file()],
-        "env_file_encoding": "utf-8",
-        # 同一 .env 里还有 app 级与其它源的字段，忽略未知项
-        "extra": "ignore",
     }
-
-    @classmethod
-    def settings_customise_sources(
-        cls,
-        settings_cls: type[BaseSettings],
-        init_settings: PydanticBaseSettingsSource,
-        env_settings: PydanticBaseSettingsSource,
-        dotenv_settings: PydanticBaseSettingsSource,
-        file_secret_settings: PydanticBaseSettingsSource,
-    ) -> tuple[PydanticBaseSettingsSource, ...]:
-        """来源优先级：init 参数 > 系统密钥环 > 环境变量 > .env > 默认值。"""
-        return (
-            init_settings,
-            KeyringSource(settings_cls, _KEYRING_FIELDS),
-            env_settings,
-            dotenv_settings,
-            file_secret_settings,
-        )
 
     @property
     def db_keys_map(self) -> dict[str, str]:

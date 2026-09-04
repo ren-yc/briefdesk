@@ -5,20 +5,21 @@ QQFLOW_API_TOKEN / QQFLOW_QQ / QQFLOW_KEY 为必填项，缺失时由
 QqFlowPlugin.setup 抛 PluginDisabledError 自禁用（见 briefdesk/plugins/qqflow/plugin.py）。
 """
 
+from typing import ClassVar
+
 from pydantic import Field, SecretStr
-from pydantic_settings import BaseSettings, PydanticBaseSettingsSource
 
-from briefdesk.secrets_store import KeyringSource
-from briefdesk.settings_env import PROJECT_ROOT, get_settings_file
-
-# 密钥解析链（keyring > 环境变量 > .env > 默认值），见 briefdesk/secrets_store.py
-_KEYRING_FIELDS = {
-    "api_token": "QQFLOW_API_TOKEN",
-    "key": "QQFLOW_KEY",
-}
+from briefdesk.settings_base import KeyringSettingsBase
 
 
-class QqFlowSettings(BaseSettings):
+class QqFlowSettings(KeyringSettingsBase):
+    """QqFlow 消息源配置，密钥字段支持系统密钥环。"""
+
+    # 密钥解析链（keyring > 环境变量 > .env > 默认值），见 briefdesk/secrets_store.py
+    KEYRING_FIELDS: ClassVar[dict[str, str]] = {
+        "api_token": "QQFLOW_API_TOKEN",
+        "key": "QQFLOW_KEY",
+    }
     api_base: str = "http://127.0.0.1:5032"  # env: QQFLOW_API_BASE
     api_token: SecretStr = SecretStr("")  # env: QQFLOW_API_TOKEN（必填，缺失→禁用源）
     qq: str = ""  # env: QQFLOW_QQ（必填，引导注册 QQ 号，缺失→禁用源）
@@ -43,27 +44,6 @@ class QqFlowSettings(BaseSettings):
     )
 
     model_config = {
+        **KeyringSettingsBase.model_config,
         "env_prefix": "QQFLOW_",  # api_base → QQFLOW_API_BASE
-        "env_file": [PROJECT_ROOT / ".env", get_settings_file()],
-        "env_file_encoding": "utf-8",
-        # 同一 .env 里还有 app 级与其它源的字段，忽略未知项
-        "extra": "ignore",
     }
-
-    @classmethod
-    def settings_customise_sources(
-        cls,
-        settings_cls: type[BaseSettings],
-        init_settings: PydanticBaseSettingsSource,
-        env_settings: PydanticBaseSettingsSource,
-        dotenv_settings: PydanticBaseSettingsSource,
-        file_secret_settings: PydanticBaseSettingsSource,
-    ) -> tuple[PydanticBaseSettingsSource, ...]:
-        """来源优先级：init 参数 > 系统密钥环 > 环境变量 > .env > 默认值。"""
-        return (
-            init_settings,
-            KeyringSource(settings_cls, _KEYRING_FIELDS),
-            env_settings,
-            dotenv_settings,
-            file_secret_settings,
-        )

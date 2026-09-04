@@ -50,9 +50,6 @@ Thumbs.db
 
 # Temp / debug scratch files
 tmp_*
-tmp*.sqlite
-tmp*.sqlite-wal
-tmp*.sqlite-shm
 *.tmp
 *.bak
 *_stub*.js
