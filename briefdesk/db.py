@@ -404,40 +404,72 @@ def _sqlite_item_is_expired(
     return int(item_is_expired(start, end, extra_times, now_local))
 
 
+async def _init_connection(
+    path: str,
+    *,
+    validate_schema_flag: bool = True,
+    extra_pragmas: dict[str, str] | None = None,
+) -> aiosqlite.Connection:
+    """初始化数据库连接并设置 PRAGMA。
+
+    Args:
+        path: 数据库文件路径
+        validate_schema_flag: 是否执行 schema 验证（主连接需要，向量连接不需要）
+        extra_pragmas: 额外的 PRAGMA 设置（如 foreign_keys）
+
+    Returns:
+        已初始化的数据库连接
+
+    Raises:
+        SchemaMismatchError: schema 验证失败（仅当 validate_schema_flag=True）
+        SystemExit: schema 不匹配时拒绝启动
+    """
+    conn = await aiosqlite.connect(path)
+    conn.row_factory = aiosqlite.Row
+
+    # 默认 PRAGMA 设置
+    default_pragmas = {
+        "journal_mode": "WAL",
+        "busy_timeout": "5000",
+        "synchronous": "NORMAL",  # WAL 下 NORMAL 仅掉电丢最近一次提交
+    }
+    all_pragmas = {**default_pragmas, **(extra_pragmas or {})}
+
+    for key, value in all_pragmas.items():
+        cursor = await conn.execute(f"PRAGMA {key} = {value}")
+        await cursor.close()
+    await conn.commit()
+
+    # Schema 初始化/验证
+    try:
+        if validate_schema_flag:
+            await validate_schema(conn)
+        await init_schema(conn)  # 幂等：补建缺失的表
+    except SchemaMismatchError as e:
+        logger.critical("数据库 schema 不匹配，拒绝启动: %s", e)
+        await conn.close()
+        raise SystemExit(1) from e
+    except Exception:
+        # init 其余异常（磁盘满/库损坏等）：关闭本连接再上抛，
+        # 否则泄漏的 aiosqlite 连接（非 daemon worker 线程）滞留
+        await conn.close()
+        raise
+
+    return conn
+
+
 async def get_db() -> aiosqlite.Connection:
     global _db
     if _db is None:
         async with _lock:
             if _db is None:
-                conn = await aiosqlite.connect(config.db_path)
-                conn.row_factory = aiosqlite.Row
-                cursor = await conn.execute("PRAGMA journal_mode = WAL")
-                await cursor.close()
-                cursor = await conn.execute("PRAGMA foreign_keys = ON")
-                await cursor.close()
                 # 与向量连接对称（审计 B-1）：embed 连接持写锁落向量期间，
                 # 主连接的写操作短暂等待而非立即抛 "database is locked"
-                cursor = await conn.execute("PRAGMA busy_timeout = 5000")
-                await cursor.close()
-                # WAL 下 NORMAL 仅掉电丢最近一次提交（应用崩溃不丢），消除
-                # 默认 FULL 的每 commit 一次 fsync——逐条小事务回填路径的
-                # 主要写放大来源
-                cursor = await conn.execute("PRAGMA synchronous = NORMAL")
-                await cursor.close()
-                await conn.commit()
-                try:
-                    await validate_schema(conn)
-                    await init_schema(conn)
-                except SchemaMismatchError as e:
-                    logger.critical("数据库 schema 不匹配，拒绝启动: %s", e)
-                    await conn.close()
-                    raise SystemExit(1) from e
-                except Exception:
-                    # init 其余异常（磁盘满/库损坏等）：关闭本连接再上抛，
-                    # 否则泄漏的 aiosqlite 连接（非 daemon worker 线程）滞留
-                    await conn.close()
-                    raise
-                _db = conn  # Only assign after full init
+                _db = await _init_connection(
+                    config.db_path,
+                    validate_schema_flag=True,
+                    extra_pragmas={"foreign_keys": "ON"},
+                )
     return _db
 
 
@@ -461,17 +493,11 @@ async def get_embed_db() -> aiosqlite.Connection:
     if _embed_db is None:
         async with _lock:
             if _embed_db is None:
-                conn = await aiosqlite.connect(config.db_path)
-                conn.row_factory = aiosqlite.Row
-                cursor = await conn.execute("PRAGMA journal_mode = WAL")
-                await cursor.close()
-                cursor = await conn.execute("PRAGMA busy_timeout = 5000")
-                await cursor.close()
-                # 与主连接同步语义一致（WAL + NORMAL），见 get_db 内注释
-                cursor = await conn.execute("PRAGMA synchronous = NORMAL")
-                await cursor.close()
-                await init_schema(conn)  # 幂等：同文件表结构由主连接维护，此处兜底
-                _embed_db = conn
+                # 与主连接同步语义一致（WAL + NORMAL）
+                _embed_db = await _init_connection(
+                    config.db_path,
+                    validate_schema_flag=False,  # 主连接已验证
+                )
     return _embed_db
 
 

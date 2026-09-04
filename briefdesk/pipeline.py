@@ -151,109 +151,128 @@ async def process_all_batches(
         m.source = source
 
     # ── 入口统一过滤 + raw 落库（替代源内实现；源不触碰 DB）──
-    # 顺序：自己发送（IGNORE_SELF）→ 纯占位符图片（OCR 未启用）→ 启用会话
+    # 单遍过滤：自己发送（IGNORE_SELF）→ 纯占位符图片（OCR 未启用）→ 启用会话
     # → 已处理 → raw 批量落库，均无锁。空启用集 → 全滤（保持原监听器语义）；
     # INSERT OR IGNORE 幂等。
-    self_filtered = 0
-    if config.ignore_self:
-        self_filtered = sum(1 for m in messages if m.is_self)
-        if self_filtered:
-            messages = [m for m in messages if not m.is_self]
-            logger.info("%s 过滤自己发送: %d 条", origin, self_filtered)
 
-    # OCR 未启用（enrich 槽位为空）时纯占位符图片消息无信息价值：不落 raw、
-    # 不进分类、不标记 processed。图片+文字混合消息（content 非占位符）不受
-    # 影响：文字仍有信息价值，照常处理。
-    # ⚠️ 可恢复性的真实边界：这些消息不落 raw_messages，钉窗机制看不到它们，
-    # 而本轮全滤后水位照常推进——重新启用 OCR 并不会"自动重拉"；要找回这批
-    # 消息需重新停用/启用会话（清水位触发 BACKFILL_HOURS 回填）或临时将
-    # BACKFILL_HOURS 设为 -1 全量回填。
-    # 判定正则单源见 briefdesk.masking.PLACEHOLDER_ONLY_RE。
+    # OCR 配置检查（在遍历前执行）
     enrich_stages = get_stages("enrich")
-    images_filtered = 0
-    if not enrich_stages:
-        if config.ai_vision_enabled:
-            # vision 开启但 OCR 缺位：纯占位符图片消息被下行过滤、混合消息
-            # 拿不到图片字节——公告提示修复配置（announce 幂等，不刷屏）。
-            logger.warning(
-                "AI_VISION_ENABLED 已开启但 ocr 插件未启用：图片不会送入模型"
-            )
-            await announcements.announce(
-                "vision_without_ocr",
-                "warning",
-                "AI 视觉输入已开启（AI_VISION_ENABLED）但 ocr 插件未启用："
-                "图片不会送入模型。请在 PLUGINS 启用 ocr（安装 briefdesk[ocr]）"
-                "或关闭 AI_VISION_ENABLED",
-            )
-        images_filtered = sum(
-            1
-            for m in messages
-            if m.image_urls and PLACEHOLDER_ONLY_RE.match(m.content)
+    if not enrich_stages and config.ai_vision_enabled:
+        # vision 开启但 OCR 缺位：纯占位符图片消息被下行过滤、混合消息
+        # 拿不到图片字节——公告提示修复配置（announce 幂等，不刷屏）。
+        logger.warning(
+            "AI_VISION_ENABLED 已开启但 ocr 插件未启用：图片不会送入模型"
         )
-        if images_filtered:
-            messages = [
-                m
-                for m in messages
-                if not (m.image_urls and PLACEHOLDER_ONLY_RE.match(m.content))
-            ]
-            logger.info(
-                "%s 屏蔽纯占位符图片消息（OCR 未启用）: %d 条",
-                origin,
-                images_filtered,
-            )
+        await announcements.announce(
+            "vision_without_ocr",
+            "warning",
+            "AI 视觉输入已开启（AI_VISION_ENABLED）但 ocr 插件未启用："
+            "图片不会送入模型。请在 PLUGINS 启用 ocr（安装 briefdesk[ocr]）"
+            "或关闭 AI_VISION_ENABLED",
+        )
+
+    # 获取启用会话集合（在遍历前执行）
+    enabled_rows = await get_enabled_sessions(source)
+    enabled_ids = {r["session_id"] for r in enabled_rows}
+
+    # 获取已处理消息集合（在遍历前执行）
+    processed_ids = await are_messages_processed(source, [m.msg_id for m in messages])
+
+    # 单遍过滤：遍历一次，同时执行所有过滤条件
+    filtered_messages = []
+    filter_stats = {
+        'self': 0,
+        'images': 0,
+        'disabled': 0,
+        'processed': 0,
+    }
+
+    for m in messages:
+        # 1. 自己发送的消息
+        if config.ignore_self and m.is_self:
+            filter_stats['self'] += 1
+            continue
+
+        # 2. 纯占位符图片（OCR 未启用时）
+        # OCR 未启用（enrich 槽位为空）时纯占位符图片消息无信息价值：不落 raw、
+        # 不进分类、不标记 processed。图片+文字混合消息（content 非占位符）不受
+        # 影响：文字仍有信息价值，照常处理。
+        # ⚠️ 可恢复性的真实边界：这些消息不落 raw_messages，钉窗机制看不到它们，
+        # 而本轮全滤后水位照常推进——重新启用 OCR 并不会"自动重拉"；要找回这批
+        # 消息需重新停用/启用会话（清水位触发 BACKFILL_HOURS 回填）或临时将
+        # BACKFILL_HOURS 设为 -1 全量回填。
+        # 判定正则单源见 briefdesk.masking.PLACEHOLDER_ONLY_RE。
+        if not enrich_stages and m.image_urls and PLACEHOLDER_ONLY_RE.match(m.content):
+            filter_stats['images'] += 1
+            continue
+
+        # 3. 未启用的会话
+        if enabled_ids and m.session_id not in enabled_ids:
+            filter_stats['disabled'] += 1
+            continue
+
+        # 4. 已处理的消息
+        if m.msg_id in processed_ids:
+            filter_stats['processed'] += 1
+            continue
+
+        filtered_messages.append(m)
+
+    # 过滤统计日志
+    if filter_stats['self']:
+        logger.info("%s 过滤自己发送: %d 条", origin, filter_stats['self'])
+    if filter_stats['images']:
+        logger.info(
+            "%s 屏蔽纯占位符图片消息（OCR 未启用）: %d 条",
+            origin,
+            filter_stats['images']
+        )
 
     # 计数日志：仅自消息/纯占位符图片过滤后的数量——启用会话与已处理过滤
     # 随后执行（过滤量在末尾 summary 单独汇总），故「处理 N 条」是进入
     # 分类的上界而非精确值（非最终进入 classify 的条数）
     logger.info("%s 处理: %d 条 (源 %s)", origin, len(messages), source)
-    enabled_rows = await get_enabled_sessions(source)
-    enabled_ids = {r["session_id"] for r in enabled_rows}
-    enabled_filtered = len(messages)
-    messages = [m for m in messages if m.session_id in enabled_ids]
-    enabled_filtered -= len(messages)
-    processed_filtered = 0
+
+    messages = filtered_messages
+
+    # 无启用类别 → 整批保留：不标记 processed（回填窗口内下轮自动重试），
+    # 同时跳过 raw 落库（将来成功分类时再落）。
+    if messages and not await get_enabled_categories():
+        logger.warning("没有启用的类别，本轮消息全部跳过（保留待回填）")
+        set_status(
+            {
+                "lastWarning": "没有启用的类别，新消息将被保留待回填"
+                "（请在设置-信息分类中启用至少一个分类）"
+            }
+        )
+        return False
+    # raw 落库（过滤后的消息）
     if messages:
-        # 无启用类别 → 整批保留：不标记 processed（回填窗口内下轮自动重试），
-        # 同时跳过已处理过滤与 raw 落库（将来成功分类时再落）。
-        if not await get_enabled_categories():
-            logger.warning("没有启用的类别，本轮消息全部跳过（保留待回填）")
-            set_status(
-                {
-                    "lastWarning": "没有启用的类别，新消息将被保留待回填"
-                    "（请在设置-信息分类中启用至少一个分类）"
-                }
-            )
-            return False
-        processed = await are_messages_processed(source, [m.msg_id for m in messages])
-        if processed:
-            processed_filtered = len(messages)
-            messages = [m for m in messages if m.msg_id not in processed]
-            processed_filtered -= len(messages)
-        if messages:
-            await bulk_insert_raw_messages(
-                [
-                    RawMsgInput(
-                        source=source,
-                        msg_id=m.msg_id,
-                        session_id=m.session_id,
-                        group_name=m.group_name,
-                        sender_id=m.sender_id,
-                        sender_name=m.sender_name,
-                        content=m.content,
-                        timestamp=m.timestamp,
-                        article_url=m.article_url or "",
-                    )
-                    for m in messages
-                ]
-            )
-            logger.debug("raw 落库: %d 条", len(messages))
+        await bulk_insert_raw_messages(
+            [
+                RawMsgInput(
+                    source=source,
+                    msg_id=m.msg_id,
+                    session_id=m.session_id,
+                    group_name=m.group_name,
+                    sender_id=m.sender_id,
+                    sender_name=m.sender_name,
+                    content=m.content,
+                    timestamp=m.timestamp,
+                    article_url=m.article_url or "",
+                )
+                for m in messages
+            ]
+        )
+        logger.debug("raw 落库: %d 条", len(messages))
+
     if not messages:
         logger.debug(
             "入口过滤后无消息: 自消息过滤 %d, 图片屏蔽 %d, 启用会话过滤 %d, 已处理过滤 %d",
-            self_filtered,
-            images_filtered,
-            enabled_filtered,
-            processed_filtered,
+            filter_stats['self'],
+            filter_stats['images'],
+            filter_stats['disabled'],
+            filter_stats['processed'],
         )
         # ⚠️ 此处 return True 是**有意**行为，与下方「零产出 return False」语义相反，
         # 勿改成 False（会令水位永不前进）：
