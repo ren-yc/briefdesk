@@ -1,6 +1,7 @@
 """server 路由层与安全中间件测试（monkeypatch 隔离 DB/AI）。"""
 
 import asyncio
+import os
 import tempfile
 import time
 import unittest
@@ -893,18 +894,38 @@ class BackupRestoreRouteTest(unittest.TestCase):
     def test_restore_success_stages_pending_file(self):
         client = _client()
         replaced: list[str] = []
-        with patch(
-            "briefdesk.server.routes_items.validate_restore_file",
-            AsyncMock(return_value=None),
-        ), patch(
-            "briefdesk.server.routes_items.os.replace",
-            lambda src, dst: replaced.append(dst),
-        ):
-            resp = client.post("/api/restore", files={"file": ("b.sqlite", b"valid")})
-        client.close()
-        self.assertEqual(resp.status_code, 200)
-        self.assertEqual(len(replaced), 1)
-        self.assertTrue(replaced[0].endswith(".restore-pending"))
+        created_tmp: list[str] = []
+
+        # 捕获 mkstemp 创建的临时文件路径以便清理
+        original_mkstemp = tempfile.mkstemp
+        def tracked_mkstemp(*args, **kwargs):
+            fd, path = original_mkstemp(*args, **kwargs)
+            created_tmp.append(path)
+            return fd, path
+
+        try:
+            with patch(
+                "briefdesk.server.routes_items.tempfile.mkstemp",
+                side_effect=tracked_mkstemp,
+            ), patch(
+                "briefdesk.server.routes_items.validate_restore_file",
+                AsyncMock(return_value=None),
+            ), patch(
+                "briefdesk.server.routes_items.os.replace",
+                lambda src, dst: replaced.append(dst),
+            ):
+                resp = client.post("/api/restore", files={"file": ("b.sqlite", b"valid")})
+            self.assertEqual(resp.status_code, 200)
+            self.assertEqual(len(replaced), 1)
+            self.assertTrue(replaced[0].endswith(".restore-pending"))
+        finally:
+            client.close()
+            # 清理测试产生的临时文件（os.replace 被 mock 后文件未移动）
+            for tmp_file in created_tmp:
+                try:
+                    os.remove(tmp_file)
+                except OSError:
+                    pass
 
 
 class SessionToggleRouteTest(unittest.TestCase):
