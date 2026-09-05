@@ -651,6 +651,17 @@ function bindSessionEvents() {
   sessionFilter.bindEvents();
 }
 
+// 设置弹窗内的「非草稿」控件：输入/勾选即时提交（行内「保存」写钥匙串、
+// 即写 localStorage）或纯属视图过滤，不参与底部「保存」的差异链路，因此
+// 不应置位脏标记（否则弹窗取消时会被误问「是否放弃修改」——密钥框打字
+// 即曾如此）。草稿控件（启动配置项/类别编辑/群聊筛选勾选等）不在此列。
+const _NON_DRAFT_SELECTOR = ".env-secret-input input, #env-filter, #subs-add-kw, #block-add-kw,"
+  + " .subs-enabled, .block-enabled, #notify-mode, #session-search, #restore-file";
+
+function _isNonDraftSettingsControl(target) {
+  return !!(target && target.closest && target.closest(_NON_DRAFT_SELECTOR));
+}
+
 function bindSettingsFormEvents() {
   // "保存"统一应用三类更改：刷新间隔（localStorage）+ 类别草稿 + 会话草稿。
   // 同步进行中时延迟到同步完成后应用（本次同步按旧配置跑，避免数据与配置不一致）。
@@ -759,9 +770,14 @@ function bindSettingsFormEvents() {
   $settingsModal.addEventListener("click", (e) => {
     if (e.target === $settingsModal) closeSettingsModal();
   });
-  // 设置草稿脏检查：任何输入/变更即标记（input 捕获文本框，change 捕获勾选/下拉）
-  $settingsModal.addEventListener("input", () => { settingsDirtyFlag = true; });
-  $settingsModal.addEventListener("change", () => { settingsDirtyFlag = true; });
+  // 设置草稿脏检查：任何输入/变更即标记（input 捕获文本框，change 捕获勾选/下拉）；
+  // 非草稿控件除外（见 _isNonDraftSettingsControl），否则弹窗取消会被误问「是否放弃」
+  $settingsModal.addEventListener("input", (e) => {
+    if (!_isNonDraftSettingsControl(e.target)) settingsDirtyFlag = true;
+  });
+  $settingsModal.addEventListener("change", (e) => {
+    if (!_isNonDraftSettingsControl(e.target)) settingsDirtyFlag = true;
+  });
 }
 
 function bindSyncButtonEvents() {
@@ -4994,7 +5010,7 @@ function injectPluginScript(name) {
   });
 }
 
-let settingsDirtyFlag = false; // 设置弹窗内任一 input/change 即置位；保存成功后 force 关闭
+let settingsDirtyFlag = false; // 设置弹窗内任一 input/change 即置位（非草稿控件除外，见 _isNonDraftSettingsControl）；保存成功后 force 关闭
 function closeSettingsModal({ force = false } = {}) {
   // 显式保存模型下，Esc/取消/点遮罩静默丢弃全部草稿属可避免错误（Nielsen #5）
   if (!force && settingsDirtyFlag && !window.confirm("有未保存的修改，确定放弃并关闭？")) return;

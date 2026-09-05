@@ -1,12 +1,14 @@
 // 启动配置（设置 → 启动配置）面板逻辑回归（Node vm 加载真实 ui/app.js）。
 //
-// 守三件事：
+// 守四件事：
 // 1. _collectEnvChanges 的布尔分支必须跳过未变化项——此前缺失相等性检查，
 //    每次「暂存更改」都会把所有布尔项重写进暂存文件，「没有需要暂存的更改」
 //    永不触发，差异计数常驻虚高；
 // 2. 分组渲染：未启用插件组默认折叠并在组头标注「未启用」（行内徽章不再
 //    重复）；布尔项渲染为开关；已配置（钥匙串）的密钥提供「替换/取消」入口；
 // 3. 「暂存更改」按钮的脏计数联动。
+// 4. 脏检查排除清单：非草稿控件（即时提交/视图过滤）不置位脏标记，否则
+//    密钥框打字后点弹窗取消会被误问「是否放弃修改」。
 //
 // 数据一律虚构（见 AGENTS.md）。
 
@@ -172,6 +174,30 @@ sandbox.renderEnvConfig();
   assert.equal(missRow.classList.contains("hidden"), false, "清空后全部行可见");
   assert.equal(hitGroup.open, false, "清空后按默认展开态还原（该组默认折叠）");
   assert.equal(missGroup.open, true, "清空后按默认展开态还原（该组默认展开）");
+}
+
+// ── 6. 脏检查排除清单：非草稿控件不置位脏标记 ──
+// 真实 closest 一次收到完整选择器串（_NON_DRAFT_SELECTOR），桩据此校验
+// 清单确实覆盖每个关键控件，同时验证谓词的分支行为。
+{
+  for (const frag of [
+    ".env-secret-input",   // 密钥框：行内「保存」即时写钥匙串
+    "#env-filter",         // 启动配置搜索：纯视图过滤
+    "#subs-add-kw",        // 订阅添加：点「添加」即写 localStorage
+    "#block-add-kw",       // 黑名单添加：同上
+    ".subs-enabled",       // 订阅启用勾选：勾选即写 localStorage
+    ".block-enabled",      // 黑名单启用勾选：同上
+    "#notify-mode",        // 通知模式：变更即写 localStorage
+    "#session-search",     // 群聊筛选搜索：纯视图过滤
+    "#restore-file",       // 备份文件：选完即走立即恢复流程
+  ]) {
+    const probe = { closest: (sel) => (typeof sel === "string" && sel.includes(frag) ? {} : null) };
+    assert.equal(sandbox._isNonDraftSettingsControl(probe), true, `排除清单应覆盖非草稿控件 ${frag}`);
+  }
+  const draftControl = { closest: () => null }; // 草稿控件（如刷新间隔、类别编辑）
+  assert.equal(sandbox._isNonDraftSettingsControl(draftControl), false, "草稿控件不命中排除清单，应继续置位脏标记");
+  assert.equal(sandbox._isNonDraftSettingsControl(null), false, "空目标应安全返回 false");
+  assert.equal(sandbox._isNonDraftSettingsControl({}), false, "无 closest 的目标应安全返回 false");
 }
 
 console.log("ui_env_panel_test: all assertions passed");
