@@ -707,6 +707,57 @@ class IgnoreSelfFilterTest(_StageTestBase):
         self.assertEqual(raw_rows, [])
 
 
+class EmptyEnabledSessionsFilterTest(_StageTestBase):
+    """空启用集 → 全滤（保持原监听器语义）：无任何启用会话时所有消息在
+    入口被过滤——不落 raw、不进分类、不标 processed，水位照常推进
+    （return True）。upsert_session 默认 enabled=0 写入，全新安装或用户
+    停用全部会话时 get_enabled_sessions 返回空集是常态路径。"""
+
+    async def asyncSetUp(self):
+        await super().asyncSetUp()
+        self.db = await aiosqlite.connect(":memory:")
+        self.db.row_factory = aiosqlite.Row
+        await self.db.execute("PRAGMA foreign_keys = ON")
+        await init_schema(self.db)
+
+    async def asyncTearDown(self):
+        await super().asyncTearDown()
+        await self.db.close()
+
+    async def _run(self, messages, classify, raw_rows):
+        _install_dedup_stage(None)  # 引擎未就绪路径：结果为空时全程无副作用
+        stages.register_stage(_classify_stage(classify))
+        with patch("briefdesk.db.get_db", new=AsyncMock(side_effect=lambda: self.db)), patch(
+            "briefdesk.pipeline.get_enabled_sessions",
+            new=AsyncMock(return_value=[]),
+        ), patch(
+            "briefdesk.pipeline.get_enabled_categories",
+            new=AsyncMock(return_value=[{"name": "x"}]),
+        ), patch(
+            "briefdesk.pipeline.are_messages_processed", new=AsyncMock(return_value=set())
+        ), patch(
+            "briefdesk.pipeline.bulk_insert_raw_messages",
+            new=AsyncMock(
+                side_effect=lambda rows: raw_rows.extend(r["msg_id"] for r in rows)
+            ),
+        ), patch("briefdesk.pipeline.set_status"), patch(
+            "briefdesk.pipeline.publish_items_updated", new=AsyncMock()
+        ):
+            return await process_all_batches(messages, _pipeline_client(), origin="test")
+
+    async def test_empty_enabled_sessions_filter_all(self):
+        classify = AsyncMock(return_value=ClassifyOutcome([], []))
+        raw_rows = []
+        result = await self._run(
+            [_pipeline_msg("m1", session_id="s9"), _pipeline_msg("m2", session_id="s9")],
+            classify,
+            raw_rows,
+        )
+        classify.assert_not_called()
+        self.assertEqual(raw_rows, [], "空启用集下消息不落 raw")
+        self.assertTrue(result, "空启用集全滤应走「过滤后无消息 return True」路径（水位照常推进）")
+
+
 class ImageFilterWhenNoEnrichTest(_StageTestBase):
     """OCR 未启用（enrich 槽位为空）时，纯占位符图片消息在入口被屏蔽：
     不落 raw、不进分类、不标记 processed；图片+文字混合消息（content 非

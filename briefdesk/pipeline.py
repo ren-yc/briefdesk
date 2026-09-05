@@ -206,8 +206,8 @@ async def process_all_batches(
             filter_stats['images'] += 1
             continue
 
-        # 3. 未启用的会话
-        if enabled_ids and m.session_id not in enabled_ids:
+        # 3. 未启用的会话（enabled_ids 为空集时全滤——保持原监听器语义）
+        if m.session_id not in enabled_ids:
             filter_stats['disabled'] += 1
             continue
 
@@ -231,7 +231,12 @@ async def process_all_batches(
     # 计数日志：仅自消息/纯占位符图片过滤后的数量——启用会话与已处理过滤
     # 随后执行（过滤量在末尾 summary 单独汇总），故「处理 N 条」是进入
     # 分类的上界而非精确值（非最终进入 classify 的条数）
-    logger.info("%s 处理: %d 条 (源 %s)", origin, len(messages), source)
+    logger.info(
+        "%s 处理: %d 条 (源 %s)",
+        origin,
+        len(messages) - filter_stats['self'] - filter_stats['images'],
+        source,
+    )
 
     messages = filtered_messages
 
