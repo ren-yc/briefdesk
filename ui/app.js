@@ -649,12 +649,6 @@ function bindSessionEvents() {
   sessionFilter.bindEvents();
 }
 
-// 设置弹窗二级面板是否处于激活态（未被 hidden）；「启动配置」与「插件」
-// 两个面板共用同一暂存保存链路，激活判定与差异计数都按两者合并处理
-function _isPanelActive(panel) {
-  return !document.querySelector('.settings-panel[data-panel="' + panel + '"]')?.classList.contains("hidden");
-}
-
 // 选项 b（保守）：类别新增/行内编辑表单打开中即视为有未保存修改——
 // 未确认的输入不进入保存链路（保存也不会保留），但静默丢弃半截输入
 // 属可避免错误，宁多问一次
@@ -662,61 +656,29 @@ function _inlineEditorOpen() {
   return !!document.querySelector('.cat-edit-form:not(.hidden), #cat-add-form:not(.hidden)');
 }
 
-// 关闭确认判据：存在任一「保存会提交」的真实差异，或行内编辑表单打开中。
-// 与保存路径共用同一 diff 函数（_diffCategoryOps/_collectEnvChanges/
-// _pluginChanges），杜绝「问了但保存也不保留」与「改了又改回仍被问」
-// 两类误报——取代旧的「任一事件即置位」布尔标记
-function _hasPendingChanges() {
-  if (_inlineEditorOpen()) return true;
-  if (catDraft && _diffCategoryOps().length) return true;
+// 全局未保存草稿计数——保存按钮文案与关闭确认的单一事实源，与统一保存
+// 路径的提交内容一一对应：类别/会话 ops + 刷新间隔 + env/PLUGINS 暂存差异
+// （PLUGINS 整组开关序列化为一行暂存，计 1 项）
+function _pendingChangeCount() {
+  let n = _diffCategoryOps().length;
   // 与 saveSettings 同口径：空值/非法值回落 300 后再比
-  if (Math.max(30, parseInt($refreshInterval.value) || 300) !== refreshIntervalSec) return true;
-  if (envData && Object.keys({ ..._collectEnvChanges(), ..._pluginChanges() }).length) return true;
-  return false;
+  if (Math.max(30, parseInt($refreshInterval.value) || 300) !== refreshIntervalSec) n += 1;
+  if (envData) n += Object.keys({ ..._collectEnvChanges(), ..._pluginChanges() }).length;
+  return n;
+}
+
+function _hasPendingChanges() {
+  // 关闭确认在计数之上追加选项 b 保守项：行内编辑表单打开中（未确认输入
+  // 不进保存链路，但静默丢弃半截输入属可避免错误，宁多问一次）
+  return _pendingChangeCount() > 0 || _inlineEditorOpen();
 }
 
 function bindSettingsFormEvents() {
-  // "保存"统一应用三类更改：刷新间隔（localStorage）+ 类别草稿 + 会话草稿。
-  // 同步进行中时延迟到同步完成后应用（本次同步按旧配置跑，避免数据与配置不一致）。
-  $settingsSave.addEventListener("click", async () => {
-    // 「启动配置 / 插件」面板共用此按钮：语义是写 .env 暂存文件（重启生效），
-    // 不走刷新间隔/类别/会话草稿的保存链路（插件开关草稿并入 PLUGINS 一并提交）
-    if (_isPanelActive("env") || _isPanelActive("plugins")) { await saveEnvConfig(); return; }
-    if (saveBusy) return;
-    saveBusy = true;
-    $settingsSave.disabled = true;
-    try {
-      saveSettings(); // 刷新间隔与同步数据无关，立即生效
-      const ops = collectAllOps(); // 保存时快照，弹窗重开/草稿重载不影响挂起
-      if (!ops) return; // collectAllOps 已弹窗说明（未加载/名称冲突），中止本次保存
-      // 实时查询同步状态（isSyncing 是缓存值，另一标签页/启动首轮可能已开始同步）
-      let syncingNow = isSyncing;
-      const liveStatus = await getJson("/api/status").catch(() => null); // 失败回退缓存值
-      if (liveStatus) syncingNow = !!liveStatus.syncing;
-      if (syncingNow) {
-        pendingChanges = ops; // 覆盖旧挂起项，最新意图为准
-        showToast("当前正在同步，更改将在同步完成后自动应用", { type: "info", duration: 6000 });
-      } else {
-        pendingChanges = null; // 直接应用时丢弃历史挂起项（最新保存为准），
-                               // 否则 fetchData 会在其后再应用一遍旧操作
-        await runSettingsOps(ops);
-      }
-      closeSettingsModal({ force: true }); // 保存成功：清脏标记直接关，不再确认
-      showToast("设置已保存", { type: "success", duration: 2500 });
-      startRefreshTimer();
-      fetchData();
-    } catch (err) {
-      console.error("Save settings error:", err);
-      showToast("保存失败，部分更改可能未生效，请重试", { type: "error", duration: 6000 });
-      // 已应用的前缀操作（如删除）不可回滚：重载草稿对齐服务端真相，
-      // 避免基于过期草稿重复操作（对已删类别再删 → 404）
-      await loadCategories();
-      await loadSessions();
-    } finally {
-      saveBusy = false;
-      $settingsSave.disabled = false;
-    }
-  });
+  // 统一保存：一次点击提交全部未保存草稿——刷新间隔（localStorage）+
+  // 类别/会话草稿 ops（同步进行中时延迟到同步完成后应用，本次同步按旧
+  // 配置跑）+ 启动配置/插件暂存（写 .env 暂存文件，重启生效）。
+  // 编排见 saveAllSettings；计数与关闭确认同源（_pendingChangeCount）
+  $settingsSave.addEventListener("click", saveAllSettings);
 
   $settingsClose.addEventListener("click", closeSettingsModal);
 
@@ -738,8 +700,8 @@ function bindSettingsFormEvents() {
       if (chip) chip.classList.toggle("checked", e.target.checked);
     });
     // 任意控件输入/变更 → 刷新「暂存更改」的差异计数与高亮态
-    $envItems.addEventListener("input", _updateEnvSaveButton);
-    $envItems.addEventListener("change", _updateEnvSaveButton);
+    $envItems.addEventListener("input", _updateSaveButton);
+    $envItems.addEventListener("change", _updateSaveButton);
   }
   if ($envSecrets) {
     $envSecrets.addEventListener("click", (e) => {
@@ -778,6 +740,11 @@ function bindSettingsFormEvents() {
     });
   }
   if ($envFilter) $envFilter.addEventListener("input", _applyEnvFilter);
+
+  // 任意草稿控件输入/变更 → 刷新全局保存计数。算的是真实差异，无需排除
+  // 清单：即时提交型控件（密钥框/订阅/通知模式等）不影响任何草稿源，天然计 0
+  $settingsModal.addEventListener("input", _updateSaveButton);
+  $settingsModal.addEventListener("change", _updateSaveButton);
 
   // 「插件」面板：逐插件开关（草稿态；保存时并入 PLUGINS 差异统一提交）
   if ($pluginsList) {
@@ -4094,6 +4061,7 @@ function confirmAddCategory() {
   $catAddForm.classList.add("hidden");
   $categoryAdd.classList.remove("hidden");
   renderCategoryToggles();
+  _updateSaveButton(); // click 驱动的草稿变更不经 input/change 事件，显式刷新计数
 }
 
 // 行内编辑"确认"：把表单值写回草稿行，点设置"保存"后才更新
@@ -4110,6 +4078,7 @@ function confirmEditCategory(row) {
     item.color = getPaletteColor(row.querySelector(".cat-palette"));
   }
   renderCategoryToggles();
+  _updateSaveButton(); // click 驱动的草稿变更不经 input/change 事件，显式刷新计数
 }
 
 // 删除确认：从草稿移除（id=null 的新行直接丢弃；已有类别记入 catDeleted 待保存时删除）
@@ -4122,6 +4091,7 @@ function markDelete(key, purge) {
     catDeleted.push({ key: c.key, row: c, purgeItems: purge });
   }
   renderCategoryToggles();
+  _updateSaveButton(); // click 驱动的草稿变更不经 input/change 事件，显式刷新计数
 }
 
 // 撤销待删除：恢复完整草稿行（含未保存的编辑）
@@ -4132,6 +4102,7 @@ function undoDelete(key) {
   const [d] = catDeleted.splice(idx, 1);
   catDraft.push(d.row);
   renderCategoryToggles();
+  _updateSaveButton(); // click 驱动的草稿变更不经 input/change 事件，显式刷新计数
 }
 
 // 收集类别/会话草稿与基线的差异操作列表（纯函数：不改状态、不弹窗）。
@@ -4302,6 +4273,82 @@ function saveSettings() {
   refreshIntervalSec = Math.max(30, parseInt($refreshInterval.value) || 300);
   $refreshInterval.value = refreshIntervalSec;
   lsSetJson("briefdesk.settings", { refreshInterval: refreshIntervalSec });
+}
+
+// 统一保存：一次点击提交全部未保存草稿——暂存（env/PLUGINS）、类别/会话
+// ops（含同步中延迟）、刷新间隔（localStorage 立即生效）。原「按面板分流」
+// 的两个保存路径就此合并：按钮计数（_pendingChangeCount）、关闭确认
+// （_hasPendingChanges）、实际提交内容三者同源，任一面板点击行为一致。
+async function saveAllSettings() {
+  if (saveBusy) return;
+  saveBusy = true;
+  $settingsSave.disabled = true;
+  try {
+    // 刷新间隔与同步数据无关，立即生效（先记是否变更，saveSettings 会更新基准）
+    const intervalChanged =
+      Math.max(30, parseInt($refreshInterval.value) || 300) !== refreshIntervalSec;
+    saveSettings();
+
+    // 1) 暂存（env/PLUGINS）：409（依赖/互斥）或警示确认取消 → 中止整个保存
+    const staged = await stagePendingEnvChanges();
+    if (staged === "aborted") return;
+
+    // 2) 类别/会话 ops：保存时快照，弹窗重开/草稿重载不影响挂起
+    const ops = collectAllOps();
+    if (!ops) return; // 名称冲突已弹窗说明，中止本次保存
+    let opsApplied = false;
+    let opsDeferred = false;
+    if (ops.length) {
+      // 实时查询同步状态（isSyncing 是缓存值，另一标签页/启动首轮可能已开始同步）
+      let syncingNow = isSyncing;
+      const liveStatus = await getJson("/api/status").catch(() => null); // 失败回退缓存值
+      if (liveStatus) syncingNow = !!liveStatus.syncing;
+      if (syncingNow) {
+        pendingChanges = ops; // 覆盖旧挂起项，最新意图为准
+        opsDeferred = true;
+        showToast("当前正在同步，更改将在同步完成后自动应用", { type: "info", duration: 6000 });
+      } else {
+        pendingChanges = null; // 直接应用时丢弃历史挂起项（最新保存为准），
+                               // 否则 fetchData 会在其后再应用一遍旧操作
+        await runSettingsOps(ops);
+        opsApplied = true;
+      }
+    }
+
+    // 3) 收尾：双改共存 → 关闭双 toast；仅暂存 → 保持打开继续调配置；
+    //    仅 ops/仅刷新间隔 → 关闭；皆无更改 → 静默关闭（「保存」即完成键）
+    if (staged === "committed" && (opsApplied || opsDeferred)) {
+      closeSettingsModal({ force: true });
+      showToast("设置已保存", { type: "success", duration: 2500 });
+      showToast("启动配置已暂存，重启应用后生效", { type: "success", duration: 4000 });
+      startRefreshTimer();
+      fetchData();
+    } else if (staged === "committed") {
+      showToast("已暂存，重启应用后生效", { type: "success", duration: 4000 });
+      await loadEnvConfig(); // 刷新面板显示已暂存徽标（并复位开关草稿）
+    } else if (opsApplied || opsDeferred || intervalChanged) {
+      closeSettingsModal({ force: true });
+      if (opsApplied || opsDeferred) {
+        showToast("设置已保存", { type: "success", duration: 2500 });
+        startRefreshTimer();
+        fetchData();
+      }
+    } else {
+      closeSettingsModal({ force: true });
+    }
+  } catch (err) {
+    console.error("Save settings error:", err);
+    showToast("保存失败，部分更改可能未生效，请重试", { type: "error", duration: 6000 });
+    // 已应用的前缀操作（如删除）不可回滚：重载草稿对齐服务端真相，
+    // 避免基于过期草稿重复操作（对已删类别再删 → 404）；暂存若已提交
+    // 也一并刷新面板显示
+    await loadCategories();
+    await loadSessions();
+    await loadEnvConfig();
+  } finally {
+    saveBusy = false;
+    $settingsSave.disabled = false;
+  }
 }
 
 // ── 启动配置（.env 暂存）──
@@ -4494,7 +4541,7 @@ function _patchEnvItem(key, fresh) {
   const $row = document.querySelector('#env-items .env-row[data-env-key="' + key + '"]');
   if ($row && group) $row.outerHTML = _envRowHtml(item, _envGroupDisabled(group));
   _applyEnvFilter();
-  _updateEnvSaveButton();
+  _updateSaveButton();
 }
 
 function _patchSecretRow(name, fresh) {
@@ -4513,13 +4560,13 @@ function renderEnvConfig() {
   const $secrets = document.getElementById("env-secrets");
   if (!envData) {
     if ($items) $items.innerHTML = '<p class="text-muted">加载失败，请刷新页面重试</p>';
-    // 全局「保存」无需禁用：saveEnvConfig 对 envData 为空时直接返回
+    // 全局「保存」无需禁用：暂存段对 envData 为空按 skipped 处理，不影响类别/会话保存
     return;
   }
   if ($path) $path.textContent = "暂存文件：" + envData.filePath;
   if ($items) $items.innerHTML = _envItemsHtml();
   if ($secrets) $secrets.innerHTML = _envSecretsHtml();
-  _updateEnvSaveButton();
+  _updateSaveButton();
 }
 
 // 搜索过滤：行级显隐 + 组级整组显隐；details 组在过滤时自动展开命中组，
@@ -4544,21 +4591,13 @@ function _applyEnvFilter() {
   }
 }
 
-// 底部全局「保存」按钮的差异数联动：启动配置/插件面板激活时显示**合并**
-// 未暂存差异数（保存（N 项））——保存语义本就是两面板差异一并提交，计数
-// 必须与实际提交项一致；切到其它面板或无差异时还原为纯「保存」
-function _updateEnvSaveButton() {
+// 底部全局「保存」按钮的差异数联动：全面板显示合并未保存差异数
+// （保存（N 项））——统一保存语义下一次点击提交全部草稿，计数与实际
+// 提交项一致；无差异时还原为纯「保存」
+function _updateSaveButton() {
   const $save = document.getElementById("settings-save");
   if (!$save) return;
-  if (!_isPanelActive("env") && !_isPanelActive("plugins")) {
-    if ($save.textContent !== "保存") $save.textContent = "保存";
-    return;
-  }
-  if (!envData) {
-    if ($save.textContent !== "保存") $save.textContent = "保存";
-    return;
-  }
-  const n = Object.keys({ ..._collectEnvChanges(), ..._pluginChanges() }).length;
+  const n = _pendingChangeCount();
   $save.textContent = n > 0 ? "保存（" + n + " 项）" : "保存";
 }
 
@@ -4602,20 +4641,19 @@ function _collectEnvChanges() {
   return changes;
 }
 
-async function saveEnvConfig() {
-  if (!envData) return;
-  // 两面板共用保存链路：启动配置项差异 + 插件开关草稿（PLUGINS）一并提交
+// 暂存 env/PLUGINS 未暂存差异（统一保存流程的第一段）。
+// 返回 "committed"（已提交）/"skipped"（无差异）/"aborted"（警示确认取消
+// 或写入失败——调用方应中止整个保存流程，弹窗保留、草稿不动）
+async function stagePendingEnvChanges() {
+  if (!envData) return "skipped";
+  // 启动配置项差异 + 插件开关草稿（PLUGINS）一并提交
   const changes = { ..._collectEnvChanges(), ..._pluginChanges() };
-  if (!Object.keys(changes).length) {
-    showToast("没有需要暂存的更改", { type: "info", duration: 2500 });
-    return;
-  }
+  if (!Object.keys(changes).length) return "skipped";
   const warnItem = envData.items.find(i => i.warn && changes[i.key] !== undefined);
-  if (warnItem && !confirm(warnItem.label + "：" + warnItem.warn + "。确定暂存？")) return;
+  if (warnItem && !confirm(warnItem.label + "：" + warnItem.warn + "。确定暂存？")) return "aborted";
   try {
     await putJson("/api/settings/env", { items: changes });
-    showToast("已暂存，重启应用后生效", { type: "success", duration: 4000 });
-    await loadEnvConfig();
+    return "committed";
   } catch (err) {
     console.error("Save env config error:", err);
     // 409（PLUGINS 依赖/互斥复检失败）服务端返回 {detail:{issues}}，逐条明示
@@ -4626,6 +4664,7 @@ async function saveEnvConfig() {
     } else {
       showToast("暂存失败，请检查输入后重试", { type: "error", duration: 6000 });
     }
+    return "aborted";
   }
 }
 
@@ -4964,10 +5003,9 @@ function setSettingsPanel(name) {
   $settingsModal.querySelectorAll(".settings-panel").forEach(p => {
     p.classList.toggle("hidden", p.dataset.panel !== name);
   });
-  // 「启动配置」与其他面板共用底部全局「保存」按钮；点击语义按当前面板分流
-  // （env → 写暂存文件，其余 → 刷新间隔 + 类别/会话草稿），差异数由
-  // _updateEnvSaveButton 追加到按钮文案上
-  _updateEnvSaveButton();
+  // 底部全局「保存」对所有面板语义一致（统一提交全部草稿），差异数由
+  // _updateSaveButton 维护在按钮文案上
+  _updateSaveButton();
 }
 
 async function loadAboutSources() {
@@ -5062,7 +5100,7 @@ function _onPluginToggle(name, wantOn, input) {
     pluginDraftSet.delete(name);
   }
   renderPluginToggles();
-  _updateEnvSaveButton();
+  _updateSaveButton();
 }
 
 function _pluginStatusBadge(p) {

@@ -409,7 +409,7 @@ Content-Disposition attachment——扩展名不可信，封死伪装 SVG/HTML �
 `POST /api/categories/:id/delete`（body `purgeItems` 控制级联删除，级联后发布 `EVENT_ITEMS_DELETED` 清 dedup 内存缓存）
 ，
 启动配置：`GET /api/settings/env`（核心 schema 从 `Settings.model_fields` 自动生成，并合并全部已发现插件的可选
-`settings_schema()`；返回生效/暂存/来源徽标、插件开关数据 `plugins`（声明元数据 + 期望启用态 + 当前进程装配状态）、密钥状态和暂存文件路径）、`PUT /api/settings/env`（批量暂存，动态 schema + 类型/约束校验 + PLUGINS 依赖/互斥复检（`validate_selection` 不合法返回 409 + issue 明细）+ 原子写
+`settings_schema()`；返回生效/暂存/来源徽标、插件开关数据 `plugins`（声明元数据 + 期望启用态 + 当前进程装配状态）、密钥状态和暂存文件路径）、`PUT /api/settings/env`（批量暂存，动态 schema + 类型/约束校验 + PLUGINS 依赖/互斥复检（`validate_selection` 不合法返回 409 + issue 明细）+ 原子写；响应携带受影响键的最终 staged/source，供前端行级贴片
 + 单写锁，`null`=恢复默认；text 型值拒绝 CR/LF 与「 #」——值含换行会被回读拆成独立 KEY=VALUE 行，可借任一 text 字段注入白名单外配置甚至密钥，绕过「暂存文件只存
 非
 密钥键 + 密钥走 keyring」分层）、`POST /api/settings/secrets`、`DELETE /api/settings/secrets/:name`（keyring 写入/清
@@ -845,9 +845,17 @@ Key behaviors:
   三个显式选项：`storageKey`（时间档位是否持久化——设置持久化、向导每次进入 `reset()` 回「全部」）、`emptyHint`（无匹配时是否显示提示行——仅向导有）、
   `pruneSources`（源芯片重渲染时是否清理失效选中项——仅设置侧）。行为守卫见 `tests/ui_session_filter_test.mjs`。**「启动配置」分组**：
   `GET /api/settings/env` 渲染白名单表单（select/number/boolean/多选/文本；`PLUGINS` 项带 hidden 标记、由「插件」面板编辑），
-  显示「已暂存 · 重启生效」与「环境变量优先」徽标与暂存文件路径；「暂存更改
-  」PUT /「恢复默认」PUT null；`DB_PATH`/`SERVER_PORT` 有警示确认；「密钥」区只显示 keyring 配置状态，未配置项输入后 POST 写入 keyring、可清除（
-  明文不回传、提交后输入框清空）
+  显示「已暂存 · 重启生效」与「环境变量优先」徽标与暂存文件路径；「恢复默认」PUT null 后由
+  写响应携带的该键最新 staged/source 做**行级贴片**（不整面重载，保住其它行未暂存编辑与「插件」面板开关草稿）；`DB_PATH`/`SERVER_PORT` 有警示确认；「密钥」区只显示 keyring 配置状态，未配置项输入后 POST 写入 keyring、可清除（
+  明文不回传、提交后按响应就地重绘该行）
+- **统一保存与脏检查**：底部全局「保存」对所有面板语义一致——一次点击提交
+  全部未保存草稿（env/PLUGINS 暂存 PUT + 类别/会话 ops + 刷新间隔 localStorage；
+  同步进行中 ops 延迟为 `pendingChanges`），收尾按提交内容分流（仅暂存保持弹窗
+  打开，其余关闭；皆无更改静默关闭）；按钮计数、关闭确认（`_hasPendingChanges`）
+  与实际提交共用同一 diff 函数（`_diffCategoryOps`/`_collectEnvChanges`/
+  `_pluginChanges`，`_pendingChangeCount` 聚合）——改了又改回、行内动作后的
+  残留不再误问「是否放弃」；类别新增/行内编辑表单打开中仍视为有未保存修改
+  （保守项）。已无「非草稿控件排除清单」机制。
 - **插件面板逐插件启停**：设置弹窗「插件」分组改由 `GET /api/settings/env` 的 `plugins` 数组渲染（声明元数据 core/dependencies/
   conflicts + 期望启用态 + `/api/plugins` 的当前进程装配状态），核心插件恒启用无开关（「核心 · 始终启用」徽章）、可选插件
   `env-switch` 开关改本地草稿集——启用被拒（互斥/缺依赖）、禁用被拒（被启用中可选插件或核心插件依赖）时 toast 点名原因，通过后

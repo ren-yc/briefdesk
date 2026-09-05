@@ -84,11 +84,11 @@ setEnvData({
   ];
   getElement("env-items").querySelectorAll = () => rows;
   const saveEl = getElement("settings-save");
-  sandbox._updateEnvSaveButton();
+  sandbox._updateSaveButton();
   assert.equal(saveEl.textContent, "保存", "无差异时应显示纯「保存」");
 
   rows[1].querySelector('input[type="checkbox"]').checked = true;
-  sandbox._updateEnvSaveButton();
+  sandbox._updateSaveButton();
   assert.equal(saveEl.textContent, "保存（1 项）", "有差异时应显示差异数");
 }
 
@@ -314,7 +314,7 @@ sandbox.renderPluginToggles();
 {
   const toasts = [];
   sandbox.showToast = (msg) => toasts.push(msg);
-  getElement("env-items").querySelectorAll = () => []; // 成功路径联动 _updateEnvSaveButton 用
+  getElement("env-items").querySelectorAll = () => []; // 成功路径联动 _updateSaveButton 用
 
   // 互斥阻止：weflow 已启用，启用 weflow-legacy 被拒
   const blockedInput = { checked: false };
@@ -469,16 +469,86 @@ sandbox.renderPluginToggles();
   getElement("env-items").querySelectorAll = () => rows;
   const saveEl = getElement("settings-save");
 
-  sandbox._updateEnvSaveButton();
+  sandbox._updateSaveButton();
   assert.equal(saveEl.textContent, "保存（1 项）", "仅 env 差异 → 1 项");
 
   // 拨一个插件开关：成功路径内部会联动刷新保存按钮
   sandbox._onPluginToggle("weflow", true, { checked: false });
-  assert.equal(saveEl.textContent, "保存（2 项）", "env 差异 + 插件草稿应合并计数（与合并提交口径一致）");
+  assert.equal(saveEl.textContent, "保存（2 项）", "env 差异 + 插件草稿应合并计数（与统一保存提交口径一致）");
 
   // 草稿回退 → 计数回落到仅 env 差异
   sandbox._onPluginToggle("weflow", false, { checked: true });
   assert.equal(saveEl.textContent, "保存（1 项）", "插件草稿回退后计数回落");
+}
+
+// ── 13. 统一保存：一次点击提交全部草稿（暂存 PUT + 类别 ops 同一次生效）──
+{
+  setEnvData({
+    filePath: "C:/tmp/settings.env",
+    pluginOptions: [],
+    items: [
+      { key: "ALPHA_KEY", type: "text", label: "Alpha 项", plugin: "", staged: null, current: "base" },
+    ],
+    secrets: [],
+    plugins: [],
+  });
+  sandbox._pluginSets();
+  const rows = [makeRow("ALPHA_KEY", { control: { value: "changed" } })];
+  getElement("env-items").querySelectorAll = () => rows;
+  // 类别草稿：名字与基线不同 → 一个 update op
+  vm.runInContext(
+    `catDraft = [{ key: "c1", id: 7, name: "类别乙", prompt: "p", color: "#111111", enabled: 1, item_count: 0 }];`
+      + `catOriginal = [{ key: "c1", id: 7, name: "类别甲", prompt: "p", color: "#111111", enabled: 1, item_count: 0 }];`
+      + `catDeleted = []; sessionOriginal = [];`,
+    sandbox,
+  );
+  getElement("session-list").querySelectorAll = () => [];
+
+  const calls = [];
+  sandbox.fetch = async (url, opts = {}) => {
+    calls.push({ url: String(url), method: opts.method || "GET" });
+    if (url === "/api/settings/env" && (opts.method || "GET") === "PUT") {
+      return { ok: true, json: async () => ({ ok: true, items: {} }) };
+    }
+    if (url === "/api/status") return { ok: true, json: async () => ({ syncing: false }) };
+    if (String(url).startsWith("/api/categories/")) return { ok: true, json: async () => ({}) };
+    return { ok: false, status: 404, json: async () => ({}) };
+  };
+  const toasts = [];
+  sandbox.showToast = (msg) => toasts.push(msg);
+  sandbox.startRefreshTimer = () => {};
+  sandbox.fetchData = () => {};
+
+  await sandbox.saveAllSettings();
+
+  assert.ok(
+    calls.some(c => c.url === "/api/settings/env" && c.method === "PUT"),
+    "暂存差异应提交（旧面板分流下类别面板点保存不会提交暂存）",
+  );
+  assert.ok(
+    calls.some(c => c.url.includes("/api/categories/7/update")),
+    "类别 ops 应同一次点击提交",
+  );
+  assert.ok(
+    getElement("settings-modal").classList.contains("hidden"),
+    "双改共存保存成功后应关闭弹窗",
+  );
+  assert.ok(toasts.some(t => t.includes("已暂存")), "双改共存应同时提示暂存待重启");
+
+  // 皆无更改：静默关闭（「保存」即完成键，不再 toast「没有需要暂存的更改」）
+  rows[0].querySelector("[data-env-key]").value = "base";
+  vm.runInContext("catDraft[0].name = '类别甲'", sandbox);
+  const realQuery13 = sandbox.document.querySelector;
+  sandbox.document.querySelector = (sel) =>
+    sel === ".cat-edit-form:not(.hidden), #cat-add-form:not(.hidden)" ? null : realQuery13(sel);
+  calls.length = 0;
+  const modalEl = getElement("settings-modal");
+  modalEl.classList.remove("hidden");
+  await sandbox.saveAllSettings();
+  assert.equal(modalEl.classList.contains("hidden"), true, "皆无更改时点保存应静默关闭");
+  assert.deepEqual(calls.filter(c => c.method === "PUT" || c.url.includes("/api/categories")), [],
+    "皆无更改时不应发出任何提交请求");
+  sandbox.document.querySelector = realQuery13;
 }
 
 console.log("ui_env_panel_test: all assertions passed");
