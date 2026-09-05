@@ -5179,6 +5179,15 @@ function renderPluginToggles() {
     $pluginsList.innerHTML = '<p class="text-muted">未发现任何插件</p>';
     return;
   }
+  // 8a：pluginsSource==="env" → 顶部警示。来源链 env > 暂存 > .env > 默认，
+  // 面板开关写入的是暂存文件（优先级低于环境变量），env 覆盖时重启不生效。
+  // 只告知不禁用：用户可能想先暂存、将来移除环境变量后生效，或借此核对
+  // 当前生效值；与启动配置面板 env 行的「环境变量优先」徽章同口径。
+  const envSourced = envData.pluginsSource === "env";
+  const envNotice = envSourced
+    ? '<div class="plugins-env-notice">PLUGINS 由环境变量控制（优先于本机配置），'
+      + "此处的开关重启后不会生效——请修改系统环境变量或 .env 配置。</div>"
+    : "";
   // 7b：无任何可选插件启用 → 面板顶部引导（覆盖零源降级最常见成因：新装
   // 复制 .env.example 默认 PLUGINS=[] / 旧版升级无 PLUGINS 行）。消息源等
   // 可选插件默认禁用，须逐个启用并重启生效。
@@ -5193,8 +5202,8 @@ function renderPluginToggles() {
     ? '<div class="plugin-section"><div class="plugin-section-title">' + title + "</div>"
       + rows.map(_pluginRowHtml).join("") + "</div>"
     : "";
-  $pluginsList.innerHTML =
-    (optionalHint ? '<div class="plugin-section">' + optionalHint + "</div>" : "")
+  $pluginsList.innerHTML = envNotice
+    + (optionalHint ? '<div class="plugin-section">' + optionalHint + "</div>" : "")
     + section("核心插件（始终启用）", plugins.filter(p => p.core))
     + section("可选插件", plugins.filter(p => !p.core));
 }

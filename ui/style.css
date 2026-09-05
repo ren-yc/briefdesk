@@ -1626,6 +1626,18 @@ body.modal-open { overflow: hidden; }
   color: var(--warn);
   border-radius: var(--radius-sm);
 }
+/* env 优先警示（8a）：PLUGINS 由环境变量控制、面板开关暂存不生效——
+   信息性提示，走中性与 env-badge 一致的视觉语言（不抢错误注意力） */
+.plugins-env-notice {
+  padding: 8px 10px;
+  margin-bottom: 2px;
+  font-size: 12px;
+  line-height: 1.5;
+  background: color-mix(in srgb, var(--text-3) 8%, transparent);
+  color: var(--text-2);
+  border: 1px solid color-mix(in srgb, var(--text-3) 22%, transparent);
+  border-radius: var(--radius-sm);
+}
 /* 开关复用 env-switch 自绘轨道（轨道样式为全局 label.env-switch）；此处
    只补行头布局：压过全局 .modal-content label 的 display:block + margin-bottom */
 .plugin-row label.env-switch {

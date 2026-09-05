@@ -336,6 +336,46 @@ sandbox.renderPluginToggles();
   sandbox._pluginSets();
 }
 
+// ── 8a. pluginsSource==="env" → 顶部警示「重启不生效」（开关保持可用） ──
+// 来源链 env > 暂存 > .env > 默认；env 覆盖时面板开关写入暂存文件无效，
+// 须告知用户。env 之外的来源（override/dotenv/default）不显示警示。
+{
+  const savedEnv = vm.runInContext("envData", sandbox);
+  const base = {
+    filePath: "C:/tmp/settings.env",
+    pluginOptions: [],
+    items: [],
+    secrets: [],
+    plugins: [
+      { name: "ai_provider", version: "1.0.0", dependencies: [], conflicts: [], core: true, enabled: true, status: "loaded", reason: "" },
+      { name: "weflow", version: "1.0.0", dependencies: [], conflicts: ["weflow-legacy"], core: false, enabled: false, status: "disabled", reason: "未启用" },
+    ],
+  };
+
+  setEnvData({ ...base, pluginsSource: "env" });
+  sandbox._pluginSets();
+  sandbox.renderPluginToggles();
+  let html = getElement("plugins-list").innerHTML;
+  assert.ok(html.includes("PLUGINS 由环境变量控制"), "env 来源应显示优先警示");
+  assert.ok(html.includes("重启后不会生效"), "警示应说明开关不生效");
+  assert.ok(html.includes('data-plugin-toggle="weflow"'), "env 来源下开关仍渲染（不禁用）");
+
+  setEnvData({ ...base, pluginsSource: "override" });
+  sandbox._pluginSets();
+  sandbox.renderPluginToggles();
+  html = getElement("plugins-list").innerHTML;
+  assert.ok(!html.includes("PLUGINS 由环境变量控制"), "override（暂存）来源不应显示警示");
+
+  setEnvData({ ...base, pluginsSource: "dotenv" });
+  sandbox._pluginSets();
+  sandbox.renderPluginToggles();
+  html = getElement("plugins-list").innerHTML;
+  assert.ok(!html.includes("PLUGINS 由环境变量控制"), "dotenv 来源不应显示警示（暂存优先于 .env）");
+
+  vm.runInContext(`envData = ${JSON.stringify(savedEnv)};`, sandbox);
+  sandbox._pluginSets();
+}
+
 // ── 9. 插件开关草稿：阻止并提示 + 通过后仅改本插件 + PLUGINS 差异 ──
 {
   const toasts = [];
