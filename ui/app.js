@@ -661,16 +661,19 @@ function _isNonDraftSettingsControl(target) {
   return !!(target && target.closest && target.closest(_NON_DRAFT_SELECTOR));
 }
 
+// 设置弹窗二级面板是否处于激活态（未被 hidden）；「启动配置」与「插件」
+// 两个面板共用同一暂存保存链路，激活判定与差异计数都按两者合并处理
+function _isPanelActive(panel) {
+  return !document.querySelector('.settings-panel[data-panel="' + panel + '"]')?.classList.contains("hidden");
+}
+
 function bindSettingsFormEvents() {
   // "保存"统一应用三类更改：刷新间隔（localStorage）+ 类别草稿 + 会话草稿。
   // 同步进行中时延迟到同步完成后应用（本次同步按旧配置跑，避免数据与配置不一致）。
   $settingsSave.addEventListener("click", async () => {
     // 「启动配置 / 插件」面板共用此按钮：语义是写 .env 暂存文件（重启生效），
     // 不走刷新间隔/类别/会话草稿的保存链路（插件开关草稿并入 PLUGINS 一并提交）
-    const panelActive = ["env", "plugins"].some(
-      p => !document.querySelector('.settings-panel[data-panel="' + p + '"]')?.classList.contains("hidden")
-    );
-    if (panelActive) { await saveEnvConfig(); return; }
+    if (_isPanelActive("env") || _isPanelActive("plugins")) { await saveEnvConfig(); return; }
     if (saveBusy) return;
     saveBusy = true;
     $settingsSave.disabled = true;
@@ -4411,10 +4414,7 @@ function _envRowHtml(item, groupDisabled) {
 function _envItemsHtml() {
   // PLUGINS（hidden）由「插件」面板逐插件开关编辑，不在本面板渲染
   return _groupByPlugin(envData.items.filter(i => !i.hidden)).map(group => {
-    // 插件整组未加载/未启用 → 默认折叠（仍可展开预配置），头部徽章示意；
-    // 正文不做容器级 opacity 调光（对比度守卫测试禁止）
-    const disabled = group.name !== "core"
-      && group.items.every(i => i.pluginStatus && i.pluginStatus !== "loaded");
+    const disabled = _envGroupDisabled(group);
     return '<details class="env-group"' + (disabled ? "" : " open")
       + ' data-env-default-open="' + (disabled ? "0" : "1") + '">'
       // summary 必须挂 env-group-head：挂上后 display:flex 会同时干掉 UA 默认的
@@ -4424,6 +4424,14 @@ function _envItemsHtml() {
       + group.items.map(item => _envRowHtml(item, disabled)).join("")
       + "</div></details>";
   }).join("");
+}
+
+// 整组未加载/未启用 → 默认折叠（仍可展开预配置），头部徽章示意，行内不再
+// 重复「未启用」徽章；正文不做容器级 opacity 调光（对比度守卫测试禁止）。
+// _envItemsHtml 与行级贴片（_patchEnvItem）共用同一判定，避免两处漂移
+function _envGroupDisabled(group) {
+  return group.name !== "core"
+    && group.items.every(i => i.pluginStatus && i.pluginStatus !== "loaded");
 }
 
 function _envSecretRowHtml(s) {
@@ -4451,7 +4459,7 @@ function _envSecretRowHtml(s) {
     ? '<button type="button" class="settings-outline-btn" data-sec-replace="' + escAttr(s.name) + '">替换</button>'
       + '<button type="button" class="settings-outline-btn" data-sec-clear="' + escAttr(s.name) + '">清除</button>'
     : "";
-  return '<div class="env-row"><div class="env-row-head">'
+  return '<div class="env-row" data-sec-name="' + escAttr(s.name) + '"><div class="env-row-head">'
     + '<label class="env-label">' + esc(s.label) + "</label>" + state + managed + "</div>"
     + input + "</div>";
 }
@@ -4465,6 +4473,34 @@ function _envSecretsHtml() {
       + group.items.map(_envSecretRowHtml).join("")
       + "</div></div>";
   }).join("") || '<p class="text-muted">无</p>';
+}
+
+// ── 行级贴片：行内动作（恢复默认/密钥写清）后只更新受影响的行 ──
+// 写端点响应携带该键的最新状态（staged/source 或密钥两布尔），前端就地
+// 替换对应行的 outerHTML——不再整面 loadEnvConfig()：整面重载会丢其它行
+// 的未暂存编辑、「插件」面板的开关草稿，还会丢搜索过滤态。极端情况
+// （贴片漏更）由下次打开弹窗的 loadEnvConfig() 全量重同步兜底。
+function _patchEnvItem(key, fresh) {
+  if (!envData || !fresh) return;
+  const item = envData.items.find(i => i.key === key);
+  if (!item) return;
+  Object.assign(item, fresh); // staged / source
+  const group = _groupByPlugin(envData.items.filter(i => !i.hidden))
+    .find(g => g.items.some(i => i.key === key));
+  const $row = document.querySelector('#env-items .env-row[data-env-key="' + key + '"]');
+  if ($row && group) $row.outerHTML = _envRowHtml(item, _envGroupDisabled(group));
+  _applyEnvFilter();
+  _updateEnvSaveButton();
+}
+
+function _patchSecretRow(name, fresh) {
+  if (!envData || !fresh) return;
+  const secret = (envData.secrets || []).find(s => s.name === name);
+  if (!secret) return;
+  Object.assign(secret, fresh); // configured / keyringConfigured
+  const $row = document.querySelector('#env-secrets .env-row[data-sec-name="' + name + '"]');
+  if ($row) $row.outerHTML = _envSecretRowHtml(secret);
+  _applyEnvFilter();
 }
 
 function renderEnvConfig() {
@@ -4504,22 +4540,21 @@ function _applyEnvFilter() {
   }
 }
 
-// 底部全局「保存」按钮的差异数联动：env / plugins 面板激活时把未暂存差异
-// 追加到文案（保存（N 项））；切到其他面板或无差异时还原为纯「保存」
+// 底部全局「保存」按钮的差异数联动：启动配置/插件面板激活时显示**合并**
+// 未暂存差异数（保存（N 项））——保存语义本就是两面板差异一并提交，计数
+// 必须与实际提交项一致；切到其它面板或无差异时还原为纯「保存」
 function _updateEnvSaveButton() {
   const $save = document.getElementById("settings-save");
   if (!$save) return;
-  const panelActive = ["env", "plugins"].some(
-    p => !document.querySelector('.settings-panel[data-panel="' + p + '"]')?.classList.contains("hidden")
-  );
-  if (!panelActive || !envData) {
+  if (!_isPanelActive("env") && !_isPanelActive("plugins")) {
     if ($save.textContent !== "保存") $save.textContent = "保存";
     return;
   }
-  const envActive = !document.querySelector('.settings-panel[data-panel="env"]')?.classList.contains("hidden");
-  const n = envActive
-    ? Object.keys(_collectEnvChanges()).length
-    : Object.keys(_pluginChanges()).length;
+  if (!envData) {
+    if ($save.textContent !== "保存") $save.textContent = "保存";
+    return;
+  }
+  const n = Object.keys({ ..._collectEnvChanges(), ..._pluginChanges() }).length;
   $save.textContent = n > 0 ? "保存（" + n + " 项）" : "保存";
 }
 
@@ -4592,9 +4627,9 @@ async function saveEnvConfig() {
 
 async function restoreEnvKey(key) {
   try {
-    await putJson("/api/settings/env", { items: { [key]: null } });
+    const res = await putJson("/api/settings/env", { items: { [key]: null } });
+    _patchEnvItem(key, res.items && res.items[key]);
     showToast(key + " 已恢复默认（重启生效）", { type: "success", duration: 3000 });
-    await loadEnvConfig();
   } catch {
     showToast("操作失败，请重试", { type: "error", duration: 4000 });
   }
@@ -4608,9 +4643,9 @@ async function setEnvSecret(name) {
     return;
   }
   try {
-    await postJson("/api/settings/secrets", { name, value });
+    const res = await postJson("/api/settings/secrets", { name, value });
+    _patchSecretRow(name, res);
     showToast(name + " 已写入钥匙串（重启生效）", { type: "success", duration: 4000 });
-    await loadEnvConfig();
   } catch (err) {
     console.error("Set secret error:", err);
     showToast("密钥写入失败", { type: "error", duration: 5000 });
@@ -4619,9 +4654,9 @@ async function setEnvSecret(name) {
 
 async function clearEnvSecret(name) {
   try {
-    await deleteJson("/api/settings/secrets/" + encodeURIComponent(name));
+    const res = await deleteJson("/api/settings/secrets/" + encodeURIComponent(name));
+    _patchSecretRow(name, res);
     showToast(name + " 已从钥匙串清除", { type: "success", duration: 3000 });
-    await loadEnvConfig();
   } catch {
     showToast("清除失败，请重试", { type: "error", duration: 4000 });
   }
@@ -4986,19 +5021,19 @@ function _pluginChanges() {
 function _onPluginToggle(name, wantOn, input) {
   const p = _pluginByName(name);
   if (!p || p.core) return;
-  if (!pluginDraftSet) pluginDraftSet = new Set(pluginBaseSet || []);
+  if (!pluginDraftSet) pluginDraftSet = new Set(pluginBaseSet);
   if (pluginDraftSet.has(name) === wantOn) return;
   if (wantOn) {
     const conflicts = (p.conflicts || []).filter(n => _pluginEnabledInDraft(n));
     if (conflicts.length) {
-      input.checked = false;
+      input.checked = !wantOn;
       showToast("无法启用 " + name + "：与 " + conflicts.join("、") + " 互斥，请先禁用",
         { type: "error", duration: 6000 });
       return;
     }
     const missing = (p.dependencies || []).filter(d => !_pluginEnabledInDraft(d));
     if (missing.length) {
-      input.checked = false;
+      input.checked = !wantOn;
       showToast("无法启用 " + name + "：需先启用 " + missing.join("、"),
         { type: "error", duration: 6000 });
       return;
@@ -5013,7 +5048,7 @@ function _onPluginToggle(name, wantOn, input) {
       else if (_pluginEnabledInDraft(q.name)) optionalDependents.push(q.name);
     }
     if (coreDependents.length || optionalDependents.length) {
-      input.checked = true;
+      input.checked = !wantOn;
       const parts = [];
       if (coreDependents.length) parts.push("核心插件 " + coreDependents.join("、") + " 依赖它");
       if (optionalDependents.length) parts.push("请先禁用 " + optionalDependents.join("、"));
@@ -5027,12 +5062,16 @@ function _onPluginToggle(name, wantOn, input) {
 }
 
 function _pluginStatusBadge(p) {
-  const cls = p.status === "loaded" ? "plugin-status-ok"
-    : (p.status === "disabled" ? "plugin-status-warn" : "plugin-status-err");
-  const label = p.status === "loaded" ? "已加载"
-    : (p.status === "disabled" ? "未启用"
-      : (p.status === "failed" ? "不可用" : (p.status || "未装配")));
-  return '<span class="plugin-status ' + cls + '">' + esc(label) + "</span>";
+  // loaded/disabled/failed 为启动装配后的常态；discovered 仅在 GET 时
+  // manager 尚未装配的极端场景出现（正常启动后不会出现）
+  const states = {
+    loaded: { cls: "plugin-status-ok", label: "已加载" },
+    disabled: { cls: "plugin-status-warn", label: "未启用" },
+    failed: { cls: "plugin-status-err", label: "不可用" },
+    discovered: { cls: "plugin-status-warn", label: "未装配" },
+  };
+  const state = states[p.status] || { cls: "plugin-status-err", label: p.status || "未装配" };
+  return '<span class="plugin-status ' + state.cls + '">' + esc(state.label) + "</span>";
 }
 
 function _pluginRowHtml(p) {

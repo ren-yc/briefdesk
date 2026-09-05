@@ -7,5 +7,7 @@
 runtime 分层，实现 SourceRuntime），加 plugin.py 装配类（显式继承
 SourcePlugin，setup 里 ctx.register_source(runtime)），并在 pyproject
 声明 [project.entry-points."briefdesk.plugins"] 的 <name> 入口指向模块内
-`plugin` 实例。
+`plugin` 实例。装配类须声明 `core = False`（消息源为可选插件，默认禁用，
+经 PLUGINS 显式列名或设置页「插件」面板启用）与 `conflicts`（无互斥则
+`()`；与其他插件互斥时对称声明，如 weflow ↔ weflow-legacy）。
 """

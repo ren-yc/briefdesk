@@ -356,7 +356,7 @@ class PluginManager:
         queue = [n for n in active if indegree[n] == 0]
         ordered: set[str] = set()
         while queue:
-            n = queue.pop()
+            n = queue.pop(0)
             ordered.add(n)
             for m in dependents.get(n, []):
                 indegree[m] -= 1

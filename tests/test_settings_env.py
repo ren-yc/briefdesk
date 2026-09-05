@@ -369,6 +369,28 @@ class EnvRoutesTest(StagedFileTestCase):
         self.assertEqual(res.status_code, 200)
         self.assertEqual(read_staged(), {})
 
+    def test_put_response_carries_fresh_item_state(self) -> None:
+        # 行级贴片依据：响应携带受影响键的最终 staged/source（与 GET 同口径）；
+        # source 依赖服务端解析链，客户端无法自行推算
+        with _env_without("LOG_LEVEL"):
+            res = self.client.put(
+                "/api/settings/env", json={"items": {"LOG_LEVEL": "DEBUG"}}
+            )
+            self.assertEqual(res.status_code, 200)
+            self.assertEqual(
+                res.json()["items"],
+                {"LOG_LEVEL": {"staged": "DEBUG", "source": "override"}},
+            )
+            # 恢复默认：staged 回 None、source 脱离 override
+            # （本地有 .env 时为 dotenv，CI 无 .env 时为 default，均合法）
+            res = self.client.put(
+                "/api/settings/env", json={"items": {"LOG_LEVEL": None}}
+            )
+            self.assertEqual(res.status_code, 200)
+            item = res.json()["items"]["LOG_LEVEL"]
+            self.assertIsNone(item["staged"])
+            self.assertIn(item["source"], ("default", "dotenv"))
+
     def test_secret_set_get_delete(self) -> None:
         # 测试只验证 keyring 的写删；宿主项目 .env 可能有真实配置，需排除其
         # 对“删除 keyring 后仍已配置”的有效影响。
@@ -382,6 +404,9 @@ class EnvRoutesTest(StagedFileTestCase):
                 json={"name": "AI_API_KEY", "value": _VALID_SECRET},
             )
             self.assertEqual(res.status_code, 200)
+            # 钥匙串写入成功即两枚为真（行级贴片依据）
+            self.assertIs(res.json()["configured"], True)
+            self.assertIs(res.json()["keyringConfigured"], True)
             data = self.client.get("/api/settings/env").json()
             ai = next(s for s in data["secrets"] if s["name"] == "AI_API_KEY")
             self.assertTrue(ai["configured"])
@@ -390,6 +415,10 @@ class EnvRoutesTest(StagedFileTestCase):
             self.assertNotIn(_VALID_SECRET, json.dumps(data))
             res = self.client.delete("/api/settings/secrets/AI_API_KEY")
             self.assertEqual(res.status_code, 200)
+            # 删除后 keyringConfigured 恒 False；configured 取决于是否另有
+            # 环境变量/.env 配置（本用例核心 schema 快照 configured=False）
+            self.assertIs(res.json()["keyringConfigured"], False)
+            self.assertIs(res.json()["configured"], False)
             ai = next(
                 s
                 for s in self.client.get("/api/settings/env").json()["secrets"]

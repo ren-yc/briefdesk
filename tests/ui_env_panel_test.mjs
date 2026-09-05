@@ -1,6 +1,6 @@
 // 启动配置（设置 → 启动配置/插件）面板逻辑回归（Node vm 加载真实 ui/app.js）。
 //
-// 守六件事：
+// 守七件事：
 // 1. _collectEnvChanges 的布尔分支必须跳过未变化项——此前缺失相等性检查，
 //    每次「暂存更改」都会把所有布尔项重写进暂存文件，「没有需要暂存的更改」
 //    永不触发，差异计数常驻虚高；
@@ -13,6 +13,8 @@
 // 5. 插件面板渲染：核心插件无开关（恒启用徽章）、可选插件开关 + 依赖提示。
 // 6. 插件开关草稿：依赖/互斥阻止并提示（不隐式改其它插件），通过后仅更新
 //    本插件草稿态；_pluginChanges 把草稿 diff 成单个 PLUGINS JSON 值。
+// 7. 行内动作（恢复默认/密钥写清）行级贴片：不整面重载 loadEnvConfig——
+//    整面重载会丢其它行的未暂存编辑、「插件」面板开关草稿与搜索过滤态。
 //
 // 数据一律虚构（见 AGENTS.md）。
 
@@ -230,6 +232,7 @@ setEnvData({
   plugins: [
     { name: "ai_provider", version: "1.0.0", dependencies: [], conflicts: [], core: true, enabled: true, status: "loaded", reason: "" },
     { name: "coresink", version: "1.0.0", dependencies: ["weflow"], conflicts: [], core: true, enabled: true, status: "loaded", reason: "" },
+    { name: "pending", version: "1.0.0", dependencies: [], conflicts: [], core: false, enabled: false, status: "discovered", reason: "" },
     { name: "weflow", version: "1.0.0", dependencies: [], conflicts: ["weflow-legacy"], core: false, enabled: true, status: "loaded", reason: "" },
     { name: "weflow-legacy", version: "1.0.0", dependencies: [], conflicts: ["weflow"], core: false, enabled: false, status: "disabled", reason: "未启用：在 PLUGINS 中列出或经「插件」面板开关即可启用" },
     { name: "qqflow", version: "1.0.1", dependencies: [], conflicts: [], core: false, enabled: false, status: "disabled", reason: "" },
@@ -248,6 +251,7 @@ sandbox.renderPluginToggles();
   assert.ok(html.includes('data-plugin-toggle="weflow" checked'), "已启用可选插件开关应为勾选态");
   assert.ok(html.includes('data-plugin-toggle="qqflow"'), "禁用可选插件也渲染开关");
   assert.ok(html.includes("依赖："), "依赖提示应渲染");
+  assert.ok(html.includes("未装配"), "discovered 状态应映射为中文「未装配」（warn 色而非红色不可用）");
   assert.ok(!html.includes("重启后启用"), "未改草稿时不应有草稿徽章");
 }
 
@@ -290,6 +294,136 @@ sandbox.renderPluginToggles();
   // 回退草稿：再次关闭 qqflow → 与基准一致，差异清空
   sandbox._onPluginToggle("qqflow", false, { checked: true });
   assert.deepEqual(JSON.parse(JSON.stringify(sandbox._pluginChanges())), {}, "草稿回退后差异应清空");
+}
+
+// ── 10. 行内动作行级贴片：不整面重载（保住插件草稿），只更新受影响行 ──
+{
+  // 行桩：outerHTML 赋值记录（makeElement 无该属性，defineProperty 捕获）
+  const rowStub = makeElement();
+  let rowHtml = "";
+  Object.defineProperty(rowStub, "outerHTML", {
+    set(v) { rowHtml = v; },
+    get() { return rowHtml; },
+  });
+
+  setEnvData({
+    filePath: "C:/tmp/settings.env",
+    pluginOptions: [],
+    items: [
+      { key: "ALPHA_KEY", type: "text", label: "Alpha 项", plugin: "", staged: "old", current: "base", source: "override" },
+    ],
+    secrets: [],
+    plugins: [
+      { name: "weflow", version: "1.0.0", dependencies: [], conflicts: [], core: false, enabled: false, status: "disabled", reason: "" },
+    ],
+  });
+  sandbox._pluginSets();
+  sandbox.renderPluginToggles();
+
+  const realQuery = sandbox.document.querySelector;
+  sandbox.document.querySelector = (sel) =>
+    sel === '#env-items .env-row[data-env-key="ALPHA_KEY"]' ? rowStub : realQuery(sel);
+  const filterCalls = [];
+  const realFilter = sandbox._applyEnvFilter;
+  sandbox._applyEnvFilter = () => { filterCalls.push(1); realFilter(); };
+  const loadCalls = [];
+  const realLoad = sandbox.loadEnvConfig;
+  sandbox.loadEnvConfig = () => { loadCalls.push(1); return realLoad(); };
+  // harness 无 fetch 桩：供 reqJson 走通成功路径
+  sandbox.fetch = async () => ({
+    ok: true,
+    json: async () => ({ ok: true, items: { ALPHA_KEY: { staged: null, source: "default" } } }),
+  });
+
+  // 前置：拨一个插件开关制造草稿
+  sandbox._onPluginToggle("weflow", true, { checked: false });
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(sandbox._pluginChanges())),
+    { PLUGINS: JSON.stringify(["weflow"]) },
+    "前置：插件草稿已建立",
+  );
+
+  await sandbox.restoreEnvKey("ALPHA_KEY");
+
+  assert.equal(loadCalls.length, 0, "行内恢复默认不应整面重载 loadEnvConfig");
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(sandbox._pluginChanges())),
+    { PLUGINS: JSON.stringify(["weflow"]) },
+    "行内动作后「插件」面板开关草稿应保留",
+  );
+  assert.ok(rowHtml.includes('data-env-key="ALPHA_KEY"'), "受影响行应被重绘");
+  assert.ok(!rowHtml.includes("恢复默认"), "恢复后该行不应再有「恢复默认」按钮（staged 已清）");
+  assert.ok(filterCalls.length > 0, "贴片后应重放搜索过滤");
+
+  sandbox.document.querySelector = realQuery;
+  sandbox._applyEnvFilter = realFilter;
+  sandbox.loadEnvConfig = realLoad;
+  delete sandbox.fetch;
+}
+
+// ── 11. 密钥行贴片：两布尔更新 + 按 data-sec-name 定位重绘 ──
+{
+  const secRow = makeElement();
+  let secHtml = "";
+  Object.defineProperty(secRow, "outerHTML", {
+    set(v) { secHtml = v; },
+    get() { return ""; },
+  });
+
+  setEnvData({
+    filePath: "C:/tmp/settings.env",
+    pluginOptions: [],
+    items: [],
+    secrets: [
+      { name: "ALPHA_TOKEN", label: "Alpha 令牌", plugin: "", configured: false, keyringConfigured: false },
+    ],
+    plugins: [],
+  });
+
+  const realQuery = sandbox.document.querySelector;
+  sandbox.document.querySelector = (sel) =>
+    sel === '#env-secrets .env-row[data-sec-name="ALPHA_TOKEN"]' ? secRow : realQuery(sel);
+  sandbox._patchSecretRow("ALPHA_TOKEN", { configured: true, keyringConfigured: true });
+  assert.ok(secHtml.includes('data-sec-name="ALPHA_TOKEN"'), "密钥行应按 data-sec-name 重绘");
+  assert.ok(secHtml.includes("已配置（钥匙串）"), "写入后应显示钥匙串已配置徽章");
+
+  secHtml = "";
+  sandbox._patchSecretRow("ALPHA_TOKEN", { configured: false, keyringConfigured: false });
+  assert.ok(!secHtml.includes("已配置"), "清除后不应再显示已配置徽章");
+  assert.ok(!secHtml.includes("data-sec-replace"), "未托管行不应有「替换」入口");
+
+  sandbox.document.querySelector = realQuery;
+}
+
+// ── 12. 保存按钮合并计数：env 差异 + 插件草稿一并计入（与合并提交一致） ──
+{
+  setEnvData({
+    filePath: "C:/tmp/settings.env",
+    pluginOptions: [],
+    items: [
+      { key: "CORE_FLAG", type: "boolean", label: "核心开关", plugin: "", staged: null, current: false },
+    ],
+    secrets: [],
+    plugins: [
+      { name: "weflow", version: "1.0.0", dependencies: [], conflicts: [], core: false, enabled: false, status: "disabled", reason: "" },
+    ],
+  });
+  sandbox._pluginSets();
+  sandbox.renderPluginToggles();
+  const rows = [makeRow("CORE_FLAG", { checkbox: { checked: true } })]; // current=false → env 差异 1 项
+  getElement("env-items").querySelectorAll = () => rows;
+  const saveEl = getElement("settings-save");
+
+  sandbox._updateEnvSaveButton();
+  assert.equal(saveEl.textContent, "保存（1 项）", "仅 env 差异 → 1 项");
+
+  // 拨一个插件开关：成功路径内部会联动刷新保存按钮
+  sandbox._onPluginToggle("weflow", true, { checked: false });
+  assert.equal(saveEl.textContent, "保存（2 项）", "env 差异 + 插件草稿应合并计数（与合并提交口径一致）");
+
+  // 草稿回退 → 计数回落到仅 env 差异
+  sandbox._onPluginToggle("weflow", false, { checked: true });
+  assert.equal(saveEl.textContent, "保存（1 项）", "插件草稿回退后计数回落");
 }
 
 console.log("ui_env_panel_test: all assertions passed");

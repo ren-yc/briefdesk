@@ -2,9 +2,10 @@
 
 - `GET /api/settings/env`     元数据 + 生效值/暂存值/来源 + 插件开关数据 + 密钥状态
 - `PUT /api/settings/env`     批量暂存（白名单 + 类型/约束校验 + 插件依赖/互斥
-  复检 409 + 原子写）
-- `POST /api/settings/secrets`  写入密钥到系统密钥环（keyring）
-- `DELETE /api/settings/secrets/{name}`  清除密钥（幂等）
+  复检 409 + 原子写）；响应携带受影响键的最终 staged/source，供前端行级贴片
+- `POST /api/settings/secrets`  写入密钥到系统密钥环（keyring）；响应携带该密钥
+  的 configured/keyringConfigured 新状态
+- `DELETE /api/settings/secrets/{name}`  清除密钥（幂等）；响应同上
 
 设计约束：密钥值**永不下发**（GET 只含 configured 布尔）；暂存文件只存
 非密钥键（存储层见 briefdesk/settings_env.py）。PLUGINS 由「插件」面板
@@ -169,6 +170,20 @@ def _schema_of(key: str) -> dict:
         if meta["key"] == key:
             return meta
     raise KeyError(key)
+
+
+def _fresh_item_state(key: str, staged_now: dict[str, str]) -> dict[str, Any]:
+    """写操作后该键的最终暂存态与来源（与 GET 同口径，供前端行级贴片）。
+
+    恢复默认（null）后键从暂存文件消失：staged 回 None、source 重新落
+    env/dotenv/default 层——source 依赖服务端解析链，客户端无法自行推算。
+    """
+    meta = _schema_of(key)  # PUT 白名单已放行，必命中
+    raw = staged_now.get(key)
+    return {
+        "staged": staged_value(raw, meta["type"]) if raw is not None else None,
+        "source": source_of(key),
+    }
 
 
 def _desired_plugins(staged: dict[str, str]) -> list[str]:
@@ -341,7 +356,14 @@ async def api_settings_env_put(payload: EnvPutPayload):
             raise HTTPException(status_code=409, detail={"issues": issues})
     async with _write_lock:
         write_staged(updates)
-    return {"ok": True, "filePath": str(get_settings_file())}
+    # 写后重读暂存，回传受影响键的最终态：前端据此做行级贴片，不必整面
+    # 重拉（整面重载会丢其它行的未暂存编辑与「插件」面板的开关草稿）
+    staged_now = read_staged()
+    return {
+        "ok": True,
+        "filePath": str(get_settings_file()),
+        "items": {key: _fresh_item_state(key, staged_now) for key in updates},
+    }
 
 
 @app.post("/api/settings/secrets")
@@ -357,7 +379,8 @@ async def api_secrets_set(payload: SecretsPutPayload):
         set_secret(name, value)
     except Exception as exc:  # SecretsStoreError 等统一转可读错误
         raise HTTPException(500, f"密钥环写入失败: {exc}") from exc
-    return {"ok": True, "name": name}
+    # 钥匙串写入成功即两枚为真：keyringConfigured 有条目、configured 是其超集
+    return {"ok": True, "name": name, "configured": True, "keyringConfigured": True}
 
 
 @app.delete("/api/settings/secrets/{name}")
@@ -366,7 +389,15 @@ async def api_secrets_delete(name: str):
     if name not in {meta["key"] for meta in _secret_schema()}:
         raise HTTPException(422, f"未知密钥名: {name!r}")
     delete_secret(name)
-    return {"ok": True, "name": name}
+    # configured 是否仍为真取决于该密钥是否另有环境变量/.env 配置——只有
+    # 服务端能判定，回传供前端行级贴片（keyringConfigured 删除后恒为 False）
+    meta = next((m for m in _secret_schema() if m["key"] == name), None)
+    return {
+        "ok": True,
+        "name": name,
+        "configured": bool(meta.get("configured")) if meta else False,
+        "keyringConfigured": False,
+    }
 
 
 app.include_router(router)
