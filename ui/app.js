@@ -503,7 +503,6 @@ function bindSidebarSearchEvents() {
 function bindSettingsEntryEvents() {
   function openSettings(e) {
     e.preventDefault();
-    settingsDirtyFlag = false; // 全新打开：草稿尚未改动（弹窗打开后会重载草稿）
     $settingsModal.classList.remove("hidden");
     syncBodyScrollLock();
     setSettingsPanel("general"); // 二级菜单：每次打开默认回到「常规」
@@ -650,21 +649,30 @@ function bindSessionEvents() {
   sessionFilter.bindEvents();
 }
 
-// 设置弹窗内的「非草稿」控件：输入/勾选即时提交（行内「保存」写钥匙串、
-// 即写 localStorage）或纯属视图过滤，不参与底部「保存」的差异链路，因此
-// 不应置位脏标记（否则弹窗取消时会被误问「是否放弃修改」——密钥框打字
-// 即曾如此）。草稿控件（启动配置项/类别编辑/群聊筛选勾选等）不在此列。
-const _NON_DRAFT_SELECTOR = ".env-secret-input input, #env-filter, #subs-add-kw, #block-add-kw,"
-  + " .subs-enabled, .block-enabled, #notify-mode, #session-search, #restore-file";
-
-function _isNonDraftSettingsControl(target) {
-  return !!(target && target.closest && target.closest(_NON_DRAFT_SELECTOR));
-}
-
 // 设置弹窗二级面板是否处于激活态（未被 hidden）；「启动配置」与「插件」
 // 两个面板共用同一暂存保存链路，激活判定与差异计数都按两者合并处理
 function _isPanelActive(panel) {
   return !document.querySelector('.settings-panel[data-panel="' + panel + '"]')?.classList.contains("hidden");
+}
+
+// 选项 b（保守）：类别新增/行内编辑表单打开中即视为有未保存修改——
+// 未确认的输入不进入保存链路（保存也不会保留），但静默丢弃半截输入
+// 属可避免错误，宁多问一次
+function _inlineEditorOpen() {
+  return !!document.querySelector('.cat-edit-form:not(.hidden), #cat-add-form:not(.hidden)');
+}
+
+// 关闭确认判据：存在任一「保存会提交」的真实差异，或行内编辑表单打开中。
+// 与保存路径共用同一 diff 函数（_diffCategoryOps/_collectEnvChanges/
+// _pluginChanges），杜绝「问了但保存也不保留」与「改了又改回仍被问」
+// 两类误报——取代旧的「任一事件即置位」布尔标记
+function _hasPendingChanges() {
+  if (_inlineEditorOpen()) return true;
+  if (catDraft && _diffCategoryOps().length) return true;
+  // 与 saveSettings 同口径：空值/非法值回落 300 后再比
+  if (Math.max(30, parseInt($refreshInterval.value) || 300) !== refreshIntervalSec) return true;
+  if (envData && Object.keys({ ..._collectEnvChanges(), ..._pluginChanges() }).length) return true;
+  return false;
 }
 
 function bindSettingsFormEvents() {
@@ -781,14 +789,6 @@ function bindSettingsFormEvents() {
 
   $settingsModal.addEventListener("click", (e) => {
     if (e.target === $settingsModal) closeSettingsModal();
-  });
-  // 设置草稿脏检查：任何输入/变更即标记（input 捕获文本框，change 捕获勾选/下拉）；
-  // 非草稿控件除外（见 _isNonDraftSettingsControl），否则弹窗取消会被误问「是否放弃」
-  $settingsModal.addEventListener("input", (e) => {
-    if (!_isNonDraftSettingsControl(e.target)) settingsDirtyFlag = true;
-  });
-  $settingsModal.addEventListener("change", (e) => {
-    if (!_isNonDraftSettingsControl(e.target)) settingsDirtyFlag = true;
   });
 }
 
@@ -4134,14 +4134,11 @@ function undoDelete(key) {
   renderCategoryToggles();
 }
 
-// 收集全部设置变更操作（类别 diff + 会话 diff），返回描述性操作列表；
-// 类别草稿未加载或最终名称集合冲突时返回 null（已弹窗说明）。
-// 在保存时刻快照——即使同步中挂起、之后弹窗重开重载草稿，操作依然有效。
-function collectAllOps() {
-  if (!catDraft) {
-    showToast("类别列表尚未加载，请关闭设置窗口后重新打开", { type: "error", duration: 5000 });
-    return null;
-  }
+// 收集类别/会话草稿与基线的差异操作列表（纯函数：不改状态、不弹窗）。
+// 脏检查（_hasPendingChanges）与保存（collectAllOps）共用本函数——
+// 保证「关闭时问的」与「保存时存的」永远一致，杜绝两套事实源漂移。
+function _diffCategoryOps() {
+  if (!catDraft) return []; // 类别草稿未加载 = 无草稿可言（不阻塞其它源保存）
   const ops = [];
   // 类别顺序：先删、再改、后增（改名先于同名新建执行，释放旧名避免 UNIQUE 冲突；
   // 会话开关与类别无关，放最后）
@@ -4178,6 +4175,13 @@ function collectAllOps() {
       ops.push({ type: "sessionToggle", source: cb.dataset.source, sessionId: cb.dataset.sessionId });
     }
   });
+  return ops;
+}
+
+// 保存时刻快照收集全部设置变更操作——即使同步中挂起、之后弹窗重开重载
+// 草稿，操作依然有效；最终名称集合冲突时返回 null（已弹窗说明）。
+function collectAllOps() {
+  const ops = _diffCategoryOps();
   // 最终名称集合校验：改名 A→B 且新建 B、两类别改名为同一新名等在服务端必然
   // 409，提前拦截并指明冲突名，避免操作执行到一半才失败。
   // 新建名撞"正在被删除/改名的旧名"不算冲突（先删后建/先改后建可成功）。
@@ -5189,11 +5193,11 @@ function injectPluginScript(name) {
   });
 }
 
-let settingsDirtyFlag = false; // 设置弹窗内任一 input/change 即置位（非草稿控件除外，见 _isNonDraftSettingsControl）；保存成功后 force 关闭
 function closeSettingsModal({ force = false } = {}) {
-  // 显式保存模型下，Esc/取消/点遮罩静默丢弃全部草稿属可避免错误（Nielsen #5）
-  if (!force && settingsDirtyFlag && !window.confirm("有未保存的修改，确定放弃并关闭？")) return;
-  settingsDirtyFlag = false;
+  // 显式保存模型下，Esc/取消/点遮罩静默丢弃全部草稿属可避免错误（Nielsen #5）。
+  // 判据是真实差异（与保存共用 diff 函数），而非「发生过事件」的累积标记：
+  // 改了又改回、行内动作后的残留等不再误问；无状态可复位（差异即算即用）
+  if (!force && _hasPendingChanges() && !window.confirm("有未保存的修改，确定放弃并关闭？")) return;
   $settingsModal.classList.add("hidden");
   syncBodyScrollLock();
   popModalFocus($settingsModal);

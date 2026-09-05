@@ -8,8 +8,9 @@
 //    重复）；布尔项渲染为开关；已配置（钥匙串）的密钥提供「替换/取消」入口；
 //    hidden 标记项（PLUGINS）不渲染进启动配置面板；
 // 3. 「暂存更改」按钮的脏计数联动。
-// 4. 脏检查排除清单：非草稿控件（即时提交/视图过滤）不置位脏标记，否则
-//    密钥框打字后点弹窗取消会被误问「是否放弃修改」。
+// 4. 脏检查差异派生：_hasPendingChanges 与保存共用同一 diff 函数——改了
+//    又改回、行内动作后的残留不再误问「是否放弃」；类别新增/行内编辑
+//    表单打开中（选项 b 保守项）仍视为有未保存修改。
 // 5. 插件面板渲染：核心插件无开关（恒启用徽章）、可选插件开关 + 依赖提示。
 // 6. 插件开关草稿：依赖/互斥阻止并提示（不隐式改其它插件），通过后仅更新
 //    本插件草稿态；_pluginChanges 把草稿 diff 成单个 PLUGINS JSON 值。
@@ -182,28 +183,82 @@ sandbox.renderEnvConfig();
   assert.equal(missGroup.open, true, "清空后按默认展开态还原（该组默认展开）");
 }
 
-// ── 6. 脏检查排除清单：非草稿控件不置位脏标记 ──
-// 真实 closest 一次收到完整选择器串（_NON_DRAFT_SELECTOR），桩据此校验
-// 清单确实覆盖每个关键控件，同时验证谓词的分支行为。
+// ── 6. 脏检查差异派生：_hasPendingChanges 按五类草稿源的真实差异判定 ──
+// 与保存路径共用同一 diff 函数：改了又改回/行内动作后的残留不再误报；
+// 选项 b 保守项：类别新增/行内编辑表单打开中即视为有未保存修改。
 {
-  for (const frag of [
-    ".env-secret-input",   // 密钥框：行内「保存」即时写钥匙串
-    "#env-filter",         // 启动配置搜索：纯视图过滤
-    "#subs-add-kw",        // 订阅添加：点「添加」即写 localStorage
-    "#block-add-kw",       // 黑名单添加：同上
-    ".subs-enabled",       // 订阅启用勾选：勾选即写 localStorage
-    ".block-enabled",      // 黑名单启用勾选：同上
-    "#notify-mode",        // 通知模式：变更即写 localStorage
-    "#session-search",     // 群聊筛选搜索：纯视图过滤
-    "#restore-file",       // 备份文件：选完即走立即恢复流程
-  ]) {
-    const probe = { closest: (sel) => (typeof sel === "string" && sel.includes(frag) ? {} : null) };
-    assert.equal(sandbox._isNonDraftSettingsControl(probe), true, `排除清单应覆盖非草稿控件 ${frag}`);
-  }
-  const draftControl = { closest: () => null }; // 草稿控件（如刷新间隔、类别编辑）
-  assert.equal(sandbox._isNonDraftSettingsControl(draftControl), false, "草稿控件不命中排除清单，应继续置位脏标记");
-  assert.equal(sandbox._isNonDraftSettingsControl(null), false, "空目标应安全返回 false");
-  assert.equal(sandbox._isNonDraftSettingsControl({}), false, "无 closest 的目标应安全返回 false");
+  // 类别/会话草稿源注入（app.js 顶层 let，同一 context 的后续 script 可赋值）
+  const catRow = { key: "c1", id: 7, name: "类别甲", prompt: "p", color: "#111111", enabled: 1, item_count: 0 };
+  vm.runInContext(
+    `catDraft = [${JSON.stringify(catRow)}]; catOriginal = [${JSON.stringify(catRow)}];`
+      + `catDeleted = []; sessionOriginal = [{ source: "qq", session_id: "123", enabled: 0 }];`,
+    sandbox,
+  );
+  const cb = { checked: false, dataset: { source: "qq", sessionId: "123" } };
+  getElement("session-list").querySelectorAll = () => [cb];
+
+  setEnvData({
+    filePath: "C:/tmp/settings.env",
+    pluginOptions: [],
+    items: [
+      { key: "ALPHA_KEY", type: "text", label: "Alpha 项", plugin: "", staged: null, current: "base" },
+    ],
+    secrets: [],
+    plugins: [
+      { name: "weflow", version: "1.0.0", dependencies: [], conflicts: [], core: false, enabled: false, status: "disabled", reason: "" },
+    ],
+  });
+  sandbox._pluginSets();
+  const rows = [makeRow("ALPHA_KEY", { control: { value: "base" } })];
+  getElement("env-items").querySelectorAll = () => rows;
+  const refreshEl = getElement("refresh-interval");
+  refreshEl.value = vm.runInContext("String(refreshIntervalSec)", sandbox);
+
+  // harness 的 document.querySelector 恒返回真值元素，会让 _inlineEditorOpen
+  // 恒真——本段专用桩化：行内编辑表默认收起，选项 b 断言时再模拟打开
+  const realQuery = sandbox.document.querySelector;
+  const editorSel = ".cat-edit-form:not(.hidden), #cat-add-form:not(.hidden)";
+  sandbox.document.querySelector = (sel) => (sel === editorSel ? null : realQuery(sel));
+
+  assert.equal(sandbox._hasPendingChanges(), false, "初始无草稿不脏");
+
+  // env 输入：改了又改回 → 不脏（旧「任一事件即置位」布尔机制会误报）
+  rows[0].querySelector("[data-env-key]").value = "changed";
+  assert.ok(sandbox._hasPendingChanges(), "env 真实差异 → 脏");
+  rows[0].querySelector("[data-env-key]").value = "base";
+  assert.equal(sandbox._hasPendingChanges(), false, "env 改回原值 → 不脏");
+
+  // 插件开关：拨开再拨回 → 不脏
+  sandbox._onPluginToggle("weflow", true, { checked: false });
+  assert.ok(sandbox._hasPendingChanges(), "插件草稿 → 脏");
+  sandbox._onPluginToggle("weflow", false, { checked: true });
+  assert.equal(sandbox._hasPendingChanges(), false, "插件拨回 → 不脏");
+
+  // 类别：改名后改回 → 不脏
+  vm.runInContext("catDraft[0].name = '类别乙'", sandbox);
+  assert.ok(sandbox._hasPendingChanges(), "类别真实差异 → 脏");
+  vm.runInContext("catDraft[0].name = '类别甲'", sandbox);
+  assert.equal(sandbox._hasPendingChanges(), false, "类别改回 → 不脏");
+
+  // 会话勾选：翻转后翻回 → 不脏
+  cb.checked = true;
+  assert.ok(sandbox._hasPendingChanges(), "会话勾选真实差异 → 脏");
+  cb.checked = false;
+  assert.equal(sandbox._hasPendingChanges(), false, "会话勾选改回 → 不脏");
+
+  // 刷新间隔：改了又改回 → 不脏
+  refreshEl.value = "999";
+  assert.ok(sandbox._hasPendingChanges(), "刷新间隔真实差异 → 脏");
+  refreshEl.value = vm.runInContext("String(refreshIntervalSec)", sandbox);
+  assert.equal(sandbox._hasPendingChanges(), false, "刷新间隔改回 → 不脏");
+
+  // 选项 b 保守项：行内编辑表单打开中 → 脏（未确认输入不进保存链路，但
+  // 静默丢弃半截输入属可避免错误，宁多问一次）
+  sandbox.document.querySelector = (sel) => (sel === editorSel ? makeElement() : realQuery(sel));
+  assert.ok(sandbox._hasPendingChanges(), "行内编辑表单打开中 → 脏（选项 b）");
+  // 段尾保持「编辑态收起」桩（还原 harness 默认会让 _inlineEditorOpen 恒真）
+  sandbox.document.querySelector = (sel) => (sel === editorSel ? null : realQuery(sel));
+  assert.equal(sandbox._hasPendingChanges(), false, "表单收起后恢复按真实差异判定");
 }
 
 // ── 7. hidden 标记项（PLUGINS）不渲染进启动配置面板（由插件面板编辑）──
