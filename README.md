@@ -223,7 +223,7 @@ briefdesk/
 
 简报台采用「核心骨架 + 插件」架构：可插拔消息源（weflow / weflow-legacy / qqflow）产出归一化消息，经 pipeline 入口统一过滤后进入阶段插件流水线（OCR 增强 → AI 分类 → 语义去重 → 同话题合并），结果写入 SQLite，由 FastAPI 服务端经 SSE 实时推送到原生 JS 前端；本体只保留存储、管道骨架、HTTP 与状态总线等核心。
 
-完整的数据流图、模块职责、插件框架、数据库 Schema、配置项与设计陷阱详见 [docs/architecture.md](docs/architecture.md)；日常使用（启动、配置、常见操作）详见 [docs/USAGE.md](docs/USAGE.md)。
+完整的数据流图、模块职责、插件框架、数据库 Schema、配置项与设计陷阱详见 [docs/architecture.md](docs/architecture.md)；日常使用（启动、配置、常见操作）详见 [USAGE.md](USAGE.md)。
 
 ## 技术栈
 
