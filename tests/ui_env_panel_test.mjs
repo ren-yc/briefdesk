@@ -308,6 +308,32 @@ sandbox.renderPluginToggles();
   assert.ok(html.includes("依赖："), "依赖提示应渲染");
   assert.ok(html.includes("未装配"), "discovered 状态应映射为中文「未装配」（warn 色而非红色不可用）");
   assert.ok(!html.includes("重启后启用"), "未改草稿时不应有草稿徽章");
+  assert.ok(!html.includes("未启用任何可选插件"), "有已启用可选插件时不应显示空态引导");
+}
+
+// ── 7b. 无可选插件启用 → 面板顶部空态引导（零源降级最常见成因） ──
+// 注意：envData/_pluginSets 是后续用例共享的可变状态，本块结束前恢复原夹具。
+{
+  const savedEnv = vm.runInContext("envData", sandbox);
+  setEnvData({
+    filePath: "C:/tmp/settings.env",
+    pluginOptions: [],
+    items: [],
+    secrets: [],
+    plugins: [
+      { name: "ai_provider", version: "1.0.0", dependencies: [], conflicts: [], core: true, enabled: true, status: "loaded", reason: "" },
+      { name: "weflow", version: "1.0.0", dependencies: [], conflicts: ["weflow-legacy"], core: false, enabled: false, status: "disabled", reason: "未启用" },
+      { name: "qqflow", version: "1.0.1", dependencies: [], conflicts: [], core: false, enabled: false, status: "disabled", reason: "未启用" },
+    ],
+  });
+  sandbox._pluginSets();
+  sandbox.renderPluginToggles();
+  const html = getElement("plugins-list").innerHTML;
+  assert.ok(html.includes("未启用任何可选插件"), "全可选禁用时应显示空态引导");
+  assert.ok(html.includes("启用至少一个消息源"), "引导应指向启用消息源");
+  assert.ok(html.includes("重启应用生效"), "引导应说明重启生效");
+  vm.runInContext(`envData = ${JSON.stringify(savedEnv)};`, sandbox);
+  sandbox._pluginSets();
 }
 
 // ── 9. 插件开关草稿：阻止并提示 + 通过后仅改本插件 + PLUGINS 差异 ──

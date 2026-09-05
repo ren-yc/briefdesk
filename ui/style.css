@@ -1617,6 +1617,15 @@ body.modal-open { overflow: hidden; }
 .plugin-status-err  { background: color-mix(in srgb, var(--state-err) 16%, var(--surface));  color: var(--state-err); }
 .plugin-reason { font-size: 0.85em; }
 .plugin-row .settings-hint { margin: 4px 0 0; }
+/* 插件面板空态引导（7b：无可选插件启用时顶部提示）——借用 warning 底色突出，
+   与面板内其它 hint 区分；不覆盖 .settings-hint 的全局负上边距（此处独立成行） */
+.plugins-empty-hint {
+  margin: 0 0 2px !important;
+  padding: 8px 10px;
+  background: color-mix(in srgb, var(--warn) 10%, transparent);
+  color: var(--warn);
+  border-radius: var(--radius-sm);
+}
 /* 开关复用 env-switch 自绘轨道（轨道样式为全局 label.env-switch）；此处
    只补行头布局：压过全局 .modal-content label 的 display:block + margin-bottom */
 .plugin-row label.env-switch {

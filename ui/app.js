@@ -501,30 +501,31 @@ function bindSidebarSearchEvents() {
 }
 
 function bindSettingsEntryEvents() {
-  function openSettings(e) {
-    e.preventDefault();
-    $settingsModal.classList.remove("hidden");
-    syncBodyScrollLock();
-    setSettingsPanel("general"); // 二级菜单：每次打开默认回到「常规」
-    // 每次打开重置搜索与两组多选（回到"全部"）；时间档位随后由 loadSessions →
-    // initSessionTimeFilter 从 localStorage/服务端默认恢复，故此处的 'all' 只是过渡值
-    sessionFilter.reset();
-    sessionFilter.renderSourceChips(); // 按 /api/status 实际启用源渲染多选芯片
-    loadSessions();
-    loadCategories();
-    loadAboutSources();
-    loadEnvConfig(); // 插件面板（逐插件开关）与启动配置共用本次数据
-    pushModalFocus($settingsModal, { initialFocus: $refreshInterval });
-  }
-
+  // 打开设置弹窗并切到指定面板（默认「常规」）。作为模块级函数供状态横幅等
+  // 外部入口直接跳转（如零源降级横幅的「去启用」直达「插件」面板）。
+  $settingsLink.addEventListener("click", (e) => openSettingsModal(e));
   // 二级菜单切换：仅显示选中分组的面板，草稿跨分组保留（保存时统一提交）
   $settingsMenu.addEventListener("click", (e) => {
     const btn = e.target.closest(".settings-menu-item");
     if (!btn) return;
     setSettingsPanel(btn.dataset.panel);
   });
+}
 
-  $settingsLink.addEventListener("click", openSettings);
+function openSettingsModal(e, { panel = "general" } = {}) {
+  if (e && e.preventDefault) e.preventDefault();
+  $settingsModal.classList.remove("hidden");
+  syncBodyScrollLock();
+  setSettingsPanel(panel); // 二级菜单：按需直达分组（默认「常规」）
+  // 每次打开重置搜索与两组多选（回到"全部"）；时间档位随后由 loadSessions →
+  // initSessionTimeFilter 从 localStorage/服务端默认恢复，故此处的 'all' 只是过渡值
+  sessionFilter.reset();
+  sessionFilter.renderSourceChips(); // 按 /api/status 实际启用源渲染多选芯片
+  loadSessions();
+  loadCategories();
+  loadAboutSources();
+  loadEnvConfig(); // 插件面板（逐插件开关）与启动配置共用本次数据
+  pushModalFocus($settingsModal, { initialFocus: $refreshInterval });
 }
 
 function bindCategoryEvents() {
@@ -3475,26 +3476,43 @@ function updateStatus(status) {
   setSyncButton(manualSyncWait);
 }
 
-// ── 错误/警告横幅：同步失败（lastError）、阶段缺失/无类别（lastWarning）显式提示 ──
+// ── 错误/警告横幅：同步失败（lastError）、阶段缺失/无类别（lastWarning）、
+// 零源降级（sources 为空）显式提示 ──
 // 关闭仅当前会话生效（下次 fetchData 若状态仍在会重现）；重试按钮复用同步入口。
 function renderStatusBanner(status) {
   const banner = document.getElementById("error-banner");
   if (!banner) return;
   const err = status && status.lastError;
   const warn = status && status.lastWarning;
-  banner.classList.toggle("hidden", !err && !warn);
-  if (!err && !warn) {
+  const zeroSource = status && !Object.keys(status.sources || {}).length;
+  banner.classList.toggle("hidden", !err && !warn && !zeroSource);
+  if (!err && !warn && !zeroSource) {
     banner.innerHTML = "";
     return;
   }
-  const isErr = !!err;
-  const text = isErr ? err : warn;
-  const action = isErr
-    ? '<button type="button" class="error-banner-btn" data-action="retry">重试同步</button>'
-    : '<button type="button" class="error-banner-btn" data-action="settings">去设置</button>';
+  // 零源降级是独立提示：与 lastError/lastWarning 不同源、可共存提示——
+  // 无 err/warn 时单独显示，有 err/warn 时让位给更具体的报错（零源信息
+  // 已在状态文字「无消息源（检查插件配置，降级运行）」中可见）。
+  let action = null;
+  let isErr = false;
+  let text = "";
+  if (err) {
+    isErr = true;
+    text = err;
+    action = { label: "重试同步", data: "retry" };
+  } else if (warn) {
+    text = warn;
+    action = { label: "去设置", data: "settings" };
+  } else if (zeroSource) {
+    text = "未启用任何消息源，消息采集不可用";
+    action = { label: "去启用", data: "settings-plugins" };
+  }
+  const actionBtn = action
+    ? '<button type="button" class="error-banner-btn" data-action="' + action.data + '">' + action.label + "</button>"
+    : "";
   banner.className = "error-banner " + (isErr ? "error" : "warning");
   banner.innerHTML =
-    '<span class="error-banner-text">' + esc(text) + '</span>' + action +
+    '<span class="error-banner-text">' + esc(text) + '</span>' + actionBtn +
     '<button type="button" class="error-banner-close" title="关闭" aria-label="关闭">'
     + '<img src="/icons/x.svg" class="icon-sm" alt=""></button>';
   banner.querySelector(".error-banner-close").addEventListener("click", () => {
@@ -3506,6 +3524,8 @@ function renderStatusBanner(status) {
     if (btn.dataset.action === "retry") {
       const syncBtn = document.getElementById("sync-btn");
       if (syncBtn) syncBtn.click();
+    } else if (btn.dataset.action === "settings-plugins") {
+      openSettingsModal(null, { panel: "plugins" }); // 直达「插件」面板
     } else {
       const link = document.getElementById("settings-link");
       if (link) link.click();
@@ -5159,12 +5179,23 @@ function renderPluginToggles() {
     $pluginsList.innerHTML = '<p class="text-muted">未发现任何插件</p>';
     return;
   }
+  // 7b：无任何可选插件启用 → 面板顶部引导（覆盖零源降级最常见成因：新装
+  // 复制 .env.example 默认 PLUGINS=[] / 旧版升级无 PLUGINS 行）。消息源等
+  // 可选插件默认禁用，须逐个启用并重启生效。
+  const optionalAllOff = !plugins.some(p => !p.core && p.enabled);
+  const optionalHint = optionalAllOff
+    ? '<p class="text-muted settings-hint plugins-empty-hint">当前未启用任何可选插件'
+      + "（消息源等默认禁用）。消息采集不可用——请在上方启用至少一个消息源，"
+      + "保存后重启应用生效。</p>"
+    : "";
   // 核心在前、可选在后（各保持服务端返回序）；空分组不渲染标题
   const section = (title, rows) => rows.length
     ? '<div class="plugin-section"><div class="plugin-section-title">' + title + "</div>"
       + rows.map(_pluginRowHtml).join("") + "</div>"
     : "";
-  $pluginsList.innerHTML = section("核心插件（始终启用）", plugins.filter(p => p.core))
+  $pluginsList.innerHTML =
+    (optionalHint ? '<div class="plugin-section">' + optionalHint + "</div>" : "")
+    + section("核心插件（始终启用）", plugins.filter(p => p.core))
     + section("可选插件", plugins.filter(p => !p.core));
 }
 
