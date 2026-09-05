@@ -683,7 +683,7 @@ function bindSettingsFormEvents() {
   $settingsClose.addEventListener("click", closeSettingsModal);
 
   // 「启动配置」面板：恢复默认/密钥读写/搜索过滤（委托在面板容器上）；
-  // 「保存」复用弹窗底部全局按钮（见 $settingsSave 的面板分流）
+  // 「保存」为弹窗底部全局按钮，所有面板统一语义（编排见 saveAllSettings）
   const $envItems = document.getElementById("env-items");
   const $envSecrets = document.getElementById("env-secrets");
   const $envFilter = document.getElementById("env-filter");
@@ -699,9 +699,6 @@ function bindSettingsFormEvents() {
       const chip = e.target.closest(".env-chip");
       if (chip) chip.classList.toggle("checked", e.target.checked);
     });
-    // 任意控件输入/变更 → 刷新「暂存更改」的差异计数与高亮态
-    $envItems.addEventListener("input", _updateSaveButton);
-    $envItems.addEventListener("change", _updateSaveButton);
   }
   if ($envSecrets) {
     $envSecrets.addEventListener("click", (e) => {
@@ -4295,7 +4292,15 @@ async function saveAllSettings() {
 
     // 2) 类别/会话 ops：保存时快照，弹窗重开/草稿重载不影响挂起
     const ops = collectAllOps();
-    if (!ops) return; // 名称冲突已弹窗说明，中止本次保存
+    if (!ops) {
+      // 名称冲突中止：暂存段若已提交仍需明示并刷新面板，避免用户不知道
+      // 配置已暂存（数据已在服务端，只是缺反馈）
+      if (staged === "committed") {
+        showToast("已暂存，重启应用后生效", { type: "success", duration: 4000 });
+        await loadEnvConfig();
+      }
+      return; // 名称冲突已弹窗说明，中止本次保存
+    }
     let opsApplied = false;
     let opsDeferred = false;
     if (ops.length) {
@@ -4328,11 +4333,9 @@ async function saveAllSettings() {
       await loadEnvConfig(); // 刷新面板显示已暂存徽标（并复位开关草稿）
     } else if (opsApplied || opsDeferred || intervalChanged) {
       closeSettingsModal({ force: true });
-      if (opsApplied || opsDeferred) {
-        showToast("设置已保存", { type: "success", duration: 2500 });
-        startRefreshTimer();
-        fetchData();
-      }
+      showToast("设置已保存", { type: "success", duration: 2500 });
+      startRefreshTimer();
+      fetchData();
     } else {
       closeSettingsModal({ force: true });
     }
@@ -4352,7 +4355,8 @@ async function saveAllSettings() {
 }
 
 // ── 启动配置（.env 暂存）──
-// 数据来自 GET /api/settings/env；「暂存更改」只写暂存文件（重启应用才生效），
+// 数据来自 GET /api/settings/env；暂存写入用户配置目录的 settings.env
+// （重启应用才生效，统一保存流程的第一段见 stagePendingEnvChanges），
 // 密钥走系统钥匙串（POST/DELETE /api/settings/secrets），服务端不回传明文。
 let envData = null;
 

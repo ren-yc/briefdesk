@@ -7,7 +7,7 @@
 // 2. 分组渲染：未启用插件组默认折叠并在组头标注「未启用」（行内徽章不再
 //    重复）；布尔项渲染为开关；已配置（钥匙串）的密钥提供「替换/取消」入口；
 //    hidden 标记项（PLUGINS）不渲染进启动配置面板；
-// 3. 「暂存更改」按钮的脏计数联动。
+// 3. 「保存」按钮的全局合并计数联动（类别/会话/刷新间隔/暂存差异一并计入）。
 // 4. 脏检查差异派生：_hasPendingChanges 与保存共用同一 diff 函数——改了
 //    又改回、行内动作后的残留不再误问「是否放弃」；类别新增/行内编辑
 //    表单打开中（选项 b 保守项）仍视为有未保存修改。
@@ -76,7 +76,7 @@ setEnvData({
 }
 
 // ── 2. 保存按钮联动：差异出现时文案带计数，归零后还原为「保存」──
-// （env 面板复用弹窗底部全局「保存」按钮，点击语义按面板分流）
+// （统一保存语义下一次点击提交全部草稿，计数与实际提交项一致）
 {
   const rows = [
     makeRow("CORE_FLAG", { checkbox: { checked: true } }),
@@ -549,6 +549,84 @@ sandbox.renderPluginToggles();
   assert.deepEqual(calls.filter(c => c.method === "PUT" || c.url.includes("/api/categories")), [],
     "皆无更改时不应发出任何提交请求");
   sandbox.document.querySelector = realQuery13;
+}
+
+// ── 14. 中止路径：暂存成功遇名称冲突仍需明示；警示确认取消不发 PUT ──
+{
+  // 夹具：env 一项差异 + 类别「改名甲→乙」撞「新建乙」（名称冲突 → ops = null）
+  setEnvData({
+    filePath: "C:/tmp/settings.env",
+    pluginOptions: [],
+    items: [
+      { key: "ALPHA_KEY", type: "text", label: "Alpha 项", plugin: "", staged: null, current: "base" },
+    ],
+    secrets: [],
+    plugins: [],
+  });
+  sandbox._pluginSets();
+  const rows = [makeRow("ALPHA_KEY", { control: { value: "changed" } })];
+  getElement("env-items").querySelectorAll = () => rows;
+  vm.runInContext(
+    `catDraft = [{ key: "c1", id: 7, name: "类别乙", prompt: "p", color: "#111111", enabled: 1, item_count: 0 },`
+      + `{ key: "n1", id: null, name: "类别乙", prompt: "", color: "#6B7280", enabled: 1, item_count: 0 }];`
+      + `catOriginal = [{ key: "c1", id: 7, name: "类别甲", prompt: "p", color: "#111111", enabled: 1, item_count: 0 }];`
+      + `catDeleted = []; sessionOriginal = [];`,
+    sandbox,
+  );
+  getElement("session-list").querySelectorAll = () => [];
+
+  const calls = [];
+  sandbox.fetch = async (url, opts = {}) => {
+    calls.push({ url: String(url), method: opts.method || "GET" });
+    if (url === "/api/settings/env" && (opts.method || "GET") === "PUT") {
+      return { ok: true, json: async () => ({ ok: true, items: {} }) };
+    }
+    // 名称冲突中止后的 loadEnvConfig 重载
+    if (url === "/api/settings/env") {
+      return {
+        ok: true,
+        json: async () => ({ ok: true, filePath: "C:/tmp/settings.env", items: [], secrets: [], plugins: [], pluginOptions: [] }),
+      };
+    }
+    if (url === "/api/status") return { ok: true, json: async () => ({ syncing: false }) };
+    return { ok: false, status: 404, json: async () => ({}) };
+  };
+  const toasts = [];
+  sandbox.showToast = (msg) => toasts.push(msg);
+  sandbox.startRefreshTimer = () => {};
+  sandbox.fetchData = () => {};
+  const modalEl = getElement("settings-modal");
+  modalEl.classList.remove("hidden");
+
+  await sandbox.saveAllSettings();
+
+  assert.ok(calls.some(c => c.url === "/api/settings/env" && c.method === "PUT"), "暂存应已提交");
+  assert.ok(!calls.some(c => String(c.url).startsWith("/api/categories")),
+    "名称冲突中止时类别 ops 不应执行");
+  assert.ok(toasts.some(t => t.includes("类别名称冲突")), "名称冲突应有提示");
+  assert.ok(toasts.some(t => t.includes("已暂存")), "中止时已提交的暂存仍应明示（不因中止被吞掉）");
+  assert.equal(modalEl.classList.contains("hidden"), false, "中止时弹窗应保留");
+
+  // 警示确认取消 → aborted：confirm 返回 false 时不发 PUT
+  setEnvData({
+    filePath: "C:/tmp/settings.env",
+    pluginOptions: [],
+    items: [
+      { key: "SERVER_PORT", type: "number", label: "服务端口", plugin: "", staged: null, current: 3000, warn: "重启后访问地址将变为新端口" },
+    ],
+    secrets: [],
+    plugins: [],
+  });
+  sandbox._pluginSets();
+  getElement("env-items").querySelectorAll = () => [makeRow("SERVER_PORT", { control: { value: "3001" } })];
+  const realConfirm = sandbox.confirm;
+  let confirmAsked = false;
+  sandbox.confirm = () => { confirmAsked = true; return false; };
+  calls.length = 0;
+  assert.equal(await sandbox.stagePendingEnvChanges(), "aborted", "警示确认取消应返回 aborted");
+  assert.ok(confirmAsked, "含 warn 项的暂存应先弹确认");
+  assert.ok(!calls.some(c => c.method === "PUT"), "确认取消后不应发 PUT");
+  delete sandbox.confirm;
 }
 
 console.log("ui_env_panel_test: all assertions passed");

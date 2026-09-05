@@ -219,7 +219,7 @@ if (MEASURE) {
     ["批量条按钮", '<div class="batch-bar"><button>删除</button></div>'],
     ["加载更多", '<button class="load-more-btn">加载更多</button>'],
     ["空态按钮", '<button class="empty-guide-btn">去设置</button>'],
-    ["设置描边按钮", '<button class="settings-outline-btn">暂存更改</button>'],
+    ["设置描边按钮", '<button class="settings-outline-btn">恢复默认</button>'],
     ["设置添加按钮", '<button class="settings-add-btn">添加</button>'],
     ["分类行按钮", '<div class="cat-row"><button>改名</button></div>'],
     ["错误条按钮", '<button class="error-banner-btn">重试</button>'],
