@@ -87,7 +87,9 @@ jobs:
       # without this step the check rests on the author remembering it.
       # Diffing against the empty-tree SHA covers every tracked file instead of
       # a push range: same behaviour on push and PR, and no all-zeros base to
-      # special-case. Verified clean at this baseline.
+      # special-case. Verified clean at this baseline. AGENTS.md's local gates
+      # mirror this command, so committed whitespace issues surface before push
+      # (a working-tree-only check goes blind once the problem is committed).
       - name: Whitespace / conflict marker check
         run: git diff --check 4b825dc642cb6eb9a060e54bf8d69288fbee4904..HEAD
 

@@ -28,6 +28,8 @@ python -m pytest tests/
 
 # 提交前完整检查
 git diff --check
+# 范围级空白检查（空树口径，与 CI 一致；提交后仍可跑）
+git diff --check 4b825dc642cb6eb9a060e54bf8d69288fbee4904..HEAD
 
 # 可选：安装 pre-commit 密钥扫描钩子（staged 新增内容自动扫描，推荐）
 powershell -ExecutionPolicy Bypass -File scripts/install-hooks.ps1
@@ -41,6 +43,9 @@ powershell -ExecutionPolicy Bypass -File scripts/install-hooks.ps1
 - 类型检查: `python -m mypy briefdesk/ tests/`（tests/ 为签名级检查；函数体深检因测试桩惯用法噪音大暂缓，配置理由见 pyproject `[tool.mypy]` 注释。CI 中 mypy 仅查 `briefdesk/` 包级——tests/ 的签名级检查由本地门禁覆盖，两处口径差异为有意为之）
 - 测试: `python -m pytest tests/`
 - 空白/冲突检查: `git diff --check`
+- 范围级空白检查（对齐 CI 的空树口径，覆盖全部跟踪文件；上一条只查工作区，
+  对已入库的空白问题失明——rag/config.py 末尾空行曾因此逃逸到 CI 才拦下）:
+  `git diff --check 4b825dc642cb6eb9a060e54bf8d69288fbee4904..HEAD`
 - 新增功能必须补充或更新对应测试
 - 不要为了“让当前任务快速完成”而跳过上述任何一步；若门禁失败，必须先修复再提交
 
@@ -86,6 +91,7 @@ powershell -ExecutionPolicy Bypass -File scripts/install-hooks.ps1
 - [ ] `python -m mypy briefdesk/ tests/` 通过
 - [ ] `python -m pytest tests/` 通过
 - [ ] `git diff --check` 通过
+- [ ] `git diff --check 4b825dc642cb6eb9a060e54bf8d69288fbee4904..HEAD` 通过（范围级，见质量门禁）
 - [ ] `git status --short` 中没有临时文件、缓存、数据库、本地 env 文件
 - [ ] `git diff --cached` 中没有真实密钥、Token、聊天记录、手机号等敏感信息
 - [ ] 只提交与任务相关的文件，没有 `tmp_*` / 调试脚本 / 无关文件
