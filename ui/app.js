@@ -736,6 +736,22 @@ function bindSettingsFormEvents() {
         }
         replaceBtn.classList.add("hidden");
       }
+      // 「取消」：收起输入框并还原「替换」入口，半输入值一并清掉（纯前端态，无请求）
+      const cancelBtn = e.target.closest("[data-sec-cancel]");
+      if (cancelBtn) {
+        const row = cancelBtn.closest(".env-row");
+        const box = row ? row.querySelector(".env-secret-input") : null;
+        if (box) {
+          const input = box.querySelector("input");
+          if (input) input.value = "";
+          box.classList.add("hidden");
+        }
+        const replace = row ? row.querySelector("[data-sec-replace]") : null;
+        if (replace) {
+          replace.classList.remove("hidden");
+          replace.focus();
+        }
+      }
     });
   }
   if ($envFilter) $envFilter.addEventListener("input", _applyEnvFilter);
@@ -4386,13 +4402,21 @@ function _envSecretRowHtml(s) {
     : s.configured
       ? '<span class="env-badge">已配置（环境变量/.env）</span>'
       : '<span class="env-badge">未配置</span>';
-  // 已配置时输入框藏起但不销毁：「替换」展开它，免去「先清除再输入」的断层
+  // 已配置时输入框藏起但不销毁：「替换」展开它，免去「先清除再输入」的断层；
+  // 「取消」仅在钥匙串托管行出现——只有这行存在可还原的「替换」态，未配置行
+  // 的输入框是常驻配置入口，收起就再无门路
   const input = '<div class="env-secret-input' + (keyringConfigured ? " hidden" : "") + '">'
     + '<input type="password" class="env-input" data-sec-input="' + escAttr(s.name) + '" placeholder="输入 ' + esc(s.label) + '" autocomplete="off">'
-    + '<button type="button" class="settings-outline-btn" data-sec-set="' + escAttr(s.name) + '">保存</button></div>';
+    + '<button type="button" class="settings-outline-btn" data-sec-set="' + escAttr(s.name) + '">保存</button>'
+    + (keyringConfigured
+      ? '<button type="button" class="settings-outline-btn" data-sec-cancel="' + escAttr(s.name) + '">取消</button>'
+      : "")
+    + "</div>";
+  // 「替换/清除」与输入框行内的「保存/取消」同款轮廓按钮（settings-outline-btn），
+  // 右置与防平分推力的对齐规则见 style.css 行头小节
   const managed = keyringConfigured
-    ? '<button type="button" class="env-restore" data-sec-replace="' + escAttr(s.name) + '">替换</button>'
-      + '<button type="button" class="env-restore" data-sec-clear="' + escAttr(s.name) + '">清除</button>'
+    ? '<button type="button" class="settings-outline-btn" data-sec-replace="' + escAttr(s.name) + '">替换</button>'
+      + '<button type="button" class="settings-outline-btn" data-sec-clear="' + escAttr(s.name) + '">清除</button>'
     : "";
   return '<div class="env-row"><div class="env-row-head">'
     + '<label class="env-label">' + esc(s.label) + "</label>" + state + managed + "</div>"

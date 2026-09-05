@@ -1899,8 +1899,14 @@ details.env-group[open] > summary.env-group-head::after { transform: rotate(-45d
 .env-row { margin: 12px 0; }
 .env-row-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 4px; }
 .env-label { font-weight: 600; }
-/* 「恢复默认」固定在行头右端，不再随内容流漂移 */
-.env-row-head .env-restore { margin-left: auto; }
+/* 「恢复默认」固定在行头右端，不再随内容流漂移；密钥行的「替换/清除」与
+   输入框行内的「保存/取消」同款（settings-outline-btn），同享右置 */
+.env-row-head .env-restore,
+.env-row-head .settings-outline-btn { margin-left: auto; }
+/* 密钥行「替换/清除」是相邻双按钮：auto margin 若逐个生效会平分剩余空间，
+   「替换」被推到行中部悬空。仅在两钮皆可见时抵消后一个的推力——「替换」
+   展开输入框后自身隐藏，「清除」须独占 auto margin 继续贴右 */
+.env-row-head .settings-outline-btn:not(.hidden) + .settings-outline-btn:not(.hidden) { margin-left: 0; }
 .env-badge {
   font-size: var(--text-xs); padding: 1px 8px; border-radius: 999px;
   background: var(--surface); border: 1px solid var(--border); color: var(--text-2);

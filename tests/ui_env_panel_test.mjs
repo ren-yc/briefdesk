@@ -5,7 +5,7 @@
 //    每次「暂存更改」都会把所有布尔项重写进暂存文件，「没有需要暂存的更改」
 //    永不触发，差异计数常驻虚高；
 // 2. 分组渲染：未启用插件组默认折叠并在组头标注「未启用」（行内徽章不再
-//    重复）；布尔项渲染为开关；已配置（钥匙串）的密钥提供「替换」入口；
+//    重复）；布尔项渲染为开关；已配置（钥匙串）的密钥提供「替换/取消」入口；
 // 3. 「暂存更改」按钮的脏计数联动。
 //
 // 数据一律虚构（见 AGENTS.md）。
@@ -119,9 +119,21 @@ sandbox.renderEnvConfig();
   const html = getElement("env-secrets").innerHTML;
   assert.ok(html.includes('data-sec-replace="ALPHA_TOKEN"'), "已配置密钥应有「替换」入口");
   assert.ok(html.includes('data-sec-clear="ALPHA_TOKEN"'), "已配置密钥应有「清除」");
+  // 「替换/清除」与输入框行内的「保存/取消」同款轮廓按钮（行头右置与
+  // 防平分推力的对齐规则按该类名生效）
+  assert.ok(html.includes('class="settings-outline-btn" data-sec-replace="ALPHA_TOKEN"'), "「替换」应与「保存/取消」同款轮廓按钮");
+  assert.ok(html.includes('class="settings-outline-btn" data-sec-clear="ALPHA_TOKEN"'), "「清除」应与「保存/取消」同款轮廓按钮");
   assert.ok(html.includes('class="env-secret-input hidden"'), "已配置密钥的输入框应藏起");
   assert.ok(html.includes('class="env-secret-input">'), "未配置密钥的输入框应直接可见");
   assert.ok(!html.includes('data-sec-replace="BETA_KEY"'), "未配置密钥无需「替换」入口");
+  // 「取消」只属于钥匙串托管行：它还原的是「替换」展开态；非托管行的
+  // 输入框是常驻配置入口，收起就没有配置门路了
+  const replaceIdx = html.indexOf('data-sec-replace="ALPHA_TOKEN"');
+  const cancelIdx = html.indexOf('data-sec-cancel="ALPHA_TOKEN"');
+  assert.ok(cancelIdx !== -1, "钥匙串托管密钥应有「取消」");
+  assert.ok(cancelIdx > replaceIdx, "「取消」应在「替换」之后渲染（输入框行内、保存旁）");
+  assert.ok(html.indexOf('data-sec-set="ALPHA_TOKEN"') < cancelIdx, "「取消」应与「保存」同在输入框行内");
+  assert.ok(!html.includes('data-sec-cancel="BETA_KEY"'), "非钥匙串密钥不应有「取消」");
 }
 
 // ── 5. 搜索过滤：行级显隐、组级整组显隐、details 组自动展开/还原 ──
