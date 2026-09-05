@@ -1067,6 +1067,26 @@ class SessionWatermarkTest(unittest.IsolatedAsyncioTestCase):
         await mark_message_processed("weflow-legacy", "f2")
         self.assertEqual(await get_oldest_unprocessed_by_session("weflow-legacy"), {"g2": 200})
 
+    async def test_chunked_queries_span_multiple_batches(self):
+        """超过 _SQL_VARS_CHUNK（900）的 IN 查询按块拼接：走 _execute_chunked
+        的两个读取口在跨块场景下结果完整（分块回归守卫，含 extra_params 路径）。"""
+        n = 905  # 900 + 5：恰好跨两块
+        await self.db.executemany(
+            "INSERT INTO sessions (source, session_id, name, is_group, enabled) "
+            "VALUES ('qqflow', ?, ?, 1, 0)",
+            [(f"s{i}", f"s{i}") for i in range(n)],
+        )
+        await self.db.executemany(
+            "INSERT OR IGNORE INTO processed_messages (source, msg_id, processed_at) "
+            "VALUES ('qqflow', ?, '2026-01-01T00:00:00+00:00')",
+            [(f"m{i}",) for i in range(n)],
+        )
+        await self.db.commit()
+        polls = await get_session_last_polls("qqflow", [f"s{i}" for i in range(n)])
+        self.assertEqual(len(polls), n, "跨块会话水位查询结果完整")
+        processed = await are_messages_processed("qqflow", [f"m{i}" for i in range(n)])
+        self.assertEqual(len(processed), n, "跨块已处理查询结果完整")
+
     async def test_mark_messages_processed_bulk(self):
         await self.db.execute(
             "INSERT INTO raw_messages (source, msg_id, session_id, group_name, "

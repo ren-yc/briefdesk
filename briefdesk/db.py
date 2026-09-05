@@ -1598,11 +1598,11 @@ async def get_items_verified_flags(item_ids: list[str]) -> dict[str, int]:
     if not item_ids:
         return {}
     db = await get_db()
-    placeholders = ",".join("?" * len(item_ids))
-    rows = await _fetchall(
+    rows = await _execute_chunked(
         db,
-        f"SELECT id, is_verified FROM items WHERE id IN ({placeholders})",
+        "SELECT id, is_verified FROM items WHERE id IN ({placeholders})",
         item_ids,
+        chunk_size=_SQL_VARS_CHUNK,
     )
     return {row["id"]: row["is_verified"] for row in rows}
 
@@ -1729,12 +1729,13 @@ async def get_session_last_polls(
     if not session_ids:
         return {}
     db = await get_db()
-    placeholders = ",".join("?" for _ in session_ids)
-    rows = await _fetchall(
+    rows = await _execute_chunked(
         db,
-        f"SELECT session_id, last_poll_ts FROM sessions "
-        f"WHERE source = ? AND session_id IN ({placeholders})",
-        (source, *session_ids),
+        "SELECT session_id, last_poll_ts FROM sessions "
+        "WHERE source = ? AND session_id IN ({placeholders})",
+        session_ids,
+        chunk_size=_SQL_VARS_CHUNK,
+        extra_params=(source,),
     )
     return {row["session_id"]: row["last_poll_ts"] for row in rows}
 
@@ -2246,7 +2247,7 @@ async def get_item_texts_by_ids(item_ids: list[str]) -> list[ItemText]:
         "COALESCE(source_quote, '') as source_quote "
         "FROM items WHERE id IN ({placeholders})",
         item_ids,
-        chunk_size=900,
+        chunk_size=_SQL_VARS_CHUNK,
     )
     return [cast(ItemText, dict(row)) for row in rows]
 
