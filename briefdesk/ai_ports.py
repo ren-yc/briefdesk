@@ -80,7 +80,10 @@ async def rag_chat(
     # 类级检测：Mock/旧实现等实例级动态属性（__getattr__）不视为实现了 rag_chat，
     # 只有真正声明该方法的供应商类才走专用通道，否则回退复用 chat。
     if hasattr(type(ai), "rag_chat"):
-        return await ai.rag_chat(  # type: ignore[attr-defined]
+        # 运行时防御性检测仍有意义：测试经 set_ai 注入的桩可能未声明 rag_chat
+        # （mypy 对函数体内构造的对象不做协议校验）；静态层面 AIProvider 协议
+        # 已含 rag_chat 成员（plugin/base.py），无需 ignore。
+        return await ai.rag_chat(
             messages,
             temperature=temperature,
             max_tokens=max_tokens,
