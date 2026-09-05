@@ -308,7 +308,7 @@ async def process_all_batches(
         set_status(
             {
                 "lastWarning": "分类/去重阶段未启用，新消息将被保留待回填"
-                "（请检查 PLUGINS 配置是否启用了 classify/dedup/ai_provider）"
+                "（查看启动日志与「设置 → 插件」面板中的状态/原因）"
             }
         )
         return False

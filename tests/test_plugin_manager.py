@@ -193,6 +193,16 @@ class FilterTest(_ManagerTestBase):
         await manager.setup_all(make_ctx())
         self.assertEqual(manager.loaded, ["a"])
 
+    async def test_star_is_unknown_not_wildcard(self):
+        """无通配语义：PLUGINS 里的 "*" 按未知名处理——只 WARNING、不启用
+        任何可选插件（旧 ["*"] 配置升级后即零源，语义须钉死防回潮）。"""
+        calls: list = []
+        manager = PluginManager(make_settings(plugins=["*"]))
+        manager.register(FakePlugin("a", calls=calls))
+        await manager.setup_all(make_ctx())
+        self.assertEqual(manager.loaded, [])
+        self.assertEqual(manager.records()["a"].status, "disabled")
+
     async def test_optional_plugin_not_listed_is_disabled(self):
         """可选插件「禁用 = 不在 PLUGINS 中」：无独立的禁用名单配置。"""
         calls: list = []
@@ -275,6 +285,13 @@ class ValidateSelectionTest(_ManagerTestBase):
         issues = self._manager().validate_selection(["ghost"])
         self.assertEqual([i["type"] for i in issues], ["unknown"])
         self.assertIn("ghost", issues[0]["detail"])
+
+    def test_star_rejected_as_unknown(self):
+        """无通配语义：旧 ["*"] 列表提交时按未知名报错（PUT 会 409），
+        不会意外放行全部插件。"""
+        issues = self._manager().validate_selection(["*"])
+        self.assertEqual([i["type"] for i in issues], ["unknown"])
+        self.assertIn("*", issues[0]["detail"])
 
     def test_missing_dep_reported(self):
         issues = self._manager().validate_selection(["stage"])

@@ -126,7 +126,8 @@ _SECRET_LABELS = {
 
 
 def _all_schema() -> list[dict[str, Any]]:
-    """核心字段加当前选中插件字段，按 key 去重。"""
+    """核心字段加全部已发现插件的可选字段（含禁用/自禁用插件，便于启用前
+    预配置必填项），按 key 去重。"""
     result: list[dict[str, Any]] = []
     seen: set[str] = set()
     for item in [*ENV_SCHEMA, *get_settings_schema()]:

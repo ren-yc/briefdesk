@@ -528,11 +528,14 @@ class PluginToggleRoutesTest(StagedFileTestCase):
         self.assertNotIn("*", data["pluginOptions"])
 
     def test_get_enabled_follows_staged_value(self) -> None:
-        write_staged({"PLUGINS": '["weflow"]'})
-        with patch.object(
-            settings_routes, "get_plugin_meta", return_value=self._META
-        ), patch.object(settings_routes, "get_plugins_info", return_value=[]):
-            data = self.client.get("/api/settings/env").json()
+        # 排除宿主环境 PLUGINS（env > 暂存 > .env > 默认）：来源判定若被宿主
+        # PLUGINS 抢占，pluginsSource 会返回 'env' 而非本用例期望的 'override'
+        with _env_without("PLUGINS"):
+            write_staged({"PLUGINS": '["weflow"]'})
+            with patch.object(
+                settings_routes, "get_plugin_meta", return_value=self._META
+            ), patch.object(settings_routes, "get_plugins_info", return_value=[]):
+                data = self.client.get("/api/settings/env").json()
         self.assertEqual(
             {p["name"]: p["enabled"] for p in data["plugins"]},
             {"weflow": True, "ai_provider": True},

@@ -87,7 +87,7 @@ weflow-server :5033        WeFlow(legacy) :5031        qqflow-server :5032
 | `briefdesk/sources_base.py` | 消息源抽象（核心契约模块，无 sources 包）：`SourceClient` Protocol（`name`/`connection_status`/`download_media`/`close` 详解见本表后同名小节。 |
 | `briefdesk/plugins/weflow/plugin.py` | `WeFlowPlugin`（显式实现 SourcePlugin）：setup 校验 `WEFLOW_API_TOKEN`/`WEFLOW_WXID`/`WEFLOW_DB_KEYS(+_2)` 必填配 详解见本表后同名小节。 |
 | `briefdesk/plugins/weflow/` | weflow 消息源（实现 `SourceRuntime`，接入 weflow-server 默认 :5033，微信 4.x 活库直读）。 详解见本表后同名小节。 |
-| `briefdesk/plugins/weflow_legacy/plugin.py` | `WeFlowLegacyPlugin`（显式实现 SourcePlugin）：setup 构造 `WeFlowLegacySource` 并经 `ctx.register_source` 注册；activate 无副作用（监听启动由应用层编排）；teardown 关闭 runtime。无必填配置校验（缺 WEFLOW_LEGACY_API_TOKEN 时上游调用期报错）。模块底部暴露 `plugin` 实例供 entry point 引用。 |
+| `briefdesk/plugins/weflow_legacy/plugin.py` | `WeFlowLegacyPlugin`（显式实现 SourcePlugin）：setup 构造 `WeFlowLegacySource` 并经 `ctx.register_source` 注册；activate 无副作用（监听启动由应用层编排）；teardown 关闭 runtime。必填校验经 `validate_required_config`（缺 `WEFLOW_LEGACY_API_TOKEN` → setup 抛 `PluginDisabledError` 自禁用，与 weflow/qqflow 一致）。模块底部暴露 `plugin` 实例供 entry point 引用。 |
 | `briefdesk/plugins/qqflow/plugin.py` | `QqFlowPlugin`（显式实现 SourcePlugin）：setup 校验 `QQFLOW_API_TOKEN`/`QQFLOW_QQ`/`QQFLOW_KEY` 必填配置，缺失抛 `PluginDisabledError` 自禁用；齐备则构造 `QqFlowSource` 并经 `ctx.register_source` 注册。teardown 关闭 runtime。 |
 | `briefdesk/plugins/weflow_legacy/runtime.py` | `WeFlowLegacySource`（实现 `SourceRuntime`）— weflow-legacy 源装配门面：构造 `WeFlowLegacyClient`（参数缺省时读 详解见本表后同名小节。 |
 | `briefdesk/plugins/qqflow/` | qqflow 消息源（实现 `SourceRuntime`，接入 qqflow-server 默认 :5032）。 详解见本表后同名小节。 |

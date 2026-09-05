@@ -10,15 +10,12 @@ teardown 关闭 runtime（幂等）。
 必填）：缺失在装配期抛 PluginDisabledError 明示，配置后重启生效。
 """
 
-import logging
 from typing import Any
 
 from briefdesk.plugin.base import PluginContext, SourcePlugin
 from briefdesk.plugin.config_helpers import validate_required_config
 from briefdesk.settings_schema import build_settings_schema
 from briefdesk.sources_base import SourceRuntime
-
-logger = logging.getLogger(__name__)
 
 
 class WeFlowLegacyPlugin(SourcePlugin):
