@@ -8,6 +8,7 @@ QqFlowPlugin.setup 抛 PluginDisabledError 自禁用（见 briefdesk/plugins/qqf
 from typing import ClassVar
 
 from pydantic import Field, SecretStr
+from pydantic_settings import SettingsConfigDict
 
 from briefdesk.settings_base import KeyringSettingsBase
 
@@ -43,7 +44,6 @@ class QqFlowSettings(KeyringSettingsBase):
         gt=0,  # env: QQFLOW_SSE_READ_TIMEOUT_MS
     )
 
-    model_config = {
-        **KeyringSettingsBase.model_config,
-        "env_prefix": "QQFLOW_",  # api_base → QQFLOW_API_BASE
-    }
+    # env_file/env_file_encoding/extra 由 KeyringSettingsBase 自动合并，无需展开；
+    # ClassVar 注解声明类级配置而非字段（RUF012）
+    model_config: ClassVar[SettingsConfigDict] = {"env_prefix": "QQFLOW_"}  # api_base → QQFLOW_API_BASE

@@ -19,6 +19,7 @@ import logging
 from typing import ClassVar
 
 from pydantic import Field, SecretStr
+from pydantic_settings import SettingsConfigDict
 
 from briefdesk.settings_base import KeyringSettingsBase
 
@@ -68,10 +69,9 @@ class WeFlowSettings(KeyringSettingsBase):
         gt=0,  # env: WEFLOW_SSE_READ_TIMEOUT_MS
     )
 
-    model_config = {
-        **KeyringSettingsBase.model_config,
-        "env_prefix": "WEFLOW_",  # api_base → WEFLOW_API_BASE
-    }
+    # env_file/env_file_encoding/extra 由 KeyringSettingsBase 自动合并，无需展开；
+    # ClassVar 注解声明类级配置而非字段（RUF012）
+    model_config: ClassVar[SettingsConfigDict] = {"env_prefix": "WEFLOW_"}  # api_base → WEFLOW_API_BASE
 
     @property
     def db_keys_map(self) -> dict[str, str]:

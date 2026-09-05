@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import ClassVar
 
 from pydantic import Field, SecretStr
+from pydantic_settings import SettingsConfigDict
 
 from briefdesk.settings_base import KeyringSettingsBase
 
@@ -134,10 +135,7 @@ class Settings(KeyringSettingsBase):
     log_level: str = Field(default="INFO", alias="LOG_LEVEL")
     """日志级别（DEBUG / INFO / WARNING / ERROR / CRITICAL），由 logger.py 读取。"""
 
-    model_config = {
-        **KeyringSettingsBase.model_config,
-        "populate_by_name": True,
-    }
+    model_config: ClassVar[SettingsConfigDict] = {"populate_by_name": True}
 
 
 config = Settings()

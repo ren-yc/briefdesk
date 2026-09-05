@@ -20,6 +20,7 @@ EMBED_BATCH_SIZE（经 ai_provider 插件注册的端口使用）。
 from typing import ClassVar
 
 from pydantic import Field, SecretStr
+from pydantic_settings import SettingsConfigDict
 
 from briefdesk.settings_base import KeyringSettingsBase
 
@@ -53,8 +54,7 @@ class RagSettings(KeyringSettingsBase):
     # env: RAG_API_KEY（问答专用 API Key，走 keyring；SecretStr 自动掩码 repr/序列化）
     api_key: SecretStr = SecretStr("")
 
-    model_config = {
-        **KeyringSettingsBase.model_config,
-        "env_prefix": "RAG_",  # top_k → RAG_TOP_K
-    }
+    # env_file/env_file_encoding/extra 由 KeyringSettingsBase 自动合并，无需展开；
+    # ClassVar 注解声明类级配置而非字段（RUF012）
+    model_config: ClassVar[SettingsConfigDict] = {"env_prefix": "RAG_"}  # top_k → RAG_TOP_K
 

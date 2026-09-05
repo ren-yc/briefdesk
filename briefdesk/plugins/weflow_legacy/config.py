@@ -7,6 +7,7 @@
 from typing import ClassVar
 
 from pydantic import Field, SecretStr
+from pydantic_settings import SettingsConfigDict
 
 from briefdesk.settings_base import KeyringSettingsBase
 
@@ -35,7 +36,6 @@ class WeFlowLegacySettings(KeyringSettingsBase):
         gt=0,  # env: WEFLOW_LEGACY_SSE_READ_TIMEOUT_MS
     )
 
-    model_config = {
-        **KeyringSettingsBase.model_config,
-        "env_prefix": "WEFLOW_LEGACY_",  # api_base → WEFLOW_LEGACY_API_BASE
-    }
+    # env_file/env_file_encoding/extra 由 KeyringSettingsBase 自动合并，无需展开；
+    # ClassVar 注解声明类级配置而非字段（RUF012）
+    model_config: ClassVar[SettingsConfigDict] = {"env_prefix": "WEFLOW_LEGACY_"}  # api_base → WEFLOW_LEGACY_API_BASE

@@ -1,5 +1,7 @@
 """插件配置验证助手函数。"""
 
+from typing import Any
+
 from briefdesk.plugin.base import PluginDisabledError
 
 
@@ -22,7 +24,9 @@ def validate_required_config(settings, required_fields: dict[str, str]) -> None:
     """
     missing = []
     for field_name, env_name in required_fields.items():
-        value = getattr(settings, field_name, None)
+        # Any 注解：getattr 缺省 None 会让 mypy 推出 Any | None，
+        # 对 None 谓 hasattr 误报 union-attr；非 str 标量（dict 等）原样参与真值判定
+        value: Any = getattr(settings, field_name, None)
         # SecretStr 需要调用 get_secret_value()
         if hasattr(value, "get_secret_value"):
             value = value.get_secret_value()

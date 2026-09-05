@@ -13,7 +13,7 @@ teardown 关闭 runtime（幂等）。
 import logging
 from typing import Any
 
-from briefdesk.plugin.base import PluginContext, PluginDisabledError, SourcePlugin
+from briefdesk.plugin.base import PluginContext, SourcePlugin
 from briefdesk.plugin.config_helpers import validate_required_config
 from briefdesk.settings_schema import build_settings_schema
 from briefdesk.sources_base import SourceRuntime
