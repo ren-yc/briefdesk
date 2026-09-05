@@ -4,7 +4,6 @@ import asyncio
 import hashlib
 import os
 import shutil
-import sqlite3
 import tempfile
 import unittest
 import uuid
@@ -60,6 +59,7 @@ from briefdesk.db import (
     update_item_category,
     update_item_merged,
     update_item_verify,
+    update_items_verify,
     update_session_last_polls,
     upsert_embeddings,
     upsert_session,
@@ -1876,6 +1876,38 @@ class DeleteCategoryPurgeCascadeTest(_InMemoryDbTest):
         self.assertEqual((await cur.fetchone())["cnt"], 1)
 
 
+class ChunkedWritePathTest(_InMemoryDbTest):
+    """_execute_chunked 写路径（fetch=False）：跨块 rowcount 累计完整。"""
+
+    async def _insert_items(self, n: int) -> list[str]:
+        ids = [f"i{i}" for i in range(n)]
+        await self.db.executemany(
+            "INSERT INTO items (id, category, title, source_quote, source_group, "
+            "source, source_msg_id, msg_time, is_verified, created_at) "
+            "VALUES (?, '活动通知', ?, '引文', '项目群', 'weflow-legacy', ?, 100, 0, "
+            "'2026-01-01T00:00:00+00:00')",
+            [(i, f"t{i}", i) for i in ids],
+        )
+        await self.db.commit()
+        return ids
+
+    async def test_update_items_verify_rowcount_across_chunks(self):
+        p1, p2 = self._patch_db()
+        with p1, p2:
+            ids = await self._insert_items(905)  # 900 + 5：跨两块
+            affected = await update_items_verify(ids, 1)
+        self.assertEqual(affected, 905, "跨块 UPDATE 的 rowcount 累计完整")
+
+    async def test_delete_items_rowcount_across_chunks(self):
+        p1, p2 = self._patch_db()
+        with p1, p2:
+            ids = await self._insert_items(905)
+            deleted = await delete_items(ids)
+        self.assertEqual(deleted, 905, "跨块 DELETE 的 rowcount 累计完整")
+        cur = await self.db.execute("SELECT COUNT(*) AS cnt FROM items")
+        self.assertEqual((await cur.fetchone())["cnt"], 0)
+
+
 class DeleteItemsRollbackTest(_InMemoryDbTest):
     """审查修复 #1a：多步写异常路径必须 rollback，不留悬挂事务。
 
@@ -1890,14 +1922,14 @@ class DeleteItemsRollbackTest(_InMemoryDbTest):
     """
 
     async def test_failed_multi_step_delete_leaves_no_open_transaction(self):
-        import briefdesk.db as db_mod
+        orig_execute = self.db.execute
 
-        orig_cursor = db_mod._cursor
-
-        def failing_cursor(db, sql, params=()):
+        async def failing_execute(sql, params=()):
+            # delete_items 已迁 _execute_chunked（不再走 _cursor），注入点改为
+            # 连接的 execute：末步（items 删除）抛错，前两步已真实写入
             if sql.startswith("DELETE FROM items WHERE id IN"):
-                raise sqlite3.OperationalError("injected: final delete failed")
-            return orig_cursor(db, sql, params)
+                raise RuntimeError("injected: final delete failed")
+            return await orig_execute(sql, params)
 
         # 先放两张可命中的卡与原文，前两步 DELETE 真实生效、事务已开
         with patch("briefdesk.db.get_db", new=AsyncMock(return_value=self.db)):
@@ -1917,8 +1949,8 @@ class DeleteItemsRollbackTest(_InMemoryDbTest):
                 ]
             )
             with (
-                patch.object(db_mod, "_cursor", new=failing_cursor),
-                self.assertRaises(sqlite3.OperationalError),
+                patch.object(self.db, "execute", new=failing_execute),
+                self.assertRaises(RuntimeError),
             ):
                 await delete_items([item_id])
         self.assertFalse(

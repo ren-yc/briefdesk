@@ -10,7 +10,7 @@ import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
-from typing import Any, NotRequired, TypedDict, cast
+from typing import Any, Literal, NotRequired, TypedDict, cast, overload
 
 import aiosqlite
 
@@ -584,6 +584,30 @@ async def atomic_transaction(db: aiosqlite.Connection) -> AsyncIterator[aiosqlit
         raise
 
 
+@overload
+async def _execute_chunked(
+    db: aiosqlite.Connection,
+    sql_template: str,
+    id_list: list[str],
+    chunk_size: int = 900,
+    *,
+    extra_params: tuple[Any, ...] = (),
+    fetch: Literal[True] = True,
+) -> list[aiosqlite.Row]: ...
+
+
+@overload
+async def _execute_chunked(
+    db: aiosqlite.Connection,
+    sql_template: str,
+    id_list: list[str],
+    chunk_size: int = 900,
+    *,
+    extra_params: tuple[Any, ...] = (),
+    fetch: Literal[False],
+) -> int: ...
+
+
 async def _execute_chunked(
     db: aiosqlite.Connection,
     sql_template: str,
@@ -592,8 +616,8 @@ async def _execute_chunked(
     *,
     extra_params: tuple[Any, ...] = (),
     fetch: bool = True,
-) -> list[aiosqlite.Row]:
-    """分块执行 IN 查询，避免超过 SQLite 变量上限（32766）。
+) -> list[aiosqlite.Row] | int:
+    """分块执行 IN 语句，避免超过 SQLite 变量上限（32766）。
 
     Args:
         db: 数据库连接
@@ -601,10 +625,11 @@ async def _execute_chunked(
         id_list: ID列表
         chunk_size: 每批大小（默认900）
         extra_params: 额外的固定参数（如 source），会放在 id_list 之前
-        fetch: True=返回查询结果，False=仅执行（用于DELETE/UPDATE）
+        fetch: True=执行查询并返回行列表；False=执行写语句（DELETE/UPDATE），
+            逐块累计并返回受影响行数
 
     Returns:
-        fetch=True 时返回所有行的列表，False 时返回空列表
+        fetch=True 时返回所有行的列表；fetch=False 时返回累计受影响行数
 
     示例：
         # 查询
@@ -615,18 +640,19 @@ async def _execute_chunked(
             extra_params=(source,)
         )
 
-        # 删除
-        await _execute_chunked(
+        # 删除（返回累计删除行数；多步写由调用方的 atomic_transaction 包裹）
+        deleted = await _execute_chunked(
             db,
             "DELETE FROM items WHERE id IN ({placeholders})",
             item_ids,
-            fetch=False
+            fetch=False,
         )
     """
     if not id_list:
-        return []
+        return [] if fetch else 0
 
-    results = []
+    results: list[aiosqlite.Row] = []
+    affected = 0
     for i in range(0, len(id_list), chunk_size):
         chunk = id_list[i : i + chunk_size]
         placeholders = ",".join("?" * len(chunk))
@@ -637,9 +663,11 @@ async def _execute_chunked(
             rows = await _fetchall(db, sql, params)
             results.extend(rows)
         else:
-            await db.execute(sql, params)
+            cursor = await db.execute(sql, params)
+            affected += cursor.rowcount
+            await cursor.close()
 
-    return results
+    return results if fetch else affected
 
 
 @asynccontextmanager
@@ -1336,14 +1364,16 @@ async def update_items_verify(ids: list[str], verified: int) -> int:
         return 0
     db = await get_db()
     now = datetime.now(UTC).isoformat()
-    placeholders = ",".join("?" for _ in ids)
-    async with _cursor(
-        db,
-        f"UPDATE items SET is_verified = ?, verified_at = ? WHERE id IN ({placeholders})",
-        (verified, now, *ids),
-    ) as cursor:
-        affected = cursor.rowcount
-    await db.commit()
+    # 分块后是多步写：异常路径必须回滚（悬挂事务会被后续无关 commit 收尾提交）
+    async with atomic_transaction(db):
+        affected = await _execute_chunked(
+            db,
+            "UPDATE items SET is_verified = ?, verified_at = ? WHERE id IN ({placeholders})",
+            ids,
+            chunk_size=_SQL_VARS_CHUNK,
+            extra_params=(verified, now),
+            fetch=False,
+        )
     return affected
 
 
@@ -1360,23 +1390,30 @@ async def delete_items(ids: list[str], *, keep_raw_messages: bool = False) -> in
     if not ids:
         return 0
     db = await get_db()
-    placeholders = ",".join("?" for _ in ids)
     async with atomic_transaction(db):
-        await db.execute(
-            f"DELETE FROM item_embeddings WHERE item_id IN ({placeholders})", tuple(ids)
+        await _execute_chunked(
+            db,
+            "DELETE FROM item_embeddings WHERE item_id IN ({placeholders})",
+            ids,
+            chunk_size=_SQL_VARS_CHUNK,
+            fetch=False,
         )
         if not keep_raw_messages:
-            await db.execute(
-                f"DELETE FROM raw_messages WHERE (source, msg_id) IN ("
-                f"SELECT source, source_msg_id FROM items WHERE id IN ({placeholders}))",
-                tuple(ids),
+            await _execute_chunked(
+                db,
+                "DELETE FROM raw_messages WHERE (source, msg_id) IN ("
+                "SELECT source, source_msg_id FROM items WHERE id IN ({placeholders}))",
+                ids,
+                chunk_size=_SQL_VARS_CHUNK,
+                fetch=False,
             )
-        async with _cursor(
+        deleted = await _execute_chunked(
             db,
-            f"DELETE FROM items WHERE id IN ({placeholders})",
-            tuple(ids),
-        ) as cursor:
-            deleted = cursor.rowcount
+            "DELETE FROM items WHERE id IN ({placeholders})",
+            ids,
+            chunk_size=_SQL_VARS_CHUNK,
+            fetch=False,
+        )
     return deleted
 
 
@@ -1669,9 +1706,7 @@ async def purge_expired_ignored(expiry_hours: int) -> int:
 # ── Processed Messages ──
 
 
-_PROCESSED_QUERY_CHUNK = 900  # 单语句占位符预算，远低于 SQLite 变量上限（32766）
-# DELETE ... IN 列表共用同一占位符预算（类别级联删除等大列表场景）
-_SQL_VARS_CHUNK = _PROCESSED_QUERY_CHUNK
+_SQL_VARS_CHUNK = 900  # IN 分块占位符预算，远低于 SQLite 变量上限（32766）
 
 
 async def are_messages_processed(source: str, msg_ids: list[str]) -> set[str]:
@@ -1683,7 +1718,7 @@ async def are_messages_processed(source: str, msg_ids: list[str]) -> set[str]:
         db,
         "SELECT msg_id FROM processed_messages WHERE source = ? AND msg_id IN ({placeholders})",
         msg_ids,
-        chunk_size=_PROCESSED_QUERY_CHUNK,
+        chunk_size=_SQL_VARS_CHUNK,
         extra_params=(source,),
     )
     return {row["msg_id"] for row in rows}
