@@ -80,10 +80,16 @@
      --cat-club / --cat-acad / --cat-trade / --cat-job 已无引用，删除以免与
      db.py 形成第二份会漂移的默认值。 */
   --cat-default:#6B7280;
-  /* 类别色"文字派生层"：DB 下发的装饰色不可直接当文字色（19 色中 0 色双主题达
-     WCAG AA）。浅色向墨色收 50%、深色向白提亮 60%，装饰用途（左色条/色点/
-     胶囊底）保留纯 --cat。链路对比度由 tests/test_ui_contrast.py 全表锁定。 */
-  --cat-fg: color-mix(in srgb, var(--cat, var(--cat-default)) 50%, var(--text));
+  /* 类别色"文字派生层"旋钮：DB 下发的装饰色不可直接当文字色（19 色中 0 色双主题
+     达 WCAG AA）。浅色 = 50% 类别色 + 50% 墨色、深色 = 60% 类别色 + 40% 白，
+     装饰用途（左色条/色点/胶囊底）保留纯 --cat。链路对比度由
+     tests/test_ui_contrast.py 全表锁定。
+     派生本体（--cat-fg）绝不能声明在令牌块：自定义属性的 var() 替换发生在
+     声明元素处，:root 上看不到 JS 内联注入的元素级 --cat，会用回退灰定格成
+     常量——全部类别同时失去颜色（真实回归）。故声明在携带 --cat 的载体
+     选择器上（.cat-link 等三处，见侧边栏小节）。 */
+  --cat-fg-pct: 50%;
+  --cat-fg-base: var(--text);
 
   /* 语义色 token（深色模式随 [data-theme] 覆盖） */
   --status-ok-bg:  #ECFDF5;
@@ -327,6 +333,14 @@ body.searching #category-nav::after {
 }
 /* 类别颜色数据驱动：--cat 由 JS 按类别颜色内联注入（style="--cat:#xxx"）；
    无注入（遗留类别）时回退 --cat-default */
+/* 类别色"文字派生层"：--cat-fg 必须在携带内联 --cat 的载体上声明，逐元素
+   求值（声明在 :root 会用回退灰定格成常量——全部类别失去颜色的真实回归，
+   详见 :root 令牌块注释与 test_ui_contrast 守卫）。三处载体覆盖全部
+   --cat-fg 消费点：侧边栏类别链接（链接本体、图标、计数胶囊）、折叠组块
+   与展开组头（组内 .group-subject / .group-more 继承） */
+.cat-link, .group-collapsed, .group-header {
+  --cat-fg: color-mix(in srgb, var(--cat, var(--cat-default)) var(--cat-fg-pct), var(--cat-fg-base));
+}
 .cat-link {
   display: flex; justify-content: space-between; align-items: center;
   padding: 7px 12px; border-radius: var(--radius-sm);
@@ -1358,8 +1372,10 @@ body.modal-open { overflow: hidden; }
   --z-skip: 400;
   --hover-bg: color-mix(in srgb, var(--accent) 7%, var(--surface));
   --topbar-h: 52px;
-  /* 深色类别文字：向白提亮 60%（19 色全表验证最差 5.24:1） */
-  --cat-fg: color-mix(in srgb, var(--cat, var(--cat-default)) 60%, #FFFFFF);
+  /* 深色类别文字：向白提亮 60%（19 色全表验证最差 5.24:1）；
+     派生本体 --cat-fg 在载体选择器上逐元素求值（见 :root 的警示） */
+  --cat-fg-pct: 60%;
+  --cat-fg-base: #FFFFFF;
   --status-ok-bg:  #123527;
   --status-warn-bg: #3A2B0A;
   --status-danger-bg: #3B1D1D;

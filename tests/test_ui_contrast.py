@@ -272,11 +272,13 @@ def test_category_foreground_chain_meets_aa() -> None:
     """类别色"文字派生层"（--cat-fg）全色板对比度锁定。
 
     DB 下发的类别装饰色不可直接作文字色（历史上 19 色中 0 色双主题过 AA）。
-    CSS 侧 --cat-fg 用 color-mix 派生：浅色 = 50% 类别色 + 50% --text，
-    深色 = 60% 类别色 + 40% 白。此处解析 app.js 的 _CAT_PALETTE 全表，
-    按同一公式复算 cat-fg 在自身 10% tint 底（.card-category 真实用途）与
-    --on-accent 在 cat-fg 实心底（.cat-link.active .cat-count）上的对比度。
-    改派生比例或色板时必须保持 ≥ 4.5:1。
+    CSS 侧 --cat-fg 用 color-mix 派生（声明在携带内联 --cat 的载体选择器上，
+    比例/基色经 --cat-fg-pct / --cat-fg-base 旋钮随主题切换）：
+    浅色 = 50% 类别色 + 50% --text，深色 = 60% 类别色 + 40% 白。
+    此处解析 app.js 的 _CAT_PALETTE 全表，按同一公式复算 cat-fg 在自身 10%
+    tint 底（.card-category 真实用途）与 --on-accent 在 cat-fg 实心底
+    （.cat-link.active .cat-count）上的对比度。改派生比例或色板时必须保持
+    ≥ 4.5:1。
     """
     app = REPO / "ui" / "app.js"
     palette = re.findall(r'color:\s*"(#[0-9A-Fa-f]{6})"',
@@ -299,3 +301,26 @@ def test_category_foreground_chain_meets_aa() -> None:
             assert ratio2 >= AA_TEXT, (
                 f"{name} {cat}: on-accent on cat-fg = {ratio2:.2f}:1 < {AA_TEXT}"
             )
+
+
+def test_cat_fg_derivation_stays_per_element() -> None:
+    """守卫：--cat-fg 派生必须逐元素求值，禁止回到主题令牌块。
+
+    自定义属性的 var() 替换发生在声明元素处：曾把派生声明在 :root 与
+    [data-theme="dark"]，var(--cat) 在 :root 处吃不到 JS 内联注入的元素级
+    类别色，用回退灰定格成常量——所有类别的激活态文字/图标与组头标题同时
+    变灰（真实回归，用户可见为"侧边栏类别颜色消失"）。派生本体只允许声明
+    在携带内联 --cat 的载体选择器上（.cat-link / .group-collapsed /
+    .group-header），主题差异经 --cat-fg-pct / --cat-fg-base 两个旋钮切换。
+    """
+    light, dark = _tokens()
+    for token in ("--cat-fg-pct", "--cat-fg-base"):
+        assert token in light, f"浅色令牌块缺少 {token}"
+        assert token in dark, f"深色令牌块缺少 {token}"
+    css = _strip_comments(STYLE.read_text(encoding="utf-8"))
+    decls = re.findall(r"--cat-fg\s*:\s*([^;]+);", css)
+    assert decls, "--cat-fg 派生声明缺失（类别文字色链路断裂）"
+    for decl in decls:
+        assert "var(--cat" in decl, (
+            f"--cat-fg 派生必须引用元素级 --cat（逐元素求值），得到: {decl.strip()}"
+        )
