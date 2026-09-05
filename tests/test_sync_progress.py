@@ -37,10 +37,10 @@ from briefdesk.types import (
     ClassifyOutcome,
     ClassifyResult,
     DedupResult,
-    InternalMessage,
 )
+from tests._helpers import _pipeline_client, _pipeline_msg
 
-# ── 复用的测试小工具（与 test_pipeline.py 保持一致的装配方式）──
+# ── 复用的测试小工具（pipeline 消息/客户端构造已收敛至 tests/_helpers）──
 
 
 async def _noop_async(*args, **kwargs):
@@ -108,26 +108,6 @@ def _dedup_engine_mock():
         add_to_cache=Mock(),
         flush_pending_embeddings=AsyncMock(),
     )
-
-
-def _pipeline_msg(mid, content="c", session_id="s", ts=1):
-    return InternalMessage(
-        msg_id=mid,
-        content=content,
-        sender_name="A",
-        sender_id="u",
-        session_id=session_id,
-        group_name="g",
-        timestamp=ts,
-        source="weflow-legacy",
-    )
-
-
-def _pipeline_client():
-    c = AsyncMock()
-    c.name = "weflow-legacy"
-    c.download_media = AsyncMock(return_value=b"x")
-    return c
 
 
 # ── status.SyncProgress 状态机 ──

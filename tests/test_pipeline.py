@@ -35,6 +35,7 @@ from briefdesk.types import (
     InsertedRow,
     InternalMessage,
 )
+from tests._helpers import _pipeline_client, _pipeline_msg
 
 
 async def _noop_async(*args, **kwargs):
@@ -118,27 +119,6 @@ class _StageTestBase(unittest.IsolatedAsyncioTestCase):
 
     async def asyncTearDown(self):
         stages.reset()
-
-
-def _pipeline_msg(mid, content="c", session_id="s", ts=1, is_self=False):
-    return InternalMessage(
-        msg_id=mid,
-        content=content,
-        sender_name="A",
-        sender_id="u",
-        session_id=session_id,
-        group_name="g",
-        timestamp=ts,
-        source="weflow-legacy",
-        is_self=is_self,
-    )
-
-
-def _pipeline_client(name="weflow-legacy"):
-    c = Mock()
-    c.name = name
-    c.download_media = AsyncMock(return_value=b"x")
-    return c
 
 
 class BuildItemInputTest(unittest.TestCase):
