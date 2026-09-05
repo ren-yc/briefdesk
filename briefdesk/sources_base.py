@@ -6,7 +6,8 @@
 监听器实现本协议，server 只依赖协议不依赖具体源。
 `SourceRuntime` 是已装配消息源单元：main 通过它编排启动/关闭与轮询
 同步——**新增消息源 = 实现 SourceRuntime 并以插件发布**（briefdesk/plugins/*，
-entry point 组 briefdesk.plugins，启用走 PLUGINS/PLUGINS_DISABLED）。
+entry point 组 briefdesk.plugins；消息源为可选插件，启用走 PLUGINS 显式
+列表或设置页「插件」面板开关）。
 轮询拉取等源特有的控制流留在各插件包内。
 """
 

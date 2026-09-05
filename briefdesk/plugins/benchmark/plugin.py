@@ -33,8 +33,8 @@ class BenchmarkPlugin(WebPlugin, StagePlugin):
     name = "benchmark"
     version = "1.0.2"
     dependencies: tuple[str, ...] = ("ai_provider",)
-    default_disabled = True  # 实验性基准工具：默认不随 PLUGINS=["*"] 加载，
-    # 需在 PLUGINS 中显式列名（如 ["*", "benchmark"]）才启用（manager 按此过滤）
+    conflicts: tuple[str, ...] = ()
+    core = False  # 可选插件（实验性基准工具）：默认禁用，经 PLUGINS / 设置页开关启用
     slot = "post_insert"  # 阶段槽位：合并判定之后（batch.merge_checks 已填充）
     priority = 1  # 同槽 priority 升序：在 merge 阶段（priority=0）之后运行
 

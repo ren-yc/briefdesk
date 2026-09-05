@@ -30,7 +30,7 @@ def _ctx(register_stage=None):
 
     ctx = PluginContext(
         config=Settings(
-            plugins=["*"], plugins_disabled=[], plugins_required=[], plugin_path=""
+            plugins=[], plugins_required=[], plugin_path=""
         ),
         publish_event=_noop_async,
         subscribe_event=lambda event, handler: subscribers.append((event, handler)),
@@ -241,7 +241,6 @@ class _NoEntryPoints(list):
 def _mgr_settings(*, required=None):
     return Settings(
         plugins=["boom", "dep"],
-        plugins_disabled=[],
         plugins_required=list(required or []),
         plugin_path="",
     )
@@ -366,7 +365,7 @@ class PluginDisabledNoTeardownTest(unittest.IsolatedAsyncioTestCase):
                 calls.append("teardown")
 
         settings = Settings(
-            plugins=["p"], plugins_disabled=[], plugins_required=[], plugin_path=""
+            plugins=["p"], plugins_required=[], plugin_path=""
         )
         manager = PluginManager(settings)
         manager.register(P())

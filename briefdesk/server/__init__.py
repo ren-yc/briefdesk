@@ -31,5 +31,7 @@ from briefdesk.server.web_plugins import _plugin_assets as _plugin_assets
 from briefdesk.server.web_plugins import include_plugin_router as include_plugin_router
 from briefdesk.server.web_plugins import has_settings_schema_callback as has_settings_schema_callback
 from briefdesk.server.web_plugins import register_plugin_assets as register_plugin_assets
+from briefdesk.server.web_plugins import set_plugin_meta_callback as set_plugin_meta_callback
+from briefdesk.server.web_plugins import set_plugin_validation_callback as set_plugin_validation_callback
 from briefdesk.server.web_plugins import set_plugins_info_callback as set_plugins_info_callback
 from briefdesk.server.web_plugins import set_settings_schema_callback as set_settings_schema_callback

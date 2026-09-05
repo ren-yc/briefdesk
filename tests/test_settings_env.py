@@ -2,8 +2,9 @@
 
 - 存储层：BRIEFDESK_SETTINGS_FILE 显式路径、读写/删键/整文件移除、来源判定
 - 优先级链：暂存文件 > .env > 默认（pydantic-settings 多文件后加载优先）
-- 路由：GET 元数据/暂存/来源；PUT 白名单/类型校验/原子写/null 恢复；
-  POST/DELETE 密钥（fake keyring 隔离真实凭据管理器）
+- 路由：GET 元数据/暂存/来源/插件开关数据；PUT 白名单/类型校验/插件依赖
+  互斥复检（409）/原子写/null 恢复；POST/DELETE 密钥（fake keyring 隔离
+  真实凭据管理器）
 - 前端守卫：index.html 面板与 app.js 端点引用不漂移
 """
 
@@ -13,6 +14,7 @@ import tempfile
 import unittest
 from contextlib import contextmanager
 from pathlib import Path
+from typing import ClassVar
 from unittest.mock import patch
 
 import keyring
@@ -246,10 +248,10 @@ class EnvRoutesTest(StagedFileTestCase):
     def test_put_multi_json_array(self) -> None:
         res = self.client.put(
             "/api/settings/env",
-            json={"items": {"PLUGINS": json.dumps(["*", "benchmark"])}},
+            json={"items": {"PLUGINS": json.dumps(["weflow", "qqflow"])}},
         )
         self.assertEqual(res.status_code, 200)
-        self.assertEqual(read_staged()["PLUGINS"], '["*","benchmark"]')
+        self.assertEqual(read_staged()["PLUGINS"], '["weflow","qqflow"]')
 
     def test_dynamic_plugin_schema_is_rendered_validated_and_saved(self) -> None:
         dynamic = [
@@ -428,6 +430,126 @@ class EnvRoutesTest(StagedFileTestCase):
         )
 
 
+class PluginToggleRoutesTest(StagedFileTestCase):
+    """「插件」面板路由：GET plugins 数组（核心/可选 + 期望启用态）、
+    PUT PLUGINS 的依赖/互斥复检（409）与 PLUGINS_DISABLED 键淘汰。"""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.client = TestClient(
+            srv.app,
+            base_url="http://localhost",
+            headers={"Origin": "http://localhost"},
+        )
+
+    _META: ClassVar[list[dict]] = [
+        {
+            "name": "weflow",
+            "version": "1.0.0",
+            "dependencies": [],
+            "conflicts": ["weflow-legacy"],
+            "core": False,
+        },
+        {
+            "name": "ai_provider",
+            "version": "1.0.0",
+            "dependencies": [],
+            "conflicts": [],
+            "core": True,
+        },
+    ]
+
+    def test_get_returns_plugin_toggle_data(self) -> None:
+        infos = [
+            {"name": "weflow", "version": "1.0.0", "status": "disabled",
+             "reason": "未启用：在 PLUGINS 中列出或经「插件」面板开关即可启用",
+             "has_frontend": False, "core": False},
+            {"name": "ai_provider", "version": "1.0.0", "status": "loaded",
+             "reason": "", "has_frontend": False, "core": True},
+            # 加载失败记录（无插件实例、无元数据）应兜底展示
+            {"name": "ghost", "version": "", "status": "failed",
+             "reason": "entry point 加载失败", "has_frontend": False, "core": False},
+        ]
+        # 隔离宿主环境：config 单例回落值与 PLUGINS 来源判定均指向干净默认
+        with patch.object(
+            settings_routes, "get_plugin_meta", return_value=self._META
+        ), patch.object(
+            settings_routes, "get_plugins_info", return_value=infos
+        ), patch.object(
+            settings_routes, "config", Settings(
+                plugins=[], plugins_required=[], plugin_path=""
+            )
+        ), patch.object(
+            settings_routes, "source_of", return_value="default"
+        ):
+            data = self.client.get("/api/settings/env").json()
+        plugins = {p["name"]: p for p in data["plugins"]}
+        self.assertIs(plugins["ai_provider"]["core"], True)
+        self.assertIs(plugins["ai_provider"]["enabled"], True)  # 核心恒启用
+        self.assertIs(plugins["weflow"]["enabled"], False)  # 默认 PLUGINS=[]，未列出即禁用
+        self.assertEqual(plugins["weflow"]["status"], "disabled")
+        self.assertIn("ghost", plugins)  # 失败记录兜底可见
+        self.assertEqual(plugins["ghost"]["status"], "failed")
+        self.assertEqual(data["pluginsSource"], "default")
+        # PLUGINS 项带 hidden 标记（由插件面板编辑）；PLUGINS_DISABLED 已淘汰
+        plugins_item = next(i for i in data["items"] if i["key"] == "PLUGINS")
+        self.assertIs(plugins_item["hidden"], True)
+        self.assertNotIn("PLUGINS_DISABLED", {i["key"] for i in data["items"]})
+        # 芯片选项不含通配符
+        self.assertNotIn("*", data["pluginOptions"])
+
+    def test_get_enabled_follows_staged_value(self) -> None:
+        write_staged({"PLUGINS": '["weflow"]'})
+        with patch.object(
+            settings_routes, "get_plugin_meta", return_value=self._META
+        ), patch.object(settings_routes, "get_plugins_info", return_value=[]):
+            data = self.client.get("/api/settings/env").json()
+        self.assertEqual(
+            {p["name"]: p["enabled"] for p in data["plugins"]},
+            {"weflow": True, "ai_provider": True},
+        )
+        self.assertEqual(data["pluginsSource"], "override")
+
+    def test_put_plugins_conflict_rejected_409(self) -> None:
+        issues = [
+            {
+                "type": "conflict",
+                "plugin": "weflow",
+                "detail": "与 weflow-legacy 互斥，两者不可同时启用",
+            }
+        ]
+        with patch.object(
+            settings_routes, "validate_plugin_selection", return_value=issues
+        ):
+            res = self.client.put(
+                "/api/settings/env",
+                json={"items": {"PLUGINS": json.dumps(["weflow", "weflow-legacy"])}},
+            )
+        self.assertEqual(res.status_code, 409)
+        self.assertEqual(res.json()["detail"]["issues"], issues)
+        self.assertNotIn("PLUGINS", read_staged())  # 校验失败不落盘
+
+    def test_put_plugins_valid_selection_stages(self) -> None:
+        with patch.object(
+            settings_routes, "validate_plugin_selection", return_value=[]
+        ):
+            res = self.client.put(
+                "/api/settings/env",
+                json={"items": {"PLUGINS": json.dumps(["weflow"])}},
+            )
+        self.assertEqual(res.status_code, 200)
+        self.assertEqual(read_staged()["PLUGINS"], '["weflow"]')
+
+    def test_put_plugins_disabled_key_rejected(self) -> None:
+        # PLUGINS_DISABLED 已随通配语义一并移除：键不再在白名单
+        res = self.client.put(
+            "/api/settings/env",
+            json={"items": {"PLUGINS_DISABLED": json.dumps(["weflow-legacy"])}},
+        )
+        self.assertEqual(res.status_code, 422)
+        self.assertEqual(read_staged(), {})
+
+
 class FrontendGuardTest(unittest.TestCase):
     """前端面板与端点引用守卫（防漂移）。"""
 
@@ -438,6 +560,11 @@ class FrontendGuardTest(unittest.TestCase):
         self.assertIn('id="env-secrets"', html)
         self.assertIn('id="env-file-path"', html)
 
+    def test_index_html_has_plugins_toggle_panel(self) -> None:
+        html = (_REPO_ROOT / "ui" / "index.html").read_text(encoding="utf-8")
+        self.assertIn('data-panel="plugins"', html)
+        self.assertIn('id="plugins-list"', html)
+
     def test_app_js_references_env_endpoints(self) -> None:
         js = (_REPO_ROOT / "ui" / "app.js").read_text(encoding="utf-8")
         self.assertIn('"/api/settings/env"', js)
@@ -446,6 +573,15 @@ class FrontendGuardTest(unittest.TestCase):
         self.assertIn("data-sec-set", js)
         self.assertIn("keyringConfigured", js)
         self.assertIn('class="env-input"', js)
+
+    def test_app_js_references_plugin_toggle_flow(self) -> None:
+        js = (_REPO_ROOT / "ui" / "app.js").read_text(encoding="utf-8")
+        self.assertIn("data-plugin-toggle", js)
+        self.assertIn("_onPluginToggle", js)
+        self.assertIn("renderPluginToggles", js)
+        self.assertIn("_pluginChanges", js)
+        # 多选控件不再注入通配符选项
+        self.assertNotIn('opts.unshift("*")', js)
 
 
 if __name__ == "__main__":

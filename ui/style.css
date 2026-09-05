@@ -1593,22 +1593,37 @@ body.modal-open { overflow: hidden; }
    时间线须盖过插件详情浮层（calendar，z-index:110） */
 #subject-timeline-modal { z-index: var(--z-modal-top); }
 
-/* ── 插件列表（设置弹窗「插件」分组） ── */
+/* ── 插件列表（设置弹窗「插件」分组，逐插件启停） ── */
 .plugins-list {
   display: flex; flex-direction: column; gap: 8px;
   max-height: 40vh; overflow-y: auto;
 }
+.plugin-section { display: flex; flex-direction: column; gap: 6px; }
+.plugin-section-title { font-size: 12px; font-weight: 600; color: var(--text-2); }
 .plugin-row {
-  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
-  padding: 6px 8px; border-radius: var(--radius-sm);
+  padding: 8px 10px; border-radius: var(--radius-sm);
   background: var(--surface-1);
 }
+.plugin-row-head {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+}
+/* 开关贴右：spacer 吃掉行头剩余空间（比逐元素 margin-left:auto 直观） */
+.plugin-row-spacer { flex: 1 1 auto; }
 .plugin-name { font-weight: 600; }
 .plugin-version { font-size: 0.85em; opacity: 0.7; }
 .plugin-status { font-size: 0.78em; padding: 1px 8px; border-radius: 999px; }
 .plugin-status-ok   { background: color-mix(in srgb, var(--state-ok) 16%, var(--surface));   color: var(--state-ok); }
 .plugin-status-warn { background: color-mix(in srgb, var(--state-warn) 16%, var(--surface)); color: var(--state-warn); }
 .plugin-status-err  { background: color-mix(in srgb, var(--state-err) 16%, var(--surface));  color: var(--state-err); }
+.plugin-reason { font-size: 0.85em; }
+.plugin-row .settings-hint { margin: 4px 0 0; }
+/* 开关复用 env-switch 自绘轨道（轨道样式为全局 label.env-switch）；此处
+   只补行头布局：压过全局 .modal-content label 的 display:block + margin-bottom */
+.plugin-row label.env-switch {
+  display: inline-flex; align-items: center; gap: 8px;
+  margin-bottom: 0; cursor: pointer; user-select: none;
+  font-size: 13px; color: var(--text-2);
+}
 
 /* ═══ 第一批新增：搜索历史 / 错误横幅 / 快捷键 / 操作区收纳 ═══ */
 

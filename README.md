@@ -99,14 +99,14 @@ OCR 依赖为**可选**（`pip install -e ".[ocr]"`）：
    copy .env.example .env
    ```
 
-2. 编辑 `.env`，填入必填项 `AI_API_KEY`；消息源为 `weflow` 时需 `WEFLOW_API_TOKEN`/`WEFLOW_WXID`/`WEFLOW_DB_KEYS`（微信每库独立密钥的 JSON 映射，过长时拆 `WEFLOW_DB_KEYS_2` 第二段；密钥项走系统钥匙串而非 `.env`），为 `weflow-legacy` 时需 `WEFLOW_LEGACY_API_TOKEN`，为 `qqflow` 时需 `QQFLOW_API_TOKEN`/`QQFLOW_QQ`/`QQFLOW_KEY`（weflow/qqflow 缺失任一必填项 → 该插件自禁用）。消息源启用走 `PLUGINS` / `PLUGINS_DISABLED`（weflow/weflow-legacy/qqflow 均为内置插件），其余按需修改。
+2. 编辑 `.env`，填入必填项 `AI_API_KEY`；消息源为 `weflow` 时需 `WEFLOW_API_TOKEN`/`WEFLOW_WXID`/`WEFLOW_DB_KEYS`（微信每库独立密钥的 JSON 映射，过长时拆 `WEFLOW_DB_KEYS_2` 第二段；密钥项走系统钥匙串而非 `.env`），为 `weflow-legacy` 时需 `WEFLOW_LEGACY_API_TOKEN`，为 `qqflow` 时需 `QQFLOW_API_TOKEN`/`QQFLOW_QQ`/`QQFLOW_KEY`（weflow/qqflow 缺失任一必填项 → 该插件自禁用）。消息源为可选插件，启用走 `PLUGINS` 显式列表（如 `PLUGINS=["weflow","qqflow"]`）或应用内「设置 → 插件」面板逐个开关，其余按需修改。
 3. `AI_MODEL` 默认 `deepseek-v4-flash`：若你对接的 OpenAI 兼容服务没有该模型名，请改为实际模型名（如 `deepseek-chat`、`qwen-turbo` 等），否则首次分类会报模型不存在。
 
 常用可调项（完整清单与逐项注释见 `.env.example`）：
 
 | 环境变量 | 默认 | 说明 |
 |---|---|---|
-| `PLUGINS` / `PLUGINS_DISABLED` | `["*"]` / `[]` | 插件启用/禁用（JSON 数组），消息源启用的唯一开关（不再使用 SOURCES） |
+| `PLUGINS` | `[]` | 可选插件（消息源/ocr/benchmark）显式启用列表（JSON 数组，无通配）；核心插件恒装配，亦可在设置页「插件」面板逐个开关（不再使用 SOURCES） |
 | `POLL_OVERLAP_SECONDS` | `300` | 增量轮询窗口与水位间的重叠秒数（吸收边界秒/时钟偏差/翻页偏移；重叠部分由已处理表去重，无 AI 开销） |
 | `POLL_INTERVAL_SECONDS` | `0`（禁用） | 周期同步间隔（秒）：SSE 断连窗口的消息补齐兜底，>0 时按周期自动触发与「同步消息」同路径的同步（进行中互斥） |
 | `IGNORE_SELF` | `true` | 过滤本账号自己发送的消息（SSE 实时 + REST 回填） |
@@ -166,7 +166,7 @@ briefdesk/
 │       ├── calendar/           # 日历 Web 插件（plugin.py + router.py + db.py：/api/calendar；ui/ 含完整前端）
 │       ├── reminders/          # 提醒 Web 插件（plugin.py + router.py：提醒设置 + 到期轮询；ui/ 含完整前端）
 │       ├── rag/                # 检索问答 Web 插件（plugin.py + router.py + db.py + engine.py + prompts.py；ui/ 含完整前端）
-│       └── benchmark/           # 实验基准（case 样例 + runner + 报告生成，见 benchmark/README.md；默认禁用，PLUGINS 显式列名启用）
+│       └── benchmark/           # 实验基准（case 样例 + runner + 报告生成，见 benchmark/README.md；可选插件，默认禁用，PLUGINS 显式列名启用）
 ├── ui/
 │   ├── index.html          # 桌面端页面
 │   ├── app.js              # 前端逻辑
@@ -181,17 +181,17 @@ briefdesk/
 
 - 打包插件经 `[project.entry-points."briefdesk.plugins"]` 声明；开发期插件放
   `PLUGIN_PATH` 目录（每个 `.py` 暴露 `plugin` 实例）即可被加载
-- `briefdesk/plugin/manager.py` 的 `PluginManager`：发现 → `PLUGINS` /
-  `PLUGINS_DISABLED` 过滤 → 依赖拓扑排序 → setup（HTTP 启动前）→
-  activate（服务器就绪后）→ teardown（逆序幂等）
+- `briefdesk/plugin/manager.py` 的 `PluginManager`：发现 → 核心/可选分层过滤
+  （核心恒装配；可选按 `PLUGINS` 显式列表，互斥对先列者保留）→ 依赖拓扑
+  排序 → setup（HTTP 启动前）→ activate（服务器就绪后）→ teardown（逆序幂等）
 - 单插件失败只禁用该插件；`PLUGINS_REQUIRED` 名单内的失败则中止启动
 - 依赖方向由 `tests/test_no_core_imports_plugins.py` 守卫：核心永不 import
   `briefdesk.plugins.*`
-- 消息源为内置插件（weflow/weflow-legacy/qqflow），启用走 `PLUGINS` /
-  `PLUGINS_DISABLED`（不再使用 SOURCES）
-- 声明 `default_disabled = True` 的插件（如实验性 benchmark）默认不随
-  `PLUGINS=["*"]` 加载，需显式列名（`PLUGINS=["*", "benchmark"]`）才启用；
-  `PLUGINS_DISABLED` 仍为最高优先级
+- 插件分核心/可选两层：核心插件（ai_provider/classify/dedup/merge/rag/
+  calendar/reminders）恒装配；可选插件（weflow/weflow-legacy/qqflow/ocr/
+  benchmark）默认禁用，经 `PLUGINS` 显式列名或设置页「插件」面板逐个开关
+  启用（不再使用 SOURCES）；插件可声明 `conflicts` 互斥（weflow 与
+  weflow-legacy 互斥——同一上游新旧采集器，同开会重复采集）
 - 管道阶段化：OCR / AI 分类 / 语义去重 / 同话题合并各是一个阶段插件
   （`briefdesk/plugins/{ocr,classify,dedup,merge}/`，槽位
   enrich → classify → dedup → post_insert），`briefdesk/pipeline.py` 只做
@@ -233,4 +233,4 @@ briefdesk/
 - **AI**: AI Chat API (openai SDK 兼容)
 - **HTTP 客户端**: httpx (异步)
 - **前端**: 原生 HTML + CSS + JavaScript（无框架）
-- **消息源**: 可插拔多源（weflow-server :5033 微信 4.x、WeFlow :5031、qqflow-server :5032；消息源为内置插件，通过 `PLUGINS` / `PLUGINS_DISABLED` 启用，JSON 数组格式）
+- **消息源**: 可插拔多源（weflow-server :5033 微信 4.x、WeFlow :5031、qqflow-server :5032；消息源为可选插件，通过 `PLUGINS` 显式列表或设置页「插件」面板开关启用，JSON 数组格式）

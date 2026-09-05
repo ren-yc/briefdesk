@@ -118,7 +118,7 @@ class WebPluginSetupTest(unittest.IsolatedAsyncioTestCase):
         from briefdesk.plugin.base import PluginContext
 
         ctx = PluginContext(
-            config=Settings(plugins=["*"], plugins_disabled=[], plugins_required=[], plugin_path=""),
+            config=Settings(plugins=[], plugins_required=[], plugin_path=""),
             publish_event=publish_event,
             subscribe_event=subscribe_event,
             register_source=lambda r: None,

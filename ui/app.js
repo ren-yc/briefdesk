@@ -514,8 +514,7 @@ function bindSettingsEntryEvents() {
     loadSessions();
     loadCategories();
     loadAboutSources();
-    loadPlugins();
-    loadEnvConfig();
+    loadEnvConfig(); // 插件面板（逐插件开关）与启动配置共用本次数据
     pushModalFocus($settingsModal, { initialFocus: $refreshInterval });
   }
 
@@ -666,10 +665,12 @@ function bindSettingsFormEvents() {
   // "保存"统一应用三类更改：刷新间隔（localStorage）+ 类别草稿 + 会话草稿。
   // 同步进行中时延迟到同步完成后应用（本次同步按旧配置跑，避免数据与配置不一致）。
   $settingsSave.addEventListener("click", async () => {
-    // 「启动配置」面板共用此按钮：语义是写 .env 暂存文件（重启生效），
-    // 不走刷新间隔/类别/会话草稿的保存链路
-    const envActive = !document.querySelector('.settings-panel[data-panel="env"]')?.classList.contains("hidden");
-    if (envActive) { await saveEnvConfig(); return; }
+    // 「启动配置 / 插件」面板共用此按钮：语义是写 .env 暂存文件（重启生效），
+    // 不走刷新间隔/类别/会话草稿的保存链路（插件开关草稿并入 PLUGINS 一并提交）
+    const panelActive = ["env", "plugins"].some(
+      p => !document.querySelector('.settings-panel[data-panel="' + p + '"]')?.classList.contains("hidden")
+    );
+    if (panelActive) { await saveEnvConfig(); return; }
     if (saveBusy) return;
     saveBusy = true;
     $settingsSave.disabled = true;
@@ -766,6 +767,14 @@ function bindSettingsFormEvents() {
     });
   }
   if ($envFilter) $envFilter.addEventListener("input", _applyEnvFilter);
+
+  // 「插件」面板：逐插件开关（草稿态；保存时并入 PLUGINS 差异统一提交）
+  if ($pluginsList) {
+    $pluginsList.addEventListener("change", (e) => {
+      const input = e.target.closest("input[data-plugin-toggle]");
+      if (input) _onPluginToggle(input.dataset.pluginToggle, input.checked, input);
+    });
+  }
 
   $settingsModal.addEventListener("click", (e) => {
     if (e.target === $settingsModal) closeSettingsModal();
@@ -4201,7 +4210,13 @@ async function reqJson(url, { method = "GET", body } = {}) {
     headers: body === undefined ? undefined : { "Content-Type": "application/json" },
     body: body === undefined ? undefined : JSON.stringify(body),
   });
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  if (!res.ok) {
+    const err = new Error(`HTTP ${res.status}`);
+    // 结构化错误体挂到 payload（如 PLUGINS 校验 409 的 {detail:{issues}}）；
+    // 无体/非 JSON 响应静默忽略，调用点按需取用
+    try { err.payload = await res.json(); } catch { /* 忽略 */ }
+    throw err;
+  }
   return res.json();
 }
 
@@ -4289,7 +4304,9 @@ let envData = null;
 
 async function loadEnvConfig() {
   envData = await getJson("/api/settings/env").catch(() => null);
+  _pluginSets(); // 插件开关草稿以本次加载的服务端期望值为基准（重载即重置草稿）
   renderEnvConfig();
+  renderPluginToggles();
 }
 
 function _envBadges(item, { skipPluginBadge = false } = {}) {
@@ -4327,13 +4344,12 @@ function _envControl(item) {
       + "</select>";
   }
   if (item.type === "multi") {
-    // 选项 = 已发现插件 ∪ 当前值（保证既有值不回丢）
+    // 选项 = 已发现插件 ∪ 当前值（保证既有值不回丢）；无通配语义
     const current = Array.isArray(cur) ? cur : [];
     const opts = current.slice();
     for (const name of (envData.pluginOptions || [])) {
       if (!opts.includes(name)) opts.push(name);
     }
-    if (!opts.includes("*")) opts.unshift("*");
     return '<div class="env-multi" data-env-key="' + keyAttr + '">'
       + opts.map(o => '<label class="env-chip' + (current.includes(o) ? " checked" : "") + '">'
         + '<input type="checkbox" value="' + escAttr(o) + '"'
@@ -4393,7 +4409,8 @@ function _envRowHtml(item, groupDisabled) {
 }
 
 function _envItemsHtml() {
-  return _groupByPlugin(envData.items).map(group => {
+  // PLUGINS（hidden）由「插件」面板逐插件开关编辑，不在本面板渲染
+  return _groupByPlugin(envData.items.filter(i => !i.hidden)).map(group => {
     // 插件整组未加载/未启用 → 默认折叠（仍可展开预配置），头部徽章示意；
     // 正文不做容器级 opacity 调光（对比度守卫测试禁止）
     const disabled = group.name !== "core"
@@ -4487,17 +4504,22 @@ function _applyEnvFilter() {
   }
 }
 
-// 底部全局「保存」按钮的差异数联动：env 面板激活时把未暂存差异追加到文案
-// （保存（N 项））；切到其他面板或无差异时还原为纯「保存」
+// 底部全局「保存」按钮的差异数联动：env / plugins 面板激活时把未暂存差异
+// 追加到文案（保存（N 项））；切到其他面板或无差异时还原为纯「保存」
 function _updateEnvSaveButton() {
   const $save = document.getElementById("settings-save");
   if (!$save) return;
-  const envActive = !document.querySelector('.settings-panel[data-panel="env"]')?.classList.contains("hidden");
-  if (!envActive || !envData) {
+  const panelActive = ["env", "plugins"].some(
+    p => !document.querySelector('.settings-panel[data-panel="' + p + '"]')?.classList.contains("hidden")
+  );
+  if (!panelActive || !envData) {
     if ($save.textContent !== "保存") $save.textContent = "保存";
     return;
   }
-  const n = Object.keys(_collectEnvChanges()).length;
+  const envActive = !document.querySelector('.settings-panel[data-panel="env"]')?.classList.contains("hidden");
+  const n = envActive
+    ? Object.keys(_collectEnvChanges()).length
+    : Object.keys(_pluginChanges()).length;
   $save.textContent = n > 0 ? "保存（" + n + " 项）" : "保存";
 }
 
@@ -4543,7 +4565,8 @@ function _collectEnvChanges() {
 
 async function saveEnvConfig() {
   if (!envData) return;
-  const changes = _collectEnvChanges();
+  // 两面板共用保存链路：启动配置项差异 + 插件开关草稿（PLUGINS）一并提交
+  const changes = { ..._collectEnvChanges(), ..._pluginChanges() };
   if (!Object.keys(changes).length) {
     showToast("没有需要暂存的更改", { type: "info", duration: 2500 });
     return;
@@ -4556,7 +4579,14 @@ async function saveEnvConfig() {
     await loadEnvConfig();
   } catch (err) {
     console.error("Save env config error:", err);
-    showToast("暂存失败，请检查输入后重试", { type: "error", duration: 6000 });
+    // 409（PLUGINS 依赖/互斥复检失败）服务端返回 {detail:{issues}}，逐条明示
+    const issues = err && err.payload && err.payload.detail && err.payload.detail.issues;
+    if (Array.isArray(issues) && issues.length) {
+      showToast("无法暂存：" + issues.map(i => i.plugin + "：" + i.detail).join("；"),
+        { type: "error", duration: 8000 });
+    } else {
+      showToast("暂存失败，请检查输入后重试", { type: "error", duration: 6000 });
+    }
   }
 }
 
@@ -4916,31 +4946,141 @@ async function loadAboutSources() {
   }
 }
 
-async function loadPlugins() {
-  // 「插件」页：/api/plugins 元数据（名称/版本/状态/原因），失败不阻塞弹窗
-  if (!$pluginsList) return;
-  try {
-    const data = await getJson("/api/plugins");
-    const plugins = Array.isArray(data.plugins) ? data.plugins : [];
-    if (!plugins.length) {
-      $pluginsList.innerHTML = '<p class="text-muted">未发现任何插件</p>';
+// ── 插件面板（逐插件启停）──
+// 数据复用 GET /api/settings/env 的 plugins 数组（声明元数据 + 期望启用态 +
+// 当前进程装配状态）。开关只改本地草稿集，点「保存」才写 PLUGINS 暂存
+// （重启生效）；核心插件恒装配、无开关，仅展示状态。
+
+let pluginBaseSet = null;   // 服务端期望启用的可选插件名集合（加载时快照）
+let pluginDraftSet = null;  // 草稿启用集合；null = 尚未改动
+
+function _pluginSets() {
+  const plugins = (envData && envData.plugins) || [];
+  pluginBaseSet = new Set(plugins.filter(p => !p.core && p.enabled).map(p => p.name));
+  pluginDraftSet = null;
+}
+
+function _pluginByName(name) {
+  return (((envData || {}).plugins) || []).find(p => p.name === name) || null;
+}
+
+function _pluginEnabledInDraft(name) {
+  const p = _pluginByName(name);
+  if (!p) return false;
+  if (p.core) return true; // 核心插件恒装配：依赖指向它视为恒满足
+  return pluginDraftSet ? pluginDraftSet.has(name) : pluginBaseSet.has(name);
+}
+
+function _pluginChanges() {
+  // 草稿 → PLUGINS 期望列表（仅可选插件名，按名排序稳定序列化）
+  if (!pluginDraftSet) return {};
+  const draft = [...pluginDraftSet].sort();
+  const base = [...pluginBaseSet].sort();
+  if (JSON.stringify(draft) === JSON.stringify(base)) return {};
+  return { PLUGINS: JSON.stringify(draft) };
+}
+
+// 开关校验（阻止并逐步提示，绝不隐式改动其它插件）：
+// 启用 → 互斥对已启用 / 依赖未启用则拒；禁用 → 被启用中的可选插件或核心
+// 插件依赖则拒。通过后仅更新本插件草稿态。
+function _onPluginToggle(name, wantOn, input) {
+  const p = _pluginByName(name);
+  if (!p || p.core) return;
+  if (!pluginDraftSet) pluginDraftSet = new Set(pluginBaseSet || []);
+  if (pluginDraftSet.has(name) === wantOn) return;
+  if (wantOn) {
+    const conflicts = (p.conflicts || []).filter(n => _pluginEnabledInDraft(n));
+    if (conflicts.length) {
+      input.checked = false;
+      showToast("无法启用 " + name + "：与 " + conflicts.join("、") + " 互斥，请先禁用",
+        { type: "error", duration: 6000 });
       return;
     }
-    $pluginsList.innerHTML = plugins.map(p => {
-      const statusCls = p.status === "loaded"
-        ? "plugin-status-ok"
-        : (p.status === "disabled" ? "plugin-status-warn" : "plugin-status-err");
-      const reason = p.reason ? '<span class="text-muted"> — ' + esc(p.reason) + "</span>" : "";
-      return '<div class="plugin-row">'
-        + '<span class="plugin-name">' + esc(p.name) + "</span>"
-        + '<span class="plugin-version">v' + esc(p.version) + "</span>"
-        + '<span class="plugin-status ' + statusCls + '">' + esc(p.status) + "</span>"
-        + reason
-        + "</div>";
-    }).join("");
-  } catch {
-    $pluginsList.innerHTML = '<p class="text-muted">加载失败</p>';
+    const missing = (p.dependencies || []).filter(d => !_pluginEnabledInDraft(d));
+    if (missing.length) {
+      input.checked = false;
+      showToast("无法启用 " + name + "：需先启用 " + missing.join("、"),
+        { type: "error", duration: 6000 });
+      return;
+    }
+    pluginDraftSet.add(name);
+  } else {
+    const optionalDependents = [];
+    const coreDependents = [];
+    for (const q of (envData.plugins || [])) {
+      if (q.name === name || !(q.dependencies || []).includes(name)) continue;
+      if (q.core) coreDependents.push(q.name);
+      else if (_pluginEnabledInDraft(q.name)) optionalDependents.push(q.name);
+    }
+    if (coreDependents.length || optionalDependents.length) {
+      input.checked = true;
+      const parts = [];
+      if (coreDependents.length) parts.push("核心插件 " + coreDependents.join("、") + " 依赖它");
+      if (optionalDependents.length) parts.push("请先禁用 " + optionalDependents.join("、"));
+      showToast("无法禁用 " + name + "：" + parts.join("；"), { type: "error", duration: 6000 });
+      return;
+    }
+    pluginDraftSet.delete(name);
   }
+  renderPluginToggles();
+  _updateEnvSaveButton();
+}
+
+function _pluginStatusBadge(p) {
+  const cls = p.status === "loaded" ? "plugin-status-ok"
+    : (p.status === "disabled" ? "plugin-status-warn" : "plugin-status-err");
+  const label = p.status === "loaded" ? "已加载"
+    : (p.status === "disabled" ? "未启用"
+      : (p.status === "failed" ? "不可用" : (p.status || "未装配")));
+  return '<span class="plugin-status ' + cls + '">' + esc(label) + "</span>";
+}
+
+function _pluginRowHtml(p) {
+  const on = pluginDraftSet ? pluginDraftSet.has(p.name) : pluginBaseSet.has(p.name);
+  const badges = [];
+  if (p.core) {
+    badges.push('<span class="env-badge">核心 · 始终启用</span>');
+  } else if (pluginDraftSet && pluginDraftSet.has(p.name) !== pluginBaseSet.has(p.name)) {
+    badges.push('<span class="env-badge env-badge-staged">'
+      + (pluginDraftSet.has(p.name) ? "重启后启用" : "重启后禁用") + "</span>");
+  }
+  badges.push(_pluginStatusBadge(p));
+  if (p.reason) badges.push('<span class="plugin-reason text-muted">' + esc(p.reason) + "</span>");
+  const control = p.core ? ""
+    : '<label class="env-switch"><input type="checkbox" data-plugin-toggle="' + escAttr(p.name) + '"'
+      + (on ? " checked" : "") + '><span class="env-switch-text">启用</span></label>';
+  const deps = p.dependencies || [];
+  const depsHint = deps.length
+    ? '<p class="text-muted settings-hint">依赖：' + deps.map(esc).join("、") + "（核心插件恒满足）</p>"
+    : "";
+  return '<div class="plugin-row" data-plugin="' + escAttr(p.name) + '">'
+    + '<div class="plugin-row-head">'
+    + '<span class="plugin-name">' + esc(p.name) + "</span>"
+    + '<span class="plugin-version">v' + esc(p.version || "?") + "</span>"
+    + badges.join("")
+    + '<span class="plugin-row-spacer"></span>'
+    + control + "</div>"
+    + depsHint + "</div>";
+}
+
+function renderPluginToggles() {
+  if (!$pluginsList) return;
+  if (!envData) {
+    $pluginsList.innerHTML = '<p class="text-muted">加载失败，请刷新页面重试</p>';
+    return;
+  }
+  const plugins = envData.plugins || [];
+  if (!plugins.length) {
+    $pluginsList.innerHTML = '<p class="text-muted">未发现任何插件</p>';
+    return;
+  }
+  // 核心在前、可选在后（各保持服务端返回序）；空分组不渲染标题
+  const section = (title, rows) => rows.length
+    ? '<div class="plugin-section"><div class="plugin-section-title">' + title + "</div>"
+      + rows.map(_pluginRowHtml).join("") + "</div>"
+    : "";
+  $pluginsList.innerHTML = section("核心插件（始终启用）", plugins.filter(p => p.core))
+    + section("可选插件", plugins.filter(p => !p.core));
 }
 
 async function loadPluginFrontends() {

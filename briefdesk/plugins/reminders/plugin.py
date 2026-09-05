@@ -18,6 +18,8 @@ class RemindersPlugin(WebPlugin):
     name = "reminders"
     version = "1.0.0"
     dependencies: tuple[str, ...] = ()
+    conflicts: tuple[str, ...] = ()
+    core = True  # 核心插件：始终装配，不受 PLUGINS 过滤
 
     def router(self) -> APIRouter:
         from briefdesk.plugins.reminders import router as reminders_router

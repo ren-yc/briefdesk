@@ -17,6 +17,8 @@ class CalendarPlugin(WebPlugin):
     name = "calendar"
     version = "1.0.0"
     dependencies: tuple[str, ...] = ()
+    conflicts: tuple[str, ...] = ()
+    core = True  # 核心插件：始终装配，不受 PLUGINS 过滤
 
     def router(self) -> APIRouter:
         from briefdesk.plugins.calendar import router as calendar_router

@@ -23,16 +23,16 @@ class Settings(KeyringSettingsBase):
         "ai_api_key": "AI_API_KEY",
         "embed_api_key": "EMBED_API_KEY",
     }
-    plugins: list[str] = Field(default=["*"], alias="PLUGINS")
-    """启用的插件名列表（JSON 数组；"*" = 全部发现的插件）。
-    消息源启用的唯一开关：weflow-legacy/qqflow 等源插件由本开关控制。"""
-
-    plugins_disabled: list[str] = Field(default=[], alias="PLUGINS_DISABLED")
-    """明确禁用的插件名列表（JSON 数组），优先于 PLUGINS。"""
+    plugins: list[str] = Field(default=[], alias="PLUGINS")
+    """可选插件（消息源 / ocr / benchmark 等）的显式启用名列表（JSON 数组，
+    无通配语义）。核心插件（ai_provider/classify/dedup/merge/rag/calendar/
+    reminders）不受本开关控制、始终装配；可选插件不列出即禁用，
+    亦可在设置页「插件」面板逐个开关。"""
 
     plugins_required: list[str] = Field(default=[], alias="PLUGINS_REQUIRED")
-    """必选插件名列表（JSON 数组）：其 setup/activate 失败视为致命
-    （抛 PluginError 中止启动），其余插件失败仅禁用并继续。"""
+    """必选插件名列表（JSON 数组，实际只对可选插件有意义——核心插件恒
+    装配）：其 setup/activate 失败视为致命（抛 PluginError 中止启动），
+    其余插件失败仅禁用并继续。"""
 
     plugin_path: str = Field(default="", alias="PLUGIN_PATH")
     """开发期插件目录：目录下每个 *.py 文件暴露 `plugin` 实例即被

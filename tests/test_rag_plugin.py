@@ -28,7 +28,7 @@ def _ctx(provider=None):
     registered_stages, routers, assets = [], [], []
     ctx = PluginContext(
         config=Settings(
-            plugins=["*"], plugins_disabled=[], plugins_required=[], plugin_path=""
+            plugins=[], plugins_required=[], plugin_path=""
         ),
         publish_event=_noop_async,
         subscribe_event=lambda event, handler: None,

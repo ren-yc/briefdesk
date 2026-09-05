@@ -45,6 +45,8 @@ class RagPlugin(StagePlugin, WebPlugin):
     name = "rag"
     version = "1.0.0"
     dependencies: tuple[str, ...] = ("ai_provider",)
+    conflicts: tuple[str, ...] = ()
+    core = True  # 核心插件：始终装配，不受 PLUGINS 过滤
     slot = "post_insert"
     priority = 10
 

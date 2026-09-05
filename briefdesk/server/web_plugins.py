@@ -21,6 +21,8 @@ from briefdesk.server.media import _is_safe_media_path
 
 _plugins_info_callback: Callable[[], list[dict]] | None = None
 _settings_schema_callback: Callable[[], list[dict]] | None = None
+_plugin_meta_callback: Callable[[], list[dict]] | None = None
+_plugin_validation_callback: Callable[[list[str]], list[dict]] | None = None
 
 
 def set_plugins_info_callback(cb: Callable[[], list[dict]] | None) -> None:
@@ -35,6 +37,20 @@ def set_settings_schema_callback(cb: Callable[[], list[dict]] | None) -> None:
     _settings_schema_callback = cb
 
 
+def set_plugin_meta_callback(cb: Callable[[], list[dict]] | None) -> None:
+    """注入插件声明元数据回调（main 注册 manager.plugin_meta）。"""
+    global _plugin_meta_callback
+    _plugin_meta_callback = cb
+
+
+def set_plugin_validation_callback(
+    cb: Callable[[list[str]], list[dict]] | None,
+) -> None:
+    """注入可选插件期望启用集合校验回调（main 注册 manager.validate_selection）。"""
+    global _plugin_validation_callback
+    _plugin_validation_callback = cb
+
+
 def get_plugins_info() -> list[dict]:
     """读取插件装配摘要（未注入回调时返回空列表）。"""
     cb = _plugins_info_callback
@@ -45,6 +61,18 @@ def get_settings_schema() -> list[dict]:
     """读取启用插件设置 schema（未注入时返回空列表）。"""
     cb = _settings_schema_callback
     return cb() if cb is not None else []
+
+
+def get_plugin_meta() -> list[dict]:
+    """读取插件声明元数据（未注入时返回空列表）。"""
+    cb = _plugin_meta_callback
+    return cb() if cb is not None else []
+
+
+def validate_plugin_selection(names: list[str]) -> list[dict] | None:
+    """校验可选插件期望启用集合（未注入回调时返回 None = 无管理器可校验）。"""
+    cb = _plugin_validation_callback
+    return cb(names) if cb is not None else None
 
 
 def has_settings_schema_callback() -> bool:

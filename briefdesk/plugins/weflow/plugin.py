@@ -23,6 +23,10 @@ class WeFlowPlugin(SourcePlugin):
     name = "weflow"
     version = "1.0.0"
     dependencies: tuple[str, ...] = ()
+    # 与 weflow-legacy 互斥：同一上游（WeFlow/微信）的新旧两代采集器，
+    # 同时启用会重复采集同一批消息
+    conflicts: tuple[str, ...] = ("weflow-legacy",)
+    core = False  # 可选插件：默认禁用，经 PLUGINS / 设置页开关启用
 
     def __init__(self) -> None:
         self._runtime: SourceRuntime | None = None

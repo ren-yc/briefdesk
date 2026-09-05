@@ -1,14 +1,18 @@
-// 启动配置（设置 → 启动配置）面板逻辑回归（Node vm 加载真实 ui/app.js）。
+// 启动配置（设置 → 启动配置/插件）面板逻辑回归（Node vm 加载真实 ui/app.js）。
 //
-// 守四件事：
+// 守六件事：
 // 1. _collectEnvChanges 的布尔分支必须跳过未变化项——此前缺失相等性检查，
 //    每次「暂存更改」都会把所有布尔项重写进暂存文件，「没有需要暂存的更改」
 //    永不触发，差异计数常驻虚高；
 // 2. 分组渲染：未启用插件组默认折叠并在组头标注「未启用」（行内徽章不再
 //    重复）；布尔项渲染为开关；已配置（钥匙串）的密钥提供「替换/取消」入口；
+//    hidden 标记项（PLUGINS）不渲染进启动配置面板；
 // 3. 「暂存更改」按钮的脏计数联动。
 // 4. 脏检查排除清单：非草稿控件（即时提交/视图过滤）不置位脏标记，否则
 //    密钥框打字后点弹窗取消会被误问「是否放弃修改」。
+// 5. 插件面板渲染：核心插件无开关（恒启用徽章）、可选插件开关 + 依赖提示。
+// 6. 插件开关草稿：依赖/互斥阻止并提示（不隐式改其它插件），通过后仅更新
+//    本插件草稿态；_pluginChanges 把草稿 diff 成单个 PLUGINS JSON 值。
 //
 // 数据一律虚构（见 AGENTS.md）。
 
@@ -198,6 +202,94 @@ sandbox.renderEnvConfig();
   assert.equal(sandbox._isNonDraftSettingsControl(draftControl), false, "草稿控件不命中排除清单，应继续置位脏标记");
   assert.equal(sandbox._isNonDraftSettingsControl(null), false, "空目标应安全返回 false");
   assert.equal(sandbox._isNonDraftSettingsControl({}), false, "无 closest 的目标应安全返回 false");
+}
+
+// ── 7. hidden 标记项（PLUGINS）不渲染进启动配置面板（由插件面板编辑）──
+setEnvData({
+  filePath: "C:/tmp/settings.env",
+  pluginOptions: [],
+  items: [
+    { key: "PLUGINS", type: "multi", label: "启用的可选插件", plugin: "", staged: null, current: [], hidden: true },
+    { key: "OTHER_KEY", type: "text", label: "普通项", plugin: "", staged: null, current: "x" },
+  ],
+  secrets: [],
+});
+sandbox.renderEnvConfig();
+{
+  const html = getElement("env-items").innerHTML;
+  assert.ok(!html.includes('data-env-key="PLUGINS"'), "hidden 项（PLUGINS）不应渲染进启动配置面板");
+  assert.ok(html.includes('data-env-key="OTHER_KEY"'), "未标记 hidden 的项照常渲染");
+}
+
+// ── 8/9 共用夹具：核心行无开关、可选行开关 + 依赖提示；开关草稿校验 ──
+setEnvData({
+  filePath: "C:/tmp/settings.env",
+  pluginOptions: [],
+  items: [],
+  secrets: [],
+  plugins: [
+    { name: "ai_provider", version: "1.0.0", dependencies: [], conflicts: [], core: true, enabled: true, status: "loaded", reason: "" },
+    { name: "coresink", version: "1.0.0", dependencies: ["weflow"], conflicts: [], core: true, enabled: true, status: "loaded", reason: "" },
+    { name: "weflow", version: "1.0.0", dependencies: [], conflicts: ["weflow-legacy"], core: false, enabled: true, status: "loaded", reason: "" },
+    { name: "weflow-legacy", version: "1.0.0", dependencies: [], conflicts: ["weflow"], core: false, enabled: false, status: "disabled", reason: "未启用：在 PLUGINS 中列出或经「插件」面板开关即可启用" },
+    { name: "qqflow", version: "1.0.1", dependencies: [], conflicts: [], core: false, enabled: false, status: "disabled", reason: "" },
+    { name: "stage", version: "1.0.0", dependencies: ["src"], conflicts: [], core: false, enabled: false, status: "disabled", reason: "" },
+    { name: "src", version: "1.0.0", dependencies: [], conflicts: [], core: false, enabled: false, status: "disabled", reason: "" },
+    { name: "dependent", version: "1.0.0", dependencies: ["weflow"], conflicts: [], core: false, enabled: true, status: "loaded", reason: "" },
+  ],
+});
+sandbox._pluginSets();
+sandbox.renderPluginToggles();
+{
+  const html = getElement("plugins-list").innerHTML;
+  assert.ok(html.includes("核心插件（始终启用）"), "核心分组标题应渲染");
+  assert.ok(html.includes("核心 · 始终启用"), "核心插件应带恒启用徽章");
+  assert.ok(!html.includes('data-plugin-toggle="ai_provider"'), "核心插件不应渲染开关");
+  assert.ok(html.includes('data-plugin-toggle="weflow" checked'), "已启用可选插件开关应为勾选态");
+  assert.ok(html.includes('data-plugin-toggle="qqflow"'), "禁用可选插件也渲染开关");
+  assert.ok(html.includes("依赖："), "依赖提示应渲染");
+  assert.ok(!html.includes("重启后启用"), "未改草稿时不应有草稿徽章");
+}
+
+// ── 9. 插件开关草稿：阻止并提示 + 通过后仅改本插件 + PLUGINS 差异 ──
+{
+  const toasts = [];
+  sandbox.showToast = (msg) => toasts.push(msg);
+  getElement("env-items").querySelectorAll = () => []; // 成功路径联动 _updateEnvSaveButton 用
+
+  // 互斥阻止：weflow 已启用，启用 weflow-legacy 被拒
+  const blockedInput = { checked: false };
+  sandbox._onPluginToggle("weflow-legacy", true, blockedInput);
+  assert.equal(blockedInput.checked, false, "被拒后开关应回弹");
+  assert.equal(toasts.length, 1, "被拒应提示一次");
+  assert.ok(toasts[0].includes("互斥"), "互斥提示应说明原因");
+  assert.deepEqual(JSON.parse(JSON.stringify(sandbox._pluginChanges())), {}, "被拒不改草稿（差异仍为空）");
+
+  // 缺依赖阻止：stage 依赖 src（未启用）
+  sandbox._onPluginToggle("stage", true, { checked: true });
+  assert.ok(toasts.at(-1).includes("需先启用 src"), "缺依赖应提示先启用什么");
+  assert.deepEqual(JSON.parse(JSON.stringify(sandbox._pluginChanges())), {}, "缺依赖不改草稿");
+
+  // 禁用被下游阻止：weflow 被启用中的可选插件 dependent 依赖，
+  // 且被核心插件 coresink 依赖——两类下游都点名
+  sandbox._onPluginToggle("weflow", false, { checked: true });
+  assert.ok(toasts.at(-1).includes("核心插件 coresink 依赖它"), "核心下游应单独点名");
+  assert.ok(toasts.at(-1).includes("请先禁用 dependent"), "可选下游应提示先禁用");
+  assert.deepEqual(JSON.parse(JSON.stringify(sandbox._pluginChanges())), {}, "禁用被阻不改草稿");
+
+  // 通过：启用无冲突无依赖的 qqflow → 草稿 diff 成单个 PLUGINS JSON
+  sandbox._onPluginToggle("qqflow", true, { checked: false });
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(sandbox._pluginChanges())),
+    { PLUGINS: JSON.stringify(["dependent", "qqflow", "weflow"]) },
+    "草稿应 diff 成排序稳定的 PLUGINS 期望列表",
+  );
+  const html = getElement("plugins-list").innerHTML;
+  assert.ok(html.includes("重启后启用"), "草稿变更应显示「重启后启用」徽章");
+
+  // 回退草稿：再次关闭 qqflow → 与基准一致，差异清空
+  sandbox._onPluginToggle("qqflow", false, { checked: true });
+  assert.deepEqual(JSON.parse(JSON.stringify(sandbox._pluginChanges())), {}, "草稿回退后差异应清空");
 }
 
 console.log("ui_env_panel_test: all assertions passed");

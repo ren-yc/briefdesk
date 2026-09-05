@@ -49,6 +49,8 @@ class ZeroSourceDegradedStartupTest(unittest.IsolatedAsyncioTestCase):
         from briefdesk import stages
         from briefdesk.server.callbacks import set_refresh_sessions_callback
         from briefdesk.server.web_plugins import (
+            set_plugin_meta_callback,
+            set_plugin_validation_callback,
             set_plugins_info_callback,
             set_settings_schema_callback,
         )
@@ -59,6 +61,8 @@ class ZeroSourceDegradedStartupTest(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(stages.reset)
         self.addCleanup(set_plugins_info_callback, None)
         self.addCleanup(set_settings_schema_callback, None)
+        self.addCleanup(set_plugin_meta_callback, None)
+        self.addCleanup(set_plugin_validation_callback, None)
         self.addCleanup(set_sync_callback, None)
         self.addCleanup(set_refresh_sessions_callback, None)
 

@@ -34,6 +34,8 @@ class OcrPlugin(StagePlugin):
     name = "ocr"
     version = "1.0.0"
     dependencies: tuple[str, ...] = ()
+    conflicts: tuple[str, ...] = ()
+    core = False  # 可选插件：默认禁用，经 PLUGINS / 设置页开关启用
     slot = "enrich"
     priority = 0
 

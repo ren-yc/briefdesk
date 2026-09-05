@@ -1,8 +1,9 @@
 """入口 — 运行时生命周期管理（启动/优雅关闭）。
 
 轮询周期业务编排见 briefdesk/poll_cycle.py；插件装配见
-briefdesk/plugin/manager.py —— 消息源为内置插件（weflow-legacy/qqflow），
-启用/禁用走 PLUGINS / PLUGINS_DISABLED 配置。
+briefdesk/plugin/manager.py —— 消息源为内置插件（weflow/weflow-legacy/
+qqflow，可选插件），启用/禁用走 PLUGINS 配置或设置页「插件」面板
+（核心插件恒装配）。
 """
 
 import asyncio
@@ -41,6 +42,8 @@ from briefdesk.server import (
     app,
     include_plugin_router,
     register_plugin_assets,
+    set_plugin_meta_callback,
+    set_plugin_validation_callback,
     set_plugins_info_callback,
     set_refresh_sessions_callback,
     set_settings_schema_callback,
@@ -224,13 +227,16 @@ async def _run() -> None:
             register_plugin_assets(name, directory)
         set_plugins_info_callback(manager.infos)
         set_settings_schema_callback(manager.settings_schema)
+        set_plugin_meta_callback(manager.plugin_meta)
+        set_plugin_validation_callback(manager.validate_selection)
         if not runtimes:
             # 零源降级启动（决策 ①=1B）：不再中止——UI/设置/向导可用，
             # 消息采集不可用，状态栏明示；这也是三源统一「缺配置自禁用」
             # 语义的前提（否则唯一启用的源自禁用会触发零源中止）
             logger.warning(
                 "没有可用的消息源插件，进入降级启动：UI/设置可用、消息采集"
-                "不可用（检查 PLUGINS / PLUGINS_DISABLED 配置与上方插件日志，"
+                "不可用（检查 PLUGINS 配置与上方插件日志——消息源为可选插件，"
+                "须在 PLUGINS 显式列出或经设置页「插件」面板启用，"
                 "配置后重启生效）"
             )
         for s in runtimes:

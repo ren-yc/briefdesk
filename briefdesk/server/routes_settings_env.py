@@ -1,12 +1,14 @@
-"""启动配置路由（server 子包）—「设置 → 启动配置」面板后端。
+"""启动配置路由（server 子包）—「设置 → 启动配置 / 插件」面板后端。
 
-- `GET /api/settings/env`     元数据 + 生效值/暂存值/来源 + 密钥状态 + 文件路径
-- `PUT /api/settings/env`     批量暂存（白名单 + 类型/约束校验 + 原子写）
+- `GET /api/settings/env`     元数据 + 生效值/暂存值/来源 + 插件开关数据 + 密钥状态
+- `PUT /api/settings/env`     批量暂存（白名单 + 类型/约束校验 + 插件依赖/互斥
+  复检 409 + 原子写）
 - `POST /api/settings/secrets`  写入密钥到系统密钥环（keyring）
 - `DELETE /api/settings/secrets/{name}`  清除密钥（幂等）
 
 设计约束：密钥值**永不下发**（GET 只含 configured 布尔）；暂存文件只存
-非密钥键（存储层见 briefdesk/settings_env.py）。
+非密钥键（存储层见 briefdesk/settings_env.py）。PLUGINS 由「插件」面板
+逐插件开关编辑（schema 中带 hidden 标记，不在启动配置面板渲染）。
 """
 
 import asyncio
@@ -20,9 +22,11 @@ from briefdesk.config import Settings, config
 from briefdesk.secrets_store import SECRET_NAMES, delete_secret, get_secret, set_secret
 from briefdesk.server.app import app
 from briefdesk.server.web_plugins import (
+    get_plugin_meta,
     get_plugins_info,
     get_settings_schema,
     has_settings_schema_callback,
+    validate_plugin_selection,
 )
 from briefdesk.settings_env import (
     get_settings_file,
@@ -43,9 +47,16 @@ _write_lock = asyncio.Lock()
 
 # 核心设置的展示覆盖层；字段本身从 Settings.model_fields 自动发现。
 _CORE_UI: dict[str, dict[str, Any]] = {
-    "PLUGINS": {"label": "启用的插件", "hint": "\"*\" = 全部发现插件；亦可用显式列表"},
-    "PLUGINS_DISABLED": {"label": "禁用的插件", "hint": "优先于 PLUGINS"},
-    "PLUGINS_REQUIRED": {"label": "必选插件", "hint": "这些插件装配失败时将阻止应用启动"},
+    "PLUGINS": {
+        "label": "启用的可选插件",
+        "hint": "显式列表，无通配；核心插件恒装配，无需列出",
+        # 由「插件」面板逐插件开关编辑，不在启动配置面板渲染
+        "hidden": True,
+    },
+    "PLUGINS_REQUIRED": {
+        "label": "必选插件",
+        "hint": "这些可选插件装配失败时将阻止应用启动（核心插件恒装配，无需列入）",
+    },
     "PLUGIN_PATH": {"label": "开发期插件目录", "hint": "留空表示不扫描外部插件"},
     "AI_API_KEY": {"label": "AI API Key"},
     "AI_API_BASE": {"label": "AI API 地址"},
@@ -160,6 +171,65 @@ def _schema_of(key: str) -> dict:
     raise KeyError(key)
 
 
+def _desired_plugins(staged: dict[str, str]) -> list[str]:
+    """下次启动的可选插件期望启用列表：暂存值优先，否则回落启动快照。
+
+    暂存值写入时已经 normalize_setting 校验，解析失败属防御分支（按快照
+    处理）。启动后修改过的 .env/环境变量不在此反映（快照语义，与设置
+    面板其余 current 字段一致）。
+    """
+    raw = staged.get("PLUGINS")
+    if raw is None:
+        return list(config.plugins)
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return list(config.plugins)
+    if not isinstance(parsed, list) or not all(isinstance(n, str) for n in parsed):
+        return list(config.plugins)
+    return parsed
+
+
+def _plugin_toggle_data(staged: dict[str, str]) -> list[dict[str, Any]]:
+    """「插件」面板数据：声明元数据 + 期望启用态 + 当前进程装配状态。
+
+    加载失败记录（无插件实例、元数据缺失）兜底追加，保证面板仍可见其
+    失败原因。
+    """
+    runtime = {p.get("name"): p for p in get_plugins_info() if p.get("name")}
+    desired = set(_desired_plugins(staged))
+    plugins: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for meta in get_plugin_meta():
+        name = meta["name"]
+        seen.add(name)
+        rt = runtime.get(name, {})
+        plugins.append(
+            {
+                **meta,
+                "enabled": True if meta["core"] else name in desired,
+                "status": rt.get("status", "discovered"),
+                "reason": rt.get("reason", ""),
+            }
+        )
+    for name, rt in runtime.items():
+        if name in seen:
+            continue
+        plugins.append(
+            {
+                "name": name,
+                "version": "",
+                "dependencies": [],
+                "conflicts": [],
+                "core": False,
+                "enabled": name in desired,
+                "status": rt.get("status", ""),
+                "reason": rt.get("reason", ""),
+            }
+        )
+    return plugins
+
+
 def _normalize(key: str, raw: str) -> str:
     """动态 schema + 类型/约束校验，返回规范化的暂存字符串。"""
     try:
@@ -194,7 +264,10 @@ async def api_settings_env():
                 "source": source_of(key),
             }
         )
-    plugin_names = sorted({p.get("name", "") for p in get_plugins_info()} - {""})
+    # PLUGINS_REQUIRED 芯片选项：仅可选插件（核心插件恒装配，列入无意义）
+    plugin_names = sorted(
+        {p.get("name", "") for p in get_plugins_info() if not p.get("core")} - {""}
+    )
     secrets = []
     for meta in _secret_schema():
         name = meta["key"]
@@ -214,6 +287,8 @@ async def api_settings_env():
         "filePath": str(get_settings_file()),
         "items": items,
         "pluginOptions": plugin_names,
+        "plugins": _plugin_toggle_data(staged),
+        "pluginsSource": source_of("PLUGINS"),
         "secrets": secrets,
     }
 
@@ -246,6 +321,24 @@ async def api_settings_env_put(payload: EnvPutPayload):
         if not isinstance(raw, str):
             raise HTTPException(422, f"{key}: 值须为字符串或 null")
         updates[key] = _normalize(key, raw)
+    # PLUGINS 变更先做依赖/互斥复检（暂存前失败快返回，409 携带 issue 明细）
+    if "PLUGINS" in updates:
+        raw = updates["PLUGINS"]
+        if raw is None:
+            desired: list[str] = list(config.plugins)
+        else:
+            try:
+                parsed = json.loads(raw)
+            except json.JSONDecodeError as exc:
+                raise HTTPException(422, f"PLUGINS: 校验失败（{exc}）") from exc
+            if not isinstance(parsed, list) or not all(
+                isinstance(n, str) for n in parsed
+            ):
+                raise HTTPException(422, "PLUGINS: 值须为 JSON 字符串数组")
+            desired = parsed
+        issues = validate_plugin_selection(desired)
+        if issues:
+            raise HTTPException(status_code=409, detail={"issues": issues})
     async with _write_lock:
         write_staged(updates)
     return {"ok": True, "filePath": str(get_settings_file())}

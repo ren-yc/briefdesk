@@ -54,6 +54,8 @@ class MergePlugin(StagePlugin):
         "dedup",
         "ai_provider",  # 判官/重拟标题依赖 AI 供应商
     )
+    conflicts: tuple[str, ...] = ()
+    core = True  # 核心插件：始终装配，不受 PLUGINS 过滤
     slot = "post_insert"
     priority = 0
 

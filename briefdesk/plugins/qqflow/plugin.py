@@ -22,6 +22,8 @@ class QqFlowPlugin(SourcePlugin):
     name = "qqflow"
     version = "1.0.1"
     dependencies: tuple[str, ...] = ()
+    conflicts: tuple[str, ...] = ()
+    core = False  # 可选插件：默认禁用，经 PLUGINS / 设置页开关启用
 
     def __init__(self) -> None:
         self._runtime: SourceRuntime | None = None

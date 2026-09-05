@@ -12,7 +12,7 @@ attached images (含图消息按模型能力路由：纯文本模型仅送 OCR �
 节), and displays structured, deduplicated information briefs (factory default categories: 13 — 活动通知/社
 团招新/学术/交易/实习 默认启用，另有 失物招领/求助互助/组队拼团/兼职家教/免费福利/房屋租售/志愿公益/奖助申报 出厂停用；空库播种全量，存量库由
 `_backfill_default_categories` 按 `PRAGMA user_version` 门控一次性补齐缺失项（不改写已有行）；均可在设置中自定义). Multiple
-sources can run concurrently (each source is a plugin, enabled via `PLUGINS` config).
+sources can run concurrently (each source is an optional plugin, enabled via the `PLUGINS` list or the per-plugin toggles in 设置 → 插件).
 
 ## 总览与数据流
 
@@ -83,7 +83,7 @@ weflow-server :5033        WeFlow(legacy) :5031        qqflow-server :5032
 | `briefdesk/server/` | FastAPI HTTP 服务子包（按职责分组的模块）：`app.py`（FastAPI 实例）、`middleware.py`（Host 白名单 + 同源校验 + CSP 头；CSRF 收口： 详解见本表后同名小节。 |
 | `briefdesk/plugins/calendar/plugin.py` + `router.py` + `db.py` | `CalendarPlugin`（显式实现 WebPlugin）：`/api/calendar` 日历视图路由（区间带开始/截止卡片，排除已忽略）；**数据访问随插件分发**——`db.py` 的 详解见本表后同名小节。 |
 | `briefdesk/plugins/reminders/plugin.py` + `router.py` | `RemindersPlugin`（显式实现 WebPlugin）：`POST /api/items/:id/reminder`（设置/清除卡片提醒，aware→本地墙钟换算、参数校验）与 详解见本表后同名小节。 |
-| `briefdesk/plugins/benchmark/` | 实验性基准插件（`default_disabled`，显式实现 WebPlugin + StagePlugin 双能力）：`/api/benchmark/*` 路由 + 自带前端（设置弹窗内运行，前端轮 详解见本表后同名小节。 |
+| `briefdesk/plugins/benchmark/` | 实验性基准插件（可选插件，默认禁用，显式实现 WebPlugin + StagePlugin 双能力）：`/api/benchmark/*` 路由 + 自带前端（设置弹窗内运行，前端轮 详解见本表后同名小节。 |
 | `briefdesk/sources_base.py` | 消息源抽象（核心契约模块，无 sources 包）：`SourceClient` Protocol（`name`/`connection_status`/`download_media`/`close` 详解见本表后同名小节。 |
 | `briefdesk/plugins/weflow/plugin.py` | `WeFlowPlugin`（显式实现 SourcePlugin）：setup 校验 `WEFLOW_API_TOKEN`/`WEFLOW_WXID`/`WEFLOW_DB_KEYS(+_2)` 必填配 详解见本表后同名小节。 |
 | `briefdesk/plugins/weflow/` | weflow 消息源（实现 `SourceRuntime`，接入 weflow-server 默认 :5033，微信 4.x 活库直读）。 详解见本表后同名小节。 |
@@ -113,14 +113,15 @@ weflow-server :5033        WeFlow(legacy) :5031        qqflow-server :5032
 
 Real entry point — runtime lifecycle only (业务编排见 `poll_cycle.py`). **新增消息源 = 在 `briefdesk/plugins/`
 实
-现 `SourceRuntime` 并以插件发布（entry point 组 `briefdesk.plugins`，启用走 `PLUGINS`/`PLUGINS_DISABLED`）**（其余接线走
+现 `SourceRuntime` 并以插件发布（entry point 组 `briefdesk.plugins`；消息源为可选插件，启用走 `PLUGINS` 显式列表或设置页「插件」面板）**（其余接线走
 `SourceRuntime` 协议）。Startup order: apply pending restore (`apply_pending_restore`) → init DB → purge
 expired ignored（`IGNORED_EXPIRY_HOURS` > 0 时）→ `PluginManager.setup_all()`（发现并装配插件：源插件经
 `ctx.register_source` 注册、阶段插件经 `ctx.register_stage` 注册、dedup 插件在 setup 内完成去重缓存预热、`ctx.dedup` 服务端口就绪、
 Web 插件经 `ctx.register_router`/`ctx.register_plugin_assets` 注册；按名注册到 server，零源降级启动（warning + UI 明示，不再
 中
 止——决策 ①=1B））→ Web 插件挂载（`include_plugin_router` 展开路由插到 SPA mount 前 + 静态资源注册 +
-`set_plugins_info_callback(manager.infos)` + `set_settings_schema_callback(manager.settings_schema)`）
+`set_plugins_info_callback(manager.infos)` + `set_settings_schema_callback(manager.settings_schema)` +
+`set_plugin_meta_callback(manager.plugin_meta)` + `set_plugin_validation_callback(manager.validate_selection)`）
 → start uvicorn → wait for `server.started` → `activate_all()` + 逐个 `source.start()`（启动实时监听）→
 background initial sync (`trigger_sync`). Registers SIGINT/SIGTERM graceful shutdown via
 `_install_signal_handlers` (Windows falls back to `signal.signal` + `call_soon_threadsafe`)，**安装在
@@ -291,8 +292,9 @@ pipeline 入口「vision 开启但 enrich 槽为空」（`vision_without_ocr`，
 #### briefdesk/config.py
 
 `pydantic-settings` from `[.env, UI 暂存文件]`（密钥型字段以 `SecretStr` 持有，repr/序列化自动掩码；密钥解析链见「配置解析链」小节）。含
-`plugins`（`PLUGINS`，默认 `["*"]`，JSON 数组，**消息源启用的唯一开关**，weflow-legacy/qqflow 为内置插件）、
-`plugins_disabled`/`plugins_required`/`plugin_path`、`db_path`（默认 `briefdesk.sqlite`）、
+`plugins`（`PLUGINS`，默认 `[]`，JSON 数组，无通配语义，只过滤**可选插件**——不列出即禁用；核心插件恒装配，亦可在设置页
+「插件」面板逐个开关）、
+`plugins_required`/`plugin_path`、`db_path`（默认 `briefdesk.sqlite`）、
 `server_port`（3000）、`backfill_hours`（24）、`log_level`（`LOG_LEVEL`，默认 `"INFO"`，logger.py 读取）、
 `realtime_batch_max_count`/`realtime_batch_timeout_ms`（实时批缓冲，跨源公共）、`backfill_batch_max_count`（回填切批）、
 AI 模型等。插件专属配置（`WEFLOW_*`/`WEFLOW_LEGACY_*`/`QQFLOW_*`/`RAG_*`）在各插件包的 `config.py`，不占 app 级配置——前缀归插件所有
@@ -406,8 +408,8 @@ Content-Disposition attachment——扩展名不可信，封死伪装 SVG/HTML �
 `POST /api/categories`、`POST /api/categories/:id/update`、`POST /api/categories/:id/toggle`、
 `POST /api/categories/:id/delete`（body `purgeItems` 控制级联删除，级联后发布 `EVENT_ITEMS_DELETED` 清 dedup 内存缓存）
 ，
-启动配置：`GET /api/settings/env`（核心 schema 从 `Settings.model_fields` 自动生成，并合并当前 manager 选中插件的可选
-`settings_schema()`；返回生效/暂存/来源徽标、密钥状态和暂存文件路径）、`PUT /api/settings/env`（批量暂存，动态 schema + 类型/约束校验 + 原子写
+启动配置：`GET /api/settings/env`（核心 schema 从 `Settings.model_fields` 自动生成，并合并全部已发现插件的可选
+`settings_schema()`；返回生效/暂存/来源徽标、插件开关数据 `plugins`（声明元数据 + 期望启用态 + 当前进程装配状态）、密钥状态和暂存文件路径）、`PUT /api/settings/env`（批量暂存，动态 schema + 类型/约束校验 + PLUGINS 依赖/互斥复检（`validate_selection` 不合法返回 409 + issue 明细）+ 原子写
 + 单写锁，`null`=恢复默认；text 型值拒绝 CR/LF 与「 #」——值含换行会被回读拆成独立 KEY=VALUE 行，可借任一 text 字段注入白名单外配置甚至密钥，绕过「暂存文件只存
 非
 密钥键 + 密钥走 keyring」分层）、`POST /api/settings/secrets`、`DELETE /api/settings/secrets/:name`（keyring 写入/清
@@ -456,7 +458,7 @@ tests/test_web_plugins.py 的核心前端边界守卫测试覆盖）。`GET /api
 
 #### briefdesk/plugins/benchmark/
 
-实验性基准插件（`default_disabled`，显式实现 WebPlugin + StagePlugin 双能力）：`/api/benchmark/*` 路由 + 自带前端（设置弹窗内运行，前端
+实验性基准插件（可选插件，默认禁用，显式实现 WebPlugin + StagePlugin 双能力）：`/api/benchmark/*` 路由 + 自带前端（设置弹窗内运行，前端
 轮
 询门控——仅设置弹窗打开或基准运行中保活 3s 轮询）+ CLI 入口（`python -m briefdesk.plugins.benchmark.cli`）。运行环境
 `providers.bench_environment`（Web 与 CLI 共用同一套门闸）：进入即 `pipeline.set_processing_paused(True)` 暂停生产管道
@@ -720,8 +722,15 @@ WARNING）的日志噪音；`fmt_dur()` 统一耗时格式。
 
 - **发现**：打包插件经 pyproject entry point 组 `briefdesk.plugins` 声明；开发期插件放 `PLUGIN_PATH` 目录（每个 `*.py` 暴露
   `plugin` 实例即被加载，免打包）。
-- **过滤**：`PLUGINS` / `PLUGINS_DISABLED`（后者最高优先）；另有**默认禁用**层——声明 `default_disabled = True` 的插件（如实验性
-  benchmark）仅在被 `PLUGINS` 显式列名时启用，`"*"` 通配不包含，被排除时标 disabled + 原因供 `/api/plugins` 展示。
+- **核心/可选分层**：插件声明 `core`（协议必填属性）。核心插件（ai_provider/classify/dedup/merge/rag/calendar/reminders）
+  **恒装配**、不受 `PLUGINS` 控制、设置页无启停开关；可选插件（weflow/weflow-legacy/qqflow/ocr/benchmark）默认禁用，
+  经 `PLUGINS` 显式列名或设置页「插件」面板逐个开关启用（写暂存、重启生效，操作时校验依赖与互斥）。
+- **互斥**：插件声明 `conflicts`（协议必填属性，对称声明即可，manager 归一化为无序对）。互斥对同时入选（手工改 .env 才
+  可能）时按 `PLUGINS` 列表位置先列者保留，后者降级 disabled + 原因供 `/api/plugins` 展示；核心插件恒胜（不得声明
+  conflicts，`_accept` 拒绝）。设置 API 写入 PLUGINS 前经 `PluginManager.validate_selection` 复检（unknown/missing_dep/
+  conflict/cycle），不合法返回 409。
+- **过滤**：`PLUGINS` 显式列表（无通配语义），只过滤可选插件——不列出即禁用（标 disabled + 原因供 `/api/plugins`
+  展示），未知名打 WARNING。
 - **排序**：依赖拓扑排序（未知依赖/依赖环降级 disabled）。
 - **生命周期**：`setup_all`（HTTP 启动前、DB 就绪后）→ `activate_all`（服务器就绪后）→ `teardown_all`（逆序幂等）。消息源预热（去重缓存等）与监听启动
   等顺序约束由该阶段划分承载。
@@ -835,10 +844,15 @@ Key behaviors:
   （`sessionFilter` / `onboardFilter`），状态收敛进实例、模块级只留两侧真共享的 `enabledSources`/`sessionDefaultBackfill`。差异仅
   三个显式选项：`storageKey`（时间档位是否持久化——设置持久化、向导每次进入 `reset()` 回「全部」）、`emptyHint`（无匹配时是否显示提示行——仅向导有）、
   `pruneSources`（源芯片重渲染时是否清理失效选中项——仅设置侧）。行为守卫见 `tests/ui_session_filter_test.mjs`。**「启动配置」分组**：
-  `GET /api/settings/env` 渲染白名单表单（select/number/boolean/多选插件/文本），显示「已暂存 · 重启生效」与「环境变量优先」徽标与暂存文件路径；「暂存更改
+  `GET /api/settings/env` 渲染白名单表单（select/number/boolean/多选/文本；`PLUGINS` 项带 hidden 标记、由「插件」面板编辑），
+  显示「已暂存 · 重启生效」与「环境变量优先」徽标与暂存文件路径；「暂存更改
   」PUT /「恢复默认」PUT null；`DB_PATH`/`SERVER_PORT` 有警示确认；「密钥」区只显示 keyring 配置状态，未配置项输入后 POST 写入 keyring、可清除（
   明文不回传、提交后输入框清空）
-- **插件前端随插件包分发**：设置弹窗有「插件」分组（`/api/plugins` 渲染名称/版本/状态/原因）；核心前端只留通用加载器 `loadPluginFrontends`——读取
+- **插件面板逐插件启停**：设置弹窗「插件」分组改由 `GET /api/settings/env` 的 `plugins` 数组渲染（声明元数据 core/dependencies/
+  conflicts + 期望启用态 + `/api/plugins` 的当前进程装配状态），核心插件恒启用无开关（「核心 · 始终启用」徽章）、可选插件
+  `env-switch` 开关改本地草稿集——启用被拒（互斥/缺依赖）、禁用被拒（被启用中可选插件或核心插件依赖）时 toast 点名原因，通过后
+  仅更新本插件草稿；「保存」把草稿 diff 成单个 `PLUGINS` JSON 并入 PUT（服务端复检 409 时逐条 toast issues），重启生效。
+- **插件前端随插件包分发**：核心前端只留通用加载器 `loadPluginFrontends`——读取
   `/api/plugins` 取 loaded 名单 → 隐藏所有 `[data-plugin-entry="<name>"]` 声明入口 → **仅对声明了前端资源的插
   件**（`has_frontend`，`asset_dir()` 非 None）注入 `/plugin-assets/<name>/ui.css`（样式）与
   `/plugin-assets/<name>/ui.js`（脚本；无前端资源的插件不请求，避免 404 触发浏览器严格 MIME 检查告警）→ 调用
@@ -924,9 +938,8 @@ required field of `weflow`/`qqflow` → that plugin self-disables via `PluginDis
 
 | Env var | Default | Purpose |
 |---|---|---|
-| `PLUGINS` | `["*"]` | **JSON array** of enabled plugin names; `"*"` = all discovered. 消息源启用的唯一开关（weflow-legacy/qqflow 等源插件由本开关控制）。声明 `default_disabled = True` 的插件（如实验性 benchmark）默认不随 `"*"` 加载，需显式列名（`PLUGINS=["*", "benchmark"]`）才启用 |
-| `PLUGINS_DISABLED` | `[]` | **JSON array** of disabled plugin names (takes precedence over `PLUGINS`) |
-| `PLUGINS_REQUIRED` | `[]` | **JSON array** of plugins whose setup/activate failure is fatal (`PluginError` 中止启动) |
+| `PLUGINS` | `[]` | **JSON array** of enabled *optional* plugin names (explicit list, no wildcard). 核心插件（ai_provider/classify/dedup/merge/rag/calendar/reminders）恒装配、不受本项控制；可选插件（weflow/weflow-legacy/qqflow/ocr/benchmark）不列出即禁用，亦可在设置页「插件」面板逐个开关（暂存后重启生效，写入时校验依赖与互斥——weflow 与 weflow-legacy 互斥，先列者保留） |
+| `PLUGINS_REQUIRED` | `[]` | **JSON array** of plugins whose setup/activate failure is fatal (`PluginError` 中止启动)；仅对可选插件有意义（核心插件恒装配） |
 | `PLUGIN_PATH` | `` (disabled) | 开发期插件目录：目录下每个 *.py 暴露 `plugin` 实例即被加载（免打包） |
 | `WEFLOW_API_BASE` / `WEFLOW_WXID` / `WEFLOW_DB_PATH` / `WEFLOW_SSE_RECONNECT_INITIAL_MS` / `WEFLOW_SSE_RECONNECT_MAX_MS` / `WEFLOW_SSE_READ_TIMEOUT_MS` | `http://127.0.0.1:5033` / `` / `` / `1000` / `60000` / `60000` | weflow source-specific 非密钥项（read by `briefdesk/plugins/weflow/config.py`, only when the `weflow` plugin is enabled）。`WXID` 必填（参与注册与库路径推导）；`DB_PATH` 可留空（上游按 wxid 推导 `xwechat_files/<wxid>`）；SSE 读超时默认 60s = 上游 25s ping 的 ≈2.4 个周期，与 qqflow 同口径（曾误取 weflow-legacy 的 5 分钟，那个源上游无心跳） |
 | `WEFLOW_API_TOKEN` / `WEFLOW_IMG_AES_KEY` / `WEFLOW_IMG_XOR_KEY` / `WEFLOW_DB_KEYS` / `WEFLOW_DB_KEYS_2` | 全为空 | weflow 密钥项，**只走系统钥匙串（keyring），不落 .env 明文**。`DB_KEYS(+_2)` 存 `{库相对路径: 64位hex enc_key}` 的整份 JSON：微信 4.x 每库独立密钥（实测 26 个库约 2347 字节），而 Windows 凭据管理器单条上限约 1280 字节，故**拆两段存储**，`db_keys_map` property 合并解析（非法 JSON / 形状不符 → 空 dict + WARNING，由 plugin 决定自禁用）。`API_TOKEN` 与 `DB_KEYS` 缺失 → 插件自禁用 |
@@ -983,11 +996,11 @@ Settings 经 `ClassVar KEYRING_FIELDS` 声明密钥字段继承之，位于 env 
   `%LOCALAPPDATA%\briefdesk\settings.env`；macOS `~/Library/Application Support/briefdesk/`；Linux
   `~/.config/briefdesk/`），也可经 `BRIEFDESK_SETTINGS_FILE` 显式指定（测试/便携）；只存非密钥键值，不存在时静默跳过；原子写（临时文件 +
   `os.replace`）+ 单写锁
-- **UI「设置 → 启动配置」面板**：GET/PUT `/api/settings/env`（核心字段从 `Settings.model_fields` 自动生成，并合并当前
-  `PLUGINS`/`PLUGINS_DISABLED` 选中插件实现的 `settings_schema()`；支持 select/number/boolean/multi/text 与约束校验
-  ，`null`=恢复默认）、POST/DELETE `/api/settings/secrets`（keyring 写入/清除，明文永不下发；密钥状态同时区分有效配置 `configured` 与钥匙串
+- **UI「设置 → 启动配置」面板**：GET/PUT `/api/settings/env`（核心字段从 `Settings.model_fields` 自动生成，并合并全部已发现
+  插件实现的 `settings_schema()`；支持 select/number/boolean/multi/text 与约束校验
+  ，`null`=恢复默认；PUT 对 PLUGINS 变更先经 `validate_selection` 依赖/互斥复检，不合法 409）、POST/DELETE `/api/settings/secrets`（keyring 写入/清除，明文永不下发；密钥状态同时区分有效配置 `configured` 与钥匙串
   条目 `keyringConfigured`）；写入后**重启生效**（配置在启动时快照，无热应用）；来源徽标区分 override/env/dotenv/default（环境变量级优先时 UI 提示「
-  暂存不生效」）。插件自禁用时仍显示其配置入口，便于补齐缺失配置；未实现可选 schema 的旧插件不受影响
+  暂存不生效」）。可选插件禁用后仍显示其配置入口，便于启用前预配置；未实现可选 schema 的旧插件不受影响
 - 系统密钥环经 `keyring` 库（Windows=凭据管理器/DPAPI，随用户账号加密；macOS=钥匙串；Linux=Secret Service），由 CLI
   `briefdesk secrets set|get|rm|list` 或 UI 密钥区管理（白名单 `SECRET_NAMES`）；
 - 密钥环不可用（无桌面会话 / 无 Secret Service / 未安装 keyring）或 `BRIEFDESK_KEYRING=0` 时**静默回退**环境变量 → `.env` → 默认值（读路
