@@ -35,6 +35,23 @@ _polling = False
 _poll_lock = asyncio.Lock()
 
 
+async def upsert_sessions_from_infos(sessions: list[SessionInfo]) -> None:
+    """会话信息逐条落库（main 实时刷新与 poll_cycle 轮询两条路径共用）。
+
+    调用方须持 db.storage_lock：会话写与全应用写路径串行化——单连接隐式
+    事务下锁外 commit 会把管道未完成的多步写一并提交（部分写入提前可见）。
+    """
+    for s in sessions:
+        await upsert_session(
+            s.source,
+            s.session_id,
+            s.name,
+            s.is_group,
+            s.is_official,
+            last_active_at=s.last_active_at or None,
+        )
+
+
 async def run_poll_cycle(source: SourceRuntime) -> None:
     """执行一轮完整轮询：历史拉取 → 批量流水线处理 → 记录轮询时间。
 
@@ -79,15 +96,7 @@ async def run_poll_cycle(source: SourceRuntime) -> None:
             await bulk_upsert_contacts(
                 [(c.source, c.sender_id, c.display_name) for c in result.contacts]
             )
-            for s in result.sessions:
-                await upsert_session(
-                    s.source,
-                    s.session_id,
-                    s.name,
-                    s.is_group,
-                    s.is_official,
-                    last_active_at=s.last_active_at or None,
-                )
+            await upsert_sessions_from_infos(result.sessions)
         ok = await process_all_batches(
             result.messages,
             source.client,

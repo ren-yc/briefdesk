@@ -24,7 +24,6 @@ from briefdesk.db import (
     get_db,
     purge_expired_ignored,
     storage_lock,
-    upsert_session,
 )
 from briefdesk.events import event_bus
 from briefdesk.logger import (
@@ -36,7 +35,7 @@ from briefdesk.logger import (
 from briefdesk.pipeline import process_all_batches
 from briefdesk.plugin.base import PluginContext
 from briefdesk.plugin.manager import PluginManager
-from briefdesk.poll_cycle import run_poll_cycle
+from briefdesk.poll_cycle import run_poll_cycle, upsert_sessions_from_infos
 from briefdesk.realtime import signal_shutdown
 from briefdesk.server import (
     app,
@@ -78,15 +77,7 @@ async def _refresh_all(sources: list[SourceRuntime]) -> None:
             logger.error("[%s] 会话刷新失败: %s", source.name, sessions)
             continue
         async with storage_lock:
-            for s in sessions:
-                await upsert_session(
-                    s.source,
-                    s.session_id,
-                    s.name,
-                    s.is_group,
-                    s.is_official,
-                    last_active_at=s.last_active_at or None,
-                )
+            await upsert_sessions_from_infos(sessions)
 
 
 def _start_listener(s: SourceRuntime) -> None:
