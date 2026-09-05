@@ -57,4 +57,3 @@ class RagSettings(KeyringSettingsBase):
     # env_file/env_file_encoding/extra 由 KeyringSettingsBase 自动合并，无需展开；
     # ClassVar 注解声明类级配置而非字段（RUF012）
     model_config: ClassVar[SettingsConfigDict] = {"env_prefix": "RAG_"}  # top_k → RAG_TOP_K
-
