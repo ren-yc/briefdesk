@@ -10,6 +10,7 @@ import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any, Literal, NotRequired, TypedDict, cast, overload
 
 import aiosqlite
@@ -499,6 +500,49 @@ async def get_embed_db() -> aiosqlite.Connection:
                     validate_schema_flag=False,  # 主连接已验证
                 )
     return _embed_db
+
+
+@asynccontextmanager
+async def db_redirect(
+    path: str | Path,
+) -> AsyncIterator[tuple[aiosqlite.Connection, aiosqlite.Connection]]:
+    """把主/向量连接整体重定向到 path 指向的独立库，退出时原样还原。
+
+    官方隔离缝（取代 benchmark 曾用的 get_db/get_embed_db 模块属性补丁）：
+    进入时按 get_db/get_embed_db 同口径在 path 上新建两条连接（主连接
+    validate_schema + foreign_keys=ON，向量连接免验证），并把模块级单例
+    指向它们——窗口内所有经 get_db()/get_embed_db() 的调用都落到临时库；
+    退出先同步还原单例（先于任何 await，取消路径也必达），再关闭临时
+    连接。应用已有连接不关闭、不改动，退出后继续使用。
+
+    调用方须自行保证窗口语义（benchmark 门闸：先暂停管道并排空在途批次
+    再进入；窗口内 UI 写操作会落到临时库并在退出后丢弃）。
+    """
+    global _db, _embed_db
+    main_conn = await _init_connection(
+        str(path), validate_schema_flag=True, extra_pragmas={"foreign_keys": "ON"}
+    )
+    try:
+        embed_conn = await _init_connection(str(path), validate_schema_flag=False)
+    except BaseException:
+        # 半程失败防护：第二条连接创建失败必须关闭第一条，
+        # 否则泄漏的 aiosqlite 连接（非 daemon worker 线程）滞留
+        await main_conn.close()
+        raise
+    saved_main, saved_embed = _db, _embed_db
+    _db, _embed_db = main_conn, embed_conn
+    try:
+        yield main_conn, embed_conn
+    finally:
+        _db, _embed_db = saved_main, saved_embed
+        try:
+            await embed_conn.close()
+        except Exception:  # 关闭失败不阻断另一连接与还原（ruff 0.16：记录日志的处理豁免 BLE001）
+            logger.debug("db_redirect: 临时向量连接关闭失败", exc_info=True)
+        try:
+            await main_conn.close()
+        except Exception:  # 同上
+            logger.debug("db_redirect: 临时主连接关闭失败", exc_info=True)
 
 
 async def close_db() -> None:

@@ -26,6 +26,7 @@ from briefdesk.db import (
     backup_db_to,
     bulk_insert_raw_messages,
     close_db,
+    db_redirect,
     delete_category,
     delete_items,
     get_all_item_texts,
@@ -1906,6 +1907,66 @@ class ChunkedWritePathTest(_InMemoryDbTest):
         self.assertEqual(deleted, 905, "跨块 DELETE 的 rowcount 累计完整")
         cur = await self.db.execute("SELECT COUNT(*) AS cnt FROM items")
         self.assertEqual((await cur.fetchone())["cnt"], 0)
+
+
+class DbRedirectTest(unittest.IsolatedAsyncioTestCase):
+    """db_redirect 官方缝：窗口内单例指向临时库，退出原样还原。"""
+
+    async def test_redirect_swaps_and_restores_singletons(self):
+        import briefdesk.db as db_mod
+
+        saved_main, saved_embed = db_mod._db, db_mod._embed_db
+        with tempfile.TemporaryDirectory() as d:
+            async with db_redirect(os.path.join(d, "bench.sqlite")) as (
+                main_conn,
+                embed_conn,
+            ):
+                self.assertIs(db_mod._db, main_conn)
+                self.assertIs(db_mod._embed_db, embed_conn)
+                # 两条连接已按各自口径初始化 schema（空库可查）
+                cur = await main_conn.execute("SELECT COUNT(*) AS cnt FROM items")
+                self.assertEqual((await cur.fetchone())["cnt"], 0)
+                self.assertIsNotNone(embed_conn)
+            self.assertIs(db_mod._db, saved_main, "退出必须还原主连接单例")
+            self.assertIs(db_mod._embed_db, saved_embed, "退出必须还原向量连接单例")
+
+    async def test_second_connection_failure_closes_first(self):
+        import briefdesk.db as db_mod
+
+        real_init = db_mod._init_connection
+        created: list = []
+        closed = {"v": False}
+        calls = {"n": 0}
+
+        async def flaky_init(path, **kwargs):
+            calls["n"] += 1
+            if calls["n"] >= 2:
+                raise RuntimeError("disk full")
+            conn = await real_init(path, **kwargs)
+            orig_close = conn.close
+
+            async def spy_close():
+                closed["v"] = True
+                await orig_close()
+
+            conn.close = spy_close
+            created.append(conn)
+            return conn
+
+        saved_main, saved_embed = db_mod._db, db_mod._embed_db
+        with tempfile.TemporaryDirectory() as d:
+            with (
+                patch.object(db_mod, "_init_connection", new=flaky_init),
+                self.assertRaises(RuntimeError),
+            ):
+                async with db_redirect(os.path.join(d, "bench.sqlite")):
+                    pass  # 不可达：进入即失败
+            # 半程失败：第一条连接已关闭（不留非 daemon worker 线程）、
+            # 模块单例未被换入
+            self.assertEqual(calls["n"], 2)
+            self.assertTrue(closed["v"], "半程失败的 main_conn 未被关闭")
+            self.assertIs(db_mod._db, saved_main)
+            self.assertIs(db_mod._embed_db, saved_embed)
 
 
 class DeleteItemsRollbackTest(_InMemoryDbTest):
