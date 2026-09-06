@@ -325,6 +325,9 @@ def normalize_rest(
     # 文章卡片：拆条解析（公众号推送与群聊转发同格式）
     if msg.get("localType") == _APPMSG_LOCAL_TYPE:
         articles = parse_appmsg_xml(msg.get("content", ""))
+        if not articles:
+            logger.debug("REST msg_id=%s: appmsg 解析失败，丢弃", server_id)
+            return []
         msgs = _article_messages(
             msg_id_base=server_id,
             articles=articles,

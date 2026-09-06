@@ -230,6 +230,47 @@ class ChatJsonObjectTest(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("response_format", kwargs)
 
 
+class ChatJsonModeOverrideTest(unittest.IsolatedAsyncioTestCase):
+    """AI_JSON_MODE 显式开关：on/off 优先于启发式，auto 回退启发式。"""
+
+    async def _call(self, *, api_key: str, model: str, json_mode: str):
+        client, create = _fake_client()
+        with patch("briefdesk.plugins.ai_provider.engine.get_ai_client", return_value=client), patch.object(
+            config, "ai_json_mode", json_mode
+        ), patch.object(config, "ai_api_key", SecretStr(api_key)), patch.object(
+            config, "ai_model", model
+        ):
+            await chat([], temperature=0.1, max_tokens=64)
+        return create.call_args.kwargs
+
+    async def test_on_forces_json_object_for_non_heuristic_model(self):
+        # qwen3.5 不在启发式内，但 on 强制开启
+        kwargs = await self._call(
+            api_key="deepseek", model="qwen3.5", json_mode="on"
+        )
+        self.assertEqual(kwargs["response_format"], {"type": "json_object"})
+
+    async def test_off_disables_json_object_for_heuristic_model(self):
+        # deepseek-v4-flash 在启发式内，但 off 强制关闭
+        kwargs = await self._call(
+            api_key="deepseek", model="deepseek-v4-flash", json_mode="off"
+        )
+        self.assertNotIn("response_format", kwargs)
+
+    async def test_auto_falls_back_to_heuristic(self):
+        # auto 保持原启发式行为
+        kwargs = await self._call(
+            api_key="deepseek", model="deepseek-v4-flash", json_mode="auto"
+        )
+        self.assertEqual(kwargs["response_format"], {"type": "json_object"})
+
+    async def test_auto_disables_for_non_heuristic_model(self):
+        kwargs = await self._call(
+            api_key="deepseek", model="qwen3.5", json_mode="auto"
+        )
+        self.assertNotIn("response_format", kwargs)
+
+
 class EmbedBatchCountTest(unittest.IsolatedAsyncioTestCase):
     """P2 修复：embed_texts 每 chunk 校验返回向量数量——供应商少返即抛错，
     绝不产生错位结果（错位向量会持久化进 item_embeddings，永久污染余弦通道）。"""

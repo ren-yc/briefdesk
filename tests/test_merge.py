@@ -9,6 +9,7 @@ from briefdesk.plugins.merge.engine import (
     TITLE_PROMPT,
     _build_judge_user_message,
     _build_title_user_message,
+    _clip_desc,
     _parse_merge,
     _parse_title,
     judge_merge,
@@ -147,6 +148,24 @@ class JudgeMergeTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("45元", msgs[1]["content"])
         self.assertIn("运费aa", msgs[1]["content"])
         self.assertIn("面交", msgs[1]["content"])
+
+    async def test_long_desc_is_clipped_before_send(self):
+        # 超长描述在判官 user 消息里被截断，尾部不再送入
+        long_desc = "x" * 1000
+        chat_mock = AsyncMock(return_value=_resp('{"task":"merge","data":{"merge": true}}'))
+        with patch("briefdesk.plugins.merge.engine.chat", new=chat_mock):
+            await judge_merge("a", long_desc, "b", "短")
+        user = chat_mock.call_args.kwargs["messages"][1]["content"]
+        self.assertIn("x" * 400, user)
+        self.assertNotIn("x" * 401, user)  # 截断到 400 字符，无更长连续段
+
+
+class ClipDescTest(unittest.TestCase):
+    def test_short_text_unchanged(self):
+        self.assertEqual(_clip_desc("短文本"), "短文本")
+
+    def test_long_text_clipped_to_max(self):
+        self.assertEqual(len(_clip_desc("x" * 1000)), 400)
 
 
 class TitleRegenerationTest(unittest.TestCase):

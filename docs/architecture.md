@@ -962,6 +962,7 @@ required field of `weflow`/`qqflow` → that plugin self-disables via `PluginDis
 | `POLL_OVERLAP_SECONDS` | `300` | 增量轮询窗口与上次水位间的重叠秒数：吸收边界秒/时钟偏差/翻页偏移，重叠部分由 processed_messages 去重 |
 | `POLL_INTERVAL_SECONDS` | `0` (disabled) | Periodic sync interval in seconds: fallback to backfill messages missed during SSE outages; >0 triggers the same sync path as `/api/sync` periodically (mutually exclusive) |
 | `AI_DISABLE_THINKING` | `true`（.env.example 默认建议值，代码默认 `false`） | When `true`, chat requests pass `reasoning_effort="none"` to disable thinking mode。⚠️ DeepSeek/思考系模型建议开启：思考输出计入 max_tokens 预算，会挤压时间提取/分类 JSON 造成 length 截断整批丢失（2026-08-28 问题报告 §4）；`.env.example` 已注记 |
+| `AI_JSON_MODE` | `auto` | JSON 严格输出开关（`response_format={"type": "json_object"}`）：`auto`（默认，启发式：ollama 端点或 deepseek-v4 系列模型）/ `on`（强制开启）/ `off`（强制关闭）。非默认 key 的 ollama 端点或其它支持 json_object 的模型经 `on` 强制开启 |
 | `AI_VISION_ENABLED` | `false` | **视觉路由开关**：主模型（`AI_MODEL`）支持图片输入时开启——含图消息将 OCR 文本连同图片一并送入 classify（多模态 content parts）；关闭时维持纯文本 OCR 路径（现状）。**需启用 ocr 插件**（图片字节由 enrich 下载归一化后随批暂存；缺失时纯占位符图片被入口过滤并常驻 `vision_without_ocr` 公告）。请求级失败（异常/空 choices）自动同批降级纯文本重试并置 `vision_fallback` 公告 |
 | `AI_VISION_MAX_IMAGES` | `4` | 单条消息随分类请求附图上限（多图超出只发 OCR 文本）；单次请求另有总量预算兜底（classify 引擎内 `_MAX_IMAGES_PER_REQUEST=12`） |
 | `MAX_CLASSIFY_TOKENS` | `8192` | Max output tokens per classify call (DeepSeek cap 8192; truncation breaks JSON) |

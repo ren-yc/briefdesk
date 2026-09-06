@@ -80,6 +80,16 @@ def _parse_merge(content: str, *, repair: bool = True) -> bool | None:
     return merged if isinstance(merged, bool) else None
 
 
+# 判官描述截断上限：话题相似性判定不依赖长文本尾部的细节；超长原文
+# （含 OCR 增强或长引用）整体送入既浪费 token 又拉长锁内判定延迟。
+_MAX_JUDGE_DESC_CHARS = 400
+
+
+def _clip_desc(text: str) -> str:
+    """把判官描述截到上限；短文本原样返回。"""
+    return text if len(text) <= _MAX_JUDGE_DESC_CHARS else text[:_MAX_JUDGE_DESC_CHARS]
+
+
 async def judge_merge(
     title_a: str, desc_a: str, title_b: str, desc_b: str
 ) -> bool | None:
@@ -89,6 +99,8 @@ async def judge_merge(
     （调用方保守不合并；None 区别于明确的 False——失败不构成判定依据，
     观察型插件据此跳过记录）。
     """
+    desc_a = _clip_desc(desc_a)
+    desc_b = _clip_desc(desc_b)
     for attempt in (1, 2):
         try:
             resp = await chat(

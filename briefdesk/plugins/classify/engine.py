@@ -4,6 +4,7 @@
 本模块是 classify 阶段插件的引擎实现。
 """
 
+import asyncio
 import base64
 import logging
 import re
@@ -1022,15 +1023,17 @@ async def classify_batch(
         messages, cats, offset=0, depth=_MAX_SPLIT_DEPTH, vision_images=vision_images
     )
 
-    # 第二步：对分类标记 time=true 的消息批量提取 start/end/times（sysc，
-    # 尽力而为，失败回退默认不阻塞）。只在顶层调用一次（拆半合并后）。
-    if outcome.results and outcome.time_indexes:
-        await extract_times(outcome.results, outcome.time_indexes, messages)
-
-    # 第三步：对分类结果批量生成简洁标题（尽力而为，失败回退默认标题不阻塞）。
-    # 只在顶层调用一次（拆半子请求合并后），避免每个子请求重复概括。
+    # 第二步与第三步并行：时间提取（sysc，写 start/end/extra_times）与
+    # 标题概括（写 summary/subject）字段互不重叠、均为尽力而为（各自内部
+    # 吞异常回退默认），gather 并发执行把分类后延迟从两次往返压到 max(两次)。
     if outcome.results:
-        await summarize_results(outcome.results, messages)
+        tasks: list = []
+        if outcome.time_indexes:
+            tasks.append(
+                extract_times(outcome.results, outcome.time_indexes, messages)
+            )
+        tasks.append(summarize_results(outcome.results, messages))
+        await asyncio.gather(*tasks)
     return outcome
 
 

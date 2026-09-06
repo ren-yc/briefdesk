@@ -49,6 +49,13 @@ class Settings(KeyringSettingsBase):
     """设为 true 时，AI 请求会附带 reasoning_effort="none"，
     用于关闭 Qwen3 / Qwen3.5 等模型的思考模式。"""
 
+    ai_json_mode: str = Field(default="auto", alias="AI_JSON_MODE")
+    """JSON 严格输出模式（response_format={"type": "json_object"}）：
+    auto（默认，按现有启发式）/ on（强制开启）/ off（强制关闭）。
+    自动启发式：ollama 兼容端点（AI_API_KEY == "ollama"）或
+    deepseek-v4 系列模型。非默认 key 的 ollama 端点或其它支持
+    json_object 的模型可用 on 强制开启。"""
+
     ai_vision_enabled: bool = Field(default=False, alias="AI_VISION_ENABLED")
     """主模型支持图片输入（视觉模型）时开启：含图消息将 OCR 文本连同图片
     一并送入 AI_MODEL 分类（vision 路由）；关闭时维持纯文本 OCR 路径（现状）。

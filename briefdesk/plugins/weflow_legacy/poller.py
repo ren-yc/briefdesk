@@ -39,6 +39,9 @@ logger = logging.getLogger(__name__)
 # 翻页守卫：单页条数 × 页数上限，防异常状态下的无界循环
 # （本文件所有窗口模式统一用 _MAX_PAGES；注意与 qqflow poller 不同：
 #   qqflow 常规模式单会话仅 100 页，仅 BACKFILL_HOURS=-1 全量放宽到 2000 页）
+# 页大小取 500：上游为安装版 WeFlow（:5031，Electron），其 exportMediaForMessages
+# 遍历整页全部消息导出媒体、无 200 截断（与 weflow-server Rust 版不同），
+# 故 500 不会因媒体导出上限丢图；非 weflow 源不受 messages.rs 的 200 约束。
 _PAGE_LIMIT = 500
 _MAX_PAGES = 2000
 

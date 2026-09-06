@@ -557,6 +557,7 @@ async def close_db() -> None:
     """
     global _db, _embed_db
     embed_err: BaseException | None = None
+    main_err: BaseException | None = None
     if _embed_db is not None:
         try:
             await _embed_db.close()
@@ -568,12 +569,13 @@ async def close_db() -> None:
         try:
             await _db.close()
         except Exception as e:  # noqa: BLE001 — 同上，记录后继续收尾
-            if embed_err is None:
-                embed_err = e
+            main_err = e
         finally:
             _db = None
-    if embed_err is not None:
-        logger.error("关闭数据库连接失败: %r", embed_err)
+    if embed_err is not None or main_err is not None:
+        logger.error(
+            "关闭数据库连接失败: embed=%r, main=%r", embed_err, main_err
+        )
 
 
 # ── 查询助手（游标纪律：所有游标必须显式关闭，禁止依赖 GC）──
@@ -1479,7 +1481,8 @@ async def update_item_category(item_id: str, category: str) -> ItemRow | None:
     if not changed:
         return None
     try:
-        await db.execute(
+        async with _cursor(
+            db,
             "INSERT INTO recat_log "
             "(item_id, source, source_msg_id, category_before, category_after, content, created_at) "
             "VALUES (?, ?, ?, ?, ?, ?, ?)",
@@ -1492,7 +1495,8 @@ async def update_item_category(item_id: str, category: str) -> ItemRow | None:
                 old["source_quote"] or "",
                 datetime.now(UTC).isoformat(),
             ),
-        )
+        ):
+            pass
     except Exception:
         # 样本记录失败不应阻断分类修正，故容错吞掉。
         # 带栈：失败原因（表缺列/约束冲突/库锁/磁盘满）决定要不要人工介入，
@@ -2039,11 +2043,13 @@ async def update_category(
 async def toggle_category(cat_id: int) -> CategoryRow | None:
     """翻转类别启用状态；返回新行，不存在返回 None。"""
     db = await get_db()
-    await db.execute(
+    async with _cursor(
+        db,
         "UPDATE categories SET enabled = CASE WHEN enabled = 1 THEN 0 ELSE 1 END "
         "WHERE id = ?",
         (cat_id,),
-    )
+    ):
+        pass
     await db.commit()
     return await _get_category(db, cat_id)
 
@@ -2288,9 +2294,11 @@ async def merge_source_group(item_id: str, new_group: str) -> None:
     if new_group and new_group not in groups:
         groups.append(new_group)
         merged = ", ".join(groups)
-        await db.execute(
+        async with _cursor(
+            db,
             "UPDATE items SET source_group = ? WHERE id = ?", (merged, item_id)
-        )
+        ):
+            pass
         await db.commit()
 
 

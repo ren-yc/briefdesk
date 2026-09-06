@@ -91,7 +91,15 @@ def _use_json_object() -> bool:
     的外壳（{"task":...} 对象根）与 dedup/merge/title 的裸对象输出，
     下游解析不再面对叙述性文本/裸数组等跑偏形态。
     模型名用包含匹配，兼容带前缀的 vendor 命名（如 deepseek/deepseek-v4-flash）。
+
+    显式开关 AI_JSON_MODE=on/off 优先于启发式：非默认 key 的 ollama 端点、
+    或其它支持 json_object 的模型可经 on 强制开启；需要关闭时用 off。
     """
+    mode = config.ai_json_mode
+    if mode == "on":
+        return True
+    if mode == "off":
+        return False
     if config.ai_api_key.get_secret_value() == "ollama":
         return True
     return "deepseek-v4-flash" in config.ai_model or "deepseek-v4-pro" in config.ai_model

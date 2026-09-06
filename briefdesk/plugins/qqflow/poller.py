@@ -39,6 +39,9 @@ logger = logging.getLogger(__name__)
 # 全量拉取（BACKFILL_HOURS=-1）放宽到 2000 页（100 万条）
 _MAX_PAGES = 100
 _MAX_PAGES_ALL = 2000
+# 页大小取 500：上游 qqflow-server 的 media_export.rs::export_page 遍历整页
+# 全部消息导出媒体、无 200 截断（与 weflow-server Rust 版的 truncate(200) 不同），
+# 故 500 不会因媒体导出上限丢图。
 _PAGE_LIMIT = 500
 
 
