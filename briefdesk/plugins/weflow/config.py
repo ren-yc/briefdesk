@@ -6,12 +6,11 @@
 （keyring）读取，绝不落 .env 明文；非密钥字段（wxid / db_path / sse 参数）
 走 .env。参考 qqflow（keyring SecretStr 密钥）与 weflow-legacy（SSE 参数层）。
 
-`keys`（weflow-server.json 中单个 db 相对路径 → SQLCipher 64 位 hex 密钥
-的映射对象）整体按 JSON 字符串存入密钥环条目，但 Windows 凭据管理器单条
-上限约 1280 字节、26 库映射约 2347 字节放不下——故拆为两段存储：
-  WEFLOW_DB_KEYS（前半）+ WEFLOW_DB_KEYS_2（后半），
-`db_keys_map` property 合并两段反序列化为 dict[str, str]（形状不符返回
-空 dict，由上层决定是否自禁用）。
+`WEFLOW_DB_KEYS`（weflow-server.json 中单个 db 相对路径 → SQLCipher 64 位 hex
+密钥的映射对象，JSON 字符串）在**配置语义上是一份完整 JSON**。Windows 凭据
+管理器单条上限约 1280 字节、26 库映射约 2347 字节放不下，故存储层
+(briefdesk/secrets_store.py) 自动切成动态多段——拆段对配置侧透明，字段仍只
+是一个 `db_keys: SecretStr`，`db_keys_map` property 直接解析合并后的完整 JSON。
 """
 
 import json
@@ -29,13 +28,14 @@ logger = logging.getLogger(__name__)
 class WeFlowSettings(KeyringSettingsBase):
     """WeFlow 消息源配置，密钥字段支持系统密钥环。"""
 
-    # 密钥解析链（keyring > 环境变量 > .env > 默认值），见 briefdesk/secrets_store.py
+    # 密钥解析链（keyring > 环境变量 > .env > 默认值），见 briefdesk/secrets_store.py。
+    # WEFLOW_DB_KEYS 由 KeyringSource 特判读取合并后的完整 JSON（存储层切段，
+    # 配置层只见一份）。
     KEYRING_FIELDS: ClassVar[dict[str, str]] = {
         "api_token": "WEFLOW_API_TOKEN",
         "img_aes_key": "WEFLOW_IMG_AES_KEY",
         "img_xor_key": "WEFLOW_IMG_XOR_KEY",
         "db_keys": "WEFLOW_DB_KEYS",
-        "db_keys_2": "WEFLOW_DB_KEYS_2",
     }
     # ── 非密钥字段（.env） ──
     api_base: str = "http://127.0.0.1:5033"  # env: WEFLOW_API_BASE
@@ -46,10 +46,9 @@ class WeFlowSettings(KeyringSettingsBase):
     api_token: SecretStr = SecretStr("")  # env: WEFLOW_API_TOKEN
     img_aes_key: SecretStr = SecretStr("")  # env: WEFLOW_IMG_AES_KEY（图片 AES 解密密钥）
     img_xor_key: SecretStr = SecretStr("")  # env: WEFLOW_IMG_XOR_KEY（图片 XOR 解密密钥）
-    # env: WEFLOW_DB_KEYS / WEFLOW_DB_KEYS_2（各一段 JSON 字符串：
-    # {相对路径: 64位hex} 的库→密钥映射，合并后为完整 keys 对象）
+    # env: WEFLOW_DB_KEYS（完整 JSON：{相对路径: 64位hex} 库→密钥映射；超长时由
+    # 存储层自动切段，配置侧只填/读这份完整映射）
     db_keys: SecretStr = SecretStr("")
-    db_keys_2: SecretStr = SecretStr("")
 
     # ── SSE 参数（.env） ──
     sse_reconnect_initial_ms: int = Field(
@@ -75,29 +74,27 @@ class WeFlowSettings(KeyringSettingsBase):
 
     @property
     def db_keys_map(self) -> dict[str, str]:
-        """把 WEFLOW_DB_KEYS / WEFLOW_DB_KEYS_2 的 JSON 字符串合并解析为
-        {相对路径: hex} 映射。
+        """把 `WEFLOW_DB_KEYS` 的完整 JSON 字符串解析为 {相对路径: hex} 映射。
 
-        两段各自独立解析后合并：非法 JSON / 非 JSON 对象记 WARNING 并丢弃
-        该段（另一段有效仍返回非空）；键或值非字符串的条目静默跳过；不校验
-        hex 形状，值按原样保留。两段均未配置/无效时返回空 dict——`keys` 是
-        可选增强项，缺失不应阻断其它字段的读取，由上层决定是否据此自禁用。
+        keyring 写入超长时会自动切段，但解析链（KeyringSource 特判）始终把
+        `db_keys` 字段还原为一份完整 JSON，故这里无需再合并——直接解析。非法
+        JSON / 非 JSON 对象记 WARNING 并返回空 dict，由上层决定是否据以自禁用；
+        键或值非字符串的条目静默跳过；不校验 hex 形状，值按原样保留。`keys` 是
+        可选增强项，缺失不应阻断其它字段读取。
         """
-        result: dict[str, str] = {}
-        for field_name, key_name in (("db_keys", "WEFLOW_DB_KEYS"), ("db_keys_2", "WEFLOW_DB_KEYS_2")):
-            raw = getattr(self, field_name).get_secret_value()
-            if not raw:
-                continue
-            try:
-                data = json.loads(raw)
-            except json.JSONDecodeError:
-                logger.warning("%s 非法 JSON，按未配置处理", key_name)
-                continue
-            if not isinstance(data, dict):
-                logger.warning("%s 应为 JSON 对象，按未配置处理", key_name)
-                continue
-            for key, value in data.items():
-                if not isinstance(key, str) or not isinstance(value, str):
-                    continue
-                result[key] = value
-        return result
+        raw = self.db_keys.get_secret_value()
+        if not raw:
+            return {}
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            logger.warning("WEFLOW_DB_KEYS 非法 JSON，按未配置处理")
+            return {}
+        if not isinstance(data, dict):
+            logger.warning("WEFLOW_DB_KEYS 应为 JSON 对象，按未配置处理")
+            return {}
+        return {
+            key: value
+            for key, value in data.items()
+            if isinstance(key, str) and isinstance(value, str)
+        }

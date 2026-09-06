@@ -99,7 +99,7 @@ OCR 依赖为**可选**（`pip install -e ".[ocr]"`）：
    copy .env.example .env
    ```
 
-2. 编辑 `.env`，填入必填项 `AI_API_KEY`；消息源为 `weflow` 时需 `WEFLOW_API_TOKEN`/`WEFLOW_WXID`/`WEFLOW_DB_KEYS`（微信每库独立密钥的 JSON 映射，过长时拆 `WEFLOW_DB_KEYS_2` 第二段；密钥项走系统钥匙串而非 `.env`），为 `weflow-legacy` 时需 `WEFLOW_LEGACY_API_TOKEN`，为 `qqflow` 时需 `QQFLOW_API_TOKEN`/`QQFLOW_QQ`/`QQFLOW_KEY`（weflow/qqflow 缺失任一必填项 → 该插件自禁用）。消息源为可选插件，启用走 `PLUGINS` 显式列表（如 `PLUGINS=["weflow","qqflow"]`）或应用内「设置 → 插件」面板逐个开关，其余按需修改。
+2. 编辑 `.env`，填入必填项 `AI_API_KEY`；消息源为 `weflow` 时需 `WEFLOW_API_TOKEN`/`WEFLOW_WXID`/`WEFLOW_DB_KEYS`（微信每库独立密钥的 JSON 映射，一份完整 JSON 即可，超长时由系统自动分片存储；密钥项走系统钥匙串而非 `.env`），为 `weflow-legacy` 时需 `WEFLOW_LEGACY_API_TOKEN`，为 `qqflow` 时需 `QQFLOW_API_TOKEN`/`QQFLOW_QQ`/`QQFLOW_KEY`（weflow/qqflow 缺失任一必填项 → 该插件自禁用）。消息源为可选插件，启用走 `PLUGINS` 显式列表（如 `PLUGINS=["weflow","qqflow"]`）或应用内「设置 → 插件」面板逐个开关，其余按需修改。
 3. `AI_MODEL` 默认 `deepseek-v4-flash`：若你对接的 OpenAI 兼容服务没有该模型名，请改为实际模型名（如 `deepseek-chat`、`qwen-turbo` 等），否则首次分类会报模型不存在。
 
 常用可调项（完整清单与逐项注释见 `.env.example`）：

@@ -10,6 +10,9 @@
 NAME 白名单见 secrets_store.SECRET_NAMES（env 风格命名，与 .env 对齐）。
 密钥只写入系统密钥环，绝不回写 .env 明文文件；无桌面会话/无 Secret Service
 时可用环境变量或 .env 作为回退（见 briefdesk/secrets_store.py）。
+
+`WEFLOW_DB_KEYS` 特殊：配置语义是一份完整 JSON，CLI 一次写入/读取整份，超长
+时由存储层自动分片（segment `_2`/`_3`… 对用户隐藏，不在此白名单中）。
 """
 
 import argparse
@@ -17,10 +20,14 @@ import getpass
 import sys
 
 from briefdesk.secrets_store import (
+    DB_KEYS_BASE,
     SECRET_NAMES,
     SecretsStoreError,
+    delete_db_keys,
     delete_secret,
+    get_db_keys,
     get_secret,
+    set_db_keys,
     set_secret,
 )
 
@@ -37,14 +44,18 @@ def _cmd_set(args: argparse.Namespace) -> int:
     value = args.value
     if value is None:
         value = getpass.getpass(f"{name}: ")
-    set_secret(name, value)
+    if name == DB_KEYS_BASE:
+        # WEFLOW_DB_KEYS 配置语义为一份完整 JSON；超长自动分片存储
+        set_db_keys(value)
+    else:
+        set_secret(name, value)
     print(f"{name} 已写入系统密钥环（重启生效）")
     return 0
 
 
 def _cmd_get(args: argparse.Namespace) -> int:
     name = _valid_name(args.name)
-    value = get_secret(name)
+    value = get_db_keys() if name == DB_KEYS_BASE else get_secret(name)
     if not value:
         # 空条目与未配置同语义（真值判定，见 secrets_store 模块 docstring），
         # 展示口径与解析层一致
@@ -59,7 +70,10 @@ def _cmd_get(args: argparse.Namespace) -> int:
 
 def _cmd_rm(args: argparse.Namespace) -> int:
     name = _valid_name(args.name)
-    delete_secret(name)
+    if name == DB_KEYS_BASE:
+        delete_db_keys()
+    else:
+        delete_secret(name)
     print(f"{name} 已从系统密钥环删除")
     return 0
 
@@ -67,7 +81,8 @@ def _cmd_rm(args: argparse.Namespace) -> int:
 def _cmd_list(args: argparse.Namespace) -> int:
     for name in SECRET_NAMES:
         # 真值判定：空条目与未配置同语义（对齐 secrets_store 的解析口径）
-        print(f"{name}: {'已配置' if get_secret(name) else '未配置'}")
+        value = get_db_keys() if name == DB_KEYS_BASE else get_secret(name)
+        print(f"{name}: {'已配置' if value else '未配置'}")
     return 0
 
 

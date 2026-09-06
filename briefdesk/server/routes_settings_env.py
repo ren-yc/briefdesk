@@ -20,7 +20,16 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
 from briefdesk.config import Settings, config
-from briefdesk.secrets_store import SECRET_NAMES, delete_secret, get_secret, set_secret
+from briefdesk.secrets_store import (
+    DB_KEYS_BASE,
+    SECRET_NAMES,
+    delete_db_keys,
+    delete_secret,
+    get_db_keys,
+    get_secret,
+    set_db_keys,
+    set_secret,
+)
 from briefdesk.server.app import app
 from briefdesk.server.web_plugins import (
     get_plugin_meta,
@@ -116,8 +125,7 @@ _SECRET_LABELS = {
     "WEFLOW_API_TOKEN": "weflow 访问令牌",
     "WEFLOW_IMG_AES_KEY": "weflow 图片 AES 解密密钥",
     "WEFLOW_IMG_XOR_KEY": "weflow 图片 XOR 解密密钥",
-    "WEFLOW_DB_KEYS": "weflow 库密钥映射（JSON 前半）",
-    "WEFLOW_DB_KEYS_2": "weflow 库密钥映射（JSON 后半）",
+    "WEFLOW_DB_KEYS": "weflow 库密钥映射（JSON；超长自动分片存储）",
     "WEFLOW_LEGACY_API_TOKEN": "WeFlow Legacy 访问令牌",
     "QQFLOW_API_TOKEN": "qqflow 访问令牌",
     "QQFLOW_KEY": "qqflow 引导密钥",
@@ -287,7 +295,10 @@ async def api_settings_env():
     secrets = []
     for meta in _secret_schema():
         name = meta["key"]
-        keyring_configured = get_secret(name) is not None
+        if name == DB_KEYS_BASE:
+            keyring_configured = get_db_keys() is not None
+        else:
+            keyring_configured = get_secret(name) is not None
         secrets.append(
             {
                 "name": name,
@@ -377,7 +388,10 @@ async def api_secrets_set(payload: SecretsPutPayload):
     if not isinstance(value, str) or not value:
         raise HTTPException(422, "密钥值不能为空")
     try:
-        set_secret(name, value)
+        if name == DB_KEYS_BASE:
+            set_db_keys(value)
+        else:
+            set_secret(name, value)
     except Exception as exc:  # SecretsStoreError 等统一转可读错误
         raise HTTPException(500, f"密钥环写入失败: {exc}") from exc
     # 钥匙串写入成功即两枚为真：keyringConfigured 有条目、configured 是其超集
@@ -389,7 +403,10 @@ async def api_secrets_delete(name: str):
     """清除密钥（幂等：未配置也视为成功）。"""
     if name not in {meta["key"] for meta in _secret_schema()}:
         raise HTTPException(422, f"未知密钥名: {name!r}")
-    delete_secret(name)
+    if name == DB_KEYS_BASE:
+        delete_db_keys()
+    else:
+        delete_secret(name)
     # configured 是否仍为真取决于该密钥是否另有环境变量/.env 配置——只有
     # 服务端能判定，回传供前端行级贴片（keyringConfigured 删除后恒为 False）
     meta = next((m for m in _secret_schema() if m["key"] == name), None)

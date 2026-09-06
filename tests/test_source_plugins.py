@@ -153,7 +153,7 @@ class WeFlowPluginTest(unittest.IsolatedAsyncioTestCase):
         message = str(cm.exception)
         self.assertIn("WEFLOW_API_TOKEN", message)
         self.assertIn("WEFLOW_WXID", message)
-        self.assertIn("WEFLOW_DB_KEYS(+WEFLOW_DB_KEYS_2)", message)
+        self.assertIn("WEFLOW_DB_KEYS", message)
 
     async def test_config_present_registers_runtime(self):
         ctx, registered = _ctx()

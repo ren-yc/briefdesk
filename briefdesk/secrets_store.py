@@ -10,8 +10,13 @@ Linux=Secret Service。密钥环不可用（无桌面会话 / 无 Secret Service
 
 空条目（值 == ""）与未配置同语义（真值判定）：读取层不会让空串以「已配置」
 身份压过环境变量/.env 的有效值。
+
+`WEFLOW_DB_KEYS` 特有：配置语义上是一份完整 JSON，但存储层按
+`DB_KEYS_SEGMENT_LIMIT` 自动切成动态 N 段（规范名 + `_2`/`_3`…）——拆段只在
+本模块的 set_db_keys/get_db_keys 助手内发生，对配置输入与读取侧完全透明。
 """
 
+import json
 import logging
 import os
 from typing import Any
@@ -27,6 +32,9 @@ SERVICE_NAME = "briefdesk"
 
 # 可管理的秘密白名单（env 风格命名，与 .env / CLI 参数对齐；
 # CLI 与 UI 只允许操作这些键，拒绝任意 key 防误写）
+#
+# 注意：WEFLOW_DB_KEYS 的存储段（WEFLOW_DB_KEYS_2 / _3 / …）**不在此白名单内**——
+# 它们是密钥环存储层的物理分割（见 DB_KEYS_* 助手），对用户/CLI/UI 完全透明。
 SECRET_NAMES = (
     "AI_API_KEY",
     "EMBED_API_KEY",
@@ -34,12 +42,135 @@ SECRET_NAMES = (
     "WEFLOW_IMG_AES_KEY",
     "WEFLOW_IMG_XOR_KEY",
     "WEFLOW_DB_KEYS",
-    "WEFLOW_DB_KEYS_2",
     "WEFLOW_LEGACY_API_TOKEN",
     "QQFLOW_API_TOKEN",
     "QQFLOW_KEY",
     "RAG_API_KEY",
 )
+
+# ── WEFLOW_DB_KEYS 配置/存储语义分离 ────────────────────────────────────────
+# 配置输入层始终把 WEFLOW_DB_KEYS 视为**一份完整 JSON**（{相对路径: 64位hex} 库
+# 密钥映射）。但 Windows 凭据管理器单条条目有容量上限，而微信 4.x 实测 26 库
+# 约 2347 字节放不下——拆段是**存储层的物理细节**，不会泄漏到配置输入/读取侧。
+#
+# 拆段布局（动态 N 段，段序固定）：
+#   segment 0  → WEFLOW_DB_KEYS        （也是用户/CLI/UI 唯一可见的规范名）
+#   segment n  → WEFLOW_DB_KEYS_{n+1}  （n≥1，故 n=1 → WEFLOW_DB_KEYS_2）
+# 读取时按序拼接；对 JSON 解析不可行时回退「旧格式」——旧版把两段各存半份
+# JSON 对象（各自 json.loads 后按 dict 合并）。两种格式都透明产出完整 JSON。
+DB_KEYS_BASE = "WEFLOW_DB_KEYS"
+
+# 单条 keyring 条目安全净载荷上限（字节）。Windows 凭据管理器 CRED_MAX 约
+# 2560 字节，但条目还含服务名/用户名/注释等头尾开销，留足余量取 1100B，并做
+# 字节级硬校验兜底；换容量更大的存储后端时可调大让段数自动收敛回 1。
+DB_KEYS_SEGMENT_LIMIT: int = 1100
+
+
+def _db_keys_segment_name(index: int) -> str:
+    """第 index 段的 keyring 条目名：0 → WEFLOW_DB_KEYS，n≥1 → ..._n+1。"""
+    if index < 0:
+        raise ValueError(f"非法段索引: {index}")
+    return DB_KEYS_BASE if index == 0 else f"{DB_KEYS_BASE}_{index + 1}"
+
+
+def split_db_keys(json_text: str) -> list[str]:
+    """把完整 DB_KEYS JSON 文本按字节上限切成 1..N 段（段序固定）。
+
+    在字符边界切分，绝不把一个多字节 UTF-8 字符拆到两段（各段被独立存进
+    keyring，必须是合法 UTF-8 文本）。单条总长不超过上限时直接返回整段。
+    """
+    if len(json_text.encode("utf-8")) <= DB_KEYS_SEGMENT_LIMIT:
+        return [json_text]
+    segments: list[str] = []
+    current: list[str] = []
+    current_bytes = 0
+    for ch in json_text:
+        char_bytes = len(ch.encode("utf-8"))
+        if current and current_bytes + char_bytes > DB_KEYS_SEGMENT_LIMIT:
+            segments.append("".join(current))
+            current = []
+            current_bytes = 0
+        current.append(ch)
+        current_bytes += char_bytes
+    if current:
+        segments.append("".join(current))
+    return segments
+
+
+def join_db_keys(segments: list[str]) -> str:
+    """按序拼接各段为完整 DB_KEYS JSON 文本（仅拼接，不做 JSON 校验）。"""
+    return "".join(segments)
+
+
+def _read_db_keys_segments() -> list[str]:
+    """按段序读出全部已配置段（从段 0 起，遇空即停）。"""
+    segments: list[str] = []
+    while True:
+        value = get_secret(_db_keys_segment_name(len(segments)))
+        if not value:
+            break
+        segments.append(value)
+    return segments
+
+
+def _delete_db_keys_segments() -> None:
+    """清掉当前全部 DB_KEYS 段（写前重置 / 删除入口用，幂等）。"""
+    index = 0
+    while get_secret(_db_keys_segment_name(index)) is not None:
+        delete_secret(_db_keys_segment_name(index))
+        index += 1
+
+
+def set_db_keys(json_text: str) -> None:
+    """把完整 DB_KEYS JSON 写入密钥环；超限自动切段存储（存储细节，调用方无感）。
+
+    写路径要求密钥环可用（否则抛 SecretsStoreError），行为与 set_secret 一致。
+    """
+    if not is_keyring_available():
+        raise SecretsStoreError(
+            "系统密钥环不可用（可用 BRIEFDESK_KEYRING=0 确认强制禁用）"
+        )
+    _delete_db_keys_segments()
+    for index, segment in enumerate(split_db_keys(json_text)):
+        set_secret(_db_keys_segment_name(index), segment)
+
+
+def delete_db_keys() -> None:
+    """删除全部 DB_KEYS 段（幂等）。"""
+    _delete_db_keys_segments()
+
+
+def get_db_keys() -> str | None:
+    """读回完整 DB_KEYS JSON 文本，兼容新/旧两种存储格式。
+
+    - 新格式：各段是连续 JSON 的字节切片 → 按序拼接后 json.loads 校验，返回拼接串。
+    - 旧格式：各段是独立 JSON 对象（旧版各存半份映射）→ 拼接不可解析，则逐段
+      json.loads 并按 dict 合并，返回合并后的规范化 JSON。
+    均不可解析/无任何段 → 返回 None。
+    """
+    segments = _read_db_keys_segments()
+    if not segments:
+        return None
+    joined = join_db_keys(segments)
+    try:
+        json.loads(joined)
+    except json.JSONDecodeError:
+        merged: dict[str, str] = {}
+        for segment in segments:
+            try:
+                data = json.loads(segment)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(data, dict):
+                for key, value in data.items():
+                    if isinstance(key, str) and isinstance(value, str):
+                        merged[key] = value
+        return (
+            json.dumps(merged, ensure_ascii=False, separators=(",", ":"))
+            if merged
+            else None
+        )
+    return joined
 
 
 class SecretsStoreError(RuntimeError):
@@ -128,6 +259,16 @@ class KeyringSource(PydanticBaseSettingsSource):
             return field_name
         return field.alias or field_name
 
+    def _read_value(self, name: str) -> str | None:
+        """按密钥名取值；`WEFLOW_DB_KEYS` 特判为存储层段合并后的完整 JSON。
+
+        其它密钥沿用单条 get_secret。这样配置层只面对一份完整 `WEFLOW_DB_KEYS`，
+        拆段/合并在存储层完成，`KeyringSource` 得以维持统一的解析链优先级。
+        """
+        if name == DB_KEYS_BASE:
+            return get_db_keys()
+        return get_secret(name)
+
     def get_field_value(
         self, field: FieldInfo, field_name: str
     ) -> tuple[Any, str, bool]:
@@ -140,7 +281,7 @@ class KeyringSource(PydanticBaseSettingsSource):
         name = self._field_map.get(field_name)
         if name is None:
             return None, field_name, False
-        value = get_secret(name)
+        value = self._read_value(name)
         if not value:
             return None, field_name, False
         return SecretStr(value), self._key_for_field(field_name), True
@@ -149,5 +290,5 @@ class KeyringSource(PydanticBaseSettingsSource):
         return {
             self._key_for_field(field_name): SecretStr(value)
             for field_name, name in self._field_map.items()
-            if (value := get_secret(name))
+            if (value := self._read_value(name))
         }

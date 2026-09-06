@@ -44,8 +44,7 @@ class WeFlowPlugin(SourcePlugin):
                 "db_path": "wechat 数据目录",
                 "img_aes_key": "图片 AES 解密密钥",
                 "img_xor_key": "图片 XOR 解密密钥",
-                "db_keys": "库密钥映射（JSON 前半）",
-                "db_keys_2": "库密钥映射（JSON 后半）",
+                "db_keys": "库密钥映射（JSON）",
                 "sse_reconnect_initial_ms": "SSE 初始重连间隔（毫秒）",
                 "sse_reconnect_max_ms": "SSE 最大重连间隔（毫秒）",
                 "sse_read_timeout_ms": "SSE 读取超时（毫秒）",
@@ -54,8 +53,7 @@ class WeFlowPlugin(SourcePlugin):
                 "api_token": "密钥只保存到系统钥匙串，不会写入暂存文件",
                 "img_aes_key": "密钥只保存到系统钥匙串，不会写入暂存文件",
                 "img_xor_key": "密钥只保存到系统钥匙串，不会写入暂存文件",
-                "db_keys": "密钥只保存到系统钥匙串，不会写入暂存文件；两段各存约一半库映射",
-                "db_keys_2": "密钥只保存到系统钥匙串，不会写入暂存文件；两段各存约一半库映射",
+                "db_keys": "密钥只保存到系统钥匙串，不会写入暂存文件；超长自动分片存储",
             },
         )
 
@@ -65,12 +63,12 @@ class WeFlowPlugin(SourcePlugin):
         from briefdesk.plugins.weflow import runtime as wf_runtime
 
         settings = wf_config.WeFlowSettings()
-        # db_keys_map 为 property（合并解析 WEFLOW_DB_KEYS/_2），空 dict 视为缺失；
-        # 与 api_token/wxid 聚合在同一条错误里一次报全（恢复 85e6e87 前的报错口径）
+        # db_keys_map 为 property（解析一份完整 WEFLOW_DB_KEYS），空 dict 视为
+        # 缺失；与 api_token/wxid 聚合在同一条错误里一次报全
         validate_required_config(settings, {
             'api_token': 'WEFLOW_API_TOKEN',
             'wxid': 'WEFLOW_WXID',
-            'db_keys_map': 'WEFLOW_DB_KEYS(+WEFLOW_DB_KEYS_2)',
+            'db_keys_map': 'WEFLOW_DB_KEYS',
         })
         runtime = wf_runtime.WeFlowSource()
         ctx.register_source(runtime)
