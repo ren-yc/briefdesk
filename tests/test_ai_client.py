@@ -311,6 +311,20 @@ class EmbedBatchCountTest(unittest.IsolatedAsyncioTestCase):
             got = await embed_texts(["a", "b"])
         self.assertEqual(got, [[0.1], [0.2]])
 
+    async def test_duplicate_index_raises_value_error(self):
+        # 复核 P3-9：数量相符但 index 重复（如 [0,0,1]），排序后 index 序列
+        # 非 0..n-1 连续，向量仍整体错位——必须整批失败防余弦通道污染。
+        client, _ = self._client(
+            [
+                SimpleNamespace(index=0, embedding=[0.1]),
+                SimpleNamespace(index=0, embedding=[0.2]),  # 重复 index
+                SimpleNamespace(index=1, embedding=[0.3]),
+            ]
+        )
+        p_client, p_batch, p_sem = self._patches(client)
+        with p_client, p_batch, p_sem, self.assertRaises(ValueError):
+            await embed_texts(["a", "b", "c"])
+
 
 class EmbedAnnouncementTest(unittest.IsolatedAsyncioTestCase):
     """嵌入公告联动：失败置位 embedding_unreachable、成功撤销、未配置归 disabled。"""

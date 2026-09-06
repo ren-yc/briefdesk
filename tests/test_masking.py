@@ -232,6 +232,17 @@ class CountryCodePrefixTest(unittest.TestCase):
         # 86 打头但位数不构成任何 PII 形态：不脱敏
         self.assertEqual(mask_content("861380013800"), "861380013800")
 
+    def test_fullwidth_country_code_with_separator(self):
+        # 复核 P3-13：全角国家码「＋８６」＋全角/半角分隔符写法此前漏脱敏
+        # （digits 由 isdigit 收集保留全角字符，ASCII startswith("86") 失配）。
+        # NFKC 归一半角后应整体命中 [PHONE]。
+        self.assertEqual(
+            mask_content("＋８６－１３８－００１３－８０００"), "[PHONE]"
+        )
+        self.assertEqual(
+            mask_content("电话＋８６ １３８ ００１３ ８０００"), "电话[PHONE]"
+        )
+
 
 class FullwidthEmailTest(unittest.TestCase):
     def test_fullwidth_at_masked(self):

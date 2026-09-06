@@ -88,7 +88,14 @@ _RUN_WS_SPLIT_RE = re.compile(r"([ －　]+)")
 
 
 def _classify_digits(digits: str) -> str | None:
-    """去分隔符后的纯数字串 → 占位符；非已知 PII 形态返回 None。"""
+    """去分隔符后的纯数字串 → 占位符；非已知 PII 形态返回 None。
+
+    NFKC 归一（复核 P3-13）：全角数字（０-９）与全角国家码「８６」经 NFKC
+    转半角后参与长度与「86」前缀判定，否则「＋８６－１３８－...」这类全角
+    国家码＋分隔符写法会漏脱敏（`digits` 由 isdigit 收集保留全角字符，
+    ASCII `startswith("86")` 失配）。占位符不含数字，幂等性不受影响。
+    """
+    digits = unicodedata.normalize("NFKC", digits)
     n = len(digits)
     if n == 11:
         return PHONE_PLACEHOLDER

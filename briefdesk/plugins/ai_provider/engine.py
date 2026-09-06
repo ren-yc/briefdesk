@@ -315,6 +315,13 @@ async def embed_texts(texts: list[str]) -> list[list[float]]:
                 raise ValueError(
                     f"嵌入返回数量不符：请求 {len(chunk)} 条，实际 {len(ordered)} 条"
                 )
+            # 复核 P3-9：数量相符但 index 序列非 0..n-1 连续（端点返回重复/错乱
+            # index）时，排序无法纠偏，向量仍整体错位——同样整批失败防污染。
+            if any(d.index != i for i, d in enumerate(ordered)):
+                raise ValueError(
+                    f"嵌入返回 index 序列不连续：期望 0..{len(chunk)-1}，"
+                    f"实际 {[d.index for d in ordered]}"
+                )
             results.extend(d.embedding for d in ordered)
     except Exception:
         await _announce_embed_failure()

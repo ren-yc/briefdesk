@@ -1160,6 +1160,22 @@ class ConversationMergeStageTest(unittest.IsolatedAsyncioTestCase):
         add_calls = [c for c in self.dedup_calls if c[0] == "add"]
         self.assertEqual(add_calls[0][1], "c1")
 
+    async def test_judge_new_desc_uses_msg_content_not_quote(self):
+        # 复核 P3-8：新卡判官证据须用 msg.content（完整原文），与头卡
+        # source_quote 对称；此前用 result.quote（AI 摘录），与观察记录
+        # tail.source_quote 记的 msg.content 不一致。
+        await self._seed_cand("c1", 100, title="塔卡沙团购", quote="塔卡沙团购")
+        msg = self._msg("m2", 180, "完整原文内容，包含价格45元")
+        result = ClassifyResult(
+            msg_index=0, category="交易", summary="塔卡沙团购",
+            key_info="45", quote="摘要：仅45元",  # quote 与 content 不同
+        )
+        _merged, judge_mock = await self._store(msg, result, True, new_title="塔卡沙团购（45元）")
+        # judge_merge(title_a, desc_a, title_b, desc_b)：desc_b 是第 4 个位置参数
+        args = judge_mock.call_args.args
+        self.assertIn("完整原文内容，包含价格45元", args[3], "new_desc 须用 msg.content")
+        self.assertNotIn("摘要：仅45元", args[3], "new_desc 不得用 result.quote")
+
     async def test_folds_earlier_cand_into_newer_head(self):
         # 乱序：候选比新卡晚 → 新卡成为头卡，候选被吸收
         await self._seed_cand(

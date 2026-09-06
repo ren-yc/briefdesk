@@ -90,9 +90,14 @@ class MergePlugin(StagePlugin):
                     for x in (cand["title"], cand["key_info"], cand["source_quote"])
                     if x
                 )
+                # 复核 P3-8：新卡判官证据改用 row.msg.content（完整原文），
+                # 与头卡 cand["source_quote"]（完整原文）对称——此前用
+                # row.result.quote（AI 摘录，可为空/与原文不同），判官两侧
+                # 证据不对称，且观察记录 tail.source_quote 记的是 msg.content，
+                # 与判官实际所见不一致。
                 new_desc = " ".join(
                     x
-                    for x in (row.title, row.result.key_info, row.result.quote)
+                    for x in (row.title, row.result.key_info, row.msg.content)
                     if x
                 )
                 same = await judge_merge(
