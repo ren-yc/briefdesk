@@ -297,27 +297,40 @@ class MergePlugin(StagePlugin):
         if not batch.reembed_queue or ctx.dedup is None:
             return
         from briefdesk.ai_ports import embed_texts  # 延迟：依赖 ai_provider 插件
+        from briefdesk.db import get_existing_item_ids
         from briefdesk.plugins.dedup.engine import _embedding_text
+
+        # 锁外复查存在性（复核 P1-3）：run 释放存储锁后、本 after_run 嵌入
+        # 返回前，用户可能已删除该卡（缓存经 EVENT_ITEMS_DELETED 同步清空）。
+        # 若不加过滤，add_to_cache 会走「新建分支」重建幽灵条目，后续相似
+        # 消息被判重、标记 processed 却无卡片，静默丢失直到重启。
+        reembed_ids = [item_id for item_id, *_rest in batch.reembed_queue]
+        existing = await get_existing_item_ids(reembed_ids)
+        reembed = [
+            entry for entry in batch.reembed_queue if entry[0] in existing
+        ]
+        if not reembed:
+            return
 
         try:
             vectors = await embed_texts(
                 [
                     _embedding_text(title, quote)
-                    for _item_id, title, quote, _imgs, _src in batch.reembed_queue
+                    for _item_id, title, quote, _imgs, _src in reembed
                 ]
             )
         except Exception:
             logger.debug("merge: 存活卡补嵌失败，重启后由缓存加载补齐", exc_info=True)
             return
-        if len(vectors) != len(batch.reembed_queue):
+        if len(vectors) != len(reembed):
             logger.warning(
                 "merge: 补嵌返回数不符（%d/%d），跳过本轮补嵌",
                 len(vectors),
-                len(batch.reembed_queue),
+                len(reembed),
             )
             return
         for (item_id, title, quote, images, source), vec in zip(
-            batch.reembed_queue, vectors
+            reembed, vectors
         ):
             ctx.dedup.add_to_cache(
                 item_id,

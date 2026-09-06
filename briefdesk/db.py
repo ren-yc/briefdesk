@@ -2342,6 +2342,25 @@ async def get_item_texts_by_ids(item_ids: list[str]) -> list[ItemText]:
     return [cast(ItemText, dict(row)) for row in rows]
 
 
+async def get_existing_item_ids(item_ids: list[str]) -> set[str]:
+    """按 id 批量查仍存在的卡片 id 集合（复核 P1-3）。
+
+    供 merge.after_run 锁外复查：锁释放后用户可能已删卡，add_to_cache
+    之前按此过滤掉已删除 id，防止复活幽灵缓存条目。IN 列表分块防变量上限。
+    """
+    if not item_ids:
+        return set()
+    db = await get_db()
+    rows = await _execute_chunked(
+        db,
+        "SELECT id FROM items WHERE id IN ({placeholders})",
+        item_ids,
+        chunk_size=_SQL_VARS_CHUNK,
+        fetch=True,
+    )
+    return {row["id"] for row in rows}
+
+
 async def load_embeddings(model: str) -> dict[str, list[float]]:
     """读取指定模型的全部已存向量，返回 {item_id: embedding}。
 

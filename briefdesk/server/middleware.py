@@ -70,7 +70,13 @@ async def _local_security_guard(request: Request, call_next):
     response = await call_next(request)
     response.headers.setdefault(
         "Content-Security-Policy",
-        "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; "
+        # script-src 的 sha256 白名单放行 ui/index.html 的 <head> 内联主题脚本
+        # （防首绘闪烁：深色用户必须在首次绘制前落定 data-theme，复核 P1-6）。
+        # 该 hash 与 tests/test_csp_inline_theme.py 的守卫测试对齐——未来若改动
+        # 内联脚本内容，守卫测试会失败并提示重算。
+        "default-src 'self'; "
+        "script-src 'self' 'sha256-XZLQINd02QwVke0X8Od0yT+xXvttl9wMlf7/YGDmINA='; "
+        "style-src 'self' 'unsafe-inline'; "
         "img-src 'self' data:; connect-src 'self'; font-src 'self'; "
         "object-src 'none'; base-uri 'none'; frame-ancestors 'none'",
     )

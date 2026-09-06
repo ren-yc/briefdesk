@@ -414,13 +414,17 @@ class RagEngine:
         与 retrieve 的缓存刷新共用 _refresh_lock：维护循环与并发 ask 的
         水位/整表重建不交错（交错当前是良性的，但锁纪律名存实亡会诱使
         后续在 _refresh_vector_cache 中加入非幂等步骤）。
+
+        force_full 语义（复核 P1-4）：整表重建 = 拉全表后按 key 差集剔除
+        缓存内本次未 fetch 到的条目——否则「删除信号」被归零计数吞掉，
+        已删内容持续可被检索。
         """
 
         if force_full:
             self._vec_watermark = ""
             self._vec_count_seen = 0
         async with self._refresh_lock:
-            await self._refresh_vector_cache()
+            await self._refresh_vector_cache(force_full=force_full)
 
     def _vec_cache_clear(self) -> None:
         self._vec_entries.clear()
@@ -450,7 +454,7 @@ class RagEngine:
             [self._vec_entries[k][1] for k in keys], dtype=np.float32
         )
 
-    async def _refresh_vector_cache(self) -> None:
+    async def _refresh_vector_cache(self, *, force_full: bool = False) -> None:
         model = ai_ports.embed_model_name()
         if self._vec_model != model:
             logger.info("rag: 嵌入模型切换 %s -> %s，重建向量缓存", self._vec_model, model)
@@ -469,7 +473,21 @@ class RagEngine:
             raw_rows, max_created = await fetch_new_embeddings(
                 edb, model, self._vec_watermark, self.settings.group_only
             )
+        if force_full:
+            # 整表重建（复核 P1-4）：本次 fetch 到的 key 集合之外，缓存内其余
+            # key 一律剔除——等价整表重建但省一次全量重嵌，且空表（全删）时
+            # 也能清空残留。放在 raw_rows 判空之前，保证「删光了」也能收敛。
+            # _vec_count_seen 由本方法末尾 self._vec_count_seen = total 统一
+            # 更新为全表行数（收缩检测语义保持不变）。
+            fetched_keys = {(r["source"], r["msg_id"]) for r in raw_rows}
+            for key in list(self._vec_entries):
+                if key not in fetched_keys:
+                    del self._vec_entries[key]
         if not raw_rows:
+            if force_full:
+                # 全表已空（全部删除）：差集剔除已清空 _vec_entries，须重建
+                # 矩阵，否则旧的 float32 矩阵残留已删向量继续参与检索。
+                self._rebuild_matrix()
             return
         entries, bad_keys = await asyncio.to_thread(parse_embedding_rows, raw_rows)
         # 维度对账（审查回归）：同模型名下供应商原地换维度或历史脏行会让

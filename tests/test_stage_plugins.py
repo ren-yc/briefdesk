@@ -399,6 +399,10 @@ class MergeAfterRunReembedTest(unittest.IsolatedAsyncioTestCase):
         vec = [0.1, 0.2, 0.3]
         with patch(
             "briefdesk.ai_ports.embed_texts", AsyncMock(return_value=[vec])
+        ), patch(
+            # after_run 补嵌前复查存在性（P1-3）；本测试 i1 仍存在
+            "briefdesk.db.get_existing_item_ids",
+            AsyncMock(return_value={"i1"}),
         ):
             await MergePlugin().after_run(batch, SimpleNamespace(dedup=engine))
         self.assertEqual(engine._cache[0].title, "合并后标题")
@@ -415,3 +419,34 @@ class MergeAfterRunReembedTest(unittest.IsolatedAsyncioTestCase):
         # 无队列 / 无 dedup 服务（插件禁用）均静默跳过
         await MergePlugin().after_run(batch, SimpleNamespace(dedup=None))
         await MergePlugin().after_run(batch, SimpleNamespace(dedup=None))
+
+    async def test_after_run_skips_deleted_items(self):
+        """复核 P1-3：锁外补嵌前按 item_id 复查存在性，已删除的卡不得
+        add_to_cache（否则复活幽灵缓存条目，相似消息被误判重静默丢失）。"""
+        from types import SimpleNamespace
+
+        from briefdesk.plugins.dedup.engine import DedupEngine
+        from briefdesk.plugins.merge.plugin import MergePlugin
+        from briefdesk.types import BatchContext
+
+        engine = DedupEngine()
+        engine._embed_cache_ok = True
+        # 预置一条已存在缓存（i1），reembed_queue 里放已删除的 i2 与存在的 i1
+        engine.add_to_cache("i1", "旧标题", source="weflow-legacy", source_quote="旧文")
+        batch = BatchContext(messages=[], client=Mock())
+        batch.reembed_queue.append(
+            ("i2", "已删除卡", "已删除原文", None, "weflow-legacy")
+        )
+        vec = [0.1, 0.2, 0.3]
+        with patch(
+            "briefdesk.ai_ports.embed_texts", AsyncMock(return_value=[vec])
+        ), patch(
+            # after_run 内部延迟导入 get_existing_item_ids
+            "briefdesk.db.get_existing_item_ids",
+            AsyncMock(return_value=set()),  # i2 已不存在
+        ):
+            await MergePlugin().after_run(batch, SimpleNamespace(dedup=engine))
+        # i2 被过滤：不 add_to_cache，不产生幽灵条目
+        cached_ids = {c.id for c in engine._cache}
+        self.assertNotIn("i2", cached_ids, "已删除卡不得复活进缓存")
+        self.assertIn("i1", cached_ids, "既有缓存条目不受影响")

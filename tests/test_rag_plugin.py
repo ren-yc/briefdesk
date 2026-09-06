@@ -1156,6 +1156,49 @@ class RagCrossSourceScopeTest(_MemoryEngineBase):
         self.assertIsNone(await self.engine.retrieve("周六6点开会有通知"))
 
 
+class RagWarmVectorsForceFullTest(_MemoryEngineBase):
+    """复核 P1-4：warm_vectors(force_full=True) 必须按 key 差集剔除已删条目，
+    否则「行数回退→整表重建」信号被归零计数吞掉，已删内容持续可检索。"""
+
+    async def test_force_full_purges_deleted_keys_from_cache(self):
+        from briefdesk.plugins.rag.db import (
+            ChunkRow,
+            ensure_rag_schema,
+            upsert_chunks,
+            upsert_embeddings,
+        )
+
+        await ensure_rag_schema(self.db)
+        chunk = ChunkRow(
+            source="weflow-legacy", msg_id="m1", session_id="s1", group_name="测试群",
+            sender_name="小明", msg_time=1700000000,
+            content="周六6点开会有通知", item_id="",
+        )
+        await upsert_chunks(self.db, [chunk])
+        await upsert_embeddings(
+            self.db, [("weflow-legacy", "m1")], [[1.0, 0.0]], "test-model", "t0"
+        )
+        await self.engine.warm_vectors()
+        self.assertIn(("weflow-legacy", "m1"), self.engine._vec_entries)
+
+        # 模拟 GC 删除向量行（chunk 保留，仅向量行被删）
+        cursor = await self.db.execute(
+            "DELETE FROM rag_chunk_embeddings WHERE source = ? AND msg_id = ?",
+            ("weflow-legacy", "m1"),
+        )
+        await cursor.close()
+        await self.db.commit()
+
+        # force_full 整表重建：已删 key 必须从内存缓存剔除
+        await self.engine.warm_vectors(force_full=True)
+        self.assertNotIn(
+            ("weflow-legacy", "m1"),
+            self.engine._vec_entries,
+            "force_full 后已删向量 key 必须从内存缓存剔除",
+        )
+        self.assertEqual(len(self.engine._matrix_keys), 0, "矩阵须同步清空")
+
+
 class RagFreshDbDays0Test(unittest.IsolatedAsyncioTestCase):
     """days=0 时维护路径在全新库上也安全空转（回归：早退先于建表曾致循环崩溃）。"""
 
