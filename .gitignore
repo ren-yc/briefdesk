@@ -66,6 +66,9 @@ debug*.py
 # ZCode agent workspace
 .zcode/
 
+# ZCode video-agent-kit 插件产物（记录本机绝对路径，禁止入库）
+.video_agent/
+
 # Benchmark run artifacts（fromweb 为网页导出用例，含真实聊天内容，禁止入库）
 briefdesk/plugins/benchmark/reports/
 briefdesk/plugins/benchmark/.tmp/
