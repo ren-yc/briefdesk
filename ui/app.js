@@ -2019,7 +2019,12 @@ async function renderOnboardEnv() {
   }
   const srcs = Object.entries(status.sources || {});
   const srcHtml = srcs.length
-    ? srcs.map(([name, s]) => `<span class="onboard-chip">${esc(name)} · ${_STATUS_LABELS[s.status] || s.status || "offline"}</span>`).join("")
+    ? srcs.map(([name, s]) => {
+        // 复核 P2-5：收敛白名单 + 转义（与 _statusParts / openStatusPanel 同口径）
+        const raw = s.status || "offline";
+        const st = Object.prototype.hasOwnProperty.call(_STATUS_LABELS, raw) ? raw : "offline";
+        return `<span class="onboard-chip">${esc(name)} · ${esc(_STATUS_LABELS[st] || raw)}</span>`;
+      }).join("")
     : '<span class="onboard-chip onboard-warn">未启用任何消息源</span>';
   const warn = status.lastError || status.lastWarning;
   const warnHtml = warn
@@ -3451,8 +3456,12 @@ function _statusParts(status) {
     : states.some(st => st === "reconnecting") ? "reconnecting"
     : "offline";
   const parts = sources.map(([name, s]) => {
-    const st = s.status || "offline";
-    return `<img src="${_STATUS_ICONS[st]}" class="icon" alt="">${esc(name)} ${_STATUS_LABELS[st]}`;
+    // 复核 P2-5：状态值收敛到已知白名单，未知一律按 offline 呈现（避免
+    // _STATUS_ICONS/_STATUS_LABELS 查表得 undefined）；与 openStatusPanel 同口径。
+    const raw = s.status || "offline";
+    const st = Object.prototype.hasOwnProperty.call(_STATUS_LABELS, raw) ? raw : "offline";
+    const icon = _STATUS_ICONS[st] || _STATUS_ICONS.offline;
+    return `<img src="${icon}" class="icon" alt="">${esc(name)} ${esc(_STATUS_LABELS[st] || raw)}`;
   });
   return { overall, parts };
 }

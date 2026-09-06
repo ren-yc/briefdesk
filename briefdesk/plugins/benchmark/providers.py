@@ -43,16 +43,19 @@ _DRAIN_POLL_INTERVAL = 0.05
 
 
 async def _wait_pipelines_drained(timeout_s: float = 120.0) -> bool:
-    """等待在途批次排空（复核 P2-22）：暂停只拦新批，已在分类阶段的批次仍会
+    """等待在途批次排空（复核 P2-22 + P1-5）：暂停只拦新批，已在分类阶段的批次仍会
     进入存储相——不排空就重定向会把它们的卡片写进临时库，并在生产去重缓存
     留下指向临时库的幽灵条目（后续相似消息被误吸收）。
 
-    以 sync 进度的 pendingCount 归零为排空信号（暂停批在管道入口直接返回，
-    不进入计数）；返回是否在超时前排空。
+    以「pendingCount==0 且 activeBatches==0」为排空信号：pendingCount 覆盖已
+    计数的批次；activeBatches 覆盖「已过暂停检查、尚未计数」的窗口批次
+    （复核 P1-5，否则该窗口批次被误判排空）。返回是否在超时前排空。
     """
+    from briefdesk.pipeline import get_active_batches
+
     deadline = asyncio.get_running_loop().time() + timeout_s
     while True:
-        if get_sync_progress().get("pendingCount") == 0:
+        if get_sync_progress().get("pendingCount") == 0 and get_active_batches() == 0:
             return True
         if asyncio.get_running_loop().time() >= deadline:
             return False

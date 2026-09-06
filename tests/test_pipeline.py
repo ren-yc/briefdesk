@@ -11,6 +11,7 @@ from briefdesk.db import init_schema
 from briefdesk.pipeline import (
     _mark_skipped,
     _split_batches,
+    get_active_batches,
     process_all_batches,
     set_processing_paused,
 )
@@ -380,6 +381,53 @@ class RawInsertHoldsStorageLockTest(_StageTestBase):
             )
 
         self.assertEqual(held, [True], "raw 落库必须在 storage_lock 内执行")
+
+
+class ActiveBatchTrackingTest(_StageTestBase):
+    """复核 P1-5：process_all_batches 执行期间 active_batches 计数为 1，
+    退出后归 0（benchmark 排空门闸据此捕捉「已过暂停检查、尚未计数」的批次）。"""
+
+    async def test_active_batches_tracks_process_lifetime(self):
+        batch = [_pipeline_msg("m0")]
+        seen_during: list[int] = []
+
+        async def probe(rows):
+            seen_during.append(get_active_batches())
+
+        _install_dedup_stage(_dedup_engine_mock())
+        _install_merge_stage()
+        stages.register_stage(_classify_stage(
+            _outcome_fn([ClassifyResult(msg_index=0, category="活动通知", summary="s", quote="q")], [])
+        ))
+
+        with patch(
+            "briefdesk.pipeline.get_enabled_sessions",
+            new=AsyncMock(return_value=[{"session_id": "s"}]),
+        ), patch(
+            "briefdesk.pipeline.get_enabled_categories",
+            new=AsyncMock(return_value=[{"name": "x"}]),
+        ), patch(
+            "briefdesk.pipeline.are_messages_processed", new=AsyncMock(return_value=set())
+        ), patch(
+            "briefdesk.pipeline.bulk_insert_raw_messages", new=AsyncMock(side_effect=probe)
+        ), patch(
+            "briefdesk.pipeline.mark_messages_processed", new=AsyncMock()
+        ), patch(
+            "briefdesk.plugins.dedup.plugin.mark_message_processed", new=AsyncMock()
+        ), patch(
+            "briefdesk.plugins.dedup.plugin.insert_item",
+            new=AsyncMock(return_value="new-id"),
+        ), patch(
+            "briefdesk.plugins.merge.plugin.get_merge_candidates",
+            new=AsyncMock(return_value=[]),
+        ), patch("briefdesk.pipeline.publish_items_updated", new=AsyncMock()):
+            await process_all_batches(
+                batch, _pipeline_client(), batch_size=10, origin="test"
+            )
+
+        self.assertEqual(get_active_batches(), 0, "执行结束后计数必须归 0")
+        self.assertTrue(all(v == 1 for v in seen_during), "执行期间计数必须为 1")
+        self.assertTrue(seen_during, "应至少探测到一次执行期间的状态")
 
 
 class MissingStageGuardTest(_StageTestBase):

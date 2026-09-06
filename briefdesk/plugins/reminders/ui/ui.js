@@ -246,7 +246,12 @@
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ at: null }),
         });
+        // 复核 P2-4：互斥判据改为响应体 cleared 字段——后端清除已无提醒的卡
+        // 返回 200 {"cleared": false}（而非 404），只有真正抢到清除权的标签页
+        // 才通知，避免多标签页重复通知。
         if (!res.ok) continue;
+        const data = await res.json().catch(() => ({}));
+        if (data.cleared === false) continue;
         notifiedReminders.add(String(it.id));
         const cur = currentItems.find(x => String(x.id) === it.id);
         if (cur) cur.remind_at = null;

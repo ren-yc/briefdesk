@@ -102,6 +102,15 @@ class LocalSecurityGuardTest(unittest.TestCase):
         resp = self.client.get("/api/status", headers={"Host": "evil.example"})
         self.assertEqual(resp.status_code, 400)
 
+    def test_malformed_host_port_returns_400_not_500(self):
+        # 复核 P2-2：request.url.port 对「数字但超范围」端口（如 99999）抛
+        # ValueError，此前未被捕获导致 500；应统一 400（识别为非法 Host）。
+        # 非数字端口（notaport 等）被 starlette 静默忽略（回退 scope server），
+        # 不会抛异常，故不在本用例范围。
+        for bad in ("localhost:99999", "localhost:65536"):
+            resp = self.client.get("/api/status", headers={"Host": bad})
+            self.assertEqual(resp.status_code, 400, f"Host {bad} 应 400")
+
     def test_rejects_cross_origin_post(self):
         resp = self.client.post("/api/sync", headers={"Origin": "http://evil.example"})
         self.assertEqual(resp.status_code, 403)
@@ -325,6 +334,34 @@ class ReminderApiTest(unittest.TestCase):
         self.assertEqual(resp.json()["remind_at"], None)
         mock.assert_awaited_once_with("i1", None)
 
+    def test_clear_no_reminder_returns_200_cleared_false(self):
+        # 复核 P2-4：清除已无提醒的卡（卡片存在但 remind_at 已为 NULL）应返回
+        # 200 {"cleared": false}，而非 404（此前两者同为 404，手动清除误导报错）。
+        with patch(
+            "briefdesk.plugins.reminders.router.set_item_reminder",
+            new=AsyncMock(return_value=False),  # 清除未命中（无提醒可清）
+        ), patch(
+            # router 内延迟导入 get_existing_item_ids，patch 源模块
+            "briefdesk.db.get_existing_item_ids",
+            new=AsyncMock(return_value={"i1"}),  # 卡片存在
+        ):
+            resp = self.client.post("/api/items/i1/reminder", json={"at": None})
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()["cleared"], False)
+        self.assertEqual(resp.json()["remind_at"], None)
+
+    def test_clear_missing_item_returns_404(self):
+        # 卡片不存在仍 404（资源缺失），与「无提醒可清」区分
+        with patch(
+            "briefdesk.plugins.reminders.router.set_item_reminder",
+            new=AsyncMock(return_value=False),
+        ), patch(
+            "briefdesk.db.get_existing_item_ids",
+            new=AsyncMock(return_value=set()),  # 卡片不存在
+        ):
+            resp = self.client.post("/api/items/i1/reminder", json={"at": None})
+        self.assertEqual(resp.status_code, 404)
+
     def test_rejects_malformed_time_before_db_call(self):
         mock = AsyncMock()
         with patch("briefdesk.plugins.reminders.router.set_item_reminder", new=mock):
@@ -337,7 +374,11 @@ class ReminderApiTest(unittest.TestCase):
 
     def test_missing_item_returns_404(self):
         mock = AsyncMock(return_value=False)
-        with patch("briefdesk.plugins.reminders.router.set_item_reminder", new=mock):
+        with patch("briefdesk.plugins.reminders.router.set_item_reminder", new=mock), patch(
+            # 复核 P2-4：清除未命中后复查存在性（卡片不存在 → 404）
+            "briefdesk.db.get_existing_item_ids",
+            new=AsyncMock(return_value=set()),
+        ):
             resp = self.client.post("/api/items/nope/reminder", json={"at": None})
         self.assertEqual(resp.status_code, 404)
 

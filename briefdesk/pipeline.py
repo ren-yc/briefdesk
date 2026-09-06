@@ -11,6 +11,7 @@
 """
 
 import asyncio
+import functools
 import logging
 import time as time_module
 from datetime import UTC, datetime
@@ -47,6 +48,31 @@ _processing_paused = False
 # 暂停门闸的首次 INFO 已落日志标志：暂停期间后续批次降级 DEBUG，防刷屏；
 # 恢复时复位，保证下一轮暂停仍有一条 INFO。
 _paused_logged_once = False
+# 活动批次计数（复核 P1-5）：process_all_batches 执行期间 +1、退出 -1。
+# benchmark 排空门闸以「pendingCount==0 且 active_batches==0」为排空信号——
+# 否则暂停置位后「已过暂停检查、尚未 note_sync_batch_start 计数」的批次
+# 不反映在 pendingCount 里，被误判排空（存储相写进临时库、去重缓存留幽灵）。
+_active_batches = 0
+
+
+def get_active_batches() -> int:
+    """返回当前活动批次计数（benchmark 排空门闸只读诊断口径）。"""
+    return _active_batches
+
+
+def _track_active_batches(fn):
+    """process_all_batches 装饰器：执行期间维护活动批次计数（复核 P1-5）。"""
+
+    @functools.wraps(fn)
+    async def wrapper(*args, **kwargs):
+        global _active_batches
+        _active_batches += 1
+        try:
+            return await fn(*args, **kwargs)
+        finally:
+            _active_batches -= 1
+
+    return wrapper
 
 
 def set_processing_paused(paused: bool) -> None:
@@ -100,6 +126,7 @@ async def _mark_skipped(bctx: BatchContext, failed_set: set[int]) -> None:
     await mark_messages_processed(rows)
 
 
+@_track_active_batches
 async def process_all_batches(
     messages: list[InternalMessage],
     client: SourceClient,

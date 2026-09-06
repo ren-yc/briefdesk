@@ -49,8 +49,16 @@ async def set_reminder(item_id: str, body: dict):
     async with storage_lock:
         updated = await set_item_reminder(item_id, remind_at)
     if not updated:
+        if remind_at is None:
+            # 复核 P2-4：清除未命中需区分「卡片不存在」（404）与「卡片存在但
+            # 无提醒可清」（200 cleared=false）——此前两者同为 404，手动清除
+            # 已无提醒的卡会误显示「设置失败」。
+            from briefdesk.db import get_existing_item_ids
+
+            if await get_existing_item_ids([item_id]):
+                return {"success": True, "cleared": False, "remind_at": None}
         raise HTTPException(404, "Item not found")
-    return {"success": True, "remind_at": remind_at}
+    return {"success": True, "remind_at": remind_at, "cleared": remind_at is None}
 
 
 @router.get("/api/reminders/due")

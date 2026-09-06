@@ -44,8 +44,15 @@ async def _local_security_guard(request: Request, call_next):
     Host 白名单阻断 DNS rebinding（恶意域名解析到 127.0.0.1）；
     Origin/Referer 校验阻断浏览器跨站表单/fetch 对变更接口的 CSRF 调用。
     """
-    host = (request.url.hostname or "").lower()
-    if host not in _ALLOWED_HOSTNAMES or request.url.port not in (
+    # 复核 P2-2：request.url 的 hostname/port 解析对畸形 Host（超范围端口
+    # 99999 / 非数字端口）抛 ValueError，发生在 call_next 之前无人捕获 → 500。
+    # 整个解析包 try 收敛为 400。
+    try:
+        host = (request.url.hostname or "").lower()
+        port = request.url.port
+    except ValueError:
+        return JSONResponse({"detail": "Invalid Host header"}, status_code=400)
+    if host not in _ALLOWED_HOSTNAMES or port not in (
         None,
         config.server_port,
     ):
