@@ -320,6 +320,23 @@ class ParseResponseTest(unittest.TestCase):
         self.assertEqual([r.msg_index for r in results], [0])
         self.assertEqual(retry, [])
 
+    def test_quote_non_string_tolerated(self):
+        # 复核 P3-10：AI 脏输出给数字/dict 型 quote，此前 _norm_align_text
+        # （re.sub）抛 TypeError → 整批本轮抛弃；现收敛为 str 走正常判定。
+        # 核心断言：不抛 TypeError、正常产出（具体 retry/results 取决于对齐判定）。
+        results, retry, _times = _parse_response(
+            '[{"index":0,"include":true,"category":"活动通知","quote":123}]',
+            self.ALLOWED, 1,
+            contents=["摄影社下周三下午3点面试"],
+        )
+        self.assertEqual(len(results) + len(retry), 1, "数字 quote 应收敛并正常判定")
+        results2, retry2, _times2 = _parse_response(
+            '[{"index":0,"include":true,"category":"活动通知","quote":{"a":1}}]',
+            self.ALLOWED, 1,
+            contents=["摄影社下周三下午3点面试"],
+        )
+        self.assertEqual(len(results2) + len(retry2), 1, "dict quote 应收敛并正常判定")
+
     def test_missing_index_covered_by_all_false_response(self):
         # F1：include:false 也算覆盖该 index
         results, retry, _times = _parse_response(

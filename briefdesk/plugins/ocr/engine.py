@@ -101,7 +101,13 @@ async def ocr_images_bytes(contents: list[bytes]) -> str:
 
     texts: list[str] = []
     for i, content in enumerate(contents, 1):
-        text = await ocr_image_bytes(content)
+        try:
+            text = await ocr_image_bytes(content)
+        except Exception:  # noqa: BLE001 — 单图失败跳过继续，不放弃后续图
+            # 复核 P3-7：此前循环内无逐图 try，第 N 张图非 RapidOCRError 异常
+            # 会使同消息后续图片的 OCR 全部放弃。单图失败只丢该图，其余照常。
+            logger.debug("第 %d 张图片 OCR 失败，跳过继续", i)
+            continue
         if text.strip():
             texts.append(f"[图片 {i} OCR 结果]\n{text}")
 

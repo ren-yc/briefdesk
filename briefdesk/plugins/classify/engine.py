@@ -613,6 +613,11 @@ def _parse_response(
         # 由 _classify_once 调第二关（语义裁判）复核
         if contents is not None:
             quote_raw = item.get("quote", "") or ""
+            if not isinstance(quote_raw, str):
+                # 复核 P3-10：AI 脏输出可能给数字/dict 型 quote，直接传给
+                # _norm_align_text（re.sub）会抛 TypeError → 整批本轮抛弃，
+                # 模型持续脏输出时会话陷入重试循环。收敛为 str 后走正常判定。
+                quote_raw = str(quote_raw)
             verdict = _char_quote_verdict(quote_raw, msg_index, contents)
             if verdict is False:
                 logger.warning(

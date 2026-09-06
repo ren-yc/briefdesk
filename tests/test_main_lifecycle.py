@@ -119,6 +119,78 @@ class MainRunCleanupOnSetupFailureTest(unittest.IsolatedAsyncioTestCase):
         close_db.assert_awaited_once()
 
 
+class MainRunServerStartFailureTest(unittest.IsolatedAsyncioTestCase):
+    """复核 P3-4：server 启动失败（如端口占用）时等待循环不得白等满 10s——
+    server_task.done() 为真即提前退出等待，随后 await server_task 抛出、
+    finally 统一清理。"""
+
+    async def test_server_start_failure_breaks_wait_early_and_cleans_up(self):
+        import time as time_module
+
+        from briefdesk import main as main_mod
+        from briefdesk import stages
+        from briefdesk.server.callbacks import set_refresh_sessions_callback
+        from briefdesk.server.web_plugins import (
+            set_plugin_meta_callback,
+            set_plugin_validation_callback,
+            set_plugins_info_callback,
+            set_settings_schema_callback,
+        )
+        from briefdesk.sync import set_sync_callback
+
+        # _run 会覆盖全局回调/stages 上下文，测试后必须复位（防污染后续用例
+        # ——test_server 依赖 409/503 的未注册语义）
+        self.addCleanup(stages.reset)
+        self.addCleanup(set_plugins_info_callback, None)
+        self.addCleanup(set_settings_schema_callback, None)
+        self.addCleanup(set_plugin_meta_callback, None)
+        self.addCleanup(set_plugin_validation_callback, None)
+        self.addCleanup(set_sync_callback, None)
+        self.addCleanup(set_refresh_sessions_callback, None)
+
+        real_sleep = asyncio.sleep
+
+        manager = MagicMock()
+        manager.setup_all = AsyncMock()
+        manager.activate_all = AsyncMock()
+        manager.teardown_all = AsyncMock()
+        close_db = AsyncMock()
+        server = MagicMock()
+        server.started = False  # 始终未就绪
+        server.serve = AsyncMock(side_effect=RuntimeError("port in use"))
+        sleep_calls: list[float] = []
+
+        async def fake_sleep(seconds):
+            sleep_calls.append(seconds)
+            # 真实让出事件循环：server_task 才有机会运行并进入 done 态
+            await real_sleep(0)
+
+        start = time_module.perf_counter()
+        with (
+            patch.object(main_mod, "PluginManager", return_value=manager),
+            patch.object(
+                main_mod, "apply_pending_restore", new=AsyncMock(return_value=False)
+            ),
+            patch.object(main_mod, "get_db", new=AsyncMock()),
+            patch.object(main_mod.config, "ignored_expiry_hours", 0),
+            patch.object(main_mod, "close_db", close_db),
+            patch.object(main_mod.uvicorn, "Config", MagicMock()),
+            patch.object(main_mod.uvicorn, "Server", MagicMock(return_value=server)),
+            patch.object(main_mod, "_install_signal_handlers"),
+            patch.object(main_mod, "trigger_sync", return_value=None),
+            patch("briefdesk.main.asyncio.sleep", side_effect=fake_sleep),
+            self.assertRaises(RuntimeError),
+        ):
+            await main_mod._run()
+        elapsed = time_module.perf_counter() - start
+
+        self.assertLess(elapsed, 2.0, "启动失败不得白等满 10s")
+        # 第一轮 sleep 让出后 server_task 完成，第二轮即 break——远小于 200 轮
+        self.assertLessEqual(len(sleep_calls), 2, "循环应提前因 server_task.done() 退出")
+        manager.teardown_all.assert_awaited_once()
+        close_db.assert_awaited_once()
+
+
 class ReapTaskTest(unittest.IsolatedAsyncioTestCase):
     """_reap_task 直接单测（关闭期收尾契约，幂等且不向调用方传播异常）。"""
 

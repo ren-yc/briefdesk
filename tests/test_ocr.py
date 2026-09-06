@@ -16,7 +16,11 @@ from PIL import Image
 try:
     from rapidocr.main import RapidOCRError
 
-    from briefdesk.plugins.ocr.engine import _extract_text, ocr_image_bytes
+    from briefdesk.plugins.ocr.engine import (
+        _extract_text,
+        ocr_image_bytes,
+        ocr_images_bytes,
+    )
 
     _OCR_DEPS_AVAILABLE = True
 except ImportError:  # pragma: no cover — 未安装 OCR extra 时引擎测试跳过
@@ -94,6 +98,37 @@ class OcrImageBytesTest(unittest.IsolatedAsyncioTestCase):
             self.assertRaises(RuntimeError),
         ):
             await ocr_image_bytes(b"img")
+
+
+@unittest.skipUnless(_OCR_DEPS_AVAILABLE, "OCR 依赖未安装（pip install briefdesk[ocr]）")
+class OcrImagesBytesPerImageToleranceTest(unittest.IsolatedAsyncioTestCase):
+    async def test_single_image_failure_does_not_abandon_later_images(self):
+        # 复核 P3-7：循环内逐图容错——第 2 张失败（非 RapidOCRError），
+        # 第 1/3 张仍识别；此前无逐图 try，第 2 张失败使后续全部放弃。
+        async def fake_single(content: bytes) -> str:
+            if content == b"img2":
+                raise RuntimeError("decode broken")
+            return "text-of-" + content.decode()
+
+        with patch(
+            "briefdesk.plugins.ocr.engine.ocr_image_bytes",
+            new=AsyncMock(side_effect=fake_single),
+        ):
+            result = await ocr_images_bytes([b"img1", b"img2", b"img3"])
+
+        self.assertIn("[图片 1 OCR 结果]\ntext-of-img1", result)
+        self.assertIn("[图片 3 OCR 结果]\ntext-of-img3", result)
+        self.assertNotIn("img2", result)
+
+    async def test_all_failures_returns_empty(self):
+        async def fake_single(content: bytes) -> str:
+            raise RuntimeError("engine down")
+
+        with patch(
+            "briefdesk.plugins.ocr.engine.ocr_image_bytes",
+            new=AsyncMock(side_effect=fake_single),
+        ):
+            self.assertEqual(await ocr_images_bytes([b"img1", b"img2"]), "")
 
 
 class OcrPluginSetupTest(unittest.IsolatedAsyncioTestCase):

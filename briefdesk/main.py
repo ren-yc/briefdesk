@@ -328,6 +328,11 @@ async def _run() -> None:
         for _ in range(200):  # 最多等 10s（启动失败则跳过注册）
             if server.started:
                 break
+            if server_task.done():
+                # 复核 P3-4：启动失败（如端口占用）时 server_task 提前结束，
+                # 无需白等满 10s——提前退出等待，随后 await server_task 会把
+                # 失败抛给 finally 统一清理。
+                break
             await asyncio.sleep(0.05)
         _install_signal_handlers(asyncio.get_running_loop(), _shutdown)
 

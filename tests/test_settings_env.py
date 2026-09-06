@@ -444,6 +444,21 @@ class EnvRoutesTest(StagedFileTestCase):
         self.assertTrue(ai["configured"])
         self.assertFalse(ai["keyringConfigured"])
 
+    def test_keyring_empty_string_not_configured(self) -> None:
+        # 复核 P3-14：keyring 空串条目不得判「已配置」——`secrets set X ""`
+        # 会在钥匙串留下空串，is not None 会误报已配置，与实际解析链相反。
+        core_schema = [
+            {**item, "configured": False}
+            for item in settings_routes._CORE_SECRET_SCHEMA
+        ]
+        with patch.object(settings_routes, "_CORE_SECRET_SCHEMA", core_schema), patch.object(
+            settings_routes, "get_secret", return_value=""
+        ):
+            data = self.client.get("/api/settings/env").json()
+        ai = next(s for s in data["secrets"] if s["name"] == "AI_API_KEY")
+        self.assertFalse(ai["configured"])
+        self.assertFalse(ai["keyringConfigured"], "空串条目应判未配置")
+
     def test_secret_rejects_unknown_name_and_empty_value(self) -> None:
         res = self.client.post(
             "/api/settings/secrets", json={"name": "OTHER", "value": "x"}

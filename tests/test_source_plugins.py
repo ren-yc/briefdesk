@@ -169,3 +169,24 @@ class WeFlowPluginTest(unittest.IsolatedAsyncioTestCase):
         ):
             await plugin.setup(ctx)
         self.assertEqual(registered, [fake_runtime])
+
+
+class SseReconnectInitialMsValidationTest(unittest.TestCase):
+    """复核 P3-17：sse_reconnect_initial_ms 不得为 0（零间隔热重连风暴）。"""
+
+    def test_zero_initial_ms_rejected(self):
+        from pydantic import ValidationError
+
+        from briefdesk.plugins.qqflow.config import QqFlowSettings
+        from briefdesk.plugins.weflow.config import WeFlowSettings
+        from briefdesk.plugins.weflow_legacy.config import WeFlowLegacySettings
+
+        for cls in (WeFlowSettings, WeFlowLegacySettings, QqFlowSettings):
+            with self.assertRaises(ValidationError, msg=f"{cls.__name__} 应拒绝 0"):
+                cls(sse_reconnect_initial_ms=0)
+
+    def test_positive_initial_ms_accepted(self):
+        from briefdesk.plugins.weflow.config import WeFlowSettings
+
+        s = WeFlowSettings(sse_reconnect_initial_ms=1)
+        self.assertEqual(s.sse_reconnect_initial_ms, 1)

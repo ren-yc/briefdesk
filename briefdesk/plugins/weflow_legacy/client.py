@@ -263,7 +263,11 @@ class WeFlowLegacyClient(SourceClient):
                 if not resp.is_success:
                     # 重试响应失败必须走与主路径相同的错误出口：静默保留
                     # 首次的空 data 会让调用方拿到"成功"的空结果，把上游
-                    # 4xx/5xx 伪装成正常翻页终止（审查回归）
+                    # 4xx/5xx 伪装成正常翻页终止（审查回归）。
+                    # 复核 P3-16：not_found_ok 的 404 降级同样适用于重试分支，
+                    # 否则脏会话重试遇 404 本可降级空信封却令整会话失败。
+                    if not_found_ok and resp.status_code == 404:
+                        return None
                     raise RuntimeError(
                         f"WeFlow API error: {resp.status_code} on {path} (retry)"
                         f" — {resp.text[:200]}"

@@ -30,7 +30,7 @@ class QqFlowSettings(KeyringSettingsBase):
     db_path: str = ""
     sse_reconnect_initial_ms: int = Field(
         default=1000,
-        ge=0,  # env: QQFLOW_SSE_RECONNECT_INITIAL_MS
+        gt=0,  # env: QQFLOW_SSE_RECONNECT_INITIAL_MS（复核 P3-17：0 会退化为热重连风暴）
     )
     sse_reconnect_max_ms: int = Field(
         default=60000,

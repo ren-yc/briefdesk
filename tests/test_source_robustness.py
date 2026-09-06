@@ -584,6 +584,42 @@ class LegacyMessagesNotFoundTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(resp, {"messages": [], "hasMore": False})
         self.assertTrue(get_mock.call_args.kwargs.get("not_found_ok"))
 
+    async def test_retry_on_empty_404_with_not_found_ok_returns_none(self):
+        """复核 P3-16：retry_on_empty 的重试分支遇 404 且 not_found_ok=True
+        应降级返回 None（与主路径同口径），而非 raise 令整会话失败。"""
+
+        class _Empty:
+            status_code = 200
+            is_success = True
+            text = ""
+            url = httpx.URL("http://127.0.0.1:5031/api/v1/messages")
+
+            def json(self) -> dict:
+                return {"messages": []}
+
+        class _NotFound:
+            status_code = 404
+            is_success = False
+            text = "not found"
+            url = httpx.URL("http://127.0.0.1:5031/api/v1/messages")
+
+            def json(self) -> dict:
+                return {}
+
+        client = WeFlowLegacyClient("http://127.0.0.1:5031", "tok")
+        # 首次返回空 messages（触发重试），重试返回 404
+        with patch(
+            "briefdesk.plugins.weflow_legacy.client.with_connect_retry",
+            AsyncMock(side_effect=[_Empty(), _NotFound()]),
+        ):
+            resp = await client._get(
+                "/api/v1/messages",
+                retry_on_empty=True,
+                not_found_ok=True,
+                params={"talker": "g1"},
+            )
+        self.assertIsNone(resp, "重试遇 404 且 not_found_ok=True 应降级 None")
+
 
 class SseConnectLoopSurvivesGenericErrorTest(unittest.IsolatedAsyncioTestCase):
     """【复核 P1】_connect_loop 对非取消异常必须自愈：带栈记日志后退避重连。

@@ -298,7 +298,10 @@ async def api_settings_env():
         if name == DB_KEYS_BASE:
             keyring_configured = get_db_keys() is not None
         else:
-            keyring_configured = get_secret(name) is not None
+            # 复核 P3-14：按真值判定而非 is not None——`secrets set X ""` 会在
+            # 钥匙串留下空串条目，is not None 会误判「已配置」，与解析链
+            # （configured_names 等按真值）相反，UI 显示已配置但实际无效。
+            keyring_configured = bool(get_secret(name))
         secrets.append(
             {
                 "name": name,
