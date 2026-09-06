@@ -323,7 +323,8 @@ body.searching #category-nav { opacity: .45; pointer-events: none; }
 body.searching #category-nav::after {
   content: "搜索中 · 分类导航已停用（清空搜索后恢复）";
   display: block; font-size: 11px; color: var(--text-3);
-  padding: 6px 12px; white-space: nowrap;
+  padding: 6px 12px; /* 不设 nowrap：侧栏 200px 宽度放不下整句，换行避免尾部被裁 */
+  line-height: 1.5;
 }
 /* 类别颜色数据驱动：--cat 由 JS 按类别颜色内联注入（style="--cat:#xxx"）；
    无注入（遗留类别）时回退 --cat-default */

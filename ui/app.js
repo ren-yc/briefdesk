@@ -1035,15 +1035,11 @@ function bindHashRouteEvents() {
     if (v) {
       applyHashView(v);
     } else {
+      // 清空走 clearSearch()：与其余退出搜索路径同一条同步链（含 body.searching
+      // 摘牌与防抖计时器清理），避免浏览器后退后搜索框已空、导航仍「已停用」。
+      clearSearch();
       currentCategory = "全部";
       currentVerified = "unverified";
-      currentSearch = "";
-      preSearchCategory = "";
-      searchFilterCat = "";
-      searchFilterRange = "";
-      searchFilterGroup = "";
-      $itemSearch.value = "";
-      $itemSearchClear.classList.add("hidden");
       updateActiveNav();
     }
     fetchData();
@@ -1432,6 +1428,15 @@ function renderSearchHistoryDropdown(show) {
   });
 }
 
+// `body.searching` 是「分类导航停用」的唯一开关，必须与 currentSearch 同真假。
+// 会改 currentSearch 的只有三处——applySearch / clearSearch / applyHashView——
+// 全部经本函数同步。此前只有 applySearch 切换它：clearSearch()（备忘录/已忽略/
+// 分类入口等退出路径）与 applyHashView（hash 恢复）清空搜索后不摘牌，导航停在
+// 「已停用」且 pointer-events:none，搜索框却已是空的，侧栏整段无法操作。
+function updateSearchingClass() {
+  document.body.classList.toggle("searching", !!currentSearch);
+}
+
 function applySearch(term) {
   exitPluginViews(); // 搜索 → 列表视图（退出插件视图）
   const hadTerm = !!currentSearch;
@@ -1444,7 +1449,7 @@ function applySearch(term) {
   currentSearch = term;
   // 搜索态全局标记：侧栏分类导航禁用并给说明。此前导航可点且第一步就
   // clearSearch()——点击侧栏会静默丢弃整个搜索，且与过滤条同名 chip 语义相反。
-  document.body.classList.toggle("searching", !!term);
+  updateSearchingClass();
   if (term) {
     // 搜索跨全部分类
     currentCategory = "全部";
@@ -1471,6 +1476,7 @@ function clearSearch() {
   searchFilterRange = "";
   searchFilterGroup = "";
   $itemSearchClear.classList.add("hidden");
+  updateSearchingClass(); // 退出搜索路径必须同步摘牌，否则导航停在「已停用」
 }
 
 // ── 点类别标签跳转到该分类视图（单源）──
@@ -4727,6 +4733,7 @@ function applyHashView(v) {
   searchFilterGroup = "";
   $itemSearch.value = v.q;
   $itemSearchClear.classList.toggle("hidden", !v.q);
+  updateSearchingClass(); // hash 恢复也可能带/不带搜索词，与 currentSearch 同步
   updateActiveNav();
 }
 
