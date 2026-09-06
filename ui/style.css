@@ -908,7 +908,8 @@ body.modal-open { overflow: hidden; }
 }
 .seg-pill {
   position: absolute; top: 2px; left: 2px;
-  width: calc(33.333% - 2px); height: calc(100% - 4px); /* 三档位等宽 */
+  /* 百分比按 padding box 解析，先扣左右 4px 内边距还原内容盒再等分，与 flex:1 1 0 的等分口径一致 */
+  width: calc((100% - 4px) / 3); height: calc(100% - 4px); /* 三档位等宽 */
   border-radius: 999px;
   background: var(--accent);
   /* 原写死 rgba(27,94,65,…) 即旧墨绿字面值：主题色一变就不跟随 */
@@ -920,6 +921,8 @@ body.modal-open { overflow: hidden; }
 .seg-btn {
   position: relative; z-index: 1;
   flex: 1 1 0;
+  min-width: 0; /* 抵消 flex 项 min-width:auto 下限：三字文案 68px 会顶破 64px 等分宽，档位因此不等宽 */
+  display: flex; justify-content: center; align-items: center; /* text-align 对溢出行不生效，flex 居中让文字对称侵入自身 padding 保持光学居中 */
   padding: 4px 16px;
   border: none; background: transparent;
   font-family: inherit; font-size: 12px; font-weight: 600;
