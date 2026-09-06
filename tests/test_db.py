@@ -4,7 +4,6 @@ import asyncio
 import hashlib
 import os
 import shutil
-import sqlite3
 import tempfile
 import unittest
 import uuid
@@ -27,6 +26,7 @@ from briefdesk.db import (
     backup_db_to,
     bulk_insert_raw_messages,
     close_db,
+    db_redirect,
     delete_category,
     delete_items,
     get_all_item_texts,
@@ -36,6 +36,7 @@ from briefdesk.db import (
     get_db,
     get_due_reminders,
     get_group_count,
+    get_item_texts_by_ids,
     get_items,
     get_items_by_subject,
     get_items_page,
@@ -50,6 +51,7 @@ from briefdesk.db import (
     item_is_expired,
     load_embeddings,
     mark_message_processed,
+    mark_messages_processed,
     merge_source_group,
     purge_expired_ignored,
     set_item_reminder,
@@ -58,6 +60,7 @@ from briefdesk.db import (
     update_item_category,
     update_item_merged,
     update_item_verify,
+    update_items_verify,
     update_session_last_polls,
     upsert_embeddings,
     upsert_session,
@@ -977,6 +980,39 @@ class UpsertSessionTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(rows), 1)
 
 
+class GetItemTextsByIdsTest(unittest.IsolatedAsyncioTestCase):
+    """【复核 P2-18】按 id 取卡片文本（unverify 回加去重缓存的数据源）。"""
+
+    async def asyncSetUp(self):
+        self.db = await aiosqlite.connect(":memory:")
+        self.db.row_factory = aiosqlite.Row
+        await init_schema(self.db)
+        for i, title in (("i1", "标题一"), ("i2", "标题二")):
+            await self.db.execute(
+                "INSERT INTO items (id, category, title, source_quote, source_group, "
+                "source, source_msg_id, msg_time, is_verified, created_at) "
+                "VALUES (?, '活动通知', ?, '引文', '项目群', 'weflow-legacy', ?, 100, 0, "
+                "'2026-01-01T00:00:00+00:00')",
+                (i, title, i),
+            )
+        await self.db.commit()
+
+    async def asyncTearDown(self):
+        await self.db.close()
+
+    async def test_returns_rows_in_shape_of_warmup(self):
+        with patch("briefdesk.db.get_db", new=AsyncMock(return_value=self.db)):
+            rows = await get_item_texts_by_ids(["i1", "missing"])
+        self.assertEqual([r["id"] for r in rows], ["i1"], "缺失 id 静默跳过")
+        self.assertEqual(rows[0]["title"], "标题一")
+        self.assertEqual(rows[0]["source"], "weflow-legacy")
+        self.assertEqual(rows[0]["source_quote"], "引文")
+
+    async def test_empty_input_is_noop(self):
+        with patch("briefdesk.db.get_db", new=AsyncMock(return_value=self.db)):
+            self.assertEqual(await get_item_texts_by_ids([]), [])
+
+
 class SessionWatermarkTest(unittest.IsolatedAsyncioTestCase):
     """会话水位（增量轮询）读写与未处理消息按会话查询。"""
 
@@ -1031,6 +1067,43 @@ class SessionWatermarkTest(unittest.IsolatedAsyncioTestCase):
         await mark_message_processed("weflow-legacy", "f1")
         await mark_message_processed("weflow-legacy", "f2")
         self.assertEqual(await get_oldest_unprocessed_by_session("weflow-legacy"), {"g2": 200})
+
+    async def test_chunked_queries_span_multiple_batches(self):
+        """超过 _SQL_VARS_CHUNK（900）的 IN 查询按块拼接：走 _execute_chunked
+        的两个读取口在跨块场景下结果完整（分块回归守卫，含 extra_params 路径）。"""
+        n = 905  # 900 + 5：恰好跨两块
+        await self.db.executemany(
+            "INSERT INTO sessions (source, session_id, name, is_group, enabled) "
+            "VALUES ('qqflow', ?, ?, 1, 0)",
+            [(f"s{i}", f"s{i}") for i in range(n)],
+        )
+        await self.db.executemany(
+            "INSERT OR IGNORE INTO processed_messages (source, msg_id, processed_at) "
+            "VALUES ('qqflow', ?, '2026-01-01T00:00:00+00:00')",
+            [(f"m{i}",) for i in range(n)],
+        )
+        await self.db.commit()
+        polls = await get_session_last_polls("qqflow", [f"s{i}" for i in range(n)])
+        self.assertEqual(len(polls), n, "跨块会话水位查询结果完整")
+        processed = await are_messages_processed("qqflow", [f"m{i}" for i in range(n)])
+        self.assertEqual(len(processed), n, "跨块已处理查询结果完整")
+
+    async def test_mark_messages_processed_bulk(self):
+        await self.db.execute(
+            "INSERT INTO raw_messages (source, msg_id, session_id, group_name, "
+            "sender_id, sender_name, content, timestamp) "
+            "VALUES ('weflow-legacy', 'f1', 'g1', '群', 'u', 'n', 'x', 100), "
+            "('weflow-legacy', 'f2', 'g1', '群', 'u', 'n', 'x', 300)"
+        )
+        await self.db.commit()
+        # 批量标记（含重复项：INSERT OR IGNORE 幂等）；空表 no-op 不抛
+        await mark_messages_processed(
+            [("weflow-legacy", "f1"), ("weflow-legacy", "f2"), ("weflow-legacy", "f2")]
+        )
+        await mark_messages_processed([])
+        self.assertEqual(
+            await get_oldest_unprocessed_by_session("weflow-legacy"), {}
+        )
 
     async def test_toggle_enable_clears_watermark(self):
         await update_session_last_polls("weflow-legacy", [("g1", 100)])
@@ -1683,6 +1756,32 @@ class EmbeddingsDbTest(unittest.IsolatedAsyncioTestCase):
         # 关闭后按需重建新连接，数据仍在（同一库文件）
         self.assertEqual((await load_embeddings("m"))["a"], [1.0])
 
+    async def test_close_db_closes_main_even_if_embed_close_fails(self):
+        """【核验 H3】_embed_db.close 抛错不得阻断 _db.close：残留的非 daemon
+        worker 线程会让解释器退出挂死（与关闭路径要防的故障同源），且两个
+        全局引用都必须置 None，保证后续按需重建不悬挂旧连接。"""
+        import briefdesk.db as db_module
+
+        await get_db()  # 主连接
+        await upsert_embeddings([("a", "m", [1.0])])  # 向量连接
+
+        embed_db = db_module._embed_db
+        main_db = db_module._db
+        self.assertIsNotNone(embed_db)
+        self.assertIsNotNone(main_db)
+
+        with (
+            patch.object(
+                embed_db, "close", side_effect=RuntimeError("模拟 close 失败")
+            ),
+            patch.object(main_db, "close") as main_close_mock,
+        ):
+            await close_db()
+
+        main_close_mock.assert_awaited_once()
+        self.assertIsNone(db_module._embed_db)
+        self.assertIsNone(db_module._db)
+
 
 # ── 审查修复回归测试（内存库，不触碰应用数据库文件）──
 
@@ -1778,6 +1877,98 @@ class DeleteCategoryPurgeCascadeTest(_InMemoryDbTest):
         self.assertEqual((await cur.fetchone())["cnt"], 1)
 
 
+class ChunkedWritePathTest(_InMemoryDbTest):
+    """_execute_chunked 写路径（fetch=False）：跨块 rowcount 累计完整。"""
+
+    async def _insert_items(self, n: int) -> list[str]:
+        ids = [f"i{i}" for i in range(n)]
+        await self.db.executemany(
+            "INSERT INTO items (id, category, title, source_quote, source_group, "
+            "source, source_msg_id, msg_time, is_verified, created_at) "
+            "VALUES (?, '活动通知', ?, '引文', '项目群', 'weflow-legacy', ?, 100, 0, "
+            "'2026-01-01T00:00:00+00:00')",
+            [(i, f"t{i}", i) for i in ids],
+        )
+        await self.db.commit()
+        return ids
+
+    async def test_update_items_verify_rowcount_across_chunks(self):
+        p1, p2 = self._patch_db()
+        with p1, p2:
+            ids = await self._insert_items(905)  # 900 + 5：跨两块
+            affected = await update_items_verify(ids, 1)
+        self.assertEqual(affected, 905, "跨块 UPDATE 的 rowcount 累计完整")
+
+    async def test_delete_items_rowcount_across_chunks(self):
+        p1, p2 = self._patch_db()
+        with p1, p2:
+            ids = await self._insert_items(905)
+            deleted = await delete_items(ids)
+        self.assertEqual(deleted, 905, "跨块 DELETE 的 rowcount 累计完整")
+        cur = await self.db.execute("SELECT COUNT(*) AS cnt FROM items")
+        self.assertEqual((await cur.fetchone())["cnt"], 0)
+
+
+class DbRedirectTest(unittest.IsolatedAsyncioTestCase):
+    """db_redirect 官方缝：窗口内单例指向临时库，退出原样还原。"""
+
+    async def test_redirect_swaps_and_restores_singletons(self):
+        import briefdesk.db as db_mod
+
+        saved_main, saved_embed = db_mod._db, db_mod._embed_db
+        with tempfile.TemporaryDirectory() as d:
+            async with db_redirect(os.path.join(d, "bench.sqlite")) as (
+                main_conn,
+                embed_conn,
+            ):
+                self.assertIs(db_mod._db, main_conn)
+                self.assertIs(db_mod._embed_db, embed_conn)
+                # 两条连接已按各自口径初始化 schema（空库可查）
+                cur = await main_conn.execute("SELECT COUNT(*) AS cnt FROM items")
+                self.assertEqual((await cur.fetchone())["cnt"], 0)
+                self.assertIsNotNone(embed_conn)
+            self.assertIs(db_mod._db, saved_main, "退出必须还原主连接单例")
+            self.assertIs(db_mod._embed_db, saved_embed, "退出必须还原向量连接单例")
+
+    async def test_second_connection_failure_closes_first(self):
+        import briefdesk.db as db_mod
+
+        real_init = db_mod._init_connection
+        created: list = []
+        closed = {"v": False}
+        calls = {"n": 0}
+
+        async def flaky_init(path, **kwargs):
+            calls["n"] += 1
+            if calls["n"] >= 2:
+                raise RuntimeError("disk full")
+            conn = await real_init(path, **kwargs)
+            orig_close = conn.close
+
+            async def spy_close():
+                closed["v"] = True
+                await orig_close()
+
+            conn.close = spy_close
+            created.append(conn)
+            return conn
+
+        saved_main, saved_embed = db_mod._db, db_mod._embed_db
+        with tempfile.TemporaryDirectory() as d:
+            with (
+                patch.object(db_mod, "_init_connection", new=flaky_init),
+                self.assertRaises(RuntimeError),
+            ):
+                async with db_redirect(os.path.join(d, "bench.sqlite")):
+                    pass  # 不可达：进入即失败
+            # 半程失败：第一条连接已关闭（不留非 daemon worker 线程）、
+            # 模块单例未被换入
+            self.assertEqual(calls["n"], 2)
+            self.assertTrue(closed["v"], "半程失败的 main_conn 未被关闭")
+            self.assertIs(db_mod._db, saved_main)
+            self.assertIs(db_mod._embed_db, saved_embed)
+
+
 class DeleteItemsRollbackTest(_InMemoryDbTest):
     """审查修复 #1a：多步写异常路径必须 rollback，不留悬挂事务。
 
@@ -1792,14 +1983,14 @@ class DeleteItemsRollbackTest(_InMemoryDbTest):
     """
 
     async def test_failed_multi_step_delete_leaves_no_open_transaction(self):
-        import briefdesk.db as db_mod
+        orig_execute = self.db.execute
 
-        orig_cursor = db_mod._cursor
-
-        def failing_cursor(db, sql, params=()):
+        async def failing_execute(sql, params=()):
+            # delete_items 已迁 _execute_chunked（不再走 _cursor），注入点改为
+            # 连接的 execute：末步（items 删除）抛错，前两步已真实写入
             if sql.startswith("DELETE FROM items WHERE id IN"):
-                raise sqlite3.OperationalError("injected: final delete failed")
-            return orig_cursor(db, sql, params)
+                raise RuntimeError("injected: final delete failed")
+            return await orig_execute(sql, params)
 
         # 先放两张可命中的卡与原文，前两步 DELETE 真实生效、事务已开
         with patch("briefdesk.db.get_db", new=AsyncMock(return_value=self.db)):
@@ -1819,8 +2010,8 @@ class DeleteItemsRollbackTest(_InMemoryDbTest):
                 ]
             )
             with (
-                patch.object(db_mod, "_cursor", new=failing_cursor),
-                self.assertRaises(sqlite3.OperationalError),
+                patch.object(self.db, "execute", new=failing_execute),
+                self.assertRaises(RuntimeError),
             ):
                 await delete_items([item_id])
         self.assertFalse(

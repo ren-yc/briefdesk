@@ -1,7 +1,8 @@
 """日志配置 — 使用标准 logging 模块，格式对齐 uvicorn/FastAPI（彩色、10 字符级别）。
 
-支持 LOG_LEVEL 配置（.env 或环境变量，DEBUG / INFO / WARNING / ERROR，另接受
-uvicorn 的 TRACE，默认 INFO）：DEBUG 开启逐条细节（每条事件、每条过滤决策，以及
+支持 LOG_LEVEL 配置（.env 或环境变量，DEBUG / INFO / WARNING / ERROR /
+CRITICAL，另接受 uvicorn 的 TRACE，默认 INFO）：DEBUG 开启逐条细节（每条事件、
+每条过滤决策，以及
 uvicorn/FastAPI 的每次 HTTP 请求——见 _AccessLogGate），INFO 只保留阶段与汇总行。
 级别经 briefdesk.config.Settings 读取（与全项目配置同源），直接读 os.environ
 看不到 .env 内容。
@@ -274,8 +275,9 @@ def setup_logging(level: int | None = None) -> None:
     logging.getLogger("PIL").setLevel(logging.WARNING)
 
     # RapidOCR 图片无文字时抛 RapidOCRError 并记 WARNING，属正常现象
-    # （ocr.py 已把该异常视为"未识别到文字"返回空串，不向调用方抛错；
-    # 此处仅压制 rapidocr 自身 logger 的 WARNING 噪音）。其 logger 自带
+    # （briefdesk/plugins/ocr/engine.py 已把该异常视为"未识别到文字"返回
+    # 空串，不向调用方抛错；此处仅压制 rapidocr 自身 logger 的 WARNING 噪音）。
+    # 其 logger 自带
     # handler 且 propagate=False，根 logger 级别压不住，须在 logger 上挂 filter。
     # 注意：logger 实例须在 RapidOCR 首次构造前就拿到（logging 按名注册表
     # 返回同一实例，filter 在 handler 添加后依然生效）。

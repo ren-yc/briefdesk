@@ -4,20 +4,18 @@
 activate 无副作用（监听启动由应用层在服务器就绪后统一编排）；
 teardown 关闭 runtime（幂等）。
 
-本插件为旧版 WeFlow 消息源，改名腾出 `weflow` 标识给未来新源。无必填
-配置校验（缺 WEFLOW_LEGACY_API_TOKEN 时插件仍注册，与旧工厂语义一致）：
-缺失会在 setup 阶段打醒目 WARNING，首次同步时由上游调用报错定位——
-不采用自禁用（weflow-legacy 是默认源，自禁用会触发"零源报错"中止启动）。
+本插件为旧版 WeFlow 消息源，改名腾出 `weflow` 标识给未来新源。必填
+配置校验与 weflow/qqflow 统一（决策 ①=1B：零源降级启动后自禁用不再有
+「唯一源中止启动」的顾虑，.env.example 亦标注 WEFLOW_LEGACY_API_TOKEN
+必填）：缺失在装配期抛 PluginDisabledError 明示，配置后重启生效。
 """
 
-import logging
 from typing import Any
 
 from briefdesk.plugin.base import PluginContext, SourcePlugin
+from briefdesk.plugin.config_helpers import validate_required_config
 from briefdesk.settings_schema import build_settings_schema
 from briefdesk.sources_base import SourceRuntime
-
-logger = logging.getLogger(__name__)
 
 
 class WeFlowLegacyPlugin(SourcePlugin):
@@ -26,6 +24,10 @@ class WeFlowLegacyPlugin(SourcePlugin):
     name = "weflow-legacy"
     version = "1.0.0"
     dependencies: tuple[str, ...] = ()
+    # 与 weflow 互斥：同一上游（WeFlow/微信）的新旧两代采集器，
+    # 同时启用会重复采集同一批消息
+    conflicts: tuple[str, ...] = ("weflow",)
+    core = False  # 可选插件：默认禁用，经 PLUGINS / 设置页开关启用
 
     def __init__(self) -> None:
         self._runtime: SourceRuntime | None = None
@@ -54,12 +56,11 @@ class WeFlowLegacyPlugin(SourcePlugin):
         from briefdesk.plugins.weflow_legacy import runtime as wfl_runtime
 
         settings = wfl_config.WeFlowLegacySettings()
-        if not settings.api_token.get_secret_value():
-            logger.warning(
-                "WEFLOW_LEGACY_API_TOKEN 未配置：实时监听与历史"
-                "回填将在调用期失败。请在 .env 中填入 WeFlow Legacy HTTP API 访问"
-                "令牌后重启。"
-            )
+        # 必填校验与 weflow/qqflow 统一（决策 ①=1B：零源降级启动后，自禁用
+        # 不再引发「唯一源中止启动」；.env.example 标注本项必填）
+        validate_required_config(settings, {
+            'api_token': 'WEFLOW_LEGACY_API_TOKEN',
+        })
         runtime = wfl_runtime.WeFlowLegacySource()
         ctx.register_source(runtime)
         self._runtime = runtime

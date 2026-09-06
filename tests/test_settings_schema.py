@@ -74,6 +74,23 @@ class SettingsSchemaTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             normalize_setting(by_key["EXAMPLE_ENABLED"], "maybe")
 
+    def test_rejects_newline_and_inline_comment_in_string_value(self) -> None:
+        """【复核 P1-7】字符串值含换行 / ' #' 时拒绝：暂存文件是 KEY=VALUE
+        行格式，换行可注入任意配置行（含密钥名——路由白名单只过滤键名），
+        ' #' 会被 dotenv 当行内注释截断，写入/读回不保真。"""
+
+        class PlainSettings(BaseSettings):
+            greeting: str = "hi"
+
+            model_config = {"env_prefix": "PLAIN_"}
+
+        by_key = {item["key"]: item for item in build_settings_schema(PlainSettings)}
+        self.assertEqual(normalize_setting(by_key["PLAIN_GREETING"], "hello"), "hello")
+        with self.assertRaises(ValueError):
+            normalize_setting(by_key["PLAIN_GREETING"], "hello\nAI_API_KEY=sk-evil")
+        with self.assertRaises(ValueError):
+            normalize_setting(by_key["PLAIN_GREETING"], "hello # comment")
+
     def test_text_value_rejects_newlines_and_inline_comment(self) -> None:
         # 审查回归：text 型暂存值含 CR/LF 时会向暂存文件注入任意 KEY=VALUE 行
         # （绕过键白名单与「密钥只走 keyring」分层）；「 #」是 dotenv 行内

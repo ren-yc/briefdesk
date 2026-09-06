@@ -16,7 +16,7 @@ import logging
 import time as time_module
 from collections.abc import AsyncIterator, Callable
 from datetime import UTC, datetime, timedelta
-from typing import Any, Literal, TypedDict
+from typing import Any, Literal, TypedDict, cast
 
 import httpx
 
@@ -505,6 +505,7 @@ class WeFlowLegacyClient(SourceClient):
         offset: int = 0,
         media: bool = False,
         retry_on_empty: bool = True,
+        not_found_ok: bool = False,
     ) -> WeFlowLegacyMessagesResponse:
         """获取指定会话的历史消息（返回完整信封，含 hasMore）。
 
@@ -519,6 +520,8 @@ class WeFlowLegacyClient(SourceClient):
             media: 是否导出媒体（图片等），为 True 时附加 media=1&image=1
             retry_on_empty: 空结果是否 500ms 后重试一次（回查链路应传 False；
                 轮询首页保留默认 True 以维持既有「刚入库查不到」竞态兜底）
+            not_found_ok: 会话不存在（404）时返回空信封而非抛错；轮询路径应
+                传 True（对齐 weflow/qqflow 的脏会话容错，复核 U1-1）
 
         查询参数经 params= 由 httpx 编码（与 weflow/qqflow 客户端一致）：
         会话 ID 拼进查询串时若含保留字符（&、=、# 等）手拼会产生错误请求。
@@ -529,10 +532,17 @@ class WeFlowLegacyClient(SourceClient):
         if media:
             params["media"] = 1
             params["image"] = 1
-        data: WeFlowLegacyMessagesResponse = await self._get(
-            "/api/v1/messages", params=params, retry_on_empty=retry_on_empty
+        # 不标注返回类型：not_found_ok=True 时 _get 可能返回 None，
+        # 标成 WeFlowLegacyMessagesResponse 会让下面的 None 判空显得不可达
+        data = await self._get(
+            "/api/v1/messages",
+            params=params,  # httpx 编码：talker 含 &/%/非 ASCII 时手拼查询串会被截断污染
+            retry_on_empty=retry_on_empty,
+            not_found_ok=not_found_ok,
         )
-        return data
+        if data is None:
+            return {"messages": [], "hasMore": False}
+        return cast(WeFlowLegacyMessagesResponse, data)
 
     # ── SSE 流 ──
 

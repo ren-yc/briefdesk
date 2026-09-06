@@ -38,9 +38,16 @@ class JudgeUserMessageTest(unittest.TestCase):
         self.assertIn("面交", p)
 
     def test_message_escapes_braces_safely(self):
-        # 数据可能含花括号：replace 填充不会被 str.format/f-string 误解析
+        # 数据可能含花括号：填充不会被 str.format/f-string 误解析
         p = _build_judge_user_message("{特殊}", "x", "y", "z")
         self.assertIn("{特殊}", p)
+
+    def test_message_does_not_rescan_data_values(self):
+        # P6 同款缺陷守卫：数据值含模板占位符字面量时不得被二次替换
+        # （旧顺序 replace 链会把 desc_a 里的 "{desc_b}" 换成卡片B 内容）
+        p = _build_judge_user_message("甲", "原文含 {desc_b} 字面量", "乙", "丙")
+        self.assertIn("原文含 {desc_b} 字面量", p)
+        self.assertIn("内容：丙", p)
 
 
 class JudgeSystemPromptTest(unittest.TestCase):

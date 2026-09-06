@@ -285,7 +285,7 @@ class WeflowPollerSelfDropTest(unittest.IsolatedAsyncioTestCase):
 
         async def fetch_messages(
             self, talker, start_ts, limit=500, offset=0, media=False,
-            retry_on_empty=True,
+            not_found_ok=False, retry_on_empty=True,
         ):
             return {"messages": self._messages, "hasMore": False}
 
@@ -365,7 +365,9 @@ class QqflowPollerSelfDropTest(unittest.IsolatedAsyncioTestCase):
         async def fetch_sessions(self):
             return [{"username": "g1", "displayName": "群", "type": 2}]
 
-        async def fetch_messages(self, talker, start=None, limit=500, offset=0):
+        async def fetch_messages(
+            self, talker, start=None, limit=500, offset=0, not_found_ok=False
+        ):
             return {"messages": self._messages, "hasMore": False}
 
     def _enabled(self):

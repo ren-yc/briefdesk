@@ -15,9 +15,14 @@ from unittest.mock import AsyncMock, patch
 
 import httpx
 
-from briefdesk.plugins.weflow.client import WeFlowClient, WeFlowNotReadyError
+from briefdesk.plugins.weflow.client import (
+    WeFlowAccountMismatchError,
+    WeFlowClient,
+    WeFlowNotReadyError,
+)
 from briefdesk.plugins.weflow.config import WeFlowSettings
 from briefdesk.plugins.weflow.poller import _session_kind
+from briefdesk.sources_base import SourceError
 
 
 def _client() -> WeFlowClient:
@@ -41,16 +46,27 @@ def _health(phase: str = "unregistered", version: str = "0.5.0") -> dict:
     }
 
 
+def _own(state: str = "ready") -> list[dict]:
+    """明细：绑定的就是 _client() 配置的那个 wxid（身份闸门放行）。"""
+    return [{"wxid": "wxid_test_0001", "state": state}]
+
+
+def _foreign(state: str = "ready") -> list[dict]:
+    """明细：绑定的是**另一个** wxid（身份闸门应抛错）。"""
+    return [{"wxid": "wxid_other_0002", "state": state}]
+
+
 class EnsureReadyTest(unittest.IsolatedAsyncioTestCase):
     """ensure_ready 的健康检查短路与注册决策。"""
 
     async def test_ready_account_skips_registration(self):
-        """已有 ready 账号：不注册，且记忆化（后续调用不再查 health）。"""
+        """已有 ready 的**自有**账号：不注册，且记忆化（后续调用不再查 health）。"""
         client = _client()
         with (
             patch.object(
                 client, "fetch_health", AsyncMock(return_value=_health("ready"))
             ) as health,
+            patch.object(client, "fetch_accounts", AsyncMock(return_value=_own())),
             patch.object(client, "register_account", AsyncMock()) as register,
         ):
             await client.ensure_ready()
@@ -59,11 +75,14 @@ class EnsureReadyTest(unittest.IsolatedAsyncioTestCase):
         health.assert_awaited_once()
 
     async def test_indexing_account_skips_registration(self):
-        """账号建索引中（indexing）：良性态，不重复注册（防注册风暴）。"""
+        """自有账号建索引中（indexing）：良性态，不重复注册（防注册风暴）。"""
         client = _client()
         with (
             patch.object(
                 client, "fetch_health", AsyncMock(return_value=_health("indexing"))
+            ),
+            patch.object(
+                client, "fetch_accounts", AsyncMock(return_value=_own("indexing"))
             ),
             patch.object(client, "register_account", AsyncMock()) as register,
         ):
@@ -147,6 +166,7 @@ class EnsureReadyTest(unittest.IsolatedAsyncioTestCase):
             self.assertLogs("briefdesk.plugins.weflow.client", "WARNING") as logs,
         ):
             await client.ensure_ready()
+        # 身份闸门取过一次，_log_account_errors 复用同一份，不得再打一次 GET
         accounts.assert_awaited_once()
         register.assert_awaited_once()  # 诊断不得挡住注册重试
         self.assertTrue(any("页 1 HMAC 校验失败" in m for m in logs.output))
@@ -171,23 +191,141 @@ class EnsureReadyTest(unittest.IsolatedAsyncioTestCase):
         register.assert_awaited_once()
         self.assertTrue(client._ready_checked)
 
-    async def test_account_conflict_is_not_memoized(self):
-        """服务端已绑定另一个 wxid：不记忆化（人工注销/改配置后自愈），按 ERROR 报。"""
+    async def test_account_conflict_propagates_from_register(self):
+        """注册回 account_conflict：冒泡为账号不符，且不记忆化。
+
+        取代旧的「按 ERROR 报后正常返回」用例 —— 静默返回会让 poller 继续跑，
+        而服务端绑的是别人的账号，继续跑就是在入库他人消息。
+        这里只测**传播**（抛出点在 register_account 内部，HTTP 层用例见
+        RegisterConflictHttpTest），故让桩自己抛。
+        """
         client = _client()
         with (
             patch.object(client, "fetch_health", AsyncMock(return_value=_health())),
             patch.object(
                 client,
                 "register_account",
-                AsyncMock(return_value=("account_conflict", "unknown")),
+                AsyncMock(side_effect=WeFlowAccountMismatchError("已绑定 wxid_other")),
             ) as register,
-            self.assertLogs("briefdesk.plugins.weflow.client", "ERROR") as logs,
+        ):
+            with self.assertRaises(WeFlowAccountMismatchError):
+                await client.ensure_ready()
+            self.assertFalse(client._ready_checked, "账号不符不得记忆化")
+            with self.assertRaises(WeFlowAccountMismatchError):
+                await client.ensure_ready()  # 未记忆化 → 下轮重试
+        self.assertEqual(register.await_count, 2)
+
+    async def test_mismatch_error_is_not_a_not_ready_error(self):
+        """最关键的防回归：账号不符**不能**被当成瞬态未就绪。
+
+        WeFlowNotReadyError 会被 poller/runtime 静默跳过本轮，若不符错误继承了
+        它，这个修复就完全失效 —— 用户看不到 lastError，他人消息继续静默入库。
+        """
+        self.assertTrue(issubclass(WeFlowAccountMismatchError, SourceError))
+        self.assertFalse(
+            issubclass(WeFlowAccountMismatchError, WeFlowNotReadyError),
+            "不符是稳态故障，必须冒泡，不能走瞬态静默跳过的路径",
+        )
+
+    # ── 身份闸门：/health 的标量阶段不含身份，短路前必须比对账号 ──
+
+    async def test_ready_phase_with_foreign_account_raises(self):
+        """服务端 ready 但绑的是别人的 wxid：抛错，不短路、不注册、不记忆化。"""
+        client = _client()
+        with (
+            patch.object(
+                client, "fetch_health", AsyncMock(return_value=_health("ready"))
+            ),
+            patch.object(client, "fetch_accounts", AsyncMock(return_value=_foreign())),
+            patch.object(client, "register_account", AsyncMock()) as register,
+            self.assertRaises(WeFlowAccountMismatchError) as cm,
         ):
             await client.ensure_ready()
-            self.assertFalse(client._ready_checked)
-            await client.ensure_ready()  # 未记忆化 → 下轮重试
-        self.assertEqual(register.await_count, 2)
-        self.assertTrue(any("已绑定另一个账号" in m for m in logs.output))
+        self.assertIn("wxid_other_0002", str(cm.exception))
+        self.assertIn("wxid_test_0001", str(cm.exception), "要给出本地配置值")
+        register.assert_not_called()
+        self.assertFalse(client._ready_checked)
+
+    async def test_indexing_phase_with_foreign_account_raises(self):
+        """indexing 阶段同样比对身份（别人的账号正在建索引）。"""
+        client = _client()
+        with (
+            patch.object(
+                client, "fetch_health", AsyncMock(return_value=_health("indexing"))
+            ),
+            patch.object(
+                client, "fetch_accounts", AsyncMock(return_value=_foreign("indexing"))
+            ),
+            patch.object(client, "register_account", AsyncMock()) as register,
+            self.assertRaises(WeFlowAccountMismatchError),
+        ):
+            await client.ensure_ready()
+        register.assert_not_called()
+
+    async def test_error_phase_with_foreign_account_raises(self):
+        """error 阶段也要比对：上游的 error 不释放绑定，占用仍然成立。"""
+        client = _client()
+        with (
+            patch.object(
+                client, "fetch_health", AsyncMock(return_value=_health("error"))
+            ),
+            patch.object(
+                client, "fetch_accounts", AsyncMock(return_value=_foreign("error"))
+            ),
+            patch.object(client, "register_account", AsyncMock()) as register,
+            self.assertRaises(WeFlowAccountMismatchError),
+        ):
+            await client.ensure_ready()
+        register.assert_not_called()
+
+    async def test_awaiting_key_entry_is_not_treated_as_bound(self):
+        """只有 awaiting_key 条目 = 无人绑定：不得据此判定不符。
+
+        weflow 的 account_views() 会把启动扫描发现但未注册的账号合成进明细
+        （state=awaiting_key），那些不代表绑定，必须排除。
+        """
+        client = _client()
+        with (
+            patch.object(
+                client, "fetch_health", AsyncMock(return_value=_health("ready"))
+            ),
+            patch.object(
+                client,
+                "fetch_accounts",
+                AsyncMock(return_value=_foreign("awaiting_key")),
+            ),
+            patch.object(
+                client,
+                "register_account",
+                AsyncMock(return_value=("accepted", "indexing")),
+            ) as register,
+        ):
+            await client.ensure_ready()  # 不抛
+        register.assert_awaited_once()  # 无法确认 → 交给注册守卫定夺
+
+    async def test_detail_unavailable_falls_through_to_register(self):
+        """明细端点取不到时不硬失败：退回注册，由上游冲突守卫兜底判定身份。
+
+        双层设计的下层——鉴权端点只是快路，挂了不能让整源不可用。
+        """
+        client = _client()
+        with (
+            patch.object(
+                client, "fetch_health", AsyncMock(return_value=_health("ready"))
+            ),
+            patch.object(
+                client,
+                "fetch_accounts",
+                AsyncMock(side_effect=RuntimeError("detail 端点 500")),
+            ),
+            patch.object(
+                client,
+                "register_account",
+                AsyncMock(return_value=("accepted", "indexing")),
+            ) as register,
+        ):
+            await client.ensure_ready()  # 不抛
+        register.assert_awaited_once()
 
     async def test_health_failure_not_memoized(self):
         """健康检查失败（服务未起）：上抛且不记忆化，下轮重试。"""
@@ -210,6 +348,7 @@ class EnsureReadyTest(unittest.IsolatedAsyncioTestCase):
             patch.object(
                 client, "fetch_health", AsyncMock(return_value=_health("ready"))
             ) as health,
+            patch.object(client, "fetch_accounts", AsyncMock(return_value=_own())),
             patch.object(client, "register_account", AsyncMock()),
         ):
             await client.ensure_ready()
@@ -225,6 +364,7 @@ class EnsureReadyTest(unittest.IsolatedAsyncioTestCase):
                 "fetch_health",
                 AsyncMock(side_effect=[_health("ready"), _health()]),
             ),
+            patch.object(client, "fetch_accounts", AsyncMock(return_value=_own())),
             patch.object(
                 client,
                 "register_account",
@@ -299,6 +439,77 @@ class AccountDetailTest(unittest.IsolatedAsyncioTestCase):
             self.assertRaises(RuntimeError),
         ):
             await client.fetch_accounts()
+
+
+class RegisterConflictHttpTest(unittest.IsolatedAsyncioTestCase):
+    """register_account 就地抛账号不符 —— 在 HTTP 层验证（不打桩该方法）。
+
+    必须走 MockTransport：EnsureReadyTest 里 patch.object 把 register_account
+    整体换掉，那条路径上永远碰不到方法内部的 raise。
+    """
+
+    @staticmethod
+    def _client_with(handler) -> WeFlowClient:
+        client = _client()
+        client._client = httpx.AsyncClient(
+            base_url="http://127.0.0.1:5033",
+            transport=httpx.MockTransport(handler),
+        )
+        return client
+
+    async def test_register_conflict_raises_with_occupied_by(self):
+        """account_conflict 响应 → 抛不符，且把占用方写进消息（便于排障）。"""
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                json={
+                    "state": "account_conflict",
+                    "occupied_by": "wxid_other_0002",
+                    "occupied_status": "ready",
+                },
+            )
+
+        client = self._client_with(handler)
+        try:
+            with self.assertRaises(WeFlowAccountMismatchError) as cm:
+                await client.register_account()
+            self.assertIn("wxid_other_0002", str(cm.exception))
+            self.assertIn("wxid_test_0001", str(cm.exception))
+        finally:
+            await client.close()
+
+    async def test_benign_state_still_returns_two_tuple(self):
+        """良性态返回 (state, status) 形状不变（D6 只加抛出，不改签名）。"""
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json={"state": "accepted", "status": "indexing"})
+
+        client = self._client_with(handler)
+        try:
+            self.assertEqual(
+                await client.register_account(), ("accepted", "indexing")
+            )
+        finally:
+            await client.close()
+
+    async def test_register_400_is_not_reported_as_mismatch(self):
+        """错钥的同步 400 预校验（WCDB 页 1 HMAC）仍是 RuntimeError。
+
+        weflow 独有：SQLCipher 无等价的轻量页校验，qqflow 侧只能异步转 error。
+        这里断言两种失败不被混为一谈 —— 密钥错和账号错的处置完全不同。
+        """
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(400, json={"error": "页 1 HMAC 校验失败"})
+
+        client = self._client_with(handler)
+        try:
+            with self.assertRaises(RuntimeError) as cm:
+                await client.register_account()
+            self.assertNotIsInstance(cm.exception, WeFlowAccountMismatchError)
+        finally:
+            await client.close()
 
 
 class ReadyGateTest(unittest.IsolatedAsyncioTestCase):
@@ -513,6 +724,48 @@ class SessionKindTest(unittest.TestCase):
         self.assertEqual(_session_kind({"type": 2}), (False, True))
         self.assertEqual(_session_kind({"type": 3}), (False, False))
         self.assertEqual(_session_kind({}), (False, False))
+
+
+class SseSelfHealMismatchTest(unittest.IsolatedAsyncioTestCase):
+    """SSE 自愈检查遇账号不符时必须冒泡中止本轮监听（D5 止漏）。
+
+    与 test_source_robustness.SseSelfHealMismatchTest 同构：stream_events 自建
+    AsyncClient，故按 MockTransport 注入假构造器才能覆盖「HTTP 200 之后」那段。
+    """
+
+    async def _collect(self, client: WeFlowClient) -> list:
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                headers={"content-type": "text/event-stream"},
+                text='data: {"event":"message_new","rawid":"r1"}\n\n',
+            )
+
+        # 真身要提前抓住：patch 之后这个名字就是替身，工厂里再引用会无限递归。
+        real_cls = httpx.AsyncClient
+
+        with patch(
+            "briefdesk.plugins.weflow.client.httpx.AsyncClient",
+            lambda **_kw: real_cls(transport=httpx.MockTransport(handler)),
+        ):
+            return [event async for event in client.stream_events()]
+
+    async def test_mismatch_aborts_stream_instead_of_warning(self):
+        client = _client()
+        client.ensure_ready = AsyncMock(  # type: ignore[method-assign]
+            side_effect=WeFlowAccountMismatchError("已绑定另一个账号 wxid_other_0002")
+        )
+        with self.assertRaises(WeFlowAccountMismatchError):
+            await self._collect(client)
+
+    async def test_other_self_heal_failure_still_swallowed(self):
+        """反向断言：普通自愈失败仍降级为 WARNING，不得连坐掐断实时流。"""
+        client = _client()
+        client.ensure_ready = AsyncMock(  # type: ignore[method-assign]
+            side_effect=WeFlowNotReadyError("索引中")
+        )
+        events = await self._collect(client)
+        self.assertEqual([e.get("rawid") for e in events], ["r1"])
 
 
 if __name__ == "__main__":

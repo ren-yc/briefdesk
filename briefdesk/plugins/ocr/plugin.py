@@ -20,7 +20,7 @@ from collections.abc import Awaitable, Callable
 from briefdesk.config import config
 from briefdesk.imaging import downscale_image
 from briefdesk.logger import fmt_dur
-from briefdesk.masking import mask_content
+from briefdesk.masking import PLACEHOLDER_ONLY_RE, mask_content
 from briefdesk.plugin.base import PluginContext, PluginDisabledError, StagePlugin
 from briefdesk.sources_base import MediaError
 from briefdesk.types import BatchContext
@@ -34,6 +34,8 @@ class OcrPlugin(StagePlugin):
     name = "ocr"
     version = "1.0.0"
     dependencies: tuple[str, ...] = ()
+    conflicts: tuple[str, ...] = ()
+    core = False  # 可选插件：默认禁用，经 PLUGINS / 设置页开关启用
     slot = "enrich"
     priority = 0
 
@@ -103,7 +105,12 @@ class OcrPlugin(StagePlugin):
                 # OCR 文本是构造后替换进 content 的，需在替换前单独脱敏
                 # （原文部分已在 InternalMessage 构造时脱敏）
                 ocr_text = mask_content(ocr_text)
-                msg.content = "[OCR]\n" + ocr_text
+                if PLACEHOLDER_ONLY_RE.match(msg.content):
+                    msg.content = "[OCR]\n" + ocr_text
+                else:
+                    # 图+文混合消息保留人工原文（信息密度更高，且是分类/去重
+                    # 的完整上下文），OCR 识别文本作为附加段追加（复核 P2-21）
+                    msg.content = f"{msg.content}\n[OCR]\n{ocr_text}"
             logger.debug(
                 "OCR 完成: msg_id=%s, %d 图, %d bytes, 识别 %d 字 (%s)",
                 msg.msg_id,

@@ -10,7 +10,8 @@ import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
-from typing import Any, NotRequired, TypedDict, cast
+from pathlib import Path
+from typing import Any, Literal, NotRequired, TypedDict, cast, overload
 
 import aiosqlite
 
@@ -195,7 +196,9 @@ async def validate_schema(db: aiosqlite.Connection) -> None:
 
 
 class ItemInput(TypedDict):
-    """`items` 表字段的唯一定义源 — 除 DB 生成的 id/created_at 外的全部字段。
+    """`items` 表字段的插入定义源 — 除 DB 生成的 id/created_at 与两个专用
+    更新列（verified_at 由 update_item_verify 写入、remind_at 由
+    set_item_reminder 写入，均不参与 insert）外的全部插入字段。
 
     可空列声明为 `str | None`（键必在、值可为 None）：insert_item 与
     `SELECT *` 查询行都满足该形状。
@@ -222,7 +225,8 @@ class ItemInput(TypedDict):
 
 
 class ItemRow(ItemInput):
-    """Row from the `items` table — ItemInput 加 DB 生成的 id/created_at/verified_at。"""
+    """Row from the `items` table — ItemInput 加 DB 生成的 id/created_at/
+    verified_at，另加仅查询行携带的 remind_at。"""
 
     id: str
     created_at: str
@@ -401,35 +405,72 @@ def _sqlite_item_is_expired(
     return int(item_is_expired(start, end, extra_times, now_local))
 
 
+async def _init_connection(
+    path: str,
+    *,
+    validate_schema_flag: bool = True,
+    extra_pragmas: dict[str, str] | None = None,
+) -> aiosqlite.Connection:
+    """初始化数据库连接并设置 PRAGMA。
+
+    Args:
+        path: 数据库文件路径
+        validate_schema_flag: 是否执行 schema 验证（主连接需要，向量连接不需要）
+        extra_pragmas: 额外的 PRAGMA 设置（如 foreign_keys）
+
+    Returns:
+        已初始化的数据库连接
+
+    Raises:
+        SchemaMismatchError: schema 验证失败（仅当 validate_schema_flag=True）
+        SystemExit: schema 不匹配时拒绝启动
+    """
+    conn = await aiosqlite.connect(path)
+    conn.row_factory = aiosqlite.Row
+
+    # 默认 PRAGMA 设置
+    default_pragmas = {
+        "journal_mode": "WAL",
+        "busy_timeout": "5000",
+        "synchronous": "NORMAL",  # WAL 下 NORMAL 仅掉电丢最近一次提交
+    }
+    all_pragmas = {**default_pragmas, **(extra_pragmas or {})}
+
+    for key, value in all_pragmas.items():
+        cursor = await conn.execute(f"PRAGMA {key} = {value}")
+        await cursor.close()
+    await conn.commit()
+
+    # Schema 初始化/验证
+    try:
+        if validate_schema_flag:
+            await validate_schema(conn)
+        await init_schema(conn)  # 幂等：补建缺失的表
+    except SchemaMismatchError as e:
+        logger.critical("数据库 schema 不匹配，拒绝启动: %s", e)
+        await conn.close()
+        raise SystemExit(1) from e
+    except Exception:
+        # init 其余异常（磁盘满/库损坏等）：关闭本连接再上抛，
+        # 否则泄漏的 aiosqlite 连接（非 daemon worker 线程）滞留
+        await conn.close()
+        raise
+
+    return conn
+
+
 async def get_db() -> aiosqlite.Connection:
     global _db
     if _db is None:
         async with _lock:
             if _db is None:
-                conn = await aiosqlite.connect(config.db_path)
-                conn.row_factory = aiosqlite.Row
-                cursor = await conn.execute("PRAGMA journal_mode = WAL")
-                await cursor.close()
-                cursor = await conn.execute("PRAGMA foreign_keys = ON")
-                await cursor.close()
                 # 与向量连接对称（审计 B-1）：embed 连接持写锁落向量期间，
                 # 主连接的写操作短暂等待而非立即抛 "database is locked"
-                cursor = await conn.execute("PRAGMA busy_timeout = 5000")
-                await cursor.close()
-                await conn.commit()
-                try:
-                    await validate_schema(conn)
-                    await init_schema(conn)
-                except SchemaMismatchError as e:
-                    logger.critical("数据库 schema 不匹配，拒绝启动: %s", e)
-                    await conn.close()
-                    raise SystemExit(1) from e
-                except Exception:
-                    # init 其余异常（磁盘满/库损坏等）：关闭本连接再上抛，
-                    # 否则泄漏的 aiosqlite 连接（非 daemon worker 线程）滞留
-                    await conn.close()
-                    raise
-                _db = conn  # Only assign after full init
+                _db = await _init_connection(
+                    config.db_path,
+                    validate_schema_flag=True,
+                    extra_pragmas={"foreign_keys": "ON"},
+                )
     return _db
 
 
@@ -453,15 +494,55 @@ async def get_embed_db() -> aiosqlite.Connection:
     if _embed_db is None:
         async with _lock:
             if _embed_db is None:
-                conn = await aiosqlite.connect(config.db_path)
-                conn.row_factory = aiosqlite.Row
-                cursor = await conn.execute("PRAGMA journal_mode = WAL")
-                await cursor.close()
-                cursor = await conn.execute("PRAGMA busy_timeout = 5000")
-                await cursor.close()
-                await init_schema(conn)  # 幂等：同文件表结构由主连接维护，此处兜底
-                _embed_db = conn
+                # 与主连接同步语义一致（WAL + NORMAL）
+                _embed_db = await _init_connection(
+                    config.db_path,
+                    validate_schema_flag=False,  # 主连接已验证
+                )
     return _embed_db
+
+
+@asynccontextmanager
+async def db_redirect(
+    path: str | Path,
+) -> AsyncIterator[tuple[aiosqlite.Connection, aiosqlite.Connection]]:
+    """把主/向量连接整体重定向到 path 指向的独立库，退出时原样还原。
+
+    官方隔离缝（取代 benchmark 曾用的 get_db/get_embed_db 模块属性补丁）：
+    进入时按 get_db/get_embed_db 同口径在 path 上新建两条连接（主连接
+    validate_schema + foreign_keys=ON，向量连接免验证），并把模块级单例
+    指向它们——窗口内所有经 get_db()/get_embed_db() 的调用都落到临时库；
+    退出先同步还原单例（先于任何 await，取消路径也必达），再关闭临时
+    连接。应用已有连接不关闭、不改动，退出后继续使用。
+
+    调用方须自行保证窗口语义（benchmark 门闸：先暂停管道并排空在途批次
+    再进入；窗口内 UI 写操作会落到临时库并在退出后丢弃）。
+    """
+    global _db, _embed_db
+    main_conn = await _init_connection(
+        str(path), validate_schema_flag=True, extra_pragmas={"foreign_keys": "ON"}
+    )
+    try:
+        embed_conn = await _init_connection(str(path), validate_schema_flag=False)
+    except BaseException:
+        # 半程失败防护：第二条连接创建失败必须关闭第一条，
+        # 否则泄漏的 aiosqlite 连接（非 daemon worker 线程）滞留
+        await main_conn.close()
+        raise
+    saved_main, saved_embed = _db, _embed_db
+    _db, _embed_db = main_conn, embed_conn
+    try:
+        yield main_conn, embed_conn
+    finally:
+        _db, _embed_db = saved_main, saved_embed
+        try:
+            await embed_conn.close()
+        except Exception:  # 关闭失败不阻断另一连接与还原（ruff 0.16：记录日志的处理豁免 BLE001）
+            logger.debug("db_redirect: 临时向量连接关闭失败", exc_info=True)
+        try:
+            await main_conn.close()
+        except Exception:  # 同上
+            logger.debug("db_redirect: 临时主连接关闭失败", exc_info=True)
 
 
 async def close_db() -> None:
@@ -469,15 +550,30 @@ async def close_db() -> None:
 
     aiosqlite 的 worker 线程是非 daemon 的，若不关闭连接，
     它会永久阻塞在队列上，解释器退出 join 该线程时挂死。
+
+    双连接各自 try/finally 关闭：任一连接 close 抛错（如磁盘忙/线程异常）
+    不阻断另一连接——否则残留的非 daemon worker 线程会让解释器退出挂死
+    （与关闭路径要防的故障同源）。
     """
     global _db, _embed_db
+    embed_err: BaseException | None = None
     if _embed_db is not None:
-        await _embed_db.close()
-        _embed_db = None
-    if _db is None:
-        return
-    await _db.close()
-    _db = None
+        try:
+            await _embed_db.close()
+        except Exception as e:  # noqa: BLE001 — 关闭失败不阻断另一连接
+            embed_err = e
+        finally:
+            _embed_db = None
+    if _db is not None:
+        try:
+            await _db.close()
+        except Exception as e:  # noqa: BLE001 — 同上，记录后继续收尾
+            if embed_err is None:
+                embed_err = e
+        finally:
+            _db = None
+    if embed_err is not None:
+        logger.error("关闭数据库连接失败: %r", embed_err)
 
 
 # ── 查询助手（游标纪律：所有游标必须显式关闭，禁止依赖 GC）──
@@ -510,6 +606,112 @@ async def _fetchall(
         return list(await cursor.fetchall())
     finally:
         await cursor.close()
+
+
+@asynccontextmanager
+async def atomic_transaction(db: aiosqlite.Connection) -> AsyncIterator[aiosqlite.Connection]:
+    """原子事务上下文管理器：成功提交，失败回滚。
+
+    用于多步数据库操作，确保事务完整性。异常路径自动回滚后重新抛出。
+
+    示例：
+        async with atomic_transaction(db):
+            await db.execute("UPDATE ...")
+            await db.execute("DELETE ...")
+        # 成功则已提交，异常则已回滚
+    """
+    try:
+        yield db
+        await db.commit()
+    except Exception:
+        await db.rollback()
+        raise
+
+
+@overload
+async def _execute_chunked(
+    db: aiosqlite.Connection,
+    sql_template: str,
+    id_list: list[str],
+    chunk_size: int = 900,
+    *,
+    extra_params: tuple[Any, ...] = (),
+    fetch: Literal[True] = True,
+) -> list[aiosqlite.Row]: ...
+
+
+@overload
+async def _execute_chunked(
+    db: aiosqlite.Connection,
+    sql_template: str,
+    id_list: list[str],
+    chunk_size: int = 900,
+    *,
+    extra_params: tuple[Any, ...] = (),
+    fetch: Literal[False],
+) -> int: ...
+
+
+async def _execute_chunked(
+    db: aiosqlite.Connection,
+    sql_template: str,
+    id_list: list[str],
+    chunk_size: int = 900,
+    *,
+    extra_params: tuple[Any, ...] = (),
+    fetch: bool = True,
+) -> list[aiosqlite.Row] | int:
+    """分块执行 IN 语句，避免超过 SQLite 变量上限（32766）。
+
+    Args:
+        db: 数据库连接
+        sql_template: SQL模板，必须包含 {placeholders} 占位符
+        id_list: ID列表
+        chunk_size: 每批大小（默认900）
+        extra_params: 额外的固定参数（如 source），会放在 id_list 之前
+        fetch: True=执行查询并返回行列表；False=执行写语句（DELETE/UPDATE），
+            逐块累计并返回受影响行数
+
+    Returns:
+        fetch=True 时返回所有行的列表；fetch=False 时返回累计受影响行数
+
+    示例：
+        # 查询
+        rows = await _execute_chunked(
+            db,
+            "SELECT msg_id FROM processed_messages WHERE source = ? AND msg_id IN ({placeholders})",
+            msg_ids,
+            extra_params=(source,)
+        )
+
+        # 删除（返回累计删除行数；多步写由调用方的 atomic_transaction 包裹）
+        deleted = await _execute_chunked(
+            db,
+            "DELETE FROM items WHERE id IN ({placeholders})",
+            item_ids,
+            fetch=False,
+        )
+    """
+    if not id_list:
+        return [] if fetch else 0
+
+    results: list[aiosqlite.Row] = []
+    affected = 0
+    for i in range(0, len(id_list), chunk_size):
+        chunk = id_list[i : i + chunk_size]
+        placeholders = ",".join("?" * len(chunk))
+        sql = sql_template.format(placeholders=placeholders)
+        params = (*extra_params, *chunk)
+
+        if fetch:
+            rows = await _fetchall(db, sql, params)
+            results.extend(rows)
+        else:
+            cursor = await db.execute(sql, params)
+            affected += cursor.rowcount
+            await cursor.close()
+
+    return results if fetch else affected
 
 
 @asynccontextmanager
@@ -741,7 +943,8 @@ async def init_schema(db: aiosqlite.Connection) -> None:
 async def _seed_default_categories(db: aiosqlite.Connection) -> None:
     """类别表为空时播种默认分类（当前 13 类，出厂仅启用原五类；用户删光重启后恢复）。
 
-    与 schema DDL 同事务提交，get_db 是唯一 DB 入口，首次使用时必然播种。
+    与 schema DDL 同事务提交；get_db 与 get_embed_db 两个 DB 入口首次使用时
+    都会执行播种（后者为独立向量连接上的兜底 init_schema），首次使用必然播种。
     """
     row = await _fetchone(db, "SELECT COUNT(*) as cnt FROM categories")
     if row and row["cnt"] > 0:
@@ -784,7 +987,8 @@ async def _backfill_default_categories(db: aiosqlite.Connection) -> None:
     """一次性升级迁移（user_version 0→1）：为存量库补齐缺失的默认分类。
 
     背景：默认分类从 5 类扩到 13 类，但播种仅在类别表为空时触发——
-    升级前创建的库永远见不到新类。本函数按 name 前缀 INSERT OR IGNORE：
+    升级前创建的库永远见不到新类。本函数对全部默认分类 INSERT OR IGNORE
+    （去重依赖 categories.name 的 UNIQUE 约束，按 name 去重）：
     只补缺失项且带各自出厂启用态（原五类=1、新增八类=0），绝不改动已有行，
     因此用户对既有分类的禁用/改名不受影响。
 
@@ -1135,8 +1339,10 @@ async def get_items_page(
 
 
 # 停用类别的卡片不参与任何侧边栏计数（前端显示层面同样被过滤，两侧一致）；
-# 已删除类别（categories 无行）的遗留卡片同样不计数：侧边栏只统计
-# categories 表中仍存在的分类，避免"删了类别还显示计数"。
+# 已删除类别（categories 无行）的遗留卡片：「全部/备忘/忽略」三个计数与列表
+# 均包含（NOT IN 排除不了无行类别——这是找回/改类的唯一入口，产品语义），
+# 仅类别明细不统计（get_category_counts 靠 c.name IS NOT NULL）——
+# 「全部」计数 ≥ 各类之和是预期口径，勿"修复"。
 _DISABLED_CAT_SQL = (
     " AND category NOT IN (SELECT name FROM categories WHERE enabled = 0)"
 )
@@ -1202,14 +1408,16 @@ async def update_items_verify(ids: list[str], verified: int) -> int:
         return 0
     db = await get_db()
     now = datetime.now(UTC).isoformat()
-    placeholders = ",".join("?" for _ in ids)
-    async with _cursor(
-        db,
-        f"UPDATE items SET is_verified = ?, verified_at = ? WHERE id IN ({placeholders})",
-        (verified, now, *ids),
-    ) as cursor:
-        affected = cursor.rowcount
-    await db.commit()
+    # 分块后是多步写：异常路径必须回滚（悬挂事务会被后续无关 commit 收尾提交）
+    async with atomic_transaction(db):
+        affected = await _execute_chunked(
+            db,
+            "UPDATE items SET is_verified = ?, verified_at = ? WHERE id IN ({placeholders})",
+            ids,
+            chunk_size=_SQL_VARS_CHUNK,
+            extra_params=(verified, now),
+            fetch=False,
+        )
     return affected
 
 
@@ -1226,29 +1434,30 @@ async def delete_items(ids: list[str], *, keep_raw_messages: bool = False) -> in
     if not ids:
         return 0
     db = await get_db()
-    placeholders = ",".join("?" for _ in ids)
-    try:
-        await db.execute(
-            f"DELETE FROM item_embeddings WHERE item_id IN ({placeholders})", tuple(ids)
+    async with atomic_transaction(db):
+        await _execute_chunked(
+            db,
+            "DELETE FROM item_embeddings WHERE item_id IN ({placeholders})",
+            ids,
+            chunk_size=_SQL_VARS_CHUNK,
+            fetch=False,
         )
         if not keep_raw_messages:
-            await db.execute(
-                f"DELETE FROM raw_messages WHERE (source, msg_id) IN ("
-                f"SELECT source, source_msg_id FROM items WHERE id IN ({placeholders}))",
-                tuple(ids),
+            await _execute_chunked(
+                db,
+                "DELETE FROM raw_messages WHERE (source, msg_id) IN ("
+                "SELECT source, source_msg_id FROM items WHERE id IN ({placeholders}))",
+                ids,
+                chunk_size=_SQL_VARS_CHUNK,
+                fetch=False,
             )
-        async with _cursor(
+        deleted = await _execute_chunked(
             db,
-            f"DELETE FROM items WHERE id IN ({placeholders})",
-            tuple(ids),
-        ) as cursor:
-            deleted = cursor.rowcount
-    except Exception:
-        # 多步写异常路径必须回滚：悬挂事务会被下一个不相干写操作的
-        # commit 收尾提交，造成部分写入提前可见
-        await db.rollback()
-        raise
-    await db.commit()
+            "DELETE FROM items WHERE id IN ({placeholders})",
+            ids,
+            chunk_size=_SQL_VARS_CHUNK,
+            fetch=False,
+        )
     return deleted
 
 
@@ -1385,36 +1594,30 @@ async def update_item_merged(
     """
     db = await get_db()
     content_hash = hashlib.sha256(source_quote.encode()).hexdigest()[:16]
-    await db.execute(
-        "UPDATE items SET title = ?, key_info = ?, "
-        "source_quote = ?, subject = ?, start = ?, end = ?, "
-        "msg_time = ?, image_urls = ?, extra_times = ?, content_hash = ?, "
-        "article_url = ? WHERE id = ?",
-        (
-            title,
-            key_info or None,
-            source_quote,
-            subject or None,
-            start or None,
-            end or None,
-            msg_time,
-            image_urls,
-            extra_times,
-            content_hash,
-            article_url or "",
-            item_id,
-        ),
-    )
-    try:
+    async with atomic_transaction(db):
+        await db.execute(
+            "UPDATE items SET title = ?, key_info = ?, "
+            "source_quote = ?, subject = ?, start = ?, end = ?, "
+            "msg_time = ?, image_urls = ?, extra_times = ?, content_hash = ?, "
+            "article_url = ? WHERE id = ?",
+            (
+                title,
+                key_info or None,
+                source_quote,
+                subject or None,
+                start or None,
+                end or None,
+                msg_time,
+                image_urls,
+                extra_times,
+                content_hash,
+                article_url or "",
+                item_id,
+            ),
+        )
         await db.execute(
             "DELETE FROM item_embeddings WHERE item_id = ?", (item_id,)
         )
-    except Exception:
-        # 多步写异常路径必须回滚：悬挂事务被后续无关 commit 收尾提交后，
-        # 会留下"合并后新文本配旧向量"的语义漂移（docstring 上述要防的问题）
-        await db.rollback()
-        raise
-    await db.commit()
 
 
 # ── 提醒 / 日历 / 主体时间线 ──
@@ -1476,11 +1679,11 @@ async def get_items_verified_flags(item_ids: list[str]) -> dict[str, int]:
     if not item_ids:
         return {}
     db = await get_db()
-    placeholders = ",".join("?" * len(item_ids))
-    rows = await _fetchall(
+    rows = await _execute_chunked(
         db,
-        f"SELECT id, is_verified FROM items WHERE id IN ({placeholders})",
+        "SELECT id, is_verified FROM items WHERE id IN ({placeholders})",
         item_ids,
+        chunk_size=_SQL_VARS_CHUNK,
     )
     return {row["id"]: row["is_verified"] for row in rows}
 
@@ -1522,7 +1725,7 @@ async def purge_expired_ignored(expiry_hours: int) -> int:
     """
     db = await get_db()
     cutoff = (datetime.now(UTC) - timedelta(hours=expiry_hours)).isoformat()
-    try:
+    async with atomic_transaction(db):
         await db.execute(
             "DELETE FROM item_embeddings WHERE item_id IN ("
             "SELECT id FROM items WHERE is_verified = -1 AND verified_at <= ?"
@@ -1541,21 +1744,13 @@ async def purge_expired_ignored(expiry_hours: int) -> int:
             (cutoff,),
         ) as cursor:
             purged = cursor.rowcount
-    except Exception:
-        # 多步写异常路径必须回滚：悬挂事务会被下一个不相干写操作的
-        # commit 收尾提交，造成部分写入提前可见
-        await db.rollback()
-        raise
-    await db.commit()
     return purged
 
 
 # ── Processed Messages ──
 
 
-_PROCESSED_QUERY_CHUNK = 900  # 单语句占位符预算，远低于 SQLite 变量上限（32766）
-# DELETE ... IN 列表共用同一占位符预算（类别级联删除等大列表场景）
-_SQL_VARS_CHUNK = _PROCESSED_QUERY_CHUNK
+_SQL_VARS_CHUNK = 900  # IN 分块占位符预算，远低于 SQLite 变量上限（32766）
 
 
 async def are_messages_processed(source: str, msg_ids: list[str]) -> set[str]:
@@ -1563,20 +1758,14 @@ async def are_messages_processed(source: str, msg_ids: list[str]) -> set[str]:
     if not msg_ids:
         return set()
     db = await get_db()
-    found: set[str] = set()
-    for start in range(0, len(msg_ids), _PROCESSED_QUERY_CHUNK):
-        chunk = msg_ids[start : start + _PROCESSED_QUERY_CHUNK]
-        placeholders = ",".join("?" for _ in chunk)
-        # 物化读取（_fetchall）：流式 async for 会保持活动游标，与实时监听
-        # 管道并发 commit 时触发 "cannot commit transaction - SQL statements in progress"
-        rows = await _fetchall(
-            db,
-            f"SELECT msg_id FROM processed_messages WHERE source = ? "
-            f"AND msg_id IN ({placeholders})",
-            (source, *chunk),
-        )
-        found.update(row["msg_id"] for row in rows)
-    return found
+    rows = await _execute_chunked(
+        db,
+        "SELECT msg_id FROM processed_messages WHERE source = ? AND msg_id IN ({placeholders})",
+        msg_ids,
+        chunk_size=_SQL_VARS_CHUNK,
+        extra_params=(source,),
+    )
+    return {row["msg_id"] for row in rows}
 
 
 async def mark_message_processed(source: str, msg_id: str) -> None:
@@ -1586,6 +1775,26 @@ async def mark_message_processed(source: str, msg_id: str) -> None:
         "INSERT OR IGNORE INTO processed_messages (source, msg_id, processed_at) VALUES (?, ?, ?)",
         (source, msg_id, now),
     )
+    await db.commit()
+
+
+async def mark_messages_processed(rows: list[tuple[str, str]]) -> None:
+    """批量标记已处理（闲聊跳过路径）：executemany + 单次 commit，入参
+    [(source, msg_id)]。
+
+    逐条 commit 在大回填时每条一次 fsync（Windows NTFS 单次 5-20ms，数千
+    条串行拉长存储锁窗口、阻塞实时批）；INSERT OR IGNORE 幂等，与逐条
+    语义一致（同 bulk_upsert_contacts 的优化动机）。
+    """
+    if not rows:
+        return
+    db = await get_db()
+    now = datetime.now(UTC).isoformat()
+    cursor = await db.executemany(
+        "INSERT OR IGNORE INTO processed_messages (source, msg_id, processed_at) VALUES (?, ?, ?)",
+        [(source, msg_id, now) for source, msg_id in rows],
+    )
+    await cursor.close()
     await db.commit()
 
 
@@ -1599,12 +1808,13 @@ async def get_session_last_polls(
     if not session_ids:
         return {}
     db = await get_db()
-    placeholders = ",".join("?" for _ in session_ids)
-    rows = await _fetchall(
+    rows = await _execute_chunked(
         db,
-        f"SELECT session_id, last_poll_ts FROM sessions "
-        f"WHERE source = ? AND session_id IN ({placeholders})",
-        (source, *session_ids),
+        "SELECT session_id, last_poll_ts FROM sessions "
+        "WHERE source = ? AND session_id IN ({placeholders})",
+        session_ids,
+        chunk_size=_SQL_VARS_CHUNK,
+        extra_params=(source,),
     )
     return {row["session_id"]: row["last_poll_ts"] for row in rows}
 
@@ -1703,7 +1913,7 @@ async def get_enabled_sessions(source: str) -> list[SessionRow]:
 
 async def toggle_session(source: str, session_id: str) -> SessionRow | None:
     db = await get_db()
-    try:
+    async with atomic_transaction(db):
         await db.execute(
             "UPDATE sessions SET enabled = CASE WHEN enabled = 1 THEN 0 ELSE 1 END "
             "WHERE source = ? AND session_id = ?",
@@ -1722,12 +1932,6 @@ async def toggle_session(source: str, session_id: str) -> SessionRow | None:
                 "WHERE source = ? AND session_id = ?",
                 (source, session_id),
             )
-    except Exception:
-        # 两步写必须原子：若「翻转 enabled」被提前提交而清水位失败，
-        # 该会话会按旧水位增量轮询、跳过旧水位至今的消息（回填窗口丢失）
-        await db.rollback()
-        raise
-    await db.commit()
     return cast(SessionRow, dict(row)) if row else None
 
 
@@ -1813,7 +2017,7 @@ async def update_category(
     if not row:
         return None
     old_name = row["name"]
-    try:
+    async with atomic_transaction(db):
         if name is not None:
             await db.execute("UPDATE categories SET name = ? WHERE id = ?", (name, cat_id))
             if name != old_name:
@@ -1829,12 +2033,6 @@ async def update_category(
             await db.execute(
                 "UPDATE categories SET color = ? WHERE id = ?", (color, cat_id)
             )
-    except Exception:
-        # 改名 + items 同步是两步写：中途失败若不回滚，悬挂事务被后续
-        # commit 收尾后会出现"类别已改、卡片未跟上"的孤儿卡片
-        await db.rollback()
-        raise
-    await db.commit()
     return await _get_category(db, cat_id)
 
 
@@ -1867,36 +2065,38 @@ async def delete_category(
     if not row:
         return None, []
     deleted_ids: list[str] = []
-    try:
+    async with atomic_transaction(db):
         if purge_items:
             rows = await _fetchall(
                 db, "SELECT id FROM items WHERE category = ?", (row["name"],)
             )
             deleted_ids = [r["id"] for r in rows]
-            # 按 IN 占位符预算分块：类别下卡片超过 SQLite 变量上限时
-            # 整条 DELETE 会抛 "too many SQL variables"，purge 整体失败
-            for start in range(0, len(deleted_ids), _SQL_VARS_CHUNK):
-                chunk = deleted_ids[start : start + _SQL_VARS_CHUNK]
-                placeholders = ",".join("?" for _ in chunk)
-                await db.execute(
-                    f"DELETE FROM item_embeddings WHERE item_id IN ({placeholders})",
-                    tuple(chunk),
+            if deleted_ids:
+                # 按 IN 占位符预算分块：类别下卡片超过 SQLite 变量上限时
+                # 整条 DELETE 会抛 "too many SQL variables"，purge 整体失败
+                await _execute_chunked(
+                    db,
+                    "DELETE FROM item_embeddings WHERE item_id IN ({placeholders})",
+                    deleted_ids,
+                    chunk_size=_SQL_VARS_CHUNK,
+                    fetch=False,
                 )
-                await db.execute(
-                    f"DELETE FROM raw_messages WHERE (source, msg_id) IN ("
-                    f"SELECT source, source_msg_id FROM items WHERE id IN ({placeholders}))",
-                    tuple(chunk),
+                await _execute_chunked(
+                    db,
+                    "DELETE FROM raw_messages WHERE (source, msg_id) IN ("
+                    "SELECT source, source_msg_id FROM items WHERE id IN ({placeholders}))",
+                    deleted_ids,
+                    chunk_size=_SQL_VARS_CHUNK,
+                    fetch=False,
                 )
-                await db.execute(
-                    f"DELETE FROM items WHERE id IN ({placeholders})", tuple(chunk)
+                await _execute_chunked(
+                    db,
+                    "DELETE FROM items WHERE id IN ({placeholders})",
+                    deleted_ids,
+                    chunk_size=_SQL_VARS_CHUNK,
+                    fetch=False,
                 )
         await db.execute("DELETE FROM categories WHERE id = ?", (cat_id,))
-    except Exception:
-        # 级联删除是三表多步写：中途失败若不回滚，悬挂事务被后续 commit
-        # 收尾后会留下删了一半的卡片（如 embeddings 删了但 items 还在）
-        await db.rollback()
-        raise
-    await db.commit()
     return cast(CategoryRow, dict(row)), deleted_ids
 
 
@@ -1930,22 +2130,22 @@ async def bulk_upsert_contacts(rows: list[tuple[str, str, str]]) -> None:
 # ── Raw Messages ──
 
 
-# raw_messages 单条 SQL 插入的行数上限：SQLite 单语句变量上限 32766，
-# 每行 9 个占位符，500 行 = 4500 参数，远低于上限且留足余量
-# （整批一次拼接在回填超 ~3640 条时会抛 "too many SQL variables"）。
+# raw_messages 分块写入的块大小：executemany 按行绑定（每次执行 9 个参数，
+# 不拼接单条大 SQL），本就不受 SQLite 32766 变量上限约束；500 仅控制单次
+# executemany 调用的参数列表内存，无正确性含义
 _RAW_INSERT_CHUNK = 500
 
 
 async def bulk_insert_raw_messages(messages: list[RawMsgInput]) -> None:
     """批量写入 raw_messages（单事务）；INSERT OR IGNORE 幂等。
 
-    分块 executemany 落库：避免单条 SQL 拼接全部行触发 SQLite 变量上限
-    （32766 个，超过 ~3640 行即报错导致整轮回填失败）。
+    分块 executemany 落库（每行独立绑定参数，非单条 SQL 拼接），块大小
+    仅控制单次调用的参数列表内存。
     """
     if not messages:
         return
     db = await get_db()
-    try:
+    async with atomic_transaction(db):
         for start in range(0, len(messages), _RAW_INSERT_CHUNK):
             chunk = messages[start : start + _RAW_INSERT_CHUNK]
             params: list[Any] = []
@@ -1970,12 +2170,6 @@ async def bulk_insert_raw_messages(messages: list[RawMsgInput]) -> None:
                 [params[i : i + 9] for i in range(0, len(params), 9)],
             )
             await cursor.close()
-    except Exception:
-        # 多块写异常路径统一 rollback：虽 INSERT OR IGNORE 幂等（重拉无损），
-        # 悬挂事务被后续无关 commit 收尾仍会造成部分写入提前可见
-        await db.rollback()
-        raise
-    await db.commit()
 
 
 _OCR_MARKER_LINE_RE = re.compile(r"^\[(?:OCR|图片 \d+ OCR 结果)\]$")
@@ -2118,6 +2312,25 @@ async def get_all_item_texts() -> list[ItemText]:
     return [cast(ItemText, dict(row)) for row in rows]
 
 
+async def get_item_texts_by_ids(item_ids: list[str]) -> list[ItemText]:
+    """按 id 取卡片文本（形状同 get_all_item_texts），供 unverify 后回加
+    去重缓存（复核 P2-18）。IN 列表按 900 分块防 SQLite 变量上限。"""
+    if not item_ids:
+        return []
+    db = await get_db()
+    rows = await _execute_chunked(
+        db,
+        "SELECT id, source, title, "
+        "COALESCE(content_hash, '') as content_hash, "
+        "COALESCE(image_urls, '') as image_urls, "
+        "COALESCE(source_quote, '') as source_quote "
+        "FROM items WHERE id IN ({placeholders})",
+        item_ids,
+        chunk_size=_SQL_VARS_CHUNK,
+    )
+    return [cast(ItemText, dict(row)) for row in rows]
+
+
 async def load_embeddings(model: str) -> dict[str, list[float]]:
     """读取指定模型的全部已存向量，返回 {item_id: embedding}。
 
@@ -2142,7 +2355,8 @@ async def upsert_embeddings(rows: list[tuple[str, str, list[float]]]) -> None:
     独立 embed 连接 + _embed_lock 串行 + 游标先 close 再 commit：
     杜绝"活动语句未终结就 COMMIT"导致的 OperationalError
     （cannot commit transaction - SQL statements in progress）。
-    跨连接写锁竞争（database is locked）按指数退避重试（最多 3 次）。
+    跨连接写锁竞争（database is locked）按线性退避重试（0.1s 逐次递增，
+    最多 3 次）。
     """
     if not rows:
         return

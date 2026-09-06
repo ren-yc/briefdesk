@@ -142,8 +142,21 @@ JUDGE_PROMPT = """你是一个信息去重助手。本提示词是唯一的规�
 
 
 def _embedding_text(title: str, quote: str) -> str:
-    """嵌入用文本：标题 + 原文，查询与缓存加载共用同一格式，保证可比性。"""
-    return f"{title} {quote}"
+    """嵌入用文本：标题 + 原文，查询与缓存加载共用同一格式，保证可比性。
+
+    截断至 2000 字符（复核 P2-17）：嵌入语义集中在前部，截断不影响判重
+    可比性；不设上限时一条超长文本（如长截图 OCR）会让 embed API 抛错 →
+    _ensure_cache 整体降级且每次重启确定性复现。单点截断，查询/缓存口径
+    自动一致。存量超长文本的旧向量按全文计算，与新口径有一次性偏差
+    （方向为相似度略降、漏判，可接受，随重嵌收敛）。
+    """
+    return f"{title} {quote}"[:2000]
+
+
+# 判定请求超时（秒）：判定在存储锁内执行——与入库/add_to_cache 有批内顺序
+# 依赖（先行消息入库后后续判定要能看到）、并发批次也靠锁串行化，不能移出
+# 锁外；以短超时限制锁的最坏持有时间，防上游挂起冻结管道与卡片管理路由
+_JUDGE_TIMEOUT = 45.0
 
 
 class DedupEngine(DedupService):
@@ -403,13 +416,25 @@ class DedupEngine(DedupService):
         )
         out: list[bool | None] = []
         for (cand, _score), res in zip(candidates, raw):
+            if isinstance(res, asyncio.CancelledError):
+                # 取消必须穿透，不能降级为「判定失败」：关闭/中断语义下
+                # 整形为 None 会掩盖取消信号，令上层误以为只是判定失败
+                raise res
             if isinstance(res, BaseException):
                 logger.warning(
                     '  "%s" 判定失败，%s: %r', cand.title, fail_note, res
                 )
                 out.append(None)
+            elif res is None:
+                # 解析失败（_ask_ai 两次均无法解析）与传输异常同等降级，
+                # 也须同等可见：否则日志里只剩「重试」的 WARNING，看不出
+                # 该候选最终被按 fail_note 的口径处置掉了
+                logger.warning(
+                    '  "%s" 判定未知（输出无法解析），%s', cand.title, fail_note
+                )
+                out.append(None)
             else:
-                out.append(None if res is None else bool(res))
+                out.append(bool(res))
         return out
 
     async def _ask_ai(self, a: CachedItem, b_title: str, b_quote: str) -> bool | None:
@@ -430,6 +455,7 @@ class DedupEngine(DedupService):
                     ],
                     temperature=0.1,
                     max_tokens=128,
+                    timeout=_JUDGE_TIMEOUT,
                 )
             except Exception as e:
                 # 仅 DEBUG：判定失败是被容错的（调用方 _judge_* 按"该候选降级/
@@ -455,6 +481,10 @@ class DedupEngine(DedupService):
                 resp.choices[0].finish_reason if resp.choices else "empty-choices",
                 content[:200],
             )
+        # 两次解析均失败 → None（「判定未知」）：不抛错（异常当控制流会让
+        # strong 短路路径必须 except 兜底），也绝不 return False 被当作明确
+        # 的 DIFFERENT 票计入计权。调用方 _collect_verdicts 会按 fail_note
+        # 的口径记 WARNING 并施加各自门禁。
         return None
 
     @staticmethod
@@ -834,6 +864,16 @@ class DedupEngine(DedupService):
                     e,
                 )
                 verdict = None
+            else:
+                if verdict is None:
+                    # 解析失败（_ask_ai 两次均无法解析）不抛异常，走不到上面的
+                    # except；此处补记，否则短路候选的降级在日志里无声无息
+                    # （_collect_verdicts 的同款 WARNING 只覆盖多数票路径）
+                    logger.warning(
+                        '  [strong] "%s" 判定未知（输出无法解析），'
+                        "该候选保留参与后续多数票",
+                        strong_cand.title,
+                    )
             if verdict is not None:
                 logger.debug(
                     '  [strong] "%s" (%s: %.0f%%): %s',

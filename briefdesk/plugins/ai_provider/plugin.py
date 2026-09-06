@@ -14,6 +14,8 @@ class AiProviderPlugin(Plugin, AIProvider):
     name = "ai_provider"
     version = "1.0.0"
     dependencies: tuple[str, ...] = ()
+    conflicts: tuple[str, ...] = ()
+    core = True  # 核心插件：始终装配，不受 PLUGINS 过滤
 
     def __init__(self) -> None:
         self._provider: AIProvider | None = None
@@ -40,9 +42,11 @@ class AiProviderPlugin(Plugin, AIProvider):
         self._provider = None
 
     # AIProvider 端口（委托给内部 Provider 实例）
-    async def chat(self, messages, *, temperature, max_tokens):
+    async def chat(self, messages, *, temperature, max_tokens, timeout=None):
         assert self._provider is not None
-        return await self._provider.chat(messages, temperature=temperature, max_tokens=max_tokens)
+        return await self._provider.chat(
+            messages, temperature=temperature, max_tokens=max_tokens, timeout=timeout
+        )
 
     async def rag_chat(
         self, messages, *, temperature, max_tokens, model="", api_base="", api_key=""

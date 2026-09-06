@@ -7,7 +7,7 @@
 
 嵌入为硬依赖：ctx.ai 缺失或未启用嵌入（EMBED_* 未配置）时 setup 抛
 PluginDisabledError 自禁用——同 ocr 缺可选依赖、qqflow 缺必填配置的自禁用
-语义。raw_messages 仍是唯一事实源，rag 三表只是派生索引。
+语义。raw_messages 仍是唯一事实源，rag 四表（chunks/embeddings/fts/skipped，另有 rag_meta）只是派生索引。
 """
 
 from __future__ import annotations
@@ -21,6 +21,7 @@ from typing import Any
 
 from fastapi import APIRouter
 
+from briefdesk.events import EVENT_ITEMS_DELETED
 from briefdesk.plugin.base import (
     PluginContext,
     PluginDisabledError,
@@ -44,12 +45,15 @@ class RagPlugin(StagePlugin, WebPlugin):
     name = "rag"
     version = "1.0.0"
     dependencies: tuple[str, ...] = ("ai_provider",)
+    conflicts: tuple[str, ...] = ()
+    core = True  # 核心插件：始终装配，不受 PLUGINS 过滤
     slot = "post_insert"
     priority = 10
 
     def __init__(self) -> None:
         self._engine: RagEngine | None = None
         self._backfill_task: asyncio.Task[None] | None = None
+        self._gc_task: asyncio.Task[None] | None = None
         # 维护循环的唤醒事件：reindex/降级自愈在循环休眠期踢一脚时立即
         # 执行回填，而不是干等一个维护间隔（默认 1h）后才生效
         self._kick_event = asyncio.Event()
@@ -103,6 +107,7 @@ class RagPlugin(StagePlugin, WebPlugin):
             self._engine = engine
             set_engine(engine)
             ctx.register_stage(self)
+            ctx.subscribe_event(EVENT_ITEMS_DELETED, self._on_items_deleted)
             ctx.register_router(self.router())
             asset_dir = self.asset_dir()
             if asset_dir is not None:
@@ -183,10 +188,41 @@ class RagPlugin(StagePlugin, WebPlugin):
             with contextlib.suppress(asyncio.CancelledError):
                 await self._backfill_task
             self._backfill_task = None
+        if self._gc_task is not None:
+            self._gc_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._gc_task
+            self._gc_task = None
         if self._engine is not None:
             await self._engine.teardown()
         self._engine = None
         set_engine(None)
+
+    def _on_items_deleted(self, item_ids: list[str]) -> None:
+        """同步 handler（发布方持锁）：卡片删除后即时触发一次孤儿对账。
+
+        delete_items 会级联删 raw_messages → rag_chunks/FTS/向量随之孤儿化，
+        gc_orphans 对账即清。事件驱动让删除秒级生效（此前最长滞留一个维护
+        周期，已删内容仍可被 /api/rag/ask 引用——复核 P2-24）。
+        """
+        if self._gc_task is not None and not self._gc_task.done():
+            return  # 已有待跑/在跑的 GC，本轮对账足以覆盖新删除
+        self._gc_task = asyncio.get_running_loop().create_task(
+            self._run_gc(), name="rag-delete-gc"
+        )
+
+    async def _run_gc(self) -> None:
+        # handler 在存储锁内被调用：先让出执行权待发布方释放锁，
+        # maintenance_gc 自取存储锁（复核 P2-23）
+        await asyncio.sleep(0)
+        if self._engine is None:
+            return
+        try:
+            await self._engine.maintenance_gc()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("rag: 删除触发 GC 异常，待维护周期对账兜底")
 
     async def before_run(self, batch: BatchContext, ctx: PluginContext) -> None:
         # 锁外：批量嵌入（网络调用只允许发生在这里）

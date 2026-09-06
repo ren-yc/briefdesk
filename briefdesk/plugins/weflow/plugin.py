@@ -11,7 +11,8 @@ teardown 关闭 runtime（幂等）。
 
 from typing import Any
 
-from briefdesk.plugin.base import PluginContext, PluginDisabledError, SourcePlugin
+from briefdesk.plugin.base import PluginContext, SourcePlugin
+from briefdesk.plugin.config_helpers import validate_required_config
 from briefdesk.settings_schema import build_settings_schema
 from briefdesk.sources_base import SourceRuntime
 
@@ -22,6 +23,10 @@ class WeFlowPlugin(SourcePlugin):
     name = "weflow"
     version = "1.0.0"
     dependencies: tuple[str, ...] = ()
+    # 与 weflow-legacy 互斥：同一上游（WeFlow/微信）的新旧两代采集器，
+    # 同时启用会重复采集同一批消息
+    conflicts: tuple[str, ...] = ("weflow-legacy",)
+    core = False  # 可选插件：默认禁用，经 PLUGINS / 设置页开关启用
 
     def __init__(self) -> None:
         self._runtime: SourceRuntime | None = None
@@ -39,8 +44,7 @@ class WeFlowPlugin(SourcePlugin):
                 "db_path": "wechat 数据目录",
                 "img_aes_key": "图片 AES 解密密钥",
                 "img_xor_key": "图片 XOR 解密密钥",
-                "db_keys": "库密钥映射（JSON 前半）",
-                "db_keys_2": "库密钥映射（JSON 后半）",
+                "db_keys": "库密钥映射（JSON）",
                 "sse_reconnect_initial_ms": "SSE 初始重连间隔（毫秒）",
                 "sse_reconnect_max_ms": "SSE 最大重连间隔（毫秒）",
                 "sse_read_timeout_ms": "SSE 读取超时（毫秒）",
@@ -49,8 +53,7 @@ class WeFlowPlugin(SourcePlugin):
                 "api_token": "密钥只保存到系统钥匙串，不会写入暂存文件",
                 "img_aes_key": "密钥只保存到系统钥匙串，不会写入暂存文件",
                 "img_xor_key": "密钥只保存到系统钥匙串，不会写入暂存文件",
-                "db_keys": "密钥只保存到系统钥匙串，不会写入暂存文件；两段各存约一半库映射",
-                "db_keys_2": "密钥只保存到系统钥匙串，不会写入暂存文件；两段各存约一半库映射",
+                "db_keys": "密钥只保存到系统钥匙串，不会写入暂存文件；超长自动分片存储",
             },
         )
 
@@ -60,17 +63,13 @@ class WeFlowPlugin(SourcePlugin):
         from briefdesk.plugins.weflow import runtime as wf_runtime
 
         settings = wf_config.WeFlowSettings()
-        required = (
-            ("WEFLOW_API_TOKEN", settings.api_token.get_secret_value()),
-            ("WEFLOW_WXID", settings.wxid),
-        )
-        missing = [name for name, value in required if not value]
-        if not settings.db_keys_map:
-            missing.append("WEFLOW_DB_KEYS(+WEFLOW_DB_KEYS_2)")
-        if missing:
-            raise PluginDisabledError(
-                f"缺少必填配置 {', '.join(missing)}（在 .env / 系统密钥环中配置后重启生效）"
-            )
+        # db_keys_map 为 property（解析一份完整 WEFLOW_DB_KEYS），空 dict 视为
+        # 缺失；与 api_token/wxid 聚合在同一条错误里一次报全
+        validate_required_config(settings, {
+            'api_token': 'WEFLOW_API_TOKEN',
+            'wxid': 'WEFLOW_WXID',
+            'db_keys_map': 'WEFLOW_DB_KEYS',
+        })
         runtime = wf_runtime.WeFlowSource()
         ctx.register_source(runtime)
         self._runtime = runtime

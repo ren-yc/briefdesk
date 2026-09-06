@@ -1,0 +1,81 @@
+name: Bug 报告
+description: 报告简报台运行中的错误或与预期不符的行为
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **提交前请务必脱敏**：本项目会处理真实群聊消息，请确保以下内容不出现在本 issue 的任何位置（含日志、截图、配置片段）：
+        真实聊天内容、手机号、QQ/微信 ID（wxid）、地址、Token、API Key。
+        密钥等敏感值请用占位符（如 `<your-api-key>`）代替；环境变量只写键名，不要贴值。
+  - type: dropdown
+    id: module
+    attributes:
+      label: 影响模块
+      description: 问题最可能出在哪个环节？
+      options:
+        - 消息源插件（weflow / weflow-legacy / qqflow）
+        - rag 问答插件
+        - OCR 增强（enrich）
+        - AI 分类（classify）
+        - 语义去重 / 同话题合并（dedup / post_insert）
+        - SQLite 存储（db）
+        - server / SSE 推送
+        - 前端 UI
+        - 安装 / 启动 / 配置
+        - 其它
+    validations:
+      required: true
+  - type: textarea
+    id: description
+    attributes:
+      label: 问题描述
+      description: 实际发生了什么？期望是什么？
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: 复现步骤
+      placeholder: |
+        1. 启动 `python main.py`
+        2. …
+        3. 出现 …
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: 日志 / 截图（已脱敏）
+      description: 终端输出或截图；提交前再次确认不含真实聊天内容、ID 与凭据。
+      render: shell
+    validations:
+      required: false
+  - type: textarea
+    id: environment
+    attributes:
+      label: 环境信息
+      placeholder: |
+        - 操作系统：
+        - Python 版本（`python --version`，需 ≥ 3.12）：
+        - 安装方式（`pip install -e .` / 含 `[ocr]` extra）：
+        - 启动方式：
+    validations:
+      required: true
+  - type: textarea
+    id: source-config
+    attributes:
+      label: 消息源与配置概况
+      description: 使用哪个消息源插件？涉及哪些环境变量（**仅键名，禁止贴值**，如 `WEFLOW_API_TOKEN`、`AI_API_KEY`）？
+    validations:
+      required: false
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: 提交前确认
+      options:
+        - label: 我已确认以上内容全部脱敏，不含真实聊天记录、手机号、QQ/微信 ID、地址、Token 或 Key
+          required: true
+        - label: 我已搜索既有 issue，确认无重复
+          required: true
+        - label: 我运行的是最新 master（否则请在复现步骤注明具体 commit）

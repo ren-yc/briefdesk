@@ -80,10 +80,16 @@
      --cat-club / --cat-acad / --cat-trade / --cat-job 已无引用，删除以免与
      db.py 形成第二份会漂移的默认值。 */
   --cat-default:#6B7280;
-  /* 类别色"文字派生层"：DB 下发的装饰色不可直接当文字色（19 色中 0 色双主题达
-     WCAG AA）。浅色向墨色收 50%、深色向白提亮 60%，装饰用途（左色条/色点/
-     胶囊底）保留纯 --cat。链路对比度由 tests/test_ui_contrast.py 全表锁定。 */
-  --cat-fg: color-mix(in srgb, var(--cat, var(--cat-default)) 50%, var(--text));
+  /* 类别色"文字派生层"旋钮：DB 下发的装饰色不可直接当文字色（19 色中 0 色双主题
+     达 WCAG AA）。浅色 = 50% 类别色 + 50% 墨色、深色 = 60% 类别色 + 40% 白，
+     装饰用途（左色条/色点/胶囊底）保留纯 --cat。链路对比度由
+     tests/test_ui_contrast.py 全表锁定。
+     派生本体（--cat-fg）绝不能声明在令牌块：自定义属性的 var() 替换发生在
+     声明元素处，:root 上看不到 JS 内联注入的元素级 --cat，会用回退灰定格成
+     常量——全部类别同时失去颜色（真实回归）。故声明在携带 --cat 的载体
+     选择器上（.cat-link 等三处，见侧边栏小节）。 */
+  --cat-fg-pct: 50%;
+  --cat-fg-base: var(--text);
 
   /* 语义色 token（深色模式随 [data-theme] 覆盖） */
   --status-ok-bg:  #ECFDF5;
@@ -328,6 +334,14 @@ body.searching #category-nav::after {
 }
 /* 类别颜色数据驱动：--cat 由 JS 按类别颜色内联注入（style="--cat:#xxx"）；
    无注入（遗留类别）时回退 --cat-default */
+/* 类别色"文字派生层"：--cat-fg 必须在携带内联 --cat 的载体上声明，逐元素
+   求值（声明在 :root 会用回退灰定格成常量——全部类别失去颜色的真实回归，
+   详见 :root 令牌块注释与 test_ui_contrast 守卫）。三处载体覆盖全部
+   --cat-fg 消费点：侧边栏类别链接（链接本体、图标、计数胶囊）、折叠组块
+   与展开组头（组内 .group-subject / .group-more 继承） */
+.cat-link, .group-collapsed, .group-header {
+  --cat-fg: color-mix(in srgb, var(--cat, var(--cat-default)) var(--cat-fg-pct), var(--cat-fg-base));
+}
 .cat-link {
   display: flex; justify-content: space-between; align-items: center;
   padding: 7px 12px; border-radius: var(--radius-sm);
@@ -895,7 +909,8 @@ body.modal-open { overflow: hidden; }
 }
 .seg-pill {
   position: absolute; top: 2px; left: 2px;
-  width: calc(33.333% - 2px); height: calc(100% - 4px); /* 三档位等宽 */
+  /* 百分比按 padding box 解析，先扣左右 4px 内边距还原内容盒再等分，与 flex:1 1 0 的等分口径一致 */
+  width: calc((100% - 4px) / 3); height: calc(100% - 4px); /* 三档位等宽 */
   border-radius: 999px;
   background: var(--accent);
   /* 原写死 rgba(27,94,65,…) 即旧墨绿字面值：主题色一变就不跟随 */
@@ -907,6 +922,8 @@ body.modal-open { overflow: hidden; }
 .seg-btn {
   position: relative; z-index: 1;
   flex: 1 1 0;
+  min-width: 0; /* 抵消 flex 项 min-width:auto 下限：三字文案 68px 会顶破 64px 等分宽，档位因此不等宽 */
+  display: flex; justify-content: center; align-items: center; /* text-align 对溢出行不生效，flex 居中让文字对称侵入自身 padding 保持光学居中 */
   padding: 4px 16px;
   border: none; background: transparent;
   font-family: inherit; font-size: 12px; font-weight: 600;
@@ -1359,8 +1376,10 @@ body.modal-open { overflow: hidden; }
   --z-skip: 400;
   --hover-bg: color-mix(in srgb, var(--accent) 7%, var(--surface));
   --topbar-h: 52px;
-  /* 深色类别文字：向白提亮 60%（19 色全表验证最差 5.24:1） */
-  --cat-fg: color-mix(in srgb, var(--cat, var(--cat-default)) 60%, #FFFFFF);
+  /* 深色类别文字：向白提亮 60%（19 色全表验证最差 5.24:1）；
+     派生本体 --cat-fg 在载体选择器上逐元素求值（见 :root 的警示） */
+  --cat-fg-pct: 60%;
+  --cat-fg-base: #FFFFFF;
   --status-ok-bg:  #123527;
   --status-warn-bg: #3A2B0A;
   --status-danger-bg: #3B1D1D;
@@ -1578,22 +1597,58 @@ body.modal-open { overflow: hidden; }
    时间线须盖过插件详情浮层（calendar，z-index:110） */
 #subject-timeline-modal { z-index: var(--z-modal-top); }
 
-/* ── 插件列表（设置弹窗「插件」分组） ── */
+/* ── 插件列表（设置弹窗「插件」分组，逐插件启停） ── */
 .plugins-list {
   display: flex; flex-direction: column; gap: 8px;
   max-height: 40vh; overflow-y: auto;
 }
+.plugin-section { display: flex; flex-direction: column; gap: 6px; }
+.plugin-section-title { font-size: 12px; font-weight: 600; color: var(--text-2); }
 .plugin-row {
-  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
-  padding: 6px 8px; border-radius: var(--radius-sm);
+  padding: 8px 10px; border-radius: var(--radius-sm);
   background: var(--surface-1);
 }
+.plugin-row-head {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+}
+/* 开关贴右：spacer 吃掉行头剩余空间（比逐元素 margin-left:auto 直观） */
+.plugin-row-spacer { flex: 1 1 auto; }
 .plugin-name { font-weight: 600; }
 .plugin-version { font-size: 0.85em; opacity: 0.7; }
 .plugin-status { font-size: 0.78em; padding: 1px 8px; border-radius: 999px; }
 .plugin-status-ok   { background: color-mix(in srgb, var(--state-ok) 16%, var(--surface));   color: var(--state-ok); }
 .plugin-status-warn { background: color-mix(in srgb, var(--state-warn) 16%, var(--surface)); color: var(--state-warn); }
 .plugin-status-err  { background: color-mix(in srgb, var(--state-err) 16%, var(--surface));  color: var(--state-err); }
+.plugin-reason { font-size: 0.85em; }
+.plugin-row .settings-hint { margin: 4px 0 0; }
+/* 插件面板空态引导（7b：无可选插件启用时顶部提示）——借用 warning 底色突出，
+   与面板内其它 hint 区分；不覆盖 .settings-hint 的全局负上边距（此处独立成行） */
+.plugins-empty-hint {
+  margin: 0 0 2px !important;
+  padding: 8px 10px;
+  background: color-mix(in srgb, var(--warn) 10%, transparent);
+  color: var(--warn);
+  border-radius: var(--radius-sm);
+}
+/* env 优先警示（8a）：PLUGINS 由环境变量控制、面板开关暂存不生效——
+   信息性提示，走中性与 env-badge 一致的视觉语言（不抢错误注意力） */
+.plugins-env-notice {
+  padding: 8px 10px;
+  margin-bottom: 2px;
+  font-size: 12px;
+  line-height: 1.5;
+  background: color-mix(in srgb, var(--text-3) 8%, transparent);
+  color: var(--text-2);
+  border: 1px solid color-mix(in srgb, var(--text-3) 22%, transparent);
+  border-radius: var(--radius-sm);
+}
+/* 开关复用 env-switch 自绘轨道（轨道样式为全局 label.env-switch）；此处
+   只补行头布局：压过全局 .modal-content label 的 display:block + margin-bottom */
+.plugin-row label.env-switch {
+  display: inline-flex; align-items: center; gap: 8px;
+  margin-bottom: 0; cursor: pointer; user-select: none;
+  font-size: 13px; color: var(--text-2);
+}
 
 /* ═══ 第一批新增：搜索历史 / 错误横幅 / 快捷键 / 操作区收纳 ═══ */
 
@@ -1884,8 +1939,14 @@ details.env-group[open] > summary.env-group-head::after { transform: rotate(-45d
 .env-row { margin: 12px 0; }
 .env-row-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 4px; }
 .env-label { font-weight: 600; }
-/* 「恢复默认」固定在行头右端，不再随内容流漂移 */
-.env-row-head .env-restore { margin-left: auto; }
+/* 「恢复默认」固定在行头右端，不再随内容流漂移；密钥行的「替换/清除」与
+   输入框行内的「保存/取消」同款（settings-outline-btn），同享右置 */
+.env-row-head .env-restore,
+.env-row-head .settings-outline-btn { margin-left: auto; }
+/* 密钥行「替换/清除」是相邻双按钮：auto margin 若逐个生效会平分剩余空间，
+   「替换」被推到行中部悬空。仅在两钮皆可见时抵消后一个的推力——「替换」
+   展开输入框后自身隐藏，「清除」须独占 auto margin 继续贴右 */
+.env-row-head .settings-outline-btn:not(.hidden) + .settings-outline-btn:not(.hidden) { margin-left: 0; }
 .env-badge {
   font-size: var(--text-xs); padding: 1px 8px; border-radius: 999px;
   background: var(--surface); border: 1px solid var(--border); color: var(--text-2);

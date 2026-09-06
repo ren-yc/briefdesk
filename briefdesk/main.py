@@ -1,8 +1,9 @@
 """入口 — 运行时生命周期管理（启动/优雅关闭）。
 
 轮询周期业务编排见 briefdesk/poll_cycle.py；插件装配见
-briefdesk/plugin/manager.py —— 消息源为内置插件（weflow-legacy/qqflow），
-启用/禁用走 PLUGINS / PLUGINS_DISABLED 配置。
+briefdesk/plugin/manager.py —— 消息源为内置插件（weflow/weflow-legacy/
+qqflow，可选插件），启用/禁用走 PLUGINS 配置或设置页「插件」面板
+（核心插件恒装配）。
 """
 
 import asyncio
@@ -24,7 +25,6 @@ from briefdesk.db import (
     get_db,
     purge_expired_ignored,
     storage_lock,
-    upsert_session,
 )
 from briefdesk.events import event_bus
 from briefdesk.logger import (
@@ -36,12 +36,14 @@ from briefdesk.logger import (
 from briefdesk.pipeline import process_all_batches
 from briefdesk.plugin.base import PluginContext
 from briefdesk.plugin.manager import PluginManager
-from briefdesk.poll_cycle import run_poll_cycle
+from briefdesk.poll_cycle import run_poll_cycle, upsert_sessions_from_infos
 from briefdesk.realtime import signal_shutdown
 from briefdesk.server import (
     app,
     include_plugin_router,
     register_plugin_assets,
+    set_plugin_meta_callback,
+    set_plugin_validation_callback,
     set_plugins_info_callback,
     set_refresh_sessions_callback,
     set_settings_schema_callback,
@@ -78,15 +80,7 @@ async def _refresh_all(sources: list[SourceRuntime]) -> None:
             logger.error("[%s] 会话刷新失败: %s", source.name, sessions)
             continue
         async with storage_lock:
-            for s in sessions:
-                await upsert_session(
-                    s.source,
-                    s.session_id,
-                    s.name,
-                    s.is_group,
-                    s.is_official,
-                    last_active_at=s.last_active_at or None,
-                )
+            await upsert_sessions_from_infos(sessions)
 
 
 def _start_listener(s: SourceRuntime) -> None:
@@ -185,6 +179,7 @@ async def _run() -> None:
     runtimes: list[SourceRuntime] = []
     server_task: asyncio.Task[None] | None = None
     initial_sync_task: asyncio.Task[None] | None = None
+    periodic_task: asyncio.Task[None] | None = None
 
     try:
         # 1. 应用待恢复备份（上传恢复后重启生效：先替换正式库再开库）
@@ -232,9 +227,17 @@ async def _run() -> None:
             register_plugin_assets(name, directory)
         set_plugins_info_callback(manager.infos)
         set_settings_schema_callback(manager.settings_schema)
+        set_plugin_meta_callback(manager.plugin_meta)
+        set_plugin_validation_callback(manager.validate_selection)
         if not runtimes:
-            raise ValueError(
-                "没有可用的消息源插件（检查 PLUGINS / PLUGINS_DISABLED 配置与上方插件日志）"
+            # 零源降级启动（决策 ①=1B）：不再中止——UI/设置/向导可用，
+            # 消息采集不可用，状态栏明示；这也是三源统一「缺配置自禁用」
+            # 语义的前提（否则唯一启用的源自禁用会触发零源中止）
+            logger.warning(
+                "没有可用的消息源插件，进入降级启动：UI/设置可用、消息采集"
+                "不可用（检查 PLUGINS 配置与上方插件日志——消息源为可选插件，"
+                "须在 PLUGINS 显式列出或经设置页「插件」面板启用，"
+                "配置后重启生效）"
             )
         for s in runtimes:
             register_source_client(s.name, s.client)
@@ -290,6 +293,17 @@ async def _run() -> None:
         if initial_sync_task is None:
             logger.warning("首轮回填跳过：同步已在进行或未注册回调")
 
+        # 5.1 可选周期同步兜底（POLL_INTERVAL_SECONDS，默认 0 = 禁用）：
+        # SSE 断连/监听死亡窗口的消息此前完全依赖用户手动同步，>0 时按周期
+        # 自动补齐（与 /api/sync 同路径，互斥由 trigger_sync 保证）
+        if config.poll_interval_seconds > 0:
+            periodic_task = asyncio.create_task(
+                _periodic_sync_loop(), name="periodic-sync"
+            )
+            logger.info(
+                "周期同步已启用: 每 %d 秒", config.poll_interval_seconds
+            )
+
         # 6. 注册优雅关闭信号
         # Ctrl+C 触发优雅关闭（SSE 流结束 → should_exit），uvicorn 正常收尾后
         # await server_task 返回。安装前的启动窗口期若按 Ctrl+C，KeyboardInterrupt
@@ -330,11 +344,19 @@ async def _run() -> None:
             with contextlib.suppress(OSError, ValueError):  # 非主线程等场景防御
                 signal.signal(sig, signal.SIG_IGN)
         shutdown_start = time_module.perf_counter()
+        # 吸收尚未投递的取消请求（启动窗口 Ctrl+C 经 Runner 取消主任务）：
+        # 保证后续清理 await 不被同一次取消打断（close_db 被跳过 = 退出挂死）；
+        # 清理期间用户再次 Ctrl+C 是硬杀语义，不在此防御范围
+        _task = asyncio.current_task()
+        if _task is not None and _task.cancelling():
+            _task.uncancel()
         # 清理顺序即下方语句序：server → initial_sync → 插件逆序 → DB → 残留兜底。
         # cancel 不同步等待、aiosqlite 非 daemon 线程等陷阱见 docs/architecture.md
         # 「运行时与优雅关闭」小节。
         await _reap_task(server_task)
         await _reap_task(initial_sync_task)
+        if periodic_task is not None:
+            await _reap_task(periodic_task)
         await manager.teardown_all()
         logger.info(
             "插件已关闭 (%s)", fmt_dur(time_module.perf_counter() - shutdown_start)
@@ -349,6 +371,19 @@ async def _run() -> None:
         )
 
 
+async def _periodic_sync_loop() -> None:
+    """周期同步兜底（POLL_INTERVAL_SECONDS > 0 时由 _run 拉起）。
+
+    与手动 /api/sync 共用 trigger_sync 路径：进行中互斥由其返回 None 保证；
+    await 同步任务串行化，上一轮未完成不叠加触发。
+    """
+    while True:
+        await asyncio.sleep(config.poll_interval_seconds)
+        task = trigger_sync(reason="periodic")
+        if task is not None:
+            await task
+
+
 def main() -> None:
     """入口：`briefdesk secrets` 子命令或启动本地服务。"""
     if len(sys.argv) >= 2 and sys.argv[1] == "secrets":
@@ -357,25 +392,18 @@ def main() -> None:
         raise SystemExit(secrets_cli_main(sys.argv[2:]))
 
     setup_logging()
-    loop = asyncio.new_event_loop()
+    # asyncio.Runner：SIGINT 由 Runner 自己的 handler 接管——第一次 Ctrl+C
+    # 取消主任务并等其 finally 跑完再收敛。裸 run_until_complete 下 _run 的
+    # finally 不会执行（aiosqlite 非 daemon worker 线程会让解释器退出挂死），
+    # 启动窗口尤其如此：我们的信号处理器要等 server.started 后才安装。
+    # 清理期间的再次 Ctrl+C 由 _run 的 finally 开头置 SIG_IGN 挡住（uvicorn
+    # capture_signals 退出时已还原默认 handler），确需强杀走关终端/任务管理器。
+    # Runner 另附带 shutdown_asyncgens + shutdown_default_executor 兜底。
     try:
-        main_task = loop.create_task(_run(), name="briefdesk-main")
-        try:
-            loop.run_until_complete(main_task)
-        except KeyboardInterrupt:
-            # 启动窗口期（信号 handler 在 server.started 后才安装）的 Ctrl+C：
-            # _run 协程仍挂在 await 点上，直接退出会跳过其 finally（teardown_all
-            # / close_db 是唯一清理点），aiosqlite 非 daemon worker 线程令解释器
-            # 退出挂死。取消任务并继续驱动事件循环，让清理跑完；循环以
-            # main_task.done() 收口，清理中途再按 Ctrl+C 也不丢清理。
-            main_task.cancel()
-            while not main_task.done():
-                try:
-                    loop.run_until_complete(main_task)
-                except (KeyboardInterrupt, asyncio.CancelledError):
-                    pass
-    finally:
-        loop.close()
+        with asyncio.Runner() as runner:
+            runner.run(_run())
+    except KeyboardInterrupt:
+        pass
 
 
 if __name__ == "__main__":

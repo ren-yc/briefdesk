@@ -28,6 +28,8 @@ python -m pytest tests/
 
 # 提交前完整检查
 git diff --check
+# 范围级空白检查（空树口径，与 CI 一致；提交后仍可跑）
+git diff --check 4b825dc642cb6eb9a060e54bf8d69288fbee4904..HEAD
 
 # 可选：安装 pre-commit 密钥扫描钩子（staged 新增内容自动扫描，推荐）
 powershell -ExecutionPolicy Bypass -File scripts/install-hooks.ps1
@@ -38,11 +40,21 @@ powershell -ExecutionPolicy Bypass -File scripts/install-hooks.ps1
 ### 提交前质量门禁
 
 - Lint: `python -m ruff check briefdesk/ tests/`
-- 类型检查: `python -m mypy briefdesk/ tests/`（tests/ 为签名级检查；函数体深检因测试桩惯用法噪音大暂缓，配置理由见 pyproject `[tool.mypy]` 注释）
+- 类型检查: `python -m mypy briefdesk/ tests/`（tests/ 为签名级检查；函数体深检因测试桩惯用法噪音大暂缓，配置理由见 pyproject `[tool.mypy]` 注释。CI 中 mypy 仅查 `briefdesk/` 包级——tests/ 的签名级检查由本地门禁覆盖，两处口径差异为有意为之）
 - 测试: `python -m pytest tests/`
 - 空白/冲突检查: `git diff --check`
+- 范围级空白检查（对齐 CI 的空树口径，覆盖全部跟踪文件；上一条只查工作区，
+  对已入库的空白问题失明——rag/config.py 末尾空行曾因此逃逸到 CI 才拦下）:
+  `git diff --check 4b825dc642cb6eb9a060e54bf8d69288fbee4904..HEAD`
 - 新增功能必须补充或更新对应测试
 - 不要为了“让当前任务快速完成”而跳过上述任何一步；若门禁失败，必须先修复再提交
+
+### 依赖锁文件（`requirements-dev.txt`）
+
+- 该文件是 `pyproject.toml` 的 `[dev,ocr]` **依赖闭包**，由 `pip-compile` 生成，**不是** `pip freeze` 的整环境快照。重新生成用文件头部记录的那条命令。
+- 不用 `pip freeze`：整环境快照会把项目从不 import 的包一并钉死（曾因此钉入 yank 版本的 `polars` 与整套 ML 栈），任何无关包的 yank 或平台轮子缺失都会弄红 CI。
+- 升级依赖：`pip-compile --upgrade`（全量）或 `-P <包名>`（单包），随后必须在本地重跑全部门禁；不加 `--upgrade` 时既有 pin 会被复用，仅做闭包收敛。
+- 该文件只服务 CI 的可复现安装，不参与任何测试断言；修改后应在干净虚拟环境中实测 `pip install -r requirements-dev.txt` + `pip install -e . --no-deps` 后跑一遍 pytest，确认闭包足够。
 
 ### 临时文件清理
 
@@ -79,6 +91,7 @@ powershell -ExecutionPolicy Bypass -File scripts/install-hooks.ps1
 - [ ] `python -m mypy briefdesk/ tests/` 通过
 - [ ] `python -m pytest tests/` 通过
 - [ ] `git diff --check` 通过
+- [ ] `git diff --check 4b825dc642cb6eb9a060e54bf8d69288fbee4904..HEAD` 通过（范围级，见质量门禁）
 - [ ] `git status --short` 中没有临时文件、缓存、数据库、本地 env 文件
 - [ ] `git diff --cached` 中没有真实密钥、Token、聊天记录、手机号等敏感信息
 - [ ] 只提交与任务相关的文件，没有 `tmp_*` / 调试脚本 / 无关文件

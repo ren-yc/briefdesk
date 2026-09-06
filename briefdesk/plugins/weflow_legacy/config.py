@@ -4,17 +4,20 @@
 环境变量名为 WEFLOW_LEGACY_API_BASE / WEFLOW_LEGACY_API_TOKEN。
 """
 
+from typing import ClassVar
+
 from pydantic import Field, SecretStr
-from pydantic_settings import BaseSettings, PydanticBaseSettingsSource
+from pydantic_settings import SettingsConfigDict
 
-from briefdesk.secrets_store import KeyringSource
-from briefdesk.settings_env import PROJECT_ROOT, get_settings_file
-
-# 密钥解析链（keyring > 环境变量 > .env > 默认值），见 briefdesk/secrets_store.py
-_KEYRING_FIELDS = {"api_token": "WEFLOW_LEGACY_API_TOKEN"}
+from briefdesk.settings_base import KeyringSettingsBase
 
 
-class WeFlowLegacySettings(BaseSettings):
+class WeFlowLegacySettings(KeyringSettingsBase):
+    """WeFlow Legacy 消息源配置，密钥字段支持系统密钥环。"""
+
+    # 密钥解析链（keyring > 环境变量 > .env > 默认值），见 briefdesk/secrets_store.py
+    KEYRING_FIELDS: ClassVar[dict[str, str]] = {"api_token": "WEFLOW_LEGACY_API_TOKEN"}
+
     api_base: str = "http://127.0.0.1:5031"
     api_token: SecretStr = SecretStr("")
     sse_reconnect_initial_ms: int = Field(
@@ -33,28 +36,6 @@ class WeFlowLegacySettings(BaseSettings):
         gt=0,  # env: WEFLOW_LEGACY_SSE_READ_TIMEOUT_MS
     )
 
-    model_config = {
-        "env_prefix": "WEFLOW_LEGACY_",  # api_base → WEFLOW_LEGACY_API_BASE
-        "env_file": [PROJECT_ROOT / ".env", get_settings_file()],
-        "env_file_encoding": "utf-8",
-        # 同一 .env 里还有 app 级与其它源的字段，忽略未知项
-        "extra": "ignore",
-    }
-
-    @classmethod
-    def settings_customise_sources(
-        cls,
-        settings_cls: type[BaseSettings],
-        init_settings: PydanticBaseSettingsSource,
-        env_settings: PydanticBaseSettingsSource,
-        dotenv_settings: PydanticBaseSettingsSource,
-        file_secret_settings: PydanticBaseSettingsSource,
-    ) -> tuple[PydanticBaseSettingsSource, ...]:
-        """来源优先级：init 参数 > 系统密钥环 > 环境变量 > .env > 默认值。"""
-        return (
-            init_settings,
-            KeyringSource(settings_cls, _KEYRING_FIELDS),
-            env_settings,
-            dotenv_settings,
-            file_secret_settings,
-        )
+    # env_file/env_file_encoding/extra 由 KeyringSettingsBase 自动合并，无需展开；
+    # ClassVar 注解声明类级配置而非字段（RUF012）
+    model_config: ClassVar[SettingsConfigDict] = {"env_prefix": "WEFLOW_LEGACY_"}  # api_base → WEFLOW_LEGACY_API_BASE

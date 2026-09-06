@@ -8,7 +8,7 @@ from briefdesk.server.app import app as app
 
 # 子模块导入顺序即组装顺序：
 #   中间件 → Web 插件注入点（必须先于 static，否则被 SPA mount 兜底截胡）
-#   → 核心路由 → 类别路由 → 媒体代理 → SPA 静态托管（mount 恒在最后，
+#   → 核心路由 → 类别路由 → 启动配置路由 → 媒体代理 → SPA 静态托管（mount 恒在最后，
 #   include_plugin_router 按首个 Mount 前插）。
 from briefdesk.server import middleware  # noqa: F401 — 导入即注册中间件
 from briefdesk.server import web_plugins  # noqa: F401 — 导入即注册插件路由
@@ -31,5 +31,7 @@ from briefdesk.server.web_plugins import _plugin_assets as _plugin_assets
 from briefdesk.server.web_plugins import include_plugin_router as include_plugin_router
 from briefdesk.server.web_plugins import has_settings_schema_callback as has_settings_schema_callback
 from briefdesk.server.web_plugins import register_plugin_assets as register_plugin_assets
+from briefdesk.server.web_plugins import set_plugin_meta_callback as set_plugin_meta_callback
+from briefdesk.server.web_plugins import set_plugin_validation_callback as set_plugin_validation_callback
 from briefdesk.server.web_plugins import set_plugins_info_callback as set_plugins_info_callback
 from briefdesk.server.web_plugins import set_settings_schema_callback as set_settings_schema_callback

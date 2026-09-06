@@ -84,6 +84,25 @@ class PluginAssetsTest(unittest.TestCase):
                 srv._plugin_assets.pop("demo", None)
 
 
+class PluginRouterPrefixGuardTest(unittest.TestCase):
+    """【复核 P2-11】插件路由必须挂在 /api/ 下：middleware 仅对 /api/ 前缀
+    的变更方法做同源校验，其它前缀会静默绕过 CSRF 防线——装配期硬失败。"""
+
+    def test_non_api_prefix_rejected(self):
+        from fastapi import APIRouter
+
+        from briefdesk.server.web_plugins import include_plugin_router
+
+        router = APIRouter()
+
+        @router.post("/plugin-page/action")
+        async def _action() -> dict:  # pragma: no cover - 断言在装配期，handler 不会被调
+            return {}
+
+        with self.assertRaisesRegex(RuntimeError, "/api/"):
+            include_plugin_router(router)
+
+
 class WebPluginSetupTest(unittest.IsolatedAsyncioTestCase):
     async def test_calendar_registers_router(self):
         registered = []
@@ -99,7 +118,7 @@ class WebPluginSetupTest(unittest.IsolatedAsyncioTestCase):
         from briefdesk.plugin.base import PluginContext
 
         ctx = PluginContext(
-            config=Settings(plugins=["*"], plugins_disabled=[], plugins_required=[], plugin_path=""),
+            config=Settings(plugins=[], plugins_required=[], plugin_path=""),
             publish_event=publish_event,
             subscribe_event=subscribe_event,
             register_source=lambda r: None,

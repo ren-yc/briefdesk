@@ -405,7 +405,9 @@ function bindNavEvents() {
   // "查看全部" link in filtered-empty-state
   $content.addEventListener("click", (e) => {
     const link = e.target.closest(".reset-filter-link");
-    if (!link) return;
+    // fetch-retry-btn 借用本类做样式（fetch 失败态重试），但不得触发清筛选：
+    // 否则点「重试」会静默清空搜索词与分类上下文（复核 P2-27）
+    if (!link || link.id === "fetch-retry-btn") return;
     e.preventDefault();
     exitPluginViews();
     clearSearch();
@@ -499,32 +501,31 @@ function bindSidebarSearchEvents() {
 }
 
 function bindSettingsEntryEvents() {
-  function openSettings(e) {
-    e.preventDefault();
-    settingsDirtyFlag = false; // 全新打开：草稿尚未改动（弹窗打开后会重载草稿）
-    $settingsModal.classList.remove("hidden");
-    syncBodyScrollLock();
-    setSettingsPanel("general"); // 二级菜单：每次打开默认回到「常规」
-    // 每次打开重置搜索与两组多选（回到"全部"）；时间档位随后由 loadSessions →
-    // initSessionTimeFilter 从 localStorage/服务端默认恢复，故此处的 'all' 只是过渡值
-    sessionFilter.reset();
-    sessionFilter.renderSourceChips(); // 按 /api/status 实际启用源渲染多选芯片
-    loadSessions();
-    loadCategories();
-    loadAboutSources();
-    loadPlugins();
-    loadEnvConfig();
-    pushModalFocus($settingsModal, { initialFocus: $refreshInterval });
-  }
-
+  // 打开设置弹窗并切到指定面板（默认「常规」）。作为模块级函数供状态横幅等
+  // 外部入口直接跳转（如零源降级横幅的「去启用」直达「插件」面板）。
+  $settingsLink.addEventListener("click", (e) => openSettingsModal(e));
   // 二级菜单切换：仅显示选中分组的面板，草稿跨分组保留（保存时统一提交）
   $settingsMenu.addEventListener("click", (e) => {
     const btn = e.target.closest(".settings-menu-item");
     if (!btn) return;
     setSettingsPanel(btn.dataset.panel);
   });
+}
 
-  $settingsLink.addEventListener("click", openSettings);
+function openSettingsModal(e, { panel = "general" } = {}) {
+  if (e && e.preventDefault) e.preventDefault();
+  $settingsModal.classList.remove("hidden");
+  syncBodyScrollLock();
+  setSettingsPanel(panel); // 二级菜单：按需直达分组（默认「常规」）
+  // 每次打开重置搜索与两组多选（回到"全部"）；时间档位随后由 loadSessions →
+  // initSessionTimeFilter 从 localStorage/服务端默认恢复，故此处的 'all' 只是过渡值
+  sessionFilter.reset();
+  sessionFilter.renderSourceChips(); // 按 /api/status 实际启用源渲染多选芯片
+  loadSessions();
+  loadCategories();
+  loadAboutSources();
+  loadEnvConfig(); // 插件面板（逐插件开关）与启动配置共用本次数据
+  pushModalFocus($settingsModal, { initialFocus: $refreshInterval });
 }
 
 function bindCategoryEvents() {
@@ -649,54 +650,41 @@ function bindSessionEvents() {
   sessionFilter.bindEvents();
 }
 
+// 选项 b（保守）：类别新增/行内编辑表单打开中即视为有未保存修改——
+// 未确认的输入不进入保存链路（保存也不会保留），但静默丢弃半截输入
+// 属可避免错误，宁多问一次
+function _inlineEditorOpen() {
+  return !!document.querySelector('.cat-edit-form:not(.hidden), #cat-add-form:not(.hidden)');
+}
+
+// 全局未保存草稿计数——保存按钮文案与关闭确认的单一事实源，与统一保存
+// 路径的提交内容一一对应：类别/会话 ops + 刷新间隔 + env/PLUGINS 暂存差异
+// （PLUGINS 整组开关序列化为一行暂存，计 1 项）
+function _pendingChangeCount() {
+  let n = _diffCategoryOps().length;
+  // 与 saveSettings 同口径：空值/非法值回落 300 后再比
+  if (Math.max(30, parseInt($refreshInterval.value) || 300) !== refreshIntervalSec) n += 1;
+  if (envData) n += Object.keys({ ..._collectEnvChanges(), ..._pluginChanges() }).length;
+  return n;
+}
+
+function _hasPendingChanges() {
+  // 关闭确认在计数之上追加选项 b 保守项：行内编辑表单打开中（未确认输入
+  // 不进保存链路，但静默丢弃半截输入属可避免错误，宁多问一次）
+  return _pendingChangeCount() > 0 || _inlineEditorOpen();
+}
+
 function bindSettingsFormEvents() {
-  // "保存"统一应用三类更改：刷新间隔（localStorage）+ 类别草稿 + 会话草稿。
-  // 同步进行中时延迟到同步完成后应用（本次同步按旧配置跑，避免数据与配置不一致）。
-  $settingsSave.addEventListener("click", async () => {
-    // 「启动配置」面板共用此按钮：语义是写 .env 暂存文件（重启生效），
-    // 不走刷新间隔/类别/会话草稿的保存链路
-    const envActive = !document.querySelector('.settings-panel[data-panel="env"]')?.classList.contains("hidden");
-    if (envActive) { await saveEnvConfig(); return; }
-    if (saveBusy) return;
-    saveBusy = true;
-    $settingsSave.disabled = true;
-    try {
-      saveSettings(); // 刷新间隔与同步数据无关，立即生效
-      const ops = collectAllOps(); // 保存时快照，弹窗重开/草稿重载不影响挂起
-      if (!ops) return; // collectAllOps 已弹窗说明（未加载/名称冲突），中止本次保存
-      // 实时查询同步状态（isSyncing 是缓存值，另一标签页/启动首轮可能已开始同步）
-      let syncingNow = isSyncing;
-      const liveStatus = await getJson("/api/status").catch(() => null); // 失败回退缓存值
-      if (liveStatus) syncingNow = !!liveStatus.syncing;
-      if (syncingNow) {
-        pendingChanges = ops; // 覆盖旧挂起项，最新意图为准
-        showToast("当前正在同步，更改将在同步完成后自动应用", { type: "info", duration: 6000 });
-      } else {
-        pendingChanges = null; // 直接应用时丢弃历史挂起项（最新保存为准），
-                               // 否则 fetchData 会在其后再应用一遍旧操作
-        await runSettingsOps(ops);
-      }
-      closeSettingsModal({ force: true }); // 保存成功：清脏标记直接关，不再确认
-      showToast("设置已保存", { type: "success", duration: 2500 });
-      startRefreshTimer();
-      fetchData();
-    } catch (err) {
-      console.error("Save settings error:", err);
-      showToast("保存失败，部分更改可能未生效，请重试", { type: "error", duration: 6000 });
-      // 已应用的前缀操作（如删除）不可回滚：重载草稿对齐服务端真相，
-      // 避免基于过期草稿重复操作（对已删类别再删 → 404）
-      await loadCategories();
-      await loadSessions();
-    } finally {
-      saveBusy = false;
-      $settingsSave.disabled = false;
-    }
-  });
+  // 统一保存：一次点击提交全部未保存草稿——刷新间隔（localStorage）+
+  // 类别/会话草稿 ops（同步进行中时延迟到同步完成后应用，本次同步按旧
+  // 配置跑）+ 启动配置/插件暂存（写 .env 暂存文件，重启生效）。
+  // 编排见 saveAllSettings；计数与关闭确认同源（_pendingChangeCount）
+  $settingsSave.addEventListener("click", saveAllSettings);
 
   $settingsClose.addEventListener("click", closeSettingsModal);
 
   // 「启动配置」面板：恢复默认/密钥读写/搜索过滤（委托在面板容器上）；
-  // 「保存」复用弹窗底部全局按钮（见 $settingsSave 的面板分流）
+  // 「保存」为弹窗底部全局按钮，所有面板统一语义（编排见 saveAllSettings）
   const $envItems = document.getElementById("env-items");
   const $envSecrets = document.getElementById("env-secrets");
   const $envFilter = document.getElementById("env-filter");
@@ -712,9 +700,6 @@ function bindSettingsFormEvents() {
       const chip = e.target.closest(".env-chip");
       if (chip) chip.classList.toggle("checked", e.target.checked);
     });
-    // 任意控件输入/变更 → 刷新「暂存更改」的差异计数与高亮态
-    $envItems.addEventListener("input", _updateEnvSaveButton);
-    $envItems.addEventListener("change", _updateEnvSaveButton);
   }
   if ($envSecrets) {
     $envSecrets.addEventListener("click", (e) => {
@@ -734,16 +719,42 @@ function bindSettingsFormEvents() {
         }
         replaceBtn.classList.add("hidden");
       }
+      // 「取消」：收起输入框并还原「替换」入口，半输入值一并清掉（纯前端态，无请求）
+      const cancelBtn = e.target.closest("[data-sec-cancel]");
+      if (cancelBtn) {
+        const row = cancelBtn.closest(".env-row");
+        const box = row ? row.querySelector(".env-secret-input") : null;
+        if (box) {
+          const input = box.querySelector("input");
+          if (input) input.value = "";
+          box.classList.add("hidden");
+        }
+        const replace = row ? row.querySelector("[data-sec-replace]") : null;
+        if (replace) {
+          replace.classList.remove("hidden");
+          replace.focus();
+        }
+      }
     });
   }
   if ($envFilter) $envFilter.addEventListener("input", _applyEnvFilter);
 
+  // 任意草稿控件输入/变更 → 刷新全局保存计数。算的是真实差异，无需排除
+  // 清单：即时提交型控件（密钥框/订阅/通知模式等）不影响任何草稿源，天然计 0
+  $settingsModal.addEventListener("input", _updateSaveButton);
+  $settingsModal.addEventListener("change", _updateSaveButton);
+
+  // 「插件」面板：逐插件开关（草稿态；保存时并入 PLUGINS 差异统一提交）
+  if ($pluginsList) {
+    $pluginsList.addEventListener("change", (e) => {
+      const input = e.target.closest("input[data-plugin-toggle]");
+      if (input) _onPluginToggle(input.dataset.pluginToggle, input.checked, input);
+    });
+  }
+
   $settingsModal.addEventListener("click", (e) => {
     if (e.target === $settingsModal) closeSettingsModal();
   });
-  // 设置草稿脏检查：任何输入/变更即标记（input 捕获文本框，change 捕获勾选/下拉）
-  $settingsModal.addEventListener("input", () => { settingsDirtyFlag = true; });
-  $settingsModal.addEventListener("change", () => { settingsDirtyFlag = true; });
 }
 
 function bindSyncButtonEvents() {
@@ -1504,8 +1515,12 @@ function connectRealtimeStream() {
   }
 
   stream = new EventSource("/api/stream");
-  // 连接成功即复位退避（下次断开从 2s 重新开始）
-  stream.addEventListener("open", () => { sseBackoffMs = 2000; });
+  // 连接成功即复位退避（下次断开从 2s 重新开始），并恢复状态栏常规文案
+  // （断线期间被「实时推送已断开」占位，复核 P2-28）
+  stream.addEventListener("open", () => {
+    sseBackoffMs = 2000;
+    updateStatus(lastStatusInfo || {});
+  });
 
   stream.addEventListener("items_updated", (ev) => {
     // 同步完成事件（payload {"synced":true}）：恢复同步按钮；手动触发时给完成提示
@@ -1542,7 +1557,10 @@ function connectRealtimeStream() {
       stream = null;
     }
     if (streamReconnectTimer) return;
-    // 指数退避：后端重启/断网时不再以固定 0.5 QPS 持续敲服务器（SSE 客户端标准实践）
+    // 断线可见性（复核 P2-28）：静默重连会让界面退化成长间隔兜底轮询而
+    // 用户毫不知情；状态栏明示，重连成功的 open 事件复位
+    $statusText.classList.remove("hidden");
+    $statusText.innerHTML = '实时推送已断开，重连中…';
     streamReconnectTimer = setTimeout(() => {
       streamReconnectTimer = null;
       connectRealtimeStream();
@@ -1779,16 +1797,16 @@ function renderNav(categories, ignoredCount, memoCount) {
     html += `
       <button type="button" class="cat-link${isActive ? " active" : ""}"${colorStyle} data-category="${escAttr(cat.key)}" data-verified="unverified">
         ${icon ? `<img src="${icon}" class="icon-sm cat-icon" alt="">` : ""}${esc(cat.key)}
-        <span class="cat-count">${cat.count}</span>
+        <span class="cat-count">${escAttr(cat.count)}</span>
       </button>`;
   }
   $nav.innerHTML = html;
 
   if (memoCount !== undefined) {
-    $memoLink.innerHTML = `<span class="cat-link-main"><img src="/icons/bookmark-check.svg" class="icon-sm cat-icon" alt="">备忘录<span class="cat-count">${memoCount}</span></span>`;
+    $memoLink.innerHTML = `<span class="cat-link-main"><img src="/icons/bookmark-check.svg" class="icon-sm cat-icon" alt="">备忘录<span class="cat-count">${escAttr(memoCount)}</span></span>`;
   }
   if (ignoredCount !== undefined) {
-    $ignoredLink.innerHTML = `<span class="cat-link-main"><img src="/icons/ban.svg" class="icon-sm cat-icon" alt="">已忽略<span class="cat-count">${ignoredCount}</span></span>`;
+    $ignoredLink.innerHTML = `<span class="cat-link-main"><img src="/icons/ban.svg" class="icon-sm cat-icon" alt="">已忽略<span class="cat-count">${escAttr(ignoredCount)}</span></span>`;
   }
 }
 
@@ -2065,7 +2083,7 @@ async function renderOnboardSessions() {
       const kindTag = s.is_official ? '公' : (s.is_group ? '群' : '私');
       const checked = s.is_group ? "checked" : "";
       return `
-      <label class="session-row" data-is-group="${s.is_group ? "1" : "0"}" data-is-official="${s.is_official ? "1" : "0"}" data-source="${escAttr(s.source)}" data-last-active="${s.last_active || ""}">
+      <label class="session-row" data-is-group="${s.is_group ? "1" : "0"}" data-is-official="${s.is_official ? "1" : "0"}" data-source="${escAttr(s.source)}" data-last-active="${escAttr(s.last_active || "")}">
         <input type="checkbox" data-source="${escAttr(s.source)}" data-session-id="${escAttr(s.session_id)}" ${checked}>
         <span class="session-name">${esc(s.name || s.session_id)}</span>
         <span class="text-muted" style="font-size:11px">${esc(kindTag)} · ${esc(s.source)} · ${esc(s.session_id.substring(0, 15))}...</span>
@@ -3015,7 +3033,7 @@ function renderItemRow(item, { cls = "", showSubject = false, showSubscribed = f
     : `${imagesHtml}<div class="quote-meta">${esc(item.sender_name || "未知")} · ${msgTime} · ${sourceGroupChips(item.source_group)}</div>${quoteTextHtml(item)}<div class="card-quote-context"><p class="text-muted">加载上下文中...</p></div>`;
 
   return `
-    <div class="ov-row${cls ? " " + cls : ""} ${verifiedClass}" style="${catColorStyle}" data-id="${escAttr(item.id)}" data-source="${escAttr(item.source || "")}" data-session-id="${escAttr(item.session_id || "")}" data-msgtime="${item.msg_time || ""}" data-msgid="${escAttr(item.source_msg_id || "")}">
+    <div class="ov-row${cls ? " " + cls : ""} ${verifiedClass}" style="${catColorStyle}" data-id="${escAttr(item.id)}" data-source="${escAttr(item.source || "")}" data-session-id="${escAttr(item.session_id || "")}" data-msgtime="${escAttr(item.msg_time || "")}" data-msgid="${escAttr(item.source_msg_id || "")}">
       <div class="ov-row-head">
         <span class="card-category" data-cat="${escAttr(item.category)}">${esc(item.category)}</span>
         ${timeBadgeHtml(item)}
@@ -3202,7 +3220,7 @@ function renderCard(item, groupKey = "") {
   const hasQuote = !!(item.source_quote && item.source_quote.trim());
 
   return `
-    <div tabindex="-1" class="item-card ${verifiedClass}${batchMode ? " batch-selectable" : ""}${batchSel ? " selected" : ""}${subscribed ? " card-subscribed" : ""}${badge && badge.expired ? " card-expired" : ""}" style="${catColorStyle}" data-id="${escAttr(item.id)}" data-key="${escAttr(groupKey)}" data-category="${escAttr(item.category)}" data-source="${escAttr(item.source || "")}" data-session-id="${escAttr(item.session_id || "")}" data-msgtime="${item.msg_time || (item.created_at ? Math.floor(new Date(item.created_at).getTime() / 1000) : "")}" data-msgid="${escAttr(item.source_msg_id || "")}">
+    <div tabindex="-1" class="item-card ${verifiedClass}${batchMode ? " batch-selectable" : ""}${batchSel ? " selected" : ""}${subscribed ? " card-subscribed" : ""}${badge && badge.expired ? " card-expired" : ""}" style="${catColorStyle}" data-id="${escAttr(item.id)}" data-key="${escAttr(groupKey)}" data-category="${escAttr(item.category)}" data-source="${escAttr(item.source || "")}" data-session-id="${escAttr(item.session_id || "")}" data-msgtime="${escAttr(item.msg_time || (item.created_at ? Math.floor(new Date(item.created_at).getTime() / 1000) : ""))}" data-msgid="${escAttr(item.source_msg_id || "")}">
       <div class="card-header">
         ${batchMode ? `<label class="batch-check"><input type="checkbox" aria-label="选择：${escAttr((item.title || "").slice(0, 30))}" ${batchSel ? "checked" : ""}></label>` : ""}
         <span class="card-category" data-cat="${escAttr(item.category)}">${esc(item.category)}</span>
@@ -3424,9 +3442,12 @@ const _STATUS_LABELS = { online: "在线", reconnecting: "重连中", offline: "
 // 各消息源在线状态 → { overall, partsHtml }（指示器圆点颜色与文字共用）
 function _statusParts(status) {
   const sources = Object.entries(status.sources || {});
+  if (!sources.length) {
+    // 零源降级启动（决策 ①=1B）：明示采集不可用，替代含混的「未连接」
+    return { overall: "offline", parts: ["无消息源（检查插件配置，降级运行）"] };
+  }
   const states = sources.map(([, s]) => s.status || "offline");
-  const overall = states.length === 0 ? "offline"
-    : states.every(st => st === "online") ? "online"
+  const overall = states.every(st => st === "online") ? "online"
     : states.some(st => st === "reconnecting") ? "reconnecting"
     : "offline";
   const parts = sources.map(([name, s]) => {
@@ -3461,26 +3482,43 @@ function updateStatus(status) {
   setSyncButton(manualSyncWait);
 }
 
-// ── 错误/警告横幅：同步失败（lastError）、阶段缺失/无类别（lastWarning）显式提示 ──
+// ── 错误/警告横幅：同步失败（lastError）、阶段缺失/无类别（lastWarning）、
+// 零源降级（sources 为空）显式提示 ──
 // 关闭仅当前会话生效（下次 fetchData 若状态仍在会重现）；重试按钮复用同步入口。
 function renderStatusBanner(status) {
   const banner = document.getElementById("error-banner");
   if (!banner) return;
   const err = status && status.lastError;
   const warn = status && status.lastWarning;
-  banner.classList.toggle("hidden", !err && !warn);
-  if (!err && !warn) {
+  const zeroSource = status && !Object.keys(status.sources || {}).length;
+  banner.classList.toggle("hidden", !err && !warn && !zeroSource);
+  if (!err && !warn && !zeroSource) {
     banner.innerHTML = "";
     return;
   }
-  const isErr = !!err;
-  const text = isErr ? err : warn;
-  const action = isErr
-    ? '<button type="button" class="error-banner-btn" data-action="retry">重试同步</button>'
-    : '<button type="button" class="error-banner-btn" data-action="settings">去设置</button>';
+  // 零源降级是独立提示：与 lastError/lastWarning 不同源、可共存提示——
+  // 无 err/warn 时单独显示，有 err/warn 时让位给更具体的报错（零源信息
+  // 已在状态文字「无消息源（检查插件配置，降级运行）」中可见）。
+  let action = null;
+  let isErr = false;
+  let text = "";
+  if (err) {
+    isErr = true;
+    text = err;
+    action = { label: "重试同步", data: "retry" };
+  } else if (warn) {
+    text = warn;
+    action = { label: "去设置", data: "settings" };
+  } else if (zeroSource) {
+    text = "未启用任何消息源，消息采集不可用";
+    action = { label: "去启用", data: "settings-plugins" };
+  }
+  const actionBtn = action
+    ? '<button type="button" class="error-banner-btn" data-action="' + action.data + '">' + action.label + "</button>"
+    : "";
   banner.className = "error-banner " + (isErr ? "error" : "warning");
   banner.innerHTML =
-    '<span class="error-banner-text">' + esc(text) + '</span>' + action +
+    '<span class="error-banner-text">' + esc(text) + '</span>' + actionBtn +
     '<button type="button" class="error-banner-close" title="关闭" aria-label="关闭">'
     + '<img src="/icons/x.svg" class="icon-sm" alt=""></button>';
   banner.querySelector(".error-banner-close").addEventListener("click", () => {
@@ -3492,6 +3530,8 @@ function renderStatusBanner(status) {
     if (btn.dataset.action === "retry") {
       const syncBtn = document.getElementById("sync-btn");
       if (syncBtn) syncBtn.click();
+    } else if (btn.dataset.action === "settings-plugins") {
+      openSettingsModal(null, { panel: "plugins" }); // 直达「插件」面板
     } else {
       const link = document.getElementById("settings-link");
       if (link) link.click();
@@ -3630,7 +3670,7 @@ function renderSessions(sessions) {
     ...sessions.map(s => {
       const kindTag = s.is_official ? '公' : (s.is_group ? '群' : '私');
       return `
-      <label class="session-row" data-is-group="${s.is_group ? "1" : "0"}" data-is-official="${s.is_official ? "1" : "0"}" data-source="${escAttr(s.source)}" data-last-active="${s.last_active || ""}">
+      <label class="session-row" data-is-group="${s.is_group ? "1" : "0"}" data-is-official="${s.is_official ? "1" : "0"}" data-source="${escAttr(s.source)}" data-last-active="${escAttr(s.last_active || "")}">
         <input type="checkbox" data-source="${escAttr(s.source)}" data-session-id="${escAttr(s.session_id)}" ${s.enabled ? "checked" : ""}>
         <span class="session-name">${esc(s.name)}</span>
         <span class="text-muted" style="font-size:11px">${esc(kindTag)} · ${esc(s.source)} · ${esc(s.session_id.substring(0, 15))}...</span>
@@ -3966,7 +4006,7 @@ function renderCategoryToggles() {
       <label class="cat-toggle-label">
         <input type="checkbox" data-cat-id="${c.key}" ${c.enabled ? "checked" : ""}>
         <span class="cat-name">${esc(c.name)}${isNew ? ' <em class="cat-new-tag">新增</em>' : ""}</span>
-        <span class="text-muted" style="font-size:11px">(${c.item_count})</span>
+        <span class="text-muted" style="font-size:11px">(${escAttr(c.item_count)})</span>
       </label>
       <button class="cat-edit">编辑</button>
       <button class="cat-del">删除</button>`;
@@ -4044,6 +4084,7 @@ function confirmAddCategory() {
   $catAddForm.classList.add("hidden");
   $categoryAdd.classList.remove("hidden");
   renderCategoryToggles();
+  _updateSaveButton(); // click 驱动的草稿变更不经 input/change 事件，显式刷新计数
 }
 
 // 行内编辑"确认"：把表单值写回草稿行，点设置"保存"后才更新
@@ -4060,6 +4101,7 @@ function confirmEditCategory(row) {
     item.color = getPaletteColor(row.querySelector(".cat-palette"));
   }
   renderCategoryToggles();
+  _updateSaveButton(); // click 驱动的草稿变更不经 input/change 事件，显式刷新计数
 }
 
 // 删除确认：从草稿移除（id=null 的新行直接丢弃；已有类别记入 catDeleted 待保存时删除）
@@ -4072,6 +4114,7 @@ function markDelete(key, purge) {
     catDeleted.push({ key: c.key, row: c, purgeItems: purge });
   }
   renderCategoryToggles();
+  _updateSaveButton(); // click 驱动的草稿变更不经 input/change 事件，显式刷新计数
 }
 
 // 撤销待删除：恢复完整草稿行（含未保存的编辑）
@@ -4082,16 +4125,14 @@ function undoDelete(key) {
   const [d] = catDeleted.splice(idx, 1);
   catDraft.push(d.row);
   renderCategoryToggles();
+  _updateSaveButton(); // click 驱动的草稿变更不经 input/change 事件，显式刷新计数
 }
 
-// 收集全部设置变更操作（类别 diff + 会话 diff），返回描述性操作列表；
-// 类别草稿未加载或最终名称集合冲突时返回 null（已弹窗说明）。
-// 在保存时刻快照——即使同步中挂起、之后弹窗重开重载草稿，操作依然有效。
-function collectAllOps() {
-  if (!catDraft) {
-    showToast("类别列表尚未加载，请关闭设置窗口后重新打开", { type: "error", duration: 5000 });
-    return null;
-  }
+// 收集类别/会话草稿与基线的差异操作列表（纯函数：不改状态、不弹窗）。
+// 脏检查（_hasPendingChanges）与保存（collectAllOps）共用本函数——
+// 保证「关闭时问的」与「保存时存的」永远一致，杜绝两套事实源漂移。
+function _diffCategoryOps() {
+  if (!catDraft) return []; // 类别草稿未加载 = 无草稿可言（不阻塞其它源保存）
   const ops = [];
   // 类别顺序：先删、再改、后增（改名先于同名新建执行，释放旧名避免 UNIQUE 冲突；
   // 会话开关与类别无关，放最后）
@@ -4128,6 +4169,13 @@ function collectAllOps() {
       ops.push({ type: "sessionToggle", source: cb.dataset.source, sessionId: cb.dataset.sessionId });
     }
   });
+  return ops;
+}
+
+// 保存时刻快照收集全部设置变更操作——即使同步中挂起、之后弹窗重开重载
+// 草稿，操作依然有效；最终名称集合冲突时返回 null（已弹窗说明）。
+function collectAllOps() {
+  const ops = _diffCategoryOps();
   // 最终名称集合校验：改名 A→B 且新建 B、两类别改名为同一新名等在服务端必然
   // 409，提前拦截并指明冲突名，避免操作执行到一半才失败。
   // 新建名撞"正在被删除/改名的旧名"不算冲突（先删后建/先改后建可成功）。
@@ -4163,7 +4211,13 @@ async function reqJson(url, { method = "GET", body } = {}) {
     headers: body === undefined ? undefined : { "Content-Type": "application/json" },
     body: body === undefined ? undefined : JSON.stringify(body),
   });
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  if (!res.ok) {
+    const err = new Error(`HTTP ${res.status}`);
+    // 结构化错误体挂到 payload（如 PLUGINS 校验 409 的 {detail:{issues}}）；
+    // 无体/非 JSON 响应静默忽略，调用点按需取用
+    try { err.payload = await res.json(); } catch { /* 忽略 */ }
+    throw err;
+  }
   return res.json();
 }
 
@@ -4223,8 +4277,10 @@ async function runSettingsOps(ops) {
 // ── Settings ──
 // 类别启用/停用已由后端持久化（categories.enabled），localStorage 只存刷新间隔
 function loadSettings() {
-  // 存值可能是任意 JSON（含 null/数组/标量），故 || {} 兜住非对象后再取字段
-  const saved = lsGetJson("briefdesk-settings", {}) || {};
+  // 存值可能是任意 JSON（含 null/数组/标量），故 || {} 兜住非对象后再取字段；
+  // 键名统一为点分风格（复核 P3），旧连字符键一次性搬迁
+  const saved = (lsGetJson("briefdesk.settings", null)
+    ?? lsGetJson("briefdesk-settings", {})) || {};
   refreshIntervalSec = Math.max(30, parseInt(saved.refreshInterval, 10) || 300);
   $refreshInterval.value = refreshIntervalSec;
   notifyMode = lsGet("briefdesk.notifyMode", "off");
@@ -4239,17 +4295,102 @@ function loadSettings() {
 function saveSettings() {
   refreshIntervalSec = Math.max(30, parseInt($refreshInterval.value) || 300);
   $refreshInterval.value = refreshIntervalSec;
-  lsSetJson("briefdesk-settings", { refreshInterval: refreshIntervalSec });
+  lsSetJson("briefdesk.settings", { refreshInterval: refreshIntervalSec });
+}
+
+// 统一保存：一次点击提交全部未保存草稿——暂存（env/PLUGINS）、类别/会话
+// ops（含同步中延迟）、刷新间隔（localStorage 立即生效）。原「按面板分流」
+// 的两个保存路径就此合并：按钮计数（_pendingChangeCount）、关闭确认
+// （_hasPendingChanges）、实际提交内容三者同源，任一面板点击行为一致。
+async function saveAllSettings() {
+  if (saveBusy) return;
+  saveBusy = true;
+  $settingsSave.disabled = true;
+  try {
+    // 刷新间隔与同步数据无关，立即生效（先记是否变更，saveSettings 会更新基准）
+    const intervalChanged =
+      Math.max(30, parseInt($refreshInterval.value) || 300) !== refreshIntervalSec;
+    saveSettings();
+
+    // 1) 暂存（env/PLUGINS）：409（依赖/互斥）或警示确认取消 → 中止整个保存
+    const staged = await stagePendingEnvChanges();
+    if (staged === "aborted") return;
+
+    // 2) 类别/会话 ops：保存时快照，弹窗重开/草稿重载不影响挂起
+    const ops = collectAllOps();
+    if (!ops) {
+      // 名称冲突中止：暂存段若已提交仍需明示并刷新面板，避免用户不知道
+      // 配置已暂存（数据已在服务端，只是缺反馈）
+      if (staged === "committed") {
+        showToast("已暂存，重启应用后生效", { type: "success", duration: 4000 });
+        await loadEnvConfig();
+      }
+      return; // 名称冲突已弹窗说明，中止本次保存
+    }
+    let opsApplied = false;
+    let opsDeferred = false;
+    if (ops.length) {
+      // 实时查询同步状态（isSyncing 是缓存值，另一标签页/启动首轮可能已开始同步）
+      let syncingNow = isSyncing;
+      const liveStatus = await getJson("/api/status").catch(() => null); // 失败回退缓存值
+      if (liveStatus) syncingNow = !!liveStatus.syncing;
+      if (syncingNow) {
+        pendingChanges = ops; // 覆盖旧挂起项，最新意图为准
+        opsDeferred = true;
+        showToast("当前正在同步，更改将在同步完成后自动应用", { type: "info", duration: 6000 });
+      } else {
+        pendingChanges = null; // 直接应用时丢弃历史挂起项（最新保存为准），
+                               // 否则 fetchData 会在其后再应用一遍旧操作
+        await runSettingsOps(ops);
+        opsApplied = true;
+      }
+    }
+
+    // 3) 收尾：双改共存 → 关闭双 toast；仅暂存 → 保持打开继续调配置；
+    //    仅 ops/仅刷新间隔 → 关闭；皆无更改 → 静默关闭（「保存」即完成键）
+    if (staged === "committed" && (opsApplied || opsDeferred)) {
+      closeSettingsModal({ force: true });
+      showToast("设置已保存", { type: "success", duration: 2500 });
+      showToast("启动配置已暂存，重启应用后生效", { type: "success", duration: 4000 });
+      startRefreshTimer();
+      fetchData();
+    } else if (staged === "committed") {
+      showToast("已暂存，重启应用后生效", { type: "success", duration: 4000 });
+      await loadEnvConfig(); // 刷新面板显示已暂存徽标（并复位开关草稿）
+    } else if (opsApplied || opsDeferred || intervalChanged) {
+      closeSettingsModal({ force: true });
+      showToast("设置已保存", { type: "success", duration: 2500 });
+      startRefreshTimer();
+      fetchData();
+    } else {
+      closeSettingsModal({ force: true });
+    }
+  } catch (err) {
+    console.error("Save settings error:", err);
+    showToast("保存失败，部分更改可能未生效，请重试", { type: "error", duration: 6000 });
+    // 已应用的前缀操作（如删除）不可回滚：重载草稿对齐服务端真相，
+    // 避免基于过期草稿重复操作（对已删类别再删 → 404）；暂存若已提交
+    // 也一并刷新面板显示
+    await loadCategories();
+    await loadSessions();
+    await loadEnvConfig();
+  } finally {
+    saveBusy = false;
+    $settingsSave.disabled = false;
+  }
 }
 
 // ── 启动配置（.env 暂存）──
-// 数据来自 GET /api/settings/env；「暂存更改」只写暂存文件（重启应用才生效），
+// 数据来自 GET /api/settings/env；暂存写入用户配置目录的 settings.env
+// （重启应用才生效，统一保存流程的第一段见 stagePendingEnvChanges），
 // 密钥走系统钥匙串（POST/DELETE /api/settings/secrets），服务端不回传明文。
 let envData = null;
 
 async function loadEnvConfig() {
   envData = await getJson("/api/settings/env").catch(() => null);
+  _pluginSets(); // 插件开关草稿以本次加载的服务端期望值为基准（重载即重置草稿）
   renderEnvConfig();
+  renderPluginToggles();
 }
 
 function _envBadges(item, { skipPluginBadge = false } = {}) {
@@ -4287,13 +4428,12 @@ function _envControl(item) {
       + "</select>";
   }
   if (item.type === "multi") {
-    // 选项 = 已发现插件 ∪ 当前值（保证既有值不回丢）
+    // 选项 = 已发现插件 ∪ 当前值（保证既有值不回丢）；无通配语义
     const current = Array.isArray(cur) ? cur : [];
     const opts = current.slice();
     for (const name of (envData.pluginOptions || [])) {
       if (!opts.includes(name)) opts.push(name);
     }
-    if (!opts.includes("*")) opts.unshift("*");
     return '<div class="env-multi" data-env-key="' + keyAttr + '">'
       + opts.map(o => '<label class="env-chip' + (current.includes(o) ? " checked" : "") + '">'
         + '<input type="checkbox" value="' + escAttr(o) + '"'
@@ -4353,11 +4493,9 @@ function _envRowHtml(item, groupDisabled) {
 }
 
 function _envItemsHtml() {
-  return _groupByPlugin(envData.items).map(group => {
-    // 插件整组未加载/未启用 → 默认折叠（仍可展开预配置），头部徽章示意；
-    // 正文不做容器级 opacity 调光（对比度守卫测试禁止）
-    const disabled = group.name !== "core"
-      && group.items.every(i => i.pluginStatus && i.pluginStatus !== "loaded");
+  // PLUGINS（hidden）由「插件」面板逐插件开关编辑，不在本面板渲染
+  return _groupByPlugin(envData.items.filter(i => !i.hidden)).map(group => {
+    const disabled = _envGroupDisabled(group);
     return '<details class="env-group"' + (disabled ? "" : " open")
       + ' data-env-default-open="' + (disabled ? "0" : "1") + '">'
       // summary 必须挂 env-group-head：挂上后 display:flex 会同时干掉 UA 默认的
@@ -4369,6 +4507,14 @@ function _envItemsHtml() {
   }).join("");
 }
 
+// 整组未加载/未启用 → 默认折叠（仍可展开预配置），头部徽章示意，行内不再
+// 重复「未启用」徽章；正文不做容器级 opacity 调光（对比度守卫测试禁止）。
+// _envItemsHtml 与行级贴片（_patchEnvItem）共用同一判定，避免两处漂移
+function _envGroupDisabled(group) {
+  return group.name !== "core"
+    && group.items.every(i => i.pluginStatus && i.pluginStatus !== "loaded");
+}
+
 function _envSecretRowHtml(s) {
   const keyringConfigured = s.keyringConfigured !== undefined
     ? !!s.keyringConfigured
@@ -4378,15 +4524,23 @@ function _envSecretRowHtml(s) {
     : s.configured
       ? '<span class="env-badge">已配置（环境变量/.env）</span>'
       : '<span class="env-badge">未配置</span>';
-  // 已配置时输入框藏起但不销毁：「替换」展开它，免去「先清除再输入」的断层
+  // 已配置时输入框藏起但不销毁：「替换」展开它，免去「先清除再输入」的断层；
+  // 「取消」仅在钥匙串托管行出现——只有这行存在可还原的「替换」态，未配置行
+  // 的输入框是常驻配置入口，收起就再无门路
   const input = '<div class="env-secret-input' + (keyringConfigured ? " hidden" : "") + '">'
     + '<input type="password" class="env-input" data-sec-input="' + escAttr(s.name) + '" placeholder="输入 ' + esc(s.label) + '" autocomplete="off">'
-    + '<button type="button" class="settings-outline-btn" data-sec-set="' + escAttr(s.name) + '">保存</button></div>';
+    + '<button type="button" class="settings-outline-btn" data-sec-set="' + escAttr(s.name) + '">保存</button>'
+    + (keyringConfigured
+      ? '<button type="button" class="settings-outline-btn" data-sec-cancel="' + escAttr(s.name) + '">取消</button>'
+      : "")
+    + "</div>";
+  // 「替换/清除」与输入框行内的「保存/取消」同款轮廓按钮（settings-outline-btn），
+  // 右置与防平分推力的对齐规则见 style.css 行头小节
   const managed = keyringConfigured
-    ? '<button type="button" class="env-restore" data-sec-replace="' + escAttr(s.name) + '">替换</button>'
-      + '<button type="button" class="env-restore" data-sec-clear="' + escAttr(s.name) + '">清除</button>'
+    ? '<button type="button" class="settings-outline-btn" data-sec-replace="' + escAttr(s.name) + '">替换</button>'
+      + '<button type="button" class="settings-outline-btn" data-sec-clear="' + escAttr(s.name) + '">清除</button>'
     : "";
-  return '<div class="env-row"><div class="env-row-head">'
+  return '<div class="env-row" data-sec-name="' + escAttr(s.name) + '"><div class="env-row-head">'
     + '<label class="env-label">' + esc(s.label) + "</label>" + state + managed + "</div>"
     + input + "</div>";
 }
@@ -4402,19 +4556,47 @@ function _envSecretsHtml() {
   }).join("") || '<p class="text-muted">无</p>';
 }
 
+// ── 行级贴片：行内动作（恢复默认/密钥写清）后只更新受影响的行 ──
+// 写端点响应携带该键的最新状态（staged/source 或密钥两布尔），前端就地
+// 替换对应行的 outerHTML——不再整面 loadEnvConfig()：整面重载会丢其它行
+// 的未暂存编辑、「插件」面板的开关草稿，还会丢搜索过滤态。极端情况
+// （贴片漏更）由下次打开弹窗的 loadEnvConfig() 全量重同步兜底。
+function _patchEnvItem(key, fresh) {
+  if (!envData || !fresh) return;
+  const item = envData.items.find(i => i.key === key);
+  if (!item) return;
+  Object.assign(item, fresh); // staged / source
+  const group = _groupByPlugin(envData.items.filter(i => !i.hidden))
+    .find(g => g.items.some(i => i.key === key));
+  const $row = document.querySelector('#env-items .env-row[data-env-key="' + key + '"]');
+  if ($row && group) $row.outerHTML = _envRowHtml(item, _envGroupDisabled(group));
+  _applyEnvFilter();
+  _updateSaveButton();
+}
+
+function _patchSecretRow(name, fresh) {
+  if (!envData || !fresh) return;
+  const secret = (envData.secrets || []).find(s => s.name === name);
+  if (!secret) return;
+  Object.assign(secret, fresh); // configured / keyringConfigured
+  const $row = document.querySelector('#env-secrets .env-row[data-sec-name="' + name + '"]');
+  if ($row) $row.outerHTML = _envSecretRowHtml(secret);
+  _applyEnvFilter();
+}
+
 function renderEnvConfig() {
   const $path = document.getElementById("env-file-path");
   const $items = document.getElementById("env-items");
   const $secrets = document.getElementById("env-secrets");
   if (!envData) {
     if ($items) $items.innerHTML = '<p class="text-muted">加载失败，请刷新页面重试</p>';
-    // 全局「保存」无需禁用：saveEnvConfig 对 envData 为空时直接返回
+    // 全局「保存」无需禁用：暂存段对 envData 为空按 skipped 处理，不影响类别/会话保存
     return;
   }
   if ($path) $path.textContent = "暂存文件：" + envData.filePath;
   if ($items) $items.innerHTML = _envItemsHtml();
   if ($secrets) $secrets.innerHTML = _envSecretsHtml();
-  _updateEnvSaveButton();
+  _updateSaveButton();
 }
 
 // 搜索过滤：行级显隐 + 组级整组显隐；details 组在过滤时自动展开命中组，
@@ -4439,17 +4621,13 @@ function _applyEnvFilter() {
   }
 }
 
-// 底部全局「保存」按钮的差异数联动：env 面板激活时把未暂存差异追加到文案
-// （保存（N 项））；切到其他面板或无差异时还原为纯「保存」
-function _updateEnvSaveButton() {
+// 底部全局「保存」按钮的差异数联动：全面板显示合并未保存差异数
+// （保存（N 项））——统一保存语义下一次点击提交全部草稿，计数与实际
+// 提交项一致；无差异时还原为纯「保存」
+function _updateSaveButton() {
   const $save = document.getElementById("settings-save");
   if (!$save) return;
-  const envActive = !document.querySelector('.settings-panel[data-panel="env"]')?.classList.contains("hidden");
-  if (!envActive || !envData) {
-    if ($save.textContent !== "保存") $save.textContent = "保存";
-    return;
-  }
-  const n = Object.keys(_collectEnvChanges()).length;
+  const n = _pendingChangeCount();
   $save.textContent = n > 0 ? "保存（" + n + " 项）" : "保存";
 }
 
@@ -4493,30 +4671,38 @@ function _collectEnvChanges() {
   return changes;
 }
 
-async function saveEnvConfig() {
-  if (!envData) return;
-  const changes = _collectEnvChanges();
-  if (!Object.keys(changes).length) {
-    showToast("没有需要暂存的更改", { type: "info", duration: 2500 });
-    return;
-  }
+// 暂存 env/PLUGINS 未暂存差异（统一保存流程的第一段）。
+// 返回 "committed"（已提交）/"skipped"（无差异）/"aborted"（警示确认取消
+// 或写入失败——调用方应中止整个保存流程，弹窗保留、草稿不动）
+async function stagePendingEnvChanges() {
+  if (!envData) return "skipped";
+  // 启动配置项差异 + 插件开关草稿（PLUGINS）一并提交
+  const changes = { ..._collectEnvChanges(), ..._pluginChanges() };
+  if (!Object.keys(changes).length) return "skipped";
   const warnItem = envData.items.find(i => i.warn && changes[i.key] !== undefined);
-  if (warnItem && !confirm(warnItem.label + "：" + warnItem.warn + "。确定暂存？")) return;
+  if (warnItem && !confirm(warnItem.label + "：" + warnItem.warn + "。确定暂存？")) return "aborted";
   try {
     await putJson("/api/settings/env", { items: changes });
-    showToast("已暂存，重启应用后生效", { type: "success", duration: 4000 });
-    await loadEnvConfig();
+    return "committed";
   } catch (err) {
     console.error("Save env config error:", err);
-    showToast("暂存失败，请检查输入后重试", { type: "error", duration: 6000 });
+    // 409（PLUGINS 依赖/互斥复检失败）服务端返回 {detail:{issues}}，逐条明示
+    const issues = err && err.payload && err.payload.detail && err.payload.detail.issues;
+    if (Array.isArray(issues) && issues.length) {
+      showToast("无法暂存：" + issues.map(i => i.plugin + "：" + i.detail).join("；"),
+        { type: "error", duration: 8000 });
+    } else {
+      showToast("暂存失败，请检查输入后重试", { type: "error", duration: 6000 });
+    }
+    return "aborted";
   }
 }
 
 async function restoreEnvKey(key) {
   try {
-    await putJson("/api/settings/env", { items: { [key]: null } });
+    const res = await putJson("/api/settings/env", { items: { [key]: null } });
+    _patchEnvItem(key, res.items && res.items[key]);
     showToast(key + " 已恢复默认（重启生效）", { type: "success", duration: 3000 });
-    await loadEnvConfig();
   } catch {
     showToast("操作失败，请重试", { type: "error", duration: 4000 });
   }
@@ -4530,9 +4716,9 @@ async function setEnvSecret(name) {
     return;
   }
   try {
-    await postJson("/api/settings/secrets", { name, value });
+    const res = await postJson("/api/settings/secrets", { name, value });
+    _patchSecretRow(name, res);
     showToast(name + " 已写入钥匙串（重启生效）", { type: "success", duration: 4000 });
-    await loadEnvConfig();
   } catch (err) {
     console.error("Set secret error:", err);
     showToast("密钥写入失败", { type: "error", duration: 5000 });
@@ -4541,9 +4727,9 @@ async function setEnvSecret(name) {
 
 async function clearEnvSecret(name) {
   try {
-    await deleteJson("/api/settings/secrets/" + encodeURIComponent(name));
+    const res = await deleteJson("/api/settings/secrets/" + encodeURIComponent(name));
+    _patchSecretRow(name, res);
     showToast(name + " 已从钥匙串清除", { type: "success", duration: 3000 });
-    await loadEnvConfig();
   } catch {
     showToast("清除失败，请重试", { type: "error", duration: 4000 });
   }
@@ -4848,10 +5034,9 @@ function setSettingsPanel(name) {
   $settingsModal.querySelectorAll(".settings-panel").forEach(p => {
     p.classList.toggle("hidden", p.dataset.panel !== name);
   });
-  // 「启动配置」与其他面板共用底部全局「保存」按钮；点击语义按当前面板分流
-  // （env → 写暂存文件，其余 → 刷新间隔 + 类别/会话草稿），差异数由
-  // _updateEnvSaveButton 追加到按钮文案上
-  _updateEnvSaveButton();
+  // 底部全局「保存」对所有面板语义一致（统一提交全部草稿），差异数由
+  // _updateSaveButton 维护在按钮文案上
+  _updateSaveButton();
 }
 
 async function loadAboutSources() {
@@ -4869,31 +5054,165 @@ async function loadAboutSources() {
   }
 }
 
-async function loadPlugins() {
-  // 「插件」页：/api/plugins 元数据（名称/版本/状态/原因），失败不阻塞弹窗
-  if (!$pluginsList) return;
-  try {
-    const data = await getJson("/api/plugins");
-    const plugins = Array.isArray(data.plugins) ? data.plugins : [];
-    if (!plugins.length) {
-      $pluginsList.innerHTML = '<p class="text-muted">未发现任何插件</p>';
+// ── 插件面板（逐插件启停）──
+// 数据复用 GET /api/settings/env 的 plugins 数组（声明元数据 + 期望启用态 +
+// 当前进程装配状态）。开关只改本地草稿集，点「保存」才写 PLUGINS 暂存
+// （重启生效）；核心插件恒装配、无开关，仅展示状态。
+
+let pluginBaseSet = null;   // 服务端期望启用的可选插件名集合（加载时快照）
+let pluginDraftSet = null;  // 草稿启用集合；null = 尚未改动
+
+function _pluginSets() {
+  const plugins = (envData && envData.plugins) || [];
+  pluginBaseSet = new Set(plugins.filter(p => !p.core && p.enabled).map(p => p.name));
+  pluginDraftSet = null;
+}
+
+function _pluginByName(name) {
+  return (((envData || {}).plugins) || []).find(p => p.name === name) || null;
+}
+
+function _pluginEnabledInDraft(name) {
+  const p = _pluginByName(name);
+  if (!p) return false;
+  if (p.core) return true; // 核心插件恒装配：依赖指向它视为恒满足
+  return pluginDraftSet ? pluginDraftSet.has(name) : pluginBaseSet.has(name);
+}
+
+function _pluginChanges() {
+  // 草稿 → PLUGINS 期望列表（仅可选插件名，按名排序稳定序列化）
+  if (!pluginDraftSet) return {};
+  const draft = [...pluginDraftSet].sort();
+  const base = [...pluginBaseSet].sort();
+  if (JSON.stringify(draft) === JSON.stringify(base)) return {};
+  return { PLUGINS: JSON.stringify(draft) };
+}
+
+// 开关校验（阻止并逐步提示，绝不隐式改动其它插件）：
+// 启用 → 互斥对已启用 / 依赖未启用则拒；禁用 → 被启用中的可选插件或核心
+// 插件依赖则拒。通过后仅更新本插件草稿态。
+function _onPluginToggle(name, wantOn, input) {
+  const p = _pluginByName(name);
+  if (!p || p.core) return;
+  if (!pluginDraftSet) pluginDraftSet = new Set(pluginBaseSet);
+  if (pluginDraftSet.has(name) === wantOn) return;
+  if (wantOn) {
+    const conflicts = (p.conflicts || []).filter(n => _pluginEnabledInDraft(n));
+    if (conflicts.length) {
+      input.checked = !wantOn;
+      showToast("无法启用 " + name + "：与 " + conflicts.join("、") + " 互斥，请先禁用",
+        { type: "error", duration: 6000 });
       return;
     }
-    $pluginsList.innerHTML = plugins.map(p => {
-      const statusCls = p.status === "loaded"
-        ? "plugin-status-ok"
-        : (p.status === "disabled" ? "plugin-status-warn" : "plugin-status-err");
-      const reason = p.reason ? '<span class="text-muted"> — ' + esc(p.reason) + "</span>" : "";
-      return '<div class="plugin-row">'
-        + '<span class="plugin-name">' + esc(p.name) + "</span>"
-        + '<span class="plugin-version">v' + esc(p.version) + "</span>"
-        + '<span class="plugin-status ' + statusCls + '">' + esc(p.status) + "</span>"
-        + reason
-        + "</div>";
-    }).join("");
-  } catch {
-    $pluginsList.innerHTML = '<p class="text-muted">加载失败</p>';
+    const missing = (p.dependencies || []).filter(d => !_pluginEnabledInDraft(d));
+    if (missing.length) {
+      input.checked = !wantOn;
+      showToast("无法启用 " + name + "：需先启用 " + missing.join("、"),
+        { type: "error", duration: 6000 });
+      return;
+    }
+    pluginDraftSet.add(name);
+  } else {
+    const optionalDependents = [];
+    const coreDependents = [];
+    for (const q of (envData.plugins || [])) {
+      if (q.name === name || !(q.dependencies || []).includes(name)) continue;
+      if (q.core) coreDependents.push(q.name);
+      else if (_pluginEnabledInDraft(q.name)) optionalDependents.push(q.name);
+    }
+    if (coreDependents.length || optionalDependents.length) {
+      input.checked = !wantOn;
+      const parts = [];
+      if (coreDependents.length) parts.push("核心插件 " + coreDependents.join("、") + " 依赖它");
+      if (optionalDependents.length) parts.push("请先禁用 " + optionalDependents.join("、"));
+      showToast("无法禁用 " + name + "：" + parts.join("；"), { type: "error", duration: 6000 });
+      return;
+    }
+    pluginDraftSet.delete(name);
   }
+  renderPluginToggles();
+  _updateSaveButton();
+}
+
+function _pluginStatusBadge(p) {
+  // loaded/disabled/failed 为启动装配后的常态；discovered 仅在 GET 时
+  // manager 尚未装配的极端场景出现（正常启动后不会出现）
+  const states = {
+    loaded: { cls: "plugin-status-ok", label: "已加载" },
+    disabled: { cls: "plugin-status-warn", label: "未启用" },
+    failed: { cls: "plugin-status-err", label: "不可用" },
+    discovered: { cls: "plugin-status-warn", label: "未装配" },
+  };
+  const state = states[p.status] || { cls: "plugin-status-err", label: p.status || "未装配" };
+  return '<span class="plugin-status ' + state.cls + '">' + esc(state.label) + "</span>";
+}
+
+function _pluginRowHtml(p) {
+  const on = pluginDraftSet ? pluginDraftSet.has(p.name) : pluginBaseSet.has(p.name);
+  const badges = [];
+  if (p.core) {
+    badges.push('<span class="env-badge">核心 · 始终启用</span>');
+  } else if (pluginDraftSet && pluginDraftSet.has(p.name) !== pluginBaseSet.has(p.name)) {
+    badges.push('<span class="env-badge env-badge-staged">'
+      + (pluginDraftSet.has(p.name) ? "重启后启用" : "重启后禁用") + "</span>");
+  }
+  badges.push(_pluginStatusBadge(p));
+  if (p.reason) badges.push('<span class="plugin-reason text-muted">' + esc(p.reason) + "</span>");
+  const control = p.core ? ""
+    : '<label class="env-switch"><input type="checkbox" data-plugin-toggle="' + escAttr(p.name) + '"'
+      + (on ? " checked" : "") + '><span class="env-switch-text">启用</span></label>';
+  const deps = p.dependencies || [];
+  const depsHint = deps.length
+    ? '<p class="text-muted settings-hint">依赖：' + deps.map(esc).join("、") + "（核心插件恒满足）</p>"
+    : "";
+  return '<div class="plugin-row" data-plugin="' + escAttr(p.name) + '">'
+    + '<div class="plugin-row-head">'
+    + '<span class="plugin-name">' + esc(p.name) + "</span>"
+    + '<span class="plugin-version">v' + esc(p.version || "?") + "</span>"
+    + badges.join("")
+    + '<span class="plugin-row-spacer"></span>'
+    + control + "</div>"
+    + depsHint + "</div>";
+}
+
+function renderPluginToggles() {
+  if (!$pluginsList) return;
+  if (!envData) {
+    $pluginsList.innerHTML = '<p class="text-muted">加载失败，请刷新页面重试</p>';
+    return;
+  }
+  const plugins = envData.plugins || [];
+  if (!plugins.length) {
+    $pluginsList.innerHTML = '<p class="text-muted">未发现任何插件</p>';
+    return;
+  }
+  // 8a：pluginsSource==="env" → 顶部警示。来源链 env > 暂存 > .env > 默认，
+  // 面板开关写入的是暂存文件（优先级低于环境变量），env 覆盖时重启不生效。
+  // 只告知不禁用：用户可能想先暂存、将来移除环境变量后生效，或借此核对
+  // 当前生效值；与启动配置面板 env 行的「环境变量优先」徽章同口径。
+  const envSourced = envData.pluginsSource === "env";
+  const envNotice = envSourced
+    ? '<div class="plugins-env-notice">PLUGINS 由环境变量控制（优先于本机配置），'
+      + "此处的开关重启后不会生效——请修改系统环境变量或 .env 配置。</div>"
+    : "";
+  // 7b：无任何可选插件启用 → 面板顶部引导（覆盖零源降级最常见成因：新装
+  // 复制 .env.example 默认 PLUGINS=[] / 旧版升级无 PLUGINS 行）。消息源等
+  // 可选插件默认禁用，须逐个启用并重启生效。
+  const optionalAllOff = !plugins.some(p => !p.core && p.enabled);
+  const optionalHint = optionalAllOff
+    ? '<p class="text-muted settings-hint plugins-empty-hint">当前未启用任何可选插件'
+      + "（消息源等默认禁用）。消息采集不可用——请在上方启用至少一个消息源，"
+      + "保存后重启应用生效。</p>"
+    : "";
+  // 核心在前、可选在后（各保持服务端返回序）；空分组不渲染标题
+  const section = (title, rows) => rows.length
+    ? '<div class="plugin-section"><div class="plugin-section-title">' + title + "</div>"
+      + rows.map(_pluginRowHtml).join("") + "</div>"
+    : "";
+  $pluginsList.innerHTML = envNotice
+    + (optionalHint ? '<div class="plugin-section">' + optionalHint + "</div>" : "")
+    + section("核心插件（始终启用）", plugins.filter(p => p.core))
+    + section("可选插件", plugins.filter(p => !p.core));
 }
 
 async function loadPluginFrontends() {
@@ -4963,11 +5282,11 @@ function injectPluginScript(name) {
   });
 }
 
-let settingsDirtyFlag = false; // 设置弹窗内任一 input/change 即置位；保存成功后 force 关闭
 function closeSettingsModal({ force = false } = {}) {
-  // 显式保存模型下，Esc/取消/点遮罩静默丢弃全部草稿属可避免错误（Nielsen #5）
-  if (!force && settingsDirtyFlag && !window.confirm("有未保存的修改，确定放弃并关闭？")) return;
-  settingsDirtyFlag = false;
+  // 显式保存模型下，Esc/取消/点遮罩静默丢弃全部草稿属可避免错误（Nielsen #5）。
+  // 判据是真实差异（与保存共用 diff 函数），而非「发生过事件」的累积标记：
+  // 改了又改回、行内动作后的残留等不再误问；无状态可复位（差异即算即用）
+  if (!force && _hasPendingChanges() && !window.confirm("有未保存的修改，确定放弃并关闭？")) return;
   $settingsModal.classList.add("hidden");
   syncBodyScrollLock();
   popModalFocus($settingsModal);
@@ -4987,23 +5306,24 @@ function setSyncButton(busy) {
 // 在已转义文本中高亮全部匹配的搜索词（多词 OR：每个词的所有出现都高亮）。
 // 搜索词同样先经 esc() 转义再匹配：转义后文本中的 & < > 等实体（&amp;、&lt;）
 // 不会被搜索词命中破坏；正则元字符再单独转义。
+// 全部词必须合并为单个交替正则一次替换：逐词对上一步结果重复 replace 会命中
+// 上一轮插入的字面 <mark> 标签文本，产出 <m<mark>…</mark>rk> 标签汤（实证 bug）。
 function highlight(str) {
   const escaped = esc(str);
   if (!currentSearch) return escaped;
   const terms = currentSearch.toLowerCase().split(/\s+/).filter(Boolean);
-  if (!terms.length) return escaped;
-  let out = escaped;
-  for (const term of terms) {
-    const escapedTerm = esc(term).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    if (!escapedTerm) continue;
-    const re = new RegExp(escapedTerm, "gi");
-    out = out.replace(re, (m) => "<mark>" + m + "</mark>");
-  }
-  return out;
+  const alts = terms
+    .map((t) => esc(t).replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
+    .filter(Boolean);
+  if (!alts.length) return escaped;
+  const re = new RegExp(alts.join("|"), "gi");
+  return escaped.replace(re, (m) => "<mark>" + m + "</mark>");
 }
 
 function esc(str) {
-  if (!str) return "";
+  // 仅 null/undefined 归空（0 等 falsy 值原样转义为 "0"）：数字字段（计数、
+  // 时间戳）也走统一转义口径（复核 P3），esc(0)==="" 的旧守卫会把 0 计数吞掉
+  if (str == null) return "";
   const div = document.createElement("div");
   div.textContent = str;
   return div.innerHTML;

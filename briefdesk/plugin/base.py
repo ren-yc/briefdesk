@@ -38,11 +38,20 @@ class PluginDisabledError(Exception):
 
 
 class Plugin(Protocol):
-    """插件最小契约（协议类：内置插件显式继承以声明契约，mypy 强制实现完整性）。"""
+    """插件最小契约（协议类：内置插件显式继承以声明契约，mypy 强制实现完整性）。
+
+    core=True 的核心插件始终装配、不受 PLUGINS 过滤（UI 无启停开关）；
+    可选插件默认不启用，经 PLUGINS 显式列名或设置页逐插件开关启用。
+    conflicts 声明互斥插件名（对称声明即可，manager 归一化为无序对）：
+    核心插件不得声明互斥（恒装配下无法仲裁）；可选插件互斥对同时入选时
+    按 PLUGINS 列表位置先列者保留。
+    """
 
     name: str
     version: str
     dependencies: tuple[str, ...]
+    conflicts: tuple[str, ...]
+    core: bool
 
     async def setup(self, ctx: PluginContext) -> None: ...
     async def activate(self, ctx: PluginContext) -> None: ...
@@ -149,6 +158,7 @@ class AIProvider(Protocol):
         *,
         temperature: float,
         max_tokens: int,
+        timeout: float | None = None,
     ) -> ChatResponse: ...
     async def rag_chat(
         self,

@@ -28,7 +28,7 @@ def _ctx(provider=None):
     registered_stages, routers, assets = [], [], []
     ctx = PluginContext(
         config=Settings(
-            plugins=["*"], plugins_disabled=[], plugins_required=[], plugin_path=""
+            plugins=[], plugins_required=[], plugin_path=""
         ),
         publish_event=_noop_async,
         subscribe_event=lambda event, handler: None,
@@ -101,13 +101,13 @@ class RagSetupTest(unittest.IsolatedAsyncioTestCase):
         plugin = RagPlugin()
         await plugin.setup(ctx)
         engine = plugin._engine
-        engine._pending[("weflow-legacy", "m1")] = [0.1]
+        engine._vec_count_seen = 5
         try:
             self.assertIsNotNone(get_engine())
         finally:
             await plugin.teardown()
         self.assertIsNone(get_engine())
-        self.assertEqual(engine._pending, {})  # teardown 链式清理引擎状态
+        self.assertEqual(engine._vec_count_seen, 0)  # teardown 链式清理引擎状态
 
     async def test_hooks_noop_without_engine(self):
         plugin = RagPlugin()
@@ -441,7 +441,7 @@ class RagIndexTest(_MemoryEngineBase):
         finally:
             await cursor.close()
         self.assertEqual(row["c"], 2)
-        self.assertEqual(self.engine._pending, {})  # 消费即清
+        self.assertFalse(batch.preembeddings)  # 本批向量全部被消费
 
     async def test_embed_failure_still_indexes_content_and_kicks_once(self):
         kicks: list[int] = []
@@ -1297,3 +1297,40 @@ class RagChatRoutingTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(p.kwargs, {"temperature": 0.2, "max_tokens": 1024})
         finally:
             ai_ports.set_ai(None)
+
+
+class DeleteEventGcTest(unittest.IsolatedAsyncioTestCase):
+    """【复核 P2-24】卡片删除事件触发即时孤儿对账（此前最长滞留一个维护
+    周期，已删内容仍可被 /api/rag/ask 引用——与停用会话即时生效不对齐）。"""
+
+    async def test_setup_subscribes_and_handler_runs_gc(self):
+        from briefdesk.events import EVENT_ITEMS_DELETED
+
+        ctx, *_ = _ctx(_embed_provider(True))
+        subscribed: list[str] = []
+        ctx.subscribe_event = lambda ev, handler: subscribed.append(ev)
+        plugin = RagPlugin()
+        await plugin.setup(ctx)
+        plugin._engine.maintenance_gc = AsyncMock()
+        try:
+            self.assertIn(EVENT_ITEMS_DELETED, subscribed)
+            plugin._on_items_deleted(["i1"])
+            self.assertIsNotNone(plugin._gc_task)
+            await plugin._gc_task
+            plugin._engine.maintenance_gc.assert_awaited_once()
+        finally:
+            await plugin.teardown()
+
+    async def test_concurrent_delete_events_spawn_single_gc(self):
+        ctx, *_ = _ctx(_embed_provider(True))
+        plugin = RagPlugin()
+        await plugin.setup(ctx)
+        plugin._engine.maintenance_gc = AsyncMock()
+        try:
+            plugin._on_items_deleted(["i1"])
+            task = plugin._gc_task
+            plugin._on_items_deleted(["i2"])
+            self.assertIs(plugin._gc_task, task, "待跑/在跑 GC 期间不重复 spawn")
+            await plugin._gc_task
+        finally:
+            await plugin.teardown()

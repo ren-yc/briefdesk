@@ -37,7 +37,7 @@ def _ctx(register_stage=None):
     """最小 PluginContext（复用 test_stage_plugins 的构造模式）。"""
     return PluginContext(
         config=Settings(
-            plugins=["*"], plugins_disabled=[], plugins_required=[], plugin_path=""
+            plugins=[], plugins_required=[], plugin_path=""
         ),
         publish_event=_noop_async,
         subscribe_event=lambda event, handler: None,

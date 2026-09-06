@@ -9,6 +9,7 @@ from briefdesk import stages
 from briefdesk.config import config
 from briefdesk.db import init_schema
 from briefdesk.pipeline import (
+    _mark_skipped,
     _split_batches,
     process_all_batches,
     set_processing_paused,
@@ -34,6 +35,7 @@ from briefdesk.types import (
     InsertedRow,
     InternalMessage,
 )
+from tests._helpers import _pipeline_client, _pipeline_msg
 
 
 async def _noop_async(*args, **kwargs):
@@ -117,27 +119,6 @@ class _StageTestBase(unittest.IsolatedAsyncioTestCase):
 
     async def asyncTearDown(self):
         stages.reset()
-
-
-def _pipeline_msg(mid, content="c", session_id="s", ts=1, is_self=False):
-    return InternalMessage(
-        msg_id=mid,
-        content=content,
-        sender_name="A",
-        sender_id="u",
-        session_id=session_id,
-        group_name="g",
-        timestamp=ts,
-        source="weflow-legacy",
-        is_self=is_self,
-    )
-
-
-def _pipeline_client(name="weflow-legacy"):
-    c = Mock()
-    c.name = name
-    c.download_media = AsyncMock(return_value=b"x")
-    return c
 
 
 class BuildItemInputTest(unittest.TestCase):
@@ -277,9 +258,17 @@ class OcrEnrichTest(unittest.IsolatedAsyncioTestCase):
         await self._run(msg, client, AsyncMock(return_value="识别文字"))
         self.assertEqual(msg.content, "原文内容")
 
-    async def test_ocr_success_replaces_content_with_prefix(self):
-        # 以源码为准：识别文本以 [OCR] 前缀替换（而非追加）content
+    async def test_ocr_mixed_message_appends_ocr_section(self):
+        # 图+文混合消息（复核 P2-21）：人工原文保留（信息密度更高），OCR 文本
+        # 作为附加段追加——此前整段替换会丢掉原文，分类/去重也失去该上下文
         msg = self._msg()
+        await self._run(msg, self._client(), AsyncMock(return_value="识别文字"))
+        self.assertEqual(msg.content, "原文内容\n[OCR]\n识别文字")
+
+    async def test_ocr_placeholder_content_replaced(self):
+        # 纯占位符消息（content 为附件占位符）：维持整段替换语义
+        msg = self._msg()
+        msg.content = "[图片]"
         await self._run(msg, self._client(), AsyncMock(return_value="识别文字"))
         self.assertEqual(msg.content, "[OCR]\n识别文字")
 
@@ -301,6 +290,9 @@ class StoreBatchFailedTest(_StageTestBase):
         async def fake_mark(source, msg_id):
             processed.append(msg_id)
 
+        async def fake_bulk(rows):
+            processed.extend(msg_id for _source, msg_id in rows)
+
         _install_dedup_stage(_dedup_engine_mock())
         _install_merge_stage()
         stages.register_stage(_classify_stage(_outcome_fn(results, failed)))
@@ -309,8 +301,8 @@ class StoreBatchFailedTest(_StageTestBase):
             "briefdesk.plugins.dedup.plugin.mark_message_processed",
             new=AsyncMock(side_effect=fake_mark),
         ), patch(
-            "briefdesk.pipeline.mark_message_processed",
-            new=AsyncMock(side_effect=fake_mark),  # 骨架 _mark_skipped 走 pipeline 名
+            "briefdesk.pipeline.mark_messages_processed",
+            new=AsyncMock(side_effect=fake_bulk),  # 骨架 _mark_skipped 走批量标记
         ), patch(
             "briefdesk.plugins.dedup.plugin.insert_item",
             new=AsyncMock(return_value="new-id"),
@@ -349,9 +341,6 @@ class MissingStageGuardTest(_StageTestBase):
     async def _run(self, install_stages):
         processed: list[str] = []
 
-        async def fake_mark(source, msg_id):
-            processed.append(msg_id)
-
         install_stages()
         with patch(
             "briefdesk.pipeline.get_enabled_sessions",
@@ -364,8 +353,8 @@ class MissingStageGuardTest(_StageTestBase):
         ), patch(
             "briefdesk.pipeline.bulk_insert_raw_messages", new=AsyncMock()
         ), patch(
-            "briefdesk.pipeline.mark_message_processed",
-            new=AsyncMock(side_effect=fake_mark),
+            "briefdesk.pipeline.mark_messages_processed",
+            new=AsyncMock(),
         ), patch("briefdesk.pipeline.publish_items_updated", new=AsyncMock()):
             await process_all_batches(
                 [_pipeline_msg("m1")], _pipeline_client(), batch_size=10, origin="test"
@@ -421,7 +410,7 @@ class ProcessAllBatchesReturnTest(_StageTestBase):
             ), patch(
                 "briefdesk.pipeline.publish_items_updated", new=AsyncMock()
             ), patch(
-                "briefdesk.pipeline.mark_message_processed", new=AsyncMock()
+                "briefdesk.pipeline.mark_messages_processed", new=AsyncMock()
             ), patch(
                 "briefdesk.plugins.dedup.plugin.insert_item",
                 new=AsyncMock(return_value="fake-id"),
@@ -698,6 +687,57 @@ class IgnoreSelfFilterTest(_StageTestBase):
         self.assertEqual(raw_rows, [])
 
 
+class EmptyEnabledSessionsFilterTest(_StageTestBase):
+    """空启用集 → 全滤（保持原监听器语义）：无任何启用会话时所有消息在
+    入口被过滤——不落 raw、不进分类、不标 processed，水位照常推进
+    （return True）。upsert_session 默认 enabled=0 写入，全新安装或用户
+    停用全部会话时 get_enabled_sessions 返回空集是常态路径。"""
+
+    async def asyncSetUp(self):
+        await super().asyncSetUp()
+        self.db = await aiosqlite.connect(":memory:")
+        self.db.row_factory = aiosqlite.Row
+        await self.db.execute("PRAGMA foreign_keys = ON")
+        await init_schema(self.db)
+
+    async def asyncTearDown(self):
+        await super().asyncTearDown()
+        await self.db.close()
+
+    async def _run(self, messages, classify, raw_rows):
+        _install_dedup_stage(None)  # 引擎未就绪路径：结果为空时全程无副作用
+        stages.register_stage(_classify_stage(classify))
+        with patch("briefdesk.db.get_db", new=AsyncMock(side_effect=lambda: self.db)), patch(
+            "briefdesk.pipeline.get_enabled_sessions",
+            new=AsyncMock(return_value=[]),
+        ), patch(
+            "briefdesk.pipeline.get_enabled_categories",
+            new=AsyncMock(return_value=[{"name": "x"}]),
+        ), patch(
+            "briefdesk.pipeline.are_messages_processed", new=AsyncMock(return_value=set())
+        ), patch(
+            "briefdesk.pipeline.bulk_insert_raw_messages",
+            new=AsyncMock(
+                side_effect=lambda rows: raw_rows.extend(r["msg_id"] for r in rows)
+            ),
+        ), patch("briefdesk.pipeline.set_status"), patch(
+            "briefdesk.pipeline.publish_items_updated", new=AsyncMock()
+        ):
+            return await process_all_batches(messages, _pipeline_client(), origin="test")
+
+    async def test_empty_enabled_sessions_filter_all(self):
+        classify = AsyncMock(return_value=ClassifyOutcome([], []))
+        raw_rows = []
+        result = await self._run(
+            [_pipeline_msg("m1", session_id="s9"), _pipeline_msg("m2", session_id="s9")],
+            classify,
+            raw_rows,
+        )
+        classify.assert_not_called()
+        self.assertEqual(raw_rows, [], "空启用集下消息不落 raw")
+        self.assertTrue(result, "空启用集全滤应走「过滤后无消息 return True」路径（水位照常推进）")
+
+
 class ImageFilterWhenNoEnrichTest(_StageTestBase):
     """OCR 未启用（enrich 槽位为空）时，纯占位符图片消息在入口被屏蔽：
     不落 raw、不进分类、不标记 processed；图片+文字混合消息（content 非
@@ -738,7 +778,9 @@ class ImageFilterWhenNoEnrichTest(_StageTestBase):
         ), patch("briefdesk.pipeline.set_status"), patch(
             "briefdesk.pipeline.publish_items_updated", new=AsyncMock()
         ):
-            await process_all_batches(messages, _pipeline_client(), origin="test")
+            return await process_all_batches(
+                messages, _pipeline_client(), origin="test"
+            )
 
     @staticmethod
     def _img_msg(mid, content="[图片]", **kw):
@@ -839,6 +881,18 @@ class ImageFilterWhenNoEnrichTest(_StageTestBase):
         classify = AsyncMock()
         raw_rows = []
         await self._run([self._img_msg("m1")], classify, raw_rows)
+        classify.assert_not_called()
+        self.assertEqual(raw_rows, [])
+
+    async def test_all_images_filtered_returns_true(self):
+        """【核验 C1】全滤（纯占位符图片、OCR 未启用）时返回 True——**有意**
+        语义：被滤消息不落 raw、钉窗不可见，推进水位即「终态过滤」（重新启用
+        OCR 不会自动重拉）；与「零产出 return False 保留待回填」语义相反。
+        钉住该契约，防后续重构误改为 False 令水位永不前进。"""
+        classify = AsyncMock()
+        raw_rows = []
+        ok = await self._run([self._img_msg("m1")], classify, raw_rows)
+        self.assertTrue(ok)
         classify.assert_not_called()
         self.assertEqual(raw_rows, [])
 
@@ -1275,7 +1329,7 @@ class ProcessAllBatchesAllFailedReturnTest(_StageTestBase):
             ), patch(
                 "briefdesk.pipeline.publish_items_updated", new=AsyncMock()
             ), patch(
-                "briefdesk.pipeline.mark_message_processed", new=AsyncMock()
+                "briefdesk.pipeline.mark_messages_processed", new=AsyncMock()
             ), patch(
                 "briefdesk.plugins.dedup.plugin.insert_item",
                 new=AsyncMock(return_value="fake-id"),
@@ -1293,6 +1347,35 @@ class ProcessAllBatchesAllFailedReturnTest(_StageTestBase):
         finally:
             await db.close()
         self.assertFalse(ok)
+
+
+class MarkSkippedContractTest(unittest.IsolatedAsyncioTestCase):
+    """【复核 P2-4】outcome is None（classify 契约违约）不得当全批闲聊：
+    整批不标记，零产出路径使 poll_cycle 跳过水位推进；模型显式全排除
+    （outcome.results 为空但 outcome 非 None）才标记 processed。"""
+
+    async def test_outcome_none_marks_nothing(self):
+        bctx = BatchContext(
+            messages=[_pipeline_msg("m1"), _pipeline_msg("m2")],
+            client=_pipeline_client(),
+        )
+        await _mark_skipped(bctx, failed_set=set())
+        self.assertEqual(bctx.skipped, 0, "契约违约时不得把消息当闲聊标记")
+
+    async def test_explicit_all_excluded_marks_all(self):
+        bctx = BatchContext(
+            messages=[_pipeline_msg("m1"), _pipeline_msg("m2")],
+            client=_pipeline_client(),
+        )
+        bctx.outcomes = ClassifyOutcome(results=[], failed=[])
+        with patch(
+            "briefdesk.pipeline.mark_messages_processed", new=AsyncMock()
+        ) as bulk:
+            await _mark_skipped(bctx, failed_set=set())
+        self.assertEqual(bctx.skipped, 2)
+        bulk.assert_awaited_once_with(
+            [("weflow-legacy", "m1"), ("weflow-legacy", "m2")]
+        )
 
 
 if __name__ == "__main__":

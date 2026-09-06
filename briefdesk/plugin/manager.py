@@ -8,6 +8,7 @@ import importlib.metadata
 import importlib.util
 import logging
 import sys
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, cast
@@ -34,6 +35,8 @@ class PluginRecord:
     status: Literal["discovered", "loaded", "disabled", "failed"] = "discovered"
     reason: str = ""
     dependencies: tuple[str, ...] = ()
+    conflicts: tuple[str, ...] = ()
+    core: bool = False
 
     def info(self) -> dict[str, str | bool]:
         """装配摘要：供 /api/plugins 与前端加载器使用。
@@ -56,6 +59,7 @@ class PluginRecord:
             "status": self.status,
             "reason": self.reason,
             "has_frontend": has_frontend,
+            "core": self.core,
         }
 
 
@@ -95,36 +99,60 @@ class PluginManager:
     # ── 装配 ──
 
     def enabled_names(self) -> list[str]:
-        """按 PLUGINS / PLUGINS_DISABLED / 默认禁用名单过滤后的插件名（保持发现顺序）。
+        """核心插件恒入选、可选插件按 PLUGINS 显式列表过滤后的插件名（保持发现顺序）。
 
-        默认禁用语义：声明 `default_disabled = True` 的插件（如实验性 benchmark）
-        仅在 PLUGINS 中显式列名时启用——`PLUGINS=["*"]` 的"启用全部"不包含它，
-        显式名称优先于通配；PLUGINS_DISABLED 仍为最高优先级，无论是否显式列名。
+        PLUGINS 无通配语义：仅接受可选插件名，未知名打 WARNING；可选插件
+        不在列表即禁用（"禁用 = 不列出"，无独立的禁用名单配置）。互斥对
+        同时入选（手工改 .env 才可能）时按 PLUGINS 列表位置仲裁，先列者
+        保留，后者降级 disabled（见 ``_arbitrate_conflicts``）。
         """
-        names = list(self._records)
         allow = self._settings.plugins
+        for name in allow:
+            if name not in self._records:
+                logger.warning("PLUGINS 含未知插件名: %s", name)
         explicit = set(allow)
-        if "*" not in allow:
-            for name in allow:
-                if name not in self._records:
-                    logger.warning("PLUGINS 含未知插件名: %s", name)
-            names = [n for n in names if n in explicit]
-        blocked = set(self._settings.plugins_disabled)
         enabled = []
-        for name in names:
-            if name in blocked:
-                continue
-            rec = self._records[name]
-            if (
-                getattr(rec.plugin, "default_disabled", False)
-                and name not in explicit
-            ):
+        for name, rec in self._records.items():
+            if rec.core or name in explicit:
+                enabled.append(name)
+            elif rec.status not in ("disabled", "failed"):
+                # 可选插件未列出即禁用：显式标记（/api/plugins 与设置页据此
+                # 显示「未启用」而非笼统的「不可用」），幂等不覆盖既有原因
                 self._mark(
-                    name, "disabled", "默认禁用：在 PLUGINS 中显式列出即可启用"
+                    name, "disabled", "未启用：在 PLUGINS 中列出或经「插件」面板开关即可启用"
                 )
+        return self._arbitrate_conflicts(enabled)
+
+    def _arbitrate_conflicts(self, enabled: list[str]) -> list[str]:
+        """互斥仲裁：互斥对同时入选时按 PLUGINS 列表位置先列者保留。
+
+        PLUGINS 位置未知（核心插件恒入选、或对端未显式列出）时按发现
+        顺序兜底。落选者降级 disabled 并注明原因；返回仲裁后的启用名单。
+        """
+        allow = self._settings.plugins
+        order = {name: i for i, name in enumerate(allow)}
+        rank = {name: i for i, name in enumerate(enabled)}  # 发现顺序兜底
+
+        def _key(name: str) -> tuple[int, int, int]:
+            rec = self._records[name]
+            # 核心恒装配：互斥对中核心插件恒胜（第三方可选插件与核心互斥时
+            # 可选侧让位，避免把核心插件仲裁掉），其次 PLUGINS 先列者
+            return (0 if rec.core else 1, order.get(name, len(allow)), rank[name])
+
+        losers: dict[str, str] = {}
+        for name in enabled:
+            if name in losers:
                 continue
-            enabled.append(name)
-        return enabled
+            for other in self._records[name].conflicts:
+                if other == name or other not in rank or other in losers:
+                    continue
+                loser, winner = (
+                    (name, other) if _key(name) > _key(other) else (other, name)
+                )
+                losers[loser] = winner
+        for name, winner in losers.items():
+            self._mark(name, "disabled", f"与 {winner} 互斥（PLUGINS 先列者保留）")
+        return [n for n in enabled if n not in losers]
 
     def setup_order(self) -> list[str]:
         """启用插件按依赖拓扑排序（Kahn，稳定：同级保持发现顺序）。
@@ -188,8 +216,12 @@ class PluginManager:
                 continue
             except Exception as e:
                 # 装配失败先 best-effort 回收副作用再标 failed。回收范围以插件
-                # teardown 自身实现为准：内置插件的资源获取严格先于各类注册，
-                # 无可达残留路径；第三方插件需自行保证 teardown 覆盖其注册行为。
+                # teardown 自身实现为准：内置插件大体满足"资源获取先于各类
+                # 注册"，但并非严格无可达残留——ai_provider 的注册（ai_ports/
+                # ctx.ai）先于 setup 内可失败的 announce，失败窗口 teardown
+                # 只清 ai_ports 与 _provider，ctx.ai 残留；dedup 的事件订阅
+                # 同理不退订（窗口仅 setup 抛错时可达，影响面小）。第三方
+                # 插件需自行保证 teardown 覆盖其注册行为。
                 await self._best_effort_teardown(name, plugin)
                 self._mark(name, "failed", f"setup 失败: {e!r}")
                 logger.exception("插件 %s setup 失败", name)
@@ -237,17 +269,114 @@ class PluginManager:
         """全部插件的发现/装配摘要（供 /api/plugins 与测试使用）。"""
         return [rec.info() for rec in self._records.values()]
 
-    def settings_schema(self) -> list[dict[str, Any]]:
-        """返回当前配置选中的插件设置描述。
+    def plugin_meta(self) -> list[dict[str, Any]]:
+        """全部有效插件的声明元数据（供设置页逐插件开关渲染）。"""
+        self.discover()
+        result: list[dict[str, Any]] = []
+        for rec in self._records.values():
+            if rec.plugin is None:
+                continue  # 加载失败记录无声明可读，前端经 infos() 兜底展示
+            result.append(
+                {
+                    "name": rec.name,
+                    "version": rec.version,
+                    "dependencies": list(rec.dependencies),
+                    "conflicts": list(rec.conflicts),
+                    "core": rec.core,
+                }
+            )
+        return result
 
-        依据选中的插件而不是仅依据 ``loaded`` 状态筛选：插件因缺少必填
-        配置自禁用时，用户仍需能在设置页补齐它的配置。
+    def validate_selection(self, names: Iterable[str]) -> list[dict[str, str]]:
+        """校验可选插件期望启用集合（纯检查，不改变任何插件状态）。
+
+        供设置 API 在写入暂存前复检期望列表，issue 类型：unknown（未知名）、
+        missing_dep（依赖既不在集合也不是核心插件）、conflict（互斥对同现）、
+        cycle（依赖环）。返回空列表即合法。核心插件恒装配、无需出现在集合
+        中，指向核心插件的依赖视为恒满足。
         """
         self.discover()
-        selected = set(self.enabled_names())
+        selected = list(dict.fromkeys(names))
+        selected_set = set(selected)
+        core_names = {n for n, rec in self._records.items() if rec.core}
+        issues: list[dict[str, str]] = []
+
+        for name in selected:
+            if name not in self._records:
+                issues.append(
+                    {"type": "unknown", "plugin": name, "detail": f"未知插件名: {name}"}
+                )
+        for name in selected:
+            rec = self._records.get(name)
+            if rec is None:
+                continue
+            for dep in rec.dependencies:
+                if dep in selected_set or dep in core_names:
+                    continue
+                note = "插件不存在" if dep not in self._records else "未启用"
+                issues.append(
+                    {
+                        "type": "missing_dep",
+                        "plugin": name,
+                        "detail": f"缺少依赖: {dep}（{note}）",
+                    }
+                )
+        reported: set[frozenset[str]] = set()
+        for name in selected:
+            rec = self._records.get(name)
+            if rec is None:
+                continue
+            for other in rec.conflicts:
+                if other not in selected_set:
+                    continue
+                pair = frozenset((name, other))
+                if len(pair) != 2 or pair in reported:
+                    continue
+                reported.add(pair)
+                issues.append(
+                    {
+                        "type": "conflict",
+                        "plugin": name,
+                        "detail": f"与 {other} 互斥，两者不可同时启用",
+                    }
+                )
+        issues.extend(self._cycle_issues(selected_set | core_names))
+        return issues
+
+    def _cycle_issues(self, nodes: set[str]) -> list[dict[str, str]]:
+        """nodes（插件名）子图上的依赖环检测（Kahn；环成员各报一条）。"""
+        active = {n for n in nodes if n in self._records}
+        indegree = {n: 0 for n in active}
+        dependents: dict[str, list[str]] = {}
+        for n in active:
+            for dep in self._records[n].dependencies:
+                if dep in indegree:
+                    indegree[n] += 1
+                    dependents.setdefault(dep, []).append(n)
+        queue = [n for n in active if indegree[n] == 0]
+        ordered: set[str] = set()
+        while queue:
+            n = queue.pop(0)
+            ordered.add(n)
+            for m in dependents.get(n, []):
+                indegree[m] -= 1
+                if indegree[m] == 0:
+                    queue.append(m)
+        return [
+            {"type": "cycle", "plugin": n, "detail": "依赖环成员，无法确定装配顺序"}
+            for n in sorted(active - ordered)
+        ]
+
+    def settings_schema(self) -> list[dict[str, Any]]:
+        """返回插件的设置描述（核心 + 全部已发现的可选插件）。
+
+        不按启用状态筛选：可选插件禁用时用户仍需能预配置（启用前先填
+        必填项），自禁用（缺必填配置）时亦然；UI 对未加载插件组折叠展示。
+        """
+        self.discover()
         result: list[dict[str, Any]] = []
         for name, rec in self._records.items():
-            if name not in selected or rec.plugin is None:
+            if rec.plugin is None:
                 continue
             callback = getattr(rec.plugin, "settings_schema", None)
             if not callable(callback):
@@ -299,12 +428,30 @@ class PluginManager:
         ):
             self._record_failure(name, "dependencies 必须为字符串元组/列表")
             return
+        core = getattr(obj, "core", False)
+        conflicts = getattr(obj, "conflicts", ())
+        if not isinstance(core, bool):
+            self._record_failure(name, "core 必须为布尔值")
+            return
+        if not isinstance(conflicts, (tuple, list)) or not all(
+            isinstance(c, str) and c for c in conflicts
+        ):
+            self._record_failure(name, "conflicts 必须为非空字符串元组/列表")
+            return
+        if name in conflicts or len(set(conflicts)) != len(conflicts):
+            self._record_failure(name, "conflicts 不得自指或重复")
+            return
+        if core and conflicts:
+            self._record_failure(name, "核心插件恒装配，不得声明互斥")
+            return
 
         self._records[name] = PluginRecord(
             name=name,
             version=version,
             plugin=cast(Plugin, obj),
             dependencies=tuple(dependencies),
+            conflicts=tuple(conflicts),
+            core=core,
         )
 
     def _discover_path(self, path: Path) -> None:

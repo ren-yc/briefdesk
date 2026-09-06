@@ -43,9 +43,11 @@ _QQ_RICH_XML_RE = re.compile(r'm_fileName\s*=\s*"[^"]+"\s+m_resid\s*=\s*"[^"]+"'
 def is_self_message(msg: QqFlowMessage, self_uid: str) -> bool:
     """判定消息是否本账号自己发送（IGNORE_SELF 识别谓词）。
 
-    主判据为发送者 UID 等于自身账号 UID（QQ NT UID 约定：u_<QQ号>）；
-    isSend 来自上游 40013 列（部分 QQ 版本缺列或值非 1/2 时恒 0），
-    作为方向信息的优先兜底。self_uid 为空 → 仅按 isSend 兜底（不误杀）。
+    isSend 由 qqflow-server 从原始 40013 方向列归一化为 {0,1}：1/2（均为
+    本人发送，2 为多端同步变体）→ 1，3=系统与未知值 → 0（见上游
+    direction_to_is_send，"never claim self on unverified semantics"），
+    作为快速路径优先判定。senderUsername == self_uid 是 isSend=0 时的
+    兜底（部分 QQ 版本缺 40013 列则 isSend 恒 0）；self_uid 为空时不误杀。
     """
     if bool(msg.get("isSend")):
         return True
@@ -97,8 +99,10 @@ def pre_filter_sse(event: QqFlowEvent) -> bool:
 
     ready（连接基线，载荷无 event 键）/ message.revoke（撤回）/
     sync（基线水位，无消息载荷，pipeline 幂等已兜底）/ ping（KeepAlive）
-    一律拒绝；发送者为空/缺失、空/短内容、QQ 富媒体 XML 残片
-    （m_fileName/m_resid）与占位符消息拒绝。
+    一律拒绝；空/短内容、QQ 富媒体 XML 残片
+    （m_fileName/m_resid）与占位符消息拒绝。发送者为空/缺失不再丢弃
+    （决策 ②=保留未知，与 weflow/legacy 统一），归一化阶段回退
+    sender_name="未知"。
     """
     if event.get("event") != "message.new":
         logger.debug(
@@ -112,14 +116,9 @@ def pre_filter_sse(event: QqFlowEvent) -> bool:
         # ("message.new","") 碰撞误吞后续正常事件（审查 A5）
         logger.debug("丢弃 SSE: message.new 缺 rawid")
         return False
-    # 任意发送者为空的消息均丢弃：上游可能把入群/名片等系统事件编码成
-    # “无发送者 + 内容为显示名”的形式，这类消息没有可展示/可分类的信息价值。
-    if not clean_display_name(event.get("sourceName")):
-        logger.debug(
-            "丢弃 SSE rawid=%s: 发送者为空",
-            event.get("rawid"),
-        )
-        return False
+    # 发送者为空不再丢弃（决策 ②=保留未知，与 weflow/legacy 统一）：
+    # 归一化阶段回退 sender_name="未知"。此前按「无发送者=系统事件」整类
+    # 丢弃，但也会误伤确实无发送者名而内容有效的消息。
     c: str = event.get("content", "")
     if not c:
         logger.debug("丢弃 SSE rawid=%s: 空内容", event.get("rawid"))
@@ -179,8 +178,9 @@ def normalize_rest(
     兜底。群名片是 per-conversation 的，全局 contacts 结构上表达不了。
     """
     uid = msg.get("senderUsername") or ""
-    # IGNORE_SELF 判定：自身 UID 匹配（QQ NT UID 约定 u_<QQ号>），
-    # isSend 为上游未来版本方向兜底；self_uid 为空时 fail-open
+    # IGNORE_SELF 判定：isSend 快速路径优先（上游自 40013 方向列归一化，
+    # 见 is_self_message），senderUsername == self_uid（QQ NT UID 约定
+    # u_<QQ号>）为 isSend=0 时的兜底；self_uid 为空时 UID 兜底不误杀
     is_self = is_self_message(msg, self_uid)
     # 上游 senderName 已按「本会话群名片 > 备注 > 最新消息昵称 > 档案昵称 >
     # UID」解析（与 SSE sourceName 同值），直接采用：群名片是 per-conversation
@@ -231,9 +231,10 @@ def normalize_rest(
 def pre_filter_rest(msg: QqFlowMessage) -> bool:
     """REST 消息预过滤。
 
-    拒绝：撤回（6）/ 系统消息（7）；发送者为空/缺失；空/短内容；附件占位符
+    拒绝：撤回（6）/ 系统消息（7）；空/短内容；附件占位符
     （4/5 语音视频无下游消费方，3 图片无 mediaId 时无媒体可 OCR）；QQ 富媒体
     XML 残片（m_fileName/m_resid 属性对，图片/文件卡片解析失败的原始 XML）。
+    发送者为空/缺失不再丢弃（决策 ②=保留未知，与 weflow/legacy 统一）。
     图片消息（localType=3）带 mediaId（上游保证可获取）时放行，交由
     normalize_rest 提取并 OCR。
     localType=1（"其他"）不直接拒绝——其 content 为解析后文本，可能含
@@ -247,15 +248,8 @@ def pre_filter_rest(msg: QqFlowMessage) -> bool:
             local_type,
         )
         return False
-    # 任意发送者为空的消息均丢弃：上游可能把入群/名片等系统事件编码成
-    # “无发送者 + 内容为显示名”的形式，这类消息没有可展示/可分类的信息价值。
-    if not clean_display_name(msg.get("senderUsername")):
-        logger.debug(
-            "丢弃 REST msg_id=%s: 发送者为空 (localType=%s)",
-            msg.get("localId"),
-            local_type,
-        )
-        return False
+    # 发送者为空不再丢弃（决策 ②=保留未知，与 weflow/legacy 统一，见
+    # pre_filter_sse 同款注释）。
     # 入群/名片/撤回等系统事件：上游可能以“纯 UID 内容”呈现，
     # 没有可展示/可分类的信息价值，入口直接丢弃。
     c: str = msg.get("content") or ""

@@ -25,7 +25,7 @@ _drop_warned = False
 
 # 服务关闭事件：置位后所有 /api/stream 流主动结束。
 # 若流不结束，uvicorn 优雅退出会无限等待这些常驻 ASGI 任务
-# （timeout_graceful_shutdown 默认 None）。
+# （timeout_graceful_shutdown 本项目配为 5s（uvicorn 默认 None 即无限等待））。
 _shutdown_event: asyncio.Event | None = None
 
 

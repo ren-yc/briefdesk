@@ -10,7 +10,8 @@ teardown 关闭 runtime（幂等）。
 
 from typing import Any
 
-from briefdesk.plugin.base import PluginContext, PluginDisabledError, SourcePlugin
+from briefdesk.plugin.base import PluginContext, SourcePlugin
+from briefdesk.plugin.config_helpers import validate_required_config
 from briefdesk.settings_schema import build_settings_schema
 from briefdesk.sources_base import SourceRuntime
 
@@ -21,6 +22,8 @@ class QqFlowPlugin(SourcePlugin):
     name = "qqflow"
     version = "1.0.1"
     dependencies: tuple[str, ...] = ()
+    conflicts: tuple[str, ...] = ()
+    core = False  # 可选插件：默认禁用，经 PLUGINS / 设置页开关启用
 
     def __init__(self) -> None:
         self._runtime: SourceRuntime | None = None
@@ -55,16 +58,11 @@ class QqFlowPlugin(SourcePlugin):
         settings = qqflow_config.QqFlowSettings()
         # QQFLOW_DB_PATH 允许为空：上游 qqflow-server 在 db_path 为空时
         # 自动回退到平台默认位置（Windows: Documents\Tencent Files 等）
-        required = (
-            ("QQFLOW_API_TOKEN", settings.api_token.get_secret_value()),
-            ("QQFLOW_QQ", settings.qq),
-            ("QQFLOW_KEY", settings.key.get_secret_value()),
-        )
-        missing = [name for name, value in required if not value]
-        if missing:
-            raise PluginDisabledError(
-                f"缺少必填配置 {', '.join(missing)}（在 .env 中配置后重启生效）"
-            )
+        validate_required_config(settings, {
+            'api_token': 'QQFLOW_API_TOKEN',
+            'qq': 'QQFLOW_QQ',
+            'key': 'QQFLOW_KEY',
+        })
         runtime = qqflow_runtime.QqFlowSource()
         ctx.register_source(runtime)
         self._runtime = runtime

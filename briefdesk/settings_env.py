@@ -8,7 +8,7 @@ Application Support/briefdesk/；Linux: ~/.config/briefdesk/），也可经
 - 文件只存非密钥键值（`KEY=VALUE` 行，UTF-8、无注释、键序稳定）；
   密钥一律走系统密钥环（briefdesk/secrets_store.py），绝不落此文件。
 - 解析优先级：系统密钥环（仅密钥）> 环境变量 > **暂存文件** > `.env` > 默认值。
-  三个 Settings（app 级 + weflow-legacy/qqflow）的 `env_file` 均为
+  五个 Settings（app 级 + weflow/weflow-legacy/qqflow/rag）的 `env_file` 均为
   `[项目根 .env, 暂存文件]`，pydantic-settings 多文件后加载者优先。
 - 写入为原子操作（同目录临时文件 + os.replace），并发由调用方持锁。
 
@@ -46,7 +46,7 @@ def read_staged() -> dict[str, str]:
     path = get_settings_file()
     try:
         raw = dotenv_values(str(path), encoding="utf-8")
-    except OSError:
+    except (OSError, UnicodeDecodeError):
         logger.debug("暂存文件读取失败: %s", path, exc_info=True)
         return {}
     return {k: v for k, v in raw.items() if v is not None}
@@ -59,6 +59,11 @@ def write_staged(updates: dict[str, str | None]) -> None:
     """
     path = get_settings_file()
     current = read_staged()
+    bad = [k for k, v in updates.items() if v is not None and ("\n" in v or "\r" in v)]
+    if bad:
+        # 纵深防御：normalize_setting 已拒绝换行值，此处防其他调用路径回归——
+        # 换行会把 KEY=VALUE 行格式拆出伪键（可注入任意配置行，含密钥名）
+        raise ValueError(f"暂存值不能包含换行: {bad}")
     for key, value in updates.items():
         if value is None:
             current.pop(key, None)
@@ -94,7 +99,7 @@ def source_of(alias: str) -> str:
         return "override"
     try:
         dotenv = dotenv_values(str(PROJECT_ROOT / ".env"), encoding="utf-8")
-    except OSError:
+    except (OSError, UnicodeDecodeError):
         dotenv = {}
     if dotenv.get(alias) is not None:
         return "dotenv"

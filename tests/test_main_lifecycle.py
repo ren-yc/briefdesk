@@ -15,6 +15,85 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from briefdesk.plugin.base import PluginError
 
 
+class PeriodicSyncLoopTest(unittest.IsolatedAsyncioTestCase):
+    """【复核 P1-4】POLL_INTERVAL_SECONDS > 0 时周期触发 trigger_sync（与
+    /api/sync 同路径；互斥由其返回 None 保证，不叠加触发）。"""
+
+    async def test_loop_triggers_sync_periodically_and_exits_on_cancel(self):
+        from briefdesk import main as main_mod
+
+        reasons: list[str] = []
+
+        def fake_sync(reason: str = "manual"):
+            reasons.append(reason)  # 返回 None = 同步已在进行（互斥），循环不 await
+
+        with (
+            patch.object(main_mod.config, "poll_interval_seconds", 0.01),
+            patch.object(main_mod, "trigger_sync", side_effect=fake_sync),
+        ):
+            task = asyncio.create_task(main_mod._periodic_sync_loop())
+            await asyncio.sleep(0.05)
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+        self.assertGreaterEqual(len(reasons), 1)
+        self.assertEqual(reasons[0], "periodic")
+
+
+class ZeroSourceDegradedStartupTest(unittest.IsolatedAsyncioTestCase):
+    """【复核 4a】零源不再中止启动：降级运行（UI 可用、采集不可用），
+    清理路径照常执行——三源统一「缺配置自禁用」语义的前提（决策 ①=1B）。"""
+
+    async def test_zero_sources_starts_degraded_and_cleans_up(self):
+        from briefdesk import main as main_mod
+        from briefdesk import stages
+        from briefdesk.server.callbacks import set_refresh_sessions_callback
+        from briefdesk.server.web_plugins import (
+            set_plugin_meta_callback,
+            set_plugin_validation_callback,
+            set_plugins_info_callback,
+            set_settings_schema_callback,
+        )
+        from briefdesk.sync import set_sync_callback
+
+        # 全局回调/stages 上下文会被 _run 覆盖，测试后复位为「未注册」态
+        # （None）防污染其它用例——test_server 依赖 409/503 的未注册语义
+        self.addCleanup(stages.reset)
+        self.addCleanup(set_plugins_info_callback, None)
+        self.addCleanup(set_settings_schema_callback, None)
+        self.addCleanup(set_plugin_meta_callback, None)
+        self.addCleanup(set_plugin_validation_callback, None)
+        self.addCleanup(set_sync_callback, None)
+        self.addCleanup(set_refresh_sessions_callback, None)
+
+        manager = MagicMock()
+        manager.setup_all = AsyncMock()
+        manager.activate_all = AsyncMock()
+        manager.teardown_all = AsyncMock()
+        close_db = AsyncMock()
+        server = MagicMock()
+        server.started = True
+        server.serve = AsyncMock()
+
+        with (
+            patch.object(main_mod, "PluginManager", return_value=manager),
+            patch.object(
+                main_mod, "apply_pending_restore", new=AsyncMock(return_value=False)
+            ),
+            patch.object(main_mod, "get_db", new=AsyncMock()),
+            patch.object(main_mod.config, "ignored_expiry_hours", 0),
+            patch.object(main_mod, "close_db", close_db),
+            patch.object(main_mod.uvicorn, "Config", MagicMock()),
+            patch.object(main_mod.uvicorn, "Server", MagicMock(return_value=server)),
+            patch.object(main_mod, "_install_signal_handlers"),
+            patch.object(main_mod, "trigger_sync", return_value=None),
+        ):
+            await main_mod._run()  # 零源不抛：降级启动走完全生命周期
+
+        manager.teardown_all.assert_awaited_once()
+        close_db.assert_awaited_once()
+
+
 class MainRunCleanupOnSetupFailureTest(unittest.IsolatedAsyncioTestCase):
     async def test_required_plugin_failure_still_closes_db(self):
         from briefdesk import main as main_mod

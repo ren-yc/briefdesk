@@ -1,13 +1,15 @@
 """共享文本净化 — PII 脱敏 + 显示名清洗 + 主体名归一化。
 
-- mask_content：手机号 / 身份证 / 邮箱 / 银行卡替换为占位符
-  （含分隔符写法 138-0013-8000 与全角数字；详见 _SEP_RUN_RE 注释）
+- mask_content：手机号 / 身份证 / 邮箱 / 银行卡 / API 密钥（sk- 前缀、JWT）
+  替换为占位符（PII 含分隔符写法 138-0013-8000 与全角数字；详见 _SEP_RUN_RE 注释）
 - clean_display_name：去除显示名中的 C0 控制字符与首尾空白
 - normalize_subject：主体名 NFKC + 空白折叠/首尾 + 小写归一（供时间线跨写法聚合）
 - PLACEHOLDER_ONLY_RE：纯附件占位符判定（pipeline 入口过滤与 dedup 原文短路共用）
 
 模块化设计：纯函数、只依赖标准库 re/unicodedata，被 types.py（构造即
-脱敏/净化）、pipeline.py（OCR 合并/入库）与 db.py（主体时间线查询）调用。
+脱敏/净化）、plugins/ocr（OCR 文本入库前脱敏）、pipeline.py（入口占位符
+判定）、plugins/dedup 与 plugins/merge（主体名归一化的写入侧）与 db.py
+（主体时间线查询）调用。
 """
 
 import re
@@ -17,14 +19,18 @@ EMAIL_PLACEHOLDER = "[EMAIL]"
 ID_PLACEHOLDER = "[ID]"
 BANKCARD_PLACEHOLDER = "[BANKCARD]"
 PHONE_PLACEHOLDER = "[PHONE]"
+TOKEN_PLACEHOLDER = "[TOKEN]"
 
 # 单次扫描、命名组区分类型。顺序重要：
 #  - email 优先：邮箱内 11 位数字不会被当作手机号单独脱敏（@ 同时覆盖全角＠）
+#  - token/jwt 紧随其后且先于数字类：密钥串（sk-…、eyJ…三段式 JWT）内部
+#    可能含 16-19 位连续数字（时间戳形态的 payload），必须整体先吃掉
 #  - ID 先于银行卡：18 位纯数字按身份证处理（规格歧义的确定性选择）；
 #    15 位一代身份证紧随其后（<16 位，不与银行卡区间重叠）
 #  - phone 支持可选 +86/86 国家码前缀（86 + 11 位 = 13 位，含全角＋/８６）
 #  - 数字类同时覆盖全角数字（０-９）：全角手机号/证件号/银行卡同样脱敏，
 #    邻接断言把全角数字视同数字，全角长串不会被部分命中
+#  - 9-10 位 QQ 号不脱敏：与 10 位 Unix 秒时间戳形态完全冲突，误伤面大于收益
 #
 # 用 (?<![0-9０-９]) / (?![0-9０-９]) 数字邻接断言而非 \b：Python re 的 \w 含中文，
 # "电话13800138000联系" 中"话"与数字之间没有词边界，\b\d{11}\b 会漏匹配。
@@ -32,6 +38,8 @@ PHONE_PLACEHOLDER = "[PHONE]"
 # 且 19 位数字串中的 11 位子串因前后仍是数字而不会被手机号规则部分命中。
 _MASK_RE = re.compile(
     r"(?P<email>[A-Za-z0-9._%+\-]+[@＠][A-Za-z0-9.\-]+\.[A-Za-z]{2,})"
+    r"|(?P<token>sk-[A-Za-z0-9_\-]{16,})"
+    r"|(?P<jwt>eyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]+)"
     r"|(?P<id>(?<![0-9０-９])[0-9０-９]{17}[0-9０-９Xx](?![0-9０-９]))"
     r"|(?P<id15>(?<![0-9０-９])[0-9０-９]{15}(?![0-9０-９]))"
     r"|(?P<bankcard>(?<![0-9０-９])[0-9０-９]{16,19}(?![0-9０-９]))"
@@ -40,6 +48,8 @@ _MASK_RE = re.compile(
 
 _PLACEHOLDER_BY_GROUP = {
     "email": EMAIL_PLACEHOLDER,
+    "token": TOKEN_PLACEHOLDER,
+    "jwt": TOKEN_PLACEHOLDER,
     "id": ID_PLACEHOLDER,
     "id15": ID_PLACEHOLDER,
     "bankcard": BANKCARD_PLACEHOLDER,
@@ -61,9 +71,9 @@ def _replace(match: re.Match[str]) -> str:
 # 撞型」的聚合误伤——真实 PII 分组至多 5 段（手机号 3 段、银行卡 ≤5 段），
 # 而 12 13 … 19（8 段）、301-302-…-306（6 段）、2024-01-15 - 2024-01-20
 # （6 段）这类非 PII 写法段数必然更多。
-# 整段不构成 PII 时再按空白切分逐段独立判定（空格几乎总是语义边界，
-# 「日期␣138-0013-8000」里段内连字符分隔的真手机号依赖此路径救回），
-# 空白分隔符以捕获组原样回填——不丢失任何字符，保证幂等。
+# 整段不构成 PII 时再按空白/全角连字符切分逐段独立判定（空白与全角连字符
+# 几乎总是语义边界，「日期␣138-0013-8000」里段内连字符分隔的真手机号依赖
+# 此路径救回），分隔符以捕获组原样回填——不丢失任何字符，保证幂等。
 _SEP_RUN_RE = re.compile(
     r"(?<![0-9０-９])[＋+]?[0-9０-９][0-9０-９\- －　]*[0-9０-９](?![0-9０-９])"
 )
@@ -71,7 +81,9 @@ _SEP_RUN_RE = re.compile(
 # 候选串切段：连字符与空格（半/全角）都是分组分隔符
 _RUN_SEG_SPLIT_RE = re.compile(r"[\-－ 　]+")
 
-# 空白切分（捕获组保留分隔符，供逐段判定后原样回填）
+# 空白/全角连字符切分（捕获组保留分隔符，供逐段判定后原样回填；
+# 刻意不含半角连字符——段内连字符写法的真手机号（138-0013-8000）须整体
+# 参与段级判定，不能在此被拆开）
 _RUN_WS_SPLIT_RE = re.compile(r"([ －　]+)")
 
 
@@ -107,7 +119,7 @@ def _sep_run_repl(match: re.Match[str]) -> str:
     placeholder = _classify_run(run)
     if placeholder:
         return placeholder
-    # 整段不构成 PII：按空白切分逐段独立判定，空白分隔符原样回填
+    # 整段不构成 PII：按空白/全角连字符切分逐段独立判定，分隔符原样回填
     out: list[str] = []
     for part in _RUN_WS_SPLIT_RE.split(run):
         if not part:
@@ -158,8 +170,8 @@ _SPACE_RE = re.compile(r"\s+")
 def normalize_subject(name: str | None) -> str:
     """NFKC + 空白折叠/trip + 小写的主体名归一化；空输入返回 ""。
 
-    写入（pipeline 入库）与查询（db.get_items_by_subject/get_subject_count）
-    共用同一规则，保证双向一致。
+    写入（dedup/merge 插件入库侧）与查询（db.get_items_by_subject/
+    get_subject_count）共用同一规则，保证双向一致。
     """
     if not name:
         return ""

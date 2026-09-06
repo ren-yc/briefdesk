@@ -9,7 +9,7 @@
 （items 的 msg_time/created_at、lastSync）。
 """
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import TypedDict
 
 from briefdesk.announcements import get_announcements
@@ -92,9 +92,21 @@ def note_sync_batch_start(count: int) -> dict:
     """管道入口：新增 count 条消息进入处理（含处理中的实时消息）。
 
     上一突发完成后再次有消息到达时开启新突发：重置累计计数字段。
+    新突发的 startedAt 保证严格递增，避免同一微秒内连续调用导致
+    时间戳相等而触发用例 flaky。
     """
     if _sync_progress["pendingCount"] == 0:
-        _sync_progress["startedAt"] = datetime.now(UTC).isoformat()
+        prev = _sync_progress["startedAt"]
+        now = datetime.now(UTC)
+        if prev:
+            try:
+                prev_dt = datetime.fromisoformat(prev)
+                if now <= prev_dt:
+                    now = prev_dt + timedelta(microseconds=1)
+            except ValueError:
+                if now.isoformat() == prev:
+                    now = now + timedelta(microseconds=1)
+        _sync_progress["startedAt"] = now.isoformat()
         _sync_progress["newCount"] = 0
         _sync_progress["processedCount"] = 0
         _sync_progress["done"] = False

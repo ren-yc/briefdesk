@@ -1,4 +1,4 @@
-"""内置消息源插件测试（weflow-legacy / qqflow）。"""
+"""内置消息源插件测试（weflow / weflow-legacy / qqflow）。"""
 
 import unittest
 from types import SimpleNamespace
@@ -10,6 +10,7 @@ from pydantic import SecretStr
 from briefdesk.config import Settings
 from briefdesk.plugin.base import PluginContext, PluginDisabledError
 from briefdesk.plugins.qqflow.plugin import QqFlowPlugin
+from briefdesk.plugins.weflow.plugin import WeFlowPlugin
 from briefdesk.plugins.weflow_legacy.plugin import WeFlowLegacyPlugin
 
 
@@ -25,7 +26,7 @@ def _ctx() -> tuple[PluginContext, list]:
     ctx = PluginContext(
         # 用环境变量名（alias）构造：pydantic mypy 插件对带 alias 字段按别名生成签名
         config=Settings(
-            PLUGINS=["*"], PLUGINS_DISABLED=[], PLUGINS_REQUIRED=[], PLUGIN_PATH=""
+            PLUGINS=[], PLUGINS_REQUIRED=[], PLUGIN_PATH=""
         ),
         publish_event=publish_event,
         subscribe_event=subscribe_event,
@@ -41,10 +42,24 @@ class WeFlowLegacyPluginTest(unittest.IsolatedAsyncioTestCase):
         fake_runtime = SimpleNamespace(name="weflow-legacy")
         plugin = WeFlowLegacyPlugin()
         with patch(
+            "briefdesk.plugins.weflow_legacy.config.WeFlowLegacySettings",
+            return_value=SimpleNamespace(api_token=SecretStr("t")),
+        ), patch(
             "briefdesk.plugins.weflow_legacy.runtime.WeFlowLegacySource", return_value=fake_runtime
         ):
             await plugin.setup(ctx)
         self.assertEqual(registered, [fake_runtime])
+
+    async def test_missing_token_self_disables(self):
+        """【决策 ①=1B】必填校验与 weflow/qqflow 统一：缺 token 装配期自禁用。"""
+        ctx, _ = _ctx()
+        plugin = WeFlowLegacyPlugin()
+        with patch(
+            "briefdesk.plugins.weflow_legacy.config.WeFlowLegacySettings",
+            return_value=SimpleNamespace(api_token=SecretStr("")),
+        ), self.assertRaises(PluginDisabledError) as cm:
+            await plugin.setup(ctx)
+        self.assertIn("WEFLOW_LEGACY_API_TOKEN", str(cm.exception))
 
     async def test_teardown_closes_runtime(self):
         ctx, _ = _ctx()
@@ -52,6 +67,9 @@ class WeFlowLegacyPluginTest(unittest.IsolatedAsyncioTestCase):
         fake_runtime = SimpleNamespace(name="weflow-legacy", close=close_spy)
         plugin = WeFlowLegacyPlugin()
         with patch(
+            "briefdesk.plugins.weflow_legacy.config.WeFlowLegacySettings",
+            return_value=SimpleNamespace(api_token=SecretStr("t")),
+        ), patch(
             "briefdesk.plugins.weflow_legacy.runtime.WeFlowLegacySource", return_value=fake_runtime
         ):
             await plugin.setup(ctx)
@@ -117,3 +135,37 @@ class QqFlowPluginTest(unittest.IsolatedAsyncioTestCase):
             await plugin.setup(ctx)
         await plugin.teardown()
         close_spy.assert_awaited_once()
+
+
+class WeFlowPluginTest(unittest.IsolatedAsyncioTestCase):
+    async def test_missing_all_config_lists_everything(self):
+        """api_token/wxid 与 DB_KEYS 同时缺失时聚合在一条错误中一次报全，
+        不应拆成多次抛出致用户只能看到第一项。"""
+        ctx, _ = _ctx()
+        fake_settings = SimpleNamespace(
+            api_token=SecretStr(""), wxid="", db_keys_map={}
+        )
+        plugin = WeFlowPlugin()
+        with patch(
+            "briefdesk.plugins.weflow.config.WeFlowSettings", return_value=fake_settings
+        ), self.assertRaises(PluginDisabledError) as cm:
+            await plugin.setup(ctx)
+        message = str(cm.exception)
+        self.assertIn("WEFLOW_API_TOKEN", message)
+        self.assertIn("WEFLOW_WXID", message)
+        self.assertIn("WEFLOW_DB_KEYS", message)
+
+    async def test_config_present_registers_runtime(self):
+        ctx, registered = _ctx()
+        fake_settings = SimpleNamespace(
+            api_token=SecretStr("t"), wxid="wx", db_keys_map={"k": "v"}
+        )
+        fake_runtime = SimpleNamespace(name="weflow")
+        plugin = WeFlowPlugin()
+        with patch(
+            "briefdesk.plugins.weflow.config.WeFlowSettings", return_value=fake_settings
+        ), patch(
+            "briefdesk.plugins.weflow.runtime.WeFlowSource", return_value=fake_runtime
+        ):
+            await plugin.setup(ctx)
+        self.assertEqual(registered, [fake_runtime])

@@ -59,7 +59,8 @@ class _WeFlowPagedClient:
 
     async def fetch_messages(
         self, talker: str, start_ts: int | None, limit: int = 500, offset: int = 0,
-        media: bool = False, retry_on_empty: bool = True,
+        media: bool = False, not_found_ok: bool = False,
+        retry_on_empty: bool = True,
     ) -> dict:
         self.calls.append((talker, start_ts, offset))
         page = self._messages[offset : offset + 500]
@@ -92,7 +93,12 @@ class _QqPagedClient:
         return [{"username": "g1", "displayName": "项目群", "type": 2}]
 
     async def fetch_messages(
-        self, talker: str, start: int | None = None, limit: int = 500, offset: int = 0
+        self,
+        talker: str,
+        start: int | None = None,
+        limit: int = 500,
+        offset: int = 0,
+        not_found_ok: bool = False,
     ) -> dict:
         self.calls.append((start, offset))
         page = self._messages[offset : offset + 500]

@@ -44,10 +44,16 @@ async def chat(
     *,
     temperature: float = 0.3,
     max_tokens: int = 4096,
+    timeout: float | None = None,
 ) -> ChatResponse:
-    """统一 AI 调用端口（模型/供应商由已注册插件决定）。"""
+    """统一 AI 调用端口（模型/供应商由已注册插件决定）。
+
+    timeout：单请求超时覆盖（秒）。判官类调用（dedup 判票/strong、merge
+    判官/标题）在存储锁内执行，传短超时限制锁的最坏持有时间，防上游挂起
+    冻结整条管道；None 用客户端默认。
+    """
     return await _require_ai().chat(
-        messages, temperature=temperature, max_tokens=max_tokens
+        messages, temperature=temperature, max_tokens=max_tokens, timeout=timeout
     )
 
 
@@ -74,7 +80,10 @@ async def rag_chat(
     # 类级检测：Mock/旧实现等实例级动态属性（__getattr__）不视为实现了 rag_chat，
     # 只有真正声明该方法的供应商类才走专用通道，否则回退复用 chat。
     if hasattr(type(ai), "rag_chat"):
-        return await ai.rag_chat(  # type: ignore[attr-defined]
+        # 运行时防御性检测仍有意义：测试经 set_ai 注入的桩可能未声明 rag_chat
+        # （mypy 对函数体内构造的对象不做协议校验）；静态层面 AIProvider 协议
+        # 已含 rag_chat 成员（plugin/base.py），无需 ignore。
+        return await ai.rag_chat(
             messages,
             temperature=temperature,
             max_tokens=max_tokens,
@@ -131,7 +140,7 @@ def loads_json(text: str, *, repair: bool = True) -> object | None:
 
 
 def top_k_similar(
-query_embedding: list[float] | np.ndarray,
+    query_embedding: list[float] | np.ndarray,
     item_embeddings: list[list[float]] | np.ndarray,
     top_k: int,
     threshold: float,

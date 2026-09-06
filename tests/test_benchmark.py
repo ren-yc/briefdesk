@@ -402,22 +402,24 @@ class DryRunTest(unittest.TestCase):
 
 
 class BenchEnvironmentTest(unittest.IsolatedAsyncioTestCase):
-    async def test_env_patches_get_db_and_restores(self):
-        """补丁式临时库：不改 config.db_path、不动应用连接，退出即恢复。"""
+    async def test_env_redirects_db_and_restores(self):
+        """官方缝重定向：不改 config.db_path、不动应用连接，窗口内调用落
+        临时库（含类别替换生效），退出即还原模块级单例。"""
         import briefdesk.db as briefdesk_db
 
-        old_get_db = briefdesk_db.get_db
+        old_main, old_embed = briefdesk_db._db, briefdesk_db._embed_db
         old_path = config.db_path
         async with bench_environment(
             [CategoryDef(name="自定义类别", prompt="测试说明")], register_ai=False
         ):
-            self.assertIsNot(briefdesk_db.get_db, old_get_db)  # 已替换
+            self.assertIsNot(briefdesk_db._db, old_main)  # 已重定向
             conn = await briefdesk_db.get_db()
             cursor = await conn.execute("SELECT name FROM categories ORDER BY id")
             rows = await cursor.fetchall()
             await cursor.close()
             self.assertEqual([r["name"] for r in rows], ["自定义类别"])
-        self.assertIs(briefdesk_db.get_db, old_get_db)  # 已恢复
+        self.assertIs(briefdesk_db._db, old_main)  # 已还原
+        self.assertIs(briefdesk_db._embed_db, old_embed)
         self.assertEqual(config.db_path, old_path)
 
     async def test_dedup_disjoint_pair_skips_ai_offline(self):

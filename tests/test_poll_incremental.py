@@ -24,8 +24,14 @@ from briefdesk.db import (
     mark_message_processed,
     update_session_last_polls,
 )
-from briefdesk.plugins.qqflow.client import QqFlowNotReadyError
+from briefdesk.plugins.qqflow.client import (
+    QqFlowAccountMismatchError,
+    QqFlowNotReadyError,
+)
 from briefdesk.plugins.qqflow.poller import poll as qq_poll
+from briefdesk.plugins.weflow.poller import _PAGE_LIMIT as WF_PAGE_LIMIT
+from briefdesk.plugins.weflow.poller import poll as wf_poll
+from briefdesk.plugins.weflow_legacy.poller import _PAGE_LIMIT as WFL_PAGE_LIMIT
 from briefdesk.plugins.weflow_legacy.poller import poll as we_poll
 from briefdesk.poll_cycle import _compute_session_windows, run_poll_cycle
 from briefdesk.types import SessionInfo
@@ -70,7 +76,8 @@ class _WeFlowLegacyClient:
 
     async def fetch_messages(
         self, talker: str, start_ts: int | None, limit: int = 500, offset: int = 0,
-        media: bool = False, retry_on_empty: bool = True,
+        media: bool = False, not_found_ok: bool = False,
+        retry_on_empty: bool = True,
     ) -> dict:
         self.calls.append((talker, start_ts, offset, media))
         page = self._messages[offset : offset + limit]
@@ -101,7 +108,12 @@ class _QqFlowClient:
         return [{"username": "g1", "displayName": "项目群", "type": 2}]
 
     async def fetch_messages(
-        self, talker: str, start: int | None = None, limit: int = 500, offset: int = 0
+        self,
+        talker: str,
+        start: int | None = None,
+        limit: int = 500,
+        offset: int = 0,
+        not_found_ok: bool = False,
     ) -> dict:
         self.calls.append((start, offset))
         page = self._messages[offset : offset + limit]
@@ -109,6 +121,40 @@ class _QqFlowClient:
             "messages": page,
             "hasMore": offset + len(page) < len(self._messages),
         }
+
+
+class _WeFlowClient:
+    """weflow(new) poller 桩：最小消息形状（serverId/createTime/localType）。"""
+
+    name = "weflow"
+
+    def __init__(self, messages: list[dict]):
+        self._messages = messages
+        self.calls: list[int] = []
+
+    async def ensure_ready(self) -> None:
+        pass
+
+    async def fetch_contacts(self) -> dict[str, str]:
+        return {}
+
+    async def fetch_sessions(self) -> list[dict]:
+        return [{"id": "g1", "name": "项目群", "type": "group"}]
+
+    async def fetch_messages(
+        self, talker: str, start_ts: int | None, limit: int = 500,
+        offset: int = 0, media: bool = False, not_found_ok: bool = False,
+    ) -> dict:
+        self.calls.append(offset)
+        page = self._messages[offset : offset + limit]
+        return {
+            "messages": page,
+            "hasMore": offset + len(page) < len(self._messages),
+        }
+
+
+def _weflow_new_msg(msg_id: str, ts: int) -> dict:
+    return {"serverId": msg_id, "localType": 1, "createTime": ts, "content": "x"}
 
 
 async def _no_processed(ids):
@@ -317,13 +363,48 @@ class _QqScriptedClient:
         return [{"username": "g1", "displayName": "项目群", "type": 2}]
 
     async def fetch_messages(
-        self, talker: str, start: int | None = None, limit: int = 500, offset: int = 0
+        self,
+        talker: str,
+        start: int | None = None,
+        limit: int = 500,
+        offset: int = 0,
+        not_found_ok: bool = False,
     ) -> dict:
         self.calls.append((start, offset))
         idx = len(self.calls) - 1
         if idx < len(self._pages):
             return self._pages[idx]
         return {"messages": [], "hasMore": False}
+
+
+class _LegacyScriptedClient:
+    """weflow-legacy 版按脚本逐页返回的假客户端（可造跨页重复）。"""
+
+    name = "weflow-legacy"
+
+    def __init__(self, pages: list[dict]):
+        self._pages = pages
+        self.calls: list[int] = []
+
+    async def fetch_contacts(self) -> dict[str, str]:
+        return {"u": "用户"}
+
+    async def fetch_sessions(self) -> list[dict]:
+        return [{"id": "g1", "name": "项目群", "type": "group"}]
+
+    async def fetch_messages(
+        self, talker: str, start_ts: int | None, limit: int = 500,
+        offset: int = 0, media: bool = False, not_found_ok: bool = False,
+        retry_on_empty: bool = True,
+    ) -> dict:
+        self.calls.append(offset)
+        idx = len(self.calls) - 1
+        if idx < len(self._pages):
+            return self._pages[idx]
+        return {"messages": [], "hasMore": False}
+
+    async def fetch_group_members(self, chatroom_id: str) -> dict[str, str]:
+        return {"u": "用户"}
 
 
 class QqFlowPagingGuardTest(unittest.IsolatedAsyncioTestCase):
@@ -645,3 +726,295 @@ class QqFlowNotReadyFailureTest(unittest.IsolatedAsyncioTestCase):
         client = _QqFlowClient([_qqflow_msg(1, now - 10)])
         result = await qq_poll(client, _enabled("qqflow", "g1"), _no_processed)
         self.assertEqual(result.failed_sessions, set())
+
+
+class AccountMismatchCycleTest(unittest.IsolatedAsyncioTestCase):
+    """账号不符必须走「整轮中止 + lastError + 不推水位」，与 503 的静默跳过相反。
+
+    这条守的是修复的最终收益：不符错误得真正抵达 lastError（前端可见）。
+    poller 只 `except *NotReadyError`，不符不继承它（见
+    test_source_robustness.test_mismatch_error_is_not_a_not_ready_error），
+    因此会穿到 run_poll_cycle 的兜底出口——这里端到端钉住整条链路。
+    """
+
+    async def _run(self, exc: BaseException):
+        # 关键：fetch_history 走**真** poller（只桩掉 client 的 ensure_ready），
+        # 否则测不到「poller 的 except 子句没把不符一起吞掉」这一层——
+        # 直接桩 fetch_history 等于从 poller 边界之外注入异常，形同空转。
+        client = _QqFlowClient([])
+        client.ensure_ready = AsyncMock(side_effect=exc)  # type: ignore[method-assign]
+        source = Mock()
+        source.name = "qqflow"
+        source.client = client
+        # client 是本文件通用的轻量桩，非真 QqFlowClient
+        source.fetch_history = lambda enabled, is_processed, **kw: qq_poll(
+            client,  # type: ignore[arg-type]
+            enabled,
+            is_processed,
+            **kw,
+        )
+        status: list[dict] = []
+        with patch(
+            "briefdesk.poll_cycle.get_enabled_sessions",
+            new=AsyncMock(
+                return_value=[
+                    {
+                        "source": "qqflow",
+                        "session_id": "g1",
+                        "name": "g",
+                        "is_group": 1,
+                        "is_official": 0,
+                    }
+                ]
+            ),
+        ), patch(
+            "briefdesk.poll_cycle._compute_session_windows",
+            new=AsyncMock(return_value={"g1": 0}),
+        ), patch(
+            "briefdesk.poll_cycle.set_status", side_effect=status.append
+        ), patch(
+            "briefdesk.poll_cycle.update_session_last_polls", new=AsyncMock()
+        ) as upd:
+            await run_poll_cycle(source)
+        return status, upd
+
+    async def test_mismatch_lands_in_last_error_and_blocks_watermark(self):
+        status, upd = await self._run(
+            QqFlowAccountMismatchError("qqflow-server 已绑定另一个账号 999")
+        )
+        upd.assert_not_awaited()  # 水位不推进
+        errors = [d["lastError"] for d in status if "lastError" in d]
+        self.assertEqual(len(errors), 1, "必须恰好写一次 lastError")
+        self.assertIn("999", errors[0], "前端要能看到占用方账号")
+
+    async def test_cycle_does_not_crash_out(self):
+        """兜底出口吞掉异常本身：不符不该让调度协程整个死掉。"""
+        await self._run(QqFlowAccountMismatchError("绑定不符"))  # 不抛即通过
+
+
+class SessionFailureIsolationTest(unittest.IsolatedAsyncioTestCase):
+    """【复核 P2-5】单会话拉取失败不再中止整轮：记入 failed_sessions 与
+    session_errors，其余会话照常处理（此前整轮 raise 会让一个持续失败的
+    坏会话饿死同源所有会话——已收集消息作废、全部水位不推进）。"""
+
+    async def test_session_failure_does_not_abort_round(self):
+        now = int(time.time())
+
+        class _PartialFailClient(_WeFlowLegacyClient):
+            async def fetch_messages(
+                self, talker, start_ts, limit=500, offset=0, media=False,
+                not_found_ok=False, retry_on_empty=True,
+            ):
+                if talker == "g2":
+                    raise RuntimeError("上游对该会话稳定 5xx")
+                return await super().fetch_messages(
+                    talker, start_ts, limit, offset, media, not_found_ok,
+                    retry_on_empty,
+                )
+
+        client = _PartialFailClient([_weflow_msg("m1", now - 10)])
+        window = now - 3600
+        result = await we_poll(
+            client,
+            _enabled("weflow-legacy", "g1", "g2"),
+            _no_processed,
+            window_start_by_session={"g1": window, "g2": window},
+        )
+        self.assertEqual(
+            [m.msg_id for m in result.messages], ["m1"], "坏会话不得拖垮好会话"
+        )
+        self.assertEqual(result.failed_sessions, {"g2"})
+        self.assertIn("g2", result.session_errors)
+
+    async def test_same_name_sessions_keep_both_errors(self):
+        """【核验 C2】同名群（如多个「通知群」）同轮失败：session_errors 以
+        session_id 为键互不覆盖（此前以显示名为键，后者覆盖前者，令应用层
+        len(session_errors) 的 lastWarning 计数报少、首个失败原因丢失）。"""
+        now = int(time.time())
+
+        class _FailAllClient(_WeFlowLegacyClient):
+            async def fetch_messages(
+                self, talker, start_ts, limit=500, offset=0, media=False,
+                not_found_ok=False, retry_on_empty=True,
+            ):
+                raise RuntimeError(f"fail {talker}")
+
+        client = _FailAllClient([])
+        window = now - 3600
+        sessions = [
+            SessionInfo(
+                source="weflow-legacy", session_id="g1", name="同名群",
+                is_group=True,
+            ),
+            SessionInfo(
+                source="weflow-legacy", session_id="g2", name="同名群",
+                is_group=True,
+            ),
+        ]
+        result = await we_poll(
+            client,
+            sessions,
+            _no_processed,
+            window_start_by_session={"g1": window, "g2": window},
+        )
+        self.assertEqual(result.failed_sessions, {"g1", "g2"})
+        self.assertEqual(
+            set(result.session_errors), {"g1", "g2"}, "同名群不得互相覆盖"
+        )
+
+
+class LegacyPagingGuardTest(unittest.IsolatedAsyncioTestCase):
+    """【核验 H2/A6】weflow-legacy 翻页去重与超窗计数的页内守卫。"""
+
+    def setUp(self):
+        self._hours = config.backfill_hours
+        config.backfill_hours = 24
+
+    def tearDown(self):
+        config.backfill_hours = self._hours
+
+    async def test_cross_page_duplicate_dropped_in_page(self):
+        """同一 serverId 跨页重复 → 页内即滤（对齐 qqflow）：重复条目不得
+        驻留 messages、不得重复进入 is_processed 查询（白烧查询与文章 XML
+        解析）。"""
+        now = int(time.time())
+        client = _LegacyScriptedClient(
+            [
+                {
+                    "messages": [_weflow_msg("m1", now), _weflow_msg("m2", now)],
+                    "hasMore": True,
+                },
+                # 第 2 页与第 1 页重叠 1 条（offset 漂移）
+                {
+                    "messages": [_weflow_msg("m2", now), _weflow_msg("m3", now)],
+                    "hasMore": False,
+                },
+            ]
+        )
+        seen_queries: list[list[str]] = []
+
+        async def tracking_processed(ids):
+            seen_queries.append(list(ids))
+            return set()
+
+        result = await we_poll(
+            client,
+            _enabled("weflow-legacy", "g1"),
+            tracking_processed,
+            window_start_by_session={"g1": now - _DAY},
+        )
+        ids = [m.msg_id for m in result.messages]
+        self.assertEqual(len(ids), len(set(ids)), f"无重复: {ids}")
+        self.assertEqual(set(ids), {"m1", "m2", "m3"})
+        self.assertTrue(seen_queries, "应发生过已处理查询")
+        self.assertTrue(
+            all(len(q) == len(set(q)) for q in seen_queries),
+            f"is_processed 查询不应含重复 id: {seen_queries}",
+        )
+
+    async def test_old_count_includes_full_page_tail(self):
+        """超窗消息同页多条：session_old 全数计入（此前仅首个触窗条计入/
+        候选循环恒 0，INFO「超窗口」计数误导回填诊断）。"""
+        now = int(time.time())
+        window = now - 3600
+        # 3 条窗口内 + 5 条超窗（同页触边后整页尾部全计）
+        messages = [_weflow_msg(f"m{i}", now - 10) for i in range(3)]
+        messages.extend(
+            _weflow_msg(f"o{i}", window - 1 - i) for i in range(5)
+        )
+        client = _WeFlowLegacyClient(messages)
+        with self.assertLogs(
+            "briefdesk.plugins.weflow_legacy.poller", level="INFO"
+        ) as logs:
+            await we_poll(
+                client,
+                _enabled("weflow-legacy", "g1"),
+                _no_processed,
+                window_start_by_session={"g1": window},
+            )
+        self.assertTrue(
+            any("5 超窗口" in m for m in logs.output),
+            f"会话行应含完整超窗计数: {logs.output}",
+        )
+
+    async def test_qqflow_old_count_includes_full_page_tail(self):
+        """qqflow 同款计数（改动与 legacy 同构）。"""
+        now = int(time.time())
+        window = now - 3600
+        messages = [_qqflow_msg(i, now - 10) for i in range(1, 4)]
+        messages.extend(
+            _qqflow_msg(10 + i, window - 1 - i) for i in range(5)
+        )
+        client = _QqFlowClient(messages)
+        with self.assertLogs(
+            "briefdesk.plugins.qqflow.poller", level="INFO"
+        ) as logs:
+            await qq_poll(
+                client,
+                _enabled("qqflow", "g1"),
+                _no_processed,
+                window_start_by_session={"g1": window},
+            )
+        self.assertTrue(
+            any("5 超窗口" in m for m in logs.output),
+            f"会话行应含完整超窗计数: {logs.output}",
+        )
+
+
+class PagingAgeEarlyStopTest(unittest.IsolatedAsyncioTestCase):
+    """【复核 P2-12】页内碰到早于窗口的消息即止（响应按时间倒序），不再
+    深翻后续页——防御上游无视 start 参数返回历史全量（weflow 上限 40 万条、
+    legacy 100 万条全量驻留内存）。"""
+
+    def setUp(self):
+        # 固定 BACKFILL_HOURS：本机 .env 可能设 -1（全量模式 start=None、
+        # cutoff=0，早停天然不触发），与现有增量测试同一隔离手法
+        self._hours = config.backfill_hours
+        config.backfill_hours = 24
+
+    def tearDown(self):
+        config.backfill_hours = self._hours
+
+    @staticmethod
+    def _mixed_messages(make_msg, now: int, window: int, page_limit: int) -> list[dict]:
+        # page_limit 条窗口内 + 1 条超窗 + page_limit+100 条更旧：naive 翻页
+        # 恰好 3 页；早停后第 2 页首条即超窗 → 恰好 2 页（页大小取自被测模块
+        # 的 _PAGE_LIMIT，避免硬编码页尺寸随实现漂移）
+        messages = [make_msg(f"m{i}", now - 10) for i in range(page_limit)]
+        messages.append(make_msg("old", window - 1))
+        messages.extend(
+            make_msg(f"o{i}", window - 2 - i) for i in range(page_limit + 100)
+        )
+        return messages
+
+    @staticmethod
+    async def _all_processed(ids):
+        return set(ids)
+
+    async def test_legacy_paging_stops_at_window_edge(self):
+        now = int(time.time())
+        window = now - 3600
+        client = _WeFlowLegacyClient(
+            self._mixed_messages(_weflow_msg, now, window, WFL_PAGE_LIMIT)
+        )
+        await we_poll(
+            client,
+            _enabled("weflow-legacy", "g1"),
+            self._all_processed,
+            window_start_by_session={"g1": window},
+        )
+        self.assertEqual(len(client.calls), 2, "第二页碰到超窗消息后不得再翻第三页")
+
+    async def test_weflow_paging_stops_at_window_edge(self):
+        now = int(time.time())
+        window = now - 3600
+        client = _WeFlowClient(
+            self._mixed_messages(_weflow_new_msg, now, window, WF_PAGE_LIMIT)
+        )
+        await wf_poll(
+            client,
+            _enabled("weflow", "g1"),
+            self._all_processed,
+            window_start_by_session={"g1": window},
+        )
+        self.assertEqual(len(client.calls), 2, "第二页碰到超窗消息后不得再翻第三页")

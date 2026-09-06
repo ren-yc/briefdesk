@@ -2,8 +2,9 @@
 
 - 存储层：BRIEFDESK_SETTINGS_FILE 显式路径、读写/删键/整文件移除、来源判定
 - 优先级链：暂存文件 > .env > 默认（pydantic-settings 多文件后加载优先）
-- 路由：GET 元数据/暂存/来源；PUT 白名单/类型校验/原子写/null 恢复；
-  POST/DELETE 密钥（fake keyring 隔离真实凭据管理器）
+- 路由：GET 元数据/暂存/来源/插件开关数据；PUT 白名单/类型校验/插件依赖
+  互斥复检（409）/原子写/null 恢复；POST/DELETE 密钥（fake keyring 隔离
+  真实凭据管理器）
 - 前端守卫：index.html 面板与 app.js 端点引用不漂移
 """
 
@@ -13,6 +14,7 @@ import tempfile
 import unittest
 from contextlib import contextmanager
 from pathlib import Path
+from typing import ClassVar
 from unittest.mock import patch
 
 import keyring
@@ -129,6 +131,14 @@ class SettingsFileTest(StagedFileTestCase):
         write_staged({"DB_PATH": r"C:\data\app.db?x=1"})
         self.assertEqual(read_staged()["DB_PATH"], r"C:\data\app.db?x=1")
 
+    def test_write_rejects_newline_value_and_keeps_file(self) -> None:
+        """【复核 P1-7】写入前断言拒绝换行值：防 KEY=VALUE 行格式被注入
+        伪配置行（含密钥名）；失败时原文件保持不变。"""
+        write_staged({"LOG_LEVEL": "DEBUG"})
+        with self.assertRaises(ValueError):
+            write_staged({"LOG_LEVEL": "DEBUG\nAI_API_KEY=sk-evil"})
+        self.assertEqual(read_staged(), {"LOG_LEVEL": "DEBUG"})
+
     def test_write_staged_cleans_tmp_on_failure(self) -> None:
         # 写入/替换失败时残留 .tmp 必须被清理，原文件保持不变（审查回归）
         write_staged({"LOG_LEVEL": "DEBUG"})
@@ -166,7 +176,8 @@ class SettingsFileTest(StagedFileTestCase):
 class PriorityChainTest(unittest.TestCase):
     def test_staged_file_beats_dotenv_and_env_beats_staged(self) -> None:
         # 暂存文件（后加载）优先于 .env；环境变量优先于暂存文件
-        with tempfile.TemporaryDirectory() as d:
+        # 排除宿主环境 LOG_LEVEL 干扰（本地可能预置该变量）
+        with _env_without("LOG_LEVEL"), tempfile.TemporaryDirectory() as d:
             root = Path(d)
             env_a = root / "a.env"
             env_b = root / "b.env"
@@ -202,7 +213,7 @@ class EnvRoutesTest(StagedFileTestCase):
             self.assertIn(item["source"], ("default", "dotenv", "env", "override"))
             self.assertIn("current", item)
             self.assertIn("staged", item)
-        self.assertEqual(len(data["secrets"]), 11)
+        self.assertEqual(len(data["secrets"]), 10)
         self.assertEqual(
             {s["name"] for s in data["secrets"]},
             {
@@ -212,7 +223,6 @@ class EnvRoutesTest(StagedFileTestCase):
                 "WEFLOW_IMG_AES_KEY",
                 "WEFLOW_IMG_XOR_KEY",
                 "WEFLOW_DB_KEYS",
-                "WEFLOW_DB_KEYS_2",
                 "WEFLOW_LEGACY_API_TOKEN",
                 "QQFLOW_API_TOKEN",
                 "QQFLOW_KEY",
@@ -222,23 +232,25 @@ class EnvRoutesTest(StagedFileTestCase):
         )
 
     def test_put_stages_and_get_reports_override(self) -> None:
-        res = self.client.put(
-            "/api/settings/env", json={"items": {"LOG_LEVEL": "DEBUG"}}
-        )
-        self.assertEqual(res.status_code, 200)
-        self.assertEqual(read_staged(), {"LOG_LEVEL": "DEBUG"})
-        data = self.client.get("/api/settings/env").json()
-        log_level = next(i for i in data["items"] if i["key"] == "LOG_LEVEL")
-        self.assertEqual(log_level["staged"], "DEBUG")
-        self.assertEqual(log_level["source"], "override")
+        # 宿主环境若预置 LOG_LEVEL，会使 source 判定为 env 而非 override；测试内隔离该变量
+        with _env_without("LOG_LEVEL"):
+            res = self.client.put(
+                "/api/settings/env", json={"items": {"LOG_LEVEL": "DEBUG"}}
+            )
+            self.assertEqual(res.status_code, 200)
+            self.assertEqual(read_staged(), {"LOG_LEVEL": "DEBUG"})
+            data = self.client.get("/api/settings/env").json()
+            log_level = next(i for i in data["items"] if i["key"] == "LOG_LEVEL")
+            self.assertEqual(log_level["staged"], "DEBUG")
+            self.assertEqual(log_level["source"], "override")
 
     def test_put_multi_json_array(self) -> None:
         res = self.client.put(
             "/api/settings/env",
-            json={"items": {"PLUGINS": json.dumps(["*", "benchmark"])}},
+            json={"items": {"PLUGINS": json.dumps(["weflow", "qqflow"])}},
         )
         self.assertEqual(res.status_code, 200)
-        self.assertEqual(read_staged()["PLUGINS"], '["*","benchmark"]')
+        self.assertEqual(read_staged()["PLUGINS"], '["weflow","qqflow"]')
 
     def test_dynamic_plugin_schema_is_rendered_validated_and_saved(self) -> None:
         dynamic = [
@@ -356,6 +368,28 @@ class EnvRoutesTest(StagedFileTestCase):
         self.assertEqual(res.status_code, 200)
         self.assertEqual(read_staged(), {})
 
+    def test_put_response_carries_fresh_item_state(self) -> None:
+        # 行级贴片依据：响应携带受影响键的最终 staged/source（与 GET 同口径）；
+        # source 依赖服务端解析链，客户端无法自行推算
+        with _env_without("LOG_LEVEL"):
+            res = self.client.put(
+                "/api/settings/env", json={"items": {"LOG_LEVEL": "DEBUG"}}
+            )
+            self.assertEqual(res.status_code, 200)
+            self.assertEqual(
+                res.json()["items"],
+                {"LOG_LEVEL": {"staged": "DEBUG", "source": "override"}},
+            )
+            # 恢复默认：staged 回 None、source 脱离 override
+            # （本地有 .env 时为 dotenv，CI 无 .env 时为 default，均合法）
+            res = self.client.put(
+                "/api/settings/env", json={"items": {"LOG_LEVEL": None}}
+            )
+            self.assertEqual(res.status_code, 200)
+            item = res.json()["items"]["LOG_LEVEL"]
+            self.assertIsNone(item["staged"])
+            self.assertIn(item["source"], ("default", "dotenv"))
+
     def test_secret_set_get_delete(self) -> None:
         # 测试只验证 keyring 的写删；宿主项目 .env 可能有真实配置，需排除其
         # 对“删除 keyring 后仍已配置”的有效影响。
@@ -369,6 +403,9 @@ class EnvRoutesTest(StagedFileTestCase):
                 json={"name": "AI_API_KEY", "value": _VALID_SECRET},
             )
             self.assertEqual(res.status_code, 200)
+            # 钥匙串写入成功即两枚为真（行级贴片依据）
+            self.assertIs(res.json()["configured"], True)
+            self.assertIs(res.json()["keyringConfigured"], True)
             data = self.client.get("/api/settings/env").json()
             ai = next(s for s in data["secrets"] if s["name"] == "AI_API_KEY")
             self.assertTrue(ai["configured"])
@@ -377,6 +414,10 @@ class EnvRoutesTest(StagedFileTestCase):
             self.assertNotIn(_VALID_SECRET, json.dumps(data))
             res = self.client.delete("/api/settings/secrets/AI_API_KEY")
             self.assertEqual(res.status_code, 200)
+            # 删除后 keyringConfigured 恒 False；configured 取决于是否另有
+            # 环境变量/.env 配置（本用例核心 schema 快照 configured=False）
+            self.assertIs(res.json()["keyringConfigured"], False)
+            self.assertIs(res.json()["configured"], False)
             ai = next(
                 s
                 for s in self.client.get("/api/settings/env").json()["secrets"]
@@ -417,6 +458,129 @@ class EnvRoutesTest(StagedFileTestCase):
         )
 
 
+class PluginToggleRoutesTest(StagedFileTestCase):
+    """「插件」面板路由：GET plugins 数组（核心/可选 + 期望启用态）、
+    PUT PLUGINS 的依赖/互斥复检（409）与 PLUGINS_DISABLED 键淘汰。"""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.client = TestClient(
+            srv.app,
+            base_url="http://localhost",
+            headers={"Origin": "http://localhost"},
+        )
+
+    _META: ClassVar[list[dict]] = [
+        {
+            "name": "weflow",
+            "version": "1.0.0",
+            "dependencies": [],
+            "conflicts": ["weflow-legacy"],
+            "core": False,
+        },
+        {
+            "name": "ai_provider",
+            "version": "1.0.0",
+            "dependencies": [],
+            "conflicts": [],
+            "core": True,
+        },
+    ]
+
+    def test_get_returns_plugin_toggle_data(self) -> None:
+        infos = [
+            {"name": "weflow", "version": "1.0.0", "status": "disabled",
+             "reason": "未启用：在 PLUGINS 中列出或经「插件」面板开关即可启用",
+             "has_frontend": False, "core": False},
+            {"name": "ai_provider", "version": "1.0.0", "status": "loaded",
+             "reason": "", "has_frontend": False, "core": True},
+            # 加载失败记录（无插件实例、无元数据）应兜底展示
+            {"name": "ghost", "version": "", "status": "failed",
+             "reason": "entry point 加载失败", "has_frontend": False, "core": False},
+        ]
+        # 隔离宿主环境：config 单例回落值与 PLUGINS 来源判定均指向干净默认
+        with patch.object(
+            settings_routes, "get_plugin_meta", return_value=self._META
+        ), patch.object(
+            settings_routes, "get_plugins_info", return_value=infos
+        ), patch.object(
+            settings_routes, "config", Settings(
+                plugins=[], plugins_required=[], plugin_path=""
+            )
+        ), patch.object(
+            settings_routes, "source_of", return_value="default"
+        ):
+            data = self.client.get("/api/settings/env").json()
+        plugins = {p["name"]: p for p in data["plugins"]}
+        self.assertIs(plugins["ai_provider"]["core"], True)
+        self.assertIs(plugins["ai_provider"]["enabled"], True)  # 核心恒启用
+        self.assertIs(plugins["weflow"]["enabled"], False)  # 默认 PLUGINS=[]，未列出即禁用
+        self.assertEqual(plugins["weflow"]["status"], "disabled")
+        self.assertIn("ghost", plugins)  # 失败记录兜底可见
+        self.assertEqual(plugins["ghost"]["status"], "failed")
+        self.assertEqual(data["pluginsSource"], "default")
+        # PLUGINS 项带 hidden 标记（由插件面板编辑）；PLUGINS_DISABLED 已淘汰
+        plugins_item = next(i for i in data["items"] if i["key"] == "PLUGINS")
+        self.assertIs(plugins_item["hidden"], True)
+        self.assertNotIn("PLUGINS_DISABLED", {i["key"] for i in data["items"]})
+        # 芯片选项不含通配符
+        self.assertNotIn("*", data["pluginOptions"])
+
+    def test_get_enabled_follows_staged_value(self) -> None:
+        # 排除宿主环境 PLUGINS（env > 暂存 > .env > 默认）：来源判定若被宿主
+        # PLUGINS 抢占，pluginsSource 会返回 'env' 而非本用例期望的 'override'
+        with _env_without("PLUGINS"):
+            write_staged({"PLUGINS": '["weflow"]'})
+            with patch.object(
+                settings_routes, "get_plugin_meta", return_value=self._META
+            ), patch.object(settings_routes, "get_plugins_info", return_value=[]):
+                data = self.client.get("/api/settings/env").json()
+        self.assertEqual(
+            {p["name"]: p["enabled"] for p in data["plugins"]},
+            {"weflow": True, "ai_provider": True},
+        )
+        self.assertEqual(data["pluginsSource"], "override")
+
+    def test_put_plugins_conflict_rejected_409(self) -> None:
+        issues = [
+            {
+                "type": "conflict",
+                "plugin": "weflow",
+                "detail": "与 weflow-legacy 互斥，两者不可同时启用",
+            }
+        ]
+        with patch.object(
+            settings_routes, "validate_plugin_selection", return_value=issues
+        ):
+            res = self.client.put(
+                "/api/settings/env",
+                json={"items": {"PLUGINS": json.dumps(["weflow", "weflow-legacy"])}},
+            )
+        self.assertEqual(res.status_code, 409)
+        self.assertEqual(res.json()["detail"]["issues"], issues)
+        self.assertNotIn("PLUGINS", read_staged())  # 校验失败不落盘
+
+    def test_put_plugins_valid_selection_stages(self) -> None:
+        with patch.object(
+            settings_routes, "validate_plugin_selection", return_value=[]
+        ):
+            res = self.client.put(
+                "/api/settings/env",
+                json={"items": {"PLUGINS": json.dumps(["weflow"])}},
+            )
+        self.assertEqual(res.status_code, 200)
+        self.assertEqual(read_staged()["PLUGINS"], '["weflow"]')
+
+    def test_put_plugins_disabled_key_rejected(self) -> None:
+        # PLUGINS_DISABLED 已随通配语义一并移除：键不再在白名单
+        res = self.client.put(
+            "/api/settings/env",
+            json={"items": {"PLUGINS_DISABLED": json.dumps(["weflow-legacy"])}},
+        )
+        self.assertEqual(res.status_code, 422)
+        self.assertEqual(read_staged(), {})
+
+
 class FrontendGuardTest(unittest.TestCase):
     """前端面板与端点引用守卫（防漂移）。"""
 
@@ -427,6 +591,11 @@ class FrontendGuardTest(unittest.TestCase):
         self.assertIn('id="env-secrets"', html)
         self.assertIn('id="env-file-path"', html)
 
+    def test_index_html_has_plugins_toggle_panel(self) -> None:
+        html = (_REPO_ROOT / "ui" / "index.html").read_text(encoding="utf-8")
+        self.assertIn('data-panel="plugins"', html)
+        self.assertIn('id="plugins-list"', html)
+
     def test_app_js_references_env_endpoints(self) -> None:
         js = (_REPO_ROOT / "ui" / "app.js").read_text(encoding="utf-8")
         self.assertIn('"/api/settings/env"', js)
@@ -435,6 +604,15 @@ class FrontendGuardTest(unittest.TestCase):
         self.assertIn("data-sec-set", js)
         self.assertIn("keyringConfigured", js)
         self.assertIn('class="env-input"', js)
+
+    def test_app_js_references_plugin_toggle_flow(self) -> None:
+        js = (_REPO_ROOT / "ui" / "app.js").read_text(encoding="utf-8")
+        self.assertIn("data-plugin-toggle", js)
+        self.assertIn("_onPluginToggle", js)
+        self.assertIn("renderPluginToggles", js)
+        self.assertIn("_pluginChanges", js)
+        # 多选控件不再注入通配符选项
+        self.assertNotIn('opts.unshift("*")', js)
 
 
 if __name__ == "__main__":

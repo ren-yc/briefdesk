@@ -6,6 +6,7 @@
 """
 
 import io
+import json
 import os
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
@@ -19,13 +20,18 @@ from keyring.backend import KeyringBackend
 from briefdesk.config import Settings
 from briefdesk.secrets_cli import secrets_cli_main
 from briefdesk.secrets_store import (
+    DB_KEYS_BASE,
+    DB_KEYS_SEGMENT_LIMIT,
     SECRET_NAMES,
     SecretsStoreError,
     configured_names,
     delete_secret,
+    get_db_keys,
     get_secret,
     is_keyring_available,
+    set_db_keys,
     set_secret,
+    split_db_keys,
 )
 
 
@@ -144,6 +150,20 @@ class KeyringPriorityChainTest(KeyringTestCase):
                 settings = Settings(_env_file=env_file)
             self.assertEqual(settings.ai_api_key.get_secret_value(), "dotenv-value")
 
+    def test_empty_keyring_entry_does_not_shadow_dotenv(self) -> None:
+        """【复核 P3】keyring 空条目与未配置同语义：不得以「已配置」身份
+        压过 .env 的有效值（此前 `secrets set X ""` 的空串会覆盖 .env，
+        对 weflow/qqflow 的直接后果是插件被静默自禁用，且状态面板显示
+        未配置、解析链却采用空串——显示与行为互相矛盾）。"""
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as d:
+            env_file = _env_file(d, "AI_API_KEY=dotenv-value\n")
+            self._seed("AI_API_KEY", "")  # 条目存在但值为空串
+            with patch.dict(os.environ, {}, clear=True):
+                settings = Settings(_env_file=env_file)
+            self.assertEqual(settings.ai_api_key.get_secret_value(), "dotenv-value")
+
     def test_default_when_all_layers_empty(self) -> None:
         import tempfile
 
@@ -177,6 +197,64 @@ class KeyringPriorityChainTest(KeyringTestCase):
         with patch.dict(os.environ, {"WEFLOW_LEGACY_API_TOKEN": "env-token"}):
             settings = WeFlowLegacySettings()
         self.assertEqual(settings.api_token.get_secret_value(), "env-token")
+
+
+class DbKeysSegmentationTest(KeyringTestCase):
+    """WEFLOW_DB_KEYS 配置/存储语义分离：拆段只在存储层，配置侧始终一份完整 JSON。"""
+
+    def test_split_single_segment_when_small(self) -> None:
+        parts = split_db_keys('{"a/b.db":"abcdef"}')
+        self.assertEqual(parts, ['{"a/b.db":"abcdef"}'])
+
+    def test_split_joins_roundtrip_preserves_text(self) -> None:
+        payload = {f"db_{i}.db": "ab" * 64 for i in range(40)}  # 40 库 × 128 字节 hex，远超单段上限
+        json_text = json.dumps(payload, ensure_ascii=False)
+        segments = split_db_keys(json_text)
+        self.assertGreater(len(segments), 1)  # 长文本确被切多段
+        for part in segments:
+            self.assertLessEqual(len(part.encode("utf-8")), DB_KEYS_SEGMENT_LIMIT)
+        self.assertEqual("".join(segments), json_text)
+
+    def test_split_never_splits_multibyte_char(self) -> None:
+        # 中文字符 3 字节，切分不得把字符拆到不同段
+        json_text = '{"会话": "' + "a" * 1100 + '"}'
+        segments = split_db_keys(json_text)
+        self.assertGreater(len(segments), 1)
+        for part in segments:
+            part.encode("utf-8")  # 每个段都能独立按 UTF-8 解码，不抛即通过
+        self.assertEqual("".join(segments), json_text)
+
+    def test_set_get_roundtrip_via_segments(self) -> None:
+        import json
+
+        payload = {f"db_{i}.db": ("ab" * 32) for i in range(40)}  # 远超单段上限
+        json_text = json.dumps(payload, ensure_ascii=False)
+        set_db_keys(json_text)
+        # 段 0 存在即 keyring 有值
+        self.assertIsNotNone(get_secret(DB_KEYS_BASE))
+        self.assertEqual(get_db_keys(), json_text)
+        # 读取符合 dict 形状
+        self.assertEqual(json.loads(get_db_keys() or "{}"), payload)
+
+    def test_segments_hidden_from_public_names(self) -> None:
+        self.assertNotIn("WEFLOW_DB_KEYS_2", SECRET_NAMES)
+        self.assertNotIn("WEFLOW_DB_KEYS_3", SECRET_NAMES)
+
+    def test_delete_db_keys_removes_all_segments(self) -> None:
+        from briefdesk.secrets_store import delete_db_keys
+
+        set_db_keys('{"a": "b"}')
+        self.assertIsNotNone(get_db_keys())
+        delete_db_keys()
+        self.assertIsNone(get_db_keys())
+
+    def test_legacy_two_half_json_format_still_read(self) -> None:
+        """旧格式：两段各存半份 JSON 对象 → get_db_keys 逐段解析合并。"""
+        self._seed("WEFLOW_DB_KEYS", '{"a": "1"}')
+        self._seed("WEFLOW_DB_KEYS_2", '{"b": "2"}')
+        merged = get_db_keys()
+        self.assertIsNotNone(merged)
+        self.assertEqual(json.loads(merged or "{}"), {"a": "1", "b": "2"})
 
 
 class SecretsCliTest(KeyringTestCase):
@@ -226,6 +304,28 @@ class SecretsCliTest(KeyringTestCase):
     def test_unknown_name_rejected(self) -> None:
         with self.assertRaises(SystemExit):
             secrets_cli_main(["set", "OTHER_KEY", "v"])
+
+    def test_db_keys_segments_are_not_managed_names(self) -> None:
+        """存储段名不在白名单：用户不能直接 set/rm（隐藏存储细节）。"""
+        with self.assertRaises(SystemExit):
+            secrets_cli_main(["set", "WEFLOW_DB_KEYS_2", "v"])
+
+    def test_db_keys_cli_set_get_roundtrip(self) -> None:
+        payload = '{"session/session.db":"' + "ab" * 64 + '"}'
+        out, _, code = self._run(["set", "WEFLOW_DB_KEYS", payload])
+        self.assertEqual(code, 0)
+        self.assertIn("已写入系统密钥环", out)
+        self.assertEqual(get_db_keys(), payload)
+
+        out, _, code = self._run(["get", "WEFLOW_DB_KEYS", "--reveal"])
+        self.assertEqual(code, 0)
+        self.assertIn(payload, out)
+
+    def test_db_keys_cli_rm_removes_segments(self) -> None:
+        set_db_keys('{"a":"b"}')
+        _, _, code = self._run(["rm", "WEFLOW_DB_KEYS"])
+        self.assertEqual(code, 0)
+        self.assertIsNone(get_db_keys())
 
     def test_set_when_disabled_errors(self) -> None:
         with patch.dict(os.environ, {"BRIEFDESK_KEYRING": "0"}):

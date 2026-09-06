@@ -52,7 +52,7 @@ def _bare_ctx() -> PluginContext:
     return PluginContext(
         # 用环境变量名（alias）构造：pydantic mypy 插件对带 alias 字段按别名生成签名
         config=Settings(
-            PLUGINS=["*"], PLUGINS_DISABLED=[], PLUGINS_REQUIRED=[], PLUGIN_PATH=""
+            PLUGINS=[], PLUGINS_REQUIRED=[], PLUGIN_PATH=""
         ),
         publish_event=_noop_async,
         subscribe_event=lambda e, h: None,
@@ -62,11 +62,13 @@ def _bare_ctx() -> PluginContext:
 
 
 class _AiProviderStub:
-    """ai_provider 依赖桩：benchmark 声明依赖它，装配测试需先注册后才能加载。"""
+    """ai_provider 依赖桩（核心插件，恒装配）：benchmark 声明依赖它，装配测试需先注册。"""
 
     name = "ai_provider"
     version = "0"
     dependencies: tuple[str, ...] = ()
+    conflicts: tuple[str, ...] = ()
+    core = True
 
     async def setup(self, ctx: PluginContext) -> None: ...
 
@@ -76,8 +78,8 @@ class _AiProviderStub:
 
 
 class DefaultDisabledTest(unittest.IsolatedAsyncioTestCase):
-    """默认禁用：默认配置（PLUGINS=["*"]）下 PluginManager 不装配 benchmark，
-    显式列名才启用。"""
+    """可选插件语义：默认配置（PLUGINS=[]）下 PluginManager 不装配 benchmark，
+    显式列名才启用（benchmark 无 core 声明，属可选插件）。"""
 
     async def asyncSetUp(self):
         self._eps_patch = patch(
@@ -89,7 +91,7 @@ class DefaultDisabledTest(unittest.IsolatedAsyncioTestCase):
     async def test_not_loaded_by_default(self):
         manager = PluginManager(
             Settings(
-                plugins=["*"], plugins_disabled=[], plugins_required=[], plugin_path=""
+                plugins=[], plugins_required=[], plugin_path=""
             )
         )
         manager.register(BenchmarkPlugin())
@@ -97,13 +99,12 @@ class DefaultDisabledTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(manager.loaded, [])
         rec = manager.records()["benchmark"]
         self.assertEqual(rec.status, "disabled")
-        self.assertIn("默认禁用", rec.reason)  # /api/plugins 可见原因
+        self.assertIn("未启用", rec.reason)  # /api/plugins 可见原因
 
     async def test_loaded_when_explicit(self):
         manager = PluginManager(
             Settings(
-                plugins=["*", "benchmark"],
-                plugins_disabled=[],
+                plugins=["benchmark"],
                 plugins_required=[],
                 plugin_path="",
             )
@@ -129,7 +130,7 @@ class PluginSetupTest(unittest.IsolatedAsyncioTestCase):
 
         ctx = PluginContext(
             config=Settings(
-                plugins=["*"], plugins_disabled=[], plugins_required=[], plugin_path=""
+                plugins=[], plugins_required=[], plugin_path=""
             ),
             publish_event=publish_event,
             subscribe_event=subscribe_event,
@@ -360,7 +361,7 @@ class RecorderTest(unittest.IsolatedAsyncioTestCase):
         b.dedup_checks = [self._dedup_check(True)]
         ctx = PluginContext(
             config=Settings(
-                plugins=["*"], plugins_disabled=[], plugins_required=[], plugin_path=""
+                plugins=[], plugins_required=[], plugin_path=""
             ),
             publish_event=_noop_async,
             subscribe_event=lambda e, h: None,

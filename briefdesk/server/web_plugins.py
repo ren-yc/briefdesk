@@ -13,6 +13,7 @@ from pathlib import Path
 
 from fastapi import APIRouter
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
+from fastapi.routing import APIRoute
 from starlette.routing import Mount
 
 from briefdesk.server.app import app
@@ -20,6 +21,8 @@ from briefdesk.server.media import _is_safe_media_path
 
 _plugins_info_callback: Callable[[], list[dict]] | None = None
 _settings_schema_callback: Callable[[], list[dict]] | None = None
+_plugin_meta_callback: Callable[[], list[dict]] | None = None
+_plugin_validation_callback: Callable[[list[str]], list[dict]] | None = None
 
 
 def set_plugins_info_callback(cb: Callable[[], list[dict]] | None) -> None:
@@ -34,6 +37,20 @@ def set_settings_schema_callback(cb: Callable[[], list[dict]] | None) -> None:
     _settings_schema_callback = cb
 
 
+def set_plugin_meta_callback(cb: Callable[[], list[dict]] | None) -> None:
+    """注入插件声明元数据回调（main 注册 manager.plugin_meta）。"""
+    global _plugin_meta_callback
+    _plugin_meta_callback = cb
+
+
+def set_plugin_validation_callback(
+    cb: Callable[[list[str]], list[dict]] | None,
+) -> None:
+    """注入可选插件期望启用集合校验回调（main 注册 manager.validate_selection）。"""
+    global _plugin_validation_callback
+    _plugin_validation_callback = cb
+
+
 def get_plugins_info() -> list[dict]:
     """读取插件装配摘要（未注入回调时返回空列表）。"""
     cb = _plugins_info_callback
@@ -44,6 +61,18 @@ def get_settings_schema() -> list[dict]:
     """读取启用插件设置 schema（未注入时返回空列表）。"""
     cb = _settings_schema_callback
     return cb() if cb is not None else []
+
+
+def get_plugin_meta() -> list[dict]:
+    """读取插件声明元数据（未注入时返回空列表）。"""
+    cb = _plugin_meta_callback
+    return cb() if cb is not None else []
+
+
+def validate_plugin_selection(names: list[str]) -> list[dict] | None:
+    """校验可选插件期望启用集合（未注入回调时返回 None = 无管理器可校验）。"""
+    cb = _plugin_validation_callback
+    return cb(names) if cb is not None else None
 
 
 def has_settings_schema_callback() -> bool:
@@ -87,6 +116,14 @@ def include_plugin_router(router: APIRouter) -> None:
     key = id(router)
     if key in _included_router_ids:
         return
+    # 同源校验契约（复核 P2-11）：middleware 仅对 /api/ 前缀的变更方法做
+    # CSRF 校验——插件路由挂在其它前缀会静默失去防线，装配期硬失败
+    for r in router.routes:
+        if isinstance(r, APIRoute) and not r.path.startswith("/api/"):
+            raise RuntimeError(
+                f"插件路由 {r.path!r} 必须挂在 /api/ 下"
+                "（同源校验契约，见 server/middleware.py）"
+            )
     moved = list(router.routes)
     idx = len(app.routes)
     for i, r in enumerate(app.routes):

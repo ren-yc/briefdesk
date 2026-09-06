@@ -1,12 +1,15 @@
-"""启动配置路由（server 子包）—「设置 → 启动配置」面板后端。
+"""启动配置路由（server 子包）—「设置 → 启动配置 / 插件」面板后端。
 
-- `GET /api/settings/env`     元数据 + 生效值/暂存值/来源 + 密钥状态 + 文件路径
-- `PUT /api/settings/env`     批量暂存（白名单 + 类型/约束校验 + 原子写）
-- `POST /api/settings/secrets`  写入密钥到系统密钥环（keyring）
-- `DELETE /api/settings/secrets/{name}`  清除密钥（幂等）
+- `GET /api/settings/env`     元数据 + 生效值/暂存值/来源 + 插件开关数据 + 密钥状态
+- `PUT /api/settings/env`     批量暂存（白名单 + 类型/约束校验 + 插件依赖/互斥
+  复检 409 + 原子写）；响应携带受影响键的最终 staged/source，供前端行级贴片
+- `POST /api/settings/secrets`  写入密钥到系统密钥环（keyring）；响应携带该密钥
+  的 configured/keyringConfigured 新状态
+- `DELETE /api/settings/secrets/{name}`  清除密钥（幂等）；响应同上
 
 设计约束：密钥值**永不下发**（GET 只含 configured 布尔）；暂存文件只存
-非密钥键（存储层见 briefdesk/settings_env.py）。
+非密钥键（存储层见 briefdesk/settings_env.py）。PLUGINS 由「插件」面板
+逐插件开关编辑（schema 中带 hidden 标记，不在启动配置面板渲染）。
 """
 
 import asyncio
@@ -17,12 +20,23 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
 from briefdesk.config import Settings, config
-from briefdesk.secrets_store import SECRET_NAMES, delete_secret, get_secret, set_secret
+from briefdesk.secrets_store import (
+    DB_KEYS_BASE,
+    SECRET_NAMES,
+    delete_db_keys,
+    delete_secret,
+    get_db_keys,
+    get_secret,
+    set_db_keys,
+    set_secret,
+)
 from briefdesk.server.app import app
 from briefdesk.server.web_plugins import (
+    get_plugin_meta,
     get_plugins_info,
     get_settings_schema,
     has_settings_schema_callback,
+    validate_plugin_selection,
 )
 from briefdesk.settings_env import (
     get_settings_file,
@@ -43,9 +57,16 @@ _write_lock = asyncio.Lock()
 
 # 核心设置的展示覆盖层；字段本身从 Settings.model_fields 自动发现。
 _CORE_UI: dict[str, dict[str, Any]] = {
-    "PLUGINS": {"label": "启用的插件", "hint": "\"*\" = 全部发现插件；亦可用显式列表"},
-    "PLUGINS_DISABLED": {"label": "禁用的插件", "hint": "优先于 PLUGINS"},
-    "PLUGINS_REQUIRED": {"label": "必选插件", "hint": "这些插件装配失败时将阻止应用启动"},
+    "PLUGINS": {
+        "label": "启用的可选插件",
+        "hint": "显式列表，无通配；核心插件恒装配，无需列出",
+        # 由「插件」面板逐插件开关编辑，不在启动配置面板渲染
+        "hidden": True,
+    },
+    "PLUGINS_REQUIRED": {
+        "label": "必选插件",
+        "hint": "这些可选插件装配失败时将阻止应用启动（核心插件恒装配，无需列入）",
+    },
     "PLUGIN_PATH": {"label": "开发期插件目录", "hint": "留空表示不扫描外部插件"},
     "AI_API_KEY": {"label": "AI API Key"},
     "AI_API_BASE": {"label": "AI API 地址"},
@@ -104,8 +125,7 @@ _SECRET_LABELS = {
     "WEFLOW_API_TOKEN": "weflow 访问令牌",
     "WEFLOW_IMG_AES_KEY": "weflow 图片 AES 解密密钥",
     "WEFLOW_IMG_XOR_KEY": "weflow 图片 XOR 解密密钥",
-    "WEFLOW_DB_KEYS": "weflow 库密钥映射（JSON 前半）",
-    "WEFLOW_DB_KEYS_2": "weflow 库密钥映射（JSON 后半）",
+    "WEFLOW_DB_KEYS": "weflow 库密钥映射（JSON；超长自动分片存储）",
     "WEFLOW_LEGACY_API_TOKEN": "WeFlow Legacy 访问令牌",
     "QQFLOW_API_TOKEN": "qqflow 访问令牌",
     "QQFLOW_KEY": "qqflow 引导密钥",
@@ -114,7 +134,8 @@ _SECRET_LABELS = {
 
 
 def _all_schema() -> list[dict[str, Any]]:
-    """核心字段加当前选中插件字段，按 key 去重。"""
+    """核心字段加全部已发现插件的可选字段（含禁用/自禁用插件，便于启用前
+    预配置必填项），按 key 去重。"""
     result: list[dict[str, Any]] = []
     seen: set[str] = set()
     for item in [*ENV_SCHEMA, *get_settings_schema()]:
@@ -160,6 +181,79 @@ def _schema_of(key: str) -> dict:
     raise KeyError(key)
 
 
+def _fresh_item_state(key: str, staged_now: dict[str, str]) -> dict[str, Any]:
+    """写操作后该键的最终暂存态与来源（与 GET 同口径，供前端行级贴片）。
+
+    恢复默认（null）后键从暂存文件消失：staged 回 None、source 重新落
+    env/dotenv/default 层——source 依赖服务端解析链，客户端无法自行推算。
+    """
+    meta = _schema_of(key)  # PUT 白名单已放行，必命中
+    raw = staged_now.get(key)
+    return {
+        "staged": staged_value(raw, meta["type"]) if raw is not None else None,
+        "source": source_of(key),
+    }
+
+
+def _desired_plugins(staged: dict[str, str]) -> list[str]:
+    """下次启动的可选插件期望启用列表：暂存值优先，否则回落启动快照。
+
+    暂存值写入时已经 normalize_setting 校验，解析失败属防御分支（按快照
+    处理）。启动后修改过的 .env/环境变量不在此反映（快照语义，与设置
+    面板其余 current 字段一致）。
+    """
+    raw = staged.get("PLUGINS")
+    if raw is None:
+        return list(config.plugins)
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return list(config.plugins)
+    if not isinstance(parsed, list) or not all(isinstance(n, str) for n in parsed):
+        return list(config.plugins)
+    return parsed
+
+
+def _plugin_toggle_data(staged: dict[str, str]) -> list[dict[str, Any]]:
+    """「插件」面板数据：声明元数据 + 期望启用态 + 当前进程装配状态。
+
+    加载失败记录（无插件实例、元数据缺失）兜底追加，保证面板仍可见其
+    失败原因。
+    """
+    runtime = {p.get("name"): p for p in get_plugins_info() if p.get("name")}
+    desired = set(_desired_plugins(staged))
+    plugins: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for meta in get_plugin_meta():
+        name = meta["name"]
+        seen.add(name)
+        rt = runtime.get(name, {})
+        plugins.append(
+            {
+                **meta,
+                "enabled": True if meta["core"] else name in desired,
+                "status": rt.get("status", "discovered"),
+                "reason": rt.get("reason", ""),
+            }
+        )
+    for name, rt in runtime.items():
+        if name in seen:
+            continue
+        plugins.append(
+            {
+                "name": name,
+                "version": "",
+                "dependencies": [],
+                "conflicts": [],
+                "core": False,
+                "enabled": name in desired,
+                "status": rt.get("status", ""),
+                "reason": rt.get("reason", ""),
+            }
+        )
+    return plugins
+
+
 def _normalize(key: str, raw: str) -> str:
     """动态 schema + 类型/约束校验，返回规范化的暂存字符串。"""
     try:
@@ -194,11 +288,17 @@ async def api_settings_env():
                 "source": source_of(key),
             }
         )
-    plugin_names = sorted({p.get("name", "") for p in get_plugins_info()} - {""})
+    # PLUGINS_REQUIRED 芯片选项：仅可选插件（核心插件恒装配，列入无意义）
+    plugin_names = sorted(
+        {p.get("name", "") for p in get_plugins_info() if not p.get("core")} - {""}
+    )
     secrets = []
     for meta in _secret_schema():
         name = meta["key"]
-        keyring_configured = get_secret(name) is not None
+        if name == DB_KEYS_BASE:
+            keyring_configured = get_db_keys() is not None
+        else:
+            keyring_configured = get_secret(name) is not None
         secrets.append(
             {
                 "name": name,
@@ -214,6 +314,8 @@ async def api_settings_env():
         "filePath": str(get_settings_file()),
         "items": items,
         "pluginOptions": plugin_names,
+        "plugins": _plugin_toggle_data(staged),
+        "pluginsSource": source_of("PLUGINS"),
         "secrets": secrets,
     }
 
@@ -246,9 +348,34 @@ async def api_settings_env_put(payload: EnvPutPayload):
         if not isinstance(raw, str):
             raise HTTPException(422, f"{key}: 值须为字符串或 null")
         updates[key] = _normalize(key, raw)
+    # PLUGINS 变更先做依赖/互斥复检（暂存前失败快返回，409 携带 issue 明细）
+    if "PLUGINS" in updates:
+        raw = updates["PLUGINS"]
+        if raw is None:
+            desired: list[str] = list(config.plugins)
+        else:
+            try:
+                parsed = json.loads(raw)
+            except json.JSONDecodeError as exc:
+                raise HTTPException(422, f"PLUGINS: 校验失败（{exc}）") from exc
+            if not isinstance(parsed, list) or not all(
+                isinstance(n, str) for n in parsed
+            ):
+                raise HTTPException(422, "PLUGINS: 值须为 JSON 字符串数组")
+            desired = parsed
+        issues = validate_plugin_selection(desired)
+        if issues:
+            raise HTTPException(status_code=409, detail={"issues": issues})
     async with _write_lock:
         write_staged(updates)
-    return {"ok": True, "filePath": str(get_settings_file())}
+    # 写后重读暂存，回传受影响键的最终态：前端据此做行级贴片，不必整面
+    # 重拉（整面重载会丢其它行的未暂存编辑与「插件」面板的开关草稿）
+    staged_now = read_staged()
+    return {
+        "ok": True,
+        "filePath": str(get_settings_file()),
+        "items": {key: _fresh_item_state(key, staged_now) for key in updates},
+    }
 
 
 @app.post("/api/settings/secrets")
@@ -261,10 +388,14 @@ async def api_secrets_set(payload: SecretsPutPayload):
     if not isinstance(value, str) or not value:
         raise HTTPException(422, "密钥值不能为空")
     try:
-        set_secret(name, value)
+        if name == DB_KEYS_BASE:
+            set_db_keys(value)
+        else:
+            set_secret(name, value)
     except Exception as exc:  # SecretsStoreError 等统一转可读错误
         raise HTTPException(500, f"密钥环写入失败: {exc}") from exc
-    return {"ok": True, "name": name}
+    # 钥匙串写入成功即两枚为真：keyringConfigured 有条目、configured 是其超集
+    return {"ok": True, "name": name, "configured": True, "keyringConfigured": True}
 
 
 @app.delete("/api/settings/secrets/{name}")
@@ -272,8 +403,19 @@ async def api_secrets_delete(name: str):
     """清除密钥（幂等：未配置也视为成功）。"""
     if name not in {meta["key"] for meta in _secret_schema()}:
         raise HTTPException(422, f"未知密钥名: {name!r}")
-    delete_secret(name)
-    return {"ok": True, "name": name}
+    if name == DB_KEYS_BASE:
+        delete_db_keys()
+    else:
+        delete_secret(name)
+    # configured 是否仍为真取决于该密钥是否另有环境变量/.env 配置——只有
+    # 服务端能判定，回传供前端行级贴片（keyringConfigured 删除后恒为 False）
+    meta = next((m for m in _secret_schema() if m["key"] == name), None)
+    return {
+        "ok": True,
+        "name": name,
+        "configured": bool(meta.get("configured")) if meta else False,
+        "keyringConfigured": False,
+    }
 
 
 app.include_router(router)

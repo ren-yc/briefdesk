@@ -1,5 +1,6 @@
 """去重辅助逻辑单元测试（不调用 AI / 不访问 DB）。"""
 
+import asyncio
 import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
@@ -11,6 +12,78 @@ from briefdesk.plugins.dedup.engine import (
     _embedding_text,
     _parse_images,
 )
+
+
+class AskAiParseFailureTest(unittest.IsolatedAsyncioTestCase):
+    """【复核 P2-19】_ask_ai 两次解析失败返回 None（「判定未知」），**绝不
+    return False** 被当作明确的 DIFFERENT 票计入计权。调用方 _collect_verdicts
+    按各自门禁处置该 None：normal 路径剔除计权、weak 复核当反对票。"""
+
+    async def test_double_parse_failure_returns_none(self):
+        engine = DedupEngine()
+        item = SimpleNamespace(title="A", source_quote="qa")
+        chat = AsyncMock(return_value=SimpleNamespace(choices=[]))
+        with patch("briefdesk.plugins.dedup.engine.chat", new=chat):
+            verdict = await engine._ask_ai(item, "B", "qb")
+        self.assertIsNone(verdict, "解析失败是「未知」，不是 DIFFERENT")
+        self.assertIsNot(verdict, False, "False 会被当作明确反对票计入计权")
+        self.assertEqual(chat.await_count, 2, "两次尝试后才放弃")
+
+    async def test_collect_verdicts_warns_on_unparseable(self):
+        """解析失败的降级必须可见：_collect_verdicts 对 None 与对异常同等记
+        WARNING，否则日志里只剩 _ask_ai 的「重试」提示，看不出该候选最终被
+        按 fail_note 的口径处置掉了。"""
+        engine = DedupEngine()
+        cand = SimpleNamespace(title="候选A", source_quote="qa")
+        chat = AsyncMock(return_value=SimpleNamespace(choices=[]))
+        with (
+            patch("briefdesk.plugins.dedup.engine.chat", new=chat),
+            self.assertLogs("briefdesk.plugins.dedup.engine", level="WARNING") as cm,
+        ):
+            out = await engine._collect_verdicts(
+                [(cand, 0.9)], "B", "qb", "按反对票计"
+            )
+        self.assertEqual(out, [None])
+        self.assertTrue(
+            any("判定未知" in m and "候选A" in m and "按反对票计" in m
+                for m in cm.output),
+            f"缺少解析失败的降级 WARNING：{cm.output}",
+        )
+
+
+class CollectVerdictsCancellationTest(unittest.IsolatedAsyncioTestCase):
+    """【核验 H1】_collect_verdicts 遇 CancelledError 必须向上传播，不得整形
+    为 None 当「判定失败」降级——取消是关闭/中断语义，不是判定失败。"""
+
+    async def test_cancelled_child_error_propagates(self):
+        engine = DedupEngine()
+        cand = SimpleNamespace(title="候选A", source_quote="qa")
+
+        async def cancelled_chat(*args, **kwargs):
+            raise asyncio.CancelledError()
+
+        with patch(
+            "briefdesk.plugins.dedup.engine.chat", new=cancelled_chat
+        ), self.assertRaises(asyncio.CancelledError):
+            await engine._collect_verdicts([(cand, 0.9)], "B", "qb", "测试取消")
+
+    async def test_regular_failure_still_degrades_to_none(self):
+        """非取消异常维持既有降级语义：整形为 None + WARNING，不中止整批。"""
+        engine = DedupEngine()
+        cand = SimpleNamespace(title="候选A", source_quote="qa")
+
+        async def failing_chat(*args, **kwargs):
+            raise RuntimeError("上游 5xx")
+
+        with (
+            patch("briefdesk.plugins.dedup.engine.chat", new=failing_chat),
+            self.assertLogs("briefdesk.plugins.dedup.engine", level="WARNING") as cm,
+        ):
+            out = await engine._collect_verdicts(
+                [(cand, 0.9)], "B", "qb", "按反对票计"
+            )
+        self.assertEqual(out, [None])
+        self.assertTrue(any("判定失败" in m for m in cm.output))
 
 
 class JudgePromptTest(unittest.TestCase):
@@ -200,6 +273,12 @@ class EmbeddingTextTest(unittest.TestCase):
     def test_format(self):
         self.assertEqual(_embedding_text("标题", "内容"), "标题 内容")
 
+    def test_truncates_long_input(self):
+        """【复核 P2-17】超长输入截断至 2000 字符：防单条毒丸文本让嵌入
+        通道整体降级且每次重启确定性复现。"""
+        text = _embedding_text("标题", "x" * 5000)
+        self.assertEqual(len(text), 2000)
+
 
 class CheckDedupShortCircuitTest(unittest.IsolatedAsyncioTestCase):
     """check_dedup 短路回归：同文本短路与原文哈希精确短路。
@@ -352,6 +431,37 @@ class CheckDedupShortCircuitTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result.is_duplicate)
         self.assertEqual(result.similar_to_id, "a1")
         merge_mock.assert_awaited_once_with("a1", "新生2群")
+
+    async def test_strong_unparseable_warns_and_falls_through(self):
+        """strong 候选解析失败 → 记 WARNING 并保留参与多数票。
+
+        _ask_ai 两次解析失败返回 None（不再抛错），故走不到短路段的 except；
+        若不在 None 分支补记 WARNING，该候选的降级在日志里无声无息。
+        """
+        engine = self._engine([("a1", "篮球社招新", "内容甲")])
+
+        async def unparseable(messages: list[dict], **kwargs):
+            return SimpleNamespace(choices=[])  # 无 choices → 两次尝试均无法解析
+
+        with (
+            patch(
+                "briefdesk.plugins.dedup.engine.top_k_similar",
+                return_value=[(0, 1.0)],
+            ),
+            patch(
+                "briefdesk.plugins.dedup.engine.chat",
+                new=AsyncMock(side_effect=unparseable),
+            ),
+            self.assertLogs("briefdesk.plugins.dedup.engine", level="WARNING") as cm,
+        ):
+            result = await engine.check_dedup(
+                "篮球社招新", "新生2群", q_emb=[0.5, 0.6]
+            )
+        self.assertFalse(result.is_duplicate, "判定未知不得当作重复")
+        self.assertTrue(
+            any("[strong]" in m and "判定未知" in m for m in cm.output),
+            f"缺少 strong 短路的解析失败 WARNING：{cm.output}",
+        )
 
     async def test_strong_different_falls_through_to_majority(self):
         """strong 候选判 DIFFERENT（同文本但内容不同）→ 剔除后剩余候选走多数票。"""

@@ -235,8 +235,8 @@ def normalize_setting(meta: dict[str, Any], raw: str) -> str:
         raise TypeError("值须为字符串")
     # 暂存文件是 KEY=VALUE 行格式：值含 CR/LF 会被回读拆成独立行——既破坏
     # round-trip，更可借任一 text 字段向暂存文件注入任意 KEY=VALUE（绕过键
-    # 白名单与「密钥只走 keyring」分层）。「 #」是 dotenv 行内注释起点，
-    # 值会被截断，一并拒绝。
+    # 白名单与「密钥只走 keyring」分层，因为路由层白名单只过滤键名，管不住
+    # 值内注入）。「 #」是 dotenv 行内注释起点，值会被截断，一并拒绝。
     if "\n" in raw or "\r" in raw:
         raise ValueError("值不能包含换行符")
     if " #" in raw:

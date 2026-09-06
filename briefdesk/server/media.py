@@ -31,7 +31,7 @@ def _is_safe_media_path(path: str) -> bool:
     return all(seg not in ("", ".", "..") for seg in path.split("/"))
 
 
-# 图片魔数嗅探（仅猜不出扩展名时兜底，如 qqflow 的 mediaId 无扩展名）
+# 图片魔数嗅探（仅按内容魔数判定，不依赖扩展名——扩展名不可信）
 _IMAGE_MAGIC: tuple[tuple[bytes, str], ...] = (
     (b"\x89PNG\r\n\x1a\n", "image/png"),
     (b"\xff\xd8\xff", "image/jpeg"),
