@@ -400,6 +400,9 @@ class MergeAfterRunReembedTest(unittest.IsolatedAsyncioTestCase):
         with patch(
             "briefdesk.ai_ports.embed_texts", AsyncMock(return_value=[vec])
         ), patch(
+            # P3-11 门控：after_run 仅在嵌入启用时补嵌
+            "briefdesk.ai_ports.is_embedding_enabled", return_value=True
+        ), patch(
             # after_run 补嵌前复查存在性（P1-3）；本测试 i1 仍存在
             "briefdesk.db.get_existing_item_ids",
             AsyncMock(return_value={"i1"}),

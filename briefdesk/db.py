@@ -21,6 +21,12 @@ from briefdesk.types import ContextMsg
 
 _db: aiosqlite.Connection | None = None
 _embed_db: aiosqlite.Connection | None = None
+# close_db 已执行的终态标志（P3-3）：close_db 之后任何 get_db/get_embed_db
+# 都必须拒绝重建连接——应用关闭序列里 _cancel_pending_tasks 兜底在 close_db
+# 之后，残余任务的清理路径若经双检锁复活连接，其非 daemon aiosqlite worker
+# 线程会让解释器退出 join 挂死。进程内单生命周期（main._run 仅跑一次），
+# 该标志无需复位通道。
+_db_closed = False
 _lock = asyncio.Lock()
 # 向量专用连接的语句级互斥：load/upsert 在同一连接上串行执行，
 # 避免读游标活动期间另一协程 COMMIT 触发 "statements in progress"。
@@ -461,6 +467,9 @@ async def _init_connection(
 
 async def get_db() -> aiosqlite.Connection:
     global _db
+    if _db_closed:
+        # 关闭后拒绝重建（P3-3），见模块级 _db_closed 注释
+        raise RuntimeError("数据库已关闭（应用退出中），拒绝重建连接")
     if _db is None:
         async with _lock:
             if _db is None:
@@ -491,6 +500,9 @@ async def get_embed_db() -> aiosqlite.Connection:
     语句级互斥由 _embed_lock 保证（load/upsert 短临界区，不含网络等待）。
     """
     global _embed_db
+    if _db_closed:
+        # 关闭后拒绝重建（P3-3），与主连接同口径
+        raise RuntimeError("数据库已关闭（应用退出中），拒绝重建连接")
     if _embed_db is None:
         async with _lock:
             if _embed_db is None:
@@ -554,8 +566,13 @@ async def close_db() -> None:
     双连接各自 try/finally 关闭：任一连接 close 抛错（如磁盘忙/线程异常）
     不阻断另一连接——否则残留的非 daemon worker 线程会让解释器退出挂死
     （与关闭路径要防的故障同源）。
+
+    入口即置 _db_closed 终态（P3-3）：先于任何连接 close，覆盖两连接先后
+    关闭的中间窗口——此后 get_db/get_embed_db 一律拒绝重建，防止关闭期
+    残余任务的清理路径复活连接（挂死同源）。进程内单生命周期，标志不复位。
     """
-    global _db, _embed_db
+    global _db, _embed_db, _db_closed
+    _db_closed = True
     embed_err: BaseException | None = None
     main_err: BaseException | None = None
     if _embed_db is not None:
@@ -1865,6 +1882,19 @@ async def get_oldest_unprocessed_by_session(source: str) -> dict[str, int]:
 # ── Sessions ──
 
 
+# 单行与批量共用的会话 UPSERT：enabled/last_poll_ts 不在 DO UPDATE 更新列中，
+# 保留用户启用状态与会话水位（语义锚点见 tests/test_db.py F2）
+_SESSIONS_UPSERT_SQL = (
+    "INSERT INTO sessions "
+    "(source, session_id, name, is_group, is_official, enabled, last_seen, last_active) "
+    "VALUES (?, ?, ?, ?, ?, 0, ?, ?) "
+    "ON CONFLICT(source, session_id) DO UPDATE SET "
+    "name = excluded.name, is_group = excluded.is_group, "
+    "is_official = excluded.is_official, last_seen = excluded.last_seen, "
+    "last_active = excluded.last_active"
+)
+
+
 async def upsert_session(
     source: str,
     session_id: str,
@@ -1882,13 +1912,7 @@ async def upsert_session(
     db = await get_db()
     now = datetime.now(UTC).isoformat()
     await db.execute(
-        "INSERT INTO sessions "
-        "(source, session_id, name, is_group, is_official, enabled, last_seen, last_active) "
-        "VALUES (?, ?, ?, ?, ?, 0, ?, ?) "
-        "ON CONFLICT(source, session_id) DO UPDATE SET "
-        "name = excluded.name, is_group = excluded.is_group, "
-        "is_official = excluded.is_official, last_seen = excluded.last_seen, "
-        "last_active = excluded.last_active",
+        _SESSIONS_UPSERT_SQL,
         (
             source,
             session_id,
@@ -1899,6 +1923,37 @@ async def upsert_session(
             last_active_at,
         ),
     )
+    await db.commit()
+
+
+async def bulk_upsert_sessions(
+    rows: list[tuple[str, str, str, bool, bool, int | None]],
+) -> None:
+    """批量写入/更新会话（executemany 单事务），行参数同 upsert_session。
+
+    语义与逐行 upsert_session 完全一致（enabled/last_poll_ts 保留）；
+    last_seen 整批共用同一时刻（即本轮刷新时刻）。executemany + 单次
+    commit 把 N 次 fsync 压成 1 次（同 bulk_upsert_contacts 的优化动机）
+    ——调用方在 storage_lock 内逐行 commit 会拉长全应用写路径的锁窗口。
+    """
+    if not rows:
+        return
+    db = await get_db()
+    now = datetime.now(UTC).isoformat()
+    params = [
+        (
+            source,
+            session_id,
+            name,
+            1 if is_group else 0,
+            1 if is_official else 0,
+            now,
+            last_active_at,
+        )
+        for source, session_id, name, is_group, is_official, last_active_at in rows
+    ]
+    cursor = await db.executemany(_SESSIONS_UPSERT_SQL, params)
+    await cursor.close()
     await db.commit()
 
 

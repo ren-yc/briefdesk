@@ -144,8 +144,8 @@ aiosqlite 线程挂死）。The Ctrl+C handler only does what must precede `shou
 轮询周期业务编排（应用层控制流，不属源包）。`run_poll_cycle(source: SourceRuntime)` (查启用会话 → `_compute_session_windows` 按会
 话
 算增量窗口 → `source.fetch_history(enabled_sessions, window_start_by_session=...)` → 结果 `contacts`（经
-`bulk_upsert_contacts` 单事务批量写——曾逐条 upsert + 逐条 commit，每行一次 fsync，实测 2.4w 联系人 18.98s vs 批量 0.06s）
-/`sessions` 统一写库 → `process_all_batches` → 成功后按会话批量推进水位 `update_session_last_polls`（值为本轮 cycle 开始时刻；
+`bulk_upsert_contacts` 单事务批量写——曾逐条 upsert + 逐条 commit，每行一次 fsync，实测 2.4w 联系人 18.98s vs 批量 0.06s）；`sessions` 经 `bulk_upsert_sessions` 批量单事务，同一动机——锁内
+逐行 commit 拉长存储锁窗口）统一写库 → `process_all_batches` → 成功后按会话批量推进水位 `update_session_last_polls`（值为本轮 cycle 开始时刻；
 只
 推进不在 `result.failed_sessions` 中的会话——失败会话（如 qqflow 索引期 503 静默跳过）的消息未落 raw_messages、钉窗机制看不到，照常推进会永久漏拉）
 ，guarded by `_poll_lock`)，供 `/api/sync` 与首轮回填共用；周期内错误写入 status。窗口规则：会话水位
@@ -366,7 +366,8 @@ sessions/contacts/processed_messages/raw_messages 以 `(source, id)` 复合主�
 色+图标组合）映射派生。**游标纪律**：新增查询一律经 `_fetchone`/`_fetchall`/`_cursor` 三个助手（db.py 内定义，游标 try/finally 自动
 close）；流式迭代（async for）用 `_cursor` 作用域，需 rowcount/lastrowid 的 DML 同样用 `_cursor`（须在 with 块内读取）
 ，executemany 后必须 `await cursor.close()`——未终结语句会残留连接并可能阻断后续 COMMIT。`close_db` 同时关闭主连接与向量连接（aiosqlite
-worker 线程非 daemon，漏关解释器退出挂死）。**多步写统一走 `atomic_transaction` 上下文管理器**（成功 commit、异常 rollback 后上抛——防悬挂事务
+worker 线程非 daemon，漏关解释器退出挂死）；close 后置 `_db_closed` 终态门闩，`get_db`/`get_embed_db`
+一律抛 RuntimeError 拒绝重建——防关闭期残余任务复活连接（P3-3）。**多步写统一走 `atomic_transaction` 上下文管理器**（成功 commit、异常 rollback 后上抛——防悬挂事务
 被
 后续不相干 commit 收尾提交、部分写入提前可见；delete_items / update_item_merged / purge_expired_ignored /
 toggle_session / update_category / delete_category / bulk_insert_raw_messages / update_items_verify 八处）；IN 列表分块统一走
@@ -522,7 +523,10 @@ WARNING 暴露根因——标量化后这是唯一的根因来源，诊断失败
 `WeFlowAccountMismatchError`（**不继承** `WeFlowNotReadyError`，故不被静默跳过）且不记忆化——重试不会自愈，需人工注销占用方
 `DELETE /api/v1/accounts/{wxid}`（别名 `POST .../deregister`，可选 `purge_media`）或改配置后才恢复；下游不实现注销调用，注销是运维动
 作
-——占用期探测碰不到密钥校验（冲突判定在前），自动接管等于拿不可逆操作换无法验证的假设）、**503 就绪门控**（索引期瞬态，`WeFlowNotReadyError` 静默跳过不污染
+——占用期探测碰不到密钥校验（冲突判定在前），自动接管等于拿不可逆操作换无法验证的假设；SSE 流内 `ensure_ready(force=True)`
+抛出同款 mismatch 时 `stream_events` 先落 `connection_status="offline"` 再冒泡
+中止，监听器以 60s 固定长退避（`_MISMATCH_RETRY_SECONDS`，WARNING 无栈、不递增
+指数退避计数），解除占用或改配置后自动恢复、无需重启）、**503 就绪门控**（索引期瞬态，`WeFlowNotReadyError` 静默跳过不污染
 lastError；503 复位 `_ready_checked` 以自愈服务端重启导致的内存注册表丢失——不会引发注册风暴，因下轮先查 health 会命中 indexing 短路）、**密
 钥**（26 个库各自独立 SQLCipher enc_key，整份 JSON 映射拆两段存系统钥匙串，见 `config.py`）、**媒体**（图片经 `media=1&image=1` 触发上游
 导
@@ -587,7 +591,11 @@ limit 上限，旧上游忽略 offset 时共享「本页无新增」防御回退
 `(event, rawid)` FIFO 去重缓存（上限 1024，pre_filter 之后 normalize 之前）；ready/sync/ping 控制事件直接跳过、不计入事件统计
 （ready 基线载荷 `{"status":"ok"}` 无 event 键，按空 etype 兜底；保住无消息静默语义）。**SSE 细节**：推送地址以 `httpx.URL` join 拼接；
 读
-超时可配置（`QQFLOW_SSE_READ_TIMEOUT_MS`，上游 25s KeepAlive 的 ≈2.4 个周期），超时转化为 ReadTimeout 走既有重连路径自愈半开连接；
+超时可配置（`QQFLOW_SSE_READ_TIMEOUT_MS`，上游 25s KeepAlive 的 ≈2.4 个周期），超时转化为 ReadTimeout 走既有重连路径自愈半开连接；**账号不符**：
+`QqFlowAccountMismatchError` 冒泡中止本轮流（`stream_events` 抛出前先落
+`connection_status="offline"`），监听器以 60s 固定长退避重试
+（`_MISMATCH_RETRY_SECONDS`，WARNING 无栈、不递增指数退避计数），区别于网络
+抖动的指数退避；
 runtime.close() 按 stop → await listener.aclose（冲刷残余缓冲与 in-flight 批任务）→ 关客户端收尾，消除关停竞态。**IGNORE_SELF 自
 消
 息过滤**：REST 按 `senderUsername == self_uid`（`u_<QQFLOW_QQ>`）在 poller 预滤并独立计数（`X 自己`）；SSE 事件无发送者标识，开启后按
@@ -710,7 +718,8 @@ WARNING）的日志噪音；`fmt_dur()` 统一耗时格式。
 #### briefdesk/plugins/merge/plugin.py
 
 `MergePlugin`（显式实现 StagePlugin，slot=post_insert，依赖 dedup）：run（锁内）把 `batch.inserted` 新卡与同会话近期未核实卡经 AI
-判官合并（折入最早头卡、多时间点集合化、重拟标题、保留片段 raw 行、已设提醒卡不参与）；去重缓存同步走 `ctx.dedup` 服务端口。合并继承 `article_url`（存活卡优先、缺失则继
+判官合并（折入最早头卡、多时间点集合化、重拟标题、保留片段 raw 行、已设提醒卡不参与）；去重缓存同步走 `ctx.dedup` 服务端口；after_run（锁外）对存活卡补嵌回归余弦
+候选集（`is_embedding_enabled` 门控，嵌入禁用时静默跳过）。合并继承 `article_url`（存活卡优先、缺失则继
 承
 被吸收卡——文章拆条同话题多卡合并后原文链接不从卡片上消失）；合并纯函数（`_merge_quote`/`_merge_key_info`/`_merge_time_points` 等）在
 `plugins/merge/engine.py`。
@@ -1036,7 +1045,9 @@ Settings 经 `ClassVar KEYRING_FIELDS` 声明密钥字段继承之，位于 env 
   cleanup happens in `_run()`'s single `finally`（try 自 `apply_pending_restore` 起：启动段全程纳入唯一清理点
   ，PLUGINS_REQUIRED 失败等启动期异常也必达清理——aiosqlite 非 daemon 线程否则解释器退出挂死）, which covers graceful and
   exception paths alike. 清理顺序：`_reap_task(server_task)` → `_reap_task(initial_sync_task)`（cancel +
-  shield 限时等待，幂等）→ `teardown_all` → `close_db` → `_cancel_pending_tasks`.
+  shield 限时等待，幂等）→ `teardown_all` → `close_db` → `_cancel_pending_tasks`（close_db 入口置 `_db_closed` 终态门闩：
+此后 `get_db`/`get_embed_db` 抛 `RuntimeError` 拒绝重建——兜底期残余任务的清理路径
+复活连接会令退出挂死）.
   `timeout_graceful_shutdown=5` is a safety net for stuck tasks. DB close must happen while the loop
   is still alive (aiosqlite's worker thread is non-daemon; an unclosed connection makes interpreter
   exit hang on thread join — see `close_db` in db.py). **Gotcha:** uvicorn's `serve()` installs its

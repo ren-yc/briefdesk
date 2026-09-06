@@ -2,7 +2,7 @@
 
 import unittest
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 from briefdesk.plugins.merge.engine import (
     JUDGE_PROMPT,
@@ -276,6 +276,60 @@ class SummarizeTitleTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("原标题：旧", msgs[1]["content"])  # 数据全部在 user
         self.assertIn("关键信息：k", msgs[1]["content"])
         self.assertIn("内容：q", msgs[1]["content"])
+
+
+class AfterRunEmbeddingGateTest(unittest.IsolatedAsyncioTestCase):
+    """【P3-11】after_run 补嵌入必须按 is_embedding_enabled 门控。
+
+    EMBED_API_BASE 留空（默认配置）时 embed_api_base 回退 chat 端点，
+    embed_texts 会打出一发注定失败的 /embeddings——每个含合并的批白发
+    一次网络请求并触发公告链路。门控后应零请求、零 DB 存在性复查；
+    嵌入启用时行为不变（存活卡带向量重新登记）。
+    """
+
+    def _make_batch_ctx(self):
+        from briefdesk.plugins.merge.plugin import MergePlugin
+
+        batch = SimpleNamespace(
+            reembed_queue=[(7, "合并标题", "合并引文", None, "weflow")]
+        )
+        ctx = SimpleNamespace(dedup=SimpleNamespace(add_to_cache=Mock()))
+        return MergePlugin(), batch, ctx
+
+    async def test_after_run_skips_all_io_when_embedding_disabled(self):
+        plugin, batch, ctx = self._make_batch_ctx()
+        with (
+            patch("briefdesk.ai_ports.is_embedding_enabled", return_value=False),
+            patch("briefdesk.ai_ports.embed_texts", new=AsyncMock()) as emb,
+            patch(
+                "briefdesk.db.get_existing_item_ids", new=AsyncMock()
+            ) as exist,
+        ):
+            await plugin.after_run(batch, ctx)  # 不抛即通过
+        emb.assert_not_awaited()
+        exist.assert_not_awaited()
+        ctx.dedup.add_to_cache.assert_not_called()
+
+    async def test_after_run_embeds_surviving_card_when_enabled(self):
+        plugin, batch, ctx = self._make_batch_ctx()
+        vector = [0.5, 0.5]
+        with (
+            patch("briefdesk.ai_ports.is_embedding_enabled", return_value=True),
+            patch("briefdesk.ai_ports.embed_texts", new=AsyncMock(return_value=[vector])),
+            patch(
+                "briefdesk.db.get_existing_item_ids",
+                new=AsyncMock(return_value=[7]),
+            ),
+        ):
+            await plugin.after_run(batch, ctx)
+        ctx.dedup.add_to_cache.assert_called_once_with(
+            7,
+            "合并标题",
+            embedding=vector,
+            image_urls=None,
+            source="weflow",
+            source_quote="合并引文",
+        )
 
 
 if __name__ == "__main__":

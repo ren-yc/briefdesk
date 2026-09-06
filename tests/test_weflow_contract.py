@@ -757,6 +757,8 @@ class SseSelfHealMismatchTest(unittest.IsolatedAsyncioTestCase):
         )
         with self.assertRaises(WeFlowAccountMismatchError):
             await self._collect(client)
+        # 【P3-2】raise 绕过 stream_events 尾部收尾，状态必须已前置落 offline
+        self.assertEqual(client.connection_status, "offline")
 
     async def test_other_self_heal_failure_still_swallowed(self):
         """反向断言：普通自愈失败仍降级为 WARNING，不得连坐掐断实时流。"""

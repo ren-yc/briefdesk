@@ -11,7 +11,11 @@ import random
 from collections import deque
 
 from briefdesk.config import config
-from briefdesk.plugins.qqflow.client import QqFlowClient, QqFlowEvent
+from briefdesk.plugins.qqflow.client import (
+    QqFlowAccountMismatchError,
+    QqFlowClient,
+    QqFlowEvent,
+)
 from briefdesk.plugins.qqflow.config import QqFlowSettings
 from briefdesk.plugins.qqflow.normalize import (
     is_self_message,
@@ -33,6 +37,12 @@ _SEEN_LIMIT = 1024
 
 # 周期统计上报间隔（秒）
 _STATS_INTERVAL_SECONDS = 60
+
+# 账号不符（QqFlowAccountMismatchError）的固定重试间隔：这是配置/运营问题
+# （qqflow-server 已绑定其他账号），指数退避的快速重试只会每轮重复
+# /health+/accounts 并刷 ERROR 栈。固定长退避 + WARNING 无栈；运营侧解除
+# 绑定后下一轮自动自愈，无需重启应用。不占用 sse_reconnect_*（面向网络抖动）
+_MISMATCH_RETRY_SECONDS = 60.0
 
 
 class QqFlowSseClient(DrainableListenerMixin, RealtimeListener[QqFlowClient]):
@@ -121,6 +131,14 @@ class QqFlowSseClient(DrainableListenerMixin, RealtimeListener[QqFlowClient]):
                 await self._listen()
             except asyncio.CancelledError:
                 break
+            except QqFlowAccountMismatchError as e:
+                # 账号不符走专属长退避：不递增重连计数（与网络抖动退避无关），
+                # WARNING 不带栈（主动中止不是事故，带栈 ERROR 每轮刷屏）
+                logger.warning(
+                    "SSE 账号不符，%.0fs 后重试: %s", _MISMATCH_RETRY_SECONDS, e
+                )
+                await asyncio.sleep(_MISMATCH_RETRY_SECONDS)
+                continue
             except Exception:
                 # 畸形事件/上游契约漂移（如 data 帧为非对象 JSON）不得终结监听
                 # 任务：带栈记 ERROR 后走既有退避重连，实时通道保持自愈能力

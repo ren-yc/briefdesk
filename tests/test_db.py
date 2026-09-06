@@ -26,6 +26,7 @@ from briefdesk.db import (
     atomic_transaction,
     backup_db_to,
     bulk_insert_raw_messages,
+    bulk_upsert_sessions,
     close_db,
     db_redirect,
     delete_category,
@@ -981,6 +982,102 @@ class UpsertSessionTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(rows), 1)
 
 
+class BulkUpsertSessionsTest(unittest.IsolatedAsyncioTestCase):
+    """【H2】bulk_upsert_sessions 单事务批量 UPSERT，语义与单行版一致。
+
+    曾经由 poll_cycle 逐行调 upsert_session（每行一次 commit），会话数百级
+    时 N×fsync 拉长调用方持有的存储锁窗口。
+    """
+
+    async def asyncSetUp(self):
+        self.db = await aiosqlite.connect(":memory:")
+        self.db.row_factory = aiosqlite.Row
+        await self.db.execute("PRAGMA foreign_keys = ON")
+        await init_schema(self.db)
+
+    async def asyncTearDown(self):
+        await self.db.close()
+
+    async def _bulk(self, rows) -> None:
+        with patch("briefdesk.db.get_db", new=AsyncMock(return_value=self.db)):
+            await bulk_upsert_sessions(rows)
+
+    async def _all(self) -> list[SessionRow]:
+        with patch("briefdesk.db.get_db", new=AsyncMock(return_value=self.db)):
+            return await get_all_sessions()
+
+    async def test_bulk_insert_then_update_keeps_enabled_and_watermark(self):
+        await self._bulk(
+            [
+                ("weflow", "s1", "群A", True, False, None),
+                ("weflow", "s2", "群B", True, False, 111),
+                ("qqflow", "g1", "群C", True, True, 222),
+            ]
+        )
+        rows = await self._all()
+        self.assertEqual(len(rows), 3)
+        by_id = {r["session_id"]: r for r in rows}
+        self.assertEqual(by_id["s1"]["enabled"], 0)  # 新会话默认停用
+        self.assertIsNone(by_id["s1"]["last_poll_ts"])
+        self.assertEqual(by_id["s2"]["last_active"], 111)
+        self.assertEqual(by_id["g1"]["is_official"], 1)
+
+        # 用户启用 + 水位推进后再次批量 upsert：enabled/last_poll_ts 保留
+        with patch("briefdesk.db.get_db", new=AsyncMock(return_value=self.db)):
+            await toggle_session("weflow", "s1")
+            await update_session_last_polls("weflow", [("s1", 1000)])
+        await self._bulk(
+            [
+                ("weflow", "s1", "群A新名", True, False, 999),
+                ("weflow", "s2", "群B", True, False, 111),
+            ]
+        )
+        rows = await self._all()
+        self.assertEqual(len(rows), 3)  # 不产生重复行
+        by_id = {r["session_id"]: r for r in rows}
+        self.assertEqual(by_id["s1"]["name"], "群A新名")
+        self.assertEqual(by_id["s1"]["enabled"], 1)  # 用户启用状态保留
+        self.assertEqual(by_id["s1"]["last_poll_ts"], 1000)  # 水位保留
+        self.assertEqual(by_id["s1"]["last_active"], 999)  # 新元数据写入
+
+    async def test_empty_rows_noop(self):
+        await self._bulk([])
+        self.assertEqual(await self._all(), [])
+
+
+class CloseDbLatchTest(unittest.IsolatedAsyncioTestCase):
+    """【P3-3】close_db 置终态门闩：此后 get_db/get_embed_db 拒绝重建连接。
+
+    应用关闭序列里 _cancel_pending_tasks 兜底排在 close_db 之后，残余任务
+    的清理路径若经 get_db 双检锁复活连接，其非 daemon aiosqlite worker
+    线程会让解释器退出 join 挂死。门闩把复活路径变成显式 RuntimeError。
+    """
+
+    async def asyncSetUp(self):
+        import briefdesk.db as db_module
+
+        self._db_module = db_module
+        self._saved_closed = db_module._db_closed
+        self._tmpdir = tempfile.TemporaryDirectory()
+        # 门闩是模块级终态标志，测后必须复位，防污染同进程后续用例
+        self.addCleanup(setattr, db_module, "_db_closed", self._saved_closed)
+        self.addCleanup(self._tmpdir.cleanup)
+
+    async def test_get_db_and_get_embed_db_rejected_after_close(self):
+        from briefdesk.db import get_embed_db
+
+        db_path = os.path.join(self._tmpdir.name, "latch.sqlite")
+        with patch.object(config, "db_path", db_path):
+            await get_db()  # 真实连接（全新文件，_init_connection 幂等建表）
+            self.assertFalse(self._db_module._db_closed)
+            await close_db()
+        self.assertTrue(self._db_module._db_closed)
+        with self.assertRaises(RuntimeError):
+            await get_db()
+        with self.assertRaises(RuntimeError):
+            await get_embed_db()
+
+
 class GetItemTextsByIdsTest(unittest.IsolatedAsyncioTestCase):
     """【复核 P2-18】按 id 取卡片文本（unverify 回加去重缓存的数据源）。"""
 
@@ -1678,7 +1775,7 @@ class MergeSourceGroupTest(unittest.IsolatedAsyncioTestCase):
 
 
 class EmbeddingsDbTest(unittest.IsolatedAsyncioTestCase):
-    """向量持久化：独立连接读写、并发读取不干扰落库、close_db 重建（临时文件库）。
+    """向量持久化：独立连接读写、并发读取不干扰落库（临时文件库）。
 
     回归目标：向量落库的 COMMIT 不再被主连接上的活动语句打断
     （cannot commit transaction - SQL statements in progress）。
@@ -1690,11 +1787,14 @@ class EmbeddingsDbTest(unittest.IsolatedAsyncioTestCase):
         self.tmpdir = tempfile.mkdtemp()
         self.old_db_path = config.db_path
         config.db_path = os.path.join(self.tmpdir, "embed.sqlite")
-        # 复位模块级单例，确保真实走临时库
+        # 复位模块级单例与关闭门闩（P3-3），确保真实走临时库：本类每个用例
+        # 都在 tearDown 经 close_db 收尾，下个用例须可重新建库
         self._old_db = db_module._db
         self._old_embed_db = db_module._embed_db
+        self._old_closed = db_module._db_closed
         db_module._db = None
         db_module._embed_db = None
+        db_module._db_closed = False
 
     async def asyncTearDown(self):
         import briefdesk.db as db_module
@@ -1702,6 +1802,7 @@ class EmbeddingsDbTest(unittest.IsolatedAsyncioTestCase):
         await close_db()
         db_module._db = self._old_db
         db_module._embed_db = self._old_embed_db
+        db_module._db_closed = self._old_closed
         config.db_path = self.old_db_path
         await asyncio.to_thread(shutil.rmtree, self.tmpdir, ignore_errors=True)
 
@@ -1749,13 +1850,6 @@ class EmbeddingsDbTest(unittest.IsolatedAsyncioTestCase):
         # WAL 快照：读取可能看到部分/全部新行，重点是不抛错且最终落库完整
         self.assertTrue(50 <= len(ids) <= 150, len(ids))
         self.assertEqual(len(await load_embeddings("m")), 150)
-
-    async def test_close_db_recreates_embed_connection(self):
-        await get_db()
-        await upsert_embeddings([("a", "m", [1.0])])
-        await close_db()
-        # 关闭后按需重建新连接，数据仍在（同一库文件）
-        self.assertEqual((await load_embeddings("m"))["a"], [1.0])
 
     async def test_close_db_closes_main_even_if_embed_close_fails(self):
         """【核验 H3】_embed_db.close 抛错不得阻断 _db.close：残留的非 daemon

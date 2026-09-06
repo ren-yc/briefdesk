@@ -301,7 +301,17 @@ class MergePlugin(StagePlugin):
         """
         if not batch.reembed_queue or ctx.dedup is None:
             return
-        from briefdesk.ai_ports import embed_texts  # 延迟：依赖 ai_provider 插件
+        from briefdesk.ai_ports import (  # 延迟：依赖 ai_provider 插件
+            embed_texts,
+            is_embedding_enabled,
+        )
+        if not is_embedding_enabled():
+            # 嵌入未启用（EMBED_API_BASE 留空，默认配置）时 embed_api_base
+            # 回退 chat 端点，embed_texts 必然打出一发注定失败的 /embeddings
+            # 并触发 embedding_disabled 公告链路——每个含合并的批白发一次
+            # 网络请求。此处只拦「嵌入禁用」这一确定无益的场景；嵌入启用但
+            # dedup 缓存加载失败（_embed_cache_ok=False）时补嵌仍有价值。
+            return
         from briefdesk.db import get_existing_item_ids
         from briefdesk.plugins.dedup.engine import _embedding_text
 

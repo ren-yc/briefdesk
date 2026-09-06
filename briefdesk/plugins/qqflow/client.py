@@ -656,7 +656,10 @@ class QqFlowClient(SourceClient):
                         await self.ensure_ready(force=True)
                     except QqFlowAccountMismatchError:
                         # 账号不符不是"自愈尽力而为"能兜的：继续读流就是在收他人
-                        # 的消息。必须冒泡中止本次监听。
+                        # 的消息。必须冒泡中止本次监听。先落 offline 再冒泡：
+                        # raise 绕过下方全部 except 与尾部收尾，状态否则停在
+                        # "online"，退避重连窗口期误导前端。
+                        self.connection_status = "offline"
                         raise
                     except Exception as e:  # noqa: BLE001 — 自愈尽力而为，失败不阻断流
                         logger.warning("SSE 就绪自愈检查失败: %s", e)

@@ -28,6 +28,7 @@ from briefdesk.plugins.qqflow.client import (
 )
 from briefdesk.plugins.qqflow.config import QqFlowSettings
 from briefdesk.plugins.qqflow.sse import QqFlowSseClient
+from briefdesk.plugins.weflow.client import WeFlowAccountMismatchError
 from briefdesk.plugins.weflow.config import WeFlowSettings
 from briefdesk.plugins.weflow.sse import WeFlowSseClient
 from briefdesk.plugins.weflow_legacy.client import WeFlowLegacyClient
@@ -671,6 +672,88 @@ class SseConnectLoopSurvivesGenericErrorTest(unittest.IsolatedAsyncioTestCase):
         await self._assert_survives(listener)
 
 
+class SseConnectLoopMismatchBackoffTest(unittest.IsolatedAsyncioTestCase):
+    """【P3-2】账号不符走 _connect_loop 专属长退避，不走通用指数退避。
+
+    mismatch 是配置/运营问题（server 已绑定其他账号），指数退避的快速重试
+    只会每轮重复 /health+/accounts 并刷 ERROR 栈。专属分支固定长退避、
+    WARNING 无栈、不递增重连计数；运营侧解除绑定后下一轮自动自愈。
+    两源同构，逐一回归。
+    """
+
+    async def _assert_mismatch_backoff(
+        self, listener, exc_cls, logger_name, expected_delay
+    ) -> None:
+        calls = {"n": 0}
+
+        async def fake_listen():
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise exc_cls("server 已绑定其他账号 999")
+            raise asyncio.CancelledError()
+
+        real_sleep = asyncio.sleep
+        sleeps: list[float] = []
+
+        async def fake_sleep(delay):
+            sleeps.append(delay)
+            await real_sleep(0)
+
+        listener._running = True
+        listener._listen = fake_listen
+        with (
+            patch("asyncio.sleep", new=fake_sleep),
+            self.assertLogs(logger_name, level="WARNING") as captured,
+        ):
+            await listener._connect_loop()
+        self.assertEqual(calls["n"], 2, "mismatch 长退避后重连，第二次取消才退出")
+        self.assertEqual(
+            sleeps,
+            [expected_delay],
+            "固定长退避一次，其后不得再叠加普通重连退避",
+        )
+        self.assertEqual(listener._reconnect_attempt, 0, "不递增网络抖动退避计数")
+        self.assertTrue(
+            any("账号不符" in ln for ln in captured.output),
+            captured.output,
+        )
+        self.assertEqual(
+            [ln for ln in captured.output if ln.startswith("ERROR")],
+            [],
+            "mismatch 是主动中止，不得刷 ERROR 栈",
+        )
+
+    async def test_weflow_mismatch_uses_long_backoff(self):
+        from briefdesk.plugins.weflow import sse as weflow_sse
+
+        listener = WeFlowSseClient(
+            Mock(),
+            lambda batch: None,
+            settings=WeFlowSettings(),
+        )
+        await self._assert_mismatch_backoff(
+            listener,
+            WeFlowAccountMismatchError,
+            "briefdesk.plugins.weflow.sse",
+            weflow_sse._MISMATCH_RETRY_SECONDS,
+        )
+
+    async def test_qqflow_mismatch_uses_long_backoff(self):
+        from briefdesk.plugins.qqflow import sse as qqflow_sse
+
+        listener = QqFlowSseClient(
+            Mock(),
+            lambda batch: None,
+            settings=QqFlowSettings(),
+        )
+        await self._assert_mismatch_backoff(
+            listener,
+            QqFlowAccountMismatchError,
+            "briefdesk.plugins.qqflow.sse",
+            qqflow_sse._MISMATCH_RETRY_SECONDS,
+        )
+
+
 class StopDrainsBufferTest(unittest.IsolatedAsyncioTestCase):
     """【8·P3】stop() 后冲刷批缓冲残余消息，aclose() 等待 in-flight 收尾。"""
 
@@ -950,6 +1033,8 @@ class SseSelfHealMismatchTest(unittest.IsolatedAsyncioTestCase):
         )
         with self.assertRaises(QqFlowAccountMismatchError):
             await self._collect(client)
+        # 【P3-2】raise 绕过 stream_events 尾部收尾，状态必须已前置落 offline
+        self.assertEqual(client.connection_status, "offline")
 
     async def test_other_self_heal_failure_still_swallowed(self):
         """反向断言：普通自愈失败仍降级为 WARNING，不得连坐掐断实时流。"""

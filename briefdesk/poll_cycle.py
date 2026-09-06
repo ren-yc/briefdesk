@@ -14,12 +14,12 @@ from briefdesk.config import config
 from briefdesk.db import (
     are_messages_processed,
     bulk_upsert_contacts,
+    bulk_upsert_sessions,
     get_enabled_sessions,
     get_oldest_unprocessed_by_session,
     get_session_last_polls,
     storage_lock,
     update_session_last_polls,
-    upsert_session,
 )
 from briefdesk.logger import fmt_dur
 from briefdesk.pipeline import process_all_batches
@@ -36,20 +36,25 @@ _poll_lock = asyncio.Lock()
 
 
 async def upsert_sessions_from_infos(sessions: list[SessionInfo]) -> None:
-    """会话信息逐条落库（main 实时刷新与 poll_cycle 轮询两条路径共用）。
+    """会话信息批量落库（main 实时刷新与 poll_cycle 轮询两条路径共用）。
 
-    调用方须持 db.storage_lock：会话写与全应用写路径串行化——单连接隐式
-    事务下锁外 commit 会把管道未完成的多步写一并提交（部分写入提前可见）。
+    批量单事务写入（bulk_upsert_sessions），整批一次 commit——调用方须持
+    db.storage_lock：会话写与全应用写路径串行化，锁内逐行 commit 会把
+    管道未完成的多步写一并提交（部分写入提前可见），并拉长存储锁窗口。
     """
-    for s in sessions:
-        await upsert_session(
-            s.source,
-            s.session_id,
-            s.name,
-            s.is_group,
-            s.is_official,
-            last_active_at=s.last_active_at or None,
-        )
+    await bulk_upsert_sessions(
+        [
+            (
+                s.source,
+                s.session_id,
+                s.name,
+                s.is_group,
+                s.is_official,
+                s.last_active_at or None,
+            )
+            for s in sessions
+        ]
+    )
 
 
 async def run_poll_cycle(source: SourceRuntime) -> None:
