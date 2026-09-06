@@ -23,6 +23,7 @@ from briefdesk.db import (
     _escape_like,
     apply_pending_restore,
     are_messages_processed,
+    atomic_transaction,
     backup_db_to,
     bulk_insert_raw_messages,
     close_db,
@@ -2133,6 +2134,38 @@ class DeleteItemsRollbackTest(_InMemoryDbTest):
         for table in ("items", "raw_messages"):
             cur = await self.db.execute(f"SELECT COUNT(*) AS cnt FROM {table}")
             self.assertEqual((await cur.fetchone())["cnt"], 1, table)
+
+
+class AtomicTransactionCancelTest(_InMemoryDbTest):
+    """复核 P1-1：atomic_transaction 必须捕 CancelledError（BaseException 子类），
+    否则取消逃逸留下悬挂事务，被后续无关 commit 收尾提交。"""
+
+    async def test_cancel_inside_transaction_rolls_back(self):
+        p1, p2 = self._patch_db()
+        with p1, p2:
+            async def _cancelled_body():
+                async with atomic_transaction(self.db):
+                    await self.db.execute(
+                        "INSERT INTO items (id, category, title, key_info, "
+                        "sender_name, source_quote, source_group, subject, source, "
+                        "source_msg_id, session_id, msg_time, is_verified, "
+                        "content_hash) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                        ("i1", "活动通知", "t", None, None, "q", "g", None,
+                         "weflow-legacy", "m1", "s1", 100, 0, "h"),
+                    )
+                    # 事务体内取消：CancelledError 注入
+                    raise asyncio.CancelledError()
+
+            task = asyncio.create_task(_cancelled_body())
+            await asyncio.sleep(0)  # 让 task 进入事务体
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+
+        # 取消后必须 rollback：无悬挂事务，且半程写未残留
+        self.assertFalse(self.db.in_transaction, "取消后必须 rollback，不得残留悬挂事务")
+        cur = await self.db.execute("SELECT COUNT(*) AS cnt FROM items")
+        self.assertEqual((await cur.fetchone())["cnt"], 0, "取消路径的半程写必须被回滚")
 
 
 class AreMessagesProcessedChunkTest(unittest.IsolatedAsyncioTestCase):

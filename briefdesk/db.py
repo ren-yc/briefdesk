@@ -625,7 +625,10 @@ async def atomic_transaction(db: aiosqlite.Connection) -> AsyncIterator[aiosqlit
     try:
         yield db
         await db.commit()
-    except Exception:
+    except BaseException:
+        # 必须捕 BaseException：CancelledError（Python 3.8 起）继承 BaseException
+        # 而非 Exception，只捕 Exception 会让取消逃逸、留下开启的悬挂事务，
+        # 被后续无关路径的 commit 收尾提交（半程写提前可见且不可回退，复核 P1-1）。
         await db.rollback()
         raise
 

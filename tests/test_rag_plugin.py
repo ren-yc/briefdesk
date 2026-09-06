@@ -182,6 +182,20 @@ class RagDbTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(row["c"], 1)
         self.assertEqual(row["item_id"], "i9")
 
+    async def test_upsert_chunks_backfill_empty_item_id_preserves_existing(self):
+        """复核 P0-1：回填重建的 ChunkRow 不带 item_id（空串），冲突覆盖不得
+        清空运行期已写入的「消息→卡片」引用（否则引用→卡片跳转永久丢失）。"""
+        from briefdesk.plugins.rag.db import upsert_chunks
+
+        await upsert_chunks(self.db, [self._row(item_id="i9")])  # 运行期已有 item_id
+        await upsert_chunks(self.db, [self._row()])  # 回填重建（item_id 空串）
+        cursor = await self.db.execute("SELECT item_id FROM rag_chunks")
+        try:
+            row = await cursor.fetchone()
+        finally:
+            await cursor.close()
+        self.assertEqual(row["item_id"], "i9")  # 保留既有引用，不被清空
+
     async def test_fts_trigram_long_query_hits(self):
         from briefdesk.plugins.rag.db import (
             ensure_fts,

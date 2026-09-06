@@ -253,22 +253,28 @@ async def process_all_batches(
         return False
     # raw 落库（过滤后的消息）
     if messages:
-        await bulk_insert_raw_messages(
-            [
-                RawMsgInput(
-                    source=source,
-                    msg_id=m.msg_id,
-                    session_id=m.session_id,
-                    group_name=m.group_name,
-                    sender_id=m.sender_id,
-                    sender_name=m.sender_name,
-                    content=m.content,
-                    timestamp=m.timestamp,
-                    article_url=m.article_url or "",
-                )
-                for m in messages
-            ]
-        )
+        # 纳入 storage_lock：bulk_insert_raw_messages 内部 atomic_transaction
+        # 会 commit，锁外 commit 会把锁内其它多步写（如 delete_items 级联、
+        # update_item_merged 的 UPDATE→DELETE）提前提交，击穿「单连接 + 隐式
+        # 事务 + 存储锁」不变量（复核 P1-2）。读路径（get_enabled_sessions /
+        # are_messages_processed）保持锁外，不扩大锁范围。
+        async with _storage_lock:
+            await bulk_insert_raw_messages(
+                [
+                    RawMsgInput(
+                        source=source,
+                        msg_id=m.msg_id,
+                        session_id=m.session_id,
+                        group_name=m.group_name,
+                        sender_id=m.sender_id,
+                        sender_name=m.sender_name,
+                        content=m.content,
+                        timestamp=m.timestamp,
+                        article_url=m.article_url or "",
+                    )
+                    for m in messages
+                ]
+            )
         logger.debug("raw 落库: %d 条", len(messages))
 
     if not messages:

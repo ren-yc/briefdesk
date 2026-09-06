@@ -335,6 +335,53 @@ class StoreBatchFailedTest(_StageTestBase):
         self.assertEqual(processed, ["m0", "m2"])
 
 
+class RawInsertHoldsStorageLockTest(_StageTestBase):
+    """复核 P1-2：raw 落库必须持有 storage_lock，锁外 commit 会击穿
+    「单连接 + 隐式事务 + 存储锁」不变量（把锁内多步写提前提交）。"""
+
+    async def test_bulk_insert_raw_messages_called_under_lock(self):
+        from briefdesk.pipeline import _storage_lock
+
+        batch = [_pipeline_msg("m0")]
+        held: list[bool] = []
+
+        async def fake_bulk(rows):
+            held.append(_storage_lock.locked())
+
+        _install_dedup_stage(_dedup_engine_mock())
+        _install_merge_stage()
+        stages.register_stage(_classify_stage(
+            _outcome_fn([ClassifyResult(msg_index=0, category="活动通知", summary="s", quote="q")], [])
+        ))
+
+        with patch(
+            "briefdesk.pipeline.get_enabled_sessions",
+            new=AsyncMock(return_value=[{"session_id": "s"}]),
+        ), patch(
+            "briefdesk.pipeline.get_enabled_categories",
+            new=AsyncMock(return_value=[{"name": "x"}]),
+        ), patch(
+            "briefdesk.pipeline.are_messages_processed", new=AsyncMock(return_value=set())
+        ), patch(
+            "briefdesk.pipeline.bulk_insert_raw_messages", new=AsyncMock(side_effect=fake_bulk)
+        ), patch(
+            "briefdesk.pipeline.mark_messages_processed", new=AsyncMock()
+        ), patch(
+            "briefdesk.plugins.dedup.plugin.mark_message_processed", new=AsyncMock()
+        ), patch(
+            "briefdesk.plugins.dedup.plugin.insert_item",
+            new=AsyncMock(return_value="new-id"),
+        ), patch(
+            "briefdesk.plugins.merge.plugin.get_merge_candidates",
+            new=AsyncMock(return_value=[]),
+        ), patch("briefdesk.pipeline.publish_items_updated", new=AsyncMock()):
+            await process_all_batches(
+                batch, _pipeline_client(), batch_size=10, origin="test"
+            )
+
+        self.assertEqual(held, [True], "raw 落库必须在 storage_lock 内执行")
+
+
 class MissingStageGuardTest(_StageTestBase):
     """分类/去重阶段缺失（插件被禁用）时整批保留：不标记 processed（防永久丢失）。"""
 
