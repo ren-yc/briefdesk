@@ -190,3 +190,84 @@ class SseReconnectInitialMsValidationTest(unittest.TestCase):
 
         s = WeFlowSettings(sse_reconnect_initial_ms=1)
         self.assertEqual(s.sse_reconnect_initial_ms, 1)
+
+
+class LegacyRestFilterContractTest(unittest.TestCase):
+    """legacy REST 回填路径与 SSE 实时路径过滤口径一致。
+
+    SSE 路径的附件占位符过滤（_ATTACHMENT_RE）与图片 mediaType 校验在
+    REST 路径同样生效——同一消息不因到达路径不同而入库结果不同。
+    """
+
+    def test_rest_attachment_placeholder_dropped(self):
+        from briefdesk.plugins.weflow_legacy.normalize import pre_filter_rest
+
+        self.assertFalse(
+            pre_filter_rest(
+                {"serverId": "m1", "localType": 1, "content": "[文件]"}
+            )
+        )
+        self.assertFalse(
+            pre_filter_rest(
+                {"serverId": "m1", "localType": 1, "content": "  [链接]  "}
+            )
+        )
+
+    def test_rest_voice_media_dropped(self):
+        from briefdesk.plugins.weflow_legacy.normalize import pre_filter_rest
+
+        self.assertFalse(
+            pre_filter_rest(
+                {
+                    "serverId": "m1",
+                    "localType": 3,
+                    "mediaType": "voice",
+                    "mediaUrl": "/api/v1/media/abc",
+                    "content": "[语音]",
+                }
+            )
+        )
+
+    def test_rest_image_passes_with_media(self):
+        from briefdesk.plugins.weflow_legacy.normalize import pre_filter_rest
+
+        self.assertTrue(
+            pre_filter_rest(
+                {
+                    "serverId": "m1",
+                    "localType": 3,
+                    "mediaType": "image",
+                    "mediaUrl": "/api/v1/media/abc",
+                    "content": "[图片]",
+                }
+            )
+        )
+
+    def test_sse_same_shape_unchanged(self):
+        """回归保护：SSE 同形输入行为不变。"""
+        from briefdesk.plugins.weflow_legacy.normalize import pre_filter_sse
+
+        # SSE 占位符文本仍被滤（既有口径）
+        self.assertFalse(
+            pre_filter_sse(
+                {
+                    "event": "message.new",
+                    "rawid": "r1",
+                    "sessionId": "s1",
+                    "content": "[文件]",
+                    "timestamp": 1,
+                }
+            )
+        )
+        # SSE 文本消息仍放行
+        self.assertTrue(
+            pre_filter_sse(
+                {
+                    "event": "message.new",
+                    "rawid": "r1",
+                    "sessionId": "s1",
+                    "content": "hello world",
+                    "timestamp": 1,
+                }
+            )
+        )

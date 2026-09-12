@@ -272,8 +272,10 @@ def pre_filter_rest(msg: WeFlowLegacyMessage) -> bool:
     # 文章卡片（公众号推送/转发文章）放行，交给 normalize_rest 拆条
     if local_type == _APPMSG_LOCAL_TYPE:
         return True
-    # 图片消息（localType=3）有 mediaUrl 时放行，交给 OCR
-    if local_type == 3 and msg.get("mediaUrl"):
+    # 图片消息（localType=3）且 mediaType=image、有 mediaUrl 时放行，交给
+    # OCR；语音/视频等非 image 随下方 local_type != 1 分支丢弃（mediaType
+    # 校验与 normalize_rest 口径一致，回填不再把语音视频当卡片）
+    if local_type == 3 and msg.get("mediaType") == "image" and msg.get("mediaUrl"):
         return True
     if local_type != 1:
         logger.debug(
@@ -288,5 +290,10 @@ def pre_filter_rest(msg: WeFlowLegacyMessage) -> bool:
         return False
     if len(content.strip()) < 5:
         logger.debug("丢弃 REST msg_id=%s: 内容过短", msg.get("serverId"))
+        return False
+    # 附件占位符过滤与 SSE 路径（pre_filter_sse）同口径：
+    # REST 回填不再把 [文件]/[链接] 等占位符文本当卡片入库
+    if _ATTACHMENT_RE.match(content.strip()):
+        logger.debug("丢弃 REST msg_id=%s: 附件占位符", msg.get("serverId"))
         return False
     return True

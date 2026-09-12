@@ -28,6 +28,7 @@ from briefdesk.sources_base import (
     ConnectionStatus,
     MediaError,
     SourceClient,
+    build_endpoint_url,
     make_sse_timeout,
     with_connect_retry,
 )
@@ -352,6 +353,11 @@ class WeFlowLegacyClient(SourceClient):
             return None
         return m
 
+    def _push_url(self) -> str:
+        """SSE 推送地址：按 base_url 的路径前缀拼接（三源共享助手，与
+        REST/媒体同源；base_url 应为服务根地址或反代子路径前缀）。"""
+        return build_endpoint_url(self._base_url, "/api/v1/push/messages")
+
     def _build_media_url(self, path: str) -> str:
         """将媒体路径规范化为 WeFlow 完整 URL。
 
@@ -359,17 +365,17 @@ class WeFlowLegacyClient(SourceClient):
             - 完整 URL（http://.../api/v1/media/...）→ 提取路径部分
             - 绝对路径（/api/v1/media/... 或 /api/media/...）→ 提取路径部分
             - 纯相对路径（xxx@chatroom/images/abc.jpg）→ 直接使用
+
+        按 base_url 的路径前缀拼接（三源共享助手 build_endpoint_url，与
+        REST/SSE 同源）：base_url 应为服务根地址或反代子路径前缀，不要填
+        完整端点路径、不要携带查询串。
         """
         for prefix in ("/api/v1/media/", "/api/media/"):
             idx = path.find(prefix)
             if idx >= 0:
                 path = path[idx + len(prefix) :]
                 break
-        # 用 RFC 3986 的 URL join 拼接：绝对路径引用会替换掉 base 自带的
-        # 路径与查询串，_base_url 即使误配成
-        # "http://127.0.0.1:5031/api/v1/push/messages?access_token=..."
-        # 也不会把媒体路径拼进查询串（朴素字符串拼接会打出坏 URL 导致图片挂死）。
-        return str(httpx.URL(self._base_url).join(f"/api/v1/media/{path.lstrip('/')}"))
+        return build_endpoint_url(self._base_url, f"/api/v1/media/{path.lstrip('/')}")
 
     async def download_media(self, path: str) -> bytes:
         """下载媒体文件（如图片），带鉴权返回原始字节。
@@ -570,12 +576,12 @@ class WeFlowLegacyClient(SourceClient):
         # SSE 需要独立的客户端：写/池不限，但保留可配置的读超时以自愈半开连接
         async with httpx.AsyncClient(timeout=self.sse_timeout()) as sse_client:
             try:
-                # 同样用 URL join 构建 SSE 地址，避免 _base_url 带路径/查询时拼坏；
+                # 按路径前缀拼接 SSE 地址（三源共享助手，与 REST/媒体同源）；
                 # WeFlow 文档推荐 SSE 长连接用 ?access_token= 查询参数（与 Bearer 头
                 # 同时携带）。该令牌会出现在请求 URL 中：本进程侧由 uvicorn access
                 # log 的查询参数掩码（logger.redact_query_string）兜底，httpx 调试
                 # 日志已压制在 WARNING 之下，不输出 URL
-                url = str(httpx.URL(self._base_url).join("/api/v1/push/messages"))
+                url = self._push_url()
                 params = {"access_token": self._api_token} if self._api_token else None
                 async with sse_client.stream(
                     "GET",

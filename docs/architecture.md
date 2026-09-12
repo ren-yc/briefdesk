@@ -771,7 +771,11 @@ WARNING）的日志噪音；`fmt_dur()` 统一耗时格式。
 - **三源行为契约（weflow / weflow-legacy / qqflow）**：同构六文件分层，已统一——必填配置缺失/空值即装配期 `PluginDisabledError` 自禁用（零源降级
   启动兜底，决策 ①=1B）、空发送者消息保留（归一化回退 sender_name="未知"，决策 ②）、会话级拉取失败记入
   `PollResult.failed_sessions`/`session_errors` 不中止整轮、翻页 age 早停（`hit_old`）、脏会话 404→空信封
-  （`not_found_ok=True`）、SSE `(event, rawid)` FIFO 去重。**刻意保留的上游契约差异**：SSE 心跳/读超时（weflow/qqflow 上游 25s
+  （`not_found_ok=True`）、SSE `(event, rawid)` FIFO 去重。**legacy REST/SSE 过滤口径统一（T15）**：`pre_filter_rest` 的附件占位符过滤
+  （`_ATTACHMENT_RE`）与图片 `mediaType == "image"` 校验与 SSE 路径同口径——同一消息不因到达路径（实时 SSE/回填 REST）不同而入库结果不同。
+  **URL 拼接契约（T14）**：`*_API_BASE`（base_url）必须是**服务根地址或反代
+  子路径前缀**，不得携带查询串、不得填完整端点路径；三源 SSE/媒体经共享助手 `sources_base.build_endpoint_url` 按 base 的路径前缀拼接
+  （保留 base 自带查询串），与 REST 的相对路径合并三路一致——反代子路径部署下不再 404。**刻意保留的上游契约差异**：SSE 心跳/读超时（weflow/qqflow 上游 25s
   ping→60s；legacy 上游无心跳→300s）、自消息检测（weflow/legacy 信任上游不推自消息；qqflow 每消息 REST 回查）、`retry_on_empty`（仅
   legacy 上游存在「刚入库查不到」竞态）、`WEFLOW_DB_KEYS` 存储层自动分片（Windows 凭据管理器单条上限，配置语义恒为一份完整 JSON）。
 

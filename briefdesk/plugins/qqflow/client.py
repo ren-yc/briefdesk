@@ -27,6 +27,7 @@ from briefdesk.sources_base import (
     MediaError,
     SourceClient,
     SourceError,
+    build_endpoint_url,
     fetch_all_pages,
     make_sse_timeout,
     with_connect_retry,
@@ -609,9 +610,9 @@ class QqFlowClient(SourceClient):
     # ── SSE 流 ──
 
     def _push_url(self) -> str:
-        """SSE 推送地址（RFC 3986 join）：base_url 误带路径/查询串时不会拼坏，
-        与 weflow-legacy client 及本类 _build_media_url 的拼接策略一致。"""
-        return str(httpx.URL(self._base_url).join("/api/v1/push/messages"))
+        """SSE 推送地址：按 base_url 的路径前缀拼接（三源共享助手，与
+        REST/媒体同源；base_url 应为服务根地址或反代子路径前缀）。"""
+        return build_endpoint_url(self._base_url, "/api/v1/push/messages")
 
     async def stream_events(self) -> AsyncIterator[QqFlowEvent]:
         """SSE 实时消息流 — 异步迭代器，持续产出解析后的 JSON 事件。
@@ -697,13 +698,12 @@ class QqFlowClient(SourceClient):
     def _build_media_url(self, media_id: str) -> str:
         """将 mediaId 规范化为 qqflow-server 完整 URL（GET /api/v1/media/{id}）。
 
-        用 RFC 3986 的 URL join 拼接：绝对路径引用会替换掉 base 自带的
-        路径与查询串，_base_url 即使误配成
-        "http://127.0.0.1:5032/api/v1/push/messages?access_token=..."
-        也不会把媒体路径拼进查询串（朴素字符串拼接会打出坏 URL 导致图片挂死）。
+        按 base_url 的路径前缀拼接（三源共享助手 build_endpoint_url，与
+        REST/SSE 同源）：base_url 应为服务根地址或反代子路径前缀，不要填
+        完整端点路径、不要携带查询串。
         """
-        return str(
-            httpx.URL(self._base_url).join(f"/api/v1/media/{media_id.lstrip('/')}")
+        return build_endpoint_url(
+            self._base_url, f"/api/v1/media/{media_id.lstrip('/')}"
         )
 
     async def download_media(self, path: str) -> bytes:

@@ -28,7 +28,10 @@ from briefdesk.plugins.qqflow.client import (
 )
 from briefdesk.plugins.qqflow.config import QqFlowSettings
 from briefdesk.plugins.qqflow.sse import QqFlowSseClient
-from briefdesk.plugins.weflow.client import WeFlowAccountMismatchError
+from briefdesk.plugins.weflow.client import (
+    WeFlowAccountMismatchError,
+    WeFlowClient,
+)
 from briefdesk.plugins.weflow.config import WeFlowSettings
 from briefdesk.plugins.weflow.sse import WeFlowSseClient
 from briefdesk.plugins.weflow_legacy.client import WeFlowLegacyClient
@@ -914,13 +917,69 @@ class QqFlowControlEventStatsTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(received), 1)
 
 
-class QqFlowPushUrlJoinTest(unittest.TestCase):
-    """【10·P3】SSE 地址经 RFC 3986 join，base_url 误带查询串时不拼坏。"""
+class EndpointUrlPrefixTest(unittest.TestCase):
+    """三源 SSE/媒体按 base_url 路径前缀拼接（与 REST 相对
+    路径合并同源），保留 base 自带查询串。
 
-    def test_push_url_joined_against_query_base(self):
-        client = QqFlowClient("http://127.0.0.1:5032/api/v1/push?x=1", "tok")
-        url = client._push_url()
-        self.assertEqual(url, "http://127.0.0.1:5032/api/v1/push/messages")
+    base_url 契约：服务根地址或反代子路径前缀，不得携带查询串、不得填
+    完整端点路径。补注：带查询串的 base 下 REST 相对路径合并仍产出坏 URL
+    （httpx 既有行为），由文档约束兜住，不在此修复范围。
+    """
+
+    def test_root_base_plain_path(self):
+        # 无前缀 base：三源端点语义一致（共享助手 build_endpoint_url 保证）
+        self.assertEqual(
+            QqFlowClient("http://h:5032", "tok")._push_url(),
+            "http://h:5032/api/v1/push/messages",
+        )
+        self.assertEqual(
+            WeFlowClient("http://h:5033", "tok")._push_url(),
+            "http://h:5033/api/v1/push/messages",
+        )
+        self.assertEqual(
+            WeFlowLegacyClient("http://h:5031", "tok")._push_url(),
+            "http://h:5031/api/v1/push/messages",
+        )
+
+    def test_prefix_base_preserved_on_sse_and_media(self):
+        client = QqFlowClient("http://h:5032/prefix", "tok")
+        self.assertEqual(
+            client._push_url(), "http://h:5032/prefix/api/v1/push/messages"
+        )
+        self.assertEqual(
+            client._build_media_url("abc123"),
+            "http://h:5032/prefix/api/v1/media/abc123",
+        )
+
+    def test_prefix_base_weflow_and_legacy(self):
+        wf = WeFlowClient("http://h:5033/wf", "tok")
+        self.assertEqual(
+            wf._push_url(), "http://h:5033/wf/api/v1/push/messages"
+        )
+        self.assertEqual(
+            wf._build_media_url("chat@room/images/abc.jpg"),
+            "http://h:5033/wf/api/v1/media/chat@room/images/abc.jpg",
+        )
+        legacy = WeFlowLegacyClient("http://h:5031/wfl", "tok")
+        self.assertEqual(
+            legacy._push_url(), "http://h:5031/wfl/api/v1/push/messages"
+        )
+        self.assertEqual(
+            legacy._build_media_url("/api/v1/media/a.jpg"),
+            "http://h:5031/wfl/api/v1/media/a.jpg",
+        )
+
+    def test_query_on_base_preserved_not_absorbed(self):
+        # base 自带查询串 → 原样保留（legacy SSE token-in-query 形态无害）；
+        # API 路径不被拼进查询串
+        client = QqFlowClient("http://h:5032?x=1", "tok")
+        self.assertEqual(
+            client._push_url(), "http://h:5032/api/v1/push/messages?x=1"
+        )
+        self.assertEqual(
+            client._build_media_url("abc123"),
+            "http://h:5032/api/v1/media/abc123?x=1",
+        )
 
 
 class WeflowErrorBodySafeDecodeTest(unittest.IsolatedAsyncioTestCase):

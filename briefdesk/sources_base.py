@@ -92,6 +92,22 @@ def make_sse_timeout(read_timeout_s: float) -> httpx.Timeout:
     )
 
 
+def build_endpoint_url(base_url: str, path: str) -> str:
+    """按 base_url 的路径前缀拼接端点（三源共享，REST/SSE/媒体同源语义）。
+
+    保留 scheme/host/port 与 base 自带的查询串，base 的路径前缀（反代
+    子路径部署）原样保留——区别于 `httpx.URL.join` 的绝对路径 join 语义
+    （后者会替换掉 base 的路径前缀，曾导致 REST 走相对路径合并而
+    SSE/媒体 404 的三路口径分叉）。
+
+    契约：base_url 必须是服务根地址或反代子路径前缀，不得携带查询串、
+    不得填完整端点路径（误配完整端点会产出坏 URL，由文档约束兜住）。
+    """
+    base = httpx.URL(base_url)
+    prefix = base.path.rstrip("/")
+    return str(base.copy_with(path=f"{prefix}/{path.lstrip('/')}"))
+
+
 # 列表端点单页条数：翻页的步长，不是总量上限。
 # 上游（weflow-server / qqflow-server）对 limit 的硬上限为 10000。取 5000 的
 # 依据是实测（qqflow 真实账号 23864 联系人）：page_size=1000 需 24 次请求
