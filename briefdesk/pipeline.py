@@ -7,7 +7,8 @@
   盖章 → 过滤（自消息/纯占位符图片（OCR 未启用）/启用会话/已处理）→ raw 落库 → 切批
   → 并行：enrich + classify（锁外）
   → 串行（_storage_lock 内）：dedup（判重/入库/缓存）→ 跳过标记 → post_insert（合并）
-  → 锁外：dedup/post_insert 的 after_run（向量落库等收尾）→ 计数 → 状态 → 实时通知
+  → 批尾：dedup/post_insert 的 after_run（收尾；dedup 向量落库内部自持
+    storage_lock，见 engine.flush_pending_embeddings）→ 计数 → 状态 → 实时通知
 """
 
 import asyncio

@@ -36,6 +36,9 @@ _embed_lock = asyncio.Lock()
 # server 删除必须在「DB 删除 → 去重缓存移除」之间持有此锁，
 # 否则 pipeline 的 check_dedup 可能命中已删除条目，把相似新消息
 # 判重后标记 processed，造成该消息在本回填窗口内永久丢失。
+#
+# 加锁顺序恒为 storage_lock → _embed_lock（dedup 向量落库、rag GC 均按此序）；
+# 禁止反向嵌套——两把锁跨连接，反向会与既有持锁路径形成环（死锁）。
 storage_lock = asyncio.Lock()
 
 logger = logging.getLogger(__name__)

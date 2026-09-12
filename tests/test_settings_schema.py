@@ -164,6 +164,30 @@ class SettingsSchemaTest(unittest.TestCase):
         self.assertEqual(rag["RAG_GROUP_ONLY"]["type"], "boolean")
         self.assertEqual(rag["RAG_TOP_K"]["min"], 1)
 
+    def test_source_api_base_carries_url_contract_hint(self) -> None:
+        """三源 base_url 契约：设置页必须提示「根地址/反代子路径前缀、
+        不带查询串、不填完整端点」——新实现按 base 路径前缀拼接，误配完整
+        端点会产出坏 URL（旧实现的绝对路径 join 会自动纠偏，已移除）。"""
+        from briefdesk.plugins.qqflow.plugin import QqFlowPlugin
+        from briefdesk.plugins.weflow.plugin import WeFlowPlugin
+        from briefdesk.plugins.weflow_legacy.plugin import WeFlowLegacyPlugin
+
+        cases = (
+            (WeFlowPlugin(), "WEFLOW_API_BASE"),
+            (QqFlowPlugin(), "QQFLOW_API_BASE"),
+            (WeFlowLegacyPlugin(), "WEFLOW_LEGACY_API_BASE"),
+        )
+        for plugin, key in cases:
+            item = next(
+                i for i in plugin.settings_schema() if i["key"] == key
+            )
+            # 循环内多断言（不引入 subTest，保持套件 subtests 计数稳定）
+            self.assertIn("基址", item["label"], f"{key} label 未写明「基址」")
+            hint = item["hint"]
+            self.assertIn("反代", hint, f"{key} hint 未提示反代子路径")
+            self.assertIn("查询串", hint, f"{key} hint 未提示禁止查询串")
+            self.assertIn("完整端点", hint, f"{key} hint 未提示禁止完整端点")
+
     def test_core_settings_expose_vision_fields(self) -> None:
         # vision 路由：新配置项自动进入核心设置 schema（设置页白名单表单），
         # label/hint 经 _CORE_UI 覆盖层按 env key 合入（routes_settings_env.py:95-96）

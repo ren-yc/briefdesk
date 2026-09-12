@@ -92,8 +92,8 @@ weflow-server :5033        WeFlow(legacy) :5031        qqflow-server :5032
 | `briefdesk/pipeline.py` | `process_all_batches()` — 管道**骨架**：入口过滤、raw 落库、批次编排与阶段调度（不 import 任何 AI/OCR 实现）。[详见下文](#briefdeskpipelinepy) |
 | `briefdesk/db.py` | All SQLite via `aiosqlite`（单连接单例、存储锁、schema 迁移与备份/恢复）。[详见下文](#briefdeskdbpy) |
 | `briefdesk/server/` | FastAPI HTTP 服务子包（按职责分组）：app/middleware/核心路由/媒体代理/SPA 托管。[详见下文](#briefdeskserver) |
-| `briefdesk/plugins/calendar/plugin.py` + `router.py` + `db.py` | `CalendarPlugin`（实现 WebPlugin）：`/api/calendar` 日历视图路由；数据访问随插件分发。[详见下文](#briefdeskpluginscalendarpluginpy-routerpy-dbpy) |
-| `briefdesk/plugins/reminders/plugin.py` + `router.py` | `RemindersPlugin`（实现 WebPlugin）：卡片提醒的设置/清除路由与浏览器通知轮询。[详见下文](#briefdeskpluginsreminderspluginpy-routerpy) |
+| `briefdesk/plugins/calendar/plugin.py` + `router.py` + `db.py` | `CalendarPlugin`（实现 WebPlugin）：`/api/calendar` 日历视图路由；数据访问随插件分发。[详见下文](#briefdeskpluginscalendarpluginpy--routerpy--dbpy) |
+| `briefdesk/plugins/reminders/plugin.py` + `router.py` | `RemindersPlugin`（实现 WebPlugin）：卡片提醒的设置/清除路由与浏览器通知轮询。[详见下文](#briefdeskpluginsreminderspluginpy--routerpy) |
 | `briefdesk/plugins/benchmark/` | 实验性基准插件（可选、默认禁用，WebPlugin + StagePlugin 双能力）：基准路由与自带前端。[详见下文](#briefdeskpluginsbenchmark) |
 | `briefdesk/sources_base.py` | 消息源抽象（核心契约模块）：SourceClient/Runtime 协议、批缓冲、连接重试与 URL 拼接助手。[详见下文](#briefdesksources_basepy) |
 | `briefdesk/plugins/weflow/plugin.py` | `WeFlowPlugin`（实现 SourcePlugin）：必填配置校验与 runtime 注册（缺失自禁用）。[详见下文](#briefdeskpluginsweflowpluginpy) |
@@ -111,7 +111,7 @@ weflow-server :5033        WeFlow(legacy) :5031        qqflow-server :5032
 | `briefdesk/stages.py` | 管道阶段注册表与装配期上下文：StagePlugin 经 `ctx.register_stage` 注册（main 把端口接到本模块），pipeline 骨架按槽位（enrich → classify → dedup → post_insert）读取，同槽按 priority 升序；`set_context` 注入装配期 PluginContext（阶段 run(batch, ctx) 经此获得 `ctx.dedup` 等服务端口）。模块级单例，测试用 `reset()` 隔离。 |
 | `briefdesk/plugins/ocr/plugin.py` | `OcrPlugin`（实现 StagePlugin，slot=enrich）：懒加载引擎、逐图下载容错与 vision stash。[详见下文](#briefdeskpluginsocrpluginpy) |
 | `briefdesk/plugins/classify/plugin.py` | `ClassifyPlugin`（显式实现 StagePlugin，slot=classify）：run 调引擎 `classify_batch` 并把 `ClassifyOutcome` 写入 `batch.outcomes`。 |
-| `briefdesk/plugins/dedup/plugin.py` | `DedupPlugin`（显式实现 StagePlugin，slot=dedup）：setup 构造 `DedupEngine` + **预热去重缓存**（HTTP 服务启动前、源监听启动前），注册为 `ctx.dedup` 服务端口并订阅 `EVENT_ITEMS_DELETED`（同步处理器，发布方持锁时保持原子）；`before_run`（锁外）行规划 + 批内预嵌入，`run`（锁内）判重/入库/缓存，`after_run`（锁外）向量落库。 |
+| `briefdesk/plugins/dedup/plugin.py` | `DedupPlugin`（显式实现 StagePlugin，slot=dedup）：setup 构造 `DedupEngine` + **预热去重缓存**（HTTP 服务启动前、源监听启动前），注册为 `ctx.dedup` 服务端口并订阅 `EVENT_ITEMS_DELETED`（同步处理器，发布方持锁时保持原子）；`before_run`（锁外）行规划 + 批内预嵌入，`run`（锁内）判重/入库/缓存，`after_run`（批尾）向量落库——内部自持 `storage_lock` 过滤已删条目后再 upsert。 |
 | `briefdesk/plugins/merge/plugin.py` | `MergePlugin`（实现 StagePlugin，slot=post_insert，依赖 dedup）：锁内 AI 合并判定与卡片更新。[详见下文](#briefdeskpluginsmergepluginpy) |
 | `briefdesk/plugin/__init__.py` | 插件框架包（核心侧）：导出协议与 PluginManager。实现层在 `briefdesk/plugins/`。 |
 | `briefdesk/plugin/base.py` | 插件最小契约：`Plugin` Protocol（name/version/dependencies + setup/activate/teardown 生命周期）、`PluginContext`（核心注入给插件的服务端口集合，见下「插件框架」）、异常 `PluginError`（致命）/`PluginDisabledError`（自禁用，非致命）。内置插件类显式继承对应能力协议（mypy 强制实现完整性；第三方插件亦可鸭子实现，manager 只做结构校验）。详见下方「插件框架」。 |
@@ -291,7 +291,19 @@ RapidOCR（基于 ONNX Runtime，CPU 推理）图片文字识别。只接收图�
 → `embedding_unreachable`、成功 → 撤销）；vision 路由两个探测点——classify 含图请求级失败（`vision_fallback`，vision 成功撤销）与
 pipeline 入口「vision 开启但 enrich 槽为空」（`vision_without_ocr`，配置组合守卫，`pipeline._check_vision_without_ocr`）。「条件解除方撤销」
 范式见 `vision_without_ocr`：`announce` 幂等（已置位且内容未变返回 False），WARNING 仅在首次置位分支输出，持续实时消息不逐批刷屏；
-enrich 阶段恢复或 vision 关闭时同函数走 `revoke` 撤销横幅，复发时自动重新置位。与 `lastWarning`（管道成功产出即清空的瞬态提示）互补；前端
+enrich 阶段恢复或 vision 关闭时同函数走 `revoke` 撤销横幅，复发时自动重新置位——范式代码（逐字对应
+`pipeline._check_vision_without_ocr`）：
+
+```python
+# 发现方置位：announce 幂等（已置位且内容未变返回 False）→ WARNING 只输出一次
+if await announcements.announce("vision_without_ocr", "warning", "……"):
+    logger.warning("AI_VISION_ENABLED 已开启但 ocr 插件未启用：图片不会送入模型")
+# 条件解除方撤销：revoke 幂等（无公告时仅一次 dict 查询、不发事件）
+else:
+    await announcements.revoke("vision_without_ocr")
+```
+
+与 `lastWarning`（管道成功产出即清空的瞬态提示）互补；前端
 公
 告条 `#announcements` 复用 warning 横幅样式，× 关闭仅当次会话。
 
@@ -351,7 +363,7 @@ attachment-only messages — but **image messages are kept** (`[图片]` passes 
 raw_messages 批量落库（单事务）** → 切批 → 并行跑 enrich + classify 槽位（`asyncio.create_task` + `as_completed`，锁外）→
 串行（`_storage_lock` 内）：dedup 槽位（判重/入库/缓存）→ 跳过标记（未选中且非失败的消息标记 processed，含“无分类结果全批标记”路径）→ post_insert 槽
 位
-（会话内同话题合并）→ 锁外 dedup after_run（向量落库）→ 计数/状态/实时通知。零产出（全部失败）不刷新 lastSync 且 `process_all_batches` 返回
+（会话内同话题合并）→ 批尾 dedup after_run（向量落库，内部自持 storage_lock）→ 计数/状态/实时通知。零产出（全部失败）不刷新 lastSync 且 `process_all_batches` 返回
 False——poll_cycle 据此跳过水位推进（实时路径忽略返回值）；零产出语义合并自远程审计 #1。被滤自消息不标记 processed（可恢复路径同纯占位符图片：重新停用/启用会话或全量回填
 ，
 非自动重拉）。**benchmark 暂停门闸**：`set_processing_paused(paused)` 置位后本函数顶部直接返回 False（批次保留待回填，不触 DB/AI）
@@ -738,7 +750,7 @@ WARNING）的日志噪音；`fmt_dur()` 统一耗时格式。
 #### briefdesk/plugins/merge/plugin.py
 
 `MergePlugin`（显式实现 StagePlugin，slot=post_insert，依赖 dedup）：run（锁内）把 `batch.inserted` 新卡与同会话近期未核实卡经 AI
-判官合并（折入最早头卡、多时间点集合化、重拟标题、保留片段 raw 行、已设提醒卡不参与）；去重缓存同步走 `ctx.dedup` 服务端口；after_run（锁外）对存活卡补嵌回归余弦
+判官合并（折入最早头卡、多时间点集合化、重拟标题、保留片段 raw 行、已设提醒卡不参与）；去重缓存同步走 `ctx.dedup` 服务端口；after_run（锁外，本插件不取存储锁）对存活卡补嵌回归余弦
 候选集（`is_embedding_enabled` 门控，嵌入禁用时静默跳过）。合并继承 `article_url`（存活卡优先、缺失则继
 承
 被吸收卡——文章拆条同话题多卡合并后原文链接不从卡片上消失）；合并纯函数（`_merge_quote`/`_merge_key_info`/`_merge_time_points` 等）在
@@ -789,9 +801,9 @@ WARNING）的日志噪音；`fmt_dur()` 统一耗时格式。
 - **三源行为契约（weflow / weflow-legacy / qqflow）**：同构六文件分层，已统一——必填配置缺失/空值即装配期 `PluginDisabledError` 自禁用（零源降级
   启动兜底，决策 ①=1B）、空发送者消息保留（归一化回退 sender_name="未知"，决策 ②）、会话级拉取失败记入
   `PollResult.failed_sessions`/`session_errors` 不中止整轮、翻页 age 早停（`hit_old`）、脏会话 404→空信封
-  （`not_found_ok=True`）、SSE `(event, rawid)` FIFO 去重。**legacy REST/SSE 过滤口径统一（T15）**：`pre_filter_rest` 的附件占位符过滤
+  （`not_found_ok=True`）、SSE `(event, rawid)` FIFO 去重。**legacy REST/SSE 过滤口径统一**：`pre_filter_rest` 的附件占位符过滤
   （`_ATTACHMENT_RE`）与图片 `mediaType == "image"` 校验与 SSE 路径同口径——同一消息不因到达路径（实时 SSE/回填 REST）不同而入库结果不同。
-  **URL 拼接契约（T14）**：`*_API_BASE`（base_url）必须是**服务根地址或反代
+  **URL 拼接契约**：`*_API_BASE`（base_url）必须是**服务根地址或反代
   子路径前缀**，不得携带查询串、不得填完整端点路径；三源 SSE/媒体经共享助手 `sources_base.build_endpoint_url` 按 base 的路径前缀拼接
   （保留 base 自带查询串），与 REST 的相对路径合并三路一致——反代子路径部署下不再 404。**刻意保留的上游契约差异**：SSE 心跳/读超时（weflow/qqflow 上游 25s
   ping→60s；legacy 上游无心跳→300s）、自消息检测（weflow/legacy 信任上游不推自消息；qqflow 每消息 REST 回查）、`retry_on_empty`（仅

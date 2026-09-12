@@ -38,7 +38,7 @@ class WeFlowPlugin(SourcePlugin):
             WeFlowSettings,
             plugin=self.name,
             labels={
-                "api_base": "weflow API 地址",
+                "api_base": "weflow API 基址（根地址或反代子路径前缀）",
                 "api_token": "weflow 访问令牌",
                 "wxid": "微信账号 wxid",
                 "db_path": "wechat 数据目录",
@@ -50,6 +50,10 @@ class WeFlowPlugin(SourcePlugin):
                 "sse_read_timeout_ms": "SSE 读取超时（毫秒）",
             },
             hints={
+                "api_base":
+                    "服务根地址或反代子路径前缀（如 http://127.0.0.1:5033 或 "
+                    "https://gw.example/weflow）；不要带查询串、不要填完整端点"
+                    "（如 /api/v1/push/messages）——SSE/媒体与 REST 均按此前缀拼接",
                 "api_token": "密钥只保存到系统钥匙串，不会写入暂存文件",
                 "img_aes_key": "密钥只保存到系统钥匙串，不会写入暂存文件",
                 "img_xor_key": "密钥只保存到系统钥匙串，不会写入暂存文件",

@@ -39,13 +39,17 @@ class WeFlowLegacyPlugin(SourcePlugin):
             WeFlowLegacySettings,
             plugin=self.name,
             labels={
-                "api_base": "WeFlow Legacy API 地址",
+                "api_base": "WeFlow Legacy API 基址（根地址或反代子路径前缀）",
                 "api_token": "WeFlow Legacy 访问令牌",
                 "sse_reconnect_initial_ms": "SSE 初始重连间隔（毫秒）",
                 "sse_reconnect_max_ms": "SSE 最大重连间隔（毫秒）",
                 "sse_read_timeout_ms": "SSE 读取超时（毫秒）",
             },
             hints={
+                "api_base":
+                    "服务根地址或反代子路径前缀（如 http://127.0.0.1:5031 或 "
+                    "https://gw.example/weflow-legacy）；不要带查询串、不要填完整端点"
+                    "（如 /api/v1/push/messages）——SSE/媒体与 REST 均按此前缀拼接",
                 "api_token": "密钥只保存到系统钥匙串，不会写入暂存文件",
             },
         )
