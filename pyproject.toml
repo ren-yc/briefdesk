@@ -57,6 +57,9 @@ ocr = [
 ]
 dev = [
     "pytest>=8.3",
+    # 测试套件的硬依赖：asyncio_mode = "auto"（见 [tool.pytest.ini_options]）
+    # 生效前提，且 required_plugins 会在插件缺失时显式报错
+    "pytest-asyncio>=1.4",
     "ruff>=0.9",
     "mypy>=1.11",
     "pip-tools>=7.4",
@@ -84,3 +87,14 @@ plugins = ["pydantic.mypy"]
 # 这两组是本次日志格式一致化的「防回归闸门」：没有它，新增的 f-string 日志
 # 只能靠 review 发现。
 extend-select = ["G", "LOG"]
+
+[tool.pytest.ini_options]
+# testpaths：不带参数跑 pytest 时只收集 tests/，避免误入工作区其它目录
+testpaths = ["tests"]
+# IsolatedAsyncioTestCase 迁移到 pytest 风格后的运行前提（asyncio_mode=auto）：
+# async 测试与异步夹具无需逐个标记；夹具与测试必须同循环（对齐 unittest 的
+# 每用例独立 loop 语义），因此固定 function 作用域，禁止改为 session/module
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+# 插件缺失时收集即报 "Missing required plugins"（显式失败），而非静默跳过
+required_plugins = ["pytest-asyncio"]
