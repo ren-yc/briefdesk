@@ -11,6 +11,7 @@ from typing import Any, cast
 from unittest.mock import AsyncMock, patch
 
 import aiosqlite
+import pytest
 
 from briefdesk.config import config
 from briefdesk.db import (
@@ -73,48 +74,47 @@ from briefdesk.masking import normalize_subject
 from briefdesk.plugins.calendar.db import get_calendar_items
 
 
-class EscapeLikeTest(unittest.TestCase):
+class TestEscapeLike(unittest.TestCase):
     def test_escapes_wildcards_and_backslash(self):
-        self.assertEqual(_escape_like("100%_x\\y"), r"100\%\_x\\y")
+        assert _escape_like("100%_x\\y") == r"100\%\_x\\y"
 
 
-class SchemaTest(unittest.IsolatedAsyncioTestCase):
-    async def asyncSetUp(self):
+class TestSchema:
+    @pytest.fixture(autouse=True)
+    async def _autouse_setup(self):
         self.db = await aiosqlite.connect(":memory:")
         self.db.row_factory = aiosqlite.Row
         await self.db.execute("PRAGMA foreign_keys = ON")
         await init_schema(self.db)
-
-    async def asyncTearDown(self):
+        yield
         await self.db.close()
-
     async def test_new_raw_messages_schema_has_sender_name(self):
         cursor = await self.db.execute("PRAGMA table_info(raw_messages)")
         columns = {row["name"] for row in await cursor.fetchall()}
-        self.assertIn("sender_name", columns)
+        assert "sender_name" in columns
 
     async def test_sessions_schema_has_watermark_columns(self):
         # last_active / last_poll_ts 直接在 CREATE TABLE 中定义
         cursor = await self.db.execute("PRAGMA table_info(sessions)")
         columns = {row["name"] for row in await cursor.fetchall()}
-        self.assertIn("last_active", columns)
-        self.assertIn("last_poll_ts", columns)
+        assert "last_active" in columns
+        assert "last_poll_ts" in columns
 
     async def test_items_schema_has_verified_at(self):
         cursor = await self.db.execute("PRAGMA table_info(items)")
         columns = {row["name"] for row in await cursor.fetchall()}
-        self.assertIn("verified_at", columns)
+        assert "verified_at" in columns
 
     async def test_items_schema_has_extra_times(self):
         # 多时间点结构化存储列在 CREATE TABLE 中直接定义
         cursor = await self.db.execute("PRAGMA table_info(items)")
         columns = {row["name"] for row in await cursor.fetchall()}
-        self.assertIn("extra_times", columns)
+        assert "extra_times" in columns
 
     async def test_default_categories_seeded(self):
         cursor = await self.db.execute("SELECT COUNT(*) AS cnt FROM categories")
         row = await cursor.fetchone()
-        self.assertGreaterEqual(row["cnt"], 5)
+        assert row["cnt"] >= 5
 
     async def test_validate_schema_passes_on_current_schema(self):
         # 当前 init_schema 建出的库应通过严格 schema 校验
@@ -130,7 +130,7 @@ class SchemaTest(unittest.IsolatedAsyncioTestCase):
     async def test_validate_schema_fails_on_missing_table(self):
         await self.db.execute("DROP TABLE contacts")
         await self.db.commit()
-        with self.assertRaises(SchemaMismatchError):
+        with pytest.raises(SchemaMismatchError):
             await validate_schema(self.db)
 
     async def test_validate_schema_fails_on_missing_column(self):
@@ -162,7 +162,7 @@ class SchemaTest(unittest.IsolatedAsyncioTestCase):
             )"""
         )
         await self.db.commit()
-        with self.assertRaises(SchemaMismatchError):
+        with pytest.raises(SchemaMismatchError):
             await validate_schema(self.db)
 
     async def test_validate_schema_fails_on_type_mismatch(self):
@@ -195,21 +195,20 @@ class SchemaTest(unittest.IsolatedAsyncioTestCase):
             )"""
         )
         await self.db.commit()
-        with self.assertRaises(SchemaMismatchError):
+        with pytest.raises(SchemaMismatchError):
             await validate_schema(self.db)
 
 
 
-class ContextMessagesSenderNameTest(unittest.IsolatedAsyncioTestCase):
-    async def asyncSetUp(self):
+class TestContextMessagesSenderName:
+    @pytest.fixture(autouse=True)
+    async def _autouse_setup(self):
         self.db = await aiosqlite.connect(":memory:")
         self.db.row_factory = aiosqlite.Row
         await self.db.execute("PRAGMA foreign_keys = ON")
         await init_schema(self.db)
-
-    async def asyncTearDown(self):
+        yield
         await self.db.close()
-
     async def _seed(
         self, is_group: int, raw_sender_name: str, contact_name: str
     ) -> None:
@@ -236,24 +235,24 @@ class ContextMessagesSenderNameTest(unittest.IsolatedAsyncioTestCase):
     async def _context_sender(self) -> str:
         with patch("briefdesk.db.get_db", new=AsyncMock(return_value=self.db)):
             rows = await get_context_messages("weflow-legacy", "g1", 100)
-        self.assertEqual(len(rows), 1)
+        assert len(rows) == 1
         return rows[0]["sender"]
 
     async def test_group_prefers_sender_name_snapshot_over_contact(self):
         await self._seed(is_group=1, raw_sender_name="群名片", contact_name="全局名")
-        self.assertEqual(await self._context_sender(), "群名片")
+        assert await self._context_sender() == "群名片"
 
     async def test_private_prefers_live_contact_name(self):
         await self._seed(is_group=0, raw_sender_name="旧快照", contact_name="新备注")
-        self.assertEqual(await self._context_sender(), "新备注")
+        assert await self._context_sender() == "新备注"
 
     async def test_group_legacy_uid_snapshot_falls_back_to_contact(self):
         await self._seed(is_group=1, raw_sender_name="u1", contact_name="全局名")
-        self.assertEqual(await self._context_sender(), "全局名")
+        assert await self._context_sender() == "全局名"
 
     async def test_group_empty_snapshot_falls_back_to_contact(self):
         await self._seed(is_group=1, raw_sender_name="", contact_name="全局名")
-        self.assertEqual(await self._context_sender(), "全局名")
+        assert await self._context_sender() == "全局名"
 
     async def _seed_image_context(self, source: str, placeholder: str) -> None:
         msg_id = f"m-img-{source}"
@@ -278,34 +277,33 @@ class ContextMessagesSenderNameTest(unittest.IsolatedAsyncioTestCase):
         await self._seed_image_context("weflow-legacy", "[图片]")
         with patch("briefdesk.db.get_db", new=AsyncMock(return_value=self.db)):
             rows = await get_context_messages("weflow-legacy", "g1", 100)
-        self.assertEqual(len(rows), 1)
-        self.assertEqual(rows[0]["content"], "戟川学社\n招新啦！")
+        assert len(rows) == 1
+        assert rows[0]["content"] == "戟川学社\n招新啦！"
 
     async def test_qqflow_image_placeholder_resolves_to_ocr_quote(self):
         # qqflow 图片 raw 占位符为 [image]，应与 [图片] 一样回填 OCR 原文并去掉标记行
         await self._seed_image_context("qqflow", "[image]")
         with patch("briefdesk.db.get_db", new=AsyncMock(return_value=self.db)):
             rows = await get_context_messages("qqflow", "g1", 100)
-        self.assertEqual(len(rows), 1)
-        self.assertEqual(rows[0]["content"], "戟川学社\n招新啦！")
+        assert len(rows) == 1
+        assert rows[0]["content"] == "戟川学社\n招新啦！"
 
 
-class ContextTargetInclusionTest(unittest.IsolatedAsyncioTestCase):
+class TestContextTargetInclusion:
     """上下文查询在目标消息被窗口截断时仍必须返回目标行（回归：原文引用高亮落空）。
 
     现场：高活跃会话 ±1h 窗口 87 条消息，卡片「订阅ds不涨价」的目标消息排第 40 位，
     旧的「窗口内最早 30 条」会截掉它，前端按 msg_id 高亮落空。
     """
 
-    async def asyncSetUp(self):
+    @pytest.fixture(autouse=True)
+    async def _autouse_setup(self):
         self.db = await aiosqlite.connect(":memory:")
         self.db.row_factory = aiosqlite.Row
         await self.db.execute("PRAGMA foreign_keys = ON")
         await init_schema(self.db)
-
-    async def asyncTearDown(self):
+        yield
         await self.db.close()
-
     async def _seed_active_session(self, target_index: int = 39, anchor_index: int = 39) -> int:
         """铺 87 条消息（80s 间隔，全在 ±1h 窗口内），返回锚点（卡片 msg_time）时间戳。
 
@@ -335,16 +333,16 @@ class ContextTargetInclusionTest(unittest.IsolatedAsyncioTestCase):
         with patch("briefdesk.db.get_db", new=AsyncMock(return_value=self.db)):
             rows = await get_context_messages("qqflow", "g1", anchor, "m-target")
         ids = [r["msg_id"] for r in rows]
-        self.assertIn("m-target", ids)
-        self.assertLessEqual(len(rows), 30)
+        assert "m-target" in ids
+        assert len(rows) <= 30
         # 双向取数：锚点前最近 15 条 + 锚点起（含目标）最近 15 条，整体时间升序
-        self.assertEqual(len(rows), 30)
-        self.assertEqual(ids[0], "m24")        # 锚点前最近 15 条的最早一条
-        self.assertEqual(ids[14], "m38")       # 目标前最近一条
-        self.assertEqual(ids[15], "m-target")  # 目标为后半段首条
-        self.assertEqual(ids[29], "m53")
+        assert len(rows) == 30
+        assert ids[0] == "m24"        # 锚点前最近 15 条的最早一条
+        assert ids[14] == "m38"       # 目标前最近一条
+        assert ids[15] == "m-target"  # 目标为后半段首条
+        assert ids[29] == "m53"
         times = [r["time"] for r in rows]
-        self.assertEqual(times, sorted(times))
+        assert times == sorted(times)
 
     async def test_target_msg_id_fallback_when_anchor_mismatched(self):
         # 锚点（卡片 msg_time）与目标消息时间戳不一致（目标在锚点之后 21 条）时，
@@ -353,26 +351,25 @@ class ContextTargetInclusionTest(unittest.IsolatedAsyncioTestCase):
         with patch("briefdesk.db.get_db", new=AsyncMock(return_value=self.db)):
             without = await get_context_messages("qqflow", "g1", anchor)
             with_target = await get_context_messages("qqflow", "g1", anchor, "m-target")
-        self.assertNotIn("m-target", [r["msg_id"] for r in without])
+        assert "m-target" not in [r["msg_id"] for r in without]
         ids = [r["msg_id"] for r in with_target]
-        self.assertIn("m-target", ids)
-        self.assertLessEqual(len(with_target), 30)
+        assert "m-target" in ids
+        assert len(with_target) <= 30
         times = [r["time"] for r in with_target]
-        self.assertEqual(times, sorted(times))
+        assert times == sorted(times)
 
 
-class GetCategoryCountsTest(unittest.IsolatedAsyncioTestCase):
+class TestGetCategoryCounts:
     """get_category_counts 只统计 categories 表中仍存在的分类（删除类别的遗留卡片不计入）。"""
 
-    async def asyncSetUp(self):
+    @pytest.fixture(autouse=True)
+    async def _autouse_setup(self):
         self.db = await aiosqlite.connect(":memory:")
         self.db.row_factory = aiosqlite.Row
         await self.db.execute("PRAGMA foreign_keys = ON")
         await init_schema(self.db)
-
-    async def asyncTearDown(self):
+        yield
         await self.db.close()
-
     async def _insert_item(self, item_id: str, category: str) -> None:
         await self.db.execute(
             "INSERT INTO items (id, category, title, source_quote, source_group, "
@@ -392,9 +389,9 @@ class GetCategoryCountsTest(unittest.IsolatedAsyncioTestCase):
         with patch("briefdesk.db.get_db", new=AsyncMock(return_value=self.db)):
             counts = await get_category_counts()
         keys = [c["key"] for c in counts]
-        self.assertIn("活动通知", keys)
-        self.assertNotIn("学术", keys)
-        self.assertEqual(next(c for c in counts if c["key"] == "活动通知")["count"], 1)
+        assert "活动通知" in keys
+        assert "学术" not in keys
+        assert next(c for c in counts if c["key"] == "活动通知")["count"] == 1
 
     async def test_disabled_category_items_not_counted(self):
         # 停用类别的卡片同样不计入侧边栏
@@ -406,12 +403,13 @@ class GetCategoryCountsTest(unittest.IsolatedAsyncioTestCase):
         with patch("briefdesk.db.get_db", new=AsyncMock(return_value=self.db)):
             counts = await get_category_counts()
         keys = [c["key"] for c in counts]
-        self.assertIn("活动通知", keys)
-        self.assertNotIn("交易", keys)
+        assert "活动通知" in keys
+        assert "交易" not in keys
 
 
-class GetItemsSearchTest(unittest.IsolatedAsyncioTestCase):
-    async def asyncSetUp(self):
+class TestGetItemsSearch:
+    @pytest.fixture(autouse=True)
+    async def _autouse_setup(self):
         self.db = await aiosqlite.connect(":memory:")
         self.db.row_factory = aiosqlite.Row
         await self.db.execute("PRAGMA foreign_keys = ON")
@@ -423,10 +421,8 @@ class GetItemsSearchTest(unittest.IsolatedAsyncioTestCase):
             "'weflow-legacy', 'm1', 100, 0, '2026-01-01T00:00:00+00:00')"
         )
         await self.db.commit()
-
-    async def asyncTearDown(self):
+        yield
         await self.db.close()
-
     async def _items(self, q):
         with patch("briefdesk.db.get_db", new=AsyncMock(return_value=self.db)):
             return await get_items(q=q)
@@ -434,49 +430,50 @@ class GetItemsSearchTest(unittest.IsolatedAsyncioTestCase):
     async def test_whitespace_only_query_no_sql_error(self):
         # 纯空白 q 曾拼出 "AND ()" 触发 SQL 语法错误（500）；
         # 修复后与空 q 同语义：不附加搜索条件，返回全部
-        self.assertEqual(len(await self._items("   ")), 1)
+        assert len(await self._items("   ")) == 1
 
     async def test_none_and_empty_query_return_all(self):
-        self.assertEqual(len(await self._items(None)), 1)
-        self.assertEqual(len(await self._items("")), 1)
+        assert len(await self._items(None)) == 1
+        assert len(await self._items("")) == 1
 
     async def test_term_match(self):
-        self.assertEqual(len(await self._items("讲座")), 1)
+        assert len(await self._items("讲座")) == 1
 
     async def test_multi_term_or_match(self):
-        self.assertEqual(len(await self._items("机器学习 讲座")), 1)
+        assert len(await self._items("机器学习 讲座")) == 1
 
     async def test_no_match_returns_empty(self):
-        self.assertEqual(await self._items("不存在的词"), [])
+        assert await self._items("不存在的词") == []
 
 
-class ItemExpiryTest(unittest.TestCase):
+class TestItemExpiry(unittest.TestCase):
     NOW = "2026-08-18 12:00:00"
 
     def test_past_deadline_is_expired(self):
-        self.assertTrue(item_is_expired(None, "2026-08-18 11:59", "", self.NOW))
+        assert item_is_expired(None, "2026-08-18 11:59", "", self.NOW)
 
     def test_date_only_deadline_stays_active_through_that_day(self):
-        self.assertFalse(item_is_expired(None, "2026-08-18", "", self.NOW))
+        assert not item_is_expired(None, "2026-08-18", "", self.NOW)
 
     def test_future_extra_time_keeps_partially_expired_card(self):
         extra = '[{"type":"end","time":"2026-08-20","label":"后续任务"}]'
-        self.assertFalse(item_is_expired(None, "2026-08-17", extra, self.NOW))
+        assert not item_is_expired(None, "2026-08-17", extra, self.NOW)
 
     def test_missing_or_invalid_primary_end_never_expires_card(self):
-        self.assertFalse(item_is_expired(None, None, "", self.NOW))
-        self.assertFalse(item_is_expired(None, "not-a-time", "", self.NOW))
-        self.assertFalse(item_is_expired(None, "2026-08-17 00:00:00", "", self.NOW))
+        assert not item_is_expired(None, None, "", self.NOW)
+        assert not item_is_expired(None, "not-a-time", "", self.NOW)
+        assert not item_is_expired(None, "2026-08-17 00:00:00", "", self.NOW)
 
     def test_invalid_extra_time_type_does_not_keep_card_active(self):
         extra = '[{"type":"note","time":"2026-08-20","label":"脏数据"}]'
-        self.assertTrue(item_is_expired(None, "2026-08-17", extra, self.NOW))
+        assert item_is_expired(None, "2026-08-17", extra, self.NOW)
 
 
-class ItemsPageTest(unittest.IsolatedAsyncioTestCase):
+class TestItemsPage:
     """列表分页、总数与组数必须共享全部有效过滤条件。"""
 
-    async def asyncSetUp(self):
+    @pytest.fixture(autouse=True)
+    async def _autouse_setup(self):
         self.db = await aiosqlite.connect(":memory:")
         self.db.row_factory = aiosqlite.Row
         await self.db.execute("PRAGMA foreign_keys = ON")
@@ -592,10 +589,8 @@ class ItemsPageTest(unittest.IsolatedAsyncioTestCase):
             rows,
         )
         await self.db.commit()
-
-    async def asyncTearDown(self):
+        yield
         await self.db.close()
-
     async def _page(self, offset: int):
         with patch("briefdesk.db.get_db", new=AsyncMock(return_value=self.db)):
             return await get_items_page(
@@ -611,23 +606,23 @@ class ItemsPageTest(unittest.IsolatedAsyncioTestCase):
         second = await self._page(first["next_offset"])
         third = await self._page(second["next_offset"])
 
-        self.assertEqual([len(first["items"]), len(second["items"]), len(third["items"])], [100, 100, 5])
-        self.assertEqual(first["total_count"], 205)
-        self.assertEqual(first["group_count"], 103)
-        self.assertEqual(first["filter_now"], "2026-08-18 12:00:00")
-        self.assertEqual(first["source_groups"], ["群A", "群B", "群C"])
-        self.assertTrue(first["has_more"])
-        self.assertTrue(second["has_more"])
-        self.assertFalse(third["has_more"])
-        self.assertEqual(third["next_offset"], 205)
+        assert [len(first["items"]), len(second["items"]), len(third["items"])] == [100, 100, 5]
+        assert first["total_count"] == 205
+        assert first["group_count"] == 103
+        assert first["filter_now"] == "2026-08-18 12:00:00"
+        assert first["source_groups"] == ["群A", "群B", "群C"]
+        assert first["has_more"]
+        assert second["has_more"]
+        assert not third["has_more"]
+        assert third["next_offset"] == 205
 
         ids = [item["id"] for page in (first, second, third) for item in page["items"]]
-        self.assertEqual(len(ids), 205)
-        self.assertEqual(len(set(ids)), 205)
-        self.assertIn("partial", ids)
-        self.assertNotIn("expired", ids)
-        self.assertNotIn("disabled-session", ids)
-        self.assertNotIn("disabled-category", ids)
+        assert len(ids) == 205
+        assert len(set(ids)) == 205
+        assert "partial" in ids
+        assert "expired" not in ids
+        assert "disabled-session" not in ids
+        assert "disabled-category" not in ids
 
     async def test_source_group_and_time_filters_affect_page_and_counts(self):
         with patch("briefdesk.db.get_db", new=AsyncMock(return_value=self.db)):
@@ -639,32 +634,31 @@ class ItemsPageTest(unittest.IsolatedAsyncioTestCase):
                 hide_expired=True,
                 now_local="2026-08-18 12:00:00",
             )
-        self.assertEqual(page["total_count"], 52)
-        self.assertEqual(page["group_count"], 52)
-        self.assertEqual(len(page["items"]), 52)
-        self.assertEqual(page["source_groups"], ["群A", "群B", "群C"])
-        self.assertEqual(page["filter_now"], "2026-08-18 12:00:00")
+        assert page["total_count"] == 52
+        assert page["group_count"] == 52
+        assert len(page["items"]) == 52
+        assert page["source_groups"] == ["群A", "群B", "群C"]
+        assert page["filter_now"] == "2026-08-18 12:00:00"
 
     async def test_empty_page_still_returns_full_counts(self):
         page = await self._page(999)
-        self.assertEqual(page["items"], [])
-        self.assertEqual(page["total_count"], 205)
-        self.assertEqual(page["group_count"], 103)
-        self.assertTrue(page["filter_now"])
+        assert page["items"] == []
+        assert page["total_count"] == 205
+        assert page["group_count"] == 103
+        assert page["filter_now"]
 
 
-class ReminderAndCalendarTest(unittest.IsolatedAsyncioTestCase):
+class TestReminderAndCalendar:
     """#3A/#13：到期提醒查询 + 已忽略卡片不提醒/不进日历但保留数据。"""
 
-    async def asyncSetUp(self):
+    @pytest.fixture(autouse=True)
+    async def _autouse_setup(self):
         self.db = await aiosqlite.connect(":memory:")
         self.db.row_factory = aiosqlite.Row
         await self.db.execute("PRAGMA foreign_keys = ON")
         await init_schema(self.db)
-
-    async def asyncTearDown(self):
+        yield
         await self.db.close()
-
     @staticmethod
     def _item(**overrides: Any) -> ItemInput:
         base: dict[str, Any] = {
@@ -721,46 +715,46 @@ class ReminderAndCalendarTest(unittest.IsolatedAsyncioTestCase):
         await self._verify(ignored, -1)
 
         due = await self._due("2000-01-02 00:00")
-        self.assertEqual([d["id"] for d in due], [past])
+        assert [d["id"] for d in due] == [past]
 
     async def test_undo_ignore_restores_due(self):
         item = await self._insert(title="到期后撤销忽略")
         await self._set_reminder(item, "2000-01-01 00:00")
         await self._verify(item, -1)
-        self.assertEqual(await self._due("2000-01-02 00:00"), [])
+        assert await self._due("2000-01-02 00:00") == []
         # 数据保留：行仍在 items 表
         cursor = await self.db.execute("SELECT COUNT(*) AS cnt FROM items WHERE id = ?", (item,))
         row = await cursor.fetchone()
-        self.assertEqual(row["cnt"], 1)
+        assert row["cnt"] == 1
         # 撤销忽略后重新进入到期结果
         await self._verify(item, 0)
         due = await self._due("2000-01-02 00:00")
-        self.assertEqual([d["id"] for d in due], [item])
+        assert [d["id"] for d in due] == [item]
 
     async def test_ignored_excluded_from_calendar_data_kept(self):
         item = await self._insert(title="日历卡片", start="2026-08-15 10:00")
         await self._verify(item, -1)
-        self.assertEqual(await self._calendar("2026-08-01", "2026-09-01"), [])
+        assert await self._calendar("2026-08-01", "2026-09-01") == []
         cursor = await self.db.execute("SELECT is_verified FROM items WHERE id = ?", (item,))
         row = await cursor.fetchone()
-        self.assertEqual(row["is_verified"], -1)  # 数据保留，仅标记忽略
+        assert row["is_verified"] == -1  # 数据保留，仅标记忽略
         # 撤销忽略后回到日历区间查询
         await self._verify(item, 0)
         in_cal = await self._calendar("2026-08-01", "2026-09-01")
-        self.assertEqual([d["id"] for d in in_cal], [item])
+        assert [d["id"] for d in in_cal] == [item]
 
     async def test_update_item_verify_missing_returns_false(self):
         # F3：不存在的卡片应返回 False（server 层据此转 404），而非静默成功
         with patch("briefdesk.db.get_db", new=AsyncMock(return_value=self.db)):
-            self.assertFalse(await update_item_verify("no-such-id", 1))
+            assert not await update_item_verify("no-such-id", 1)
 
     async def test_update_item_verify_existing_returns_true(self):
         item = await self._insert(title="可验证卡片")
         with patch("briefdesk.db.get_db", new=AsyncMock(return_value=self.db)):
-            self.assertTrue(await update_item_verify(item, 1))
+            assert await update_item_verify(item, 1)
         cursor = await self.db.execute("SELECT is_verified FROM items WHERE id = ?", (item,))
         row = await cursor.fetchone()
-        self.assertEqual(row["is_verified"], 1)
+        assert row["is_verified"] == 1
 
     async def test_calendar_includes_extra_times(self):
         # 多时间点卡片：extra_times 中的截止日也把卡片带进对应月份的日历
@@ -771,38 +765,29 @@ class ReminderAndCalendarTest(unittest.IsolatedAsyncioTestCase):
             '{"type":"end","time":"2026-09-20","label":"海报"}]',
         )
         # 7 月（主 end）与 8 月、9 月（extra_times）都命中
-        self.assertEqual(
-            [d["id"] for d in await self._calendar("2026-07-01", "2026-08-01")], [item]
-        )
-        self.assertEqual(
-            [d["id"] for d in await self._calendar("2026-08-01", "2026-09-01")], [item]
-        )
-        self.assertEqual(
-            [d["id"] for d in await self._calendar("2026-09-01", "2026-10-01")], [item]
-        )
+        assert [d["id"] for d in await self._calendar("2026-07-01", "2026-08-01")] == [item]
+        assert [d["id"] for d in await self._calendar("2026-08-01", "2026-09-01")] == [item]
+        assert [d["id"] for d in await self._calendar("2026-09-01", "2026-10-01")] == [item]
         # 10 月无任何时间点 → 不命中
-        self.assertEqual(await self._calendar("2026-10-01", "2026-11-01"), [])
+        assert await self._calendar("2026-10-01", "2026-11-01") == []
 
     async def test_calendar_ignores_dirty_extra_times(self):
         # extra_times 脏 JSON 不影响日历主字段行为
         item = await self._insert(title="脏数据", end="2026-07-31", extra_times="not-json")
-        self.assertEqual(
-            [d["id"] for d in await self._calendar("2026-07-01", "2026-08-01")], [item]
-        )
+        assert [d["id"] for d in await self._calendar("2026-07-01", "2026-08-01")] == [item]
 
 
-class SubjectTimelineNormalizationTest(unittest.IsolatedAsyncioTestCase):
+class TestSubjectTimelineNormalization:
     """#9B（修正版）：subject 写时归一化，时间线按归一化键跨写法聚合。"""
 
-    async def asyncSetUp(self):
+    @pytest.fixture(autouse=True)
+    async def _autouse_setup(self):
         self.db = await aiosqlite.connect(":memory:")
         self.db.row_factory = aiosqlite.Row
         await self.db.execute("PRAGMA foreign_keys = ON")
         await init_schema(self.db)
-
-    async def asyncTearDown(self):
+        yield
         await self.db.close()
-
     @staticmethod
     def _item(subject: str, msg_id: str, msg_time: int) -> ItemInput:
         return {
@@ -837,30 +822,29 @@ class SubjectTimelineNormalizationTest(unittest.IsolatedAsyncioTestCase):
         await self._insert("acm社", "m4", 4)  # 大小写 → 同一主体
         await self._insert("摄影社招新", "m5", 5)  # 不剥后缀 → 非同一主体
 
-        self.assertEqual(await self._timeline("摄影社"), ["m1", "m2"])
-        self.assertEqual(await self._timeline("ACM社"), ["m3", "m4"])
-        self.assertEqual(await self._timeline("摄影社招新"), ["m5"])
+        assert await self._timeline("摄影社") == ["m1", "m2"]
+        assert await self._timeline("ACM社") == ["m3", "m4"]
+        assert await self._timeline("摄影社招新") == ["m5"]
 
     async def test_subject_count_matches_timeline(self):
         await self._insert("摄影社", "m1", 1)
         await self._insert("摄影社 ", "m2", 2)
         await self._insert("摄影社招新", "m3", 3)
         with patch("briefdesk.db.get_db", new=AsyncMock(return_value=self.db)):
-            self.assertEqual(await get_subject_count("摄影社"), 2)
+            assert await get_subject_count("摄影社") == 2
 
 
-class GetGroupCountTest(unittest.IsolatedAsyncioTestCase):
+class TestGetGroupCount:
     """组数口径：有主体 (subject, category) 键数 + 无主体条数（与列表渲染块一致）。"""
 
-    async def asyncSetUp(self):
+    @pytest.fixture(autouse=True)
+    async def _autouse_setup(self):
         self.db = await aiosqlite.connect(":memory:")
         self.db.row_factory = aiosqlite.Row
         await self.db.execute("PRAGMA foreign_keys = ON")
         await init_schema(self.db)
-
-    async def asyncTearDown(self):
+        yield
         await self.db.close()
-
     @staticmethod
     def _item(subject, msg_id, category="活动通知", is_verified=0, title="标题") -> ItemInput:
         return {
@@ -898,7 +882,7 @@ class GetGroupCountTest(unittest.IsolatedAsyncioTestCase):
         await self._insert(subject="摄影社", category="社团招新", msg_id="c2")
         await self._insert(subject="摄影社", category="社团招新", msg_id="c3")
         await self._insert(subject="摄影社", category="社团招新", msg_id="c4")
-        self.assertEqual(await self._count(), 2 + 3)  # 无主体2 + 键(摄影社/编程社/摄影社@招新)
+        assert await self._count() == 2 + 3  # 无主体2 + 键(摄影社/编程社/摄影社@招新)
 
     async def test_category_and_verified_filters(self):
         await self._insert(subject=None, msg_id="n1")
@@ -910,9 +894,9 @@ class GetGroupCountTest(unittest.IsolatedAsyncioTestCase):
         await self._insert(subject="M社", msg_id="m1", is_verified=1)
         await self._insert(subject="I社", msg_id="i1", is_verified=-1)
 
-        self.assertEqual(await self._count(category="活动通知"), 1 + 2)  # 无主体1 + 摄影社/编程社
-        self.assertEqual(await self._count(verified="memo"), 1)
-        self.assertEqual(await self._count(verified="ignored"), 1)
+        assert await self._count(category="活动通知") == 1 + 2  # 无主体1 + 摄影社/编程社
+        assert await self._count(verified="memo") == 1
+        assert await self._count(verified="ignored") == 1
 
     async def test_disabled_category_excluded(self):
         await self.db.execute("UPDATE categories SET enabled = 0 WHERE name = '交易'")
@@ -920,27 +904,26 @@ class GetGroupCountTest(unittest.IsolatedAsyncioTestCase):
         await self._insert(subject="旧物社", msg_id="o1", category="交易")
         await self._insert(subject="旧物社", msg_id="o2", category="交易")
         await self._insert(subject="新社", msg_id="x1")
-        self.assertEqual(await self._count(), 1)
+        assert await self._count() == 1
 
     async def test_search_filter(self):
         await self._insert(subject="A社", msg_id="a1", title="机器学习讲座")
         await self._insert(subject="A社", msg_id="a2", title="机器学习讲座")
         await self._insert(subject="B社", msg_id="b1", title="篮球赛报名")
-        self.assertEqual(await self._count(q="讲座"), 1)
+        assert await self._count(q="讲座") == 1
 
 
-class UpsertSessionTest(unittest.IsolatedAsyncioTestCase):
+class TestUpsertSession:
     """F2：upsert_session 单语句 UPSERT 的插入/更新语义与并发原子性。"""
 
-    async def asyncSetUp(self):
+    @pytest.fixture(autouse=True)
+    async def _autouse_setup(self):
         self.db = await aiosqlite.connect(":memory:")
         self.db.row_factory = aiosqlite.Row
         await self.db.execute("PRAGMA foreign_keys = ON")
         await init_schema(self.db)
-
-    async def asyncTearDown(self):
+        yield
         await self.db.close()
-
     async def _upsert(self, *args, **kwargs) -> None:
         with patch("briefdesk.db.get_db", new=AsyncMock(return_value=self.db)):
             await upsert_session(*args, **kwargs)
@@ -952,9 +935,9 @@ class UpsertSessionTest(unittest.IsolatedAsyncioTestCase):
     async def test_insert_then_update_keeps_enabled_and_watermark(self):
         await self._upsert("weflow-legacy", "s1", "群A", True)
         rows = await self._all()
-        self.assertEqual(len(rows), 1)
-        self.assertEqual(rows[0]["enabled"], 0)  # 新会话默认停用
-        self.assertIsNone(rows[0]["last_poll_ts"])
+        assert len(rows) == 1
+        assert rows[0]["enabled"] == 0  # 新会话默认停用
+        assert rows[0]["last_poll_ts"] is None
 
         # 模拟用户启用 + 水位推进后再次 upsert（刷新会话）：
         # enabled/last_poll_ts 必须保留，名称/类型等元数据更新
@@ -963,12 +946,12 @@ class UpsertSessionTest(unittest.IsolatedAsyncioTestCase):
             await update_session_last_polls("weflow-legacy", [("s1", 1000)])
         await self._upsert("weflow-legacy", "s1", "群A新名", True, is_official=True, last_active_at=2000)
         rows = await self._all()
-        self.assertEqual(len(rows), 1)  # 不产生重复行
-        self.assertEqual(rows[0]["name"], "群A新名")
-        self.assertEqual(rows[0]["is_official"], 1)
-        self.assertEqual(rows[0]["enabled"], 1)  # 用户启用状态保留
-        self.assertEqual(rows[0]["last_poll_ts"], 1000)  # 水位保留
-        self.assertEqual(rows[0]["last_active"], 2000)  # 新元数据写入
+        assert len(rows) == 1  # 不产生重复行
+        assert rows[0]["name"] == "群A新名"
+        assert rows[0]["is_official"] == 1
+        assert rows[0]["enabled"] == 1  # 用户启用状态保留
+        assert rows[0]["last_poll_ts"] == 1000  # 水位保留
+        assert rows[0]["last_active"] == 2000  # 新元数据写入
 
     async def test_concurrent_upserts_same_session_no_error(self):
         # 多源并发刷新同一会话：UPSERT 原子执行，不抛主键冲突、不产生重复行
@@ -979,25 +962,24 @@ class UpsertSessionTest(unittest.IsolatedAsyncioTestCase):
 
         await asyncio.gather(run(), run(), run())
         rows = await self._all()
-        self.assertEqual(len(rows), 1)
+        assert len(rows) == 1
 
 
-class BulkUpsertSessionsTest(unittest.IsolatedAsyncioTestCase):
+class TestBulkUpsertSessions:
     """【H2】bulk_upsert_sessions 单事务批量 UPSERT，语义与单行版一致。
 
     曾经由 poll_cycle 逐行调 upsert_session（每行一次 commit），会话数百级
     时 N×fsync 拉长调用方持有的存储锁窗口。
     """
 
-    async def asyncSetUp(self):
+    @pytest.fixture(autouse=True)
+    async def _autouse_setup(self):
         self.db = await aiosqlite.connect(":memory:")
         self.db.row_factory = aiosqlite.Row
         await self.db.execute("PRAGMA foreign_keys = ON")
         await init_schema(self.db)
-
-    async def asyncTearDown(self):
+        yield
         await self.db.close()
-
     async def _bulk(self, rows) -> None:
         with patch("briefdesk.db.get_db", new=AsyncMock(return_value=self.db)):
             await bulk_upsert_sessions(rows)
@@ -1015,12 +997,12 @@ class BulkUpsertSessionsTest(unittest.IsolatedAsyncioTestCase):
             ]
         )
         rows = await self._all()
-        self.assertEqual(len(rows), 3)
+        assert len(rows) == 3
         by_id = {r["session_id"]: r for r in rows}
-        self.assertEqual(by_id["s1"]["enabled"], 0)  # 新会话默认停用
-        self.assertIsNone(by_id["s1"]["last_poll_ts"])
-        self.assertEqual(by_id["s2"]["last_active"], 111)
-        self.assertEqual(by_id["g1"]["is_official"], 1)
+        assert by_id["s1"]["enabled"] == 0  # 新会话默认停用
+        assert by_id["s1"]["last_poll_ts"] is None
+        assert by_id["s2"]["last_active"] == 111
+        assert by_id["g1"]["is_official"] == 1
 
         # 用户启用 + 水位推进后再次批量 upsert：enabled/last_poll_ts 保留
         with patch("briefdesk.db.get_db", new=AsyncMock(return_value=self.db)):
@@ -1033,19 +1015,19 @@ class BulkUpsertSessionsTest(unittest.IsolatedAsyncioTestCase):
             ]
         )
         rows = await self._all()
-        self.assertEqual(len(rows), 3)  # 不产生重复行
+        assert len(rows) == 3  # 不产生重复行
         by_id = {r["session_id"]: r for r in rows}
-        self.assertEqual(by_id["s1"]["name"], "群A新名")
-        self.assertEqual(by_id["s1"]["enabled"], 1)  # 用户启用状态保留
-        self.assertEqual(by_id["s1"]["last_poll_ts"], 1000)  # 水位保留
-        self.assertEqual(by_id["s1"]["last_active"], 999)  # 新元数据写入
+        assert by_id["s1"]["name"] == "群A新名"
+        assert by_id["s1"]["enabled"] == 1  # 用户启用状态保留
+        assert by_id["s1"]["last_poll_ts"] == 1000  # 水位保留
+        assert by_id["s1"]["last_active"] == 999  # 新元数据写入
 
     async def test_empty_rows_noop(self):
         await self._bulk([])
-        self.assertEqual(await self._all(), [])
+        assert await self._all() == []
 
 
-class CloseDbLatchTest(unittest.IsolatedAsyncioTestCase):
+class TestCloseDbLatch:
     """【P3-3】close_db 置终态门闩：此后 get_db/get_embed_db 拒绝重建连接。
 
     应用关闭序列里 _cancel_pending_tasks 兜底排在 close_db 之后，残余任务
@@ -1053,35 +1035,37 @@ class CloseDbLatchTest(unittest.IsolatedAsyncioTestCase):
     线程会让解释器退出 join 挂死。门闩把复活路径变成显式 RuntimeError。
     """
 
-    async def asyncSetUp(self):
+    @pytest.fixture(autouse=True)
+    async def _autouse_setup(self):
         import briefdesk.db as db_module
 
         self._db_module = db_module
         self._saved_closed = db_module._db_closed
         self._tmpdir = tempfile.TemporaryDirectory()
         # 门闩是模块级终态标志，测后必须复位，防污染同进程后续用例
-        self.addCleanup(setattr, db_module, "_db_closed", self._saved_closed)
-        self.addCleanup(self._tmpdir.cleanup)
-
+        yield
+        self._tmpdir.cleanup()
+        db_module._db_closed = self._saved_closed
     async def test_get_db_and_get_embed_db_rejected_after_close(self):
         from briefdesk.db import get_embed_db
 
         db_path = os.path.join(self._tmpdir.name, "latch.sqlite")
         with patch.object(config, "db_path", db_path):
             await get_db()  # 真实连接（全新文件，_init_connection 幂等建表）
-            self.assertFalse(self._db_module._db_closed)
+            assert not self._db_module._db_closed
             await close_db()
-        self.assertTrue(self._db_module._db_closed)
-        with self.assertRaises(RuntimeError):
+        assert self._db_module._db_closed
+        with pytest.raises(RuntimeError):
             await get_db()
-        with self.assertRaises(RuntimeError):
+        with pytest.raises(RuntimeError):
             await get_embed_db()
 
 
-class GetItemTextsByIdsTest(unittest.IsolatedAsyncioTestCase):
+class TestGetItemTextsByIds:
     """【复核 P2-18】按 id 取卡片文本（unverify 回加去重缓存的数据源）。"""
 
-    async def asyncSetUp(self):
+    @pytest.fixture(autouse=True)
+    async def _autouse_setup(self):
         self.db = await aiosqlite.connect(":memory:")
         self.db.row_factory = aiosqlite.Row
         await init_schema(self.db)
@@ -1094,27 +1078,26 @@ class GetItemTextsByIdsTest(unittest.IsolatedAsyncioTestCase):
                 (i, title, i),
             )
         await self.db.commit()
-
-    async def asyncTearDown(self):
+        yield
         await self.db.close()
-
     async def test_returns_rows_in_shape_of_warmup(self):
         with patch("briefdesk.db.get_db", new=AsyncMock(return_value=self.db)):
             rows = await get_item_texts_by_ids(["i1", "missing"])
-        self.assertEqual([r["id"] for r in rows], ["i1"], "缺失 id 静默跳过")
-        self.assertEqual(rows[0]["title"], "标题一")
-        self.assertEqual(rows[0]["source"], "weflow-legacy")
-        self.assertEqual(rows[0]["source_quote"], "引文")
+        assert [r["id"] for r in rows] == ["i1"], "缺失 id 静默跳过"
+        assert rows[0]["title"] == "标题一"
+        assert rows[0]["source"] == "weflow-legacy"
+        assert rows[0]["source_quote"] == "引文"
 
     async def test_empty_input_is_noop(self):
         with patch("briefdesk.db.get_db", new=AsyncMock(return_value=self.db)):
-            self.assertEqual(await get_item_texts_by_ids([]), [])
+            assert await get_item_texts_by_ids([]) == []
 
 
-class SessionWatermarkTest(unittest.IsolatedAsyncioTestCase):
+class TestSessionWatermark:
     """会话水位（增量轮询）读写与未处理消息按会话查询。"""
 
-    async def asyncSetUp(self):
+    @pytest.fixture(autouse=True)
+    async def _autouse_setup(self):
         self.db = await aiosqlite.connect(":memory:")
         self.db.row_factory = aiosqlite.Row
         await self.db.execute("PRAGMA foreign_keys = ON")
@@ -1128,26 +1111,18 @@ class SessionWatermarkTest(unittest.IsolatedAsyncioTestCase):
                 (sid, sid),
             )
         await self.db.commit()
-
-    async def asyncTearDown(self):
+        yield
         self._db_patch.stop()
         await self.db.close()
-
     async def test_get_session_last_polls_none_then_value(self):
-        self.assertEqual(
-            await get_session_last_polls("weflow-legacy", ["g1", "g2"]),
-            {"g1": None, "g2": None},
-        )
+        assert await get_session_last_polls("weflow-legacy", ["g1", "g2"]) == {"g1": None, "g2": None}
         await update_session_last_polls("weflow-legacy", [("g1", 100), ("g2", 200)])
-        self.assertEqual(
-            await get_session_last_polls("weflow-legacy", ["g1", "g2"]),
-            {"g1": 100, "g2": 200},
-        )
+        assert await get_session_last_polls("weflow-legacy", ["g1", "g2"]) == {"g1": 100, "g2": 200}
         # 多源隔离：不存在的源/会话不在结果中
-        self.assertEqual(await get_session_last_polls("qqflow", ["g1"]), {})
+        assert await get_session_last_polls("qqflow", ["g1"]) == {}
 
     async def test_get_oldest_unprocessed_by_session(self):
-        self.assertEqual(await get_oldest_unprocessed_by_session("weflow-legacy"), {})
+        assert await get_oldest_unprocessed_by_session("weflow-legacy") == {}
         await self.db.execute(
             "INSERT INTO raw_messages (source, msg_id, session_id, group_name, "
             "sender_id, sender_name, content, timestamp) "
@@ -1158,13 +1133,11 @@ class SessionWatermarkTest(unittest.IsolatedAsyncioTestCase):
         )
         await self.db.commit()
         # 按会话分组取最早未处理（源隔离，不含 qqflow 的 50）
-        self.assertEqual(
-            await get_oldest_unprocessed_by_session("weflow-legacy"), {"g1": 100, "g2": 200}
-        )
+        assert await get_oldest_unprocessed_by_session("weflow-legacy") == {"g1": 100, "g2": 200}
         # 标记 g1 全部已处理 → g1 不再出现
         await mark_message_processed("weflow-legacy", "f1")
         await mark_message_processed("weflow-legacy", "f2")
-        self.assertEqual(await get_oldest_unprocessed_by_session("weflow-legacy"), {"g2": 200})
+        assert await get_oldest_unprocessed_by_session("weflow-legacy") == {"g2": 200}
 
     async def test_chunked_queries_span_multiple_batches(self):
         """超过 _SQL_VARS_CHUNK（900）的 IN 查询按块拼接：走 _execute_chunked
@@ -1182,9 +1155,9 @@ class SessionWatermarkTest(unittest.IsolatedAsyncioTestCase):
         )
         await self.db.commit()
         polls = await get_session_last_polls("qqflow", [f"s{i}" for i in range(n)])
-        self.assertEqual(len(polls), n, "跨块会话水位查询结果完整")
+        assert len(polls) == n, "跨块会话水位查询结果完整"
         processed = await are_messages_processed("qqflow", [f"m{i}" for i in range(n)])
-        self.assertEqual(len(processed), n, "跨块已处理查询结果完整")
+        assert len(processed) == n, "跨块已处理查询结果完整"
 
     async def test_mark_messages_processed_bulk(self):
         await self.db.execute(
@@ -1199,44 +1172,37 @@ class SessionWatermarkTest(unittest.IsolatedAsyncioTestCase):
             [("weflow-legacy", "f1"), ("weflow-legacy", "f2"), ("weflow-legacy", "f2")]
         )
         await mark_messages_processed([])
-        self.assertEqual(
-            await get_oldest_unprocessed_by_session("weflow-legacy"), {}
-        )
+        assert await get_oldest_unprocessed_by_session("weflow-legacy") == {}
 
     async def test_toggle_enable_clears_watermark(self):
         await update_session_last_polls("weflow-legacy", [("g1", 100)])
         # 启用 → 水位清空（NULL = 待回填）
         row = await toggle_session("weflow-legacy", "g1")
-        self.assertEqual(row["enabled"], 1)
-        self.assertEqual(
-            await get_session_last_polls("weflow-legacy", ["g1"]), {"g1": None}
-        )
+        assert row["enabled"] == 1
+        assert await get_session_last_polls("weflow-legacy", ["g1"]) == {"g1": None}
         # 停用 → 不动水位
         await update_session_last_polls("weflow-legacy", [("g1", 100)])
         row = await toggle_session("weflow-legacy", "g1")
-        self.assertEqual(row["enabled"], 0)
-        self.assertEqual(
-            await get_session_last_polls("weflow-legacy", ["g1"]), {"g1": 100}
-        )
+        assert row["enabled"] == 0
+        assert await get_session_last_polls("weflow-legacy", ["g1"]) == {"g1": 100}
 
 
 
 
-class MergeHelpersTest(unittest.IsolatedAsyncioTestCase):
+class TestMergeHelpers:
     """会话合并 DB 辅助函数：候选查询（窗口/类别/会话/核实态/排除）与合并回写。"""
 
-    async def asyncSetUp(self):
+    @pytest.fixture(autouse=True)
+    async def _autouse_setup(self):
         self.db = await aiosqlite.connect(":memory:")
         self.db.row_factory = aiosqlite.Row
         await self.db.execute("PRAGMA foreign_keys = ON")
         await init_schema(self.db)
         self._db_patch = patch("briefdesk.db.get_db", new=AsyncMock(return_value=self.db))
         self._db_patch.start()
-
-    async def asyncTearDown(self):
+        yield
         self._db_patch.stop()
         await self.db.close()
-
     async def _insert(
         self,
         id,
@@ -1265,19 +1231,19 @@ class MergeHelpersTest(unittest.IsolatedAsyncioTestCase):
         await self._insert("d1", ts=120, is_verified=1)  # 已核实不参与
         await self._insert("e1", ts=1000)  # 窗口外
         cands = await get_merge_candidates("weflow-legacy", "s1", "交易", 200, 300, [], 10)
-        self.assertEqual([c["id"] for c in cands], ["a1", "a2"])  # msg_time 升序
+        assert [c["id"] for c in cands] == ["a1", "a2"]  # msg_time 升序
         cands = await get_merge_candidates("weflow-legacy", "s1", "交易", 200, 300, ["a1"], 10)
-        self.assertEqual([c["id"] for c in cands], ["a2"])  # exclude_ids 排除
+        assert [c["id"] for c in cands] == ["a2"]  # exclude_ids 排除
         cands = await get_merge_candidates("qqflow", "s1", "交易", 200, 300, [], 10)
-        self.assertEqual(cands, [])  # 源隔离
+        assert cands == []  # 源隔离
         cands = await get_merge_candidates(
             "weflow-legacy", "s1", "交易", 200, 300, [], 2
         )
-        self.assertEqual([c["id"] for c in cands], ["a1", "a2"])  # limit 生效
+        assert [c["id"] for c in cands] == ["a1", "a2"]  # limit 生效
         cands = await get_merge_candidates(
             "weflow-legacy", "s1", "交易", 200, 300, [], 1
         )
-        self.assertEqual([c["id"] for c in cands], ["a1"])
+        assert [c["id"] for c in cands] == ["a1"]
 
     async def test_update_item_merged_rewrites_fields_and_hash(self):
         await self._insert("m1", ts=100, title="旧标题", quote="旧")
@@ -1295,19 +1261,19 @@ class MergeHelpersTest(unittest.IsolatedAsyncioTestCase):
         )
         cursor = await self.db.execute("SELECT * FROM items WHERE id = 'm1'")
         row = await cursor.fetchone()
-        self.assertEqual(row["title"], "新标题")
-        self.assertEqual(row["key_info"], "k1, k2")
-        self.assertEqual(row["source_quote"], "合并引文")
-        self.assertEqual(row["subject"], "社团")
-        self.assertEqual(row["start"], "2026-10-11")
-        self.assertEqual(row["end"], "2026-10-12")
-        self.assertEqual(row["msg_time"], 90)
-        self.assertEqual(row["image_urls"], '["a.jpg"]')
-        self.assertEqual(row["extra_times"], '[{"type":"end","time":"2026-08-15","label":"视频"}]')
-        self.assertEqual(row["content_hash"], hashlib.sha256(
+        assert row["title"] == "新标题"
+        assert row["key_info"] == "k1, k2"
+        assert row["source_quote"] == "合并引文"
+        assert row["subject"] == "社团"
+        assert row["start"] == "2026-10-11"
+        assert row["end"] == "2026-10-12"
+        assert row["msg_time"] == 90
+        assert row["image_urls"] == '["a.jpg"]'
+        assert row["extra_times"] == '[{"type":"end","time":"2026-08-15","label":"视频"}]'
+        assert row["content_hash"] == hashlib.sha256(
             "合并引文".encode()
-        ).hexdigest()[:16])
-        self.assertEqual(row["is_verified"], 0)  # 元数据不受影响
+        ).hexdigest()[:16]
+        assert row["is_verified"] == 0  # 元数据不受影响
 
     async def test_delete_items_keep_raw_option(self):
         await self._insert("k1", ts=100)
@@ -1320,9 +1286,9 @@ class MergeHelpersTest(unittest.IsolatedAsyncioTestCase):
         # keep_raw_messages=True（会话合并吸收片段卡用）：保留原文行
         await delete_items(["k1"], keep_raw_messages=True)
         cursor = await self.db.execute("SELECT COUNT(*) AS cnt FROM raw_messages")
-        self.assertEqual((await cursor.fetchone())["cnt"], 1)
+        assert (await cursor.fetchone())["cnt"] == 1
         cursor = await self.db.execute("SELECT COUNT(*) AS cnt FROM items")
-        self.assertEqual((await cursor.fetchone())["cnt"], 0)
+        assert (await cursor.fetchone())["cnt"] == 0
         # 默认（用户批量删除等）：原文行随之删除
         await self._insert("k2", ts=110)
         await self.db.execute(
@@ -1333,20 +1299,19 @@ class MergeHelpersTest(unittest.IsolatedAsyncioTestCase):
         await self.db.commit()
         await delete_items(["k2"])
         cursor = await self.db.execute("SELECT COUNT(*) AS cnt FROM raw_messages")
-        self.assertEqual((await cursor.fetchone())["cnt"], 1)  # 只剩 k1 的原文
+        assert (await cursor.fetchone())["cnt"] == 1  # 只剩 k1 的原文
 
 
-class BulkRawInsertTest(unittest.IsolatedAsyncioTestCase):
+class TestBulkRawInsert:
     """H1 回归：大批量 raw 落库不得触发 SQLite 变量上限。"""
 
-    async def asyncSetUp(self):
+    @pytest.fixture(autouse=True)
+    async def _autouse_setup(self):
         self.db = await aiosqlite.connect(":memory:")
         self.db.row_factory = aiosqlite.Row
         await init_schema(self.db)
-
-    async def asyncTearDown(self):
+        yield
         await self.db.close()
-
     def _msg(self, i: int) -> RawMsgInput:
         return {
             "source": "weflow-legacy",
@@ -1367,27 +1332,26 @@ class BulkRawInsertTest(unittest.IsolatedAsyncioTestCase):
         with patch("briefdesk.db.get_db", new=AsyncMock(return_value=self.db)):
             await bulk_insert_raw_messages(msgs)
         cursor = await self.db.execute("SELECT COUNT(*) AS cnt FROM raw_messages")
-        self.assertEqual((await cursor.fetchone())["cnt"], 5000)
+        assert (await cursor.fetchone())["cnt"] == 5000
 
     async def test_duplicate_ids_idempotent(self):
         msgs = [self._msg(1), self._msg(1), self._msg(2)]
         with patch("briefdesk.db.get_db", new=AsyncMock(return_value=self.db)):
             await bulk_insert_raw_messages(msgs)
         cursor = await self.db.execute("SELECT COUNT(*) AS cnt FROM raw_messages")
-        self.assertEqual((await cursor.fetchone())["cnt"], 2)
+        assert (await cursor.fetchone())["cnt"] == 2
 
 
-class InsertItemConflictTest(unittest.IsolatedAsyncioTestCase):
+class TestInsertItemConflict:
     """H2 回归：insert_item 唯一键冲突时返回已存在行的真实 id（非幽灵 id）。"""
 
-    async def asyncSetUp(self):
+    @pytest.fixture(autouse=True)
+    async def _autouse_setup(self):
         self.db = await aiosqlite.connect(":memory:")
         self.db.row_factory = aiosqlite.Row
         await init_schema(self.db)
-
-    async def asyncTearDown(self):
+        yield
         await self.db.close()
-
     def _item(self, source_msg_id: str = "m") -> dict:
         return {
             "category": "活动通知",
@@ -1410,31 +1374,30 @@ class InsertItemConflictTest(unittest.IsolatedAsyncioTestCase):
             first = await insert_item(self._item())
             second = await insert_item(self._item())  # 同 (source, source_msg_id)
         # 两次返回同一 id，且该 id 真实存在于 items 表
-        self.assertEqual(first, second)
+        assert first == second
         cursor = await self.db.execute("SELECT COUNT(*) AS cnt FROM items")
-        self.assertEqual((await cursor.fetchone())["cnt"], 1)
+        assert (await cursor.fetchone())["cnt"] == 1
         cursor = await self.db.execute("SELECT id FROM items WHERE source='weflow-legacy' AND source_msg_id='m'")
         row = await cursor.fetchone()
-        self.assertEqual(second, row["id"])
+        assert second == row["id"]
 
     async def test_distinct_msg_ids_get_distinct_ids(self):
         with patch("briefdesk.db.get_db", new=AsyncMock(return_value=self.db)):
             a = await insert_item(self._item("m1"))
             b = await insert_item(self._item("m2"))
-        self.assertNotEqual(a, b)
+        assert a != b
 
 
-class RecatLogTest(unittest.IsolatedAsyncioTestCase):
+class TestRecatLog:
     """分类修正样本积累：update_item_category 记录 before/after，可导出。"""
 
-    async def asyncSetUp(self):
+    @pytest.fixture(autouse=True)
+    async def _autouse_setup(self):
         self.db = await aiosqlite.connect(":memory:")
         self.db.row_factory = aiosqlite.Row
         await init_schema(self.db)
-
-    async def asyncTearDown(self):
+        yield
         await self.db.close()
-
     def _item(self) -> dict:
         return {
             "category": "活动通知",
@@ -1458,19 +1421,19 @@ class RecatLogTest(unittest.IsolatedAsyncioTestCase):
             await update_item_category(item_id, "学术")
         cursor = await self.db.execute("SELECT * FROM recat_log")
         rows = await cursor.fetchall()
-        self.assertEqual(len(rows), 1)
+        assert len(rows) == 1
         r = rows[0]
-        self.assertEqual(r["item_id"], item_id)
-        self.assertEqual(r["category_before"], "活动通知")
-        self.assertEqual(r["category_after"], "学术")
-        self.assertEqual(r["content"], "原文内容（已脱敏）")
+        assert r["item_id"] == item_id
+        assert r["category_before"] == "活动通知"
+        assert r["category_after"] == "学术"
+        assert r["content"] == "原文内容（已脱敏）"
 
     async def test_same_category_not_logged(self):
         with patch("briefdesk.db.get_db", new=AsyncMock(return_value=self.db)):
             item_id = await insert_item(self._item())
             await update_item_category(item_id, "活动通知")  # 相同类别
         cursor = await self.db.execute("SELECT COUNT(*) AS cnt FROM recat_log")
-        self.assertEqual((await cursor.fetchone())["cnt"], 0)
+        assert (await cursor.fetchone())["cnt"] == 0
 
     async def test_get_recat_samples_only_real_changes(self):
         with patch("briefdesk.db.get_db", new=AsyncMock(return_value=self.db)):
@@ -1479,23 +1442,22 @@ class RecatLogTest(unittest.IsolatedAsyncioTestCase):
             await update_item_category(a, "学术")      # 记日志
             await update_item_category(b, "活动通知")  # 未变不记
             samples = await get_recat_samples()
-        self.assertEqual(len(samples), 1)
-        self.assertEqual(samples[0]["category_after"], "学术")
+        assert len(samples) == 1
+        assert samples[0]["category_after"] == "学术"
 
 
-class BackupRestoreTest(unittest.IsolatedAsyncioTestCase):
+class TestBackupRestore:
     """在线备份 + 恢复校验 + 启动替换（临时文件，不触碰应用库）。"""
 
-    async def asyncSetUp(self):
+    @pytest.fixture(autouse=True)
+    async def _autouse_setup(self):
         self.tmpdir = tempfile.mkdtemp()
         self.old_db_path = config.db_path
         self.main_path = os.path.join(self.tmpdir, "main.sqlite")
         self.bak_path = os.path.join(self.tmpdir, "bak.sqlite")
-
-    async def asyncTearDown(self):
+        yield
         config.db_path = self.old_db_path
         await asyncio.to_thread(shutil.rmtree, self.tmpdir, ignore_errors=True)
-
     async def _build_db(self, path: str, marker: str) -> None:
         conn = await aiosqlite.connect(path)
         try:
@@ -1522,12 +1484,12 @@ class BackupRestoreTest(unittest.IsolatedAsyncioTestCase):
                 await backup_db_to(self.bak_path)
         finally:
             await src.close()
-        self.assertIsNone(await validate_restore_file(self.bak_path))
+        assert await validate_restore_file(self.bak_path) is None
         conn = await aiosqlite.connect(self.bak_path)
         try:
             conn.row_factory = aiosqlite.Row
             cursor = await conn.execute("SELECT COUNT(*) AS cnt FROM items")
-            self.assertEqual((await cursor.fetchone())["cnt"], 1)
+            assert (await cursor.fetchone())["cnt"] == 1
         finally:
             await conn.close()
 
@@ -1544,12 +1506,12 @@ class BackupRestoreTest(unittest.IsolatedAsyncioTestCase):
             finally:
                 await conn.close()
 
-        self.assertEqual(await _titles(self.main_path), ["主库A"])
+        assert await _titles(self.main_path) == ["主库A"]
         shutil.copyfile(self.bak_path, self.main_path + ".restore-pending")
         config.db_path = self.main_path
-        self.assertTrue(await apply_pending_restore())
-        self.assertFalse(os.path.exists(self.main_path + ".restore-pending"))
-        self.assertEqual(await _titles(self.main_path), ["备份B"])
+        assert await apply_pending_restore()
+        assert not os.path.exists(self.main_path + ".restore-pending")
+        assert await _titles(self.main_path) == ["备份B"]
 
     async def test_invalid_pending_ignored(self):
         await self._build_db(self.main_path, "主库A")
@@ -1560,18 +1522,18 @@ class BackupRestoreTest(unittest.IsolatedAsyncioTestCase):
 
         await asyncio.to_thread(_write_pending)
         config.db_path = self.main_path
-        self.assertFalse(await apply_pending_restore())
-        self.assertFalse(os.path.exists(self.main_path + ".restore-pending"))
+        assert not await apply_pending_restore()
+        assert not os.path.exists(self.main_path + ".restore-pending")
         conn = await aiosqlite.connect(self.main_path)
         try:
             conn.row_factory = aiosqlite.Row
             cursor = await conn.execute("SELECT COUNT(*) AS cnt FROM items")
-            self.assertEqual((await cursor.fetchone())["cnt"], 1)
+            assert (await cursor.fetchone())["cnt"] == 1
         finally:
             await conn.close()
 
 
-class RestoreEmptyDbRejectedTest(unittest.IsolatedAsyncioTestCase):
+class TestRestoreEmptyDbRejected:
     """空库（无应用表）不可通过恢复校验，防止空库覆盖正式数据。"""
 
     async def test_empty_db_rejected(self):
@@ -1581,8 +1543,8 @@ class RestoreEmptyDbRejectedTest(unittest.IsolatedAsyncioTestCase):
             conn = await aiosqlite.connect(path)
             await conn.close()  # 全新空库：integrity_check=ok 但无应用表
             err = await validate_restore_file(path)
-            self.assertIsNotNone(err)
-            self.assertIn("不含应用数据表", err)
+            assert err is not None
+            assert "不含应用数据表" in err
         finally:
             await asyncio.to_thread(os.unlink, path)
 
@@ -1596,25 +1558,24 @@ class RestoreEmptyDbRejectedTest(unittest.IsolatedAsyncioTestCase):
             await conn.commit()
             await conn.close()
             err = await validate_restore_file(path)
-            self.assertIsNotNone(err)
+            assert err is not None
         finally:
             await asyncio.to_thread(os.unlink, path)
 
 
-class GetItemTextsTest(unittest.IsolatedAsyncioTestCase):
+class TestGetItemTexts:
     """get_all_item_texts 返回真实原文列（source_quote，不拼接其它字段）。"""
 
-    async def asyncSetUp(self):
+    @pytest.fixture(autouse=True)
+    async def _autouse_setup(self):
         self.db = await aiosqlite.connect(":memory:")
         self.db.row_factory = aiosqlite.Row
         await init_schema(self.db)
         self._db_patch = patch("briefdesk.db.get_db", new=AsyncMock(return_value=self.db))
         self._db_patch.start()
-
-    async def asyncTearDown(self):
+        yield
         self._db_patch.stop()
         await self.db.close()
-
     async def test_source_quote_is_real_column_not_concatenated(self):
         await insert_item({
             "category": "活动通知", "title": "标题X",
@@ -1624,16 +1585,17 @@ class GetItemTextsTest(unittest.IsolatedAsyncioTestCase):
             "is_verified": 0, "content_hash": "h",
         })
         rows = await get_all_item_texts()
-        self.assertEqual(len(rows), 1)
-        self.assertEqual(rows[0]["title"], "标题X")
+        assert len(rows) == 1
+        assert rows[0]["title"] == "标题X"
         # source_quote 为真实原文列（不拼接 title 等字段）
-        self.assertEqual(rows[0]["source_quote"], "原文Z")
+        assert rows[0]["source_quote"] == "原文Z"
 
 
-class MergeVectorCleanupTest(unittest.IsolatedAsyncioTestCase):
+class TestMergeVectorCleanup:
     """合并回写（update_item_merged）后旧向量被删除，防重启语义漂移。"""
 
-    async def asyncSetUp(self):
+    @pytest.fixture(autouse=True)
+    async def _autouse_setup(self):
         # 主连接与 embed 连接需共享同一数据库（:memory: 每连接独立，删除不可见）
         fd, path = tempfile.mkstemp(suffix=".sqlite")
         os.close(fd)
@@ -1650,14 +1612,12 @@ class MergeVectorCleanupTest(unittest.IsolatedAsyncioTestCase):
             "briefdesk.db.get_embed_db", new=AsyncMock(return_value=self.embed_db)
         )
         self._embed_patch.start()
-
-    async def asyncTearDown(self):
+        yield
         self._db_patch.stop()
         self._embed_patch.stop()
         await self.db.close()
         await self.embed_db.close()
         await asyncio.to_thread(os.unlink, self.path)
-
     async def test_merged_item_embedding_removed(self):
         item_id = await insert_item({
             "category": "活动通知", "title": "旧标题",
@@ -1667,7 +1627,7 @@ class MergeVectorCleanupTest(unittest.IsolatedAsyncioTestCase):
             "is_verified": 0, "content_hash": "h",
         })
         await upsert_embeddings([(item_id, "test-model", [0.1, 0.2])])
-        self.assertIn(item_id, await load_embeddings("test-model"))
+        assert item_id in await load_embeddings("test-model")
 
         await update_item_merged(
             item_id,
@@ -1676,20 +1636,19 @@ class MergeVectorCleanupTest(unittest.IsolatedAsyncioTestCase):
             msg_time=1, image_urls="",
         )
         # 合并改写了文本 → 旧向量删除，重启后按新文本重算
-        self.assertNotIn(item_id, await load_embeddings("test-model"))
+        assert item_id not in await load_embeddings("test-model")
 
 
-class SourceGroupsSplitTest(unittest.IsolatedAsyncioTestCase):
+class TestSourceGroupsSplit:
     """多来源合并卡片的 source_group 在来源筛选下拉中按 ", " 拆分展示。"""
 
-    async def asyncSetUp(self):
+    @pytest.fixture(autouse=True)
+    async def _autouse_setup(self):
         self.db = await aiosqlite.connect(":memory:")
         self.db.row_factory = aiosqlite.Row
         await init_schema(self.db)
-
-    async def asyncTearDown(self):
+        yield
         await self.db.close()
-
     async def _insert(self, item_id: str, source_group: str) -> None:
         await self.db.execute(
             "INSERT INTO items (id, category, title, source_quote, source_group, "
@@ -1706,7 +1665,7 @@ class SourceGroupsSplitTest(unittest.IsolatedAsyncioTestCase):
         # 来源下拉选项仅在搜索模式（q 非空）下随分页返回
         with patch("briefdesk.db.get_db", new=AsyncMock(return_value=self.db)):
             page = await get_items_page(category=None, verified="unverified", q="标题")
-        self.assertEqual(page["source_groups"], ["群A", "群B", "群C"])
+        assert page["source_groups"] == ["群A", "群B", "群C"]
 
     async def test_source_group_filter_matches_merged(self):
         await self._insert("a", "群A")
@@ -1716,20 +1675,19 @@ class SourceGroupsSplitTest(unittest.IsolatedAsyncioTestCase):
             page = await get_items_page(
                 category=None, verified="unverified", q=None, source_group="群A"
             )
-        self.assertEqual(sorted(r["id"] for r in page["items"]), ["a", "b"])
+        assert sorted(r["id"] for r in page["items"]) == ["a", "b"]
 
 
-class MergeSourceGroupTest(unittest.IsolatedAsyncioTestCase):
+class TestMergeSourceGroup:
     """merge_source_group：逗号分隔、精确匹配去重（C3：群名互为子串不误判）。"""
 
-    async def asyncSetUp(self):
+    @pytest.fixture(autouse=True)
+    async def _autouse_setup(self):
         self.db = await aiosqlite.connect(":memory:")
         self.db.row_factory = aiosqlite.Row
         await init_schema(self.db)
-
-    async def asyncTearDown(self):
+        yield
         await self.db.close()
-
     async def _insert(self, item_id: str, source_group: str) -> None:
         await self.db.execute(
             "INSERT INTO items (id, category, title, source_quote, source_group, "
@@ -1752,21 +1710,21 @@ class MergeSourceGroupTest(unittest.IsolatedAsyncioTestCase):
         await self._insert("a", "我们四个")
         with patch("briefdesk.db.get_db", new=AsyncMock(return_value=self.db)):
             await merge_source_group("a", "我们四个2")
-        self.assertEqual(await self._get_group("a"), "我们四个, 我们四个2")
+        assert await self._get_group("a") == "我们四个, 我们四个2"
 
     async def test_exact_duplicate_is_skipped(self):
         """已存在的群名（精确匹配）不重复追加。"""
         await self._insert("a", "群A, 群B")
         with patch("briefdesk.db.get_db", new=AsyncMock(return_value=self.db)):
             await merge_source_group("a", "群B")
-        self.assertEqual(await self._get_group("a"), "群A, 群B")
+        assert await self._get_group("a") == "群A, 群B"
 
     async def test_first_group_writes_without_separator(self):
         """空 source_group 首写：不产生多余分隔符。"""
         await self._insert("a", "")
         with patch("briefdesk.db.get_db", new=AsyncMock(return_value=self.db)):
             await merge_source_group("a", "群A")
-        self.assertEqual(await self._get_group("a"), "群A")
+        assert await self._get_group("a") == "群A"
 
     async def test_missing_item_is_noop(self):
         """目标卡不存在 → 静默跳过。"""
@@ -1774,14 +1732,15 @@ class MergeSourceGroupTest(unittest.IsolatedAsyncioTestCase):
             await merge_source_group("nope", "群A")  # 不抛错
 
 
-class EmbeddingsDbTest(unittest.IsolatedAsyncioTestCase):
+class TestEmbeddingsDb:
     """向量持久化：独立连接读写、并发读取不干扰落库（临时文件库）。
 
     回归目标：向量落库的 COMMIT 不再被主连接上的活动语句打断
     （cannot commit transaction - SQL statements in progress）。
     """
 
-    async def asyncSetUp(self):
+    @pytest.fixture(autouse=True)
+    async def _autouse_setup(self):
         import briefdesk.db as db_module
 
         self.tmpdir = tempfile.mkdtemp()
@@ -1795,8 +1754,7 @@ class EmbeddingsDbTest(unittest.IsolatedAsyncioTestCase):
         db_module._db = None
         db_module._embed_db = None
         db_module._db_closed = False
-
-    async def asyncTearDown(self):
+        yield
         import briefdesk.db as db_module
 
         await close_db()
@@ -1805,18 +1763,17 @@ class EmbeddingsDbTest(unittest.IsolatedAsyncioTestCase):
         db_module._db_closed = self._old_closed
         config.db_path = self.old_db_path
         await asyncio.to_thread(shutil.rmtree, self.tmpdir, ignore_errors=True)
-
     async def test_upsert_load_roundtrip(self):
         await get_db()  # 主连接初始化 schema
         await upsert_embeddings([("a", "m1", [0.1, 0.2]), ("b", "m1", [0.3])])
         loaded = await load_embeddings("m1")
-        self.assertEqual(set(loaded), {"a", "b"})
-        self.assertEqual(loaded["a"], [0.1, 0.2])
+        assert set(loaded) == {"a", "b"}
+        assert loaded["a"] == [0.1, 0.2]
         # 模型过滤
-        self.assertEqual(await load_embeddings("m2"), {})
+        assert await load_embeddings("m2") == {}
         # REPLACE 按 item_id 覆盖
         await upsert_embeddings([("a", "m1", [9.9])])
-        self.assertEqual((await load_embeddings("m1"))["a"], [9.9])
+        assert (await load_embeddings("m1"))["a"] == [9.9]
 
     async def test_concurrent_read_does_not_break_upsert(self):
         await get_db()
@@ -1848,8 +1805,8 @@ class EmbeddingsDbTest(unittest.IsolatedAsyncioTestCase):
 
         ids, _ = await asyncio.gather(reader(), writer())
         # WAL 快照：读取可能看到部分/全部新行，重点是不抛错且最终落库完整
-        self.assertTrue(50 <= len(ids) <= 150, len(ids))
-        self.assertEqual(len(await load_embeddings("m")), 150)
+        assert 50 <= len(ids) <= 150, len(ids)
+        assert len(await load_embeddings("m")) == 150
 
     async def test_close_db_closes_main_even_if_embed_close_fails(self):
         """【核验 H3】_embed_db.close 抛错不得阻断 _db.close：残留的非 daemon
@@ -1862,8 +1819,8 @@ class EmbeddingsDbTest(unittest.IsolatedAsyncioTestCase):
 
         embed_db = db_module._embed_db
         main_db = db_module._db
-        self.assertIsNotNone(embed_db)
-        self.assertIsNotNone(main_db)
+        assert embed_db is not None
+        assert main_db is not None
 
         with (
             patch.object(
@@ -1874,24 +1831,23 @@ class EmbeddingsDbTest(unittest.IsolatedAsyncioTestCase):
             await close_db()
 
         main_close_mock.assert_awaited_once()
-        self.assertIsNone(db_module._embed_db)
-        self.assertIsNone(db_module._db)
+        assert db_module._embed_db is None
+        assert db_module._db is None
 
 
 # ── 审查修复回归测试（内存库，不触碰应用数据库文件）──
 
 
-class _InMemoryDbTest(unittest.IsolatedAsyncioTestCase):
-    """公共基座：内存库 + get_db/get_embed_db 打桩到该连接。"""
+class _InMemoryDbTest:
+    """公共基座：内存库 + get_db/get_embed_db 打桩到该连接。
 
-    async def asyncSetUp(self):
-        self.db = await aiosqlite.connect(":memory:")
-        self.db.row_factory = aiosqlite.Row
-        await init_schema(self.db)
+    试点：内存库样板改由共享夹具 memory_db（tests/conftest.py）提供，
+    子类经 autouse 夹具注入 self.db，teardown 由夹具统一关闭。
+    """
 
-    async def asyncTearDown(self):
-        await self.db.close()
-
+    @pytest.fixture(autouse=True)
+    async def _memory_db(self, memory_db):
+        self.db = memory_db
     def _patch_db(self):
         return (
             patch("briefdesk.db.get_db", new=AsyncMock(return_value=self.db)),
@@ -1917,7 +1873,7 @@ class _InMemoryDbTest(unittest.IsolatedAsyncioTestCase):
         }
 
 
-class CategoryRenameSyncTest(_InMemoryDbTest):
+class TestCategoryRenameSync(_InMemoryDbTest):
     """审查修复 #1 回归保护：类别改名必须在同一事务内同步 items.category。"""
 
     async def test_rename_updates_items_category_in_same_transaction(self):
@@ -1926,19 +1882,19 @@ class CategoryRenameSyncTest(_InMemoryDbTest):
             cat = await insert_category("旧类", "提示词", "#111111")
             await insert_item(self._item("旧类"))
             updated = await update_category(cat["id"], name="新类")
-        self.assertIsNotNone(updated)
-        self.assertEqual(updated["name"], "新类")
+        assert updated is not None
+        assert updated["name"] == "新类"
         cur = await self.db.execute(
             "SELECT COUNT(*) AS cnt FROM items WHERE category = '新类'"
         )
-        self.assertEqual((await cur.fetchone())["cnt"], 1)
+        assert (await cur.fetchone())["cnt"] == 1
         cur = await self.db.execute(
             "SELECT COUNT(*) AS cnt FROM items WHERE category = '旧类'"
         )
-        self.assertEqual((await cur.fetchone())["cnt"], 0)
+        assert (await cur.fetchone())["cnt"] == 0
 
 
-class DeleteCategoryPurgeCascadeTest(_InMemoryDbTest):
+class TestDeleteCategoryPurgeCascade(_InMemoryDbTest):
     """审查修复 #1 回归保护：purge 级联删三表且 processed_messages 保留。"""
 
     async def test_purge_deletes_items_raw_embeddings_keeps_processed(self):
@@ -1963,16 +1919,16 @@ class DeleteCategoryPurgeCascadeTest(_InMemoryDbTest):
             await mark_message_processed("weflow-legacy", "m1")
             await upsert_embeddings([(item_id, "embed-model", [0.1, 0.2])])
             row, deleted_ids = await delete_category(cat["id"], purge_items=True)
-        self.assertIsNotNone(row)
-        self.assertEqual(deleted_ids, [item_id])
+        assert row is not None
+        assert deleted_ids == [item_id]
         for table in ("items", "raw_messages", "item_embeddings"):
             cur = await self.db.execute(f"SELECT COUNT(*) AS cnt FROM {table}")
-            self.assertEqual((await cur.fetchone())["cnt"], 0, table)
+            assert (await cur.fetchone())["cnt"] == 0, table
         cur = await self.db.execute("SELECT COUNT(*) AS cnt FROM processed_messages")
-        self.assertEqual((await cur.fetchone())["cnt"], 1)
+        assert (await cur.fetchone())["cnt"] == 1
 
 
-class ChunkedWritePathTest(_InMemoryDbTest):
+class TestChunkedWritePath(_InMemoryDbTest):
     """_execute_chunked 写路径（fetch=False）：跨块 rowcount 累计完整。"""
 
     async def _insert_items(self, n: int) -> list[str]:
@@ -1992,19 +1948,19 @@ class ChunkedWritePathTest(_InMemoryDbTest):
         with p1, p2:
             ids = await self._insert_items(905)  # 900 + 5：跨两块
             affected = await update_items_verify(ids, 1)
-        self.assertEqual(affected, 905, "跨块 UPDATE 的 rowcount 累计完整")
+        assert affected == 905, "跨块 UPDATE 的 rowcount 累计完整"
 
     async def test_delete_items_rowcount_across_chunks(self):
         p1, p2 = self._patch_db()
         with p1, p2:
             ids = await self._insert_items(905)
             deleted = await delete_items(ids)
-        self.assertEqual(deleted, 905, "跨块 DELETE 的 rowcount 累计完整")
+        assert deleted == 905, "跨块 DELETE 的 rowcount 累计完整"
         cur = await self.db.execute("SELECT COUNT(*) AS cnt FROM items")
-        self.assertEqual((await cur.fetchone())["cnt"], 0)
+        assert (await cur.fetchone())["cnt"] == 0
 
 
-class DbRedirectTest(unittest.IsolatedAsyncioTestCase):
+class TestDbRedirect:
     """db_redirect 官方缝：窗口内单例指向临时库，退出原样还原。"""
 
     async def test_redirect_swaps_and_restores_singletons(self):
@@ -2016,14 +1972,14 @@ class DbRedirectTest(unittest.IsolatedAsyncioTestCase):
                 main_conn,
                 embed_conn,
             ):
-                self.assertIs(db_mod._db, main_conn)
-                self.assertIs(db_mod._embed_db, embed_conn)
+                assert db_mod._db is main_conn
+                assert db_mod._embed_db is embed_conn
                 # 两条连接已按各自口径初始化 schema（空库可查）
                 cur = await main_conn.execute("SELECT COUNT(*) AS cnt FROM items")
-                self.assertEqual((await cur.fetchone())["cnt"], 0)
-                self.assertIsNotNone(embed_conn)
-            self.assertIs(db_mod._db, saved_main, "退出必须还原主连接单例")
-            self.assertIs(db_mod._embed_db, saved_embed, "退出必须还原向量连接单例")
+                assert (await cur.fetchone())["cnt"] == 0
+                assert embed_conn is not None
+            assert db_mod._db is saved_main, "退出必须还原主连接单例"
+            assert db_mod._embed_db is saved_embed, "退出必须还原向量连接单例"
 
     async def test_second_connection_failure_closes_first(self):
         import briefdesk.db as db_mod
@@ -2052,19 +2008,19 @@ class DbRedirectTest(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as d:
             with (
                 patch.object(db_mod, "_init_connection", new=flaky_init),
-                self.assertRaises(RuntimeError),
+                pytest.raises(RuntimeError),
             ):
                 async with db_redirect(os.path.join(d, "bench.sqlite")):
                     pass  # 不可达：进入即失败
             # 半程失败：第一条连接已关闭（不留非 daemon worker 线程）、
             # 模块单例未被换入
-            self.assertEqual(calls["n"], 2)
-            self.assertTrue(closed["v"], "半程失败的 main_conn 未被关闭")
-            self.assertIs(db_mod._db, saved_main)
-            self.assertIs(db_mod._embed_db, saved_embed)
+            assert calls["n"] == 2
+            assert closed["v"], "半程失败的 main_conn 未被关闭"
+            assert db_mod._db is saved_main
+            assert db_mod._embed_db is saved_embed
 
 
-class DeleteItemsRollbackTest(_InMemoryDbTest):
+class TestDeleteItemsRollback(_InMemoryDbTest):
     """审查修复 #1a：多步写异常路径必须 rollback，不留悬挂事务。
 
     悬挂事务会被下一个不相干写操作的 commit 收尾提交（部分写入提前可见），
@@ -2106,17 +2062,15 @@ class DeleteItemsRollbackTest(_InMemoryDbTest):
             )
             with (
                 patch.object(self.db, "execute", new=failing_execute),
-                self.assertRaises(RuntimeError),
+                pytest.raises(RuntimeError),
             ):
                 await delete_items([item_id])
-        self.assertFalse(
-            self.db.in_transaction, "多步写失败后必须 rollback，不得残留悬挂事务"
-        )
+        assert not self.db.in_transaction, "多步写失败后必须 rollback，不得残留悬挂事务"
         # 回滚后数据完好：items/raw_messages 行仍在，连接可用
         cur = await self.db.execute("SELECT COUNT(*) AS cnt FROM items")
-        self.assertEqual((await cur.fetchone())["cnt"], 1)
+        assert (await cur.fetchone())["cnt"] == 1
         cur = await self.db.execute("SELECT COUNT(*) AS cnt FROM raw_messages")
-        self.assertEqual((await cur.fetchone())["cnt"], 1)
+        assert (await cur.fetchone())["cnt"] == 1
 
     # ── 故障注入扩展：db.execute 第 N 步抛 RuntimeError ──
 
@@ -2162,15 +2116,13 @@ class DeleteItemsRollbackTest(_InMemoryDbTest):
             await self.db.commit()
             with (
                 self._fail_execute_on("DELETE FROM raw_messages"),
-                self.assertRaises(RuntimeError),
+                pytest.raises(RuntimeError),
             ):
                 await purge_expired_ignored(24)
-        self.assertFalse(
-            self.db.in_transaction, "purge 失败后必须 rollback，不得残留悬挂事务"
-        )
+        assert not self.db.in_transaction, "purge 失败后必须 rollback，不得残留悬挂事务"
         for table in ("items", "raw_messages", "item_embeddings"):
             cur = await self.db.execute(f"SELECT COUNT(*) AS cnt FROM {table}")
-            self.assertEqual((await cur.fetchone())["cnt"], 1, table)
+            assert (await cur.fetchone())["cnt"] == 1, table
 
     async def test_update_category_failure_rolls_back_rename_sync(self):
         """改名第 2 步（items 同步）失败 → 异常上抛，类别名与卡片均保持旧值。"""
@@ -2180,18 +2132,16 @@ class DeleteItemsRollbackTest(_InMemoryDbTest):
             await insert_item(self._item("旧类"))
             with (
                 self._fail_execute_on("UPDATE items SET category"),
-                self.assertRaises(RuntimeError),
+                pytest.raises(RuntimeError),
             ):
                 await update_category(cat["id"], name="新类")
-        self.assertFalse(
-            self.db.in_transaction, "改名失败后必须 rollback，不得残留悬挂事务"
-        )
+        assert not self.db.in_transaction, "改名失败后必须 rollback，不得残留悬挂事务"
         cur = await self.db.execute("SELECT name FROM categories WHERE id = ?", (cat["id"],))
-        self.assertEqual((await cur.fetchone())["name"], "旧类")
+        assert (await cur.fetchone())["name"] == "旧类"
         cur = await self.db.execute(
             "SELECT COUNT(*) AS cnt FROM items WHERE category = '旧类'"
         )
-        self.assertEqual((await cur.fetchone())["cnt"], 1)
+        assert (await cur.fetchone())["cnt"] == 1
 
     async def test_delete_category_failure_rolls_back_cascade(self):
         """级联删除在 items 删除步失败 → 异常上抛，categories 行仍在、items 未删。"""
@@ -2215,22 +2165,20 @@ class DeleteItemsRollbackTest(_InMemoryDbTest):
             )
             with (
                 self._fail_execute_on("DELETE FROM items WHERE id IN"),
-                self.assertRaises(RuntimeError),
+                pytest.raises(RuntimeError),
             ):
                 await delete_category(cat["id"], purge_items=True)
-        self.assertFalse(
-            self.db.in_transaction, "级联删除失败后必须 rollback，不得残留悬挂事务"
-        )
+        assert not self.db.in_transaction, "级联删除失败后必须 rollback，不得残留悬挂事务"
         cur = await self.db.execute(
             "SELECT COUNT(*) AS cnt FROM categories WHERE id = ?", (cat["id"],)
         )
-        self.assertEqual((await cur.fetchone())["cnt"], 1, "类别行必须仍在")
+        assert (await cur.fetchone())["cnt"] == 1, "类别行必须仍在"
         for table in ("items", "raw_messages"):
             cur = await self.db.execute(f"SELECT COUNT(*) AS cnt FROM {table}")
-            self.assertEqual((await cur.fetchone())["cnt"], 1, table)
+            assert (await cur.fetchone())["cnt"] == 1, table
 
 
-class AtomicTransactionCancelTest(_InMemoryDbTest):
+class TestAtomicTransactionCancel(_InMemoryDbTest):
     """复核 P1-1：atomic_transaction 必须捕 CancelledError（BaseException 子类），
     否则取消逃逸留下悬挂事务，被后续无关 commit 收尾提交。"""
 
@@ -2253,16 +2201,16 @@ class AtomicTransactionCancelTest(_InMemoryDbTest):
             task = asyncio.create_task(_cancelled_body())
             await asyncio.sleep(0)  # 让 task 进入事务体
             task.cancel()
-            with self.assertRaises(asyncio.CancelledError):
+            with pytest.raises(asyncio.CancelledError):
                 await task
 
         # 取消后必须 rollback：无悬挂事务，且半程写未残留
-        self.assertFalse(self.db.in_transaction, "取消后必须 rollback，不得残留悬挂事务")
+        assert not self.db.in_transaction, "取消后必须 rollback，不得残留悬挂事务"
         cur = await self.db.execute("SELECT COUNT(*) AS cnt FROM items")
-        self.assertEqual((await cur.fetchone())["cnt"], 0, "取消路径的半程写必须被回滚")
+        assert (await cur.fetchone())["cnt"] == 0, "取消路径的半程写必须被回滚"
 
 
-class AreMessagesProcessedChunkTest(unittest.IsolatedAsyncioTestCase):
+class TestAreMessagesProcessedChunk:
     """审查修复 #6：are_messages_processed 按 900 条分块防 SQLite 变量上限。
 
     本机 SQLite 3.51 变量上限为 32766（>=3.32），1100 个 id 单次查询不会崩，
@@ -2282,10 +2230,10 @@ class AreMessagesProcessedChunkTest(unittest.IsolatedAsyncioTestCase):
         ):
             got = await are_messages_processed("weflow-legacy", ids)
 
-        self.assertEqual(got, set(ids))
-        self.assertEqual(len(calls), 2)  # ceil(1100/900) = 2 次
+        assert got == set(ids)
+        assert len(calls) == 2  # ceil(1100/900) = 2 次
         for params in calls:
-            self.assertLessEqual(len(params) - 1, 900)
+            assert len(params) - 1 <= 900
 
     async def test_small_batch_single_query_unchanged(self):
         calls: list[tuple] = []
@@ -2300,11 +2248,11 @@ class AreMessagesProcessedChunkTest(unittest.IsolatedAsyncioTestCase):
         ):
             got = await are_messages_processed("weflow-legacy", ids)
 
-        self.assertEqual(got, {"a", "b"})
-        self.assertEqual(len(calls), 1)
+        assert got == {"a", "b"}
+        assert len(calls) == 1
 
 
-class AreMessagesProcessedLargeSetTest(_InMemoryDbTest):
+class TestAreMessagesProcessedLargeSet(_InMemoryDbTest):
     """审查修复 #6 端到端：1100 个 id 全部已处理 → 返回全集（首跑即绿的保护性测试）。"""
 
     async def test_1100_processed_ids_all_found(self):
@@ -2312,29 +2260,29 @@ class AreMessagesProcessedLargeSetTest(_InMemoryDbTest):
             for i in range(1100):
                 await mark_message_processed("weflow-legacy", f"m{i}")
             got = await are_messages_processed("weflow-legacy", [f"m{i}" for i in range(1100)])
-        self.assertEqual(len(got), 1100)
+        assert len(got) == 1100
 
 
-class SetItemReminderClearMutexTest(_InMemoryDbTest):
+class TestSetItemReminderClearMutex(_InMemoryDbTest):
     """审查修复 #7：清除提醒仅在已有提醒时命中——rowcount 才能当多标签页互斥判据。"""
 
     async def test_clear_when_no_reminder_returns_false(self):
         with patch("briefdesk.db.get_db", new=AsyncMock(return_value=self.db)):
             item_id = await insert_item(self._item("活动通知"))
             changed = await set_item_reminder(item_id, None)
-        self.assertFalse(changed, "无提醒时清除不应命中（否则多标签页互斥失效）")
+        assert not changed, "无提醒时清除不应命中（否则多标签页互斥失效）"
 
     async def test_clear_existing_then_second_clear_false(self):
         with patch("briefdesk.db.get_db", new=AsyncMock(return_value=self.db)):
             item_id = await insert_item(self._item("活动通知"))
-            self.assertTrue(await set_item_reminder(item_id, "2026-08-15 10:00"))
+            assert await set_item_reminder(item_id, "2026-08-15 10:00")
             first_clear = await set_item_reminder(item_id, None)
             second_clear = await set_item_reminder(item_id, None)
-        self.assertTrue(first_clear)
-        self.assertFalse(second_clear, "第二次清除不得命中（已被第一个标签页清掉）")
+        assert first_clear
+        assert not second_clear, "第二次清除不得命中（已被第一个标签页清掉）"
 
 
-class DefaultCategoriesUpgradeTest(_InMemoryDbTest):
+class TestDefaultCategoriesUpgrade(_InMemoryDbTest):
     """默认分类 5→13 升级：出厂启用态 + 存量库 user_version 一次性回填。
 
     契约：新装库播种 13 类但仅原五类启用；存量库经回填补齐缺失默认类
@@ -2351,9 +2299,9 @@ class DefaultCategoriesUpgradeTest(_InMemoryDbTest):
 
     async def test_fresh_seed_enables_only_original_five(self):
         rows = await self._load_enabled_map()
-        self.assertEqual(len(rows), 13)
+        assert len(rows) == 13
         enabled = {n for n, e in rows.items() if e}
-        self.assertEqual(enabled, set(self._ORIGINAL_FIVE))
+        assert enabled == set(self._ORIGINAL_FIVE)
 
     async def test_backfill_adds_missing_disabled_respects_existing(self):
         # 模拟升级前旧库：删掉新增八类；用户曾手动禁用"交易"；重置迁移标记
@@ -2363,12 +2311,12 @@ class DefaultCategoriesUpgradeTest(_InMemoryDbTest):
         await self.db.commit()
         await init_schema(self.db)  # 触发一次性回填
         rows = await self._load_enabled_map()
-        self.assertEqual(len(rows), 13)
-        self.assertEqual(rows["交易"], 0)   # 已有行绝不被回填改写
+        assert len(rows) == 13
+        assert rows["交易"] == 0   # 已有行绝不被回填改写
         for n in self._NEW_EIGHT:
-            self.assertEqual(rows[n], 0, n)  # 补入项按出厂态停用
+            assert rows[n] == 0, n  # 补入项按出厂态停用
         for n in ("活动通知", "社团招新", "学术", "实习"):
-            self.assertEqual(rows[n], 1, n)
+            assert rows[n] == 1, n
 
     async def test_backfill_runs_once_and_respects_deletion(self):
         await self.db.execute("DELETE FROM categories WHERE name = '失物招领'")
@@ -2378,7 +2326,7 @@ class DefaultCategoriesUpgradeTest(_InMemoryDbTest):
             "SELECT COUNT(*) AS cnt FROM categories WHERE name = '失物招领'"
         )
         row = await cursor.fetchone()
-        self.assertEqual(row["cnt"], 0, "迁移完成后用户的删除必须被尊重")
+        assert row["cnt"] == 0, "迁移完成后用户的删除必须被尊重"
 
     async def test_activity_notice_prompt_migrates_once_respecting_edits(self):
         # C3：活动通知口径 v1→v2——旧版原文才更新、已编辑行不动、只跑一次
@@ -2401,7 +2349,7 @@ class DefaultCategoriesUpgradeTest(_InMemoryDbTest):
         )
         await self.db.commit()
         await init_schema(self.db)
-        self.assertEqual(await _notice_prompt(), _ACTIVITY_NOTICE_NEW_PROMPT)
+        assert await _notice_prompt() == _ACTIVITY_NOTICE_NEW_PROMPT
 
         # 只跑一次：此后（含用户改回旧文案）不再被覆盖
         await self.db.execute(
@@ -2410,7 +2358,7 @@ class DefaultCategoriesUpgradeTest(_InMemoryDbTest):
         )
         await self.db.commit()
         await init_schema(self.db)
-        self.assertEqual(await _notice_prompt(), _ACTIVITY_NOTICE_OLD_PROMPT)
+        assert await _notice_prompt() == _ACTIVITY_NOTICE_OLD_PROMPT
 
 
 if __name__ == "__main__":

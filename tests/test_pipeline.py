@@ -1,5 +1,6 @@
 """pipeline 骨架与阶段插件测试：不触发真实 AI，DB 用内存库/桩。"""
 
+import contextlib
 import unittest
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -283,6 +284,56 @@ class OcrEnrichTest(unittest.IsolatedAsyncioTestCase):
         client.download_media.assert_not_called()
 
 
+@contextlib.contextmanager
+def _pipeline_patches(
+    *,
+    dedup_mark=None,
+    bulk_mark=None,
+    insert_item=None,
+    merge_candidates=None,
+    enabled_sessions=None,
+    enabled_categories=None,
+    processed=None,
+    raw_insert=None,
+    publish=None,
+):
+    """process_all_batches 全链路打桩的 9 个 patch 目标集中一处。
+
+    原三处测试各自内联同一组 patch；断言需要观测的替身由调用方构造后
+    经关键字参数传入（dedup_mark/bulk_mark/raw_insert/probe 等），其余
+    用标准缺省替身。patch 顺序与原内联版本保持一致。
+    """
+    with patch(
+        "briefdesk.plugins.dedup.plugin.mark_message_processed",
+        new=dedup_mark if dedup_mark is not None else AsyncMock(),
+    ), patch(
+        "briefdesk.pipeline.mark_messages_processed",
+        new=bulk_mark if bulk_mark is not None else AsyncMock(),
+    ), patch(
+        "briefdesk.plugins.dedup.plugin.insert_item",
+        new=insert_item if insert_item is not None else AsyncMock(return_value="new-id"),
+    ), patch(
+        "briefdesk.plugins.merge.plugin.get_merge_candidates",
+        new=merge_candidates if merge_candidates is not None else AsyncMock(return_value=[]),
+    ), patch(
+        "briefdesk.pipeline.get_enabled_sessions",
+        new=enabled_sessions if enabled_sessions is not None else AsyncMock(return_value=[{"session_id": "s"}]),
+    ), patch(
+        "briefdesk.pipeline.get_enabled_categories",
+        new=enabled_categories if enabled_categories is not None else AsyncMock(return_value=[{"name": "x"}]),
+    ), patch(
+        "briefdesk.pipeline.are_messages_processed",
+        new=processed if processed is not None else AsyncMock(return_value=set()),
+    ), patch(
+        "briefdesk.pipeline.bulk_insert_raw_messages",
+        new=raw_insert if raw_insert is not None else AsyncMock(),
+    ), patch(
+        "briefdesk.pipeline.publish_items_updated",
+        new=publish if publish is not None else AsyncMock(),
+    ):
+        yield
+
+
 class StoreBatchFailedTest(_StageTestBase):
     """骨架 + dedup 阶段：failed index 的消息不标记 processed（本轮抛弃、下轮回填）。"""
 
@@ -300,29 +351,11 @@ class StoreBatchFailedTest(_StageTestBase):
         _install_merge_stage()
         stages.register_stage(_classify_stage(_outcome_fn(results, failed)))
 
-        with patch(
-            "briefdesk.plugins.dedup.plugin.mark_message_processed",
-            new=AsyncMock(side_effect=fake_mark),
-        ), patch(
-            "briefdesk.pipeline.mark_messages_processed",
-            new=AsyncMock(side_effect=fake_bulk),  # 骨架 _mark_skipped 走批量标记
-        ), patch(
-            "briefdesk.plugins.dedup.plugin.insert_item",
-            new=AsyncMock(return_value="new-id"),
-        ), patch(
-            "briefdesk.plugins.merge.plugin.get_merge_candidates",
-            new=AsyncMock(return_value=[]),
-        ), patch(
-            "briefdesk.pipeline.get_enabled_sessions",
-            new=AsyncMock(return_value=[{"session_id": "s"}]),
-        ), patch(
-            "briefdesk.pipeline.get_enabled_categories",
-            new=AsyncMock(return_value=[{"name": "x"}]),
-        ), patch(
-            "briefdesk.pipeline.are_messages_processed", new=AsyncMock(return_value=set())
-        ), patch(
-            "briefdesk.pipeline.bulk_insert_raw_messages", new=AsyncMock()
-        ), patch("briefdesk.pipeline.publish_items_updated", new=AsyncMock()):
+        # 骨架 _mark_skipped 走批量标记
+        with _pipeline_patches(
+            dedup_mark=AsyncMock(side_effect=fake_mark),
+            bulk_mark=AsyncMock(side_effect=fake_bulk),
+        ):
             await process_all_batches(
                 batch, _pipeline_client(), batch_size=10, origin="test"
             )
@@ -357,27 +390,7 @@ class RawInsertHoldsStorageLockTest(_StageTestBase):
             _outcome_fn([ClassifyResult(msg_index=0, category="活动通知", summary="s", quote="q")], [])
         ))
 
-        with patch(
-            "briefdesk.pipeline.get_enabled_sessions",
-            new=AsyncMock(return_value=[{"session_id": "s"}]),
-        ), patch(
-            "briefdesk.pipeline.get_enabled_categories",
-            new=AsyncMock(return_value=[{"name": "x"}]),
-        ), patch(
-            "briefdesk.pipeline.are_messages_processed", new=AsyncMock(return_value=set())
-        ), patch(
-            "briefdesk.pipeline.bulk_insert_raw_messages", new=AsyncMock(side_effect=fake_bulk)
-        ), patch(
-            "briefdesk.pipeline.mark_messages_processed", new=AsyncMock()
-        ), patch(
-            "briefdesk.plugins.dedup.plugin.mark_message_processed", new=AsyncMock()
-        ), patch(
-            "briefdesk.plugins.dedup.plugin.insert_item",
-            new=AsyncMock(return_value="new-id"),
-        ), patch(
-            "briefdesk.plugins.merge.plugin.get_merge_candidates",
-            new=AsyncMock(return_value=[]),
-        ), patch("briefdesk.pipeline.publish_items_updated", new=AsyncMock()):
+        with _pipeline_patches(raw_insert=AsyncMock(side_effect=fake_bulk)):
             await process_all_batches(
                 batch, _pipeline_client(), batch_size=10, origin="test"
             )
@@ -402,27 +415,7 @@ class ActiveBatchTrackingTest(_StageTestBase):
             _outcome_fn([ClassifyResult(msg_index=0, category="活动通知", summary="s", quote="q")], [])
         ))
 
-        with patch(
-            "briefdesk.pipeline.get_enabled_sessions",
-            new=AsyncMock(return_value=[{"session_id": "s"}]),
-        ), patch(
-            "briefdesk.pipeline.get_enabled_categories",
-            new=AsyncMock(return_value=[{"name": "x"}]),
-        ), patch(
-            "briefdesk.pipeline.are_messages_processed", new=AsyncMock(return_value=set())
-        ), patch(
-            "briefdesk.pipeline.bulk_insert_raw_messages", new=AsyncMock(side_effect=probe)
-        ), patch(
-            "briefdesk.pipeline.mark_messages_processed", new=AsyncMock()
-        ), patch(
-            "briefdesk.plugins.dedup.plugin.mark_message_processed", new=AsyncMock()
-        ), patch(
-            "briefdesk.plugins.dedup.plugin.insert_item",
-            new=AsyncMock(return_value="new-id"),
-        ), patch(
-            "briefdesk.plugins.merge.plugin.get_merge_candidates",
-            new=AsyncMock(return_value=[]),
-        ), patch("briefdesk.pipeline.publish_items_updated", new=AsyncMock()):
+        with _pipeline_patches(raw_insert=AsyncMock(side_effect=probe)):
             await process_all_batches(
                 batch, _pipeline_client(), batch_size=10, origin="test"
             )
