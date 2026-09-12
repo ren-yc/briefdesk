@@ -499,3 +499,29 @@ class MergeAfterRunReembedTest(unittest.IsolatedAsyncioTestCase):
         cached_ids = {c.id for c in engine._cache}
         self.assertNotIn("i2", cached_ids, "已删除卡不得复活进缓存")
         self.assertIn("i1", cached_ids, "既有缓存条目不受影响")
+
+
+class AiProviderPortsGuardTest(unittest.IsolatedAsyncioTestCase):
+    """未 setup 直接调用端口 → 显式 RuntimeError（非
+    AssertionError，-O 下 assert 被剥离时同样可靠）。"""
+
+    def setUp(self):
+        ai_ports.set_ai(None)
+
+    async def asyncTearDown(self):
+        ai_ports.set_ai(None)
+
+    async def test_unsetup_port_calls_raise_runtime_error(self):
+        plugin = AiProviderPlugin()
+        with self.assertRaises(RuntimeError):
+            await plugin.chat(
+                [{"role": "user", "content": "x"}], temperature=0.1, max_tokens=1
+            )
+        with self.assertRaises(RuntimeError):
+            await plugin.rag_chat(
+                [{"role": "user", "content": "x"}], temperature=0.1, max_tokens=1
+            )
+        with self.assertRaises(RuntimeError):
+            await plugin.embed_texts(["x"])
+        with self.assertRaises(RuntimeError):
+            plugin.embed_model_name()

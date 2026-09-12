@@ -72,15 +72,40 @@ class OcrPlugin(StagePlugin):
             if not msg.image_urls:
                 continue
             ocr_start = time_module.perf_counter()
-            try:
-                contents = [
-                    await batch.client.download_media(url) for url in msg.image_urls
-                ]
-            except MediaError as e:
-                # 单条图片下载失败不应拖垮整批（图片过期/源离线时跳过 OCR，
-                # 卡片仍以原文内容入库并保留 image_urls 供前端代理显示）
-                logger.warning("图片下载失败，跳过 OCR（消息 %s）: %s", msg.msg_id, e)
+            # 逐图下载、按图容错（行为改进）：MediaError 的图置
+            # None，其余图继续 OCR 与 vision stash——单图过期/源离线不再
+            # 拖垮同消息的其它图。与原短路实现相比，失败后剩余下载会被
+            # 并发打出（对源客户端多若干请求），换取同消息多图可用性。
+            # 非预期异常（非 MediaError）保持原传播语义。
+            results = await asyncio.gather(
+                *(batch.client.download_media(url) for url in msg.image_urls),
+                return_exceptions=True,
+            )
+            contents: list[bytes | None] = []
+            failed: list[MediaError] = []
+            for r in results:
+                if isinstance(r, MediaError):
+                    contents.append(None)
+                    failed.append(r)
+                elif isinstance(r, BaseException):
+                    raise r
+                else:
+                    contents.append(r)
+            if len(failed) == len(msg.image_urls):
+                # 全部图失败：整条跳过 OCR（卡片仍以原文内容入库并保留
+                # image_urls 供前端代理显示）
+                logger.warning(
+                    "图片下载失败，跳过 OCR（消息 %s）: %s", msg.msg_id, failed[0]
+                )
                 continue
+            if failed:
+                logger.warning(
+                    "图片下载部分失败（消息 %s）：%d/%d 张成功，失败图跳过",
+                    msg.msg_id,
+                    len(contents) - len(failed),
+                    len(contents),
+                )
+            valid = [c for c in contents if c is not None]
             if config.ai_vision_enabled:
                 # vision 路由：归一化后的图片字节随批暂存供 classify 构建
                 # 多模态请求。置于 OCR 之前且独立于其结果——OCR 失败或
@@ -89,14 +114,14 @@ class OcrPlugin(StagePlugin):
                 stashed = [
                     normalized
                     for normalized in await asyncio.to_thread(
-                        self._normalize_vision_bytes, contents
+                        self._normalize_vision_bytes, valid
                     )
                     if normalized is not None
                 ]
                 if stashed:
                     batch.vision_images[(msg.source, msg.msg_id)] = stashed
             try:
-                ocr_text = await self._ocr_image_bytes(contents)
+                ocr_text = await self._ocr_image_bytes(valid)
             except Exception as e:  # noqa: BLE001 — OCR 失败不应拖垮整批
                 # 引擎故障等非预期异常：跳过 OCR，卡片仍以原文内容入库
                 logger.warning("OCR 识别失败，跳过（消息 %s）: %s", msg.msg_id, e)
@@ -114,8 +139,8 @@ class OcrPlugin(StagePlugin):
             logger.debug(
                 "OCR 完成: msg_id=%s, %d 图, %d bytes, 识别 %d 字 (%s)",
                 msg.msg_id,
-                len(msg.image_urls),
-                sum(len(c) for c in contents),
+                len(valid),
+                sum(len(c) for c in valid),
                 len(ocr_text or ""),
                 fmt_dur(time_module.perf_counter() - ocr_start),
             )

@@ -168,6 +168,27 @@ async def _reap_task(task: asyncio.Task[None] | None, timeout: float = 5.0) -> N
         logger.exception("关闭期间任务 %s 异常", task.get_name())
 
 
+async def _wait_server_started(server, server_task: asyncio.Task, *, timeout_s: float = 10.0, poll_interval_s: float = 0.05) -> None:
+    """等 uvicorn 进入 started（信号 handler 覆盖的前提），默认最多 10s。
+
+    - started：正常返回。
+    - server_task 提前结束（启动失败，如端口占用）：立即返回且**不告警**——
+      失败由 await server_task 上抛给 finally 统一清理（显式
+      失败而非静默超时）。
+    - 超时：告警后以未确认状态继续（静默跳过注册会排障误导）。
+    """
+    steps = max(1, int(timeout_s / poll_interval_s))
+    for _ in range(steps):
+        if server.started:
+            return
+        if server_task.done():
+            return
+        await asyncio.sleep(poll_interval_s)
+    logger.warning(
+        "server 启动等待超时（%.0fs），以未确认状态继续", timeout_s
+    )
+
+
 async def _run() -> None:
     """启动顺序：数据库 → 插件装配 → HTTP 服务器 → 实时监听 → 回填。
 
@@ -330,15 +351,7 @@ async def _run() -> None:
         # （capture_signals），Ctrl+C 只设 should_exit、不会 signal_shutdown，
         # SSE 流会干等 timeout_graceful_shutdown 后被强杀。等 uvicorn 启动
         # 完成（started，handle_exit 已注册）后再注册，覆盖回我们的 handler。
-        for _ in range(200):  # 最多等 10s（启动失败则跳过注册）
-            if server.started:
-                break
-            if server_task.done():
-                # 复核 P3-4：启动失败（如端口占用）时 server_task 提前结束，
-                # 无需白等满 10s——提前退出等待，随后 await server_task 会把
-                # 失败抛给 finally 统一清理。
-                break
-            await asyncio.sleep(0.05)
+        await _wait_server_started(server, server_task)
         _install_signal_handlers(asyncio.get_running_loop(), _shutdown)
 
         # 7. 等待服务器退出；随后统一清理（finally 是唯一清理点，

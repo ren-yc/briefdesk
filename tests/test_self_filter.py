@@ -463,3 +463,64 @@ class QqflowLookupMessageTest(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SelfCheckCacheTest(unittest.IsolatedAsyncioTestCase):
+    """（预防性）：IGNORE_SELF 回查判定带短 TTL 缓存——同 rawid
+    重复投递只回查一次 REST，TTL 过期后重新回查。"""
+
+    async def _handle(self, listener, rawid="42"):
+        event = {
+            "event": "message.new",
+            "sessionId": "g1",
+            "sessionType": "group",
+            "groupName": "群",
+            "rawid": rawid,
+            "sourceName": "自己",
+            "content": "测试消息内容",
+            "timestamp": 1000,
+        }
+        with patch.object(config, "ignore_self", True), patch.object(
+            config, "realtime_batch_max_count", 10
+        ):
+            await listener._handle_event(event)
+
+    def _make_listener(self):
+        client = Mock()
+        client.name = "qqflow"
+        client.self_uid = "u_12345"
+        client.lookup_message = AsyncMock(
+            return_value={
+                "localId": 42,
+                "localType": 0,
+                "createTime": 1,
+                "isSend": 0,
+                "senderUsername": "u_0",
+                "content": "内容",
+            }
+        )
+        listener = QqFlowSseClient(client, lambda batch: None, settings=Mock())
+        return listener, client
+
+    async def test_same_rawid_looks_up_once(self):
+        listener, client = self._make_listener()
+        with patch.object(config, "realtime_batch_max_count", 10):
+            await self._handle(listener)
+            await self._handle(listener, rawid="42")
+        client.lookup_message.assert_awaited_once()
+        self.assertIn("42", listener._self_check_cache)
+
+    async def test_expired_ttl_relooks_up(self):
+        import time as time_module
+
+        listener, client = self._make_listener()
+        with patch.object(config, "realtime_batch_max_count", 10):
+            await self._handle(listener)
+            # 另一 rawid 预置过期缓存条目（同 rawid 会被 SSE FIFO 去重拦下）
+            listener._self_check_cache["other"] = (
+                time_module.monotonic() - 61.0,
+                False,
+            )
+            await self._handle(listener, rawid="other")
+        self.assertEqual(client.lookup_message.await_count, 2)
+        self.assertGreaterEqual(listener._self_check_cache["other"][0], 0)

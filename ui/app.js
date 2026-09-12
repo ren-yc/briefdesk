@@ -294,7 +294,15 @@ async function _loadInlineSvg(img, src) {
     span.className = img.className;
     if (img.id) span.id = img.id;
     if (img.alt) span.setAttribute("aria-label", img.alt);
-    span.innerHTML = svgText;
+    // SVG 文本先经 DOMParser 解析取根节点再插入 DOM——不再把未解析
+    // 字符串直接 innerHTML；_SVG_CONTENT_RE 形状校验保留在上游，此处拒绝
+    // 解析失败（parsererror）与非 svg 根节点
+    const doc = new DOMParser().parseFromString(svgText, "image/svg+xml");
+    const svgRoot = doc.documentElement;
+    if (!svgRoot || svgRoot.nodeName !== "svg" || svgRoot.querySelector("parsererror")) {
+      throw new Error("invalid svg document");
+    }
+    span.appendChild(document.importNode(svgRoot, true));
     img.replaceWith(span);
   } catch {
     // 保留原始 <img>（黑色兜底），不阻断页面
@@ -4577,7 +4585,7 @@ function _patchEnvItem(key, fresh) {
   Object.assign(item, fresh); // staged / source
   const group = _groupByPlugin(envData.items.filter(i => !i.hidden))
     .find(g => g.items.some(i => i.key === key));
-  const $row = document.querySelector('#env-items .env-row[data-env-key="' + key + '"]');
+  const $row = document.querySelector('#env-items .env-row[data-env-key="' + CSS.escape(key) + '"]');
   if ($row && group) $row.outerHTML = _envRowHtml(item, _envGroupDisabled(group));
   _applyEnvFilter();
   _updateSaveButton();
@@ -4588,7 +4596,7 @@ function _patchSecretRow(name, fresh) {
   const secret = (envData.secrets || []).find(s => s.name === name);
   if (!secret) return;
   Object.assign(secret, fresh); // configured / keyringConfigured
-  const $row = document.querySelector('#env-secrets .env-row[data-sec-name="' + name + '"]');
+  const $row = document.querySelector('#env-secrets .env-row[data-sec-name="' + CSS.escape(name) + '"]');
   if ($row) $row.outerHTML = _envSecretRowHtml(secret);
   _applyEnvFilter();
 }
@@ -4718,7 +4726,7 @@ async function restoreEnvKey(key) {
 }
 
 async function setEnvSecret(name) {
-  const input = document.querySelector('[data-sec-input="' + name + '"]');
+  const input = document.querySelector('[data-sec-input="' + CSS.escape(name) + '"]');
   const value = input ? input.value.trim() : "";
   if (!value) {
     showToast("请输入密钥值", { type: "error", duration: 3000 });

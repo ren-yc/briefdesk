@@ -4,6 +4,17 @@
 > **同步更新义务**：修改模块职责、插件体系、DB schema、server 路由或配置项时，必须同步更新本文对应小节。
 > 分工：`README.md` 面向使用者的快速上手；根目录 `USAGE.md` 面向普通用户的日常使用手册；`AGENTS.md` 只承载协作规则与质量门禁；本文承载全部架构细节。
 
+## 目录
+
+- [定位](#定位)
+- [总览与数据流](#总览与数据流)
+- [核心模块](#核心模块)
+- [插件框架](#插件框架)
+- [数据库](#数据库)
+- [前端](#前端)
+- [配置](#配置)
+- [设计要点与陷阱](#设计要点与陷阱)
+
 ## 定位
 
 简报台（Brief Desk）is a local web app that monitors group chat messages via pluggable message sources
@@ -56,52 +67,52 @@ weflow-server :5033        WeFlow(legacy) :5031        qqflow-server :5032
 | Module | Role |
 |---|---|
 | `main.py` (root) | 3-line shim for `python main.py` backward compatibility. Delegates to `briefdesk.main:main`. |
-| `briefdesk/main.py` | Real entry point — runtime lifecycle only (业务编排见 `poll_cycle.py`) 详解见本表后同名小节。 |
+| `briefdesk/main.py` | Real entry point — runtime lifecycle only（启动顺序、关停编排、信号处理）。[详见下文](#briefdeskmainpy) |
 | `briefdesk/__main__.py` | Enables `python -m briefdesk`. |
-| `briefdesk/poll_cycle.py` | 轮询周期业务编排（应用层控制流，不属源包）。 详解见本表后同名小节。 |
-| `briefdesk/types.py` | Cross-module base types: `InternalMessage` dataclass (msg_id, content, sender_name, sender_id, 详解见本表后同名小节。 |
-| `briefdesk/masking.py` | 共享文本净化（纯函数、只依赖标准库 re/unicodedata）：`mask_content` 把手机号/身份证/邮箱/银行卡替换为占位符（幂等），被 详解见本表后同名小节。 |
+| `briefdesk/poll_cycle.py` | 轮询周期业务编排（应用层控制流，不属源包）：`run_poll_cycle` 拉取→管道→水位推进。[详见下文](#briefdeskpoll_cyclepy) |
+| `briefdesk/types.py` | Cross-module base types：`InternalMessage`/`BatchContext`/`ClassifyOutcome` 等跨模块 dataclass。[详见下文](#briefdesktypespy) |
+| `briefdesk/masking.py` | 共享文本净化（纯函数）：`mask_content` 把手机号/身份证/邮箱/银行卡替换为占位符（幂等）。[详见下文](#briefdeskmaskingpy) |
 | `briefdesk/imaging.py` | 图片字节归一化（vision 路由的 classify 输入预处理，Pillow 为直接依赖）：`downscale_image` 把任意可解码图片归一为受限 JPEG——EXIF 转正、透明通道平铺白底（防透明区落黑底干扰识别）、超 1568px 等比缩放（LANCZOS）、超 `max_bytes` 先降质量再降边长各一次（仍超尽力而为返回最后一次结果）；任何解码/处理失败返回 None，由调用方逐图跳过。**输出恒为 JPEG** → classify 侧 data URL 无需格式嗅探。 |
-| `briefdesk/ai_ports.py` | AI 供应商端口：ai_provider 插件在 setup 阶段把实例注册到 `ctx.ai` 与本模块（`set_ai`），引擎（classify/dedup/merge）经端口函数 详解见本表后同名小节。 |
-| `briefdesk/plugins/ai_provider/engine.py` | OpenAI 兼容供应商实现：共享 `AsyncOpenAI` 客户端（`get_ai_client`）、`chat`（thinking 开关 `AI_DISABLE_THINKING`、**严格 详解见本表后同名小节。 |
+| `briefdesk/ai_ports.py` | AI 供应商端口：引擎经 `chat`/`embed_texts`/`rag_chat` 等端口函数调用，不直接依赖供应商插件。[详见下文](#briefdeskai_portspy) |
+| `briefdesk/plugins/ai_provider/engine.py` | OpenAI 兼容供应商实现：共享 `AsyncOpenAI` 客户端、`chat`（thinking 开关）与嵌入端点封装。[详见下文](#briefdeskpluginsai_providerenginepy) |
 | `briefdesk/plugins/ai_provider/plugin.py` | `AiProviderPlugin`（显式实现 Plugin + AIProvider）：setup 构造 `Provider` 并注册到 `ctx.ai` 与 `briefdesk.ai_ports`；teardown 清除注册（幂等）。classify/dedup/merge 依赖本插件（拓扑序保证其先就绪）。 |
-| `briefdesk/plugins/classify/engine.py` | AI 分类引擎。 详解见本表后同名小节。 |
-| `briefdesk/plugins/dedup/engine.py` | `DedupEngine`（显式实现 DedupService 服务端口）语义去重，判定管线：**image_urls 精确短路**（图片路径集合完全一致 → 直接判重、零 AI；同图重发是确定性证据， 详解见本表后同名小节。 |
-| `briefdesk/plugins/merge/engine.py` | 会话内同话题片段合并判官（与去重互补的第二个 AI 判定）：同一会话里一个话题常由前后多条消息拼成（物品名/价格/运费各一句），逐条分类会各成一张卡。 详解见本表后同名小节。 |
-| `briefdesk/plugins/ocr/engine.py` | RapidOCR（基于 ONNX Runtime，CPU 推理）图片文字识别。 详解见本表后同名小节。 |
-| `briefdesk/announcements.py` | 应用级公告注册表——持续性条件的顶部横幅（如嵌入服务未启用/不可用）：`announce(code, level, message)`/`revoke(code)` 仅内容变化时发布 详解见本表后同名小节。 |
+| `briefdesk/plugins/classify/engine.py` | AI 分类引擎：sysb/sysc 两阶段 prompt、截断与边界、解析容错。[详见下文](#briefdeskpluginsclassifyenginepy) |
+| `briefdesk/plugins/dedup/engine.py` | `DedupEngine`（实现 DedupService 端口）语义去重判定管线：精确短路→字符重叠→嵌入→AI 判官。[详见下文](#briefdeskpluginsdedupenginepy) |
+| `briefdesk/plugins/merge/engine.py` | 会话内同话题片段合并判官（与去重互补的第二个 AI 判定），判定字段与合并证据。[详见下文](#briefdeskpluginsmergeenginepy) |
+| `briefdesk/plugins/ocr/engine.py` | RapidOCR（基于 ONNX Runtime，CPU 推理）图片文字识别（懒加载、进程内单例）。[详见下文](#briefdeskpluginsocrenginepy) |
+| `briefdesk/announcements.py` | 应用级公告注册表——持续性条件的顶部横幅：置位/撤销契约与 SSE 下发。[详见下文](#briefdeskannouncementspy) |
 | `briefdesk/realtime.py` | 进程内发布/订阅：`publish_items_updated()`（列表刷新）与 `publish_sync_progress()`（同步进度事件）把事件推给所有订阅队列（队列项为 `(事件名, data JSON)` 二元组），由 server 的 `/api/stream` SSE 按事件名转发给前端。订阅队列满丢弃事件累计 `_dropped_count`（`get_dropped_count()` 只读诊断口）。 |
-| `briefdesk/status.py` | 应用运行时状态 + 消息源注册表：`set_status`/`get_status_info`/`is_syncing`、`register_source_client`/`get_source_client`、 详解见本表后同名小节。 |
+| `briefdesk/status.py` | 应用运行时状态 + 消息源注册表：`set_status`/`is_syncing`/同步进度计数与源客户端注册。[详见下文](#briefdeskstatuspy) |
 | `briefdesk/sync.py` | 同步服务：`set_sync_callback` + `trigger_sync()`（fire-and-forget 全源轮询任务，syncing 互斥，结束后经 realtime 广播 `synced`）。main 启动与 `/api/sync` 共用。 |
-| `briefdesk/config.py` | `pydantic-settings` from `[.env, UI 暂存文件]`（密钥型字段以 `SecretStr` 持有，repr/序列化自动掩码；密钥解析链见「配置解析链」小节）。 详解见本表后同名小节。 |
+| `briefdesk/config.py` | `pydantic-settings` 配置（.env + UI 暂存文件；密钥 `SecretStr` 掩码；解析链见「配置」节）。[详见下文](#briefdeskconfigpy) |
 | `briefdesk/settings_env.py` | UI「启动配置」暂存层：`get_settings_file()`（`platformdirs.user_config_dir("briefdesk")/settings.env`，可经 `BRIEFDESK_SETTINGS_FILE` 覆盖）、`read_staged`/`write_staged`（`KEY=VALUE` 行、原子写、空则删文件）、`source_of`（override/env/dotenv/default 判定）。不 import config（config 在 import 期构造 env_file 列表）。 |
-| `briefdesk/settings_base.py` | `KeyringSettingsBase`——app 级与 weflow/weflow-legacy/qqflow/rag 五个 Settings 的公共基类： 详解见本表后同名小节。 |
+| `briefdesk/settings_base.py` | `KeyringSettingsBase`——app 级与各源插件 Settings 的公共基类（密钥环解析链挂载）。[详见下文](#briefdesksettings_basepy) |
 | `briefdesk/settings_schema.py` | 从核心或插件 `BaseSettings` 模型生成 JSON 安全的设置 schema（字段类型、默认值、当前值、约束与密钥配置状态）；统一规范化/校验前端暂存值，密钥不回传明文。 |
-| `briefdesk/plugins/weflow_legacy/normalize.py` | Two normalization paths: `normalize_sse` and `normalize_rest` both produce **lists** of `InternalMessage` 详解见本表后同名小节。 |
-| `briefdesk/pipeline.py` | `process_all_batches()` — 管道**骨架**（不 import 任何 AI/OCR 实现）：入口对每条消息统一盖章 `msg.source = client.name`（源身份单 详解见本表后同名小节。 |
-| `briefdesk/db.py` | All SQLite via `aiosqlite` 详解见本表后同名小节。 |
-| `briefdesk/server/` | FastAPI HTTP 服务子包（按职责分组的模块）：`app.py`（FastAPI 实例）、`middleware.py`（Host 白名单 + 同源校验 + CSP 头；CSRF 收口： 详解见本表后同名小节。 |
-| `briefdesk/plugins/calendar/plugin.py` + `router.py` + `db.py` | `CalendarPlugin`（显式实现 WebPlugin）：`/api/calendar` 日历视图路由（区间带开始/截止卡片，排除已忽略）；**数据访问随插件分发**——`db.py` 的 详解见本表后同名小节。 |
-| `briefdesk/plugins/reminders/plugin.py` + `router.py` | `RemindersPlugin`（显式实现 WebPlugin）：`POST /api/items/:id/reminder`（设置/清除卡片提醒，aware→本地墙钟换算、参数校验）与 详解见本表后同名小节。 |
-| `briefdesk/plugins/benchmark/` | 实验性基准插件（可选插件，默认禁用，显式实现 WebPlugin + StagePlugin 双能力）：`/api/benchmark/*` 路由 + 自带前端（设置弹窗内运行，前端轮 详解见本表后同名小节。 |
-| `briefdesk/sources_base.py` | 消息源抽象（核心契约模块，无 sources 包）：`SourceClient` Protocol（`name`/`connection_status`/`download_media`/`close` 详解见本表后同名小节。 |
-| `briefdesk/plugins/weflow/plugin.py` | `WeFlowPlugin`（显式实现 SourcePlugin）：setup 校验 `WEFLOW_API_TOKEN`/`WEFLOW_WXID`/`WEFLOW_DB_KEYS` 必填配 详解见本表后同名小节。 |
-| `briefdesk/plugins/weflow/` | weflow 消息源（实现 `SourceRuntime`，接入 weflow-server 默认 :5033，微信 4.x 活库直读）。 详解见本表后同名小节。 |
+| `briefdesk/plugins/weflow_legacy/normalize.py` | Two normalization paths: `normalize_sse` and `normalize_rest` both produce **lists** of `InternalMessage`。[详见下文](#briefdeskpluginsweflow_legacynormalizepy) |
+| `briefdesk/pipeline.py` | `process_all_batches()` — 管道**骨架**：入口过滤、raw 落库、批次编排与阶段调度（不 import 任何 AI/OCR 实现）。[详见下文](#briefdeskpipelinepy) |
+| `briefdesk/db.py` | All SQLite via `aiosqlite`（单连接单例、存储锁、schema 迁移与备份/恢复）。[详见下文](#briefdeskdbpy) |
+| `briefdesk/server/` | FastAPI HTTP 服务子包（按职责分组）：app/middleware/核心路由/媒体代理/SPA 托管。[详见下文](#briefdeskserver) |
+| `briefdesk/plugins/calendar/plugin.py` + `router.py` + `db.py` | `CalendarPlugin`（实现 WebPlugin）：`/api/calendar` 日历视图路由；数据访问随插件分发。[详见下文](#briefdeskpluginscalendarpluginpy-routerpy-dbpy) |
+| `briefdesk/plugins/reminders/plugin.py` + `router.py` | `RemindersPlugin`（实现 WebPlugin）：卡片提醒的设置/清除路由与浏览器通知轮询。[详见下文](#briefdeskpluginsreminderspluginpy-routerpy) |
+| `briefdesk/plugins/benchmark/` | 实验性基准插件（可选、默认禁用，WebPlugin + StagePlugin 双能力）：基准路由与自带前端。[详见下文](#briefdeskpluginsbenchmark) |
+| `briefdesk/sources_base.py` | 消息源抽象（核心契约模块）：SourceClient/Runtime 协议、批缓冲、连接重试与 URL 拼接助手。[详见下文](#briefdesksources_basepy) |
+| `briefdesk/plugins/weflow/plugin.py` | `WeFlowPlugin`（实现 SourcePlugin）：必填配置校验与 runtime 注册（缺失自禁用）。[详见下文](#briefdeskpluginsweflowpluginpy) |
+| `briefdesk/plugins/weflow/` | weflow 消息源（实现 `SourceRuntime`，接入 weflow-server 默认 :5033，微信 4.x 活库直读）。[详见下文](#briefdeskpluginsweflow) |
 | `briefdesk/plugins/weflow_legacy/plugin.py` | `WeFlowLegacyPlugin`（显式实现 SourcePlugin）：setup 构造 `WeFlowLegacySource` 并经 `ctx.register_source` 注册；activate 无副作用（监听启动由应用层编排）；teardown 关闭 runtime。必填校验经 `validate_required_config`（缺 `WEFLOW_LEGACY_API_TOKEN` → setup 抛 `PluginDisabledError` 自禁用，与 weflow/qqflow 一致）。模块底部暴露 `plugin` 实例供 entry point 引用。 |
 | `briefdesk/plugins/qqflow/plugin.py` | `QqFlowPlugin`（显式实现 SourcePlugin）：setup 校验 `QQFLOW_API_TOKEN`/`QQFLOW_QQ`/`QQFLOW_KEY` 必填配置，缺失抛 `PluginDisabledError` 自禁用；齐备则构造 `QqFlowSource` 并经 `ctx.register_source` 注册。teardown 关闭 runtime。 |
-| `briefdesk/plugins/weflow_legacy/runtime.py` | `WeFlowLegacySource`（实现 `SourceRuntime`）— weflow-legacy 源装配门面：构造 `WeFlowLegacyClient`（参数缺省时读 详解见本表后同名小节。 |
-| `briefdesk/plugins/qqflow/` | qqflow 消息源（实现 `SourceRuntime`，接入 qqflow-server 默认 :5032）。 详解见本表后同名小节。 |
-| `briefdesk/plugins/weflow_legacy/client.py` | `WeFlowLegacyClient` class（实现 `SourceClient`）— 封装所有 WeFlow HTTP 通信 + API 数据类型（`WeFlowLegacyEvent`, 详解见本表后同名小节。 |
-| `briefdesk/plugins/weflow_legacy/sse.py` | SSE 实时监听，指数退避 + 抖动自动重连（退避参数由 `WeFlowLegacySettings` 构造注入）；SSE 读超时可配置 详解见本表后同名小节。 |
-| `briefdesk/plugins/rag/*` | `RagPlugin`（**双能力插件先例**：显式继承 StagePlugin + WebPlugin）：slot=post_insert（priority=10，恒排 merge 之后）做批次索引— 详解见本表后同名小节。 |
-| `briefdesk/plugins/weflow_legacy/poller.py` | REST 历史回填（**按会话窗口**：`window_start_by_session` 提供各会话增量下界（会话水位-overlap）；缺省/无水位会话回退 `BACKFILL_HOURS`（默认 详解见本表后同名小节。 |
-| `briefdesk/logger.py` | 标准 logging 配置。 详解见本表后同名小节。 |
+| `briefdesk/plugins/weflow_legacy/runtime.py` | `WeFlowLegacySource`（实现 `SourceRuntime`）— weflow-legacy 源装配门面。[详见下文](#briefdeskpluginsweflow_legacyruntimepy) |
+| `briefdesk/plugins/qqflow/` | qqflow 消息源（实现 `SourceRuntime`，接入 qqflow-server 默认 :5032）。[详见下文](#briefdeskpluginsqqflow) |
+| `briefdesk/plugins/weflow_legacy/client.py` | `WeFlowLegacyClient`（实现 `SourceClient`）— 封装全部 WeFlow HTTP 通信 + API 数据类型。[详见下文](#briefdeskpluginsweflow_legacyclientpy) |
+| `briefdesk/plugins/weflow_legacy/sse.py` | SSE 实时监听：指数退避 + 抖动自动重连、读超时与 FIFO 去重。[详见下文](#briefdeskpluginsweflow_legacyssepy) |
+| `briefdesk/plugins/rag/*` | `RagPlugin`（**双能力插件先例**：StagePlugin + WebPlugin）：检索问答的路由、库层与维护循环。[详见下文](#briefdeskpluginsrag) |
+| `briefdesk/plugins/weflow_legacy/poller.py` | REST 历史回填（**按会话窗口**：水位下界 + BACKFILL_HOURS 回退 + 翻页早停）。[详见下文](#briefdeskpluginsweflow_legacypollerpy) |
+| `briefdesk/logger.py` | 标准 logging 配置（根 handler、查询串掩码、access 日志门控）。[详见下文](#briefdeskloggerpy) |
 | `briefdesk/events.py` | 内部事件总线（topic pub/sub）：核心与插件间的通用解耦通道（realtime 只管前端 SSE）。同步/异步处理器均支持，处理器异常只记日志不向发布方传播。模块级单例 `event_bus` 由 main 注入 PluginContext。核心删除卡片后发布 `EVENT_ITEMS_DELETED`（"items_deleted"），去重插件订阅后同步清理内存缓存。 |
 | `briefdesk/stages.py` | 管道阶段注册表与装配期上下文：StagePlugin 经 `ctx.register_stage` 注册（main 把端口接到本模块），pipeline 骨架按槽位（enrich → classify → dedup → post_insert）读取，同槽按 priority 升序；`set_context` 注入装配期 PluginContext（阶段 run(batch, ctx) 经此获得 `ctx.dedup` 等服务端口）。模块级单例，测试用 `reset()` 隔离。 |
-| `briefdesk/plugins/ocr/plugin.py` | `OcrPlugin`（显式实现 StagePlugin，slot=enrich）：setup 延迟导入引擎——rapidocr/onnxruntime（可选依赖）缺失时抛 详解见本表后同名小节。 |
+| `briefdesk/plugins/ocr/plugin.py` | `OcrPlugin`（实现 StagePlugin，slot=enrich）：懒加载引擎、逐图下载容错与 vision stash。[详见下文](#briefdeskpluginsocrpluginpy) |
 | `briefdesk/plugins/classify/plugin.py` | `ClassifyPlugin`（显式实现 StagePlugin，slot=classify）：run 调引擎 `classify_batch` 并把 `ClassifyOutcome` 写入 `batch.outcomes`。 |
 | `briefdesk/plugins/dedup/plugin.py` | `DedupPlugin`（显式实现 StagePlugin，slot=dedup）：setup 构造 `DedupEngine` + **预热去重缓存**（HTTP 服务启动前、源监听启动前），注册为 `ctx.dedup` 服务端口并订阅 `EVENT_ITEMS_DELETED`（同步处理器，发布方持锁时保持原子）；`before_run`（锁外）行规划 + 批内预嵌入，`run`（锁内）判重/入库/缓存，`after_run`（锁外）向量落库。 |
-| `briefdesk/plugins/merge/plugin.py` | `MergePlugin`（显式实现 StagePlugin，slot=post_insert，依赖 dedup）：run（锁内）把 `batch.inserted` 新卡与同会话近期未核实卡经 AI 详解见本表后同名小节。 |
+| `briefdesk/plugins/merge/plugin.py` | `MergePlugin`（实现 StagePlugin，slot=post_insert，依赖 dedup）：锁内 AI 合并判定与卡片更新。[详见下文](#briefdeskpluginsmergepluginpy) |
 | `briefdesk/plugin/__init__.py` | 插件框架包（核心侧）：导出协议与 PluginManager。实现层在 `briefdesk/plugins/`。 |
 | `briefdesk/plugin/base.py` | 插件最小契约：`Plugin` Protocol（name/version/dependencies + setup/activate/teardown 生命周期）、`PluginContext`（核心注入给插件的服务端口集合，见下「插件框架」）、异常 `PluginError`（致命）/`PluginDisabledError`（自禁用，非致命）。内置插件类显式继承对应能力协议（mypy 强制实现完整性；第三方插件亦可鸭子实现，manager 只做结构校验）。详见下方「插件框架」。 |
 | `briefdesk/plugin/config_helpers.py` | 插件配置验证助手：`validate_required_config(settings, {字段名: 环境变量名})` 统一必填项检查——SecretStr 自动解包、非 str 标量（如 property 返回的 dict）按真值判定，缺失任一项抛 `PluginDisabledError` 一次性列出**全部**缺失环境变量名（weflow/weflow-legacy/qqflow 三个源插件 setup 共用；调用方应把所有必填项放进同一次调用以聚合报错，勿拆成多次）。 |
@@ -203,6 +214,11 @@ JSON 输出**（`_use_json_object`：ollama api key 或 deepseek-v4-flash/pro �
 AI 分类引擎。分类类别由 DB `categories` 表驱动（用户可增删改/启用停用，见 db.py），`build_system_prompt` 按启用类别动态构建 system
 prompt，
 按群分组构建 prompt，解析统一外壳 `{"task":"classify","data":[...]}` 中的 data 数组 → `ClassifyResult`。
+**两阶段 prompt（sysb/sysc）**：分类引擎内部由两个系统 prompt 阶段构成——**sysb 紧凑分类阶段**（`build_system_prompt` + `_build_user_message`，
+显式 include 判定：AI 对每条消息给出分类或显式排除，产出 results / retry_indexes / time_indexes；对字面模糊 quote 先经 `_char_quote_verdict`
+字面关、再经 `_quote_aligned` 语义关复核，漂移条目移出 results 进 retry）与 **sysc 时间提取阶段**（`_build_time_system_prompt` +
+`extract_times`：只消费 sysb 产出的 `time_indexes`，逐条解析时间并输出可选 `times` 数组（{type,time,label}）——下述「多时间点」描述即归属
+sysc；解析失败/超长同样整段本轮抛弃，不标 processed）。两阶段均为一次 AI 调用、独立解析，互不共享失败。
 `_parse_response` 对结构错误抛错（整段本轮抛弃）、对未知类别（AI 幻觉，不在 allowed 集合）逐条 defer 进 retry_indexes：均不标记 processed、
 由
 下一轮回填重试。`finish_reason=length` 输出截断按消息数拆半递归重试（不可再拆则本轮抛弃）；传输失败/空响应/解析失败同样整段本轮抛弃。整批字符预算
@@ -729,6 +745,8 @@ WARNING）的日志噪音；`fmt_dur()` 统一耗时格式。
 `plugins/merge/engine.py`。
 
 ## 插件框架
+
+> 第三方插件从零上手请阅读 [plugin-dev.md](plugin-dev.md)（最小示例、槽位契约、生命周期与失败补偿、配置与密钥、测试建议）；本节面向理解既有装配与契约细节。
 
 **依赖方向单向**：核心与 `briefdesk/plugin/*` 永不静态 import `briefdesk.plugins.*`，由
 `tests/test_no_core_imports_plugins.py` 的 AST 守卫强制执行；插件实现层可自由依赖核心与 `briefdesk/plugin/*`。

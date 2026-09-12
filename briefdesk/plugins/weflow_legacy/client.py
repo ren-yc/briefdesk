@@ -25,6 +25,7 @@ from briefdesk.masking import clean_display_name
 from briefdesk.plugins.weflow_legacy.config import WeFlowLegacySettings
 from briefdesk.sources_base import (
     LIST_MAX_LIMIT,
+    MAX_SSE_BUFFER_BYTES,
     ConnectionStatus,
     MediaError,
     SourceClient,
@@ -603,10 +604,22 @@ class WeFlowLegacyClient(SourceClient):
                         on_connected()
 
                     buffer = ""
+                    buffer_bytes = 0
                     async for line in resp.aiter_lines():
-                        buffer += line + "\n"
+                        chunk = line + "\n"
+                        buffer += chunk
+                        buffer_bytes += len(chunk.encode())
+                        if buffer_bytes > MAX_SSE_BUFFER_BYTES:
+                            # 预防性：畸形无换行流会让缓冲无限膨胀，
+                            # 超限结束本次流，交给既有重连退避自愈
+                            logger.warning(
+                                "SSE 缓冲超限（>%d 字节，疑似畸形流），结束本次流等待重连",
+                                MAX_SSE_BUFFER_BYTES,
+                            )
+                            break
                         while "\n\n" in buffer:
                             event_text, buffer = buffer.split("\n\n", 1)
+                            buffer_bytes -= len(event_text.encode()) + 2
                             for event_line in event_text.split("\n"):
                                 if event_line.startswith("data: "):
                                     try:

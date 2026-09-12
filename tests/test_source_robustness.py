@@ -38,6 +38,7 @@ from briefdesk.plugins.weflow_legacy.client import WeFlowLegacyClient
 from briefdesk.plugins.weflow_legacy.config import WeFlowLegacySettings
 from briefdesk.plugins.weflow_legacy.sse import WeFlowLegacySseClient
 from briefdesk.sources_base import (
+    MAX_SSE_BUFFER_BYTES,
     BatchBuffer,
     DrainableListenerMixin,
     SourceError,
@@ -1184,3 +1185,51 @@ class SseSelfHealMismatchTest(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SseBufferCapTest(unittest.IsolatedAsyncioTestCase):
+    """（预防性）：畸形无换行流令缓冲超限 → 记 WARNING、生成器
+    结束（交给既有重连退避），不无限膨胀。三源同构，参数化覆盖。"""
+
+    async def _collect(self, module_name, client, ensure_ready=None):
+        def handler(request: httpx.Request) -> httpx.Response:
+            huge = "x" * (MAX_SSE_BUFFER_BYTES + 64)
+            return httpx.Response(
+                200,
+                headers={"content-type": "text/event-stream"},
+                text='data: {"event":"message_new","rawid":"r1"}\n\n' + huge,
+            )
+
+        real_cls = httpx.AsyncClient
+        patch_target = f"briefdesk.plugins.{module_name}.client.httpx.AsyncClient"
+        if ensure_ready is not None:
+            client.ensure_ready = AsyncMock()  # type: ignore[method-assign]
+        with patch(
+            patch_target,
+            lambda **_kw: real_cls(transport=httpx.MockTransport(handler)),
+        ):
+            return [event async for event in client.stream_events()]
+
+    async def test_oversized_line_ends_stream_with_warning(self):
+        client = QqFlowClient("http://127.0.0.1:5032", "tok", qq="1", key="k" * 16)
+        with self.assertLogs("briefdesk.plugins.qqflow.client", level="WARNING"):
+            events = await self._collect("qqflow", client, ensure_ready=True)
+        # 超限前的合法事件已产出，随后流被掐断（不再有后续事件、生成器结束）
+        self.assertEqual([e.get("rawid") for e in events], ["r1"])
+
+    async def test_weflow_and_legacy_share_cap_semantics(self):
+        wf = WeFlowClient("http://127.0.0.1:5033", "tok", wxid="wx")
+        legacy = WeFlowLegacyClient("http://127.0.0.1:5031", "tok")
+        for module_name, logger_name, client in (
+            ("weflow", "briefdesk.plugins.weflow.client", wf),
+            (
+                "weflow_legacy",
+                "briefdesk.plugins.weflow_legacy.client",
+                legacy,
+            ),
+        ):
+            with self.subTest(source=module_name):
+                with self.assertLogs(logger_name, level="WARNING"):
+                    events = await self._collect(module_name, client)
+                # 超限前的合法事件照常产出，随后流被掐断
+                self.assertEqual([e.get("rawid") for e in events], ["r1"])

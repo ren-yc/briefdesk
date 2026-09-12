@@ -10,6 +10,7 @@
 import asyncio
 import sys
 import unittest
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from briefdesk.plugin.base import PluginError
@@ -299,3 +300,47 @@ class StartupInterruptCleanupTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class WaitServerStartedTest(unittest.IsolatedAsyncioTestCase):
+    """启动等待超时告警；task 提前结束不告警且立即返回。"""
+
+    async def test_timeout_warns_and_continues(self):
+        from briefdesk.main import _wait_server_started
+
+        server = SimpleNamespace(started=False)
+        task = asyncio.create_task(asyncio.sleep(5))
+        try:
+            with self.assertLogs("briefdesk.main", level="WARNING") as captured:
+                await _wait_server_started(
+                    server, task, timeout_s=0.003, poll_interval_s=0.001
+                )
+        finally:
+            task.cancel()
+        self.assertTrue(
+            any("启动等待超时" in m for m in captured.output), captured.output
+        )
+
+    async def test_task_done_exits_early_without_warning(self):
+        from briefdesk.main import _wait_server_started
+
+        server = SimpleNamespace(started=False)
+        task = asyncio.create_task(asyncio.sleep(0))  # 立即结束（模拟启动失败）
+        await task
+        with self.assertNoLogs("briefdesk.main", level="WARNING"):
+            await _wait_server_started(
+                server, task, timeout_s=10.0, poll_interval_s=0.001
+            )
+
+    async def test_started_returns_immediately(self):
+        from briefdesk.main import _wait_server_started
+
+        server = SimpleNamespace(started=True)
+        task = asyncio.create_task(asyncio.sleep(5))
+        try:
+            with self.assertNoLogs("briefdesk.main", level="WARNING"):
+                await _wait_server_started(
+                    server, task, timeout_s=10.0, poll_interval_s=0.001
+                )
+        finally:
+            task.cancel()

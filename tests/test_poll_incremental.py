@@ -1095,3 +1095,62 @@ class PagingAgeEarlyStopTest(unittest.IsolatedAsyncioTestCase):
             window_start_by_session={"g1": window},
         )
         self.assertEqual(len(client.calls), 2, "第二页碰到超窗消息后不得再翻第三页")
+
+
+class PollFlagResetTest(unittest.IsolatedAsyncioTestCase):
+    """（预防性）：poll 结束（正常/异常路径）后 _polling 复位 False，
+    且复位与置位持同一把 _poll_lock——互斥语义不依赖单线程假设。"""
+
+    def _source(self) -> Mock:
+        source = Mock()
+        source.name = "weflow-legacy"
+        source.client = Mock()
+        source.fetch_history = AsyncMock(
+            return_value=SimpleNamespace(
+                contacts=[],
+                sessions=[],
+                messages=[],
+                failed_sessions=set(),
+            )
+        )
+        return source
+
+    def _patches(self, pipeline_return=True, pipeline_side_effect=None):
+        pipeline = AsyncMock(return_value=pipeline_return)
+        if pipeline_side_effect is not None:
+            pipeline.side_effect = pipeline_side_effect
+        return (
+            patch(
+                "briefdesk.poll_cycle.get_enabled_sessions",
+                new=AsyncMock(return_value=[]),
+            ),
+            patch("briefdesk.poll_cycle.set_status", new=Mock()),
+            patch(
+                "briefdesk.poll_cycle.process_all_batches",
+                new=pipeline,
+            ),
+            patch(
+                "briefdesk.poll_cycle.update_session_last_polls",
+                new=AsyncMock(),
+            ),
+        )
+
+    async def test_poll_cycle_resets_flag_after_success(self):
+        import briefdesk.poll_cycle as pc
+
+        source = self._source()
+        patches = self._patches()
+        with patches[0], patches[1], patches[2], patches[3]:
+            await run_poll_cycle(source)
+        self.assertFalse(pc._polling)
+
+    async def test_poll_cycle_resets_flag_after_failure(self):
+        import briefdesk.poll_cycle as pc
+
+        source = self._source()
+        patches = self._patches(
+            pipeline_side_effect=RuntimeError("boom")
+        )
+        with patches[0], patches[1], patches[2], patches[3]:
+            await run_poll_cycle(source)
+        self.assertFalse(pc._polling)

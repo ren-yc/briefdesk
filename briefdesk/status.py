@@ -99,13 +99,11 @@ def note_sync_batch_start(count: int) -> dict:
         prev = _sync_progress["startedAt"]
         now = datetime.now(UTC)
         if prev:
-            try:
-                prev_dt = datetime.fromisoformat(prev)
-                if now <= prev_dt:
-                    now = prev_dt + timedelta(microseconds=1)
-            except ValueError:
-                if now.isoformat() == prev:
-                    now = now + timedelta(microseconds=1)
+            # startedAt 仅由下方 now.isoformat() 写入，fromisoformat 不会
+            # 失败（原 except ValueError 为不可达分支，已删）
+            prev_dt = datetime.fromisoformat(prev)
+            if now <= prev_dt:
+                now = prev_dt + timedelta(microseconds=1)
         _sync_progress["startedAt"] = now.isoformat()
         _sync_progress["newCount"] = 0
         _sync_progress["processedCount"] = 0

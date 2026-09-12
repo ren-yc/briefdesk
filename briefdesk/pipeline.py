@@ -279,11 +279,11 @@ async def process_all_batches(
         source,
     )
 
-    messages = filtered_messages
+    to_store = filtered_messages
 
     # 无启用类别 → 整批保留：不标记 processed（回填窗口内下轮自动重试），
     # 同时跳过 raw 落库（将来成功分类时再落）。
-    if messages and not await get_enabled_categories():
+    if to_store and not await get_enabled_categories():
         logger.warning("没有启用的类别，本轮消息全部跳过（保留待回填）")
         set_status(
             {
@@ -293,7 +293,7 @@ async def process_all_batches(
         )
         return False
     # raw 落库（过滤后的消息）
-    if messages:
+    if to_store:
         # 纳入 storage_lock：bulk_insert_raw_messages 内部 atomic_transaction
         # 会 commit，锁外 commit 会把锁内其它多步写（如 delete_items 级联、
         # update_item_merged 的 UPDATE→DELETE）提前提交，击穿「单连接 + 隐式
@@ -313,12 +313,12 @@ async def process_all_batches(
                         timestamp=m.timestamp,
                         article_url=m.article_url or "",
                     )
-                    for m in messages
+                    for m in to_store
                 ]
             )
-        logger.debug("raw 落库: %d 条", len(messages))
+        logger.debug("raw 落库: %d 条", len(to_store))
 
-    if not messages:
+    if not to_store:
         logger.debug(
             "入口过滤后无消息: 自消息过滤 %d, 图片屏蔽 %d, 启用会话过滤 %d, 已处理过滤 %d",
             filter_stats['self'],
@@ -338,7 +338,7 @@ async def process_all_batches(
 
     if batch_size is None:
         batch_size = config.realtime_batch_max_count
-    batches = _split_batches(messages, batch_size)
+    batches = _split_batches(to_store, batch_size)
 
     # enrich 阶段集已在入口 OCR 检查处获取（运行期不变：register_stage
     # 仅发生在装配期 setup_all，无运行时注册），此处不再重复获取
@@ -364,7 +364,7 @@ async def process_all_batches(
     # 同步进度：入口计数进入处理的消息（含处理中的实时消息），每批完成后
     # 递减；事件携带快照驱动前端状态指示器的同步进度展示。早退路径
     # （无类别/阶段缺失）不计数——消息未在推进，避免"永不完成"。
-    note_sync_batch_start(len(messages))
+    note_sync_batch_start(len(to_store))
     await publish_sync_progress(get_sync_progress())
 
     async def _run_front(

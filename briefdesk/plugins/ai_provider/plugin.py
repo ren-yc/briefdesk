@@ -50,18 +50,25 @@ class AiProviderPlugin(Plugin, AIProvider):
             self._ctx = None
         self._provider = None
 
-    # AIProvider 端口（委托给内部 Provider 实例）
+    # AIProvider 端口（委托给内部 Provider 实例）。
+    # 未装配检查用显式 RuntimeError：assert 在 python -O 下被
+    # 剥离，届时端口会把 None 当 Provider 用，报错点远离根因。
+    def _require_provider(self) -> AIProvider:
+        if self._provider is None:
+            raise RuntimeError("ai_provider 未完成 setup")
+        return self._provider
+
     async def chat(self, messages, *, temperature, max_tokens, timeout=None):
-        assert self._provider is not None
-        return await self._provider.chat(
+        provider = self._require_provider()
+        return await provider.chat(
             messages, temperature=temperature, max_tokens=max_tokens, timeout=timeout
         )
 
     async def rag_chat(
         self, messages, *, temperature, max_tokens, model="", api_base="", api_key=""
     ):
-        assert self._provider is not None
-        return await self._provider.rag_chat(
+        provider = self._require_provider()
+        return await provider.rag_chat(
             messages,
             temperature=temperature,
             max_tokens=max_tokens,
@@ -71,15 +78,14 @@ class AiProviderPlugin(Plugin, AIProvider):
         )
 
     async def embed_texts(self, texts):
-        assert self._provider is not None
-        return await self._provider.embed_texts(texts)
+        provider = self._require_provider()
+        return await provider.embed_texts(texts)
 
     def is_embedding_enabled(self) -> bool:
         return self._provider is not None and self._provider.is_embedding_enabled()
 
     def embed_model_name(self) -> str:
-        assert self._provider is not None
-        return self._provider.embed_model_name()
+        return self._require_provider().embed_model_name()
 
 
 plugin = AiProviderPlugin()

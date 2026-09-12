@@ -139,6 +139,39 @@ def loads_json(text: str, *, repair: bool = True) -> object | None:
             return None
 
 
+def cosine_similarity(a: list[float], b: list[float]) -> float:
+    """标量余弦相似度（单对向量，非矩阵批量）：语义对齐裁判等单对比较的
+    共享实现（原 classify 本地 _cosine 与判官数学重复，改一漏一）。
+
+    numpy 可用走向量化快路径（float64，与纯 Python 同精度）；导入失败时
+    回退纯 Python（数值一致，测试随机向量对拍保证）。任一侧范数为 0 →
+    返回 0.0（零向量与任何向量都不相似，与 top_k_similar 的 +1e-12 口径
+    语义一致）。
+    """
+    try:
+        import numpy as np
+    except ImportError:  # pragma: no cover — numpy 为核心依赖，回退仅为防御
+        np = None  # type: ignore[assignment]
+
+    if np is not None:
+        va = np.asarray(a, dtype=np.float64)
+        vb = np.asarray(b, dtype=np.float64)
+        na = float(np.linalg.norm(va))
+        nb = float(np.linalg.norm(vb))
+        if not na or not nb:
+            return 0.0
+        return float(va @ vb / (na * nb))
+
+    dot = na = nb = 0.0
+    for x, y in zip(a, b):
+        dot += x * y
+        na += x * x
+        nb += y * y
+    if not na or not nb:
+        return 0.0
+    return dot / ((na**0.5) * (nb**0.5))
+
+
 def top_k_similar(
     query_embedding: list[float] | np.ndarray,
     item_embeddings: list[list[float]] | np.ndarray,

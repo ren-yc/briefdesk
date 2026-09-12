@@ -1610,3 +1610,34 @@ class VisionClassifyTest(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CosineSharedImplementationTest(unittest.TestCase):
+    """共享余弦实现（ai_ports.cosine_similarity）的 numpy
+    快路径与纯 Python 回退路径数值一致（随机向量对拍）。"""
+
+    def test_numpy_path_matches_pure_python(self):
+        import random
+
+        from briefdesk.ai_ports import cosine_similarity
+
+        rng = random.Random(20260912)
+        for _ in range(200):
+            n = rng.randint(1, 16)
+            a = [rng.uniform(-10, 10) for _ in range(n)]
+            b = [rng.uniform(-10, 10) for _ in range(n)]
+            via_np = cosine_similarity(a, b)
+            # 纯 Python 参考（float64 顺序累加，与原 classify._cosine 逐字同）
+            dot = na = nb = 0.0
+            for x, y in zip(a, b):
+                dot += x * y
+                na += x * x
+                nb += y * y
+            via_py = 0.0 if not na or not nb else dot / ((na**0.5) * (nb**0.5))
+            self.assertAlmostEqual(via_np, via_py, delta=1e-9)
+
+    def test_zero_vector_safe(self):
+        from briefdesk.ai_ports import cosine_similarity
+
+        self.assertEqual(cosine_similarity([0.0, 0.0], [1.0, 2.0]), 0.0)
+        self.assertEqual(cosine_similarity([1.0, 2.0], [0.0, 0.0]), 0.0)

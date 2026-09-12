@@ -161,7 +161,10 @@ async def run_poll_cycle(source: SourceRuntime) -> None:
         )
         set_status({"lastError": str(e)})
     finally:
-        _polling = False
+        # 复位与置位持同一把 _poll_lock（预防性加固）：单事件循环
+        # 下当前实现已足够，显式入锁使互斥语义不依赖单线程假设
+        async with _poll_lock:
+            _polling = False
 
 
 async def _compute_session_windows(

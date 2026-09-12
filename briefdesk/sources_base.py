@@ -92,6 +92,12 @@ def make_sse_timeout(read_timeout_s: float) -> httpx.Timeout:
     )
 
 
+# 三源 stream_events 共享的未消费缓冲上限（预防性加固）：畸形
+# 无换行流会让 buffer 无限膨胀。超限记 WARNING 并结束本次流，交给既有
+# 重连退避（上游恢复后自愈）。
+MAX_SSE_BUFFER_BYTES = 1 << 20
+
+
 def build_endpoint_url(base_url: str, path: str) -> str:
     """按 base_url 的路径前缀拼接端点（三源共享，REST/SSE/媒体同源语义）。
 

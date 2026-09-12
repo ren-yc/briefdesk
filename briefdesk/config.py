@@ -145,4 +145,19 @@ class Settings(KeyringSettingsBase):
     model_config: ClassVar[SettingsConfigDict] = {"populate_by_name": True}
 
 
-config = Settings()
+def _load_config() -> Settings:
+    """实例化 Settings，把 pydantic 校验异常包装为信息明确的 RuntimeError。
+
+    裸 ValidationError 的栈对「.env 写错一个值」的场景过于晦涩；包装后
+    保留原始错误文本（str(e) 含逐字段原因）并直接给出修复指引。
+    """
+    try:
+        return Settings()
+    except Exception as e:
+        raise RuntimeError(
+            "配置校验失败：请检查 .env / 环境变量的取值与格式"
+            f"（原始错误：{e}）"
+        ) from e
+
+
+config = _load_config()

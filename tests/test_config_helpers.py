@@ -2,6 +2,7 @@
 
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from pydantic import SecretStr
 
@@ -72,6 +73,34 @@ class ValidateRequiredConfigTest(unittest.TestCase):
             message.index("A_WXID"),
             "缺失项按声明顺序列出",
         )
+
+
+
+class ConfigLoadWrapperTest(unittest.TestCase):
+    """Settings 校验失败 → 包装为带修复指引的
+    RuntimeError（保留原始逐字段错误文本），不再裸抛 ValidationError 栈。"""
+
+    def test_invalid_settings_wrapped_as_runtime_error(self):
+        from pydantic import BaseModel, ValidationError
+
+        from briefdesk import config as config_module
+
+        class _Probe(BaseModel):
+            x: int
+
+        try:
+            _Probe(x="not-an-int")  # type: ignore[arg-type]
+            self.fail("应抛 ValidationError")
+        except ValidationError as e:
+            validation_error = e
+
+        with (
+            patch.object(config_module, "Settings", side_effect=validation_error),
+            self.assertRaises(RuntimeError) as cm,
+        ):
+            config_module._load_config()
+        self.assertIn(".env", str(cm.exception))
+        self.assertIn("配置校验失败", str(cm.exception))
 
 
 if __name__ == "__main__":

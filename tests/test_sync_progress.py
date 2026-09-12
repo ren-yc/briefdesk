@@ -347,3 +347,70 @@ class PipelineSyncProgressCountsTest(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class StartedAtMonotonicityTest(unittest.TestCase):
+    """同微秒/更早时刻再次开突发 → startedAt 严格递增 +1µs（固定行为，
+    原按 except ValueError 承载，分支不可达后由时钟比较直接保证）。"""
+
+    def setUp(self):
+        from briefdesk.status import reset_sync_progress
+
+        reset_sync_progress()
+        self.addCleanup(reset_sync_progress)
+
+    def test_equal_timestamp_bumps_by_one_microsecond(self):
+        from datetime import UTC, datetime, timedelta
+
+        from briefdesk import status as status_module
+
+        fixed = datetime.now(UTC)
+        started: list[str] = []
+
+        class _FixedDatetime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return fixed
+
+        real_fromiso = status_module.datetime.fromisoformat
+
+        with patch.object(status_module, "datetime", _FixedDatetime):
+            first = status_module.note_sync_batch_start(1)
+            started.append(first["startedAt"])
+            # 收尾后同刻再开突发：startedAt 必须 +1µs 严格递增
+            status_module.note_sync_batch_done(1)
+            second = status_module.note_sync_batch_start(1)
+            started.append(second["startedAt"])
+        prev_dt = real_fromiso(started[0])
+        next_dt = real_fromiso(started[1])
+        self.assertEqual(next_dt - prev_dt, timedelta(microseconds=1))
+
+    def test_later_timestamp_kept_monotonic(self):
+        from datetime import UTC, datetime, timedelta
+
+        from briefdesk import status as status_module
+
+        base = datetime.now(UTC)
+        later = base + timedelta(microseconds=5)
+
+        class _SeqDatetime(datetime):
+            calls = 0
+
+            @classmethod
+            def now(cls, tz=None):
+                cls.calls += 1
+                return base if cls.calls == 1 else later
+
+        real_fromiso = status_module.datetime.fromisoformat
+
+        with patch.object(status_module, "datetime", _SeqDatetime):
+            first = status_module.note_sync_batch_start(1)
+            status_module.note_sync_batch_done(1)
+            second = status_module.note_sync_batch_start(1)
+        self.assertLess(
+            real_fromiso(first["startedAt"]), real_fromiso(second["startedAt"])
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()

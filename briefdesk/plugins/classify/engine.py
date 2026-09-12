@@ -13,7 +13,13 @@ from dataclasses import replace
 from difflib import SequenceMatcher
 
 from briefdesk import announcements
-from briefdesk.ai_ports import chat, embed_texts, is_embedding_enabled, loads_json
+from briefdesk.ai_ports import (
+    chat,
+    cosine_similarity,
+    embed_texts,
+    is_embedding_enabled,
+    loads_json,
+)
 from briefdesk.config import config
 from briefdesk.db import CategoryRow, get_enabled_categories
 from briefdesk.plugin.base import ChatResponse
@@ -442,17 +448,6 @@ def _char_quote_verdict(
     return None
 
 
-def _cosine(a: list[float], b: list[float]) -> float:
-    dot = na = nb = 0.0
-    for x, y in zip(a, b):
-        dot += x * y
-        na += x * x
-        nb += y * y
-    if not na or not nb:
-        return 0.0
-    return dot / ((na ** 0.5) * (nb ** 0.5))
-
-
 def _quote_aligned(qv: list[float], cvecs: list[list[float]], own_idx: int) -> bool:
     """单条语义判定：quote 向量与自身消息的相似度是否不低于最佳他者
     （容差 _SEMANTIC_ALIGN_MARGIN，不足视为平票放行——宁放行勿误杀）。
@@ -461,7 +456,7 @@ def _quote_aligned(qv: list[float], cvecs: list[list[float]], own_idx: int) -> b
     即放行）。唯一语义判定实现：字面关（_char_quote_verdict）判出的模糊
     条目经 _semantic_refine 逐条调用本函数复核。
     """
-    sims = [_cosine(qv, cv) for cv in cvecs]
+    sims = [cosine_similarity(qv, cv) for cv in cvecs]
     own = sims[own_idx] if 0 <= own_idx < len(sims) else 0.0
     best_other = max(
         (s for i, s in enumerate(sims) if i != own_idx), default=0.0
@@ -505,7 +500,7 @@ async def _semantic_refine(
             continue
         # 判定权威在 _quote_aligned；此处重算两个相似度仅供 WARNING 日志
         # （冷分支，仅漂移条目走到），供排障时对照 own/other 数值
-        sims = [_cosine(qv, cv) for cv in cvecs]
+        sims = [cosine_similarity(qv, cv) for cv in cvecs]
         own = sims[idx] if 0 <= idx < len(sims) else 0.0
         best_other = max(
             (s for i, s in enumerate(sims) if i != idx), default=0.0

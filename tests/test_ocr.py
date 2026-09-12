@@ -164,11 +164,14 @@ class OcrPluginSetupTest(unittest.IsolatedAsyncioTestCase):
 class _FakeMediaClient:
     """可配置的假媒体客户端：按 URL 返回字节或抛 MediaError。"""
 
-    def __init__(self, payloads=None, error=None):
+    def __init__(self, payloads=None, error=None, errors=None):
         self._payloads = payloads or {}
         self._error = error
+        self._errors = errors or {}
 
     async def download_media(self, url):
+        if url in self._errors:
+            raise MediaError(self._errors[url])
         if self._error is not None:
             raise MediaError(self._error)
         return self._payloads.get(url, b"raw-bytes")
@@ -236,3 +239,84 @@ class OcrPluginVisionStashTest(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class OcrPartialDownloadFailureTest(unittest.IsolatedAsyncioTestCase):
+    """（行为改进）：逐图下载按图容错——单图 MediaError 置 None，
+    其余图继续 OCR 与 vision stash；全部图失败才整条跳过。"""
+
+    def _multi_image_msg(self, urls) -> InternalMessage:
+        return InternalMessage(
+            msg_id="m1",
+            content="[图片]",
+            sender_name="张三",
+            sender_id="u1",
+            session_id="s1",
+            group_name="社团群",
+            timestamp=1,
+            source="weflow-legacy",
+            image_urls=urls,
+        )
+
+    async def test_partial_failure_keeps_other_images(self):
+        """3 图含 1 个 MediaError → 其余 2 图仍 OCR 且 stash 含 2 图字节。"""
+        plugin = OcrPlugin()
+        plugin._ocr_image_bytes = AsyncMock(return_value="识别文本")
+        png = _png_bytes()
+        msg = self._multi_image_msg(["p1", "p2", "p3"])
+        batch = BatchContext(
+            messages=[msg],
+            client=_FakeMediaClient(
+                payloads={"p1": png, "p3": png},
+                errors={"p2": "404"},
+            ),
+        )
+        with patch.object(config, "ai_vision_enabled", True):
+            await plugin.run(batch, None)
+        # 其余 2 图仍 OCR（内容替换含 OCR 文本）
+        self.assertEqual(msg.content, "[OCR]\n识别文本")
+        # stash 含 2 图（失败图不进 stash）
+        stashed = batch.vision_images[("weflow-legacy", "m1")]
+        self.assertEqual(len(stashed), 2)
+
+    async def test_ocr_receives_successful_images_in_original_order(self):
+        """OCR 引擎收到的字节序与原 image_urls 中成功图的原序一致。"""
+        plugin = OcrPlugin()
+        received: list[list[bytes]] = []
+
+        async def fake_ocr(contents):
+            received.append(contents)
+            return "文本"
+
+        plugin._ocr_image_bytes = fake_ocr
+        png1 = _png_bytes()
+        png3 = _png_bytes()
+        msg = self._multi_image_msg(["p1", "p2", "p3"])
+        batch = BatchContext(
+            messages=[msg],
+            client=_FakeMediaClient(
+                payloads={"p1": png1, "p3": png3}, errors={"p2": "404"}
+            ),
+        )
+        await plugin.run(batch, None)
+        self.assertEqual(received[-1], [png1, png3])
+
+    async def test_all_images_failed_keeps_original_skip_semantics(self):
+        """全部图失败 → 整条跳过（现有日志文案 + continue 语义不变）。"""
+        plugin = OcrPlugin()
+        ocr_mock = AsyncMock(return_value="识别文本")
+        plugin._ocr_image_bytes = ocr_mock
+        msg = self._multi_image_msg(["p1", "p2"])
+        batch = BatchContext(
+            messages=[msg],
+            client=_FakeMediaClient(error="503"),
+        )
+        with self.assertLogs("briefdesk.plugins.ocr.plugin", level="WARNING") as captured:
+            await plugin.run(batch, None)
+        ocr_mock.assert_not_awaited()
+        self.assertEqual(batch.vision_images, {})
+        self.assertEqual(msg.content, "[图片]")
+        self.assertTrue(
+            any("图片下载失败，跳过 OCR" in m for m in captured.output),
+            captured.output,
+        )

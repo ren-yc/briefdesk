@@ -8,6 +8,7 @@ import asyncio
 import logging
 import math
 import random
+import time
 from collections import deque
 
 from briefdesk.config import config
@@ -48,6 +49,12 @@ _MISMATCH_RETRY_SECONDS = 60.0
 class QqFlowSseClient(DrainableListenerMixin, RealtimeListener[QqFlowClient]):
     """SSE 实时消息监听器，自动重连。实现 RealtimeListener 契约。"""
 
+    # 预防性：IGNORE_SELF 回查判定缓存（rawid → 是否自消息）。
+    # 重连重放/重复投递会让同 rawid 重复进入回查，每条一次本机 REST 纯属
+    # 浪费；TTL 60s 内命中即复用，容量上限防长期运行缓慢累积。
+    _SELF_CHECK_TTL_SECONDS = 60.0
+    _SELF_CHECK_CACHE_MAX = 4096
+
     def __init__(
         self,
         qqflow: QqFlowClient,
@@ -75,6 +82,9 @@ class QqFlowSseClient(DrainableListenerMixin, RealtimeListener[QqFlowClient]):
         # stop() 启动的收尾冲刷任务（协议要求 stop 为同步方法，故后台执行；
         # DrainableListenerMixin 提供，此处显式置 None 以便类型检查）
         self._drain_task: asyncio.Task | None = None
+        # IGNORE_SELF 回查判定缓存（rawid → (monotonic, 是否自消息)；
+        # dict 插入序即新鲜序，容量淘汰从最旧弹出）
+        self._self_check_cache: dict[str, tuple[float, bool]] = {}
 
     def invalidate_session_cache(self) -> None:
         # 启用会话过滤已收敛到 pipeline 入口（每批实时查询），无缓存可失效；
@@ -207,23 +217,36 @@ class QqFlowSseClient(DrainableListenerMixin, RealtimeListener[QqFlowClient]):
             )
             return
         # IGNORE_SELF：SSE 事件无发送者标识，按消息回查 REST 判定（仅开启时，
-        # 每消息 +1 次本机 HTTP；回查失败/未命中 fail-open 放行不拖垮监听）
+        # 每消息 +1 次本机 HTTP；回查失败/未命中 fail-open 放行不拖垮监听）。
+        # 判定结果带短 TTL 缓存，同 rawid 重放/重复投递不再重复回查
         if config.ignore_self and not msg.is_self:
-            try:
-                raw = await self._qqflow.lookup_message(
-                    msg.session_id, msg.msg_id, msg.timestamp
-                )
-            except Exception as e:  # noqa: BLE001 — 回查失败不拖垮监听循环
-                logger.warning(
-                    "SSE rawid=%s: 自消息回查失败，按非自己放行: %s", msg.msg_id, e
-                )
+            now = time.monotonic()
+            cached = self._self_check_cache.get(msg.msg_id)
+            if cached is not None and now - cached[0] <= self._SELF_CHECK_TTL_SECONDS:
+                # 命中即刷新：重新插入保持容量淘汰的新鲜序
+                self._self_check_cache.pop(msg.msg_id)
+                self._self_check_cache[msg.msg_id] = (now, cached[1])
+                msg.is_self = cached[1]
             else:
-                if raw is not None:
-                    msg.is_self = is_self_message(raw, self._qqflow.self_uid)
-                else:
-                    logger.debug(
-                        "SSE rawid=%s: 自消息回查未命中，按非自己放行", msg.msg_id
+                if cached is not None:
+                    self._self_check_cache.pop(msg.msg_id)
+                try:
+                    raw = await self._qqflow.lookup_message(
+                        msg.session_id, msg.msg_id, msg.timestamp
                     )
+                except Exception as e:  # noqa: BLE001 — 回查失败不拖垮监听循环
+                    logger.warning(
+                        "SSE rawid=%s: 自消息回查失败，按非自己放行: %s", msg.msg_id, e
+                    )
+                else:
+                    if raw is not None:
+                        msg.is_self = is_self_message(raw, self._qqflow.self_uid)
+                    else:
+                        logger.debug(
+                            "SSE rawid=%s: 自消息回查未命中，按非自己放行", msg.msg_id
+                        )
+                    # 未命中也视为确定判定（非自己）一并缓存
+                    self._store_self_check(msg.msg_id, msg.is_self, now)
         if msg.is_self:
             # 自己发送：监听器层直接丢弃（不标记 processed，关闭 IGNORE_SELF
             # 后经回填/重放可恢复），避免管道逐条 INFO 刷屏
@@ -231,3 +254,11 @@ class QqFlowSseClient(DrainableListenerMixin, RealtimeListener[QqFlowClient]):
             logger.debug("SSE rawid=%s: 自己发送的消息，丢弃", msg.msg_id)
             return
         self._batch_buffer.add(msg)
+
+    def _store_self_check(self, rawid: str, verdict: bool, now: float) -> None:
+        """登记回查判定（重新插入保持新鲜序；超容量从最旧弹出）。"""
+        self._self_check_cache.pop(rawid, None)
+        self._self_check_cache[rawid] = (now, verdict)
+        while len(self._self_check_cache) > self._SELF_CHECK_CACHE_MAX:
+            oldest = next(iter(self._self_check_cache))
+            self._self_check_cache.pop(oldest)
