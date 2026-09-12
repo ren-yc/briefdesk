@@ -12,6 +12,7 @@ import unittest
 from unittest.mock import AsyncMock, patch
 
 import aiosqlite
+import pytest
 
 from briefdesk import stages
 from briefdesk.config import config
@@ -122,68 +123,65 @@ class SyncProgressStateTest(unittest.TestCase):
 
     def test_start_begins_burst(self):
         sp = note_sync_batch_start(3)
-        self.assertEqual(
-            sp,
-            {
+        assert sp == {
                 "startedAt": sp["startedAt"],
                 "newCount": 3,
                 "pendingCount": 3,
                 "processedCount": 0,
                 "done": False,
-            },
-        )
-        self.assertTrue(sp["startedAt"])
+            }
+        assert sp["startedAt"]
 
     def test_accumulates_while_pending(self):
         note_sync_batch_start(2)
         sp = note_sync_batch_start(3)
-        self.assertEqual(sp["newCount"], 5)
-        self.assertEqual(sp["pendingCount"], 5)
-        self.assertEqual(sp["processedCount"], 0)
-        self.assertFalse(sp["done"])
+        assert sp["newCount"] == 5
+        assert sp["pendingCount"] == 5
+        assert sp["processedCount"] == 0
+        assert not sp["done"]
 
     def test_done_decrements_and_flags_when_zero(self):
         note_sync_batch_start(3)
         sp = note_sync_batch_done(1)
-        self.assertEqual((sp["pendingCount"], sp["processedCount"]), (2, 1))
-        self.assertFalse(sp["done"])
+        assert (sp["pendingCount"], sp["processedCount"]) == (2, 1)
+        assert not sp["done"]
         sp = note_sync_batch_done(2)
-        self.assertEqual((sp["pendingCount"], sp["processedCount"]), (0, 3))
-        self.assertTrue(sp["done"])
+        assert (sp["pendingCount"], sp["processedCount"]) == (0, 3)
+        assert sp["done"]
 
     def test_new_burst_after_done_resets_counts(self):
         note_sync_batch_start(3)
         note_sync_batch_done(3)
         first = get_sync_progress()["startedAt"]
         sp = note_sync_batch_start(1)
-        self.assertEqual(sp["newCount"], 1)
-        self.assertEqual(sp["processedCount"], 0)
-        self.assertFalse(sp["done"])
-        self.assertNotEqual(sp["startedAt"], first, "新突发更新开始时间")
+        assert sp["newCount"] == 1
+        assert sp["processedCount"] == 0
+        assert not sp["done"]
+        assert sp["startedAt"] != first, "新突发更新开始时间"
 
     def test_done_clamps_negative_pending(self):
         note_sync_batch_done(99)
         sp = get_sync_progress()
-        self.assertEqual(sp["pendingCount"], 0)
+        assert sp["pendingCount"] == 0
 
     def test_snapshot_is_copy(self):
         note_sync_batch_start(2)
         snap = get_sync_progress()
         snap["newCount"] = 999
-        self.assertEqual(get_sync_progress()["newCount"], 2)
+        assert get_sync_progress()["newCount"] == 2
 
     def test_status_info_carries_sync_progress(self):
         note_sync_batch_start(5)
         status = get_status_info()
         sp = status["syncProgress"]
-        self.assertEqual(sp["newCount"], 5)
-        self.assertEqual(sp["pendingCount"], 5)
+        assert sp["newCount"] == 5
+        assert sp["pendingCount"] == 5
 
 
 # ── realtime：两类事件分别派发 ──
 
 
-class RealtimePublishEventTest(unittest.IsolatedAsyncioTestCase):
+class TestRealtimePublishEvent:
     async def _subscribe_one(self):
         q = await subscribe()
         return q
@@ -193,8 +191,8 @@ class RealtimePublishEventTest(unittest.IsolatedAsyncioTestCase):
         try:
             await publish_items_updated({"x": 1})
             name, data = await q.get()
-            self.assertEqual(name, "items_updated")
-            self.assertEqual(json.loads(data), {"x": 1})
+            assert name == "items_updated"
+            assert json.loads(data) == {"x": 1}
         finally:
             await unsubscribe(q)
 
@@ -205,10 +203,10 @@ class RealtimePublishEventTest(unittest.IsolatedAsyncioTestCase):
                 {"newCount": 7, "pendingCount": 3, "processedCount": 4, "done": False}
             )
             name, data = await q.get()
-            self.assertEqual(name, "sync_progress")
+            assert name == "sync_progress"
             payload = json.loads(data)
-            self.assertEqual(payload["newCount"], 7)
-            self.assertEqual(payload["pendingCount"], 3)
+            assert payload["newCount"] == 7
+            assert payload["pendingCount"] == 3
         finally:
             await unsubscribe(q)
 
@@ -216,10 +214,10 @@ class RealtimePublishEventTest(unittest.IsolatedAsyncioTestCase):
         q = await self._subscribe_one()
         await unsubscribe(q)
         await publish_sync_progress({"newCount": 1, "pendingCount": 1})
-        self.assertTrue(q.empty())
+        assert q.empty()
 
 
-class RealtimeDropCounterTest(unittest.IsolatedAsyncioTestCase):
+class TestRealtimeDropCounter:
     """审查修复 #9：SSE 订阅队列满丢弃事件必须可观测（累计计数器）。"""
 
     async def test_full_queue_drop_increments_counter(self):
@@ -230,8 +228,8 @@ class RealtimeDropCounterTest(unittest.IsolatedAsyncioTestCase):
                 q.put_nowait("e" + str(i))
             await publish_items_updated({"k": 1})  # 满 → 丢弃
             await publish_items_updated({"k": 2})  # 满 → 丢弃
-            self.assertEqual(q.qsize(), 32)
-            self.assertEqual(get_dropped_count() - before, 2)
+            assert q.qsize() == 32
+            assert get_dropped_count() - before == 2
         finally:
             await unsubscribe(q)
 
@@ -240,8 +238,8 @@ class RealtimeDropCounterTest(unittest.IsolatedAsyncioTestCase):
         q = await subscribe()
         try:
             await publish_items_updated({"k": 1})
-            self.assertEqual(q.qsize(), 1)
-            self.assertEqual(get_dropped_count(), before)
+            assert q.qsize() == 1
+            assert get_dropped_count() == before
         finally:
             await unsubscribe(q)
 
@@ -249,8 +247,9 @@ class RealtimeDropCounterTest(unittest.IsolatedAsyncioTestCase):
 # ── pipeline 埋点：正常处理计数、早退路径不计数 ──
 
 
-class PipelineSyncProgressCountsTest(unittest.IsolatedAsyncioTestCase):
-    async def asyncSetUp(self):
+class TestPipelineSyncProgressCounts:
+    @pytest.fixture(autouse=True)
+    async def _autouse_setup(self):
         stages.reset()
         reset_sync_progress()
         self.ctx = PluginContext(
@@ -265,12 +264,10 @@ class PipelineSyncProgressCountsTest(unittest.IsolatedAsyncioTestCase):
         self.db.row_factory = aiosqlite.Row
         await self.db.execute("PRAGMA foreign_keys = ON")
         await init_schema(self.db)
-
-    async def asyncTearDown(self):
+        yield
         reset_sync_progress()
         await self.db.close()
         stages.reset()
-
     async def _process(self, messages, categories, install_stages=None):
         install_stages = install_stages or (lambda: None)
         install_stages()
@@ -322,27 +319,27 @@ class PipelineSyncProgressCountsTest(unittest.IsolatedAsyncioTestCase):
             [{"name": "x"}],
             install_stages=self._normal_stages(3),
         )
-        self.assertTrue(ok)
+        assert ok
         sp = get_sync_progress()
-        self.assertEqual(sp["newCount"], 3)
-        self.assertEqual(sp["pendingCount"], 0)
-        self.assertEqual(sp["processedCount"], 3)
-        self.assertTrue(sp["done"])
-        self.assertTrue(sp["startedAt"])
+        assert sp["newCount"] == 3
+        assert sp["pendingCount"] == 0
+        assert sp["processedCount"] == 3
+        assert sp["done"]
+        assert sp["startedAt"]
 
     async def test_early_return_does_not_count(self):
         # 无启用类别 → 早退：消息未在推进，不计数（避免"永不完成"）
         ok = await self._process([_pipeline_msg("m1")], [])
-        self.assertFalse(ok)
+        assert not ok
         sp = get_sync_progress()
-        self.assertEqual(sp["newCount"], 0)
-        self.assertEqual(sp["pendingCount"], 0)
+        assert sp["newCount"] == 0
+        assert sp["pendingCount"] == 0
 
     async def test_missing_stages_does_not_count(self):
         ok = await self._process([_pipeline_msg("m1")], [{"name": "x"}])
-        self.assertFalse(ok)
+        assert not ok
         sp = get_sync_progress()
-        self.assertEqual(sp["newCount"], 0)
+        assert sp["newCount"] == 0
 
 
 if __name__ == "__main__":
@@ -383,7 +380,7 @@ class StartedAtMonotonicityTest(unittest.TestCase):
             started.append(second["startedAt"])
         prev_dt = real_fromiso(started[0])
         next_dt = real_fromiso(started[1])
-        self.assertEqual(next_dt - prev_dt, timedelta(microseconds=1))
+        assert next_dt - prev_dt == timedelta(microseconds=1)
 
     def test_later_timestamp_kept_monotonic(self):
         from datetime import UTC, datetime, timedelta
@@ -407,9 +404,7 @@ class StartedAtMonotonicityTest(unittest.TestCase):
             first = status_module.note_sync_batch_start(1)
             status_module.note_sync_batch_done(1)
             second = status_module.note_sync_batch_start(1)
-        self.assertLess(
-            real_fromiso(first["startedAt"]), real_fromiso(second["startedAt"])
-        )
+        assert real_fromiso(first["startedAt"]) < real_fromiso(second["startedAt"])
 
 
 if __name__ == "__main__":

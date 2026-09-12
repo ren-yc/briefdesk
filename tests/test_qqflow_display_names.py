@@ -43,8 +43,8 @@ class NormalizeRestDisplayNameTest(unittest.TestCase):
             "项目群",
             {"u_a": "全局备注名"},
         )
-        self.assertEqual(msg.sender_name, "群名片")
-        self.assertEqual(msg.sender_id, "u_a")
+        assert msg.sender_name == "群名片"
+        assert msg.sender_id == "u_a"
 
     def test_dirty_sender_name_falls_back_to_contact(self):
         msg = normalize_rest(
@@ -53,7 +53,7 @@ class NormalizeRestDisplayNameTest(unittest.TestCase):
             "项目群",
             {"u_a": "全局备注名"},
         )
-        self.assertEqual(msg.sender_name, "全局备注名")
+        assert msg.sender_name == "全局备注名"
 
     def test_uid_valued_sender_name_falls_back_to_contact(self):
         """上游名字链全退化时 senderName 即 UID，应让位于 contacts。"""
@@ -63,16 +63,16 @@ class NormalizeRestDisplayNameTest(unittest.TestCase):
             "项目群",
             {"u_a": "全局备注名"},
         )
-        self.assertEqual(msg.sender_name, "全局备注名")
+        assert msg.sender_name == "全局备注名"
 
     def test_absent_sender_name_falls_back_to_contact(self):
         """旧上游无该字段（版本偏斜兜底）。"""
         msg = normalize_rest(self._msg("u_a"), "10001", "项目群", {"u_a": "全局备注名"})
-        self.assertEqual(msg.sender_name, "全局备注名")
+        assert msg.sender_name == "全局备注名"
 
     def test_missing_names_fall_back_to_uid(self):
         msg = normalize_rest(self._msg("u_a"), "10001", "项目群", {})
-        self.assertEqual(msg.sender_name, "u_a")
+        assert msg.sender_name == "u_a"
 
 
 class NormalizeSseDisplayNameTest(unittest.TestCase):
@@ -88,8 +88,8 @@ class NormalizeSseDisplayNameTest(unittest.TestCase):
                 "timestamp": 123,
             }
         )
-        self.assertEqual(msg.sender_name, "未知")
-        self.assertEqual(msg.group_name, "未知")
+        assert msg.sender_name == "未知"
+        assert msg.group_name == "未知"
 
     def test_dirty_group_name_falls_back_to_session_id(self):
         msg = normalize_sse(
@@ -104,8 +104,8 @@ class NormalizeSseDisplayNameTest(unittest.TestCase):
                 "timestamp": 123,
             }
         )
-        self.assertEqual(msg.sender_name, "李四")
-        self.assertEqual(msg.group_name, "10001")
+        assert msg.sender_name == "李四"
+        assert msg.group_name == "10001"
 
 
 class NormalizeSseMediaTest(unittest.TestCase):
@@ -127,18 +127,18 @@ class NormalizeSseMediaTest(unittest.TestCase):
         msg = normalize_sse(
             self._event(mediaId="9f2a1c2d3e4f5a6b7c8d9e0f1a2b3c4d")
         )
-        self.assertEqual(msg.image_urls, ["9f2a1c2d3e4f5a6b7c8d9e0f1a2b3c4d"])
+        assert msg.image_urls == ["9f2a1c2d3e4f5a6b7c8d9e0f1a2b3c4d"]
 
     def test_image_without_media_id_leaves_image_urls_empty(self):
         # 上游推送的 media 为无路径视图，媒体是否可取只看 mediaId；
         # 缺失时无字节可取，image_urls 保持空（消息经 pre_filter 丢弃）
         msg = normalize_sse(self._event(media={"uuid": "R020-x"}))
-        self.assertEqual(msg.image_urls, [])
+        assert msg.image_urls == []
 
     def test_text_with_media_id_ignored(self):
         # mediaId 仅对图片占位符生效；带真实文本的消息不受影响
         msg = normalize_sse(self._event(content="hello world", mediaId="abc"))
-        self.assertEqual(msg.image_urls, [])
+        assert msg.image_urls == []
 
 
 class PrefilterSenderTest(unittest.TestCase):
@@ -156,7 +156,7 @@ class PrefilterSenderTest(unittest.TestCase):
             "content": "u_2XCtJBaCE1zEEUqL2h67Ng",
             "timestamp": 123,
         }
-        self.assertFalse(pre_filter_sse(event))
+        assert not pre_filter_sse(event)
 
     def test_sse_filters_uid_content_with_sender_name(self):
         event = {
@@ -168,7 +168,7 @@ class PrefilterSenderTest(unittest.TestCase):
             "content": "u_2XCtJBaCE1zEEUqL2h67Ng",
             "timestamp": 123,
         }
-        self.assertFalse(pre_filter_sse(event))
+        assert not pre_filter_sse(event)
 
     def test_sse_keeps_normal_text_with_empty_sender(self):
         event = {
@@ -180,7 +180,7 @@ class PrefilterSenderTest(unittest.TestCase):
             "content": "hello world",
             "timestamp": 123,
         }
-        self.assertTrue(pre_filter_sse(event))
+        assert pre_filter_sse(event)
 
     def test_sse_keeps_control_only_sender_with_normal_text(self):
         # 控制字符发送者净化后为空 → 回退"未知"，不再入口丢弃
@@ -193,7 +193,7 @@ class PrefilterSenderTest(unittest.TestCase):
             "content": "hello world",
             "timestamp": 123,
         }
-        self.assertTrue(pre_filter_sse(event))
+        assert pre_filter_sse(event)
 
     def test_sse_keeps_image_with_empty_sender(self):
         event = {
@@ -206,7 +206,7 @@ class PrefilterSenderTest(unittest.TestCase):
             "mediaId": "9f2a1c2d3e4f5a6b7c8d9e0f1a2b3c4d",
             "timestamp": 123,
         }
-        self.assertTrue(pre_filter_sse(event))
+        assert pre_filter_sse(event)
 
     def test_sse_keeps_normal_text_with_sender(self):
         event = {
@@ -218,7 +218,7 @@ class PrefilterSenderTest(unittest.TestCase):
             "content": "hello world",
             "timestamp": 123,
         }
-        self.assertTrue(pre_filter_sse(event))
+        assert pre_filter_sse(event)
 
     def test_rest_filters_empty_sender_with_uid_content(self):
         msg = {
@@ -228,7 +228,7 @@ class PrefilterSenderTest(unittest.TestCase):
             "senderUsername": "",
             "content": "u_2XCtJBaCE1zEEUqL2h67Ng",
         }
-        self.assertFalse(pre_filter_rest(msg))
+        assert not pre_filter_rest(msg)
 
     def test_rest_filters_uid_content_with_sender(self):
         msg = {
@@ -238,7 +238,7 @@ class PrefilterSenderTest(unittest.TestCase):
             "senderUsername": "u_2XCtJBaCE1zEEUqL2h67Ng",
             "content": "u_2XCtJBaCE1zEEUqL2h67Ng",
         }
-        self.assertFalse(pre_filter_rest(msg))
+        assert not pre_filter_rest(msg)
 
     def test_rest_filters_revoke_uid_content_with_sender(self):
         # 撤回内容在 qqflow 中表现为“有发送者 + 纯 UID 内容”
@@ -249,7 +249,7 @@ class PrefilterSenderTest(unittest.TestCase):
             "senderUsername": "u_Z1uF3dwITNvHz1Er6mddKQ",
             "content": "u_Z1uF3dwITNvHz1Er6mddKQ",
         }
-        self.assertFalse(pre_filter_rest(msg))
+        assert not pre_filter_rest(msg)
 
     def test_rest_keeps_normal_text_with_empty_sender(self):
         msg = {
@@ -259,7 +259,7 @@ class PrefilterSenderTest(unittest.TestCase):
             "senderUsername": "",
             "content": "hello world",
         }
-        self.assertTrue(pre_filter_rest(msg))
+        assert pre_filter_rest(msg)
 
     def test_rest_keeps_image_with_empty_sender(self):
         msg = {
@@ -270,7 +270,7 @@ class PrefilterSenderTest(unittest.TestCase):
             "content": "[image]",
             "mediaId": "abc123",
         }
-        self.assertTrue(pre_filter_rest(msg))
+        assert pre_filter_rest(msg)
 
     def test_rest_keeps_normal_text_with_sender(self):
         msg = {
@@ -280,7 +280,7 @@ class PrefilterSenderTest(unittest.TestCase):
             "senderUsername": "u_a",
             "content": "hello world",
         }
-        self.assertTrue(pre_filter_rest(msg))
+        assert pre_filter_rest(msg)
 
 
 class _FakeClient:
@@ -332,7 +332,7 @@ class _NotReadyMessagesClient(_FakeClient):
         raise QqFlowNotReadyError("qqflow-server 尚未就绪（503）")
 
 
-class PollerDisplayNameTest(unittest.IsolatedAsyncioTestCase):
+class TestPollerDisplayName:
     def _enabled(self) -> list[SessionInfo]:
         return [
             SessionInfo(
@@ -362,10 +362,10 @@ class PollerDisplayNameTest(unittest.IsolatedAsyncioTestCase):
             return set()
 
         result = await poll(client, self._enabled(), no_processed)
-        self.assertEqual(len(result.messages), 1)
-        self.assertEqual(result.messages[0].sender_name, "群名片")
-        self.assertEqual(result.messages[0].sender_id, "u_nonfriend")
-        self.assertNotIn("u_nonfriend", {c.sender_id for c in result.contacts})
+        assert len(result.messages) == 1
+        assert result.messages[0].sender_name == "群名片"
+        assert result.messages[0].sender_id == "u_nonfriend"
+        assert "u_nonfriend" not in {c.sender_id for c in result.contacts}
 
     async def test_group_members_endpoint_not_called(self):
         """/api/v1/group-members 与 senderName 同链，poller 不得再逐群请求。"""
@@ -379,8 +379,8 @@ class PollerDisplayNameTest(unittest.IsolatedAsyncioTestCase):
             return set()
 
         result = await poll(client, self._enabled(), no_processed)
-        self.assertEqual(len(result.messages), 1)
-        self.assertEqual(client.group_members_calls, [])
+        assert len(result.messages) == 1
+        assert client.group_members_calls == []
 
     async def test_messages_failure_isolated_to_session(self):
         """【复核 P2-5】单会话拉取失败不再中止整轮：该会话记入
@@ -395,10 +395,10 @@ class PollerDisplayNameTest(unittest.IsolatedAsyncioTestCase):
             return set()
 
         result = await poll(client, self._enabled(), no_processed)
-        self.assertEqual(result.messages, [])
-        self.assertEqual(result.failed_sessions, {"10001"})
+        assert result.messages == []
+        assert result.failed_sessions == {"10001"}
         # session_errors 以 session_id 为键（同名群互不覆盖，核验 C2）
-        self.assertIn("messages down", result.session_errors["10001"])
+        assert "messages down" in result.session_errors["10001"]
 
     async def test_messages_503_skips_session(self):
         client = _NotReadyMessagesClient(
@@ -411,12 +411,12 @@ class PollerDisplayNameTest(unittest.IsolatedAsyncioTestCase):
             return set()
 
         result = await poll(client, self._enabled(), no_processed)
-        self.assertEqual(result.messages, [])
+        assert result.messages == []
         # 503 会话不推进水位（防永久漏拉）
-        self.assertEqual(result.failed_sessions, {"10001"})
+        assert result.failed_sessions == {"10001"}
 
 
-class ControlEventStatsTest(unittest.IsolatedAsyncioTestCase):
+class TestControlEventStats:
     """控制事件（ready / sync）不进管道、也不计入监听统计。"""
 
     async def test_control_events_skipped_without_inflating_stats(self):
@@ -442,9 +442,9 @@ class ControlEventStatsTest(unittest.IsolatedAsyncioTestCase):
         await listener._handle_event({"status": "ok"})  # type: ignore[arg-type]
         await listener._handle_event({"event": "sync", "lastRowidGroup": 1})  # type: ignore[arg-type]
         await listener._handle_event({"event": "ready", "status": "ok"})  # type: ignore[arg-type]
-        self.assertEqual(listener._stats_events, 0)
-        self.assertEqual(listener._stats_filtered, 0)
-        self.assertEqual(batches, [])
+        assert listener._stats_events == 0
+        assert listener._stats_filtered == 0
+        assert batches == []
 
         # 真实消息仍计入事件统计（证明跳过逻辑没有误伤 message.new）
         await listener._handle_event(  # type: ignore[arg-type]
@@ -459,10 +459,10 @@ class ControlEventStatsTest(unittest.IsolatedAsyncioTestCase):
                 "timestamp": 1700000000,
             }
         )
-        self.assertEqual(listener._stats_events, 1)
+        assert listener._stats_events == 1
 
 
-class RuntimeRefreshSessionsTest(unittest.IsolatedAsyncioTestCase):
+class TestRuntimeRefreshSessions:
     async def test_dirty_session_display_name_falls_back_to_username(self):
         source = QqFlowSource(base_url="http://127.0.0.1:5032", api_token="t")
         source.client.ensure_ready = AsyncMock()
@@ -474,8 +474,8 @@ class RuntimeRefreshSessionsTest(unittest.IsolatedAsyncioTestCase):
         )
         sessions = await source.refresh_sessions()
         names = {s.session_id: s.name for s in sessions}
-        self.assertEqual(names["u1"], "u1")
-        self.assertEqual(names["g1"], "项目群")
+        assert names["u1"] == "u1"
+        assert names["g1"] == "项目群"
         await source.close()
 
 

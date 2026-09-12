@@ -14,6 +14,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import httpx
+import pytest
 
 from briefdesk.plugins.qqflow.client import QqFlowClient, QqFlowNotReadyError
 from briefdesk.plugins.weflow_legacy.client import WeFlowLegacyClient
@@ -37,7 +38,7 @@ class _FakeResp:
         return self._payload
 
 
-class WithConnectRetryTest(unittest.IsolatedAsyncioTestCase):
+class TestWithConnectRetry:
     async def test_succeeds_after_transient_connect_errors(self):
         calls = 0
 
@@ -49,8 +50,8 @@ class WithConnectRetryTest(unittest.IsolatedAsyncioTestCase):
             return "ok"
 
         result = await with_connect_retry(fn, base_delay=0)
-        self.assertEqual(result, "ok")
-        self.assertEqual(calls, 3)
+        assert result == "ok"
+        assert calls == 3
 
     async def test_exhausted_raises_last_error(self):
         calls = 0
@@ -60,9 +61,9 @@ class WithConnectRetryTest(unittest.IsolatedAsyncioTestCase):
             calls += 1
             raise httpx.ConnectError("All connection attempts failed")
 
-        with self.assertRaisesRegex(httpx.ConnectError, "All connection attempts failed"):
+        with pytest.raises(httpx.ConnectError, match="All connection attempts failed"):
             await with_connect_retry(fn, attempts=2, base_delay=0)
-        self.assertEqual(calls, 2)
+        assert calls == 2
 
     async def test_non_connect_error_not_retried(self):
         calls = 0
@@ -72,9 +73,9 @@ class WithConnectRetryTest(unittest.IsolatedAsyncioTestCase):
             calls += 1
             raise RuntimeError("boom")
 
-        with self.assertRaisesRegex(RuntimeError, "boom"):
+        with pytest.raises(RuntimeError, match="boom"):
             await with_connect_retry(fn, attempts=3, base_delay=0)
-        self.assertEqual(calls, 1)
+        assert calls == 1
 
     async def test_connect_timeout_is_retried(self):
         # ConnectTimeout 与 ConnectError 同为连接阶段失败（httpx 中平级），一并重试
@@ -88,11 +89,11 @@ class WithConnectRetryTest(unittest.IsolatedAsyncioTestCase):
             return "ok"
 
         result = await with_connect_retry(fn, base_delay=0)
-        self.assertEqual(result, "ok")
-        self.assertEqual(calls, 2)
+        assert result == "ok"
+        assert calls == 2
 
 
-class QqFlowClientRetryTest(unittest.IsolatedAsyncioTestCase):
+class TestQqFlowClientRetry:
     def _client_with_get(self, side_effect):
         client = QqFlowClient(base_url="http://127.0.0.1:5032", api_token="t")
         fake = SimpleNamespace(get=AsyncMock(side_effect=side_effect), post=AsyncMock())
@@ -105,8 +106,8 @@ class QqFlowClientRetryTest(unittest.IsolatedAsyncioTestCase):
             [httpx.ConnectError("refused"), httpx.ConnectError("refused"), resp]
         )
         result = await client.fetch_contacts()
-        self.assertEqual(result, {"u_1": "A"})
-        self.assertEqual(fake.get.call_count, 3)
+        assert result == {"u_1": "A"}
+        assert fake.get.call_count == 3
 
     async def test_fetch_health_retries_connect_errors(self):
         # /health 是标量形状：status + version + account（单个阶段值），
@@ -116,8 +117,8 @@ class QqFlowClientRetryTest(unittest.IsolatedAsyncioTestCase):
             [httpx.ConnectError("refused"), _FakeResp(200, health)]
         )
         result = await client.fetch_health()
-        self.assertEqual(result, health)
-        self.assertEqual(fake.get.call_count, 2)
+        assert result == health
+        assert fake.get.call_count == 2
 
     async def test_503_semantics_preserved_after_connect_retry(self):
         # 连接层重试只覆盖 TCP 失败；503（索引期就绪门控）保持
@@ -125,20 +126,20 @@ class QqFlowClientRetryTest(unittest.IsolatedAsyncioTestCase):
         client, fake = self._client_with_get(
             [httpx.ConnectError("refused"), _FakeResp(503, {"error": "indexing"})]
         )
-        with self.assertRaises(QqFlowNotReadyError):
+        with pytest.raises(QqFlowNotReadyError):
             await client.fetch_contacts()
-        self.assertEqual(fake.get.call_count, 2)
+        assert fake.get.call_count == 2
 
     async def test_exhausted_connect_error_still_raises(self):
         # 重试耗尽：原样上抛（poll_cycle 的 lastError 行为保持不变）
         err = httpx.ConnectError("All connection attempts failed")
         client, fake = self._client_with_get([err, httpx.ConnectError("refused"), httpx.ConnectError("refused")])
-        with self.assertRaises(httpx.ConnectError):
+        with pytest.raises(httpx.ConnectError):
             await client.fetch_contacts()
-        self.assertEqual(fake.get.call_count, 3)
+        assert fake.get.call_count == 3
 
 
-class WeFlowLegacyClientRetryTest(unittest.IsolatedAsyncioTestCase):
+class TestWeFlowLegacyClientRetry:
     async def test_fetch_contacts_retries_connect_errors(self):
         client = WeFlowLegacyClient(base_url="http://127.0.0.1:5031", api_token="t")
         resp = _FakeResp(
@@ -155,8 +156,8 @@ class WeFlowLegacyClientRetryTest(unittest.IsolatedAsyncioTestCase):
         )
         client._client = fake
         result = await client.fetch_contacts()
-        self.assertEqual(result, {"wx_1": "B"})
-        self.assertEqual(fake.get.call_count, 3)
+        assert result == {"wx_1": "B"}
+        assert fake.get.call_count == 3
 
 
 if __name__ == "__main__":

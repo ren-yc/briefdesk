@@ -75,47 +75,42 @@ class ParseAppmsgXmlTest(unittest.TestCase):
     def test_multi_item_parses_each_article(self):
         articles = parse_appmsg_xml(_MULTI_XML)
         # 第 3 个 item 只有 text_title（视频占位）→ 跳过
-        self.assertEqual(len(articles), 2)
-        self.assertEqual(
-            articles[0]["title"], "从上海书展出发，探索阅读嵌入沪苏浙皖城市日常的N种可能"
-        )
-        self.assertIn("上海书展正点亮全城阅读热情", articles[0]["summary"])
-        self.assertIn("mp.weixin.qq.com", articles[0]["url"])
-        self.assertEqual(articles[1]["title"], "【交通】沪苏嘉城际铁路建设又有新进展")
-        self.assertEqual(articles[1]["summary"], "")
-        self.assertIn("idx=2", articles[1]["url"])
+        assert len(articles) == 2
+        assert articles[0]["title"] == "从上海书展出发，探索阅读嵌入沪苏浙皖城市日常的N种可能"
+        assert "上海书展正点亮全城阅读热情" in articles[0]["summary"]
+        assert "mp.weixin.qq.com" in articles[0]["url"]
+        assert articles[1]["title"] == "【交通】沪苏嘉城际铁路建设又有新进展"
+        assert articles[1]["summary"] == ""
+        assert "idx=2" in articles[1]["url"]
 
     def test_single_article_fallback(self):
         articles = parse_appmsg_xml(_SINGLE_XML)
-        self.assertEqual(len(articles), 1)
-        self.assertEqual(articles[0]["title"], "单图文标题")
-        self.assertEqual(articles[0]["summary"], "单图文摘要")
-        self.assertIn("single#rd", articles[0]["url"])
+        assert len(articles) == 1
+        assert articles[0]["title"] == "单图文标题"
+        assert articles[0]["summary"] == "单图文摘要"
+        assert "single#rd" in articles[0]["url"]
 
     def test_plain_text_single_article_fallback(self):
         articles = parse_appmsg_xml(_PLAIN_SINGLE_XML)
-        self.assertEqual(len(articles), 1)
-        self.assertEqual(
-            articles[0]["title"],
-            "最后9天！LMCC报名即将截止（集训4天后开营）",
-        )
-        self.assertIn("2026 LMCC", articles[0]["summary"])
-        self.assertIn("&mid=2247572663", articles[0]["url"])
-        self.assertNotIn("&amp;", articles[0]["url"])
+        assert len(articles) == 1
+        assert articles[0]["title"] == "最后9天！LMCC报名即将截止（集训4天后开营）"
+        assert "2026 LMCC" in articles[0]["summary"]
+        assert "&mid=2247572663" in articles[0]["url"]
+        assert "&amp;" not in articles[0]["url"]
 
     def test_unparseable_returns_empty(self):
-        self.assertEqual(parse_appmsg_xml("<msg><appmsg><type>5</type></appmsg></msg>"), [])
-        self.assertEqual(parse_appmsg_xml("不是 XML"), [])
+        assert parse_appmsg_xml("<msg><appmsg><type>5</type></appmsg></msg>") == []
+        assert parse_appmsg_xml("不是 XML") == []
 
 
 class PreFilterRestTest(unittest.TestCase):
     def test_appmsg_card_allowed(self):
-        self.assertTrue(pre_filter_rest({"localType": _APPMSG_LOCAL_TYPE, "content": _MULTI_XML}))
+        assert pre_filter_rest({"localType": _APPMSG_LOCAL_TYPE, "content": _MULTI_XML})
 
     def test_other_local_types_still_dropped(self):
-        self.assertFalse(pre_filter_rest({"localType": 49, "content": "hello world"}))
-        self.assertTrue(pre_filter_rest({"localType": 1, "content": "hello world"}))
-        self.assertFalse(pre_filter_rest({"localType": 1, "content": "hi"}))
+        assert not pre_filter_rest({"localType": 49, "content": "hello world"})
+        assert pre_filter_rest({"localType": 1, "content": "hello world"})
+        assert not pre_filter_rest({"localType": 1, "content": "hi"})
 
 
 class NormalizeRestAppmsgTest(unittest.TestCase):
@@ -130,41 +125,41 @@ class NormalizeRestAppmsgTest(unittest.TestCase):
 
     def test_splits_into_numbered_messages(self):
         msgs = normalize_rest(self._msg(), "gh_27278ac0a645", "上海发布", {})
-        self.assertEqual(len(msgs), 2)
-        self.assertEqual(msgs[0].msg_id, "8728588931173115719_1")
-        self.assertEqual(msgs[1].msg_id, "8728588931173115719_2")
-        self.assertTrue(msgs[0].content.startswith("标题："))
-        self.assertIn("摘要：", msgs[0].content)
-        self.assertNotIn("摘要：", msgs[1].content)  # 空摘要不占行
-        self.assertIn("mp.weixin.qq.com", msgs[0].article_url)
-        self.assertEqual(msgs[0].group_name, "上海发布")
+        assert len(msgs) == 2
+        assert msgs[0].msg_id == "8728588931173115719_1"
+        assert msgs[1].msg_id == "8728588931173115719_2"
+        assert msgs[0].content.startswith("标题：")
+        assert "摘要：" in msgs[0].content
+        assert "摘要：" not in msgs[1].content  # 空摘要不占行
+        assert "mp.weixin.qq.com" in msgs[0].article_url
+        assert msgs[0].group_name == "上海发布"
 
     def test_plain_text_single_article_normalizes(self):
         msg = self._msg()
         msg["content"] = _PLAIN_SINGLE_XML
         msgs = normalize_rest(msg, "g", "G", {})
-        self.assertEqual(len(msgs), 1)
-        self.assertEqual(msgs[0].msg_id, "8728588931173115719_1")
-        self.assertIn("LMCC", msgs[0].content)
-        self.assertIn("&mid=2247572663", msgs[0].article_url)
-        self.assertNotIn("&amp;", msgs[0].article_url)
+        assert len(msgs) == 1
+        assert msgs[0].msg_id == "8728588931173115719_1"
+        assert "LMCC" in msgs[0].content
+        assert "&mid=2247572663" in msgs[0].article_url
+        assert "&amp;" not in msgs[0].article_url
 
     def test_unparseable_returns_empty(self):
         msg = self._msg()
         msg["content"] = "<msg><appmsg><type>5</type></appmsg></msg>"
-        self.assertEqual(normalize_rest(msg, "g", "G", {}), [])
+        assert normalize_rest(msg, "g", "G", {}) == []
 
     def test_plain_text_still_single_message(self):
         msg = self._msg()
         msg["localType"] = 1
         msg["content"] = "hello world"
         msgs = normalize_rest(msg, "g", "G", {})
-        self.assertEqual(len(msgs), 1)
-        self.assertEqual(msgs[0].msg_id, "8728588931173115719")
-        self.assertEqual(msgs[0].article_url, "")
+        assert len(msgs) == 1
+        assert msgs[0].msg_id == "8728588931173115719"
+        assert msgs[0].article_url == ""
 
 
-class NormalizeSseAppmsgTest(unittest.IsolatedAsyncioTestCase):
+class TestNormalizeSseAppmsg:
     async def test_sse_appmsg_splits_by_content_shape(self):
         msgs = await normalize_sse(
             {
@@ -176,10 +171,10 @@ class NormalizeSseAppmsgTest(unittest.IsolatedAsyncioTestCase):
                 "timestamp": 1786785950,
             }
         )
-        self.assertEqual(len(msgs), 2)
-        self.assertEqual(msgs[0].msg_id, "r1_1")
-        self.assertEqual(msgs[1].msg_id, "r1_2")
-        self.assertEqual(msgs[0].group_name, "上海发布")
+        assert len(msgs) == 2
+        assert msgs[0].msg_id == "r1_1"
+        assert msgs[1].msg_id == "r1_2"
+        assert msgs[0].group_name == "上海发布"
 
     async def test_sse_unparseable_appmsg_keeps_raw_single(self):
         msgs = await normalize_sse(
@@ -192,9 +187,9 @@ class NormalizeSseAppmsgTest(unittest.IsolatedAsyncioTestCase):
                 "timestamp": 1,
             }
         )
-        self.assertEqual(len(msgs), 1)
-        self.assertEqual(msgs[0].msg_id, "r1")
-        self.assertIn("<appmsg>", msgs[0].content)  # 原样放行兜底
+        assert len(msgs) == 1
+        assert msgs[0].msg_id == "r1"
+        assert "<appmsg>" in msgs[0].content  # 原样放行兜底
 
     async def test_sse_plain_text_still_single(self):
         msgs = await normalize_sse(
@@ -207,8 +202,8 @@ class NormalizeSseAppmsgTest(unittest.IsolatedAsyncioTestCase):
                 "timestamp": 1,
             }
         )
-        self.assertEqual(len(msgs), 1)
-        self.assertEqual(msgs[0].msg_id, "r1")
+        assert len(msgs) == 1
+        assert msgs[0].msg_id == "r1"
 
 
 class _PlaceholderClient:
@@ -238,7 +233,7 @@ class _PlaceholderClient:
         return self._raw
 
 
-class PollerPlaceholderLookbackTest(unittest.IsolatedAsyncioTestCase):
+class TestPollerPlaceholderLookback:
     async def test_placeholder_looked_back_and_parsed(self):
         """media=True 占位符（[视频号]…）→ fetch_message_raw 回查 XML → 拆条。"""
         import time
@@ -263,10 +258,10 @@ class PollerPlaceholderLookbackTest(unittest.IsolatedAsyncioTestCase):
             return set()
 
         result = await poll(client, enabled, no_processed)
-        self.assertEqual(len(client.lookups), 1, "占位符应触发一次回查")
-        self.assertEqual(len(result.messages), 2, "回查后按 XML 拆成 2 条")
-        self.assertEqual(result.messages[0].msg_id, "s1_1")
-        self.assertIn("mp.weixin.qq.com", result.messages[0].article_url)
+        assert len(client.lookups) == 1, "占位符应触发一次回查"
+        assert len(result.messages) == 2, "回查后按 XML 拆成 2 条"
+        assert result.messages[0].msg_id == "s1_1"
+        assert "mp.weixin.qq.com" in result.messages[0].article_url
 
     async def test_real_xml_skips_lookback(self):
         """content 已是 XML 时不触发回查（避免多余请求）。"""
@@ -291,8 +286,8 @@ class PollerPlaceholderLookbackTest(unittest.IsolatedAsyncioTestCase):
             return set()
 
         result = await poll(client, enabled, no_processed)
-        self.assertEqual(len(client.lookups), 0, "XML 内容不应回查")
-        self.assertEqual(len(result.messages), 2)
+        assert len(client.lookups) == 0, "XML 内容不应回查"
+        assert len(result.messages) == 2
 
     @staticmethod
     def _processed_querier(full_set):
@@ -324,8 +319,8 @@ class PollerPlaceholderLookbackTest(unittest.IsolatedAsyncioTestCase):
         result = await poll(
             client, self._enabled(), self._processed_querier({"s1_1", "s1_2"})
         )
-        self.assertEqual(len(client.lookups), 1, "占位符仍需回查以确定拆条数")
-        self.assertEqual(len(result.messages), 0, "拆条全部已处理 → 不产出")
+        assert len(client.lookups) == 1, "占位符仍需回查以确定拆条数"
+        assert len(result.messages) == 0, "拆条全部已处理 → 不产出"
 
     async def test_processed_xml_article_skipped_without_lookback(self):
         """XML 文章拆条全部已处理：批量查询即命中，无需回查。"""
@@ -342,8 +337,8 @@ class PollerPlaceholderLookbackTest(unittest.IsolatedAsyncioTestCase):
         result = await poll(
             client, self._enabled(), self._processed_querier({"s1_1", "s1_2"})
         )
-        self.assertEqual(len(client.lookups), 0)
-        self.assertEqual(len(result.messages), 0)
+        assert len(client.lookups) == 0
+        assert len(result.messages) == 0
 
     async def test_partially_processed_article_kept_as_candidate(self):
         """仅部分拆条已处理：整条保留为候选（pipeline 入口按拆条过滤已处理部分）。"""
@@ -360,11 +355,11 @@ class PollerPlaceholderLookbackTest(unittest.IsolatedAsyncioTestCase):
         result = await poll(
             client, self._enabled(), self._processed_querier({"s1_1"})
         )
-        self.assertEqual(len(client.lookups), 0)
-        self.assertEqual(len(result.messages), 2, "部分处理仍产出全部拆条，由 pipeline 过滤")
+        assert len(client.lookups) == 0
+        assert len(result.messages) == 2, "部分处理仍产出全部拆条，由 pipeline 过滤"
 
 
-class NormalizeSseImageDropTest(unittest.IsolatedAsyncioTestCase):
+class TestNormalizeSseImageDrop:
     """审查回归：SSE [图片] 回查未命中时整条丢弃——旧实现放行纯文本
     "[图片]" 进 AI 分类产生噪音卡，与 REST 路径「无 media.url 丢弃」
     语义不对齐。命中时剥离查询串（旧 access_token 不入 image_urls）。"""
@@ -385,7 +380,7 @@ class NormalizeSseImageDropTest(unittest.IsolatedAsyncioTestCase):
             },
             _NoMediaClient(),
         )
-        self.assertEqual(msgs, [])
+        assert msgs == []
 
     async def test_lookup_hit_keeps_image_and_strips_query(self):
         class _HitClient:
@@ -406,8 +401,8 @@ class NormalizeSseImageDropTest(unittest.IsolatedAsyncioTestCase):
             },
             _HitClient(),
         )
-        self.assertEqual(len(msgs), 1)
-        self.assertEqual(msgs[0].image_urls, ["g/images/abc.jpg"])
+        assert len(msgs) == 1
+        assert msgs[0].image_urls == ["g/images/abc.jpg"]
 
 
 if __name__ == "__main__":

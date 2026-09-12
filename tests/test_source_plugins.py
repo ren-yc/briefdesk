@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, patch
 
+import pytest
 from pydantic import SecretStr
 
 from briefdesk.config import Settings
@@ -36,7 +37,7 @@ def _ctx() -> tuple[PluginContext, list]:
     return ctx, registered
 
 
-class WeFlowLegacyPluginTest(unittest.IsolatedAsyncioTestCase):
+class TestWeFlowLegacyPlugin:
     async def test_setup_registers_runtime(self):
         ctx, registered = _ctx()
         fake_runtime = SimpleNamespace(name="weflow-legacy")
@@ -48,7 +49,7 @@ class WeFlowLegacyPluginTest(unittest.IsolatedAsyncioTestCase):
             "briefdesk.plugins.weflow_legacy.runtime.WeFlowLegacySource", return_value=fake_runtime
         ):
             await plugin.setup(ctx)
-        self.assertEqual(registered, [fake_runtime])
+        assert registered == [fake_runtime]
 
     async def test_missing_token_self_disables(self):
         """【决策 ①=1B】必填校验与 weflow/qqflow 统一：缺 token 装配期自禁用。"""
@@ -57,9 +58,9 @@ class WeFlowLegacyPluginTest(unittest.IsolatedAsyncioTestCase):
         with patch(
             "briefdesk.plugins.weflow_legacy.config.WeFlowLegacySettings",
             return_value=SimpleNamespace(api_token=SecretStr("")),
-        ), self.assertRaises(PluginDisabledError) as cm:
+        ), pytest.raises(PluginDisabledError) as cm:
             await plugin.setup(ctx)
-        self.assertIn("WEFLOW_LEGACY_API_TOKEN", str(cm.exception))
+        assert "WEFLOW_LEGACY_API_TOKEN" in str(cm.value)
 
     async def test_teardown_closes_runtime(self):
         ctx, _ = _ctx()
@@ -80,16 +81,16 @@ class WeFlowLegacyPluginTest(unittest.IsolatedAsyncioTestCase):
         await WeFlowLegacyPlugin().teardown()
 
 
-class QqFlowPluginTest(unittest.IsolatedAsyncioTestCase):
+class TestQqFlowPlugin:
     async def test_missing_required_config_self_disables(self):
         ctx, _ = _ctx()
         fake_settings = SimpleNamespace(api_token=SecretStr(""), qq="", key=SecretStr(""))
         plugin = QqFlowPlugin()
         with patch(
             "briefdesk.plugins.qqflow.config.QqFlowSettings", return_value=fake_settings
-        ), self.assertRaises(PluginDisabledError) as cm:
+        ), pytest.raises(PluginDisabledError) as cm:
             await plugin.setup(ctx)
-        self.assertIn("QQFLOW_API_TOKEN", str(cm.exception))
+        assert "QQFLOW_API_TOKEN" in str(cm.value)
 
     async def test_partial_config_names_missing_fields(self):
         ctx, _ = _ctx()
@@ -99,10 +100,10 @@ class QqFlowPluginTest(unittest.IsolatedAsyncioTestCase):
         plugin = QqFlowPlugin()
         with patch(
             "briefdesk.plugins.qqflow.config.QqFlowSettings", return_value=fake_settings
-        ), self.assertRaises(PluginDisabledError) as cm:
+        ), pytest.raises(PluginDisabledError) as cm:
             await plugin.setup(ctx)
-        self.assertIn("QQFLOW_QQ", str(cm.exception))
-        self.assertNotIn("QQFLOW_API_TOKEN", str(cm.exception))
+        assert "QQFLOW_QQ" in str(cm.value)
+        assert "QQFLOW_API_TOKEN" not in str(cm.value)
 
     async def test_config_present_registers_runtime(self):
         ctx, registered = _ctx()
@@ -117,7 +118,7 @@ class QqFlowPluginTest(unittest.IsolatedAsyncioTestCase):
             "briefdesk.plugins.qqflow.runtime.QqFlowSource", return_value=fake_runtime
         ):
             await plugin.setup(ctx)
-        self.assertEqual(registered, [fake_runtime])
+        assert registered == [fake_runtime]
 
     async def test_teardown_closes_runtime(self):
         ctx, _ = _ctx()
@@ -137,7 +138,7 @@ class QqFlowPluginTest(unittest.IsolatedAsyncioTestCase):
         close_spy.assert_awaited_once()
 
 
-class WeFlowPluginTest(unittest.IsolatedAsyncioTestCase):
+class TestWeFlowPlugin:
     async def test_missing_all_config_lists_everything(self):
         """api_token/wxid 与 DB_KEYS 同时缺失时聚合在一条错误中一次报全，
         不应拆成多次抛出致用户只能看到第一项。"""
@@ -148,12 +149,12 @@ class WeFlowPluginTest(unittest.IsolatedAsyncioTestCase):
         plugin = WeFlowPlugin()
         with patch(
             "briefdesk.plugins.weflow.config.WeFlowSettings", return_value=fake_settings
-        ), self.assertRaises(PluginDisabledError) as cm:
+        ), pytest.raises(PluginDisabledError) as cm:
             await plugin.setup(ctx)
-        message = str(cm.exception)
-        self.assertIn("WEFLOW_API_TOKEN", message)
-        self.assertIn("WEFLOW_WXID", message)
-        self.assertIn("WEFLOW_DB_KEYS", message)
+        message = str(cm.value)
+        assert "WEFLOW_API_TOKEN" in message
+        assert "WEFLOW_WXID" in message
+        assert "WEFLOW_DB_KEYS" in message
 
     async def test_config_present_registers_runtime(self):
         ctx, registered = _ctx()
@@ -168,7 +169,7 @@ class WeFlowPluginTest(unittest.IsolatedAsyncioTestCase):
             "briefdesk.plugins.weflow.runtime.WeFlowSource", return_value=fake_runtime
         ):
             await plugin.setup(ctx)
-        self.assertEqual(registered, [fake_runtime])
+        assert registered == [fake_runtime]
 
 
 class SseReconnectInitialMsValidationTest(unittest.TestCase):
@@ -189,7 +190,7 @@ class SseReconnectInitialMsValidationTest(unittest.TestCase):
         from briefdesk.plugins.weflow.config import WeFlowSettings
 
         s = WeFlowSettings(sse_reconnect_initial_ms=1)
-        self.assertEqual(s.sse_reconnect_initial_ms, 1)
+        assert s.sse_reconnect_initial_ms == 1
 
 
 class LegacyRestFilterContractTest(unittest.TestCase):
@@ -202,22 +203,17 @@ class LegacyRestFilterContractTest(unittest.TestCase):
     def test_rest_attachment_placeholder_dropped(self):
         from briefdesk.plugins.weflow_legacy.normalize import pre_filter_rest
 
-        self.assertFalse(
-            pre_filter_rest(
+        assert not pre_filter_rest(
                 {"serverId": "m1", "localType": 1, "content": "[文件]"}
             )
-        )
-        self.assertFalse(
-            pre_filter_rest(
+        assert not pre_filter_rest(
                 {"serverId": "m1", "localType": 1, "content": "  [链接]  "}
             )
-        )
 
     def test_rest_voice_media_dropped(self):
         from briefdesk.plugins.weflow_legacy.normalize import pre_filter_rest
 
-        self.assertFalse(
-            pre_filter_rest(
+        assert not pre_filter_rest(
                 {
                     "serverId": "m1",
                     "localType": 3,
@@ -226,13 +222,11 @@ class LegacyRestFilterContractTest(unittest.TestCase):
                     "content": "[语音]",
                 }
             )
-        )
 
     def test_rest_image_passes_with_media(self):
         from briefdesk.plugins.weflow_legacy.normalize import pre_filter_rest
 
-        self.assertTrue(
-            pre_filter_rest(
+        assert pre_filter_rest(
                 {
                     "serverId": "m1",
                     "localType": 3,
@@ -241,15 +235,13 @@ class LegacyRestFilterContractTest(unittest.TestCase):
                     "content": "[图片]",
                 }
             )
-        )
 
     def test_sse_same_shape_unchanged(self):
         """回归保护：SSE 同形输入行为不变。"""
         from briefdesk.plugins.weflow_legacy.normalize import pre_filter_sse
 
         # SSE 占位符文本仍被滤（既有口径）
-        self.assertFalse(
-            pre_filter_sse(
+        assert not pre_filter_sse(
                 {
                     "event": "message.new",
                     "rawid": "r1",
@@ -258,10 +250,8 @@ class LegacyRestFilterContractTest(unittest.TestCase):
                     "timestamp": 1,
                 }
             )
-        )
         # SSE 文本消息仍放行
-        self.assertTrue(
-            pre_filter_sse(
+        assert pre_filter_sse(
                 {
                     "event": "message.new",
                     "rawid": "r1",
@@ -270,4 +260,3 @@ class LegacyRestFilterContractTest(unittest.TestCase):
                     "timestamp": 1,
                 }
             )
-        )
