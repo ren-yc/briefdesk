@@ -93,50 +93,67 @@ class CharQuoteVerdictTest(unittest.TestCase):
         self.assertIs(_char_quote_verdict("", 0, ["任意内容"]), True)
 
 
-class SemanticRefereeTest(unittest.IsolatedAsyncioTestCase):
-    """第二关：嵌入余弦 argmax；嵌入不可用/失败一律放行。"""
+class SemanticRefineGuardTest(unittest.IsolatedAsyncioTestCase):
+    """第二关（经唯一生产入口 _semantic_refine）：嵌入余弦 argmax 复核；
+    嵌入不可用/失败一律放行，漂移条目移出 results 进 retry。"""
 
     def setUp(self) -> None:
         self.engine = engine
 
-    async def test_drift_paraphrase_rejected(self):
-        # quote 与 contents[1] 语义同向 → 判漂移
+    async def test_drift_removed_to_retry_and_time(self):
+        """漂移条目：移出 results、追加 retry_indexes、从 time_indexes 移除。"""
+
         async def fake_embed(texts):
+            # [quote0] + contents：quote0 与 contents[1] 同向 → own 远低
             return [[0.0, 1.0], [1.0, 0.0], [0.05, 1.0]]
 
+        results = [
+            ClassifyResult(msg_index=0, quote="位育中学的编程社团开始招收新成员了"),
+            ClassifyResult(msg_index=1, quote="无关 quote"),
+        ]
         with patch.object(
             self.engine, "is_embedding_enabled", return_value=True
         ), patch.object(self.engine, "embed_texts", side_effect=fake_embed):
-            aligned = await self.engine._semantic_quote_referee(
-                "位育中学的编程社团开始招收新成员了",
-                0,
+            out_results, retry, time_idx = await self.engine._semantic_refine(
+                [0], results, [7], [0, 1],
                 ["南模中学编程社纳新", "位育中学编程社纳新"],
             )
-        self.assertIs(aligned, False)
+        self.assertEqual([r.msg_index for r in out_results], [1])
+        self.assertEqual(retry, [7, 0])
+        self.assertEqual(time_idx, [1])
 
-    async def test_own_paraphrase_passes(self):
+    async def test_aligned_result_kept(self):
         async def fake_embed(texts):
+            # [quote0] + contents：quote0 与 contents[0] 同向 → 放行
             return [[1.0, 0.0], [0.9, 0.1], [0.0, 1.0]]
 
+        results = [ClassifyResult(msg_index=0, quote="自己的改写")]
         with patch.object(
             self.engine, "is_embedding_enabled", return_value=True
         ), patch.object(self.engine, "embed_texts", side_effect=fake_embed):
-            aligned = await self.engine._semantic_quote_referee(
-                "自己的改写", 0, ["自己原文", "无关消息"]
+            out_results, retry, time_idx = await self.engine._semantic_refine(
+                [0], results, [], [], ["自己原文", "无关消息"]
             )
-        self.assertIs(aligned, True)
+        self.assertEqual([r.msg_index for r in out_results], [0])
+        self.assertEqual(retry, [])
+        self.assertEqual(time_idx, [])
 
     async def test_embedding_failure_passes(self):
         async def fake_embed(texts):
             raise RuntimeError("ollama down")
 
+        results = [
+            ClassifyResult(msg_index=0, quote="quote"),
+            ClassifyResult(msg_index=1, quote="quote1"),
+        ]
         with patch.object(
             self.engine, "is_embedding_enabled", return_value=True
         ), patch.object(self.engine, "embed_texts", side_effect=fake_embed):
-            aligned = await self.engine._semantic_quote_referee(
-                "quote", 0, ["a", "b"]
+            out_results, retry, _ = await self.engine._semantic_refine(
+                [0], results, [], [], ["a", "b"]
             )
-        self.assertIs(aligned, True)
+        self.assertEqual(len(out_results), 2, "裁判失效按放行处理，不阻塞分类")
+        self.assertEqual(retry, [])
 
     async def test_embedding_disabled_skips_and_never_calls_embed(self):
         called = []
@@ -145,14 +162,46 @@ class SemanticRefereeTest(unittest.IsolatedAsyncioTestCase):
             called.append(texts)
             return []
 
+        results = [
+            ClassifyResult(msg_index=0, quote="quote"),
+            ClassifyResult(msg_index=1, quote="quote1"),
+        ]
         with patch.object(
             self.engine, "is_embedding_enabled", return_value=False
         ), patch.object(self.engine, "embed_texts", side_effect=fake_embed):
-            aligned = await self.engine._semantic_quote_referee(
-                "quote", 0, ["a", "b"]
+            out_results, retry, _ = await self.engine._semantic_refine(
+                [0], results, [], [], ["a", "b"]
             )
-        self.assertIs(aligned, True)
-        self.assertEqual(called, [])
+        self.assertEqual(called, [], "嵌入未启用时不得发起嵌入调用")
+        self.assertEqual(len(out_results), 2)
+        self.assertEqual(retry, [])
+
+
+class QuoteAlignedDirectTest(unittest.TestCase):
+    """_quote_aligned 直接单测（纯函数，无需 mock 嵌入）。"""
+
+    def test_own_closest_aligned(self):
+        # own 与自身向量同向，他者正交 → 放行
+        self.assertIs(engine._quote_aligned([1.0, 0.0], [[0.9, 0.1], [0.0, 1.0]], 0), True)
+
+    def test_other_closest_drift(self):
+        # own 更接近他者（超出容差） → 拦下
+        self.assertIs(engine._quote_aligned([0.0, 1.0], [[1.0, 0.0], [0.05, 1.0]], 0), False)
+
+    def test_margin_tie_passes(self):
+        # own 略低于 best_other 但差距在 _SEMANTIC_ALIGN_MARGIN(0.05) 内 → 放行
+        # own≈0.9798, best_other≈0.9950，差 ≈0.015 < 0.05 → 平票口径放行
+        self.assertIs(
+            engine._quote_aligned([1.0, 0.0], [[0.98, 0.2], [0.99, 0.1]], 0), True
+        )
+
+    def test_out_of_range_own_idx_treated_as_zero(self):
+        # own_idx 越界按 0.0 处理：单一比较对象显著更高 → 拦下
+        self.assertIs(engine._quote_aligned([1.0, 0.0], [[1.0, 0.0]], 5), False)
+
+    def test_empty_cvecs_passes(self):
+        # 无比较对象（best_other 默认 0.0）→ 放行
+        self.assertIs(engine._quote_aligned([1.0, 0.0], [], 0), True)
 
 
 class ParseResponseAmbiguousOutTest(unittest.TestCase):

@@ -314,8 +314,9 @@ async def poll(
                             f"{msg['serverId']}_{i}"
                             for i in range(1, len(articles) + 1)
                         ]
-                        split_processed = await is_processed(split_ids)
-                        if all(pid in split_processed for pid in split_ids):
+                        # 拆条 id 已随本轮 msg_ids 批量查出（processed_set），
+                        # 无需对同一批拆条二次查询
+                        if all(pid in processed_set for pid in split_ids):
                             session_processed += 1
                             continue
                 # 文章卡片拆条后返回多条；解析失败返回空列表（维持丢弃语义）

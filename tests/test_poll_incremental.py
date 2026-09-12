@@ -34,7 +34,7 @@ from briefdesk.plugins.weflow.poller import poll as wf_poll
 from briefdesk.plugins.weflow_legacy.poller import _PAGE_LIMIT as WFL_PAGE_LIMIT
 from briefdesk.plugins.weflow_legacy.poller import poll as we_poll
 from briefdesk.poll_cycle import _compute_session_windows, run_poll_cycle
-from briefdesk.types import SessionInfo
+from briefdesk.types import PollResult, SessionInfo
 
 _DAY = 86400
 
@@ -155,6 +155,23 @@ class _WeFlowClient:
 
 def _weflow_new_msg(msg_id: str, ts: int) -> dict:
     return {"serverId": msg_id, "localType": 1, "createTime": ts, "content": "x"}
+
+
+def _weflow_article_msg(msg_id: str, ts: int, titles: list[str]) -> dict:
+    """公众号文章卡片（appmsg XML，multi-item 拆条形态）。"""
+    items = "".join(
+        f"<item><title><![CDATA[{t}]]></title>"
+        f"<url><![CDATA[https://example.com/a/{i}]]></url></item>"
+        for i, t in enumerate(titles, start=1)
+    )
+    raw = f"<msg><appmsg>{items}</appmsg></msg>"
+    return {
+        "serverId": msg_id,
+        "localType": 21474836529,
+        "createTime": ts,
+        "rawContent": raw,
+        "content": raw,
+    }
 
 
 async def _no_processed(ids):
@@ -295,6 +312,66 @@ class WeFlowIncrementalTest(unittest.IsolatedAsyncioTestCase):
             self.assertIsNone(client.calls[0][1], "全量模式 start 不传")
         finally:
             config.backfill_hours = original
+
+
+class WeFlowArticleSingleQueryTest(unittest.IsolatedAsyncioTestCase):
+    """文章卡片的已处理查询必须并入首轮批量查询。
+
+    候选阶段的拆条 id（{serverId}_{i}）已随 msg_ids 批量查出
+    （processed_set），不得对同一批拆条发起第二次 is_processed。
+    """
+
+    def setUp(self):
+        self._hours = config.backfill_hours
+        config.backfill_hours = 24
+
+    def tearDown(self):
+        config.backfill_hours = self._hours
+
+    async def _poll_article(
+        self, processed_ids: list[str]
+    ) -> tuple[PollResult, list[list[str]]]:
+        now = int(time.time())
+        calls: list[list[str]] = []
+
+        async def tracking_processed(ids):
+            calls.append(list(ids))
+            return set(processed_ids) & set(ids)
+
+        client = _WeFlowClient(
+            [_weflow_article_msg("m1", now, ["文章一", "文章二"])]
+        )
+        result = await wf_poll(
+            client,  # type: ignore[arg-type]
+            _enabled("weflow", "g1"),
+            tracking_processed,
+            window_start_by_session={"g1": now - _DAY},
+        )
+        return result, calls
+
+    async def test_article_card_queried_once(self):
+        """含文章卡片的单会话轮询：is_processed 仅批量调用一次，且拆条 id
+        已包含在首轮查询里。"""
+        _, calls = await self._poll_article([])
+        self.assertEqual(
+            len(calls), 1, f"is_processed 应只批量查询一次，实际: {calls}"
+        )
+        self.assertIn("m1", calls[0])
+        self.assertIn("m1_1", calls[0])
+        self.assertIn("m1_2", calls[0])
+
+    async def test_fully_processed_article_skipped(self):
+        """拆条全部已处理（含卡片本体）→ 计已处理，不产出新消息。"""
+        result, calls = await self._poll_article(["m1", "m1_1", "m1_2"])
+        self.assertEqual(len(calls), 1)
+        self.assertEqual([m.msg_id for m in result.messages], [])
+
+    async def test_partially_processed_article_keeps_candidate(self):
+        """部分拆条已处理 → 卡片保留为候选（已处理拆条由 pipeline 入口过滤）。"""
+        result, calls = await self._poll_article(["m1_1"])
+        self.assertEqual(len(calls), 1)
+        ids = [m.msg_id for m in result.messages]
+        self.assertIn("m1_2", ids, "未处理的拆条应作为新消息产出")
 
 
 class QqFlowIncrementalTest(unittest.IsolatedAsyncioTestCase):

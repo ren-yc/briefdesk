@@ -273,7 +273,9 @@ RapidOCR（基于 ONNX Runtime，CPU 推理）图片文字识别。只接收图�
 `announcements_updated` SSE 事件（失败重试不刷屏），`get_announcements()` 返回 since 升序快照。快照同时经 `/api/status` 的
 `announcements` 字段下发。探测点：ai_provider setup（未配置 → `embedding_disabled`）与 `engine.embed_texts` 唯一咽喉（异常
 → `embedding_unreachable`、成功 → 撤销）；vision 路由两个探测点——classify 含图请求级失败（`vision_fallback`，vision 成功撤销）与
-pipeline 入口「vision 开启但 enrich 槽为空」（`vision_without_ocr`，配置组合守卫）。与 `lastWarning`（管道成功产出即清空的瞬态提示）互补；前端
+pipeline 入口「vision 开启但 enrich 槽为空」（`vision_without_ocr`，配置组合守卫，`pipeline._check_vision_without_ocr`）。「条件解除方撤销」
+范式见 `vision_without_ocr`：`announce` 幂等（已置位且内容未变返回 False），WARNING 仅在首次置位分支输出，持续实时消息不逐批刷屏；
+enrich 阶段恢复或 vision 关闭时同函数走 `revoke` 撤销横幅，复发时自动重新置位。与 `lastWarning`（管道成功产出即清空的瞬态提示）互补；前端
 公
 告条 `#announcements` 复用 warning 横幅样式，× 关闭仅当次会话。
 
@@ -482,7 +484,7 @@ getattr 探测调用）——server 只依赖它；`SourceRuntime`（`client`/`l
 用
 类型 `ConnectionStatus`、`BatchHandler`、`ProcessedQuery`、异常 `SourceError`/`MediaError`（`download_media`
 失败统一抛 `MediaError`，server 据此映射 404）；**`with_connect_retry`**（连接类失败短退避重试：捕获
-`httpx.ConnectError`/`ConnectTimeout`，0.5s/1s/2s 共 3 次，耗尽原样上抛；不重试 HTTP 状态错误与 503 门控、不用于 SSE 流（监听器已有退
+`httpx.ConnectError`/`ConnectTimeout`，0.5s/1s 共 2 次等待、3 次尝试，耗尽原样上抛；不重试 HTTP 状态错误与 503 门控、不用于 SSE 流（监听器已有退
 避
 重连））。**另提供共享 `BatchBuffer`（实时批缓冲）/`DrainableListenerMixin`（关停冲刷收尾）与 `make_sse_timeout`（SSE 读超时构造）
 ，weflow-legacy/qqflow 监听器共用**；`session_log_prefix(index, total, label)` 为会话级日志行首（`  [3/12] 群名: `）的单源
@@ -1184,7 +1186,7 @@ Settings 经 `ClassVar KEYRING_FIELDS` 声明密钥字段继承之，位于 env 
 ### 启动期上游连接竞态
 
 - briefdesk 启动即发起「首轮回填（REST）+ SSE 首连」，若上游（qqflow-server / WeFlow）TCP 尚未监听，REST 侧由 `with_connect_retry`
-  短退避自愈（3 次 ≈0.5s/1s/2s，耗尽仍写 lastError）；SSE 侧由监听器退避重连自愈。上游就绪慢于重试窗口时仍会记一次 lastError——彻底消除需「启动回填前置探活」（暂未实
+  短退避自愈（3 次尝试、2 次等待 ≈0.5s/1s，耗尽仍写 lastError）；SSE 侧由监听器退避重连自愈。上游就绪慢于重试窗口时仍会记一次 lastError——彻底消除需「启动回填前置探活」（暂未实
   施）。
 
 ### `/health` 的标量阶段不含身份 → 「服务端就绪」≠「我的账号就绪」

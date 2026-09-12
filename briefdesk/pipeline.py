@@ -31,7 +31,7 @@ from briefdesk.logger import fmt_dur
 from briefdesk.masking import PLACEHOLDER_ONLY_RE
 from briefdesk.realtime import publish_items_updated, publish_sync_progress
 from briefdesk.sources_base import SourceClient
-from briefdesk.stages import get_context, get_stages
+from briefdesk.stages import StagePlugin, get_context, get_stages
 from briefdesk.status import (
     get_sync_progress,
     note_sync_batch_done,
@@ -126,6 +126,32 @@ async def _mark_skipped(bctx: BatchContext, failed_set: set[int]) -> None:
     await mark_messages_processed(rows)
 
 
+async def _check_vision_without_ocr(enrich_stages: list[StagePlugin]) -> None:
+    """vision 开启但 OCR 缺位时的公告/撤销（announcements 契约：由发现方
+    置位、条件解除方撤销，撤销前常驻）。
+
+    announce 幂等（已置位且内容未变返回 False）：WARNING 与 SSE 事件仅在
+    首次置位时发生，持续实时消息不会逐批刷屏；条件解除（OCR 启用或 vision
+    关闭）即撤销横幅；修复后复发时 announce 重新返回 True，WARNING 随之
+    再现，无需模块级复位标志。
+    """
+    if not enrich_stages and config.ai_vision_enabled:
+        # vision 开启但 OCR 缺位：纯占位符图片消息被下行过滤、混合消息
+        # 拿不到图片字节——公告提示修复配置
+        if await announcements.announce(
+            "vision_without_ocr",
+            "warning",
+            "AI 视觉输入已开启（AI_VISION_ENABLED）但 ocr 插件未启用："
+            "图片不会送入模型。请在 PLUGINS 启用 ocr（安装 briefdesk[ocr]）"
+            "或关闭 AI_VISION_ENABLED",
+        ):
+            logger.warning(
+                "AI_VISION_ENABLED 已开启但 ocr 插件未启用：图片不会送入模型"
+            )
+    else:
+        await announcements.revoke("vision_without_ocr")
+
+
 @_track_active_batches
 async def process_all_batches(
     messages: list[InternalMessage],
@@ -182,21 +208,9 @@ async def process_all_batches(
     # → 已处理 → raw 批量落库，均无锁。空启用集 → 全滤（保持原监听器语义）；
     # INSERT OR IGNORE 幂等。
 
-    # OCR 配置检查（在遍历前执行）
+    # OCR 配置检查（在遍历前执行）：置位/撤销公告 + 条件性 WARNING
     enrich_stages = get_stages("enrich")
-    if not enrich_stages and config.ai_vision_enabled:
-        # vision 开启但 OCR 缺位：纯占位符图片消息被下行过滤、混合消息
-        # 拿不到图片字节——公告提示修复配置（announce 幂等，不刷屏）。
-        logger.warning(
-            "AI_VISION_ENABLED 已开启但 ocr 插件未启用：图片不会送入模型"
-        )
-        await announcements.announce(
-            "vision_without_ocr",
-            "warning",
-            "AI 视觉输入已开启（AI_VISION_ENABLED）但 ocr 插件未启用："
-            "图片不会送入模型。请在 PLUGINS 启用 ocr（安装 briefdesk[ocr]）"
-            "或关闭 AI_VISION_ENABLED",
-        )
+    await _check_vision_without_ocr(enrich_stages)
 
     # 获取启用会话集合（在遍历前执行）
     enabled_rows = await get_enabled_sessions(source)

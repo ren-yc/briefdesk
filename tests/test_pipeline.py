@@ -5,10 +5,11 @@ from unittest.mock import AsyncMock, Mock, patch
 
 import aiosqlite
 
-from briefdesk import stages
+from briefdesk import announcements, stages
 from briefdesk.config import config
 from briefdesk.db import init_schema
 from briefdesk.pipeline import (
+    _check_vision_without_ocr,
     _mark_skipped,
     _split_batches,
     get_active_batches,
@@ -1487,6 +1488,74 @@ class MarkSkippedContractTest(unittest.IsolatedAsyncioTestCase):
         bulk.assert_awaited_once_with(
             [("weflow-legacy", "m1"), ("weflow-legacy", "m2")]
         )
+
+
+class VisionWithoutOcrAnnouncementTest(unittest.IsolatedAsyncioTestCase):
+    """_check_vision_without_ocr 契约：announce 幂等 → 置位期间
+    WARNING 仅一条；条件解除方撤销；撤销后复发重新告警。"""
+
+    def setUp(self):
+        announcements.reset_announcements()
+        self.addCleanup(announcements.reset_announcements)
+        self.published: list[dict] = []
+
+        async def fake_publish(payload=None):
+            self.published.append(payload or {})
+
+        self._pub_patcher = patch.object(
+            announcements, "publish_announcements_updated", fake_publish
+        )
+        self._pub_patcher.start()
+        self.addCleanup(self._pub_patcher.stop)
+        self._vision_patcher = patch.object(config, "ai_vision_enabled", True)
+        self._vision_patcher.start()
+        self.addCleanup(self._vision_patcher.stop)
+
+    async def test_warning_and_event_only_on_first_announce(self):
+        """连续 3 次触发条件：WARNING 仅 1 条，公告仅置位一次。"""
+        with self.assertLogs("briefdesk.pipeline", level="WARNING") as captured:
+            for _ in range(3):
+                await _check_vision_without_ocr([])
+        self.assertEqual(len(captured.records), 1)
+        self.assertEqual(len(self.published), 1)
+        self.assertEqual(
+            [a["code"] for a in announcements.get_announcements()],
+            ["vision_without_ocr"],
+        )
+
+    async def test_condition_cleared_revokes_announcement(self):
+        """OCR 启用（enrich 阶段非空）→ 公告被撤销且无新 WARNING。"""
+        await _check_vision_without_ocr([])
+        self.assertEqual(len(announcements.get_announcements()), 1)
+        with self.assertNoLogs("briefdesk.pipeline", level="WARNING"):
+            await _check_vision_without_ocr([Mock()])
+        self.assertNotIn(
+            "vision_without_ocr",
+            {a["code"] for a in announcements.get_announcements()},
+        )
+
+    async def test_revoke_then_retrigger_warns_again(self):
+        """撤销后复发 → announce 重新置位（返回 True）且 WARNING 再现，
+        无需模块级复位标志。"""
+        await _check_vision_without_ocr([])
+        await _check_vision_without_ocr([Mock()])
+        self.assertEqual(announcements.get_announcements(), [])
+        with self.assertLogs("briefdesk.pipeline", level="WARNING") as captured:
+            await _check_vision_without_ocr([])
+        self.assertEqual(len(captured.records), 1)
+        # 置位(1) + 撤销(1) + 重新置位(1)——revoke 同样发布事件
+        self.assertEqual(len(self.published), 3)
+        self.assertEqual(
+            [a["code"] for a in announcements.get_announcements()],
+            ["vision_without_ocr"],
+        )
+
+    async def test_vision_disabled_never_announces(self):
+        """vision 关闭即条件不成立：不置位、不发事件、不告警。"""
+        with patch.object(config, "ai_vision_enabled", False):
+            await _check_vision_without_ocr([])
+        self.assertEqual(announcements.get_announcements(), [])
+        self.assertEqual(self.published, [])
 
 
 if __name__ == "__main__":

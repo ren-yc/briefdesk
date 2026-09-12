@@ -227,6 +227,19 @@ class ConflictTest(_ManagerTestBase):
         self.assertEqual(rec.status, "disabled")
         self.assertIn("与 a 互斥", rec.reason)  # /api/plugins 可见原因
 
+    async def test_conflict_reason_aggregates_all_winners(self):
+        """同一落选者与多个 winner 冲突 → reason 汇总全部对端
+        不再被最后一个 winner 覆盖）。"""
+        manager = PluginManager(make_settings(plugins=["c", "b", "a"]))
+        manager.register(FakePlugin("a", conflicts=("b", "c")))
+        manager.register(FakePlugin("b", conflicts=("a",)))
+        manager.register(FakePlugin("c", conflicts=("a",)))
+        await manager.setup_all(make_ctx())
+        self.assertEqual(manager.loaded, ["b", "c"])
+        rec = manager.records()["a"]
+        self.assertEqual(rec.status, "disabled")
+        self.assertIn("与 b、c 互斥", rec.reason)
+
     async def test_conflict_arbitration_follows_plugins_order(self):
         manager = PluginManager(make_settings(plugins=["b", "a"]))
         manager.register(FakePlugin("a", conflicts=("b",)))

@@ -139,7 +139,9 @@ class PluginManager:
             # 可选侧让位，避免把核心插件仲裁掉），其次 PLUGINS 先列者
             return (0 if rec.core else 1, order.get(name, len(allow)), rank[name])
 
-        losers: dict[str, str] = {}
+        # 同一落选者与多个 winner 冲突时全部保留（去重），/api/plugins 的
+        # reason 才不丢对端
+        losers: dict[str, list[str]] = {}
         for name in enabled:
             if name in losers:
                 continue
@@ -149,9 +151,13 @@ class PluginManager:
                 loser, winner = (
                     (name, other) if _key(name) > _key(other) else (other, name)
                 )
-                losers[loser] = winner
-        for name, winner in losers.items():
-            self._mark(name, "disabled", f"与 {winner} 互斥（PLUGINS 先列者保留）")
+                winners = losers.setdefault(loser, [])
+                if winner not in winners:
+                    winners.append(winner)
+        for name, winners in losers.items():
+            self._mark(
+                name, "disabled", f"与 {'、'.join(winners)} 互斥（PLUGINS 先列者保留）"
+            )
         return [n for n in enabled if n not in losers]
 
     def setup_order(self) -> list[str]:

@@ -38,6 +38,8 @@ class SafeMediaPathTest(unittest.TestCase):
     def test_valid(self):
         self.assertTrue(srv._is_safe_media_path("chat@room/images/abc.jpg"))
         self.assertTrue(srv._is_safe_media_path("a..b/c.jpg"))
+        self.assertTrue(srv._is_safe_media_path("abc.jpg"))
+        self.assertTrue(srv._is_safe_media_path("dir/abc.jpg"))
 
     def test_traversal_rejected(self):
         for p in (
@@ -50,6 +52,8 @@ class SafeMediaPathTest(unittest.TestCase):
             "a\\b",
             "a%2eb",
             "a\x00b",
+            "a?b.jpg",
+            "a#b",
         ):
             self.assertFalse(srv._is_safe_media_path(p), p)
 
@@ -70,6 +74,8 @@ class MediaProxyRouteTest(unittest.TestCase):
             "/api/media/weflow-legacy/..%2F..%2F..%2Fapi%2Fv1%2Fcontacts",
             "/api/media/weflow-legacy/%2e%2e/%2e%2e/api/v1/contacts",
             "/api/media/weflow-legacy/..%252F..%252F..%252Fapi%252Fv1%252Fcontacts",
+            "/api/media/weflow-legacy/a%3Fb.jpg",
+            "/api/media/weflow-legacy/a%23b",
         ):
             resp = self.client.get(path)
             self.assertEqual(resp.status_code, 404, path)
@@ -444,6 +450,37 @@ class VerifyApiTest(unittest.TestCase):
         mock = AsyncMock()
         with self._patch_verify(mock):
             resp = self.client.post("/api/items/i1/verify", json={"verified": 2})
+        self.assertEqual(resp.status_code, 400)
+        mock.assert_not_awaited()
+
+    def test_rejects_boolean_verified(self):
+        """JSON 布尔 true 不得被 == 1 吸收按 1 落库（严格类型判定）。"""
+        mock = AsyncMock()
+        with self._patch_verify(mock):
+            resp = self.client.post("/api/items/i1/verify", json={"verified": True})
+        self.assertEqual(resp.status_code, 400)
+        mock.assert_not_awaited()
+
+    def test_accepts_zero_and_minus_one(self):
+        mock = AsyncMock(return_value=True)
+        with self._patch_verify(mock):
+            for value in (0, -1):
+                resp = self.client.post("/api/items/i1/verify", json={"verified": value})
+                self.assertEqual(resp.status_code, 200, f"verified={value} 应放行")
+        self.assertEqual(mock.await_args_list[0].args, ("i1", 0))
+        self.assertEqual(mock.await_args_list[1].args, ("i1", -1))
+
+    def test_rejects_string_verified(self):
+        mock = AsyncMock()
+        with self._patch_verify(mock):
+            resp = self.client.post("/api/items/i1/verify", json={"verified": "1"})
+        self.assertEqual(resp.status_code, 400)
+        mock.assert_not_awaited()
+
+    def test_rejects_null_verified(self):
+        mock = AsyncMock()
+        with self._patch_verify(mock):
+            resp = self.client.post("/api/items/i1/verify", json={"verified": None})
         self.assertEqual(resp.status_code, 400)
         mock.assert_not_awaited()
 

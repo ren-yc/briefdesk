@@ -328,7 +328,13 @@ async def api_restore(file: Annotated[UploadFile, File()]):
 @app.post("/api/items/{item_id}/verify")
 async def api_verify(item_id: str, body: dict):
     verified = body.get("verified")
-    if verified not in (0, 1, -1):
+    # 严格类型判定（对齐 routes_categories._parse_flag）：JSON 布尔 true 在
+    # Python 里 == 1，宽松的 in 判定会把 true 按 1 吸收落库
+    if (
+        not isinstance(verified, int)
+        or isinstance(verified, bool)
+        or verified not in (0, 1, -1)
+    ):
         raise HTTPException(400, "verified must be 0, 1, or -1")
     # 与 pipeline 共用存储锁：单连接隐式事务下，锁外 commit 会把管道
     # 未完成的多步写一并提交（部分写入提前可见）

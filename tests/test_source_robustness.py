@@ -34,7 +34,11 @@ from briefdesk.plugins.weflow.sse import WeFlowSseClient
 from briefdesk.plugins.weflow_legacy.client import WeFlowLegacyClient
 from briefdesk.plugins.weflow_legacy.config import WeFlowLegacySettings
 from briefdesk.plugins.weflow_legacy.sse import WeFlowLegacySseClient
-from briefdesk.sources_base import SourceError
+from briefdesk.sources_base import (
+    BatchBuffer,
+    DrainableListenerMixin,
+    SourceError,
+)
 
 
 def _wf_event(rawid: str = "r1", content: str = "今天下午三点开会讨论") -> dict:
@@ -803,6 +807,79 @@ class StopDrainsBufferTest(unittest.IsolatedAsyncioTestCase):
         listener.stop()
         await listener.aclose()
         self.assertEqual(len(received), 1)
+
+
+class DrainTaskResetTest(unittest.IsolatedAsyncioTestCase):
+    """二次生命周期（stop→start→stop）必须产生新的收尾冲刷任务。
+
+    drain 任务完成后仍是非 None 的已完成 Task；start() 开头不复位会让
+    第二次 stop() 静默跳过收尾冲刷。
+    """
+
+    async def test_mixin_reset_allows_second_drain(self):
+        received: list = []
+
+        async def on_batch(batch):
+            received.extend(batch)
+
+        class _MixinHost(DrainableListenerMixin):
+            def __init__(self):
+                self._batch_buffer = BatchBuffer(on_batch)
+
+        host = _MixinHost()
+        host._start_final_drain()
+        drain1 = host._drain_task
+        self.assertIsNotNone(drain1)
+        await host.aclose()
+        self.assertTrue(drain1.done())
+        host._reset_final_drain()  # start() 开头的复位义务
+        self.assertIsNone(host._drain_task)
+        host._start_final_drain()
+        drain2 = host._drain_task
+        self.assertIsNotNone(drain2, "复位后必须能创建第二个 drain 任务")
+        self.assertIsNot(drain1, drain2)
+        await host.aclose()
+
+    async def test_three_sources_start_resets_drain_task(self):
+        """三源 SSE 的 start() 均履行复位义务：stop→aclose→start→stop 后
+        产生新的 drain 任务（同一参数化断言）。"""
+        listeners = [
+            ("weflow-legacy", WeFlowLegacySseClient(
+                WeFlowLegacyClient("http://127.0.0.1:5031", "tok"),
+                lambda batch: None,
+                settings=WeFlowLegacySettings(),
+            )),
+            ("qqflow", QqFlowSseClient(
+                QqFlowClient("http://127.0.0.1:5032", "tok", qq="1", key="k"),
+                lambda batch: None,
+                settings=QqFlowSettings(),
+            )),
+            ("weflow", WeFlowSseClient(
+                Mock(),
+                lambda batch: None,
+                settings=WeFlowSettings(),
+            )),
+        ]
+        for name, listener in listeners:
+            with (
+                self.subTest(source=name),
+                patch.object(listener, "_connect_loop", new=AsyncMock()),
+                patch.object(listener, "_stats_loop", new=AsyncMock()),
+            ):
+                    listener.stop()
+                    drain1 = listener._drain_task
+                    self.assertIsNotNone(drain1)
+                    await listener.aclose()
+                    self.assertTrue(drain1.done())
+                    listener.start()
+                    self.assertIsNone(
+                        listener._drain_task, "start() 应复位 drain 任务引用"
+                    )
+                    listener.stop()
+                    drain2 = listener._drain_task
+                    self.assertIsNotNone(drain2, "第二次 stop 必须启动新的 drain")
+                    self.assertIsNot(drain1, drain2)
+                    await listener.aclose()
 
 
 class QqFlowControlEventStatsTest(unittest.IsolatedAsyncioTestCase):

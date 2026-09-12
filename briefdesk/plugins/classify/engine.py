@@ -451,19 +451,15 @@ def _cosine(a: list[float], b: list[float]) -> float:
     return dot / ((na ** 0.5) * (nb ** 0.5))
 
 
-async def _semantic_quote_referee(
-    quote: str, own_idx: int, contents: list[str]
-) -> bool:
-    """第二关语义裁判（单条）：quote 的嵌入与哪条消息最近；不可用/失败放行。"""
-    if not is_embedding_enabled():
-        logger.debug("嵌入未启用，语义对齐裁判跳过（宁放行勿误杀）")
-        return True
-    try:
-        vecs = await embed_texts([quote, *contents])
-    except Exception:  # noqa: BLE001 — 裁判失效按放行处理，不阻塞分类
-        logger.debug("语义对齐裁判嵌入失败，放行该条（宁放行勿误杀）")
-        return True
-    sims = [_cosine(vecs[0], v) for v in vecs[1:]]
+def _quote_aligned(qv: list[float], cvecs: list[list[float]], own_idx: int) -> bool:
+    """单条语义判定：quote 向量与自身消息的相似度是否不低于最佳他者
+    （容差 _SEMANTIC_ALIGN_MARGIN，不足视为平票放行——宁放行勿误杀）。
+
+    own_idx 越界按 0.0 处理；cvecs 为空时 best_other 取 0.0（无比较对象
+    即放行）。唯一语义判定实现：字面关（_char_quote_verdict）判出的模糊
+    条目经 _semantic_refine 逐条调用本函数复核。
+    """
+    sims = [_cosine(qv, cv) for cv in cvecs]
     own = sims[own_idx] if 0 <= own_idx < len(sims) else 0.0
     best_other = max(
         (s for i, s in enumerate(sims) if i != own_idx), default=0.0
@@ -503,13 +499,15 @@ async def _semantic_refine(
     qvecs = vecs[: len(pairs)]
     cvecs = vecs[len(pairs) :]
     for (idx, _quote), qv in zip(pairs, qvecs):
+        if _quote_aligned(qv, cvecs, idx):
+            continue
+        # 判定权威在 _quote_aligned；此处重算两个相似度仅供 WARNING 日志
+        # （冷分支，仅漂移条目走到），供排障时对照 own/other 数值
         sims = [_cosine(qv, cv) for cv in cvecs]
         own = sims[idx] if 0 <= idx < len(sims) else 0.0
         best_other = max(
             (s for i, s in enumerate(sims) if i != idx), default=0.0
         )
-        if own >= best_other - _SEMANTIC_ALIGN_MARGIN:
-            continue
         logger.warning(
             "语义对齐裁判：quote 更接近其他消息（own=%.2f other=%.2f，"
             "index %s），转重试",

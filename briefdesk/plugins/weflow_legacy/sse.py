@@ -73,6 +73,8 @@ class WeFlowLegacySseClient(
     def start(self) -> None:
         if self._running:
             return
+        # 二次生命周期：复位上一轮的 drain 任务引用（义务见 mixin docstring）
+        self._reset_final_drain()
         self._running = True
         self._task = asyncio.create_task(self._connect_loop())
         self._stats_task = asyncio.create_task(self._stats_loop())

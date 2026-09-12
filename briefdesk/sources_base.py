@@ -309,6 +309,11 @@ class DrainableListenerMixin:
     RealtimeListener 协议的 stop 为同步方法：冲刷以受跟踪的后台任务执行，
     监听器实现方在 stop() 末尾调用 _start_final_drain()；aclose() 可等待其
     完成（SourceRuntime.close 经 getattr 探测调用）。幂等。
+
+    二次生命周期（stop→start 重启）调用义务：实现方的 start() 开头必须
+    调用 _reset_final_drain()——drain 任务完成后仍是非 None 的已完成
+    Task，不复位会让第二次 stop() 不再启动收尾冲刷（静默丢最后一波
+    缓冲）；两次生命周期之间不保证经过 aclose()。
     """
 
     _batch_buffer: BatchBuffer
@@ -317,6 +322,10 @@ class DrainableListenerMixin:
     def _start_final_drain(self) -> None:
         if self._drain_task is None:
             self._drain_task = asyncio.create_task(self._final_drain())
+
+    def _reset_final_drain(self) -> None:
+        """复位 drain 任务引用（重启方 start() 开头调用，义务见类 docstring）。"""
+        self._drain_task = None
 
     async def _final_drain(self) -> None:
         try:

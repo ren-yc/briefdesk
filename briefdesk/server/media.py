@@ -18,12 +18,16 @@ def _is_safe_media_path(path: str) -> bool:
     """路由层媒体路径安全校验（不依赖各源客户端实现）。
 
     拦截已被解码的穿越载荷（../）、绝对路径、反斜杠、控制字符，
-    以及任何残留百分号（防 %252e%252e%252f 双重编码绕过）。
-    合法文件名中的普通点号（如 abc.jpg）不受影响。
+    以及任何残留百分号（防 %252e%252e%252f 双重编码绕过）；
+    `?`/`#` 一并拒绝——解码后带查询串/片段的路径会原样拼进对源
+    客户端的媒体请求（纵深防御）。合法文件名中的普通点号（如
+    abc.jpg）不受影响。
     """
     if not path or path.startswith("/"):
         return False
     if "\\" in path or "%" in path:
+        return False
+    if "?" in path or "#" in path:
         return False
     if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in path):
         return False
