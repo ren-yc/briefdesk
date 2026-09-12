@@ -26,6 +26,8 @@ try:
 except ImportError:  # pragma: no cover — 未安装 OCR extra 时引擎测试跳过
     _OCR_DEPS_AVAILABLE = False
 
+import pytest
+
 from briefdesk.config import Settings, config
 from briefdesk.plugin.base import PluginContext, PluginDisabledError
 from briefdesk.plugins.ocr.plugin import OcrPlugin
@@ -74,34 +76,34 @@ class _FakeEngine:
 class ExtractTextTest(unittest.TestCase):
     def test_joins_nonempty_lines(self):
         engine = _FakeEngine(result=_Txts(["  a  ", "", "b"]))
-        self.assertEqual(_extract_text(engine, b"x"), "a\nb")
+        assert _extract_text(engine, b"x") == "a\nb"
 
     def test_empty_txts_returns_empty(self):
         engine = _FakeEngine(result=_Txts([]))
-        self.assertEqual(_extract_text(engine, b"x"), "")
+        assert _extract_text(engine, b"x") == ""
 
 
 @unittest.skipUnless(_OCR_DEPS_AVAILABLE, "OCR 依赖未安装（pip install briefdesk[ocr]）")
-class OcrImageBytesTest(unittest.IsolatedAsyncioTestCase):
+class TestOcrImageBytes:
     async def test_no_text_returns_empty_string(self):
         # rapidocr 对无文字图片主动抛 RapidOCRError：应视为"未识别到文字"
         # 返回空串，而不是向调用方抛错（无文字不是失败）。
         engine = _FakeEngine(error=RapidOCRError("The text detection result is empty"))
         with patch("briefdesk.plugins.ocr.engine._get_ocr_engine", new=AsyncMock(return_value=engine)):
-            self.assertEqual(await ocr_image_bytes(b"img"), "")
+            assert await ocr_image_bytes(b"img") == ""
 
     async def test_engine_failure_propagates(self):
         # 真正的引擎故障（模型加载失败等）仍应向上抛，由调用方决定降级。
         engine = _FakeEngine(error=RuntimeError("model broken"))
         with (
             patch("briefdesk.plugins.ocr.engine._get_ocr_engine", new=AsyncMock(return_value=engine)),
-            self.assertRaises(RuntimeError),
+            pytest.raises(RuntimeError),
         ):
             await ocr_image_bytes(b"img")
 
 
 @unittest.skipUnless(_OCR_DEPS_AVAILABLE, "OCR 依赖未安装（pip install briefdesk[ocr]）")
-class OcrImagesBytesPerImageToleranceTest(unittest.IsolatedAsyncioTestCase):
+class TestOcrImagesBytesPerImageTolerance:
     async def test_single_image_failure_does_not_abandon_later_images(self):
         # 复核 P3-7：循环内逐图容错——第 2 张失败（非 RapidOCRError），
         # 第 1/3 张仍识别；此前无逐图 try，第 2 张失败使后续全部放弃。
@@ -116,9 +118,9 @@ class OcrImagesBytesPerImageToleranceTest(unittest.IsolatedAsyncioTestCase):
         ):
             result = await ocr_images_bytes([b"img1", b"img2", b"img3"])
 
-        self.assertIn("[图片 1 OCR 结果]\ntext-of-img1", result)
-        self.assertIn("[图片 3 OCR 结果]\ntext-of-img3", result)
-        self.assertNotIn("img2", result)
+        assert "[图片 1 OCR 结果]\ntext-of-img1" in result
+        assert "[图片 3 OCR 结果]\ntext-of-img3" in result
+        assert "img2" not in result
 
     async def test_all_failures_returns_empty(self):
         async def fake_single(content: bytes) -> str:
@@ -128,10 +130,10 @@ class OcrImagesBytesPerImageToleranceTest(unittest.IsolatedAsyncioTestCase):
             "briefdesk.plugins.ocr.engine.ocr_image_bytes",
             new=AsyncMock(side_effect=fake_single),
         ):
-            self.assertEqual(await ocr_images_bytes([b"img1", b"img2"]), "")
+            assert await ocr_images_bytes([b"img1", b"img2"]) == ""
 
 
-class OcrPluginSetupTest(unittest.IsolatedAsyncioTestCase):
+class TestOcrPluginSetup:
     async def test_setup_registers_enrich_stage_when_deps_present(self):
         # 依赖可用（模拟 engine 模块可导入）→ 注册 enrich 槽位
         registered = []
@@ -140,7 +142,7 @@ class OcrPluginSetupTest(unittest.IsolatedAsyncioTestCase):
             {"briefdesk.plugins.ocr.engine": SimpleNamespace(ocr_images_bytes=AsyncMock())},
         ):
             await OcrPlugin().setup(_ctx(register_stage=registered.append))
-        self.assertEqual([s.slot for s in registered], ["enrich"])
+        assert [s.slot for s in registered] == ["enrich"]
 
     async def test_setup_self_disables_without_deps(self):
         # rapidocr/onnxruntime 未安装（engine 导入失败）→ 抛 PluginDisabledError
@@ -156,7 +158,7 @@ class OcrPluginSetupTest(unittest.IsolatedAsyncioTestCase):
 
         with (
             patch("builtins.__import__", side_effect=_fake_import),
-            self.assertRaises(PluginDisabledError),
+            pytest.raises(PluginDisabledError),
         ):
             await OcrPlugin().setup(_ctx())
 
@@ -197,7 +199,7 @@ def _vision_msg(msg_id="m1", source="weflow-legacy") -> InternalMessage:
     )
 
 
-class OcrPluginVisionStashTest(unittest.IsolatedAsyncioTestCase):
+class TestOcrPluginVisionStash:
     """vision 路由：下载成功后把归一化图片字节随批暂存（独立于 OCR 结果）。"""
 
     async def _run(self, *, vision_enabled, ocr_result="识别文本", ocr_error=None, media_error=None):
@@ -218,23 +220,23 @@ class OcrPluginVisionStashTest(unittest.IsolatedAsyncioTestCase):
     async def test_vision_on_stashes_normalized_jpeg(self):
         batch, msg = await self._run(vision_enabled=True)
         stashed = batch.vision_images[("weflow-legacy", "m1")]
-        self.assertEqual(len(stashed), 1)
-        self.assertTrue(stashed[0].startswith(b"\xff\xd8"))  # 归一化输出为 JPEG
-        self.assertEqual(msg.content, "[OCR]\n识别文本")  # OCR 替换契约不变
+        assert len(stashed) == 1
+        assert stashed[0].startswith(b"\xff\xd8")  # 归一化输出为 JPEG
+        assert msg.content == "[OCR]\n识别文本"  # OCR 替换契约不变
 
     async def test_vision_on_ocr_failure_still_stashes(self):
         # 暂存独立于 OCR 结果：引擎故障时图片仍可送模型，content 保持原文
         batch, msg = await self._run(vision_enabled=True, ocr_error=RuntimeError("broken"))
-        self.assertIn(("weflow-legacy", "m1"), batch.vision_images)
-        self.assertEqual(msg.content, "[图片]")
+        assert ("weflow-legacy", "m1") in batch.vision_images
+        assert msg.content == "[图片]"
 
     async def test_vision_off_no_stash(self):
         batch, _msg = await self._run(vision_enabled=False)
-        self.assertEqual(batch.vision_images, {})
+        assert batch.vision_images == {}
 
     async def test_media_error_no_stash(self):
         batch, _msg = await self._run(vision_enabled=True, media_error="404")
-        self.assertEqual(batch.vision_images, {})
+        assert batch.vision_images == {}
 
 
 if __name__ == "__main__":
@@ -274,10 +276,10 @@ class OcrPartialDownloadFailureTest(unittest.IsolatedAsyncioTestCase):
         with patch.object(config, "ai_vision_enabled", True):
             await plugin.run(batch, None)
         # 其余 2 图仍 OCR（内容替换含 OCR 文本）
-        self.assertEqual(msg.content, "[OCR]\n识别文本")
+        assert msg.content == "[OCR]\n识别文本"
         # stash 含 2 图（失败图不进 stash）
         stashed = batch.vision_images[("weflow-legacy", "m1")]
-        self.assertEqual(len(stashed), 2)
+        assert len(stashed) == 2
 
     async def test_ocr_receives_successful_images_in_original_order(self):
         """OCR 引擎收到的字节序与原 image_urls 中成功图的原序一致。"""
@@ -299,7 +301,7 @@ class OcrPartialDownloadFailureTest(unittest.IsolatedAsyncioTestCase):
             ),
         )
         await plugin.run(batch, None)
-        self.assertEqual(received[-1], [png1, png3])
+        assert received[-1] == [png1, png3]
 
     async def test_all_images_failed_keeps_original_skip_semantics(self):
         """全部图失败 → 整条跳过（现有日志文案 + continue 语义不变）。"""
@@ -314,9 +316,6 @@ class OcrPartialDownloadFailureTest(unittest.IsolatedAsyncioTestCase):
         with self.assertLogs("briefdesk.plugins.ocr.plugin", level="WARNING") as captured:
             await plugin.run(batch, None)
         ocr_mock.assert_not_awaited()
-        self.assertEqual(batch.vision_images, {})
-        self.assertEqual(msg.content, "[图片]")
-        self.assertTrue(
-            any("图片下载失败，跳过 OCR" in m for m in captured.output),
-            captured.output,
-        )
+        assert batch.vision_images == {}
+        assert msg.content == "[图片]"
+        assert any("图片下载失败，跳过 OCR" in m for m in captured.output), captured.output

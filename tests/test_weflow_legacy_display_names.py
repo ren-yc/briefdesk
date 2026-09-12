@@ -8,6 +8,8 @@ import time
 import unittest
 from unittest.mock import AsyncMock, patch
 
+import pytest
+
 from briefdesk.plugins.weflow_legacy.client import (
     WeFlowLegacyClient,
     is_group_session,
@@ -24,18 +26,18 @@ class SessionKindTest(unittest.TestCase):
     """chatlab 会话类型判定：channel→公众号，group/private 直映射，未知兜底私聊。"""
 
     def test_chatlab_types(self):
-        self.assertTrue(is_group_session({"type": "group"}))
-        self.assertTrue(is_private_session({"type": "private"}))
-        self.assertTrue(is_official_session({"type": "channel"}))
+        assert is_group_session({"type": "group"})
+        assert is_private_session({"type": "private"})
+        assert is_official_session({"type": "channel"})
 
     def test_unknown_type_falls_back_to_private(self):
         # JSON 格式的 type=2（数字）等未知值兜底为私聊，避免误判为群聊
-        self.assertFalse(is_group_session({"type": 2}))
-        self.assertTrue(is_private_session({"type": 2}))
-        self.assertFalse(is_official_session({"type": 2}))
+        assert not is_group_session({"type": 2})
+        assert is_private_session({"type": 2})
+        assert not is_official_session({"type": 2})
 
 
-class FetchContactsTest(unittest.IsolatedAsyncioTestCase):
+class TestFetchContacts:
     async def test_candidates_cleaned_before_fallback(self):
         """每级候选必须净化后再判空：脏 displayName 不能压掉干净的 nickname/remark。"""
         client = WeFlowLegacyClient(base_url="http://127.0.0.1:5031", api_token="t")
@@ -64,13 +66,10 @@ class FetchContactsTest(unittest.IsolatedAsyncioTestCase):
         }
         with patch.object(WeFlowLegacyClient, "_get", new=AsyncMock(return_value=payload)):
             contacts = await client.fetch_contacts()
-        self.assertEqual(
-            contacts,
-            {"u1": "甲", "u2": "乙", "u3": "丙", "u4": "u4"},
-        )
+        assert contacts == {"u1": "甲", "u2": "乙", "u3": "丙", "u4": "u4"}
 
 
-class FetchGroupMembersTest(unittest.IsolatedAsyncioTestCase):
+class TestFetchGroupMembers:
     async def test_group_nickname_wins_and_candidates_cleaned(self):
         client = WeFlowLegacyClient(base_url="http://127.0.0.1:5031", api_token="t")
         payload = {
@@ -109,8 +108,8 @@ class FetchGroupMembersTest(unittest.IsolatedAsyncioTestCase):
             WeFlowLegacyClient, "_get", new=AsyncMock(return_value=payload)
         ) as mock:
             members = await client.fetch_group_members("g1")
-        self.assertEqual(members, {"u1": "甲方", "u2": "李四", "u3": "乙"})
-        self.assertNotIn("u4", members)
+        assert members == {"u1": "甲方", "u2": "李四", "u3": "乙"}
+        assert "u4" not in members
         mock.assert_awaited_once_with(
             "/api/v1/group-members",
             params={"chatroomId": "g1"},
@@ -121,7 +120,7 @@ class FetchGroupMembersTest(unittest.IsolatedAsyncioTestCase):
         client = WeFlowLegacyClient(base_url="http://127.0.0.1:5031", api_token="t")
         with patch.object(WeFlowLegacyClient, "_get", new=AsyncMock(return_value=None)):
             members = await client.fetch_group_members("gone")
-        self.assertEqual(members, {})
+        assert members == {}
 
     async def test_other_errors_propagate(self):
         client = WeFlowLegacyClient(base_url="http://127.0.0.1:5031", api_token="t")
@@ -129,12 +128,12 @@ class FetchGroupMembersTest(unittest.IsolatedAsyncioTestCase):
             patch.object(
                 WeFlowLegacyClient, "_get", side_effect=RuntimeError("WeFlow API error: 500")
             ),
-            self.assertRaisesRegex(RuntimeError, "500"),
+            pytest.raises(RuntimeError, match="500"),
         ):
             await client.fetch_group_members("g1")
 
 
-class NormalizeSseDisplayNameTest(unittest.IsolatedAsyncioTestCase):
+class TestNormalizeSseDisplayName:
     async def test_dirty_source_name_falls_back_to_unknown(self):
         msgs = await normalize_sse(
             {
@@ -148,8 +147,8 @@ class NormalizeSseDisplayNameTest(unittest.IsolatedAsyncioTestCase):
             }
         )
         msg = msgs[0]
-        self.assertEqual(msg.sender_name, "未知")
-        self.assertEqual(msg.group_name, "未知")
+        assert msg.sender_name == "未知"
+        assert msg.group_name == "未知"
 
     async def test_dirty_group_name_falls_back_to_session_id(self):
         msgs = await normalize_sse(
@@ -165,8 +164,8 @@ class NormalizeSseDisplayNameTest(unittest.IsolatedAsyncioTestCase):
             }
         )
         msg = msgs[0]
-        self.assertEqual(msg.sender_name, "李四")
-        self.assertEqual(msg.group_name, "xxx@chatroom")
+        assert msg.sender_name == "李四"
+        assert msg.group_name == "xxx@chatroom"
 
 
 class NormalizeRestDisplayNameTest(unittest.TestCase):
@@ -181,16 +180,16 @@ class NormalizeRestDisplayNameTest(unittest.TestCase):
 
     def test_clean_contact_name_used(self):
         msg = normalize_rest(self._msg("wxid_a"), "sess", "群", {"wxid_a": "张三"})[0]
-        self.assertEqual(msg.sender_name, "张三")
-        self.assertEqual(msg.sender_id, "wxid_a")
+        assert msg.sender_name == "张三"
+        assert msg.sender_id == "wxid_a"
 
     def test_dirty_contact_value_falls_back_to_wxid(self):
         msg = normalize_rest(self._msg("wxid_a"), "sess", "群", {"wxid_a": "\x01\x01"})[0]
-        self.assertEqual(msg.sender_name, "wxid_a")
+        assert msg.sender_name == "wxid_a"
 
     def test_missing_contact_falls_back_to_wxid(self):
         msg = normalize_rest(self._msg("wxid_a"), "sess", "群", {})[0]
-        self.assertEqual(msg.sender_name, "wxid_a")
+        assert msg.sender_name == "wxid_a"
 
     def test_group_member_name_wins_over_contact(self):
         msg = normalize_rest(
@@ -200,8 +199,8 @@ class NormalizeRestDisplayNameTest(unittest.TestCase):
             {"wxid_a": "全局备注名"},
             {"wxid_a": "群名片"},
         )[0]
-        self.assertEqual(msg.sender_name, "群名片")
-        self.assertEqual(msg.sender_id, "wxid_a")
+        assert msg.sender_name == "群名片"
+        assert msg.sender_id == "wxid_a"
 
     def test_dirty_group_member_falls_back_to_contact(self):
         msg = normalize_rest(
@@ -211,11 +210,11 @@ class NormalizeRestDisplayNameTest(unittest.TestCase):
             {"wxid_a": "全局备注名"},
             {"wxid_a": "\x01\x01"},
         )[0]
-        self.assertEqual(msg.sender_name, "全局备注名")
+        assert msg.sender_name == "全局备注名"
 
     def test_missing_sender_username_falls_back_to_unknown(self):
         msg = normalize_rest(self._msg(""), "sess", "群", {})[0]
-        self.assertEqual(msg.sender_name, "未知")
+        assert msg.sender_name == "未知"
 
 
 class _FakeClient:
@@ -256,7 +255,7 @@ class _FailingGroupMembersClient(_FakeClient):
         raise RuntimeError("group members down")
 
 
-class PollerDisplayNameTest(unittest.IsolatedAsyncioTestCase):
+class TestPollerDisplayName:
     async def test_private_session_name_backfills_contacts(self):
         client = _FakeClient(
             contacts={"friend1": "朋友"},
@@ -279,13 +278,13 @@ class PollerDisplayNameTest(unittest.IsolatedAsyncioTestCase):
 
         result = await poll(client, [], no_processed)
         contacts = {c.sender_id: c.display_name for c in result.contacts}
-        self.assertEqual(contacts["friend1"], "朋友")
-        self.assertEqual(contacts["u_private"], "私聊对象")
-        self.assertNotIn("g1", contacts)
+        assert contacts["friend1"] == "朋友"
+        assert contacts["u_private"] == "私聊对象"
+        assert "g1" not in contacts
 
         sessions = {s.session_id: s.name for s in result.sessions}
-        self.assertEqual(sessions["u_private"], "私聊对象")
-        self.assertEqual(sessions["g1"], "g1")
+        assert sessions["u_private"] == "私聊对象"
+        assert sessions["g1"] == "g1"
 
     async def test_official_session_backfills_contacts_and_flags_official(self):
         """公众号会话：显示名兜底进 contacts，且会话产出 is_official=True。"""
@@ -299,10 +298,10 @@ class PollerDisplayNameTest(unittest.IsolatedAsyncioTestCase):
 
         result = await poll(client, [], no_processed)
         contacts = {c.sender_id: c.display_name for c in result.contacts}
-        self.assertEqual(contacts["gh_abc"], "上海发布")
+        assert contacts["gh_abc"] == "上海发布"
         sessions = {s.session_id: s for s in result.sessions}
-        self.assertTrue(sessions["gh_abc"].is_official)
-        self.assertFalse(sessions["gh_abc"].is_group)
+        assert sessions["gh_abc"].is_official
+        assert not sessions["gh_abc"].is_group
 
     async def test_contacts_failure_aborts_poll(self):
         """与 qqflow 对齐：contacts 拉取失败必须中止本轮，不能带 wxid 显示名入库。"""
@@ -320,7 +319,7 @@ class PollerDisplayNameTest(unittest.IsolatedAsyncioTestCase):
         async def no_processed(ids):
             return set()
 
-        with self.assertRaisesRegex(RuntimeError, "contacts down"):
+        with pytest.raises(RuntimeError, match="contacts down"):
             await poll(client, [], no_processed)
 
     async def test_group_member_name_resolves_non_friend_sender(self):
@@ -347,13 +346,10 @@ class PollerDisplayNameTest(unittest.IsolatedAsyncioTestCase):
             return set()
 
         result = await poll(client, enabled, no_processed)
-        self.assertEqual(len(result.messages), 1)
-        self.assertEqual(result.messages[0].sender_name, "甲方")
-        self.assertEqual(result.messages[0].sender_id, "wxid_nonfriend")
-        self.assertNotIn(
-            "wxid_nonfriend",
-            {c.sender_id for c in result.contacts},
-        )
+        assert len(result.messages) == 1
+        assert result.messages[0].sender_name == "甲方"
+        assert result.messages[0].sender_id == "wxid_nonfriend"
+        assert "wxid_nonfriend" not in {c.sender_id for c in result.contacts}
 
     async def test_group_members_failure_isolated_to_session(self):
         """【复核 P2-5】群成员解析失败只隔离该会话：该会话消息不入库
@@ -380,13 +376,13 @@ class PollerDisplayNameTest(unittest.IsolatedAsyncioTestCase):
             return set()
 
         result = await poll(client, enabled, no_processed)
-        self.assertEqual(result.messages, [], "失败会话的消息不得入库")
-        self.assertEqual(result.failed_sessions, {"g1"})
+        assert result.messages == [], "失败会话的消息不得入库"
+        assert result.failed_sessions == {"g1"}
         # session_errors 以 session_id 为键（同名群互不覆盖，核验 C2）
-        self.assertIn("group members down", result.session_errors["g1"])
+        assert "group members down" in result.session_errors["g1"]
 
 
-class RuntimeRefreshSessionsTest(unittest.IsolatedAsyncioTestCase):
+class TestRuntimeRefreshSessions:
     async def test_dirty_session_display_name_falls_back_to_id(self):
         source = WeFlowLegacySource(base_url="http://127.0.0.1:5031", api_token="t")
         source.client.fetch_sessions = AsyncMock(
@@ -411,10 +407,10 @@ class RuntimeRefreshSessionsTest(unittest.IsolatedAsyncioTestCase):
         sessions = await source.refresh_sessions()
         names = {s.session_id: s.name for s in sessions}
         kinds = {s.session_id: (s.is_group, s.is_official) for s in sessions}
-        self.assertEqual(names["u1"], "u1")
-        self.assertEqual(names["g1"], "项目群")
-        self.assertEqual(kinds["g1"], (True, False))
-        self.assertEqual(kinds["gh_x"], (False, True))
+        assert names["u1"] == "u1"
+        assert names["g1"] == "项目群"
+        assert kinds["g1"] == (True, False)
+        assert kinds["gh_x"] == (False, True)
         await source.close()
 
 

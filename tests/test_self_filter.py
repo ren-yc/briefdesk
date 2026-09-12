@@ -52,17 +52,17 @@ class WeflowRestSelfDetectionTest(unittest.TestCase):
 
     def test_is_send_1_marks_self(self):
         msgs = normalize_rest(self._msg(isSend=1), "s1", "g", {}, {})
-        self.assertEqual(len(msgs), 1)
-        self.assertTrue(msgs[0].is_self)
+        assert len(msgs) == 1
+        assert msgs[0].is_self
 
     def test_is_send_0_not_self(self):
         msgs = normalize_rest(self._msg(isSend=0), "s1", "g", {}, {})
-        self.assertEqual(len(msgs), 1)
-        self.assertFalse(msgs[0].is_self)
+        assert len(msgs) == 1
+        assert not msgs[0].is_self
 
     def test_missing_is_send_fails_open(self):
         msgs = normalize_rest(self._msg(), "s1", "g", {}, {})
-        self.assertFalse(msgs[0].is_self)
+        assert not msgs[0].is_self
 
     def test_article_card_splits_propagate_self(self):
         # 自己转发的文章卡片：拆条全部继承 is_self
@@ -75,8 +75,8 @@ class WeflowRestSelfDetectionTest(unittest.TestCase):
             {},
             {},
         )
-        self.assertEqual(len(msgs), 2)
-        self.assertTrue(all(m.is_self for m in msgs))
+        assert len(msgs) == 2
+        assert all(m.is_self for m in msgs)
 
     def test_article_card_not_self_kept(self):
         msgs = normalize_rest(
@@ -88,8 +88,8 @@ class WeflowRestSelfDetectionTest(unittest.TestCase):
             {},
             {},
         )
-        self.assertEqual(len(msgs), 2)
-        self.assertTrue(all(not m.is_self for m in msgs))
+        assert len(msgs) == 2
+        assert all(not m.is_self for m in msgs)
 
 
 class QqflowRestSelfDetectionTest(unittest.TestCase):
@@ -110,7 +110,7 @@ class QqflowRestSelfDetectionTest(unittest.TestCase):
 
     def test_self_uid_match_marks_self(self):
         m = qq_normalize_rest(self._msg(), "s1", "g", {}, self_uid="u_12345678")
-        self.assertTrue(m.is_self)
+        assert m.is_self
 
     def test_other_uid_not_self(self):
         m = qq_normalize_rest(
@@ -120,11 +120,11 @@ class QqflowRestSelfDetectionTest(unittest.TestCase):
             {},
             self_uid="u_12345678",
         )
-        self.assertFalse(m.is_self)
+        assert not m.is_self
 
     def test_empty_self_uid_fails_open(self):
         m = qq_normalize_rest(self._msg(), "s1", "g", {}, self_uid="")
-        self.assertFalse(m.is_self)
+        assert not m.is_self
 
     def test_is_send_future_proof(self):
         # 上游未来版本提供方向（isSend=1）时即使 UID 不匹配也判为自己
@@ -135,19 +135,13 @@ class QqflowRestSelfDetectionTest(unittest.TestCase):
             {},
             self_uid="u_12345678",
         )
-        self.assertTrue(m.is_self)
+        assert m.is_self
 
     def test_self_uid_matches_qq_config(self):
-        self.assertEqual(
-            QqFlowClient(
+        assert QqFlowClient(
                 base_url="http://x", api_token="t", qq="12345678", key="k"
-            ).self_uid,
-            "u_12345678",
-        )
-        self.assertEqual(
-            QqFlowClient(base_url="http://x", api_token="t", qq="", key="k").self_uid,
-            "",
-        )
+            ).self_uid == "u_12345678"
+        assert QqFlowClient(base_url="http://x", api_token="t", qq="", key="k").self_uid == ""
 
 
 class IsSelfMessagePredicateTest(unittest.TestCase):
@@ -167,15 +161,15 @@ class IsSelfMessagePredicateTest(unittest.TestCase):
         return base
 
     def test_uid_match(self):
-        self.assertTrue(is_self_message(self._msg(), "u_123"))
-        self.assertFalse(is_self_message(self._msg(senderUsername="u_0"), "u_123"))
+        assert is_self_message(self._msg(), "u_123")
+        assert not is_self_message(self._msg(senderUsername="u_0"), "u_123")
 
     def test_is_send_short_circuits(self):
-        self.assertTrue(is_self_message(self._msg(isSend=1), ""))
-        self.assertFalse(is_self_message(self._msg(), ""))  # 无 self_uid → 不误杀
+        assert is_self_message(self._msg(isSend=1), "")
+        assert not is_self_message(self._msg(), "")  # 无 self_uid → 不误杀
 
 
-class QqflowSseLookbackTest(unittest.IsolatedAsyncioTestCase):
+class TestQqflowSseLookback:
     """qqflow SSE 实时路径：IGNORE_SELF 开启时按消息回查 REST 判定。"""
 
     async def _handle(self, lookback_result, lookback_error=None):
@@ -223,22 +217,22 @@ class QqflowSseLookbackTest(unittest.IsolatedAsyncioTestCase):
         )
         client.lookup_message.assert_awaited_once_with("g1", "42", 1000)
         # 自消息在监听器层直接丢弃（不进攒批缓冲），独立计入统计
-        self.assertEqual(listener._batch_buffer._buffer, [])
-        self.assertEqual(listener._stats_self, 1)
+        assert listener._batch_buffer._buffer == []
+        assert listener._stats_self == 1
 
     async def test_lookback_miss_fails_open(self):
         listener, client, _ = await self._handle(None)
         client.lookup_message.assert_awaited_once()
         buf = listener._batch_buffer._buffer
-        self.assertEqual(len(buf), 1)
-        self.assertFalse(buf[0].is_self, "回查未命中 → 按非自己放行")
+        assert len(buf) == 1
+        assert not buf[0].is_self, "回查未命中 → 按非自己放行"
 
     async def test_lookback_error_fails_open(self):
         listener, client, _ = await self._handle(None, lookback_error=RuntimeError("503"))
         client.lookup_message.assert_awaited_once()
         buf = listener._batch_buffer._buffer
-        self.assertEqual(len(buf), 1)
-        self.assertFalse(buf[0].is_self, "回查异常 → 按非自己放行，不拖垮监听")
+        assert len(buf) == 1
+        assert not buf[0].is_self, "回查异常 → 按非自己放行，不拖垮监听"
 
     async def test_disabled_skips_lookback(self):
         captured: list = []
@@ -265,10 +259,10 @@ class QqflowSseLookbackTest(unittest.IsolatedAsyncioTestCase):
         ):
             await listener._handle_event(event)
         client.lookup_message.assert_not_called()
-        self.assertFalse(listener._batch_buffer._buffer[0].is_self)
+        assert not listener._batch_buffer._buffer[0].is_self
 
 
-class WeflowPollerSelfDropTest(unittest.IsolatedAsyncioTestCase):
+class TestWeflowPollerSelfDrop:
     """weflow-legacy 回填：IGNORE_SELF 开启时 isSend=1 消息在 poller 预滤，不进管道。"""
 
     class _Client:
@@ -330,7 +324,7 @@ class WeflowPollerSelfDropTest(unittest.IsolatedAsyncioTestCase):
                 self._enabled(),
                 self._no_processed,
             )
-        self.assertEqual([m.msg_id for m in result.messages], ["2"], "自消息不进管道")
+        assert [m.msg_id for m in result.messages] == ["2"], "自消息不进管道"
 
     async def test_ignore_self_off_keeps_self_flagged(self):
         import time
@@ -341,12 +335,12 @@ class WeflowPollerSelfDropTest(unittest.IsolatedAsyncioTestCase):
                 self._enabled(),
                 self._no_processed,
             )
-        self.assertEqual([m.msg_id for m in result.messages], ["1", "2"])
-        self.assertTrue(result.messages[0].is_self)
-        self.assertFalse(result.messages[1].is_self)
+        assert [m.msg_id for m in result.messages] == ["1", "2"]
+        assert result.messages[0].is_self
+        assert not result.messages[1].is_self
 
 
-class QqflowPollerSelfDropTest(unittest.IsolatedAsyncioTestCase):
+class TestQqflowPollerSelfDrop:
     """qqflow 回填：IGNORE_SELF 开启时自身 UID 消息在 poller 预滤。"""
 
     class _Client:
@@ -408,7 +402,7 @@ class QqflowPollerSelfDropTest(unittest.IsolatedAsyncioTestCase):
                 self._enabled(),
                 self._no_processed,
             )
-        self.assertEqual([m.msg_id for m in result.messages], ["2"], "自消息不进管道")
+        assert [m.msg_id for m in result.messages] == ["2"], "自消息不进管道"
 
     async def test_ignore_self_off_keeps_self_flagged(self):
         import time
@@ -419,12 +413,12 @@ class QqflowPollerSelfDropTest(unittest.IsolatedAsyncioTestCase):
                 self._enabled(),
                 self._no_processed,
             )
-        self.assertEqual([m.msg_id for m in result.messages], ["1", "2"])
-        self.assertTrue(result.messages[0].is_self)
-        self.assertFalse(result.messages[1].is_self)
+        assert [m.msg_id for m in result.messages] == ["1", "2"]
+        assert result.messages[0].is_self
+        assert not result.messages[1].is_self
 
 
-class QqflowLookupMessageTest(unittest.IsolatedAsyncioTestCase):
+class TestQqflowLookupMessage:
     """QqFlowClient.lookup_message：按 localId + 时间窗口匹配。"""
 
     def _client(self):
@@ -446,8 +440,8 @@ class QqflowLookupMessageTest(unittest.IsolatedAsyncioTestCase):
             }
         )
         m = await client.lookup_message("g1", "42", 1005)
-        self.assertIsNotNone(m)
-        self.assertEqual(m["localId"], 42)
+        assert m is not None
+        assert m["localId"] == 42
         client.fetch_messages.assert_awaited_once_with("g1", start=885, limit=200)
 
     async def test_out_of_window_not_matched(self):
@@ -458,14 +452,14 @@ class QqflowLookupMessageTest(unittest.IsolatedAsyncioTestCase):
             }
         )
         m = await client.lookup_message("g1", "42", 5000)
-        self.assertIsNone(m)
+        assert m is None
 
 
 if __name__ == "__main__":
     unittest.main()
 
 
-class SelfCheckCacheTest(unittest.IsolatedAsyncioTestCase):
+class TestSelfCheckCache:
     """（预防性）：IGNORE_SELF 回查判定带短 TTL 缓存——同 rawid
     重复投递只回查一次 REST，TTL 过期后重新回查。"""
 
@@ -508,7 +502,7 @@ class SelfCheckCacheTest(unittest.IsolatedAsyncioTestCase):
             await self._handle(listener)
             await self._handle(listener, rawid="42")
         client.lookup_message.assert_awaited_once()
-        self.assertIn("42", listener._self_check_cache)
+        assert "42" in listener._self_check_cache
 
     async def test_expired_ttl_relooks_up(self):
         import time as time_module
@@ -522,5 +516,5 @@ class SelfCheckCacheTest(unittest.IsolatedAsyncioTestCase):
                 False,
             )
             await self._handle(listener, rawid="other")
-        self.assertEqual(client.lookup_message.await_count, 2)
-        self.assertGreaterEqual(listener._self_check_cache["other"][0], 0)
+        assert client.lookup_message.await_count == 2
+        assert listener._self_check_cache["other"][0] >= 0

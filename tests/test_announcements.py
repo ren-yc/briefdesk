@@ -10,71 +10,71 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
 from briefdesk.realtime import publish_announcements_updated, subscribe, unsubscribe
 from briefdesk.status import get_status_info
 
 _ROOT = Path(__file__).resolve().parents[1]
 
 
-class AnnounceRegistryTest(unittest.IsolatedAsyncioTestCase):
+class TestAnnounceRegistry:
     """announce/revoke 注册表语义。"""
 
-    def setUp(self) -> None:
+    @pytest.fixture(autouse=True)
+    def _autouse_setup(self):
         from briefdesk import announcements
 
         self.announcements = announcements
         announcements.reset_announcements()
-        self.addCleanup(announcements.reset_announcements)
-
+        yield
+        announcements.reset_announcements()
     async def test_announce_sets_entry(self) -> None:
         changed = await self.announcements.announce(
             "embedding_unreachable", "warning", "嵌入服务不可用"
         )
-        self.assertIs(changed, True)
+        assert changed is True
         items = self.announcements.get_announcements()
-        self.assertEqual(len(items), 1)
-        self.assertEqual(items[0]["code"], "embedding_unreachable")
-        self.assertEqual(items[0]["level"], "warning")
-        self.assertEqual(items[0]["message"], "嵌入服务不可用")
-        self.assertTrue(items[0]["since"])
+        assert len(items) == 1
+        assert items[0]["code"] == "embedding_unreachable"
+        assert items[0]["level"] == "warning"
+        assert items[0]["message"] == "嵌入服务不可用"
+        assert items[0]["since"]
 
     async def test_announce_same_content_is_noop(self) -> None:
         await self.announcements.announce("c", "warning", "m")
-        self.assertIs(await self.announcements.announce("c", "warning", "m"), False)
-        self.assertEqual(len(self.announcements.get_announcements()), 1)
+        assert await self.announcements.announce("c", "warning", "m") is False
+        assert len(self.announcements.get_announcements()) == 1
 
     async def test_announce_updated_message_changes(self) -> None:
         await self.announcements.announce("c", "warning", "old")
-        self.assertIs(await self.announcements.announce("c", "warning", "new"), True)
-        self.assertEqual(self.announcements.get_announcements()[0]["message"], "new")
+        assert await self.announcements.announce("c", "warning", "new") is True
+        assert self.announcements.get_announcements()[0]["message"] == "new"
 
     async def test_revoke_missing_returns_false(self) -> None:
-        self.assertIs(await self.announcements.revoke("absent"), False)
+        assert await self.announcements.revoke("absent") is False
 
     async def test_revoke_removes_existing(self) -> None:
         await self.announcements.announce("c", "warning", "m")
-        self.assertIs(await self.announcements.revoke("c"), True)
-        self.assertEqual(self.announcements.get_announcements(), [])
+        assert await self.announcements.revoke("c") is True
+        assert self.announcements.get_announcements() == []
 
     async def test_list_stable_order(self) -> None:
         """since 升序；同秒并列时按 code 兜底，保证 /api/status 输出稳定。"""
         await self.announcements.announce("b", "warning", "m2")
         await self.announcements.announce("a", "warning", "m1")
-        self.assertEqual(
-            [x["code"] for x in self.announcements.get_announcements()],
-            ["a", "b"],
-        )
+        assert [x["code"] for x in self.announcements.get_announcements()] == ["a", "b"]
 
 
-class AnnouncePublishTest(unittest.IsolatedAsyncioTestCase):
+class TestAnnouncePublish:
     """仅状态变化时发布；快照随事件下发。"""
 
-    def setUp(self) -> None:
+    @pytest.fixture(autouse=True)
+    def _autouse_setup(self):
         from briefdesk import announcements
 
         self.announcements = announcements
         announcements.reset_announcements()
-        self.addCleanup(announcements.reset_announcements)
         self.published: list[dict] = []
 
         async def fake_publish(payload=None):
@@ -84,26 +84,24 @@ class AnnouncePublishTest(unittest.IsolatedAsyncioTestCase):
             announcements, "publish_announcements_updated", fake_publish
         )
         self._patcher.start()
-        self.addCleanup(self._patcher.stop)
-
+        yield
+        self._patcher.stop()
+        announcements.reset_announcements()
     async def test_publishes_only_on_change(self) -> None:
         await self.announcements.announce("c", "warning", "m")
         await self.announcements.announce("c", "warning", "m")
-        self.assertEqual(len(self.published), 1)
-        self.assertEqual(
-            self.published[0]["announcements"],
-            self.announcements.get_announcements(),
-        )
+        assert len(self.published) == 1
+        assert self.published[0]["announcements"] == self.announcements.get_announcements()
         await self.announcements.revoke("c")
-        self.assertEqual(len(self.published), 2)
-        self.assertEqual(self.published[1]["announcements"], [])
+        assert len(self.published) == 2
+        assert self.published[1]["announcements"] == []
 
     async def test_revoke_absent_does_not_publish(self) -> None:
         await self.announcements.revoke("absent")
-        self.assertEqual(self.published, [])
+        assert self.published == []
 
 
-class AnnounceRealtimeEventTest(unittest.IsolatedAsyncioTestCase):
+class TestAnnounceRealtimeEvent:
     """realtime 侧具名事件：announcements_updated 可经 /api/stream 派发。"""
 
     async def test_publish_announcements_updated_event_name(self) -> None:
@@ -111,28 +109,27 @@ class AnnounceRealtimeEventTest(unittest.IsolatedAsyncioTestCase):
         try:
             await publish_announcements_updated({"announcements": []})
             name, _data = q.get_nowait()
-            self.assertEqual(name, "announcements_updated")
+            assert name == "announcements_updated"
         finally:
             await unsubscribe(q)
 
 
-class StatusCarriesAnnouncementsTest(unittest.IsolatedAsyncioTestCase):
+class TestStatusCarriesAnnouncements:
     """/api/status 聚合携带公告快照（前端轮询兜底数据源）。"""
 
-    def setUp(self) -> None:
+    @pytest.fixture(autouse=True)
+    def _autouse_setup(self):
         from briefdesk import announcements
 
         announcements.reset_announcements()
-        self.addCleanup(announcements.reset_announcements)
+        yield
+        announcements.reset_announcements()
 
     async def test_get_status_info_includes_announcements(self) -> None:
         from briefdesk import announcements
 
         await announcements.announce("embedding_unreachable", "warning", "x")
-        self.assertEqual(
-            get_status_info()["announcements"],
-            announcements.get_announcements(),
-        )
+        assert get_status_info()["announcements"] == announcements.get_announcements()
 
 
 class UiWiringTest(unittest.TestCase):
@@ -140,13 +137,11 @@ class UiWiringTest(unittest.TestCase):
 
     def test_ui_wires_announcements(self) -> None:
         html = (_ROOT / "ui" / "index.html").read_text(encoding="utf-8")
-        self.assertIn('id="announcements"', html)
+        assert 'id="announcements"' in html
         app = (_ROOT / "ui" / "app.js").read_text(encoding="utf-8")
-        self.assertIn("function renderAnnouncements", app)
-        self.assertIn('stream.addEventListener("announcements_updated"', app)
-        self.assertIn(
-            "renderAnnouncements(data.status && data.status.announcements)", app
-        )
+        assert "function renderAnnouncements" in app
+        assert 'stream.addEventListener("announcements_updated"' in app
+        assert "renderAnnouncements(data.status && data.status.announcements)" in app
 
 
 if __name__ == "__main__":
