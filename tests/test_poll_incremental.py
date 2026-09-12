@@ -15,6 +15,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
 import aiosqlite
+import pytest
 
 from briefdesk.config import config
 from briefdesk.db import (
@@ -185,15 +186,14 @@ def _enabled(source: str, *session_ids: str) -> list[SessionInfo]:
     ]
 
 
-class WeFlowIncrementalTest(unittest.IsolatedAsyncioTestCase):
-    def setUp(self):
+class TestWeFlowIncremental:
+    @pytest.fixture(autouse=True)
+    def _autouse_setup(self):
         # 固定 BACKFILL_HOURS：增量窗口测试不依赖 .env 配置（本地 .env 可能为 -1 全量）
         self._hours = config.backfill_hours
         config.backfill_hours = 24
-
-    def tearDown(self):
+        yield
         config.backfill_hours = self._hours
-
     async def test_incremental_window_passes_start_and_pages_to_end(self):
         now = int(time.time())
         window = now - _DAY
@@ -211,13 +211,13 @@ class WeFlowIncrementalTest(unittest.IsolatedAsyncioTestCase):
         )
 
         # start 参数透传为该会话窗口下界；翻页直至 hasMore=False（无 500 条硬顶）
-        self.assertEqual(client.calls[0][1], window)
-        self.assertEqual([c[2] for c in client.calls], [0, 500])
-        self.assertTrue(all(c[3] for c in client.calls))  # media=True 保持
+        assert client.calls[0][1] == window
+        assert [c[2] for c in client.calls] == [0, 500]
+        assert all(c[3] for c in client.calls)  # media=True 保持
         ids = {m.msg_id for m in result.messages}
-        self.assertIn("edge", ids, "窗口下界含边界：createTime == start 应保留")
-        self.assertNotIn("old", ids, "超窗口消息应被过滤")
-        self.assertEqual(len(ids), 501)
+        assert "edge" in ids, "窗口下界含边界：createTime == start 应保留"
+        assert "old" not in ids, "超窗口消息应被过滤"
+        assert len(ids) == 501
 
     async def test_incremental_respects_processed(self):
         now = int(time.time())
@@ -235,7 +235,7 @@ class WeFlowIncrementalTest(unittest.IsolatedAsyncioTestCase):
             window_start_by_session={"g1": window},
         )
 
-        self.assertEqual([m.msg_id for m in result.messages], ["m2"])
+        assert [m.msg_id for m in result.messages] == ["m2"]
 
     async def test_session_missing_from_windows_falls_back_to_backfill(self):
         # 会话缺省（无水位/新启用）→ 回退 BACKFILL_HOURS 窗口（启用即回填）
@@ -253,8 +253,8 @@ class WeFlowIncrementalTest(unittest.IsolatedAsyncioTestCase):
             )
 
             start_ts = client.calls[0][1]
-            self.assertIsNotNone(start_ts)
-            self.assertAlmostEqual(start_ts, now - 24 * 3600, delta=5)
+            assert start_ts is not None
+            assert abs(start_ts - (now - 24 * 3600)) <= 5
         finally:
             config.backfill_hours = original
 
@@ -269,8 +269,8 @@ class WeFlowIncrementalTest(unittest.IsolatedAsyncioTestCase):
             await we_poll(client, _enabled("weflow-legacy", "g1"), _no_processed)
 
             start_ts = client.calls[0][1]
-            self.assertIsNotNone(start_ts)
-            self.assertAlmostEqual(start_ts, now - 24 * 3600, delta=5)
+            assert start_ts is not None
+            assert abs(start_ts - (now - 24 * 3600)) <= 5
         finally:
             config.backfill_hours = original
 
@@ -290,8 +290,8 @@ class WeFlowIncrementalTest(unittest.IsolatedAsyncioTestCase):
             )
 
             start_ts = client.calls[0][1]
-            self.assertIsNotNone(start_ts)
-            self.assertAlmostEqual(start_ts, now - 24 * 3600, delta=5)
+            assert start_ts is not None
+            assert abs(start_ts - (now - 24 * 3600)) <= 5
         finally:
             config.backfill_hours = original
 
@@ -309,25 +309,24 @@ class WeFlowIncrementalTest(unittest.IsolatedAsyncioTestCase):
                 window_start_by_session={"g1": now - 3600},
             )
 
-            self.assertIsNone(client.calls[0][1], "全量模式 start 不传")
+            assert client.calls[0][1] is None, "全量模式 start 不传"
         finally:
             config.backfill_hours = original
 
 
-class WeFlowArticleSingleQueryTest(unittest.IsolatedAsyncioTestCase):
+class TestWeFlowArticleSingleQuery:
     """文章卡片的已处理查询必须并入首轮批量查询。
 
     候选阶段的拆条 id（{serverId}_{i}）已随 msg_ids 批量查出
     （processed_set），不得对同一批拆条发起第二次 is_processed。
     """
 
-    def setUp(self):
+    @pytest.fixture(autouse=True)
+    def _autouse_setup(self):
         self._hours = config.backfill_hours
         config.backfill_hours = 24
-
-    def tearDown(self):
+        yield
         config.backfill_hours = self._hours
-
     async def _poll_article(
         self, processed_ids: list[str]
     ) -> tuple[PollResult, list[list[str]]]:
@@ -353,36 +352,33 @@ class WeFlowArticleSingleQueryTest(unittest.IsolatedAsyncioTestCase):
         """含文章卡片的单会话轮询：is_processed 仅批量调用一次，且拆条 id
         已包含在首轮查询里。"""
         _, calls = await self._poll_article([])
-        self.assertEqual(
-            len(calls), 1, f"is_processed 应只批量查询一次，实际: {calls}"
-        )
-        self.assertIn("m1", calls[0])
-        self.assertIn("m1_1", calls[0])
-        self.assertIn("m1_2", calls[0])
+        assert len(calls) == 1, f"is_processed 应只批量查询一次，实际: {calls}"
+        assert "m1" in calls[0]
+        assert "m1_1" in calls[0]
+        assert "m1_2" in calls[0]
 
     async def test_fully_processed_article_skipped(self):
         """拆条全部已处理（含卡片本体）→ 计已处理，不产出新消息。"""
         result, calls = await self._poll_article(["m1", "m1_1", "m1_2"])
-        self.assertEqual(len(calls), 1)
-        self.assertEqual([m.msg_id for m in result.messages], [])
+        assert len(calls) == 1
+        assert [m.msg_id for m in result.messages] == []
 
     async def test_partially_processed_article_keeps_candidate(self):
         """部分拆条已处理 → 卡片保留为候选（已处理拆条由 pipeline 入口过滤）。"""
         result, calls = await self._poll_article(["m1_1"])
-        self.assertEqual(len(calls), 1)
+        assert len(calls) == 1
         ids = [m.msg_id for m in result.messages]
-        self.assertIn("m1_2", ids, "未处理的拆条应作为新消息产出")
+        assert "m1_2" in ids, "未处理的拆条应作为新消息产出"
 
 
-class QqFlowIncrementalTest(unittest.IsolatedAsyncioTestCase):
-    def setUp(self):
+class TestQqFlowIncremental:
+    @pytest.fixture(autouse=True)
+    def _autouse_setup(self):
         # 固定 BACKFILL_HOURS：增量窗口测试不依赖 .env 配置（本地 .env 可能为 -1 全量）
         self._hours = config.backfill_hours
         config.backfill_hours = 24
-
-    def tearDown(self):
+        yield
         config.backfill_hours = self._hours
-
     async def test_incremental_window_passes_start_and_filters_old(self):
         now = int(time.time())
         window = now - _DAY
@@ -400,9 +396,9 @@ class QqFlowIncrementalTest(unittest.IsolatedAsyncioTestCase):
             window_start_by_session={"g1": window},
         )
 
-        self.assertEqual(client.calls[0][0], window)
+        assert client.calls[0][0] == window
         ids = {m.msg_id for m in result.messages}
-        self.assertEqual(ids, {"1", "2"})
+        assert ids == {"1", "2"}
 
     async def test_no_watermark_falls_back_to_backfill_hours(self):
         original = config.backfill_hours
@@ -414,8 +410,8 @@ class QqFlowIncrementalTest(unittest.IsolatedAsyncioTestCase):
             await qq_poll(client, _enabled("qqflow", "g1"), _no_processed)
 
             start = client.calls[0][0]
-            self.assertIsNotNone(start)
-            self.assertAlmostEqual(start, now - 24 * 3600, delta=5)
+            assert start is not None
+            assert abs(start - (now - 24 * 3600)) <= 5
         finally:
             config.backfill_hours = original
 
@@ -520,8 +516,8 @@ class QqFlowPagingGuardTest(unittest.IsolatedAsyncioTestCase):
         )
 
         ids = [m.msg_id for m in result.messages]
-        self.assertEqual(len(ids), len(set(ids)), f"无重复: {ids}")
-        self.assertEqual(set(ids), {"1", "2", "3"})
+        assert len(ids) == len(set(ids)), f"无重复: {ids}"
+        assert set(ids) == {"1", "2", "3"}
 
     async def test_short_page_with_has_more_does_not_skip_rows(self):
         """上游回短页却仍报 hasMore=true → offset 按实际条数步进，不跳行。
@@ -544,8 +540,8 @@ class QqFlowPagingGuardTest(unittest.IsolatedAsyncioTestCase):
             window_start_by_session={"g1": now - _DAY},
         )
 
-        self.assertEqual([o for _, o in client.calls], [0, 1], "按实际条数步进")
-        self.assertEqual({m.msg_id for m in result.messages}, {"1", "2"})
+        assert [o for _, o in client.calls] == [0, 1], "按实际条数步进"
+        assert {m.msg_id for m in result.messages} == {"1", "2"}
 
     async def test_session_line_carries_filtered_count(self):
         """每会话 INFO 行带「过滤」计数：区分「预滤掉了」与「本来就没有」。"""
@@ -570,20 +566,18 @@ class QqFlowPagingGuardTest(unittest.IsolatedAsyncioTestCase):
                 window_start_by_session={"g1": now - _DAY},
             )
 
-        self.assertTrue(
-            any("1 过滤" in m for m in logs.output),
-            f"会话行应带过滤计数: {logs.output}",
-        )
+        assert any("1 过滤" in m for m in logs.output), f"会话行应带过滤计数: {logs.output}"
         # 汇总行的括号收在末尾，不能是 "...1.2s), 自己 4" 那种断裂形状
         summary = [m for m in logs.output if "poll 完成" in m]
-        self.assertTrue(summary)
-        self.assertTrue(summary[0].endswith(")"), summary[0])
+        assert summary
+        assert summary[0].endswith(")"), summary[0]
 
 
-class SessionWindowComputationTest(unittest.IsolatedAsyncioTestCase):
+class TestSessionWindowComputation:
     """_compute_session_windows：会话水位 / 未处理消息按会话钉窗 / 回填起点。"""
 
-    async def asyncSetUp(self):
+    @pytest.fixture(autouse=True)
+    async def _autouse_setup(self):
         self.db = await aiosqlite.connect(":memory:")
         self.db.row_factory = aiosqlite.Row
         await init_schema(self.db)
@@ -601,13 +595,11 @@ class SessionWindowComputationTest(unittest.IsolatedAsyncioTestCase):
                 (sid, sid),
             )
         await self.db.commit()
-
-    async def asyncTearDown(self):
+        yield
         self._db_patch.stop()
         config.poll_overlap_seconds = self._overlap
         config.backfill_hours = self._hours
         await self.db.close()
-
     async def _seed_raw(self, session_id: str, msg_id: str, ts: int) -> None:
         await self.db.execute(
             "INSERT INTO raw_messages (source, msg_id, session_id, group_name, "
@@ -623,14 +615,14 @@ class SessionWindowComputationTest(unittest.IsolatedAsyncioTestCase):
     async def test_no_state_all_sessions_backfill(self):
         # 无水位会话 → 值 None（源按 BACKFILL_HOURS 回填）
         windows = await _compute_session_windows("weflow-legacy", self._enabled())
-        self.assertEqual(windows, {"g1": None, "g2": None})
+        assert windows == {"g1": None, "g2": None}
 
     async def test_watermark_minus_overlap_per_session(self):
         now = int(time.time())
         await update_session_last_polls("weflow-legacy", [("g1", now - _DAY), ("g2", now - 7200)])
         windows = await _compute_session_windows("weflow-legacy", self._enabled())
-        self.assertEqual(windows["g1"], now - _DAY - 300)
-        self.assertEqual(windows["g2"], now - 7200 - 300)
+        assert windows["g1"] == now - _DAY - 300
+        assert windows["g2"] == now - 7200 - 300
 
     async def test_unprocessed_pins_only_its_own_session(self):
         # g1 有更旧的未处理消息 → 仅 g1 窗口被钉住；g2 水位不受影响
@@ -638,8 +630,8 @@ class SessionWindowComputationTest(unittest.IsolatedAsyncioTestCase):
         await update_session_last_polls("weflow-legacy", [("g1", now - 3600), ("g2", now - 3600)])
         await self._seed_raw("g1", "f1", now - 7200)
         windows = await _compute_session_windows("weflow-legacy", self._enabled())
-        self.assertEqual(windows["g1"], now - 7200 - 300, "有未处理消息的会话以其最久远未处理消息为下界")
-        self.assertEqual(windows["g2"], now - 3600 - 300, "完整处理后的会话水位不受影响")
+        assert windows["g1"] == now - 7200 - 300, "有未处理消息的会话以其最久远未处理消息为下界"
+        assert windows["g2"] == now - 3600 - 300, "完整处理后的会话水位不受影响"
 
     async def test_unprocessed_resolved_stops_pinning(self):
         now = int(time.time())
@@ -647,27 +639,25 @@ class SessionWindowComputationTest(unittest.IsolatedAsyncioTestCase):
         await self._seed_raw("g1", "f1", now - 7200)
         await mark_message_processed("weflow-legacy", "f1")
         windows = await _compute_session_windows("weflow-legacy", self._enabled())
-        self.assertEqual(windows["g1"], now - 3600 - 300)
+        assert windows["g1"] == now - 3600 - 300
 
     async def test_pull_all_returns_none(self):
         config.backfill_hours = -1
-        self.assertIsNone(await _compute_session_windows("weflow-legacy", self._enabled()))
+        assert await _compute_session_windows("weflow-legacy", self._enabled()) is None
 
     async def test_empty_enabled_returns_empty_dict(self):
-        self.assertEqual(await _compute_session_windows("weflow-legacy", []), {})
+        assert await _compute_session_windows("weflow-legacy", []) == {}
 
     async def test_db_functions_roundtrip(self):
         now = int(time.time())
-        self.assertEqual(
-            await get_session_last_polls("weflow-legacy", ["g1", "g2"]), {"g1": None, "g2": None}
-        )
+        assert await get_session_last_polls("weflow-legacy", ["g1", "g2"]) == {"g1": None, "g2": None}
         await update_session_last_polls("weflow-legacy", [("g1", now)])
-        self.assertEqual(await get_session_last_polls("weflow-legacy", ["g1", "g2"]), {"g1": now, "g2": None})
+        assert await get_session_last_polls("weflow-legacy", ["g1", "g2"]) == {"g1": now, "g2": None}
         await self._seed_raw("g1", "f1", now - 100)
-        self.assertEqual(await get_oldest_unprocessed_by_session("weflow-legacy"), {"g1": now - 100})
+        assert await get_oldest_unprocessed_by_session("weflow-legacy") == {"g1": now - 100}
 
 
-class PollCycleWatermarkTest(unittest.IsolatedAsyncioTestCase):
+class TestPollCycleWatermark:
     """run_poll_cycle 仅在管道正常完成时推进会话水位；
     管道早退（无启用类别/阶段缺失）时跳过推进，防消息永久丢失。"""
 
@@ -722,7 +712,7 @@ class PollCycleWatermarkTest(unittest.IsolatedAsyncioTestCase):
         upd.assert_awaited_once()  # 正常完成：推进水位
 
 
-class PollCyclePartialFailureTest(unittest.IsolatedAsyncioTestCase):
+class TestPollCyclePartialFailure:
     """P0：源侧静默跳过的会话（PollResult.failed_sessions）不推进水位。
 
     qqflow 索引期 503 等瞬态失败若照常推进会话水位，被跳会话窗口内的消息
@@ -773,7 +763,7 @@ class PollCyclePartialFailureTest(unittest.IsolatedAsyncioTestCase):
         upd = await self._run({"g2"})
         upd.assert_awaited_once()
         advanced = [sid for sid, _ts in upd.await_args.args[1]]
-        self.assertEqual(advanced, ["g1"], "仅成功拉取的会话推进水位")
+        assert advanced == ["g1"], "仅成功拉取的会话推进水位"
 
     async def test_all_failed_skips_watermark(self):
         # 全部启用会话失败 → 完全不调用 update_session_last_polls
@@ -781,7 +771,7 @@ class PollCyclePartialFailureTest(unittest.IsolatedAsyncioTestCase):
         upd.assert_not_awaited()
 
 
-class QqFlowNotReadyFailureTest(unittest.IsolatedAsyncioTestCase):
+class TestQqFlowNotReadyFailure:
     """P0：qqflow poller 在 503 静默跳过时把对应会话记入 failed_sessions。"""
 
     async def test_discovery_notready_marks_all_enabled_failed(self):
@@ -789,23 +779,23 @@ class QqFlowNotReadyFailureTest(unittest.IsolatedAsyncioTestCase):
         client = _QqFlowClient([])
         client.fetch_sessions = AsyncMock(side_effect=QqFlowNotReadyError("indexing"))
         result = await qq_poll(client, _enabled("qqflow", "g1", "g2"), _no_processed)
-        self.assertEqual(result.failed_sessions, {"g1", "g2"})
+        assert result.failed_sessions == {"g1", "g2"}
 
     async def test_session_fetch_notready_marks_session_failed(self):
         # 单会话翻页期 503：仅该会话记入 failed_sessions
         client = _QqFlowClient([])
         client.fetch_messages = AsyncMock(side_effect=QqFlowNotReadyError("indexing"))
         result = await qq_poll(client, _enabled("qqflow", "g1"), _no_processed)
-        self.assertEqual(result.failed_sessions, {"g1"})
+        assert result.failed_sessions == {"g1"}
 
     async def test_success_has_empty_failed_sessions(self):
         now = int(time.time())
         client = _QqFlowClient([_qqflow_msg(1, now - 10)])
         result = await qq_poll(client, _enabled("qqflow", "g1"), _no_processed)
-        self.assertEqual(result.failed_sessions, set())
+        assert result.failed_sessions == set()
 
 
-class AccountMismatchCycleTest(unittest.IsolatedAsyncioTestCase):
+class TestAccountMismatchCycle:
     """账号不符必须走「整轮中止 + lastError + 不推水位」，与 503 的静默跳过相反。
 
     这条守的是修复的最终收益：不符错误得真正抵达 lastError（前端可见）。
@@ -861,15 +851,15 @@ class AccountMismatchCycleTest(unittest.IsolatedAsyncioTestCase):
         )
         upd.assert_not_awaited()  # 水位不推进
         errors = [d["lastError"] for d in status if "lastError" in d]
-        self.assertEqual(len(errors), 1, "必须恰好写一次 lastError")
-        self.assertIn("999", errors[0], "前端要能看到占用方账号")
+        assert len(errors) == 1, "必须恰好写一次 lastError"
+        assert "999" in errors[0], "前端要能看到占用方账号"
 
     async def test_cycle_does_not_crash_out(self):
         """兜底出口吞掉异常本身：不符不该让调度协程整个死掉。"""
         await self._run(QqFlowAccountMismatchError("绑定不符"))  # 不抛即通过
 
 
-class SessionFailureIsolationTest(unittest.IsolatedAsyncioTestCase):
+class TestSessionFailureIsolation:
     """【复核 P2-5】单会话拉取失败不再中止整轮：记入 failed_sessions 与
     session_errors，其余会话照常处理（此前整轮 raise 会让一个持续失败的
     坏会话饿死同源所有会话——已收集消息作废、全部水位不推进）。"""
@@ -897,11 +887,9 @@ class SessionFailureIsolationTest(unittest.IsolatedAsyncioTestCase):
             _no_processed,
             window_start_by_session={"g1": window, "g2": window},
         )
-        self.assertEqual(
-            [m.msg_id for m in result.messages], ["m1"], "坏会话不得拖垮好会话"
-        )
-        self.assertEqual(result.failed_sessions, {"g2"})
-        self.assertIn("g2", result.session_errors)
+        assert [m.msg_id for m in result.messages] == ["m1"], "坏会话不得拖垮好会话"
+        assert result.failed_sessions == {"g2"}
+        assert "g2" in result.session_errors
 
     async def test_same_name_sessions_keep_both_errors(self):
         """【核验 C2】同名群（如多个「通知群」）同轮失败：session_errors 以
@@ -934,10 +922,8 @@ class SessionFailureIsolationTest(unittest.IsolatedAsyncioTestCase):
             _no_processed,
             window_start_by_session={"g1": window, "g2": window},
         )
-        self.assertEqual(result.failed_sessions, {"g1", "g2"})
-        self.assertEqual(
-            set(result.session_errors), {"g1", "g2"}, "同名群不得互相覆盖"
-        )
+        assert result.failed_sessions == {"g1", "g2"}
+        assert set(result.session_errors) == {"g1", "g2"}, "同名群不得互相覆盖"
 
 
 class LegacyPagingGuardTest(unittest.IsolatedAsyncioTestCase):
@@ -981,13 +967,10 @@ class LegacyPagingGuardTest(unittest.IsolatedAsyncioTestCase):
             window_start_by_session={"g1": now - _DAY},
         )
         ids = [m.msg_id for m in result.messages]
-        self.assertEqual(len(ids), len(set(ids)), f"无重复: {ids}")
-        self.assertEqual(set(ids), {"m1", "m2", "m3"})
-        self.assertTrue(seen_queries, "应发生过已处理查询")
-        self.assertTrue(
-            all(len(q) == len(set(q)) for q in seen_queries),
-            f"is_processed 查询不应含重复 id: {seen_queries}",
-        )
+        assert len(ids) == len(set(ids)), f"无重复: {ids}"
+        assert set(ids) == {"m1", "m2", "m3"}
+        assert seen_queries, "应发生过已处理查询"
+        assert all(len(q) == len(set(q)) for q in seen_queries), f"is_processed 查询不应含重复 id: {seen_queries}"
 
     async def test_old_count_includes_full_page_tail(self):
         """超窗消息同页多条：session_old 全数计入（此前仅首个触窗条计入/
@@ -1009,10 +992,7 @@ class LegacyPagingGuardTest(unittest.IsolatedAsyncioTestCase):
                 _no_processed,
                 window_start_by_session={"g1": window},
             )
-        self.assertTrue(
-            any("5 超窗口" in m for m in logs.output),
-            f"会话行应含完整超窗计数: {logs.output}",
-        )
+        assert any("5 超窗口" in m for m in logs.output), f"会话行应含完整超窗计数: {logs.output}"
 
     async def test_qqflow_old_count_includes_full_page_tail(self):
         """qqflow 同款计数（改动与 legacy 同构）。"""
@@ -1032,26 +1012,22 @@ class LegacyPagingGuardTest(unittest.IsolatedAsyncioTestCase):
                 _no_processed,
                 window_start_by_session={"g1": window},
             )
-        self.assertTrue(
-            any("5 超窗口" in m for m in logs.output),
-            f"会话行应含完整超窗计数: {logs.output}",
-        )
+        assert any("5 超窗口" in m for m in logs.output), f"会话行应含完整超窗计数: {logs.output}"
 
 
-class PagingAgeEarlyStopTest(unittest.IsolatedAsyncioTestCase):
+class TestPagingAgeEarlyStop:
     """【复核 P2-12】页内碰到早于窗口的消息即止（响应按时间倒序），不再
     深翻后续页——防御上游无视 start 参数返回历史全量（weflow 上限 40 万条、
     legacy 100 万条全量驻留内存）。"""
 
-    def setUp(self):
+    @pytest.fixture(autouse=True)
+    def _autouse_setup(self):
         # 固定 BACKFILL_HOURS：本机 .env 可能设 -1（全量模式 start=None、
         # cutoff=0，早停天然不触发），与现有增量测试同一隔离手法
         self._hours = config.backfill_hours
         config.backfill_hours = 24
-
-    def tearDown(self):
+        yield
         config.backfill_hours = self._hours
-
     @staticmethod
     def _mixed_messages(make_msg, now: int, window: int, page_limit: int) -> list[dict]:
         # page_limit 条窗口内 + 1 条超窗 + page_limit+100 条更旧：naive 翻页
@@ -1080,7 +1056,7 @@ class PagingAgeEarlyStopTest(unittest.IsolatedAsyncioTestCase):
             self._all_processed,
             window_start_by_session={"g1": window},
         )
-        self.assertEqual(len(client.calls), 2, "第二页碰到超窗消息后不得再翻第三页")
+        assert len(client.calls) == 2, "第二页碰到超窗消息后不得再翻第三页"
 
     async def test_weflow_paging_stops_at_window_edge(self):
         now = int(time.time())
@@ -1094,10 +1070,10 @@ class PagingAgeEarlyStopTest(unittest.IsolatedAsyncioTestCase):
             self._all_processed,
             window_start_by_session={"g1": window},
         )
-        self.assertEqual(len(client.calls), 2, "第二页碰到超窗消息后不得再翻第三页")
+        assert len(client.calls) == 2, "第二页碰到超窗消息后不得再翻第三页"
 
 
-class PollFlagResetTest(unittest.IsolatedAsyncioTestCase):
+class TestPollFlagReset:
     """（预防性）：poll 结束（正常/异常路径）后 _polling 复位 False，
     且复位与置位持同一把 _poll_lock——互斥语义不依赖单线程假设。"""
 
@@ -1142,7 +1118,7 @@ class PollFlagResetTest(unittest.IsolatedAsyncioTestCase):
         patches = self._patches()
         with patches[0], patches[1], patches[2], patches[3]:
             await run_poll_cycle(source)
-        self.assertFalse(pc._polling)
+        assert not pc._polling
 
     async def test_poll_cycle_resets_flag_after_failure(self):
         import briefdesk.poll_cycle as pc
@@ -1153,4 +1129,4 @@ class PollFlagResetTest(unittest.IsolatedAsyncioTestCase):
         )
         with patches[0], patches[1], patches[2], patches[3]:
             await run_poll_cycle(source)
-        self.assertFalse(pc._polling)
+        assert not pc._polling

@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
 import aiosqlite
+import pytest
 
 from briefdesk.db import delete_items, init_schema
 from briefdesk.plugins.dedup import engine as dedup_engine_module
@@ -30,9 +31,9 @@ class AskAiParseFailureTest(unittest.IsolatedAsyncioTestCase):
         chat = AsyncMock(return_value=SimpleNamespace(choices=[]))
         with patch("briefdesk.plugins.dedup.engine.chat", new=chat):
             verdict = await engine._ask_ai(item, "B", "qb")
-        self.assertIsNone(verdict, "解析失败是「未知」，不是 DIFFERENT")
-        self.assertIsNot(verdict, False, "False 会被当作明确反对票计入计权")
-        self.assertEqual(chat.await_count, 2, "两次尝试后才放弃")
+        assert verdict is None, "解析失败是「未知」，不是 DIFFERENT"
+        assert verdict is not False, "False 会被当作明确反对票计入计权"
+        assert chat.await_count == 2, "两次尝试后才放弃"
 
     async def test_collect_verdicts_warns_on_unparseable(self):
         """解析失败的降级必须可见：_collect_verdicts 对 None 与对异常同等记
@@ -48,12 +49,9 @@ class AskAiParseFailureTest(unittest.IsolatedAsyncioTestCase):
             out = await engine._collect_verdicts(
                 [(cand, 0.9)], "B", "qb", "按反对票计"
             )
-        self.assertEqual(out, [None])
-        self.assertTrue(
-            any("判定未知" in m and "候选A" in m and "按反对票计" in m
-                for m in cm.output),
-            f"缺少解析失败的降级 WARNING：{cm.output}",
-        )
+        assert out == [None]
+        assert any("判定未知" in m and "候选A" in m and "按反对票计" in m
+                for m in cm.output), f"缺少解析失败的降级 WARNING：{cm.output}"
 
 
 class CollectVerdictsCancellationTest(unittest.IsolatedAsyncioTestCase):
@@ -69,7 +67,7 @@ class CollectVerdictsCancellationTest(unittest.IsolatedAsyncioTestCase):
 
         with patch(
             "briefdesk.plugins.dedup.engine.chat", new=cancelled_chat
-        ), self.assertRaises(asyncio.CancelledError):
+        ), pytest.raises(asyncio.CancelledError):
             await engine._collect_verdicts([(cand, 0.9)], "B", "qb", "测试取消")
 
     async def test_regular_failure_still_degrades_to_none(self):
@@ -87,28 +85,25 @@ class CollectVerdictsCancellationTest(unittest.IsolatedAsyncioTestCase):
             out = await engine._collect_verdicts(
                 [(cand, 0.9)], "B", "qb", "按反对票计"
             )
-        self.assertEqual(out, [None])
-        self.assertTrue(any("判定失败" in m for m in cm.output))
+        assert out == [None]
+        assert any("判定失败" in m for m in cm.output)
 
 
 class JudgePromptTest(unittest.TestCase):
     def test_contains_few_shot_examples(self):
-        self.assertIn("示例1：", JUDGE_PROMPT)
-        self.assertIn('{"same": true}', JUDGE_PROMPT)
-        self.assertIn("示例2：", JUDGE_PROMPT)
-        self.assertIn('{"same": false}', JUDGE_PROMPT)
+        assert "示例1：" in JUDGE_PROMPT
+        assert '{"same": true}' in JUDGE_PROMPT
+        assert "示例2：" in JUDGE_PROMPT
+        assert '{"same": false}' in JUDGE_PROMPT
 
     def test_contains_conservative_false_rule(self):
-        self.assertIn("如果不确定，请返回 {\"same\": false}", JUDGE_PROMPT)
+        assert "如果不确定，请返回 {\"same\": false}" in JUDGE_PROMPT
 
     def test_safety_rule_uses_plain_format(self):
         # 防回归：安全规则必须与主体/解析器一致地要求无外壳 JSON（{"same": ...}），
         # 带 task 外壳的旧格式不得再出现在 prompt 中
-        self.assertIn(
-            '输出必须严格且只能是 {"same": true} 或 {"same": false}',
-            JUDGE_PROMPT,
-        )
-        self.assertNotIn('{"task":"dedup"', JUDGE_PROMPT)
+        assert '输出必须严格且只能是 {"same": true} 或 {"same": false}' in JUDGE_PROMPT
+        assert '{"task":"dedup"' not in JUDGE_PROMPT
 
 
 class ParseSameRepairTest(unittest.TestCase):
@@ -118,31 +113,31 @@ class ParseSameRepairTest(unittest.TestCase):
         self.engine = DedupEngine()
 
     def test_trailing_comma(self):
-        self.assertIs(self.engine._parse_same('{"task":"dedup","data":{"same": true,}}'), True)
+        assert self.engine._parse_same('{"task":"dedup","data":{"same": true,}}') is True
 
     def test_single_quotes(self):
-        self.assertIs(self.engine._parse_same("{'task':'dedup','data':{'same': false}}"), False)
+        assert self.engine._parse_same("{'task':'dedup','data':{'same': false}}") is False
 
     def test_unquoted_keys(self):
-        self.assertIs(self.engine._parse_same('{task:"dedup",data:{same: true}}'), True)
+        assert self.engine._parse_same('{task:"dedup",data:{same: true}}') is True
 
     def test_narrative_prefix_and_suffix(self):
-        self.assertIs(self.engine._parse_same('结论如下：{"task":"dedup","data":{"same": true}}'), True)
-        self.assertIs(self.engine._parse_same('{"task":"dedup","data":{"same": true}}。以上'), True)
+        assert self.engine._parse_same('结论如下：{"task":"dedup","data":{"same": true}}') is True
+        assert self.engine._parse_same('{"task":"dedup","data":{"same": true}}。以上') is True
 
     def test_markdown_fence(self):
-        self.assertIs(self.engine._parse_same('```json\n{"task":"dedup","data":{"same": false}}\n```'), False)
+        assert self.engine._parse_same('```json\n{"task":"dedup","data":{"same": false}}\n```') is False
 
     def test_truncated_bool_not_accepted(self):
         # 截断布尔会被修复成字符串，必须被类型校验拦截（防误判）
-        self.assertIsNone(self.engine._parse_same('{"task":"dedup","data":{"same": tru'))
+        assert self.engine._parse_same('{"task":"dedup","data":{"same": tru') is None
 
     def test_repair_disabled_is_strict(self):
         # finish_reason=length 截断路径（repair=False）：可修复的瑕疵也拒绝
-        self.assertIsNone(self.engine._parse_same('{"task":"dedup","data":{"same": true,}}', repair=False))
+        assert self.engine._parse_same('{"task":"dedup","data":{"same": true,}}', repair=False) is None
 
 
-class AskAiMaxTokensTest(unittest.IsolatedAsyncioTestCase):
+class TestAskAiMaxTokens:
     async def test_ask_ai_uses_max_tokens_128(self):
         engine = DedupEngine()
         resp = SimpleNamespace(
@@ -160,8 +155,8 @@ class AskAiMaxTokensTest(unittest.IsolatedAsyncioTestCase):
                 "c",
                 "d",
             )
-        self.assertTrue(result)
-        self.assertEqual(chat_mock.call_args.kwargs["max_tokens"], 128)
+        assert result
+        assert chat_mock.call_args.kwargs["max_tokens"] == 128
 
 
 class ParseSameTest(unittest.TestCase):
@@ -170,41 +165,41 @@ class ParseSameTest(unittest.TestCase):
 
     def test_true(self):
         # 主路径：无外壳格式
-        self.assertTrue(self.engine._parse_same('{"same": true}'))
+        assert self.engine._parse_same('{"same": true}')
 
     def test_legacy_shell_tolerated(self):
         # 兼容旧版 {"task":"dedup","data":{"same": ...}} 外壳
-        self.assertTrue(self.engine._parse_same('{"task":"dedup","data":{"same": true}}'))
+        assert self.engine._parse_same('{"task":"dedup","data":{"same": true}}')
 
     def test_false(self):
-        self.assertFalse(self.engine._parse_same('{"same": false}'))
+        assert not self.engine._parse_same('{"same": false}')
 
     def test_string_false_is_none(self):
-        self.assertIsNone(self.engine._parse_same('{"same": "false"}'))
+        assert self.engine._parse_same('{"same": "false"}') is None
 
     def test_invalid_json_is_none(self):
-        self.assertIsNone(self.engine._parse_same("not json"))
+        assert self.engine._parse_same("not json") is None
 
     def test_non_dict_is_none(self):
-        self.assertIsNone(self.engine._parse_same("[1, 2]"))
+        assert self.engine._parse_same("[1, 2]") is None
 
     def test_task_field_ignored_any_shell_tolerated(self):
         # task 字段不再校验：任意外壳 dict 均按 data 取值
-        self.assertTrue(self.engine._parse_same('{"task":"other","data":{"same": true}}'))
+        assert self.engine._parse_same('{"task":"other","data":{"same": true}}')
 
     def test_missing_data_is_none(self):
-        self.assertIsNone(self.engine._parse_same('{"task":"dedup"}'))
+        assert self.engine._parse_same('{"task":"dedup"}') is None
 
 
 class TitleOverlapTest(unittest.TestCase):
     def test_identical(self):
-        self.assertEqual(DedupEngine._title_overlap("摄影社招新", "摄影社招新"), 1.0)
+        assert DedupEngine._title_overlap("摄影社招新", "摄影社招新") == 1.0
 
     def test_disjoint(self):
-        self.assertEqual(DedupEngine._title_overlap("abc", "xyz"), 0.0)
+        assert DedupEngine._title_overlap("abc", "xyz") == 0.0
 
     def test_empty(self):
-        self.assertEqual(DedupEngine._title_overlap("", "abc"), 0.0)
+        assert DedupEngine._title_overlap("", "abc") == 0.0
 
 
 class RemoveItemsTest(unittest.TestCase):
@@ -213,13 +208,13 @@ class RemoveItemsTest(unittest.TestCase):
         engine._embed_cache_ok = True
         engine.add_to_cache("keep", "keep title", source_quote="keep desc")
         engine.add_to_cache("del", "del title", [0.1, 0.2], source_quote="del desc")
-        self.assertEqual(len(engine._pending_embeds), 1)
+        assert len(engine._pending_embeds) == 1
 
         engine.remove_items(["del"])
 
-        self.assertTrue(all(it.id != "del" for it in engine._cache))
-        self.assertTrue(all(row[0] != "del" for row in engine._pending_embeds))
-        self.assertTrue(any(it.id == "keep" for it in engine._cache))
+        assert all(it.id != "del" for it in engine._cache)
+        assert all(row[0] != "del" for row in engine._pending_embeds)
+        assert any(it.id == "keep" for it in engine._cache)
 
     def test_readd_same_id_updates_in_place_and_registers_embedding(self):
         """同 id 重复追加（并发/唯一键冲突路径）：更新而非叠加，且向量照样登记。
@@ -231,18 +226,18 @@ class RemoveItemsTest(unittest.TestCase):
         engine = DedupEngine()
         engine._embed_cache_ok = True
         engine.add_to_cache("dup", "旧标题", source_quote="旧原文")
-        self.assertEqual(engine._pending_embeds, [])
+        assert engine._pending_embeds == []
 
         engine.add_to_cache("dup", "新标题", [0.3, 0.4], source_quote="新原文")
 
-        self.assertEqual(len(engine._cache), 1)  # 更新而非叠加
+        assert len(engine._cache) == 1  # 更新而非叠加
         item = engine._cache[0]
-        self.assertEqual(item.title, "新标题")
-        self.assertEqual(item.source_quote, "新原文")
-        self.assertEqual(item.content_hash, DedupEngine._content_hash("新原文"))
-        self.assertEqual(item.embedding, [0.3, 0.4])
-        self.assertEqual([row[0] for row in engine._pending_embeds], ["dup"])
-        self.assertEqual(engine._pending_embeds[0][2], [0.3, 0.4])
+        assert item.title == "新标题"
+        assert item.source_quote == "新原文"
+        assert item.content_hash == DedupEngine._content_hash("新原文")
+        assert item.embedding == [0.3, 0.4]
+        assert [row[0] for row in engine._pending_embeds] == ["dup"]
+        assert engine._pending_embeds[0][2] == [0.3, 0.4]
 
     def test_embedding_not_registered_when_cache_degraded(self):
         """_embed_cache_ok=False（向量加载失败降级）时不登记待落库向量。
@@ -254,8 +249,8 @@ class RemoveItemsTest(unittest.TestCase):
         engine._embed_cache_ok = False
         engine.add_to_cache("a", "标题", [0.1], source_quote="原文")   # 新建分支
         engine.add_to_cache("a", "标题2", [0.2], source_quote="原文2")  # 更新分支
-        self.assertEqual(engine._pending_embeds, [])
-        self.assertIsNone(engine._cache[0].embedding)
+        assert engine._pending_embeds == []
+        assert engine._cache[0].embedding is None
 
     def test_remove_unknown_ids_is_harmless_noop(self):
         """路由层 ignore 改发 EVENT_ITEMS_DELETED 后，处理器会对不在缓存的 id
@@ -269,20 +264,20 @@ class RemoveItemsTest(unittest.TestCase):
         engine.remove_items(["ghost-a", "ghost-b"])  # 不抛错
         engine.remove_items([])  # 空列表 no-op
 
-        self.assertEqual(engine._cache, before_cache)
-        self.assertEqual(engine._pending_embeds, before_pending)
-        self.assertEqual(len(engine._cache), 1)
+        assert engine._cache == before_cache
+        assert engine._pending_embeds == before_pending
+        assert len(engine._cache) == 1
 
 
 class EmbeddingTextTest(unittest.TestCase):
     def test_format(self):
-        self.assertEqual(_embedding_text("标题", "内容"), "标题 内容")
+        assert _embedding_text("标题", "内容") == "标题 内容"
 
     def test_truncates_long_input(self):
         """【复核 P2-17】超长输入截断至 2000 字符：防单条毒丸文本让嵌入
         通道整体降级且每次重启确定性复现。"""
         text = _embedding_text("标题", "x" * 5000)
-        self.assertEqual(len(text), 2000)
+        assert len(text) == 2000
 
 
 class CheckDedupShortCircuitTest(unittest.IsolatedAsyncioTestCase):
@@ -348,8 +343,8 @@ class CheckDedupShortCircuitTest(unittest.IsolatedAsyncioTestCase):
             result = await engine.check_dedup(
                 "篮球社招新", "新生2群", source_quote="欢迎加入篮球社"
             )
-        self.assertTrue(result.is_duplicate)
-        self.assertEqual(result.similar_to_id, "h1")
+        assert result.is_duplicate
+        assert result.similar_to_id == "h1"
         merge_mock.assert_awaited_once_with("h1", "新生2群")
         chat_mock.assert_not_awaited()
 
@@ -363,11 +358,11 @@ class CheckDedupShortCircuitTest(unittest.IsolatedAsyncioTestCase):
             result = await engine.check_dedup(
                 "篮球社招新", "新生2群", source_quote="欢迎加入篮球社"
             )
-        self.assertTrue(result.is_duplicate)
-        self.assertIsNotNone(result.candidate)
-        self.assertEqual(result.candidate.item_id, "h1")
-        self.assertEqual(result.candidate.title, "篮球社招新")
-        self.assertEqual(result.candidate.source_quote, "欢迎加入篮球社")
+        assert result.is_duplicate
+        assert result.candidate is not None
+        assert result.candidate.item_id == "h1"
+        assert result.candidate.title == "篮球社招新"
+        assert result.candidate.source_quote == "欢迎加入篮球社"
 
     async def test_candidate_snapshot_on_different_verdict(self):
         """未命中时 result.candidate = 参与判定的最高分候选。"""
@@ -384,10 +379,10 @@ class CheckDedupShortCircuitTest(unittest.IsolatedAsyncioTestCase):
             result = await engine.check_dedup(
                 "篮球社招新", "新生2群", q_emb=[0.5, 0.6]
             )
-        self.assertFalse(result.is_duplicate)
-        self.assertIsNotNone(result.candidate)
-        self.assertEqual(result.candidate.item_id, "a1")
-        self.assertEqual(result.candidate.title, "篮球社招新")
+        assert not result.is_duplicate
+        assert result.candidate is not None
+        assert result.candidate.item_id == "a1"
+        assert result.candidate.title == "篮球社招新"
 
     async def test_hash_unknown_falls_through(self):
         """旧数据 hash 为空 → 不触发精确短路，走正常候选判定（不误判重复）。"""
@@ -404,7 +399,7 @@ class CheckDedupShortCircuitTest(unittest.IsolatedAsyncioTestCase):
             result = await engine.check_dedup(
                 "篮球社招新", "新生2群", source_quote="欢迎加入篮球社"
             )
-        self.assertFalse(result.is_duplicate)
+        assert not result.is_duplicate
         merge_mock.assert_not_awaited()
 
     async def test_strong_same_short_circuits_majority(self):
@@ -433,8 +428,8 @@ class CheckDedupShortCircuitTest(unittest.IsolatedAsyncioTestCase):
             result = await engine.check_dedup(
                 "篮球社招新", "新生2群", q_emb=[0.5, 0.6]
             )
-        self.assertTrue(result.is_duplicate)
-        self.assertEqual(result.similar_to_id, "a1")
+        assert result.is_duplicate
+        assert result.similar_to_id == "a1"
         merge_mock.assert_awaited_once_with("a1", "新生2群")
 
     async def test_strong_unparseable_warns_and_falls_through(self):
@@ -462,11 +457,8 @@ class CheckDedupShortCircuitTest(unittest.IsolatedAsyncioTestCase):
             result = await engine.check_dedup(
                 "篮球社招新", "新生2群", q_emb=[0.5, 0.6]
             )
-        self.assertFalse(result.is_duplicate, "判定未知不得当作重复")
-        self.assertTrue(
-            any("[strong]" in m and "判定未知" in m for m in cm.output),
-            f"缺少 strong 短路的解析失败 WARNING：{cm.output}",
-        )
+        assert not result.is_duplicate, "判定未知不得当作重复"
+        assert any("[strong]" in m and "判定未知" in m for m in cm.output), f"缺少 strong 短路的解析失败 WARNING：{cm.output}"
 
     async def test_strong_different_falls_through_to_majority(self):
         """strong 候选判 DIFFERENT（同文本但内容不同）→ 剔除后剩余候选走多数票。"""
@@ -494,8 +486,8 @@ class CheckDedupShortCircuitTest(unittest.IsolatedAsyncioTestCase):
                 "篮球社招新", "新生2群", q_emb=[0.5, 0.6]
             )
         # strong (a1,1.0) 判 DIFFERENT 被剔除 → 剩余 (b1,0.8) 单候选判 SAME
-        self.assertTrue(result.is_duplicate)
-        self.assertEqual(result.similar_to_id, "b1")
+        assert result.is_duplicate
+        assert result.similar_to_id == "b1"
         merge_mock.assert_awaited_once_with("b1", "新生2群")
 
     async def test_strong_different_sole_candidate_snapshots_itself(self):
@@ -521,11 +513,11 @@ class CheckDedupShortCircuitTest(unittest.IsolatedAsyncioTestCase):
             result = await engine.check_dedup(
                 "篮球社招新", "新生2群", q_emb=[0.5, 0.6]
             )
-        self.assertFalse(result.is_duplicate)
+        assert not result.is_duplicate
         merge_mock.assert_not_awaited()
-        self.assertIsNotNone(result.candidate)
-        self.assertEqual(result.candidate.item_id, "only")
-        self.assertEqual(result.candidate.source_quote, "内容甲")
+        assert result.candidate is not None
+        assert result.candidate.item_id == "only"
+        assert result.candidate.source_quote == "内容甲"
 
     async def test_non_strong_still_uses_majority(self):
         """无 ≥0.99 候选（不同标题高相似）→ 维持原多数票语义，不误判。"""
@@ -553,7 +545,7 @@ class CheckDedupShortCircuitTest(unittest.IsolatedAsyncioTestCase):
                 "南洋模范摄影社招新", "新生2群", q_emb=[0.5, 0.6]
             )
         # 多数票 1/2 不达标 → 保守不判重
-        self.assertFalse(result.is_duplicate)
+        assert not result.is_duplicate
         merge_mock.assert_not_awaited()
 
 
@@ -561,35 +553,31 @@ class ParseImagesTest(unittest.TestCase):
     """image_urls 归一化助手：DB JSON 字符串 / 调用方列表 → 图片路径集合。"""
 
     def test_parses_json_array(self):
-        self.assertEqual(
-            _parse_images('["a.jpg", "b.jpg"]'), frozenset({"a.jpg", "b.jpg"})
-        )
+        assert _parse_images('["a.jpg", "b.jpg"]') == frozenset({"a.jpg", "b.jpg"})
 
     def test_empty_string(self):
-        self.assertEqual(_parse_images(""), frozenset())
+        assert _parse_images("") == frozenset()
 
     def test_filters_empty_entries(self):
-        self.assertEqual(_parse_images('["a.jpg", "", null]'), frozenset({"a.jpg"}))
+        assert _parse_images('["a.jpg", "", null]') == frozenset({"a.jpg"})
 
     def test_garbage_is_empty(self):
-        self.assertEqual(_parse_images("not json"), frozenset())
-        self.assertEqual(_parse_images("{}"), frozenset())
+        assert _parse_images("not json") == frozenset()
+        assert _parse_images("{}") == frozenset()
 
     def test_accepts_list_input(self):
         """调用方直传的列表（消息/合并产物）与 DB JSON 同口径。"""
-        self.assertEqual(
-            _parse_images(["a.jpg", "b.jpg"]), frozenset({"a.jpg", "b.jpg"})
-        )
+        assert _parse_images(["a.jpg", "b.jpg"]) == frozenset({"a.jpg", "b.jpg"})
 
     def test_list_filters_empty_entries(self):
-        self.assertEqual(_parse_images(["a.jpg", ""]), frozenset({"a.jpg"}))
+        assert _parse_images(["a.jpg", ""]) == frozenset({"a.jpg"})
 
     def test_none_is_empty(self):
-        self.assertEqual(_parse_images(None), frozenset())
-        self.assertEqual(_parse_images([]), frozenset())
+        assert _parse_images(None) == frozenset()
+        assert _parse_images([]) == frozenset()
 
 
-class ImageUrlShortCircuitTest(unittest.IsolatedAsyncioTestCase):
+class TestImageUrlShortCircuit:
     """图片精确短路：限定源内 image_urls 集合完全一致 → 零 AI 直接判重。
 
     回归背景：同一张海报图片重发（OCR 原文逐字相同、image_urls 完全一致），
@@ -637,8 +625,8 @@ class ImageUrlShortCircuitTest(unittest.IsolatedAsyncioTestCase):
                 image_urls=["a/b.jpg"],
                 source="weflow-legacy",
             )
-        self.assertTrue(result.is_duplicate)
-        self.assertEqual(result.similar_to_id, "img1")
+        assert result.is_duplicate
+        assert result.similar_to_id == "img1"
         merge_mock.assert_awaited_once_with("img1", "我们四个")
         chat_mock.assert_not_awaited()
 
@@ -658,8 +646,8 @@ class ImageUrlShortCircuitTest(unittest.IsolatedAsyncioTestCase):
                 image_urls=["b.jpg", "a.jpg"],
                 source="weflow-legacy",
             )
-        self.assertTrue(result.is_duplicate)
-        self.assertEqual(result.similar_to_id, "img1")
+        assert result.is_duplicate
+        assert result.similar_to_id == "img1"
         merge_mock.assert_awaited_once_with("img1", "群A")
 
     async def test_qqflow_same_image_different_text_not_short_circuit(self):
@@ -677,7 +665,7 @@ class ImageUrlShortCircuitTest(unittest.IsolatedAsyncioTestCase):
             result = await engine.check_dedup(
                 "xyz", "群A", image_urls=["a.jpg"], source="qqflow"
             )
-        self.assertFalse(result.is_duplicate)
+        assert not result.is_duplicate
         merge_mock.assert_not_awaited()
         chat_mock.assert_not_awaited()  # 无候选（重叠为 0）也不产生 AI 调用
 
@@ -695,7 +683,7 @@ class ImageUrlShortCircuitTest(unittest.IsolatedAsyncioTestCase):
             result = await engine.check_dedup(
                 "xyz", "群A", image_urls=["a.jpg"], source="weflow-legacy"
             )
-        self.assertFalse(result.is_duplicate)
+        assert not result.is_duplicate
         merge_mock.assert_not_awaited()
         chat_mock.assert_not_awaited()
 
@@ -713,7 +701,7 @@ class ImageUrlShortCircuitTest(unittest.IsolatedAsyncioTestCase):
             result = await engine.check_dedup(
                 "xyz", "群A", image_urls=["a.jpg"]
             )
-        self.assertFalse(result.is_duplicate)
+        assert not result.is_duplicate
         merge_mock.assert_not_awaited()
         chat_mock.assert_not_awaited()
 
@@ -731,7 +719,7 @@ class ImageUrlShortCircuitTest(unittest.IsolatedAsyncioTestCase):
             result = await engine.check_dedup(
                 "xyz", "群A", image_urls=["b.jpg"], source="weflow-legacy"
             )
-        self.assertFalse(result.is_duplicate)
+        assert not result.is_duplicate
         merge_mock.assert_not_awaited()
         chat_mock.assert_not_awaited()  # 无候选（重叠为 0）也不产生 AI 调用
 
@@ -749,7 +737,7 @@ class ImageUrlShortCircuitTest(unittest.IsolatedAsyncioTestCase):
             result = await engine.check_dedup(
                 "xyz", "群A", source="weflow-legacy"
             )
-        self.assertFalse(result.is_duplicate)
+        assert not result.is_duplicate
         merge_mock.assert_not_awaited()
         chat_mock.assert_not_awaited()
 
@@ -767,7 +755,7 @@ class ImageUrlShortCircuitTest(unittest.IsolatedAsyncioTestCase):
             result = await engine.check_dedup(
                 "xyz", "群A", image_urls=["a.jpg"], source="weflow-legacy"
             )
-        self.assertFalse(result.is_duplicate)
+        assert not result.is_duplicate
         merge_mock.assert_not_awaited()
         chat_mock.assert_not_awaited()
 
@@ -796,8 +784,8 @@ class ImageUrlShortCircuitTest(unittest.IsolatedAsyncioTestCase):
                 image_urls=["a/b.jpg"],
                 source="weflow-legacy",
             )
-        self.assertTrue(result.is_duplicate)
-        self.assertEqual(result.similar_to_id, "img1")
+        assert result.is_duplicate
+        assert result.similar_to_id == "img1"
         merge_mock.assert_awaited_once_with("img1", "我们四个")
         chat_mock.assert_not_awaited()
 
@@ -808,9 +796,9 @@ class ImageUrlShortCircuitTest(unittest.IsolatedAsyncioTestCase):
         engine.add_to_cache("w1", "t", image_urls=["a.jpg"], source="weflow-legacy")
         engine.add_to_cache("q1", "t", image_urls=["a.jpg"], source="qqflow")
         by_id = {it.id: it for it in engine._cache}
-        self.assertEqual(by_id["w1"].source, "weflow-legacy")
-        self.assertEqual(by_id["q1"].source, "qqflow")
-        self.assertEqual(by_id["w1"].image_urls, frozenset({"a.jpg"}))
+        assert by_id["w1"].source == "weflow-legacy"
+        assert by_id["q1"].source == "qqflow"
+        assert by_id["w1"].image_urls == frozenset({"a.jpg"})
 
 
 class DedupTieredCandidateTest(unittest.IsolatedAsyncioTestCase):
@@ -879,8 +867,8 @@ class DedupTieredCandidateTest(unittest.IsolatedAsyncioTestCase):
             result = await engine.check_dedup(
                 "玉言辩论社招新", "新生2群", q_emb=[0.5, 0.6]
             )
-        self.assertTrue(result.is_duplicate)
-        self.assertEqual(result.similar_to_id, "w1")
+        assert result.is_duplicate
+        assert result.similar_to_id == "w1"
         merge_mock.assert_awaited_once_with("w1", "新生2群")
 
     async def test_weak_candidate_any_different_misses(self):
@@ -902,7 +890,7 @@ class DedupTieredCandidateTest(unittest.IsolatedAsyncioTestCase):
             result = await engine.check_dedup(
                 "玉言辩论社招新", "新生2群", q_emb=[0.5, 0.6]
             )
-        self.assertFalse(result.is_duplicate)
+        assert not result.is_duplicate
         merge_mock.assert_not_awaited()
 
     async def test_weak_never_participates_when_normal_exists(self):
@@ -933,9 +921,9 @@ class DedupTieredCandidateTest(unittest.IsolatedAsyncioTestCase):
             result = await engine.check_dedup(
                 "篮球社招新", "新生2群", q_emb=[0.5, 0.6]
             )
-        self.assertFalse(result.is_duplicate)
+        assert not result.is_duplicate
         merge_mock.assert_not_awaited()
-        self.assertEqual(chat_mock.await_count, 2)  # 仅 normal 候选被判定
+        assert chat_mock.await_count == 2  # 仅 normal 候选被判定
 
     async def test_overlap_fallback_after_cosine_zero_hits(self):
         """重叠兜底场景（①）：余弦零候选（全部 < 0.65）→ 标题逐字相同
@@ -957,8 +945,8 @@ class DedupTieredCandidateTest(unittest.IsolatedAsyncioTestCase):
             result = await engine.check_dedup(
                 "玉言辩论社招新", "新生2群", q_emb=[0.5, 0.6]
             )
-        self.assertTrue(result.is_duplicate)
-        self.assertEqual(result.similar_to_id, "o1")
+        assert result.is_duplicate
+        assert result.similar_to_id == "o1"
         merge_mock.assert_awaited_once_with("o1", "新生2群")
 
     async def test_no_candidates_logs_diagnosis(self):
@@ -1001,13 +989,13 @@ class DedupTieredCandidateTest(unittest.IsolatedAsyncioTestCase):
             result = await engine.check_dedup(
                 "转让一台全新自行车", "新生2群", q_emb=[0.5, 0.6]
             )
-        self.assertFalse(result.is_duplicate)
+        assert not result.is_duplicate
         merge_mock.assert_not_awaited()
-        self.assertTrue(any("判重无候选" in line for line in logs.output))
-        self.assertTrue(any("cosine top-1=" in line for line in logs.output))
+        assert any("判重无候选" in line for line in logs.output)
+        assert any("cosine top-1=" in line for line in logs.output)
         # 诊断里仍要报出重叠差距（复用的是兜底那次扫描的结果，不是省掉了信息）
-        self.assertTrue(any("overlap top-1=0.20" in line for line in logs.output))
-        self.assertEqual(overlap_calls, ["转让一台全新自行车"])
+        assert any("overlap top-1=0.20" in line for line in logs.output)
+        assert overlap_calls == ["转让一台全新自行车"]
 
     async def test_zero_overlap_diagnosed_apart_from_empty_cache(self):
         """重叠全零（缓存非空但无共同字符）不得归因为「缓存为空」。
@@ -1021,11 +1009,11 @@ class DedupTieredCandidateTest(unittest.IsolatedAsyncioTestCase):
         ) as logs:
             # 与"篮球社招新"零共同字符
             result = await engine.check_dedup("明天下午停电通知", "新生2群")
-        self.assertFalse(result.is_duplicate)
+        assert not result.is_duplicate
         joined = "\n".join(logs.output)
-        self.assertIn("overlap 全零", joined)
-        self.assertIn("缓存 1 条", joined)
-        self.assertNotIn("缓存为空", joined)
+        assert "overlap 全零" in joined
+        assert "缓存 1 条" in joined
+        assert "缓存为空" not in joined
 
     async def test_empty_cache_diagnoses_cache_empty(self):
         """⑥ 的另一支：缓存为空时重叠候选为 None → 诊断报「缓存为空」。
@@ -1039,9 +1027,9 @@ class DedupTieredCandidateTest(unittest.IsolatedAsyncioTestCase):
             "briefdesk.plugins.dedup.engine", level="DEBUG"
         ) as logs:
             result = await engine.check_dedup("任意标题", "新生2群")
-        self.assertFalse(result.is_duplicate)
-        self.assertIsNone(result.candidate)
-        self.assertTrue(any("缓存为空" in line for line in logs.output))
+        assert not result.is_duplicate
+        assert result.candidate is None
+        assert any("缓存为空" in line for line in logs.output)
 
     async def test_strong_different_removes_only_judged(self):
         """④：两个 ≥0.99 候选，判 DIFFERENT 的只剔除自身，另一 SAME 候选仍命中。"""
@@ -1068,12 +1056,12 @@ class DedupTieredCandidateTest(unittest.IsolatedAsyncioTestCase):
             result = await engine.check_dedup(
                 "玉言辩论社招新", "新生2群", q_emb=[0.5, 0.6]
             )
-        self.assertTrue(result.is_duplicate)
-        self.assertEqual(result.similar_to_id, "s2")
+        assert result.is_duplicate
+        assert result.similar_to_id == "s2"
         merge_mock.assert_awaited_once_with("s2", "新生2群")
 
 
-class WeightedMajorityTest(unittest.IsolatedAsyncioTestCase):
+class TestWeightedMajority:
     """⑦ 加权多数票：票权 = 候选相似度，SAME 权重和 > 总权重一半才命中。
 
     动机：等权多数票下 0.90 高置信 SAME 会被 0.80 低置信 DIFFERENT 稀释成
@@ -1136,8 +1124,8 @@ class WeightedMajorityTest(unittest.IsolatedAsyncioTestCase):
             result = await engine.check_dedup(
                 "篮球社招新", "新生2群", q_emb=[0.5, 0.6]
             )
-        self.assertTrue(result.is_duplicate)
-        self.assertEqual(result.similar_to_id, "n1")
+        assert result.is_duplicate
+        assert result.similar_to_id == "n1"
         merge_mock.assert_awaited_once_with("n1", "新生2群")
 
     async def test_low_confidence_same_loses_to_high_confidence_different(self):
@@ -1165,7 +1153,7 @@ class WeightedMajorityTest(unittest.IsolatedAsyncioTestCase):
             result = await engine.check_dedup(
                 "篮球社招新", "新生2群", q_emb=[0.5, 0.6]
             )
-        self.assertFalse(result.is_duplicate)
+        assert not result.is_duplicate
         merge_mock.assert_not_awaited()
 
     async def test_weighted_tie_is_conservative(self):
@@ -1193,7 +1181,7 @@ class WeightedMajorityTest(unittest.IsolatedAsyncioTestCase):
             result = await engine.check_dedup(
                 "篮球社招新", "新生2群", q_emb=[0.5, 0.6]
             )
-        self.assertFalse(result.is_duplicate)
+        assert not result.is_duplicate
         merge_mock.assert_not_awaited()
 
     async def test_equal_weights_equivalent_to_majority(self):
@@ -1222,12 +1210,12 @@ class WeightedMajorityTest(unittest.IsolatedAsyncioTestCase):
             result = await engine.check_dedup(
                 "篮球社招新", "新生2群", q_emb=[0.5, 0.6]
             )
-        self.assertTrue(result.is_duplicate)
-        self.assertEqual(result.similar_to_id, "n1")
+        assert result.is_duplicate
+        assert result.similar_to_id == "n1"
         merge_mock.assert_awaited_once_with("n1", "新生2群")
 
 
-class QuoteShortcutTest(unittest.IsolatedAsyncioTestCase):
+class TestQuoteShortcut:
     """原文哈希精确短路（原文逐字节等价与哈希等价两类判定合一）。
 
     回归背景：同一条原文被上游重复投递（msg_id 不同但内容逐字节相同）时，
@@ -1283,8 +1271,8 @@ class QuoteShortcutTest(unittest.IsolatedAsyncioTestCase):
                 "我们四个",
                 source_quote=quote,
             )
-        self.assertTrue(result.is_duplicate)
-        self.assertEqual(result.similar_to_id, "q1")
+        assert result.is_duplicate
+        assert result.similar_to_id == "q1"
         merge_mock.assert_awaited_once_with("q1", "我们四个")
         chat_mock.assert_not_awaited()
 
@@ -1305,7 +1293,7 @@ class QuoteShortcutTest(unittest.IsolatedAsyncioTestCase):
             )
         # 原文短路未触发 → 走候选路径（title 相同 overlap 1.0 → strong 单候选
         # → chat 判 DIFFERENT）→ 不判重、不合并
-        self.assertFalse(result.is_duplicate)
+        assert not result.is_duplicate
         merge_mock.assert_not_awaited()
         chat_mock.assert_awaited()
 
@@ -1322,7 +1310,7 @@ class QuoteShortcutTest(unittest.IsolatedAsyncioTestCase):
             result = await engine.check_dedup(
                 "其它标题", "群", source_quote="原文B：视频截止8月15日"
             )
-        self.assertFalse(result.is_duplicate)
+        assert not result.is_duplicate
         merge_mock.assert_not_awaited()
 
     async def test_quote_empty_no_shortcut(self):
@@ -1334,10 +1322,10 @@ class QuoteShortcutTest(unittest.IsolatedAsyncioTestCase):
             ) as merge_mock,
         ):
             result = await engine.check_dedup("其它标题", "群")
-        self.assertFalse(result.is_duplicate)
+        assert not result.is_duplicate
         merge_mock.assert_not_awaited()
 
-class LockEmbedFallbackTest(unittest.IsolatedAsyncioTestCase):
+class TestLockEmbedFallback:
     """P1 修复回归：q_emb 缺失（preembed 失败/未预嵌）时判重绝不触发远程嵌入。
 
     check_dedup 运行于 pipeline 存储锁内：此前 q_emb=None 且嵌入就绪会逐条
@@ -1387,8 +1375,8 @@ class LockEmbedFallbackTest(unittest.IsolatedAsyncioTestCase):
             result = await engine.check_dedup("玉言辩论社招新", "新生2群")
         embed_mock.assert_not_awaited()
         topk_mock.assert_not_called()
-        self.assertTrue(result.is_duplicate)
-        self.assertEqual(result.similar_to_id, "o1")
+        assert result.is_duplicate
+        assert result.similar_to_id == "o1"
         merge_mock.assert_awaited_once_with("o1", "新生2群")
 
     async def test_missing_q_emb_no_candidate_returns_clean(self):
@@ -1406,7 +1394,7 @@ class LockEmbedFallbackTest(unittest.IsolatedAsyncioTestCase):
             result = await engine.check_dedup("完全无关的话题", "新生2群")
         embed_mock.assert_not_awaited()
         chat_mock.assert_not_awaited()
-        self.assertFalse(result.is_duplicate)
+        assert not result.is_duplicate
 
 
 class CandidateErrorIsolationTest(unittest.IsolatedAsyncioTestCase):
@@ -1478,9 +1466,9 @@ class CandidateErrorIsolationTest(unittest.IsolatedAsyncioTestCase):
             self.assertLogs("briefdesk.plugins.dedup.engine", level="WARNING") as logs,
         ):
             result = await engine.check_dedup("篮球社招新", "新生2群", q_emb=[0.5, 0.6])
-        self.assertFalse(result.is_duplicate)
+        assert not result.is_duplicate
         merge_mock.assert_not_awaited()
-        self.assertTrue(any("剔除该候选票" in line for line in logs.output))
+        assert any("剔除该候选票" in line for line in logs.output)
 
     async def test_error_candidate_zero_weight_others_can_still_hit(self):
         """异常票剔除出计权：其余两 SAME 票 1.7 > 剩余半数 0.85 → 命中 n1。"""
@@ -1510,11 +1498,11 @@ class CandidateErrorIsolationTest(unittest.IsolatedAsyncioTestCase):
             ) as merge_mock,
         ):
             result = await engine.check_dedup("篮球社招新", "新生2群", q_emb=[0.5, 0.6])
-        self.assertTrue(result.is_duplicate)
-        self.assertEqual(result.similar_to_id, "n1")
+        assert result.is_duplicate
+        assert result.similar_to_id == "n1"
         merge_mock.assert_awaited_once_with("n1", "新生2群")
 
-class AskAiFailureIsolationTest(unittest.IsolatedAsyncioTestCase):
+class TestAskAiFailureIsolation:
     """S1 回归：单个候选 AI 判定失败不得抛穿 check_dedup 中止整轮管道。
 
     失败候选按"无票"处理（剔除权重、不参与多数票），全部失败保守判
@@ -1556,7 +1544,7 @@ class AskAiFailureIsolationTest(unittest.IsolatedAsyncioTestCase):
             ),
         ):
             result = await engine.check_dedup("篮球社招新", "新生2群", q_emb=[0.5, 0.6])
-        self.assertFalse(result.is_duplicate)
+        assert not result.is_duplicate
 
     async def test_majority_vote_excludes_failed_candidate_weight(self):
         """两候选一败一 SAME：失败票剔除后，剩余 SAME 票正常计权命中。"""
@@ -1581,8 +1569,8 @@ class AskAiFailureIsolationTest(unittest.IsolatedAsyncioTestCase):
             ) as merge_mock,
         ):
             result = await engine.check_dedup("篮球社招新", "新生2群", q_emb=[0.5, 0.6])
-        self.assertTrue(result.is_duplicate)
-        self.assertEqual(result.similar_to_id, "a2")
+        assert result.is_duplicate
+        assert result.similar_to_id == "a2"
         merge_mock.assert_awaited_once_with("a2", "新生2群")
 
     async def test_strong_shortcircuit_failure_conservative(self):
@@ -1598,7 +1586,7 @@ class AskAiFailureIsolationTest(unittest.IsolatedAsyncioTestCase):
             ) as merge_mock,
         ):
             result = await engine.check_dedup("篮球社招新", "新生2群", q_emb=[0.1, 0.2])
-        self.assertFalse(result.is_duplicate)
+        assert not result.is_duplicate
         merge_mock.assert_not_awaited()
 
     async def test_weak_mode_all_failed_conservative(self):
@@ -1618,7 +1606,7 @@ class AskAiFailureIsolationTest(unittest.IsolatedAsyncioTestCase):
             ),
         ):
             result = await engine.check_dedup("羽毛球社招新", "新生2群", q_emb=[1.0, 0.0])
-        self.assertFalse(result.is_duplicate)
+        assert not result.is_duplicate
 
 class DegradedChannelLogGateTest(unittest.IsolatedAsyncioTestCase):
     """检索通道降级的三个一次性闸门：首条 WARNING/INFO 可见，其后降 DEBUG。
@@ -1658,20 +1646,18 @@ class DegradedChannelLogGateTest(unittest.IsolatedAsyncioTestCase):
         engine = self._engine([0.1, 0.2])
         with self.assertLogs(self._LOGGER, level="WARNING") as logs:
             result = await self._check(engine, [0.1, 0.2, 0.3])
-        self.assertFalse(result.is_duplicate, "降级不改判定：回退重叠后仍不重复")
+        assert not result.is_duplicate, "降级不改判定：回退重叠后仍不重复"
         joined = "\n".join(logs.output)
-        self.assertIn("query=3", joined)
-        self.assertIn("缓存=2", joined)
-        self.assertIn("需重建 item_embeddings", joined, "文案须说清不会自愈")
+        assert "query=3" in joined
+        assert "缓存=2" in joined
+        assert "需重建 item_embeddings" in joined, "文案须说清不会自愈"
 
         # 第二条同状态消息：WARNING 不再出现，信息仍完整保留在 DEBUG
         with self.assertNoLogs(self._LOGGER, level="WARNING"):
             await self._check(engine, [0.1, 0.2, 0.3])
         with self.assertLogs(self._LOGGER, level="DEBUG") as logs2:
             await self._check(engine, [0.1, 0.2, 0.3])
-        self.assertTrue(
-            any("维度不一致" in m for m in logs2.output), logs2.output
-        )
+        assert any("维度不一致" in m for m in logs2.output), logs2.output
 
     async def test_cosine_failure_warns_once_with_stack_then_debug(self):
         """余弦异常：首条带栈（真 numpy 异常靠它定位），其后降 DEBUG。"""
@@ -1680,8 +1666,8 @@ class DegradedChannelLogGateTest(unittest.IsolatedAsyncioTestCase):
         with patch("briefdesk.plugins.dedup.engine.top_k_similar", new=boom):
             with self.assertLogs(self._LOGGER, level="WARNING") as logs:
                 result = await self._check(engine, [0.3, 0.4])
-            self.assertFalse(result.is_duplicate)
-            self.assertIn("Traceback", "\n".join(logs.output), "首条须带栈")
+            assert not result.is_duplicate
+            assert "Traceback" in "\n".join(logs.output), "首条须带栈"
 
             with self.assertNoLogs(self._LOGGER, level="WARNING"):
                 await self._check(engine, [0.3, 0.4])
@@ -1691,9 +1677,7 @@ class DegradedChannelLogGateTest(unittest.IsolatedAsyncioTestCase):
         engine = self._engine(None)
         with self.assertLogs(self._LOGGER, level="INFO") as logs:
             await self._check(engine, [0.1, 0.2])
-        self.assertTrue(
-            any("缓存无嵌入向量" in m for m in logs.output), logs.output
-        )
+        assert any("缓存无嵌入向量" in m for m in logs.output), logs.output
         with self.assertNoLogs(self._LOGGER, level="INFO"):
             await self._check(engine, [0.1, 0.2])
 
@@ -1714,18 +1698,17 @@ class DegradedChannelLogGateTest(unittest.IsolatedAsyncioTestCase):
             await self._check(second, [0.1, 0.2, 0.3])
 
 
-class FlushPendingEmbeddingsLockTest(unittest.IsolatedAsyncioTestCase):
+class TestFlushPendingEmbeddingsLock:
     """flush_pending_embeddings 持 storage_lock 过滤已删条目
     后再 upsert——item_embeddings 无外键，孤儿向量行零容忍。"""
 
-    async def asyncSetUp(self):
+    @pytest.fixture(autouse=True)
+    async def _autouse_setup(self):
         self.db = await aiosqlite.connect(":memory:")
         self.db.row_factory = aiosqlite.Row
         await init_schema(self.db)
-
-    async def asyncTearDown(self):
+        yield
         await self.db.close()
-
     def _patch_db(self):
         return (
             patch("briefdesk.db.get_db", new=AsyncMock(return_value=self.db)),
@@ -1760,8 +1743,8 @@ class FlushPendingEmbeddingsLockTest(unittest.IsolatedAsyncioTestCase):
         with p1, p2:
             await engine.flush_pending_embeddings()
         cur = await self.db.execute("SELECT item_id FROM item_embeddings")
-        self.assertEqual([r["item_id"] for r in await cur.fetchall()], ["a"])
-        self.assertEqual(await self._orphan_count(), 0)
+        assert [r["item_id"] for r in await cur.fetchall()] == ["a"]
+        assert await self._orphan_count() == 0
 
     async def test_flush_runs_under_storage_lock(self):
         """过滤与 upsert 必须发生在 storage_lock 临界区内（顺序断言）。"""
@@ -1791,7 +1774,7 @@ class FlushPendingEmbeddingsLockTest(unittest.IsolatedAsyncioTestCase):
             patch.object(dedup_engine_module, "upsert_embeddings", fake_upsert),
         ):
             await engine.flush_pending_embeddings()
-        self.assertEqual(events, ["enter", "existing", "upsert", "exit"])
+        assert events == ["enter", "existing", "upsert", "exit"]
 
     async def test_flush_snapshot_then_delete_leaves_no_orphans(self):
         """flush 快照后条目被删：持锁过滤使孤儿行恒为 0（交错场景）。"""
@@ -1808,8 +1791,8 @@ class FlushPendingEmbeddingsLockTest(unittest.IsolatedAsyncioTestCase):
             await delete_items(["b"])
             await engine.flush_pending_embeddings()
         cur = await self.db.execute("SELECT item_id FROM item_embeddings")
-        self.assertEqual([r["item_id"] for r in await cur.fetchall()], ["a"])
-        self.assertEqual(await self._orphan_count(), 0)
+        assert [r["item_id"] for r in await cur.fetchall()] == ["a"]
+        assert await self._orphan_count() == 0
 
 
 if __name__ == "__main__":

@@ -19,6 +19,7 @@ import unittest
 from unittest.mock import AsyncMock, Mock, patch
 
 import httpx
+import pytest
 
 from briefdesk.config import config
 from briefdesk.plugins.qqflow.client import (
@@ -73,7 +74,7 @@ def _qq_message_new_event(rawid: str = "r1") -> dict:
     }
 
 
-class QqFlowFetchSessionsLimitTest(unittest.IsolatedAsyncioTestCase):
+class TestQqFlowFetchSessionsLimit:
     """【1·P1】fetch_sessions 必须按大页大小翻页取尽，否则被上游默认 100 截断。
 
     page_size=10000 = 上游 limit 硬上限：典型规模一个请求即取尽（与旧
@@ -92,8 +93,8 @@ class QqFlowFetchSessionsLimitTest(unittest.IsolatedAsyncioTestCase):
 
         client._get = fake_get  # type: ignore[method-assign]
         await client.fetch_sessions()
-        self.assertEqual(captured["path"], "/api/v1/sessions")
-        self.assertEqual(captured["params"], {"limit": 10000, "offset": 0})
+        assert captured["path"] == "/api/v1/sessions"
+        assert captured["params"] == {"limit": 10000, "offset": 0}
 
 
 class SseReadTimeoutTest(unittest.TestCase):
@@ -110,7 +111,7 @@ class SseReadTimeoutTest(unittest.TestCase):
             os.environ.pop("WEFLOW_LEGACY_SSE_READ_TIMEOUT_MS", None)
             os.environ.pop("QQFLOW_SSE_READ_TIMEOUT_MS", None)
             settings = WeFlowLegacySettings(_env_file=None)
-        self.assertEqual(settings.sse_read_timeout_ms, 300000)
+        assert settings.sse_read_timeout_ms == 300000
 
     def test_weflow_config_default_matches_heartbeat(self):
         """weflow-server 每 25s 发 ping → 60s（≈2.4 周期），与 qqflow 同口径。
@@ -121,28 +122,28 @@ class SseReadTimeoutTest(unittest.TestCase):
         with patch.dict(os.environ, {}, clear=False):
             os.environ.pop("WEFLOW_SSE_READ_TIMEOUT_MS", None)
             settings = WeFlowSettings(_env_file=None)
-        self.assertEqual(settings.sse_read_timeout_ms, 60000)
+        assert settings.sse_read_timeout_ms == 60000
 
     def test_qqflow_config_default(self):
         with patch.dict(os.environ, {}, clear=False):
             os.environ.pop("WEFLOW_LEGACY_SSE_READ_TIMEOUT_MS", None)
             os.environ.pop("QQFLOW_SSE_READ_TIMEOUT_MS", None)
             settings = QqFlowSettings(_env_file=None)
-        self.assertEqual(settings.sse_read_timeout_ms, 60000)
+        assert settings.sse_read_timeout_ms == 60000
 
     def test_weflow_client_builds_timeout_with_read(self):
         client = WeFlowLegacyClient(
             "http://127.0.0.1:5031", "tok", sse_read_timeout_ms=300000
         )
         t = client.sse_timeout()
-        self.assertEqual(t.read, 300.0)
-        self.assertEqual(t.connect, 10.0)
-        self.assertIsNone(t.write)
-        self.assertIsNone(t.pool)
+        assert t.read == 300.0
+        assert t.connect == 10.0
+        assert t.write is None
+        assert t.pool is None
 
     def test_weflow_client_explicit_override(self):
         client = WeFlowLegacyClient("http://127.0.0.1:5031", "tok", sse_read_timeout_ms=1500)
-        self.assertEqual(client.sse_timeout().read, 1.5)
+        assert client.sse_timeout().read == 1.5
 
     def test_qqflow_client_builds_timeout_with_read(self):
         client = QqFlowClient(
@@ -153,10 +154,10 @@ class SseReadTimeoutTest(unittest.TestCase):
             sse_read_timeout_ms=60000,
         )
         t = client.sse_timeout()
-        self.assertEqual(t.read, 60.0)
-        self.assertEqual(t.connect, 10.0)
-        self.assertIsNone(t.write)
-        self.assertIsNone(t.pool)
+        assert t.read == 60.0
+        assert t.connect == 10.0
+        assert t.write is None
+        assert t.pool is None
 
 
 class EnsureReadyRejectedStateTest(unittest.IsolatedAsyncioTestCase):
@@ -195,14 +196,14 @@ class EnsureReadyRejectedStateTest(unittest.IsolatedAsyncioTestCase):
         client = self._make_client("invalid_key", calls)
         await client.ensure_ready()
         await client.ensure_ready()
-        self.assertEqual(len(calls), 2, "被拒后必须再次尝试引导注册")
+        assert len(calls) == 2, "被拒后必须再次尝试引导注册"
 
     async def test_benign_state_is_memoized(self):
         calls: list = []
         client = self._make_client("accepted", calls)
         await client.ensure_ready()
         await client.ensure_ready()
-        self.assertEqual(len(calls), 1, "良性状态应记忆化避免重复注册")
+        assert len(calls) == 1, "良性状态应记忆化避免重复注册"
 
     async def test_account_conflict_propagates_from_register(self):
         """注册回 account_conflict：冒泡为账号不符，且不记忆化。
@@ -221,12 +222,12 @@ class EnsureReadyRejectedStateTest(unittest.IsolatedAsyncioTestCase):
             raise QqFlowAccountMismatchError("服务端已绑定 999，本地配置为 123")
 
         client.register_account = conflicting_register  # type: ignore[method-assign]
-        with self.assertRaises(QqFlowAccountMismatchError):
+        with pytest.raises(QqFlowAccountMismatchError):
             await client.ensure_ready()
-        self.assertFalse(client._ready_checked, "账号不符不得记忆化")
-        with self.assertRaises(QqFlowAccountMismatchError):
+        assert not client._ready_checked, "账号不符不得记忆化"
+        with pytest.raises(QqFlowAccountMismatchError):
             await client.ensure_ready()
-        self.assertEqual(len(calls), 2, "未记忆化 → 下轮仍会重试（改配置后可自愈）")
+        assert len(calls) == 2, "未记忆化 → 下轮仍会重试（改配置后可自愈）"
 
     async def test_mismatch_error_is_not_a_not_ready_error(self):
         """最关键的防回归：账号不符**不能**被当成瞬态未就绪。
@@ -235,11 +236,8 @@ class EnsureReadyRejectedStateTest(unittest.IsolatedAsyncioTestCase):
         若不符错误继承了它，这个修复就完全失效 —— 用户看不到 lastError，
         他人消息继续静默入库。
         """
-        self.assertTrue(issubclass(QqFlowAccountMismatchError, SourceError))
-        self.assertFalse(
-            issubclass(QqFlowAccountMismatchError, QqFlowNotReadyError),
-            "不符是稳态故障，必须冒泡，不能走瞬态静默跳过的路径",
-        )
+        assert issubclass(QqFlowAccountMismatchError, SourceError)
+        assert not issubclass(QqFlowAccountMismatchError, QqFlowNotReadyError), "不符是稳态故障，必须冒泡，不能走瞬态静默跳过的路径"
 
     async def test_indexing_phase_skips_registration(self):
         """服务端已在建索引：跳过注册并记忆化。
@@ -258,7 +256,7 @@ class EnsureReadyRejectedStateTest(unittest.IsolatedAsyncioTestCase):
         )
         await client.ensure_ready()
         await client.ensure_ready()
-        self.assertEqual(len(calls), 0, "索引期不应发起注册")
+        assert len(calls) == 0, "索引期不应发起注册"
 
     async def test_ready_phase_skips_registration(self):
         calls: list = []
@@ -269,14 +267,14 @@ class EnsureReadyRejectedStateTest(unittest.IsolatedAsyncioTestCase):
             accounts=[{"qq": "123", "state": "ready"}],
         )
         await client.ensure_ready()
-        self.assertEqual(len(calls), 0, "已就绪不应发起注册")
+        assert len(calls) == 0, "已就绪不应发起注册"
 
     async def test_error_phase_retries_registration(self):
         """error 阶段仍要注册：服务端的 error 不释放绑定，但同一账号可重试恢复。"""
         calls: list = []
         client = self._make_client("accepted", calls, phase="error")
         await client.ensure_ready()
-        self.assertEqual(len(calls), 1, "error 阶段应尝试重新注册以恢复")
+        assert len(calls) == 1, "error 阶段应尝试重新注册以恢复"
 
     async def test_error_phase_logs_root_cause_from_detail_endpoint(self):
         """error 阶段：/health 只给标量，根因须从需鉴权的明细接口捞出并告警。
@@ -291,9 +289,9 @@ class EnsureReadyRejectedStateTest(unittest.IsolatedAsyncioTestCase):
         )
         with self.assertLogs("briefdesk.plugins.qqflow.client", "WARNING") as logs:
             await client.ensure_ready()
-        self.assertTrue(any("密钥校验失败" in m for m in logs.output))
-        self.assertTrue(any("123" in m for m in logs.output))
-        self.assertEqual(len(calls), 1, "诊断不得挡住注册重试")
+        assert any("密钥校验失败" in m for m in logs.output)
+        assert any("123" in m for m in logs.output)
+        assert len(calls) == 1, "诊断不得挡住注册重试"
 
     async def test_detail_endpoint_failure_does_not_block_registration(self):
         """明细接口不可用（鉴权/网络）：仅降级为 debug，注册照常发起。"""
@@ -305,7 +303,7 @@ class EnsureReadyRejectedStateTest(unittest.IsolatedAsyncioTestCase):
 
         client.fetch_accounts = boom  # type: ignore[method-assign]
         await client.ensure_ready()
-        self.assertEqual(len(calls), 1, "诊断失败不得挡住注册重试")
+        assert len(calls) == 1, "诊断失败不得挡住注册重试"
 
     # ── 身份闸门：/health 的标量阶段不含身份，短路前必须比对账号 ──
 
@@ -322,12 +320,12 @@ class EnsureReadyRejectedStateTest(unittest.IsolatedAsyncioTestCase):
             phase="ready",
             accounts=[{"qq": "999", "state": "ready"}],
         )
-        with self.assertRaises(QqFlowAccountMismatchError) as cm:
+        with pytest.raises(QqFlowAccountMismatchError) as cm:
             await client.ensure_ready()
-        self.assertIn("999", str(cm.exception))
-        self.assertIn("123", str(cm.exception), "错误消息要同时给出本地配置值")
-        self.assertEqual(len(calls), 0, "快路已确认不符，不该再浪费一次注册")
-        self.assertFalse(client._ready_checked)
+        assert "999" in str(cm.value)
+        assert "123" in str(cm.value), "错误消息要同时给出本地配置值"
+        assert len(calls) == 0, "快路已确认不符，不该再浪费一次注册"
+        assert not client._ready_checked
 
     async def test_indexing_phase_with_foreign_account_raises(self):
         """indexing 阶段同样要比对身份（别人的账号正在建索引）。"""
@@ -338,9 +336,9 @@ class EnsureReadyRejectedStateTest(unittest.IsolatedAsyncioTestCase):
             phase="indexing",
             accounts=[{"qq": "999", "state": "indexing"}],
         )
-        with self.assertRaises(QqFlowAccountMismatchError):
+        with pytest.raises(QqFlowAccountMismatchError):
             await client.ensure_ready()
-        self.assertEqual(len(calls), 0)
+        assert len(calls) == 0
 
     async def test_error_phase_with_foreign_account_raises(self):
         """error 阶段也要比对：上游的 error 不释放绑定，占用仍然成立。"""
@@ -351,9 +349,9 @@ class EnsureReadyRejectedStateTest(unittest.IsolatedAsyncioTestCase):
             phase="error",
             accounts=[{"qq": "999", "state": "error", "error": "密钥校验失败"}],
         )
-        with self.assertRaises(QqFlowAccountMismatchError):
+        with pytest.raises(QqFlowAccountMismatchError):
             await client.ensure_ready()
-        self.assertEqual(len(calls), 0, "别人的账号出错不该由我们去重试注册")
+        assert len(calls) == 0, "别人的账号出错不该由我们去重试注册"
 
     async def test_ready_phase_with_own_account_skips_registration(self):
         """绑的就是自有账号：行为与修复前一致（短路 + 记忆化）。"""
@@ -366,8 +364,8 @@ class EnsureReadyRejectedStateTest(unittest.IsolatedAsyncioTestCase):
         )
         await client.ensure_ready()
         await client.ensure_ready()
-        self.assertEqual(len(calls), 0)
-        self.assertTrue(client._ready_checked)
+        assert len(calls) == 0
+        assert client._ready_checked
 
     async def test_awaiting_key_entry_is_not_treated_as_bound(self):
         """只有 awaiting_key 条目 = 无人绑定：不得据此判定不符。
@@ -383,7 +381,7 @@ class EnsureReadyRejectedStateTest(unittest.IsolatedAsyncioTestCase):
             accounts=[{"qq": "999", "state": "awaiting_key"}],
         )
         await client.ensure_ready()  # 不抛
-        self.assertEqual(len(calls), 1, "无法确认身份 → 交给注册守卫定夺")
+        assert len(calls) == 1, "无法确认身份 → 交给注册守卫定夺"
 
     async def test_detail_unavailable_falls_through_to_register(self):
         """明细端点取不到（401/抖动）：不硬失败，退化为由注册结果判定身份。"""
@@ -396,8 +394,8 @@ class EnsureReadyRejectedStateTest(unittest.IsolatedAsyncioTestCase):
         client.fetch_accounts = boom  # type: ignore[method-assign]
         with self.assertLogs("briefdesk.plugins.qqflow.client", "WARNING") as logs:
             await client.ensure_ready()
-        self.assertEqual(len(calls), 1, "兜底层必须仍然发起注册")
-        self.assertTrue(any("账号明细不可用" in m for m in logs.output))
+        assert len(calls) == 1, "兜底层必须仍然发起注册"
+        assert any("账号明细不可用" in m for m in logs.output)
 
     async def test_version_logged_once_per_change(self):
         """/health 的 version 记入 _logged_version 并只在变化时打印。
@@ -416,18 +414,18 @@ class EnsureReadyRejectedStateTest(unittest.IsolatedAsyncioTestCase):
 
         with self.assertLogs("briefdesk.plugins.qqflow.client", "INFO") as cm:
             await client.ensure_ready()
-        self.assertEqual(client._logged_version, "0.5.0")
+        assert client._logged_version == "0.5.0"
         version_lines = [ln for ln in cm.output if "qqflow-server 版本" in ln]
-        self.assertEqual(len(version_lines), 1, f"版本应恰好打印一行: {cm.output}")
-        self.assertIn("0.5.0", version_lines[0])
+        assert len(version_lines) == 1, f"版本应恰好打印一行: {cm.output}"
+        assert "0.5.0" in version_lines[0]
 
         # 同版本重检（force 绕过记忆化）不重复打印
         with self.assertNoLogs("briefdesk.plugins.qqflow.client", "INFO"):
             await client.ensure_ready(force=True)
-        self.assertEqual(client._logged_version, "0.5.0")
+        assert client._logged_version == "0.5.0"
 
 
-class RegisterConflictHttpTest(unittest.IsolatedAsyncioTestCase):
+class TestRegisterConflictHttp:
     """register_account 就地抛账号不符 —— 在 HTTP 层验证（不打桩该方法）。
 
     必须走 MockTransport：EnsureReadyRejectedStateTest 的 _make_client 会把
@@ -460,10 +458,10 @@ class RegisterConflictHttpTest(unittest.IsolatedAsyncioTestCase):
 
         client = self._client_with(handler)
         try:
-            with self.assertRaises(QqFlowAccountMismatchError) as cm:
+            with pytest.raises(QqFlowAccountMismatchError) as cm:
                 await client.register_account("123", "k" * 16, "")
-            self.assertIn("999", str(cm.exception))
-            self.assertIn("123", str(cm.exception))
+            assert "999" in str(cm.value)
+            assert "123" in str(cm.value)
         finally:
             await client.close()
 
@@ -475,9 +473,7 @@ class RegisterConflictHttpTest(unittest.IsolatedAsyncioTestCase):
 
         client = self._client_with(handler)
         try:
-            self.assertEqual(
-                await client.register_account("123", "k" * 16, ""), "accepted"
-            )
+            assert await client.register_account("123", "k" * 16, "") == "accepted"
         finally:
             await client.close()
 
@@ -489,14 +485,14 @@ class RegisterConflictHttpTest(unittest.IsolatedAsyncioTestCase):
 
         client = self._client_with(handler)
         try:
-            with self.assertRaises(RuntimeError) as cm:
+            with pytest.raises(RuntimeError) as cm:
                 await client.register_account("123", "bad", "")
-            self.assertNotIsInstance(cm.exception, QqFlowAccountMismatchError)
+            assert not isinstance(cm.value, QqFlowAccountMismatchError)
         finally:
             await client.close()
 
 
-class LookupLimitTest(unittest.IsolatedAsyncioTestCase):
+class TestLookupLimit:
     """【5·P2】回查链路 limit 提升为 _LOOKUP_LIMIT=200 且显式关闭空结果重试。"""
 
     async def test_weflow_lookup_uses_limit_and_no_retry(self):
@@ -511,9 +507,9 @@ class LookupLimitTest(unittest.IsolatedAsyncioTestCase):
 
         client.fetch_messages = fake_fetch  # type: ignore[method-assign]
         result = await client._lookup_message("wxid_x", "raw1", 1760000123, False)
-        self.assertIsNone(result)
-        self.assertEqual(captured["limit"], 200)
-        self.assertIs(captured["retry_on_empty"], False)
+        assert result is None
+        assert captured["limit"] == 200
+        assert captured["retry_on_empty"] is False
 
     async def test_qqflow_lookup_uses_limit(self):
         client = QqFlowClient("http://127.0.0.1:5032", "tok", qq="1", key="k")
@@ -525,11 +521,11 @@ class LookupLimitTest(unittest.IsolatedAsyncioTestCase):
 
         client.fetch_messages = fake_fetch  # type: ignore[method-assign]
         result = await client.lookup_message("u_x", "42", 1760000123)
-        self.assertIsNone(result)
-        self.assertEqual(captured["limit"], 200)
+        assert result is None
+        assert captured["limit"] == 200
 
 
-class WeflowSseDedupTest(unittest.IsolatedAsyncioTestCase):
+class TestWeflowSseDedup:
     """【6·P2】weflow-legacy 监听器按 (event, rawid) 去重：同一事件重投只消费一次。"""
 
     async def test_duplicate_event_consumed_once(self):
@@ -546,8 +542,8 @@ class WeflowSseDedupTest(unittest.IsolatedAsyncioTestCase):
         await listener._handle_event(ev)
         await listener._handle_event(ev)
         await asyncio.sleep(0)  # 让 fire-and-forget 的批刷新任务跑完
-        self.assertEqual(len(received), 1, "重复投递的事件只允许进管道一次")
-        self.assertEqual(listener._stats_deduped, 1)
+        assert len(received) == 1, "重复投递的事件只允许进管道一次"
+        assert listener._stats_deduped == 1
 
     async def test_distinct_events_both_consumed(self):
         received: list = []
@@ -562,7 +558,7 @@ class WeflowSseDedupTest(unittest.IsolatedAsyncioTestCase):
         await listener._handle_event(_wf_event(rawid="a"))
         await listener._handle_event(_wf_event(rawid="b"))
         await asyncio.sleep(0)
-        self.assertEqual(len(received), 2)
+        assert len(received) == 2
 
 
 class QqFlowEmptySenderKeptTest(unittest.TestCase):
@@ -578,10 +574,10 @@ class QqFlowEmptySenderKeptTest(unittest.TestCase):
             "sourceName": "",
             "content": "这条内容长度满足过滤阈值",
         }
-        self.assertTrue(pre_filter_sse(ev))
+        assert pre_filter_sse(ev)
 
 
-class LegacyMessagesNotFoundTest(unittest.IsolatedAsyncioTestCase):
+class TestLegacyMessagesNotFound:
     """【复核 U1-1】legacy fetch_messages 暴露 not_found_ok：404 → 空信封
     （对齐 weflow/qqflow 的脏会话容错），轮询路径传 True。"""
 
@@ -590,8 +586,8 @@ class LegacyMessagesNotFoundTest(unittest.IsolatedAsyncioTestCase):
         get_mock = AsyncMock(return_value=None)
         with patch.object(client, "_get", get_mock):
             resp = await client.fetch_messages("g1", None, not_found_ok=True)
-        self.assertEqual(resp, {"messages": [], "hasMore": False})
-        self.assertTrue(get_mock.call_args.kwargs.get("not_found_ok"))
+        assert resp == {"messages": [], "hasMore": False}
+        assert get_mock.call_args.kwargs.get("not_found_ok")
 
     async def test_retry_on_empty_404_with_not_found_ok_returns_none(self):
         """复核 P3-16：retry_on_empty 的重试分支遇 404 且 not_found_ok=True
@@ -627,10 +623,10 @@ class LegacyMessagesNotFoundTest(unittest.IsolatedAsyncioTestCase):
                 not_found_ok=True,
                 params={"talker": "g1"},
             )
-        self.assertIsNone(resp, "重试遇 404 且 not_found_ok=True 应降级 None")
+        assert resp is None, "重试遇 404 且 not_found_ok=True 应降级 None"
 
 
-class SseConnectLoopSurvivesGenericErrorTest(unittest.IsolatedAsyncioTestCase):
+class TestSseConnectLoopSurvivesGenericError:
     """【复核 P1】_connect_loop 对非取消异常必须自愈：带栈记日志后退避重连。
 
     此前只捕 CancelledError，畸形事件（如 data 帧为合法 JSON 但非对象时
@@ -650,8 +646,8 @@ class SseConnectLoopSurvivesGenericErrorTest(unittest.IsolatedAsyncioTestCase):
         listener._running = True
         listener._listen = fake_listen
         await listener._connect_loop()
-        self.assertEqual(calls["n"], 2, "首次异常后退避重连，第二次取消才退出")
-        self.assertEqual(listener._reconnect_attempt, 1)
+        assert calls["n"] == 2, "首次异常后退避重连，第二次取消才退出"
+        assert listener._reconnect_attempt == 1
 
     async def test_weflow_connect_loop_survives(self):
         listener = WeFlowSseClient(
@@ -714,22 +710,11 @@ class SseConnectLoopMismatchBackoffTest(unittest.IsolatedAsyncioTestCase):
             self.assertLogs(logger_name, level="WARNING") as captured,
         ):
             await listener._connect_loop()
-        self.assertEqual(calls["n"], 2, "mismatch 长退避后重连，第二次取消才退出")
-        self.assertEqual(
-            sleeps,
-            [expected_delay],
-            "固定长退避一次，其后不得再叠加普通重连退避",
-        )
-        self.assertEqual(listener._reconnect_attempt, 0, "不递增网络抖动退避计数")
-        self.assertTrue(
-            any("账号不符" in ln for ln in captured.output),
-            captured.output,
-        )
-        self.assertEqual(
-            [ln for ln in captured.output if ln.startswith("ERROR")],
-            [],
-            "mismatch 是主动中止，不得刷 ERROR 栈",
-        )
+        assert calls["n"] == 2, "mismatch 长退避后重连，第二次取消才退出"
+        assert sleeps == [expected_delay], "固定长退避一次，其后不得再叠加普通重连退避"
+        assert listener._reconnect_attempt == 0, "不递增网络抖动退避计数"
+        assert any("账号不符" in ln for ln in captured.output), captured.output
+        assert [ln for ln in captured.output if ln.startswith("ERROR")] == [], "mismatch 是主动中止，不得刷 ERROR 栈"
 
     async def test_weflow_mismatch_uses_long_backoff(self):
         from briefdesk.plugins.weflow import sse as weflow_sse
@@ -762,7 +747,7 @@ class SseConnectLoopMismatchBackoffTest(unittest.IsolatedAsyncioTestCase):
         )
 
 
-class StopDrainsBufferTest(unittest.IsolatedAsyncioTestCase):
+class TestStopDrainsBuffer:
     """【8·P3】stop() 后冲刷批缓冲残余消息，aclose() 等待 in-flight 收尾。"""
 
     async def test_stop_flushes_buffered_message(self):
@@ -775,10 +760,10 @@ class StopDrainsBufferTest(unittest.IsolatedAsyncioTestCase):
         listener = WeFlowLegacySseClient(client, on_batch, settings=WeFlowLegacySettings())
         with patch.object(config, "realtime_batch_max_count", 5):
             await listener._handle_event(_wf_event())  # 攒在缓冲区不触发刷新
-        self.assertEqual(len(received), 0)
+        assert len(received) == 0
         listener.stop()
         await listener.aclose()
-        self.assertEqual(len(received), 1, "停止时缓冲区内消息必须被冲刷")
+        assert len(received) == 1, "停止时缓冲区内消息必须被冲刷"
 
     async def test_aclose_waits_inflight_flush(self):
         received: list = []
@@ -791,11 +776,11 @@ class StopDrainsBufferTest(unittest.IsolatedAsyncioTestCase):
         client = WeFlowLegacyClient("http://127.0.0.1:5031", "tok")
         listener = WeFlowLegacySseClient(client, slow_on_batch, settings=WeFlowLegacySettings())
         await listener._handle_event(_wf_event())  # 默认 max_count=1 → in-flight
-        self.assertEqual(len(received), 0)
+        assert len(received) == 0
         listener.stop()
         release.set()
         await listener.aclose()
-        self.assertEqual(len(received), 1, "aclose 必须等待 in-flight 批处理收尾")
+        assert len(received) == 1, "aclose 必须等待 in-flight 批处理收尾"
 
     async def test_qqflow_stop_flushes_buffered_message(self):
         received: list = []
@@ -807,13 +792,13 @@ class StopDrainsBufferTest(unittest.IsolatedAsyncioTestCase):
         listener = QqFlowSseClient(client, on_batch, settings=QqFlowSettings())
         with patch.object(config, "realtime_batch_max_count", 5):
             await listener._handle_event(_qq_message_new_event())
-        self.assertEqual(len(received), 0)
+        assert len(received) == 0
         listener.stop()
         await listener.aclose()
-        self.assertEqual(len(received), 1)
+        assert len(received) == 1
 
 
-class DrainTaskResetTest(unittest.IsolatedAsyncioTestCase):
+class TestDrainTaskReset:
     """二次生命周期（stop→start→stop）必须产生新的收尾冲刷任务。
 
     drain 任务完成后仍是非 None 的已完成 Task；start() 开头不复位会让
@@ -833,15 +818,15 @@ class DrainTaskResetTest(unittest.IsolatedAsyncioTestCase):
         host = _MixinHost()
         host._start_final_drain()
         drain1 = host._drain_task
-        self.assertIsNotNone(drain1)
+        assert drain1 is not None
         await host.aclose()
-        self.assertTrue(drain1.done())
+        assert drain1.done()
         host._reset_final_drain()  # start() 开头的复位义务
-        self.assertIsNone(host._drain_task)
+        assert host._drain_task is None
         host._start_final_drain()
         drain2 = host._drain_task
-        self.assertIsNotNone(drain2, "复位后必须能创建第二个 drain 任务")
-        self.assertIsNot(drain1, drain2)
+        assert drain2 is not None, "复位后必须能创建第二个 drain 任务"
+        assert drain1 is not drain2
         await host.aclose()
 
     async def test_three_sources_start_resets_drain_task(self):
@@ -866,27 +851,24 @@ class DrainTaskResetTest(unittest.IsolatedAsyncioTestCase):
         ]
         for name, listener in listeners:
             with (
-                self.subTest(source=name),
                 patch.object(listener, "_connect_loop", new=AsyncMock()),
                 patch.object(listener, "_stats_loop", new=AsyncMock()),
             ):
                     listener.stop()
                     drain1 = listener._drain_task
-                    self.assertIsNotNone(drain1)
+                    assert drain1 is not None
                     await listener.aclose()
-                    self.assertTrue(drain1.done())
+                    assert drain1.done()
                     listener.start()
-                    self.assertIsNone(
-                        listener._drain_task, "start() 应复位 drain 任务引用"
-                    )
+                    assert listener._drain_task is None, "start() 应复位 drain 任务引用"
                     listener.stop()
                     drain2 = listener._drain_task
-                    self.assertIsNotNone(drain2, "第二次 stop 必须启动新的 drain")
-                    self.assertIsNot(drain1, drain2)
+                    assert drain2 is not None, "第二次 stop 必须启动新的 drain"
+                    assert drain1 is not drain2
                     await listener.aclose()
 
 
-class QqFlowControlEventStatsTest(unittest.IsolatedAsyncioTestCase):
+class TestQqFlowControlEventStats:
     """【9·P3】sync/ping 心跳不计入事件数与预过滤丢弃数。"""
 
     async def test_sync_and_ping_not_counted_as_events(self):
@@ -909,13 +891,13 @@ class QqFlowControlEventStatsTest(unittest.IsolatedAsyncioTestCase):
         }
         await listener._handle_event(sync_ev)
         await listener._handle_event({"event": "ping"})
-        self.assertEqual(listener._stats_events, 0)
-        self.assertEqual(listener._stats_filtered, 0)
+        assert listener._stats_events == 0
+        assert listener._stats_filtered == 0
 
         await listener._handle_event(_qq_message_new_event())
         await asyncio.sleep(0)
-        self.assertEqual(listener._stats_events, 1)
-        self.assertEqual(len(received), 1)
+        assert listener._stats_events == 1
+        assert len(received) == 1
 
 
 class EndpointUrlPrefixTest(unittest.TestCase):
@@ -929,61 +911,32 @@ class EndpointUrlPrefixTest(unittest.TestCase):
 
     def test_root_base_plain_path(self):
         # 无前缀 base：三源端点语义一致（共享助手 build_endpoint_url 保证）
-        self.assertEqual(
-            QqFlowClient("http://h:5032", "tok")._push_url(),
-            "http://h:5032/api/v1/push/messages",
-        )
-        self.assertEqual(
-            WeFlowClient("http://h:5033", "tok")._push_url(),
-            "http://h:5033/api/v1/push/messages",
-        )
-        self.assertEqual(
-            WeFlowLegacyClient("http://h:5031", "tok")._push_url(),
-            "http://h:5031/api/v1/push/messages",
-        )
+        assert QqFlowClient("http://h:5032", "tok")._push_url() == "http://h:5032/api/v1/push/messages"
+        assert WeFlowClient("http://h:5033", "tok")._push_url() == "http://h:5033/api/v1/push/messages"
+        assert WeFlowLegacyClient("http://h:5031", "tok")._push_url() == "http://h:5031/api/v1/push/messages"
 
     def test_prefix_base_preserved_on_sse_and_media(self):
         client = QqFlowClient("http://h:5032/prefix", "tok")
-        self.assertEqual(
-            client._push_url(), "http://h:5032/prefix/api/v1/push/messages"
-        )
-        self.assertEqual(
-            client._build_media_url("abc123"),
-            "http://h:5032/prefix/api/v1/media/abc123",
-        )
+        assert client._push_url() == "http://h:5032/prefix/api/v1/push/messages"
+        assert client._build_media_url("abc123") == "http://h:5032/prefix/api/v1/media/abc123"
 
     def test_prefix_base_weflow_and_legacy(self):
         wf = WeFlowClient("http://h:5033/wf", "tok")
-        self.assertEqual(
-            wf._push_url(), "http://h:5033/wf/api/v1/push/messages"
-        )
-        self.assertEqual(
-            wf._build_media_url("chat@room/images/abc.jpg"),
-            "http://h:5033/wf/api/v1/media/chat@room/images/abc.jpg",
-        )
+        assert wf._push_url() == "http://h:5033/wf/api/v1/push/messages"
+        assert wf._build_media_url("chat@room/images/abc.jpg") == "http://h:5033/wf/api/v1/media/chat@room/images/abc.jpg"
         legacy = WeFlowLegacyClient("http://h:5031/wfl", "tok")
-        self.assertEqual(
-            legacy._push_url(), "http://h:5031/wfl/api/v1/push/messages"
-        )
-        self.assertEqual(
-            legacy._build_media_url("/api/v1/media/a.jpg"),
-            "http://h:5031/wfl/api/v1/media/a.jpg",
-        )
+        assert legacy._push_url() == "http://h:5031/wfl/api/v1/push/messages"
+        assert legacy._build_media_url("/api/v1/media/a.jpg") == "http://h:5031/wfl/api/v1/media/a.jpg"
 
     def test_query_on_base_preserved_not_absorbed(self):
         # base 自带查询串 → 原样保留（legacy SSE token-in-query 形态无害）；
         # API 路径不被拼进查询串
         client = QqFlowClient("http://h:5032?x=1", "tok")
-        self.assertEqual(
-            client._push_url(), "http://h:5032/api/v1/push/messages?x=1"
-        )
-        self.assertEqual(
-            client._build_media_url("abc123"),
-            "http://h:5032/api/v1/media/abc123?x=1",
-        )
+        assert client._push_url() == "http://h:5032/api/v1/push/messages?x=1"
+        assert client._build_media_url("abc123") == "http://h:5032/api/v1/media/abc123?x=1"
 
 
-class WeflowErrorBodySafeDecodeTest(unittest.IsolatedAsyncioTestCase):
+class TestWeflowErrorBodySafeDecode:
     """【10·P3】非 UTF-8 错误体不应让 UnicodeDecodeError 掩盖原始 API 错误。"""
 
     async def test_non_utf8_error_body_raises_runtime_error(self):
@@ -994,7 +947,7 @@ class WeflowErrorBodySafeDecodeTest(unittest.IsolatedAsyncioTestCase):
         client._client = httpx.AsyncClient(
             base_url="http://127.0.0.1:5031", transport=httpx.MockTransport(handler)
         )
-        with self.assertRaises(RuntimeError):
+        with pytest.raises(RuntimeError):
             await client._get("/api/v1/contacts")
 
 
@@ -1017,7 +970,7 @@ class _RecordingListener:
         return None
 
 
-class RuntimeCloseOrderingTest(unittest.IsolatedAsyncioTestCase):
+class TestRuntimeCloseOrdering:
     """【增量·P3】runtime.close()：stop → await listener.aclose → client.close。"""
 
     async def test_weflow_close_ordering_and_idempotent(self):
@@ -1036,10 +989,10 @@ class RuntimeCloseOrderingTest(unittest.IsolatedAsyncioTestCase):
         source.client.close = recording_close  # type: ignore[method-assign]
         source.listener = _RecordingListener(events)
         await source.close()
-        self.assertEqual(events, ["stop", "aclose", "client_closed"])
-        self.assertIsNone(source.listener)
+        assert events == ["stop", "aclose", "client_closed"]
+        assert source.listener is None
         await source.close()  # 幂等：第二次 close 无副作用
-        self.assertEqual(events, ["stop", "aclose", "client_closed"])
+        assert events == ["stop", "aclose", "client_closed"]
 
     async def test_qqflow_close_ordering_and_idempotent(self):
         from briefdesk.plugins.qqflow.runtime import QqFlowSource
@@ -1057,10 +1010,10 @@ class RuntimeCloseOrderingTest(unittest.IsolatedAsyncioTestCase):
         source.client.close = recording_close  # type: ignore[method-assign]
         source.listener = _RecordingListener(events)
         await source.close()
-        self.assertEqual(events, ["stop", "aclose", "client_closed"])
-        self.assertIsNone(source.listener)
+        assert events == ["stop", "aclose", "client_closed"]
+        assert source.listener is None
         await source.close()
-        self.assertEqual(events, ["stop", "aclose", "client_closed"])
+        assert events == ["stop", "aclose", "client_closed"]
 
     async def test_weflow_close_flushes_pending_batch_before_returning(self):
         """真实监听器接线：close 返回前必须完成缓冲消息冲刷（先于 client.close）。"""
@@ -1075,11 +1028,9 @@ class RuntimeCloseOrderingTest(unittest.IsolatedAsyncioTestCase):
         source.start(on_batch)
         with patch.object(config, "realtime_batch_max_count", 5):
             await source.listener._handle_event(_wf_event())  # 攒在缓冲区
-        self.assertEqual(len(received), 0)
+        assert len(received) == 0
         await source.close()
-        self.assertEqual(
-            len(received), 1, "close 返回前缓冲区内消息必须已冲刷交付"
-        )
+        assert len(received) == 1, "close 返回前缓冲区内消息必须已冲刷交付"
 
     async def test_qqflow_close_flushes_pending_batch_before_returning(self):
         from briefdesk.plugins.qqflow.runtime import QqFlowSource
@@ -1095,9 +1046,9 @@ class RuntimeCloseOrderingTest(unittest.IsolatedAsyncioTestCase):
             config, "ignore_self", False
         ):
             await source.listener._handle_event(_qq_message_new_event())
-        self.assertEqual(len(received), 0)
+        assert len(received) == 0
         await source.close()
-        self.assertEqual(len(received), 1)
+        assert len(received) == 1
 
 
 
@@ -1112,19 +1063,19 @@ class SseRawidGuardTest(unittest.TestCase):
         from briefdesk.plugins.weflow_legacy.normalize import pre_filter_sse
 
         ev = {"event": "message.new", "content": "正常内容长度超过五字"}
-        self.assertFalse(pre_filter_sse(ev))
+        assert not pre_filter_sse(ev)
 
     def test_weflow_with_rawid_still_passes_shape(self):
         from briefdesk.plugins.weflow_legacy.normalize import pre_filter_sse
 
         ev = {"event": "message.new", "rawid": "r1", "content": "正常内容长度超过五字"}
-        self.assertTrue(pre_filter_sse(ev))
+        assert pre_filter_sse(ev)
 
     def test_qqflow_message_new_without_rawid_dropped(self):
         from briefdesk.plugins.qqflow.normalize import pre_filter_sse
 
         ev = {"event": "message.new", "sourceName": "张三", "content": "这条内容长度肯定满足过滤阈值"}
-        self.assertFalse(pre_filter_sse(ev))
+        assert not pre_filter_sse(ev)
 
     def test_qqflow_with_rawid_still_passes_shape(self):
         from briefdesk.plugins.qqflow.normalize import pre_filter_sse
@@ -1135,10 +1086,10 @@ class SseRawidGuardTest(unittest.TestCase):
             "sourceName": "张三",
             "content": "这条内容长度肯定满足过滤阈值",
         }
-        self.assertTrue(pre_filter_sse(ev))
+        assert pre_filter_sse(ev)
 
 
-class SseSelfHealMismatchTest(unittest.IsolatedAsyncioTestCase):
+class TestSseSelfHealMismatch:
     """SSE 自愈检查遇账号不符时必须冒泡中止本轮监听（D5 止漏）。
 
     这里跑的是 stream_events 真身：它自建 AsyncClient，故按 MockTransport 注入
@@ -1168,10 +1119,10 @@ class SseSelfHealMismatchTest(unittest.IsolatedAsyncioTestCase):
         client.ensure_ready = AsyncMock(  # type: ignore[method-assign]
             side_effect=QqFlowAccountMismatchError("已绑定另一个账号 999")
         )
-        with self.assertRaises(QqFlowAccountMismatchError):
+        with pytest.raises(QqFlowAccountMismatchError):
             await self._collect(client)
         # 【P3-2】raise 绕过 stream_events 尾部收尾，状态必须已前置落 offline
-        self.assertEqual(client.connection_status, "offline")
+        assert client.connection_status == "offline"
 
     async def test_other_self_heal_failure_still_swallowed(self):
         """反向断言：普通自愈失败仍降级为 WARNING，不得连坐掐断实时流。"""
@@ -1180,7 +1131,7 @@ class SseSelfHealMismatchTest(unittest.IsolatedAsyncioTestCase):
             side_effect=QqFlowNotReadyError("索引中")
         )
         events = await self._collect(client)
-        self.assertEqual([e.get("rawid") for e in events], ["r1"])
+        assert [e.get("rawid") for e in events] == ["r1"]
 
 
 if __name__ == "__main__":
@@ -1215,7 +1166,7 @@ class SseBufferCapTest(unittest.IsolatedAsyncioTestCase):
         with self.assertLogs("briefdesk.plugins.qqflow.client", level="WARNING"):
             events = await self._collect("qqflow", client, ensure_ready=True)
         # 超限前的合法事件已产出，随后流被掐断（不再有后续事件、生成器结束）
-        self.assertEqual([e.get("rawid") for e in events], ["r1"])
+        assert [e.get("rawid") for e in events] == ["r1"]
 
     async def test_weflow_and_legacy_share_cap_semantics(self):
         wf = WeFlowClient("http://127.0.0.1:5033", "tok", wxid="wx")
@@ -1232,4 +1183,4 @@ class SseBufferCapTest(unittest.IsolatedAsyncioTestCase):
                 with self.assertLogs(logger_name, level="WARNING"):
                     events = await self._collect(module_name, client)
                 # 超限前的合法事件照常产出，随后流被掐断
-                self.assertEqual([e.get("rawid") for e in events], ["r1"])
+                assert [e.get("rawid") for e in events] == ["r1"]

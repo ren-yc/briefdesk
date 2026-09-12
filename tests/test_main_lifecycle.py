@@ -13,10 +13,12 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
+
 from briefdesk.plugin.base import PluginError
 
 
-class PeriodicSyncLoopTest(unittest.IsolatedAsyncioTestCase):
+class TestPeriodicSyncLoop:
     """【复核 P1-4】POLL_INTERVAL_SECONDS > 0 时周期触发 trigger_sync（与
     /api/sync 同路径；互斥由其返回 None 保证，不叠加触发）。"""
 
@@ -35,13 +37,20 @@ class PeriodicSyncLoopTest(unittest.IsolatedAsyncioTestCase):
             task = asyncio.create_task(main_mod._periodic_sync_loop())
             await asyncio.sleep(0.05)
             task.cancel()
-            with self.assertRaises(asyncio.CancelledError):
+            with pytest.raises(asyncio.CancelledError):
                 await task
-        self.assertGreaterEqual(len(reasons), 1)
-        self.assertEqual(reasons[0], "periodic")
+        assert len(reasons) >= 1
+        assert reasons[0] == "periodic"
 
 
-class ZeroSourceDegradedStartupTest(unittest.IsolatedAsyncioTestCase):
+class TestZeroSourceDegradedStartup:
+    @pytest.fixture(autouse=True)
+    def _finalizer_collector(self):
+        self._finalizers = []
+        yield
+        for fn in reversed(self._finalizers):
+            fn()
+
     """【复核 4a】零源不再中止启动：降级运行（UI 可用、采集不可用），
     清理路径照常执行——三源统一「缺配置自禁用」语义的前提（决策 ①=1B）。"""
 
@@ -59,13 +68,13 @@ class ZeroSourceDegradedStartupTest(unittest.IsolatedAsyncioTestCase):
 
         # 全局回调/stages 上下文会被 _run 覆盖，测试后复位为「未注册」态
         # （None）防污染其它用例——test_server 依赖 409/503 的未注册语义
-        self.addCleanup(stages.reset)
-        self.addCleanup(set_plugins_info_callback, None)
-        self.addCleanup(set_settings_schema_callback, None)
-        self.addCleanup(set_plugin_meta_callback, None)
-        self.addCleanup(set_plugin_validation_callback, None)
-        self.addCleanup(set_sync_callback, None)
-        self.addCleanup(set_refresh_sessions_callback, None)
+        self._finalizers.append(stages.reset)
+        self._finalizers.append(lambda: set_plugins_info_callback(None))
+        self._finalizers.append(lambda: set_settings_schema_callback(None))
+        self._finalizers.append(lambda: set_plugin_meta_callback(None))
+        self._finalizers.append(lambda: set_plugin_validation_callback(None))
+        self._finalizers.append(lambda: set_sync_callback(None))
+        self._finalizers.append(lambda: set_refresh_sessions_callback(None))
 
         manager = MagicMock()
         manager.setup_all = AsyncMock()
@@ -95,7 +104,14 @@ class ZeroSourceDegradedStartupTest(unittest.IsolatedAsyncioTestCase):
         close_db.assert_awaited_once()
 
 
-class MainRunCleanupOnSetupFailureTest(unittest.IsolatedAsyncioTestCase):
+class TestMainRunCleanupOnSetupFailure:
+    @pytest.fixture(autouse=True)
+    def _finalizer_collector(self):
+        self._finalizers = []
+        yield
+        for fn in reversed(self._finalizers):
+            fn()
+
     async def test_required_plugin_failure_still_closes_db(self):
         from briefdesk import main as main_mod
 
@@ -112,7 +128,7 @@ class MainRunCleanupOnSetupFailureTest(unittest.IsolatedAsyncioTestCase):
             patch.object(main_mod, "get_db", new=AsyncMock()),
             patch.object(main_mod.config, "ignored_expiry_hours", 0),
             patch.object(main_mod, "close_db", close_db),
-            self.assertRaises(PluginError),
+            pytest.raises(PluginError),
         ):
             await main_mod._run()
 
@@ -120,7 +136,14 @@ class MainRunCleanupOnSetupFailureTest(unittest.IsolatedAsyncioTestCase):
         close_db.assert_awaited_once()
 
 
-class MainRunServerStartFailureTest(unittest.IsolatedAsyncioTestCase):
+class TestMainRunServerStartFailure:
+    @pytest.fixture(autouse=True)
+    def _finalizer_collector(self):
+        self._finalizers = []
+        yield
+        for fn in reversed(self._finalizers):
+            fn()
+
     """复核 P3-4：server 启动失败（如端口占用）时等待循环不得白等满 10s——
     server_task.done() 为真即提前退出等待，随后 await server_task 抛出、
     finally 统一清理。"""
@@ -141,13 +164,13 @@ class MainRunServerStartFailureTest(unittest.IsolatedAsyncioTestCase):
 
         # _run 会覆盖全局回调/stages 上下文，测试后必须复位（防污染后续用例
         # ——test_server 依赖 409/503 的未注册语义）
-        self.addCleanup(stages.reset)
-        self.addCleanup(set_plugins_info_callback, None)
-        self.addCleanup(set_settings_schema_callback, None)
-        self.addCleanup(set_plugin_meta_callback, None)
-        self.addCleanup(set_plugin_validation_callback, None)
-        self.addCleanup(set_sync_callback, None)
-        self.addCleanup(set_refresh_sessions_callback, None)
+        self._finalizers.append(stages.reset)
+        self._finalizers.append(lambda: set_plugins_info_callback(None))
+        self._finalizers.append(lambda: set_settings_schema_callback(None))
+        self._finalizers.append(lambda: set_plugin_meta_callback(None))
+        self._finalizers.append(lambda: set_plugin_validation_callback(None))
+        self._finalizers.append(lambda: set_sync_callback(None))
+        self._finalizers.append(lambda: set_refresh_sessions_callback(None))
 
         real_sleep = asyncio.sleep
 
@@ -180,14 +203,14 @@ class MainRunServerStartFailureTest(unittest.IsolatedAsyncioTestCase):
             patch.object(main_mod, "_install_signal_handlers"),
             patch.object(main_mod, "trigger_sync", return_value=None),
             patch("briefdesk.main.asyncio.sleep", side_effect=fake_sleep),
-            self.assertRaises(RuntimeError),
+            pytest.raises(RuntimeError),
         ):
             await main_mod._run()
         elapsed = time_module.perf_counter() - start
 
-        self.assertLess(elapsed, 2.0, "启动失败不得白等满 10s")
+        assert elapsed < 2.0, "启动失败不得白等满 10s"
         # 第一轮 sleep 让出后 server_task 完成，第二轮即 break——远小于 200 轮
-        self.assertLessEqual(len(sleep_calls), 2, "循环应提前因 server_task.done() 退出")
+        assert len(sleep_calls) <= 2, "循环应提前因 server_task.done() 退出"
         manager.teardown_all.assert_awaited_once()
         close_db.assert_awaited_once()
 
@@ -201,10 +224,10 @@ class ReapTaskTest(unittest.IsolatedAsyncioTestCase):
 
         task = asyncio.create_task(asyncio.sleep(0), name="done-task")
         await task  # 已完成（含结果已取出）
-        self.assertTrue(task.done())
+        assert task.done()
         await _reap_task(task)  # 直返，不取消、不抛错
-        self.assertTrue(task.done())
-        self.assertFalse(task.cancelled())
+        assert task.done()
+        assert not task.cancelled()
 
     async def test_pending_task_is_cancelled_and_awaited(self):
         """未完成任务先 cancel 再限时等待 → 返回后任务已终结（cancelled）。"""
@@ -212,8 +235,8 @@ class ReapTaskTest(unittest.IsolatedAsyncioTestCase):
 
         task = asyncio.create_task(asyncio.sleep(3600), name="pending-task")
         await _reap_task(task)
-        self.assertTrue(task.done())
-        self.assertTrue(task.cancelled())
+        assert task.done()
+        assert task.cancelled()
 
     async def test_timeout_leaves_task_pending_for_fallback(self):
         """忽略第一次取消的任务超时未终结 → WARNING 落日志、任务保持 pending，
@@ -233,14 +256,11 @@ class ReapTaskTest(unittest.IsolatedAsyncioTestCase):
         try:
             with self.assertLogs("briefdesk.main", level="WARNING") as captured:
                 await _reap_task(task, timeout=0.05)
-            self.assertTrue(
-                any("关闭等待超时" in line for line in captured.output),
-                captured.output,
-            )
-            self.assertFalse(task.done(), "超时路径不得二次 cancel 打断内部清理")
+            assert any("关闭等待超时" in line for line in captured.output), captured.output
+            assert not task.done(), "超时路径不得二次 cancel 打断内部清理"
         finally:
             task.cancel()  # 收尾清理，避免污染事件循环
-            with self.assertRaises(asyncio.CancelledError):
+            with pytest.raises(asyncio.CancelledError):
                 await task
 
     async def test_task_exception_swallowed_and_logged(self):
@@ -257,9 +277,9 @@ class ReapTaskTest(unittest.IsolatedAsyncioTestCase):
         await asyncio.sleep(0)  # 让任务先跑到首个 await 点，cancel 才会命中其内部清理
         with self.assertLogs("briefdesk.main", level="ERROR") as captured:
             await _reap_task(task, timeout=1.0)  # 不抛出
-        self.assertTrue(any("boom-task" in line for line in captured.output))
-        self.assertTrue(task.done())
-        self.assertFalse(task.cancelled())
+        assert any("boom-task" in line for line in captured.output)
+        assert task.done()
+        assert not task.cancelled()
 
 
 class StartupInterruptCleanupTest(unittest.TestCase):
@@ -295,7 +315,7 @@ class StartupInterruptCleanupTest(unittest.TestCase):
         ):
             main_mod.main()  # 必须返回且不向上抛 KeyboardInterrupt
 
-        self.assertEqual(cleaned, [True], "清理 finally 必须已执行")
+        assert cleaned == [True], "清理 finally 必须已执行"
 
 
 if __name__ == "__main__":
@@ -317,9 +337,7 @@ class WaitServerStartedTest(unittest.IsolatedAsyncioTestCase):
                 )
         finally:
             task.cancel()
-        self.assertTrue(
-            any("启动等待超时" in m for m in captured.output), captured.output
-        )
+        assert any("启动等待超时" in m for m in captured.output), captured.output
 
     async def test_task_done_exits_early_without_warning(self):
         from briefdesk.main import _wait_server_started

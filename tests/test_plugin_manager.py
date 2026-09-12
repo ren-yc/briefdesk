@@ -5,6 +5,8 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import patch
 
+import pytest
+
 from briefdesk.config import Settings
 from briefdesk.plugin.base import (
     PLUGIN_GROUP,
@@ -116,20 +118,20 @@ def make_ctx(settings: Settings | None = None) -> PluginContext:
     )
 
 
-class _ManagerTestBase(unittest.IsolatedAsyncioTestCase):
+class _ManagerTestBase:
     """测试基类：隔离真实 entry point 环境，避免本机安装的插件干扰断言。"""
 
-    async def asyncSetUp(self) -> None:
+    @pytest.fixture(autouse=True)
+    async def _autouse_setup(self):
         self._eps_patch = patch(
             "importlib.metadata.entry_points", return_value=_EmptyEPS([])
         )
         self._eps_patch.start()
-
-    async def asyncTearDown(self) -> None:
+        yield
         self._eps_patch.stop()
 
 
-class SetupOrderTest(_ManagerTestBase):
+class TestSetupOrder(_ManagerTestBase):
     async def test_dependency_topological_order(self):
         calls: list = []
         manager = PluginManager(make_settings(plugins=["c", "b", "a"]))
@@ -138,9 +140,7 @@ class SetupOrderTest(_ManagerTestBase):
         manager.register(FakePlugin("a", calls=calls))
         await manager.setup_all(make_ctx())
         setups = [c for c in calls if c[0] == "setup"]
-        self.assertEqual(
-            setups, [("setup", "a"), ("setup", "b"), ("setup", "c")]
-        )
+        assert setups == [("setup", "a"), ("setup", "b"), ("setup", "c")]
 
     async def test_activate_follows_load_order(self):
         calls: list = []
@@ -150,7 +150,7 @@ class SetupOrderTest(_ManagerTestBase):
         await manager.setup_all(make_ctx())
         await manager.activate_all(make_ctx())
         activates = [c for c in calls if c[0] == "activate"]
-        self.assertEqual(activates, [("activate", "a"), ("activate", "b")])
+        assert activates == [("activate", "a"), ("activate", "b")]
 
     async def test_teardown_reverse_order_and_idempotent(self):
         calls: list = []
@@ -160,9 +160,9 @@ class SetupOrderTest(_ManagerTestBase):
         await manager.setup_all(make_ctx())
         await manager.teardown_all()
         teardowns = [c for c in calls if c[0] == "teardown"]
-        self.assertEqual(teardowns, [("teardown", "b"), ("teardown", "a")])
+        assert teardowns == [("teardown", "b"), ("teardown", "a")]
         await manager.teardown_all()  # 幂等：第二次不重复调用
-        self.assertEqual(len([c for c in calls if c[0] == "teardown"]), 2)
+        assert len([c for c in calls if c[0] == "teardown"]) == 2
 
     async def test_core_plugins_activated_without_plugins_config(self):
         """核心插件恒装配：PLUGINS 为空也加载；可选插件不列出即不加载。"""
@@ -171,19 +171,19 @@ class SetupOrderTest(_ManagerTestBase):
         manager.register(FakePlugin("core", core=True, calls=calls))
         manager.register(FakePlugin("opt", calls=calls))
         await manager.setup_all(make_ctx())
-        self.assertEqual(manager.loaded, ["core"])
-        self.assertEqual(manager.records()["opt"].status, "disabled")
-        self.assertIn("未启用", manager.records()["opt"].reason)
+        assert manager.loaded == ["core"]
+        assert manager.records()["opt"].status == "disabled"
+        assert "未启用" in manager.records()["opt"].reason
 
 
-class FilterTest(_ManagerTestBase):
+class TestFilter(_ManagerTestBase):
     async def test_allowlist_filters_optional_plugins(self):
         calls: list = []
         manager = PluginManager(make_settings(plugins=["b"]))
         manager.register(FakePlugin("a", calls=calls))
         manager.register(FakePlugin("b", calls=calls))
         await manager.setup_all(make_ctx())
-        self.assertEqual(manager.loaded, ["b"])
+        assert manager.loaded == ["b"]
 
     async def test_unknown_plugins_name_only_warns(self):
         """PLUGINS 含未知名：仅 WARNING（启动继续），不影响已知插件。"""
@@ -191,7 +191,7 @@ class FilterTest(_ManagerTestBase):
         manager = PluginManager(make_settings(plugins=["ghost", "a"]))
         manager.register(FakePlugin("a", calls=calls))
         await manager.setup_all(make_ctx())
-        self.assertEqual(manager.loaded, ["a"])
+        assert manager.loaded == ["a"]
 
     async def test_star_is_unknown_not_wildcard(self):
         """无通配语义：PLUGINS 里的 "*" 按未知名处理——只 WARNING、不启用
@@ -200,8 +200,8 @@ class FilterTest(_ManagerTestBase):
         manager = PluginManager(make_settings(plugins=["*"]))
         manager.register(FakePlugin("a", calls=calls))
         await manager.setup_all(make_ctx())
-        self.assertEqual(manager.loaded, [])
-        self.assertEqual(manager.records()["a"].status, "disabled")
+        assert manager.loaded == []
+        assert manager.records()["a"].status == "disabled"
 
     async def test_optional_plugin_not_listed_is_disabled(self):
         """可选插件「禁用 = 不在 PLUGINS 中」：无独立的禁用名单配置。"""
@@ -210,11 +210,11 @@ class FilterTest(_ManagerTestBase):
         manager.register(FakePlugin("a", calls=calls))
         await manager.setup_all(make_ctx())
         rec = manager.records()["a"]
-        self.assertEqual(rec.status, "disabled")
-        self.assertNotIn("互斥", rec.reason)
+        assert rec.status == "disabled"
+        assert "互斥" not in rec.reason
 
 
-class ConflictTest(_ManagerTestBase):
+class TestConflict(_ManagerTestBase):
     """互斥仲裁：互斥对同现按 PLUGINS 先列者保留（手工改 .env 才可能同现）。"""
 
     async def test_conflict_first_in_plugins_wins(self):
@@ -222,10 +222,10 @@ class ConflictTest(_ManagerTestBase):
         manager.register(FakePlugin("a", conflicts=("b",)))
         manager.register(FakePlugin("b", conflicts=("a",)))
         await manager.setup_all(make_ctx())
-        self.assertEqual(manager.loaded, ["a"])
+        assert manager.loaded == ["a"]
         rec = manager.records()["b"]
-        self.assertEqual(rec.status, "disabled")
-        self.assertIn("与 a 互斥", rec.reason)  # /api/plugins 可见原因
+        assert rec.status == "disabled"
+        assert "与 a 互斥" in rec.reason  # /api/plugins 可见原因
 
     async def test_conflict_reason_aggregates_all_winners(self):
         """同一落选者与多个 winner 冲突 → reason 汇总全部对端
@@ -235,17 +235,17 @@ class ConflictTest(_ManagerTestBase):
         manager.register(FakePlugin("b", conflicts=("a",)))
         manager.register(FakePlugin("c", conflicts=("a",)))
         await manager.setup_all(make_ctx())
-        self.assertEqual(manager.loaded, ["b", "c"])
+        assert manager.loaded == ["b", "c"]
         rec = manager.records()["a"]
-        self.assertEqual(rec.status, "disabled")
-        self.assertIn("与 b、c 互斥", rec.reason)
+        assert rec.status == "disabled"
+        assert "与 b、c 互斥" in rec.reason
 
     async def test_conflict_arbitration_follows_plugins_order(self):
         manager = PluginManager(make_settings(plugins=["b", "a"]))
         manager.register(FakePlugin("a", conflicts=("b",)))
         manager.register(FakePlugin("b", conflicts=("a",)))
         await manager.setup_all(make_ctx())
-        self.assertEqual(manager.loaded, ["b"])
+        assert manager.loaded == ["b"]
 
     async def test_conflict_core_plugin_always_wins(self):
         """第三方可选插件与核心插件互斥：核心恒装配，可选侧让位。"""
@@ -253,9 +253,9 @@ class ConflictTest(_ManagerTestBase):
         manager.register(FakePlugin("core", core=True))
         manager.register(FakePlugin("opt", conflicts=("core",)))
         await manager.setup_all(make_ctx())
-        self.assertEqual(manager.loaded, ["core"])
-        self.assertEqual(manager.records()["opt"].status, "disabled")
-        self.assertIn("与 core 互斥", manager.records()["opt"].reason)
+        assert manager.loaded == ["core"]
+        assert manager.records()["opt"].status == "disabled"
+        assert "与 core 互斥" in manager.records()["opt"].reason
 
     async def test_asymmetric_conflict_declaration(self):
         """对称声明不是硬性要求：单侧声明同样参与仲裁。"""
@@ -263,8 +263,8 @@ class ConflictTest(_ManagerTestBase):
         manager.register(FakePlugin("x", conflicts=("y",)))
         manager.register(FakePlugin("y"))
         await manager.setup_all(make_ctx())
-        self.assertEqual(manager.loaded, ["x"])
-        self.assertEqual(manager.records()["y"].status, "disabled")
+        assert manager.loaded == ["x"]
+        assert manager.records()["y"].status == "disabled"
 
     async def test_conflict_only_when_both_selected(self):
         """对端未入选（未启用）时不触发仲裁。"""
@@ -273,10 +273,10 @@ class ConflictTest(_ManagerTestBase):
         manager.register(FakePlugin("x", conflicts=("y",), calls=calls))
         manager.register(FakePlugin("y", calls=calls))
         await manager.setup_all(make_ctx())
-        self.assertEqual(manager.loaded, ["x"])
+        assert manager.loaded == ["x"]
 
 
-class ValidateSelectionTest(_ManagerTestBase):
+class TestValidateSelection(_ManagerTestBase):
     """validate_selection：设置 API 写入前的期望启用集合纯校验。"""
 
     def _manager(self) -> PluginManager:
@@ -288,75 +288,75 @@ class ValidateSelectionTest(_ManagerTestBase):
         return manager
 
     def test_valid_selection_passes(self):
-        self.assertEqual(self._manager().validate_selection(["src", "stage"]), [])
+        assert self._manager().validate_selection(["src", "stage"]) == []
 
     def test_core_names_implicitly_satisfied(self):
         """依赖指向核心插件视为恒满足；核心插件本身无需列入集合。"""
-        self.assertEqual(self._manager().validate_selection(["bench"]), [])
+        assert self._manager().validate_selection(["bench"]) == []
 
     def test_unknown_name_reported(self):
         issues = self._manager().validate_selection(["ghost"])
-        self.assertEqual([i["type"] for i in issues], ["unknown"])
-        self.assertIn("ghost", issues[0]["detail"])
+        assert [i["type"] for i in issues] == ["unknown"]
+        assert "ghost" in issues[0]["detail"]
 
     def test_star_rejected_as_unknown(self):
         """无通配语义：旧 ["*"] 列表提交时按未知名报错（PUT 会 409），
         不会意外放行全部插件。"""
         issues = self._manager().validate_selection(["*"])
-        self.assertEqual([i["type"] for i in issues], ["unknown"])
-        self.assertIn("*", issues[0]["detail"])
+        assert [i["type"] for i in issues] == ["unknown"]
+        assert "*" in issues[0]["detail"]
 
     def test_missing_dep_reported(self):
         issues = self._manager().validate_selection(["stage"])
-        self.assertEqual([i["type"] for i in issues], ["missing_dep"])
-        self.assertEqual(issues[0]["plugin"], "stage")
-        self.assertIn("src", issues[0]["detail"])
+        assert [i["type"] for i in issues] == ["missing_dep"]
+        assert issues[0]["plugin"] == "stage"
+        assert "src" in issues[0]["detail"]
 
     def test_conflict_reported_once_per_pair(self):
         manager = self._manager()
         manager.register(FakePlugin("x", conflicts=("y",)))
         manager.register(FakePlugin("y", conflicts=("x",)))
         issues = manager.validate_selection(["x", "y"])
-        self.assertEqual([i["type"] for i in issues], ["conflict"])
+        assert [i["type"] for i in issues] == ["conflict"]
 
     def test_cycle_reported_per_member(self):
         manager = self._manager()
         manager.register(FakePlugin("u", dependencies=("v",)))
         manager.register(FakePlugin("v", dependencies=("u",)))
         issues = manager.validate_selection(["u", "v"])
-        self.assertEqual({i["type"] for i in issues}, {"cycle"})
-        self.assertEqual({i["plugin"] for i in issues}, {"u", "v"})
+        assert {i["type"] for i in issues} == {"cycle"}
+        assert {i["plugin"] for i in issues} == {"u", "v"}
 
     def test_duplicate_names_deduplicated(self):
-        self.assertEqual(self._manager().validate_selection(["src", "src"]), [])
+        assert self._manager().validate_selection(["src", "src"]) == []
 
     def test_unknown_dep_of_selected_plugin_reported(self):
         """依赖指向不存在的插件：missing_dep（插件不存在），非 unknown。"""
         manager = self._manager()
         manager.register(FakePlugin("bad", dependencies=("ghost",)))
         issues = manager.validate_selection(["bad"])
-        self.assertEqual([i["type"] for i in issues], ["missing_dep"])
-        self.assertIn("不存在", issues[0]["detail"])
+        assert [i["type"] for i in issues] == ["missing_dep"]
+        assert "不存在" in issues[0]["detail"]
 
 
-class FailureIsolationTest(_ManagerTestBase):
+class TestFailureIsolation(_ManagerTestBase):
     async def test_self_disabled_isolated(self):
         manager = PluginManager(make_settings(plugins=["a", "b"]))
         manager.register(FakePlugin("a", setup_disabled="缺少必填配置"))
         manager.register(FakePlugin("b"))
         await manager.setup_all(make_ctx())
-        self.assertEqual(manager.loaded, ["b"])
+        assert manager.loaded == ["b"]
         rec = manager.records()["a"]
-        self.assertEqual(rec.status, "disabled")
-        self.assertIn("缺少必填配置", rec.reason)
+        assert rec.status == "disabled"
+        assert "缺少必填配置" in rec.reason
 
     async def test_setup_error_isolated(self):
         manager = PluginManager(make_settings(plugins=["a", "b"]))
         manager.register(FakePlugin("a", setup_error=RuntimeError("boom")))
         manager.register(FakePlugin("b"))
         await manager.setup_all(make_ctx())
-        self.assertEqual(manager.loaded, ["b"])
-        self.assertEqual(manager.records()["a"].status, "failed")
+        assert manager.loaded == ["b"]
+        assert manager.records()["a"].status == "failed"
 
     async def test_setup_failure_runs_teardown_and_leaves_no_ports(self):
         """守卫：setup 中先注册端口再抛错 → 框架仍调用 teardown、插件
@@ -388,18 +388,18 @@ class FailureIsolationTest(_ManagerTestBase):
         manager.register(plugin)
         ctx = make_ctx()
         await manager.setup_all(ctx)
-        self.assertIn(("teardown", "a"), plugin.calls, "框架须 best-effort teardown")
-        self.assertEqual(manager.records()["a"].status, "failed")
-        self.assertIsNone(ctx.ai, "按契约回收后 ctx.ai 不得残留")
-        self.assertIsNone(ctx.dedup, "按契约回收后 ctx.dedup 不得残留")
+        assert ("teardown", "a") in plugin.calls, "框架须 best-effort teardown"
+        assert manager.records()["a"].status == "failed"
+        assert ctx.ai is None, "按契约回收后 ctx.ai 不得残留"
+        assert ctx.dedup is None, "按契约回收后 ctx.dedup 不得残留"
 
     async def test_unknown_dependency_disables(self):
         manager = PluginManager(make_settings(plugins=["a"]))
         manager.register(FakePlugin("a", dependencies=("ghost",)))
         await manager.setup_all(make_ctx())
         rec = manager.records()["a"]
-        self.assertEqual(rec.status, "disabled")
-        self.assertIn("未知依赖", rec.reason)
+        assert rec.status == "disabled"
+        assert "未知依赖" in rec.reason
 
     async def test_cycle_disables_both(self):
         manager = PluginManager(make_settings(plugins=["a", "b"]))
@@ -408,8 +408,8 @@ class FailureIsolationTest(_ManagerTestBase):
         await manager.setup_all(make_ctx())
         for name in ("a", "b"):
             rec = manager.records()[name]
-            self.assertEqual(rec.status, "disabled")
-            self.assertIn("依赖环", rec.reason)
+            assert rec.status == "disabled"
+            assert "依赖环" in rec.reason
 
     async def test_depends_on_failed_dependency_disables(self):
         manager = PluginManager(make_settings(plugins=["a", "b"]))
@@ -417,8 +417,8 @@ class FailureIsolationTest(_ManagerTestBase):
         manager.register(FakePlugin("b", dependencies=("a",)))
         await manager.setup_all(make_ctx())
         rec = manager.records()["b"]
-        self.assertEqual(rec.status, "disabled")
-        self.assertIn("依赖未就绪", rec.reason)
+        assert rec.status == "disabled"
+        assert "依赖未就绪" in rec.reason
 
     async def test_depends_on_unlisted_optional_dependency_disables(self):
         """依赖指向未列入 PLUGINS 的可选插件：setup 期降级「依赖未就绪」。"""
@@ -427,19 +427,19 @@ class FailureIsolationTest(_ManagerTestBase):
         manager.register(FakePlugin("b", dependencies=("a",)))
         await manager.setup_all(make_ctx())
         rec = manager.records()["b"]
-        self.assertEqual(rec.status, "disabled")
-        self.assertIn("依赖未就绪", rec.reason)
+        assert rec.status == "disabled"
+        assert "依赖未就绪" in rec.reason
 
     async def test_required_failure_raises(self):
         manager = PluginManager(make_settings(plugins=["a"], plugins_required=["a"]))
         manager.register(FakePlugin("a", setup_error=RuntimeError("boom")))
-        with self.assertRaises(PluginError):
+        with pytest.raises(PluginError):
             await manager.setup_all(make_ctx())
 
     async def test_required_self_disabled_raises(self):
         manager = PluginManager(make_settings(plugins=["a"], plugins_required=["a"]))
         manager.register(FakePlugin("a", setup_disabled="缺少配置"))
-        with self.assertRaises(PluginError):
+        with pytest.raises(PluginError):
             await manager.setup_all(make_ctx())
 
     async def test_activate_error_isolated(self):
@@ -449,24 +449,24 @@ class FailureIsolationTest(_ManagerTestBase):
         await manager.setup_all(make_ctx())
         await manager.activate_all(make_ctx())
         rec = manager.records()["a"]
-        self.assertEqual(rec.status, "failed")
-        self.assertIn("activate 失败", rec.reason)
+        assert rec.status == "failed"
+        assert "activate 失败" in rec.reason
 
 
-class RegistrationTest(unittest.TestCase):
+class TestRegistration(unittest.TestCase):
     def test_duplicate_name_skipped(self):
         manager = PluginManager(make_settings())
         manager.register(FakePlugin("a"))
         manager.register(FakePlugin("a", version="2.0.0"))
-        self.assertEqual(len(manager.records()), 1)
-        self.assertEqual(manager.records()["a"].version, "1.0.0")
+        assert len(manager.records()) == 1
+        assert manager.records()["a"].version == "1.0.0"
 
     def test_object_without_name_rejected(self):
         manager = PluginManager(make_settings())
         manager.register(object())  # type: ignore[arg-type]
         rec = manager.records()["register"]
-        self.assertEqual(rec.status, "failed")
-        self.assertIn("name", rec.reason)
+        assert rec.status == "failed"
+        assert "name" in rec.reason
 
     def test_missing_lifecycle_method_rejected(self):
         manager = PluginManager(make_settings())
@@ -480,8 +480,8 @@ class RegistrationTest(unittest.TestCase):
 
         manager.register(Partial())  # type: ignore[arg-type]
         rec = manager.records()["partial"]
-        self.assertEqual(rec.status, "failed")
-        self.assertIn("activate", rec.reason)
+        assert rec.status == "failed"
+        assert "activate" in rec.reason
 
     def test_infos_include_has_frontend(self):
         # 前端加载器据此只对有前端资源的插件注入 ui.css/ui.js
@@ -494,50 +494,50 @@ class RegistrationTest(unittest.TestCase):
         manager.register(WithFrontend("frontend"))    # asset_dir 非 None → True
         manager.register(_BrokenAssetDirPlugin("broken"))  # asset_dir 抛错 → False
         by_name = {i["name"]: i for i in manager.infos()}
-        self.assertIs(by_name["backend"]["has_frontend"], False)
-        self.assertIs(by_name["frontend"]["has_frontend"], True)
-        self.assertIs(by_name["broken"]["has_frontend"], False)
+        assert by_name["backend"]["has_frontend"] is False
+        assert by_name["frontend"]["has_frontend"] is True
+        assert by_name["broken"]["has_frontend"] is False
 
     def test_infos_include_core_flag(self):
         manager = PluginManager(make_settings())
         manager.register(FakePlugin("core", core=True))
         manager.register(FakePlugin("opt"))
         by_name = {i["name"]: i for i in manager.infos()}
-        self.assertIs(by_name["core"]["core"], True)
-        self.assertIs(by_name["opt"]["core"], False)
+        assert by_name["core"]["core"] is True
+        assert by_name["opt"]["core"] is False
 
     def test_core_plugin_with_conflicts_rejected(self):
         """核心插件恒装配，互斥无法仲裁：声明 conflicts 即接受失败。"""
         manager = PluginManager(make_settings())
         manager.register(FakePlugin("cc", core=True, conflicts=("other",)))
         rec = manager.records()["cc"]
-        self.assertEqual(rec.status, "failed")
-        self.assertIn("互斥", rec.reason)
+        assert rec.status == "failed"
+        assert "互斥" in rec.reason
 
     def test_conflicts_self_reference_rejected(self):
         manager = PluginManager(make_settings())
         manager.register(FakePlugin("bad", conflicts=("bad",)))
         rec = manager.records()["bad"]
-        self.assertEqual(rec.status, "failed")
-        self.assertIn("自指或重复", rec.reason)
+        assert rec.status == "failed"
+        assert "自指或重复" in rec.reason
 
     def test_conflicts_non_string_rejected(self):
         manager = PluginManager(make_settings())
         manager.register(FakePlugin("bad", conflicts=(1,)))  # type: ignore[list-item]
         rec = manager.records()["bad"]
-        self.assertEqual(rec.status, "failed")
-        self.assertIn("字符串", rec.reason)
+        assert rec.status == "failed"
+        assert "字符串" in rec.reason
 
 
-class SettingsSchemaTest(_ManagerTestBase):
+class TestSettingsSchema(_ManagerTestBase):
     async def test_selected_plugin_schema_is_returned(self):
         manager = PluginManager(make_settings(plugins=["example"]))
         manager.register(_SettingsPlugin("example"))
         await manager.setup_all(make_ctx())
         schema = manager.settings_schema()
-        self.assertEqual(schema[0]["key"], "EXAMPLE_LIMIT")
-        self.assertEqual(schema[0]["plugin"], "example")
-        self.assertEqual(schema[0]["pluginStatus"], "loaded")
+        assert schema[0]["key"] == "EXAMPLE_LIMIT"
+        assert schema[0]["plugin"] == "example"
+        assert schema[0]["pluginStatus"] == "loaded"
 
     async def test_self_disabled_plugin_schema_remains_configurable(self):
         manager = PluginManager(make_settings())
@@ -546,7 +546,7 @@ class SettingsSchemaTest(_ManagerTestBase):
         )
         await manager.setup_all(make_ctx())
         schema = manager.settings_schema()
-        self.assertEqual(schema[0]["pluginStatus"], "disabled")
+        assert schema[0]["pluginStatus"] == "disabled"
 
     async def test_unlisted_optional_plugin_schema_remains_configurable(self):
         """可选插件未列入 PLUGINS：设置页仍展示其配置（启用前可预配置）。"""
@@ -554,11 +554,11 @@ class SettingsSchemaTest(_ManagerTestBase):
         manager.register(_SettingsPlugin("example"))
         await manager.setup_all(make_ctx())
         schema = manager.settings_schema()
-        self.assertEqual([f["plugin"] for f in schema], ["example"])
-        self.assertEqual(schema[0]["pluginStatus"], "disabled")
+        assert [f["plugin"] for f in schema] == ["example"]
+        assert schema[0]["pluginStatus"] == "disabled"
 
 
-class DiscoveryTest(_ManagerTestBase):
+class TestDiscovery(_ManagerTestBase):
     async def test_entry_point_discovery(self):
         from importlib.metadata import EntryPoint
 
@@ -578,8 +578,8 @@ class DiscoveryTest(_ManagerTestBase):
         manager = PluginManager(make_settings())
         with patch("importlib.metadata.entry_points", return_value=eps):
             manager.discover()
-        self.assertIn("ep_a", manager.records())
-        self.assertEqual(manager.records()["ep_a"].version, "fixture")
+        assert "ep_a" in manager.records()
+        assert manager.records()["ep_a"].version == "fixture"
 
     async def test_entry_point_load_failure_recorded(self):
         from importlib.metadata import EntryPoint
@@ -601,8 +601,8 @@ class DiscoveryTest(_ManagerTestBase):
         with patch("importlib.metadata.entry_points", return_value=eps):
             manager.discover()
         rec = manager.records()["broken"]
-        self.assertEqual(rec.status, "failed")
-        self.assertIn("加载失败", rec.reason)
+        assert rec.status == "failed"
+        assert "加载失败" in rec.reason
 
     async def test_plugin_path_discovery(self):
         # 夹具目录随仓库提交：沙箱环境不允许写系统临时目录，
@@ -610,20 +610,20 @@ class DiscoveryTest(_ManagerTestBase):
         fixture_dir = str(Path(__file__).parent / "plugin_path_fixtures")
         manager = PluginManager(make_settings(plugin_path=fixture_dir))
         manager.discover()
-        self.assertIn("hello", manager.records())
-        self.assertEqual(manager.records()["hello"].version, "0.1")
+        assert "hello" in manager.records()
+        assert manager.records()["hello"].version == "0.1"
 
     async def test_plugin_path_missing_plugin_instance_recorded(self):
         fixture_dir = str(Path(__file__).parent / "plugin_path_fixtures")
         manager = PluginManager(make_settings(plugin_path=fixture_dir))
         manager.discover()
         rec = manager.records()["empty.py"]
-        self.assertEqual(rec.status, "failed")
-        self.assertIn("plugin", rec.reason)
+        assert rec.status == "failed"
+        assert "plugin" in rec.reason
 
     async def test_discover_idempotent(self):
         manager = PluginManager(make_settings())
         manager.register(FakePlugin("a"))
         manager.discover()
         manager.discover()
-        self.assertEqual(len(manager.records()), 1)
+        assert len(manager.records()) == 1

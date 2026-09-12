@@ -22,8 +22,8 @@ class TriggerSyncTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_no_callback_rejected_and_not_syncing(self):
         """未注册回调 → 返回 None、不置 syncing。"""
-        self.assertIsNone(sync_module.trigger_sync(reason="test"))
-        self.assertFalse(is_syncing())
+        assert sync_module.trigger_sync(reason="test") is None
+        assert not is_syncing()
 
     async def test_concurrent_trigger_rejected_by_mutex(self):
         """同步进行中再次触发 → 互斥拒绝（返回 None），首粒任务不受影响。"""
@@ -36,14 +36,14 @@ class TriggerSyncTest(unittest.IsolatedAsyncioTestCase):
 
         sync_module.set_sync_callback(slow_cb)
         first = sync_module.trigger_sync(reason="test")
-        self.assertIsNotNone(first)
+        assert first is not None
         await started.wait()
-        self.assertTrue(is_syncing())
+        assert is_syncing()
         # 第一轮仍在跑 → 第二次触发被拒
-        self.assertIsNone(sync_module.trigger_sync(reason="test"))
+        assert sync_module.trigger_sync(reason="test") is None
         release.set()
         await first
-        self.assertFalse(is_syncing(), "首粒任务结束后 syncing 复位")
+        assert not is_syncing(), "首粒任务结束后 syncing 复位"
 
     async def test_callback_exception_isolated_and_status_reset(self):
         """回调抛异常 → 不外泄（日志兜底）、syncing 复位、完成事件照发。"""
@@ -61,12 +61,10 @@ class TriggerSyncTest(unittest.IsolatedAsyncioTestCase):
             self.assertLogs("briefdesk.sync", level="ERROR") as captured,
         ):
             task = sync_module.trigger_sync(reason="test")
-            self.assertIsNotNone(task)
+            assert task is not None
             await task  # 异常被 _run 吞掉，任务正常结束
-        self.assertTrue(
-            any("同步任务失败" in m for m in captured.output), captured.output
-        )
-        self.assertEqual(calls, [{"syncing": True}, {"syncing": False}])
+        assert any("同步任务失败" in m for m in captured.output), captured.output
+        assert calls == [{"syncing": True}, {"syncing": False}]
         publish.assert_awaited_once_with({"synced": True})
 
     async def test_normal_path_finally_cleanup_and_publish(self):
@@ -84,9 +82,9 @@ class TriggerSyncTest(unittest.IsolatedAsyncioTestCase):
             ) as publish,
         ):
             task = sync_module.trigger_sync(reason="test")
-            self.assertIsNotNone(task)
+            assert task is not None
             await task
-        self.assertEqual(calls, [{"syncing": True}, {"syncing": False}])
+        assert calls == [{"syncing": True}, {"syncing": False}]
         publish.assert_awaited_once_with({"synced": True})
 
 

@@ -5,6 +5,7 @@ import unittest
 from unittest.mock import AsyncMock, Mock, patch
 
 import aiosqlite
+import pytest
 
 from briefdesk import announcements, stages
 from briefdesk import pipeline as pipeline_module
@@ -107,10 +108,11 @@ def _dedup_engine_mock():
     )
 
 
-class _StageTestBase(unittest.IsolatedAsyncioTestCase):
+class _StageTestBase:
     """阶段测试基座：注册表隔离 + 装配期上下文。"""
 
-    async def asyncSetUp(self):
+    @pytest.fixture(autouse=True)
+    async def _autouse_setup(self):
         stages.reset()
         self.ctx = PluginContext(
             config=config,
@@ -120,12 +122,11 @@ class _StageTestBase(unittest.IsolatedAsyncioTestCase):
             register_stage=stages.register_stage,
         )
         stages.set_context(self.ctx)
-
-    async def asyncTearDown(self):
+        yield
         stages.reset()
 
 
-class BuildItemInputTest(unittest.TestCase):
+class TestBuildItemInput(unittest.TestCase):
     def _msg(self):
         return InternalMessage(
             msg_id="m1",
@@ -144,23 +145,20 @@ class BuildItemInputTest(unittest.TestCase):
             msg_index=0, category="学术", summary="标题", quote="内容"
         )
         item = build_item_input(self._msg(), result, "标题")
-        self.assertTrue(item["content_hash"])
-        self.assertEqual(len(item["content_hash"]), 16)
-        self.assertEqual(
-            item["content_hash"],
-            build_item_input(self._msg(), result, "标题")["content_hash"],
-        )
+        assert item["content_hash"]
+        assert len(item["content_hash"]) == 16
+        assert item["content_hash"] == build_item_input(self._msg(), result, "标题")["content_hash"]
 
     def test_image_urls_serialized(self):
         result = ClassifyResult(msg_index=0, category="学术")
         item = build_item_input(self._msg(), result, "标题")
-        self.assertEqual(item["image_urls"], '["a.jpg"]')
+        assert item["image_urls"] == '["a.jpg"]'
 
     def test_sender_fields_preserved(self):
         result = ClassifyResult(msg_index=0, category="学术")
         item = build_item_input(self._msg(), result, "标题")
-        self.assertEqual(item["sender_name"], "Alice")
-        self.assertEqual(item["source_msg_id"], "m1")
+        assert item["sender_name"] == "Alice"
+        assert item["source_msg_id"] == "m1"
 
     def test_extra_times_serialized(self):
         # 多时间点以 JSON 存储（单条消息含多个截止日，如工作提醒）
@@ -173,44 +171,44 @@ class BuildItemInputTest(unittest.TestCase):
         )
         item = build_item_input(self._msg(), result, "标题")
         import json as _json
-        self.assertEqual(_json.loads(item["extra_times"]), [
+        assert _json.loads(item["extra_times"]) == [
             {"type": "end", "time": "2026-08-15", "label": "部门宣传视频"},
             {"type": "end", "time": "2026-08-20", "label": "部门文字宣传稿"},
-        ])
+        ]
         # 无多时间点时存空串
         item2 = build_item_input(self._msg(), ClassifyResult(msg_index=0, category="学术"), "t")
-        self.assertEqual(item2["extra_times"], "")
+        assert item2["extra_times"] == ""
 
     def test_subject_normalized_at_write(self):
         # subject 写时归一化（NFKC+小写+空白折叠），展示与时间线匹配共用
         result = ClassifyResult(msg_index=0, category="学术", subject="ＡＣＭ社 ")
         item = build_item_input(self._msg(), result, "标题")
-        self.assertEqual(item["subject"], "acm社")
+        assert item["subject"] == "acm社"
 
     def test_subject_none_stays_none(self):
         result = ClassifyResult(msg_index=0, category="学术", subject="")
         item = build_item_input(self._msg(), result, "标题")
-        self.assertIsNone(item["subject"])
+        assert item["subject"] is None
 
     def test_source_quote_uses_full_content_not_ai_quote(self):
         # 原文引用展示完整原文（含 [OCR] 前缀的识别文本），而非 AI 摘要式 quote
         result = ClassifyResult(msg_index=0, category="学术", quote="截断的摘要")
         item = build_item_input(self._msg(), result, "标题")
-        self.assertEqual(item["source_quote"], "原始内容")
+        assert item["source_quote"] == "原始内容"
 
 
-class SplitBatchesTest(unittest.TestCase):
+class TestSplitBatches(unittest.TestCase):
     def test_empty(self):
-        self.assertEqual(_split_batches([], 2), [])
+        assert _split_batches([], 2) == []
 
     def test_exact(self):
-        self.assertEqual([len(b) for b in _split_batches([1, 2, 3, 4], 2)], [2, 2])
+        assert [len(b) for b in _split_batches([1, 2, 3, 4], 2)] == [2, 2]
 
     def test_remainder(self):
-        self.assertEqual([len(b) for b in _split_batches([1, 2, 3], 2)], [2, 1])
+        assert [len(b) for b in _split_batches([1, 2, 3], 2)] == [2, 1]
 
 
-class OcrEnrichTest(unittest.IsolatedAsyncioTestCase):
+class TestOcrEnrich:
     """OCR 阶段（OcrPlugin.run）的异常隔离：单条 OCR 失败不拖垮整批。"""
 
     def _msg(self, msg_id="m1"):
@@ -252,7 +250,7 @@ class OcrEnrichTest(unittest.IsolatedAsyncioTestCase):
             self._client(),
             AsyncMock(side_effect=RuntimeError("engine broken")),
         )
-        self.assertEqual(msg.content, "原文内容")
+        assert msg.content == "原文内容"
 
     async def test_media_error_keeps_original_content(self):
         # 图片下载失败（MediaError）同样只跳过 OCR
@@ -260,21 +258,21 @@ class OcrEnrichTest(unittest.IsolatedAsyncioTestCase):
         client = Mock()
         client.download_media = AsyncMock(side_effect=MediaError("404"))
         await self._run(msg, client, AsyncMock(return_value="识别文字"))
-        self.assertEqual(msg.content, "原文内容")
+        assert msg.content == "原文内容"
 
     async def test_ocr_mixed_message_appends_ocr_section(self):
         # 图+文混合消息（复核 P2-21）：人工原文保留（信息密度更高），OCR 文本
         # 作为附加段追加——此前整段替换会丢掉原文，分类/去重也失去该上下文
         msg = self._msg()
         await self._run(msg, self._client(), AsyncMock(return_value="识别文字"))
-        self.assertEqual(msg.content, "原文内容\n[OCR]\n识别文字")
+        assert msg.content == "原文内容\n[OCR]\n识别文字"
 
     async def test_ocr_placeholder_content_replaced(self):
         # 纯占位符消息（content 为附件占位符）：维持整段替换语义
         msg = self._msg()
         msg.content = "[图片]"
         await self._run(msg, self._client(), AsyncMock(return_value="识别文字"))
-        self.assertEqual(msg.content, "[OCR]\n识别文字")
+        assert msg.content == "[OCR]\n识别文字"
 
     async def test_no_images_skips_download(self):
         msg = self._msg()
@@ -334,7 +332,7 @@ def _pipeline_patches(
         yield
 
 
-class StoreBatchFailedTest(_StageTestBase):
+class TestStoreBatchFailed(_StageTestBase):
     """骨架 + dedup 阶段：failed index 的消息不标记 processed（本轮抛弃、下轮回填）。"""
 
     async def _store(self, results, failed):
@@ -364,14 +362,14 @@ class StoreBatchFailedTest(_StageTestBase):
     async def test_failed_not_marked_with_partial_results(self):
         r = ClassifyResult(msg_index=0, category="活动通知", summary="s", quote="q")
         processed = await self._store([r], [1])
-        self.assertEqual(processed, ["m0", "m2"])  # m1 未标记 processed
+        assert processed == ["m0", "m2"]  # m1 未标记 processed
 
     async def test_failed_not_marked_when_results_empty(self):
         processed = await self._store([], [1])
-        self.assertEqual(processed, ["m0", "m2"])
+        assert processed == ["m0", "m2"]
 
 
-class RawInsertHoldsStorageLockTest(_StageTestBase):
+class TestRawInsertHoldsStorageLock(_StageTestBase):
     """复核 P1-2：raw 落库必须持有 storage_lock，锁外 commit 会击穿
     「单连接 + 隐式事务 + 存储锁」不变量（把锁内多步写提前提交）。"""
 
@@ -395,10 +393,10 @@ class RawInsertHoldsStorageLockTest(_StageTestBase):
                 batch, _pipeline_client(), batch_size=10, origin="test"
             )
 
-        self.assertEqual(held, [True], "raw 落库必须在 storage_lock 内执行")
+        assert held == [True], "raw 落库必须在 storage_lock 内执行"
 
 
-class ActiveBatchTrackingTest(_StageTestBase):
+class TestActiveBatchTracking(_StageTestBase):
     """复核 P1-5：process_all_batches 执行期间 active_batches 计数为 1，
     退出后归 0（benchmark 排空门闸据此捕捉「已过暂停检查、尚未计数」的批次）。"""
 
@@ -420,12 +418,12 @@ class ActiveBatchTrackingTest(_StageTestBase):
                 batch, _pipeline_client(), batch_size=10, origin="test"
             )
 
-        self.assertEqual(get_active_batches(), 0, "执行结束后计数必须归 0")
-        self.assertTrue(all(v == 1 for v in seen_during), "执行期间计数必须为 1")
-        self.assertTrue(seen_during, "应至少探测到一次执行期间的状态")
+        assert get_active_batches() == 0, "执行结束后计数必须归 0"
+        assert all(v == 1 for v in seen_during), "执行期间计数必须为 1"
+        assert seen_during, "应至少探测到一次执行期间的状态"
 
 
-class MissingStageGuardTest(_StageTestBase):
+class TestMissingStageGuard(_StageTestBase):
     """分类/去重阶段缺失（插件被禁用）时整批保留：不标记 processed（防永久丢失）。"""
 
     async def _run(self, install_stages):
@@ -457,7 +455,7 @@ class MissingStageGuardTest(_StageTestBase):
             _install_merge_stage()
 
         processed = await self._run(install)
-        self.assertEqual(processed, [])  # 未标记：回填窗口内自动重试
+        assert processed == []  # 未标记：回填窗口内自动重试
 
     async def test_no_dedup_stage_keeps_batch(self):
         def install():
@@ -470,10 +468,10 @@ class MissingStageGuardTest(_StageTestBase):
             )
 
         processed = await self._run(install)
-        self.assertEqual(processed, [])
+        assert processed == []
 
 
-class ProcessAllBatchesReturnTest(_StageTestBase):
+class TestProcessAllBatchesReturn(_StageTestBase):
     """process_all_batches 返回标志——早退（未落 raw）返回 False，
     调用方（poll_cycle）据此跳过水位推进，防消息永久丢失。"""
 
@@ -521,12 +519,12 @@ class ProcessAllBatchesReturnTest(_StageTestBase):
     async def test_no_categories_returns_false(self):
         # 无启用类别 → 早退（不落 raw、不标 processed）→ 返回 False
         ok = await self._run(categories=[])
-        self.assertFalse(ok)
+        assert not ok
 
     async def test_missing_stages_returns_false(self):
         # 阶段插件缺失 → 早退 → 返回 False
         ok = await self._run(categories=[{"name": "x"}])
-        self.assertFalse(ok)
+        assert not ok
 
     async def test_normal_path_returns_true(self):
         # 正常处理（dedup 判非重复入库）→ 返回 True（可推进水位）
@@ -542,7 +540,7 @@ class ProcessAllBatchesReturnTest(_StageTestBase):
             )
 
         ok = await self._run(categories=[{"name": "x"}], install_stages=install)
-        self.assertTrue(ok)
+        assert ok
 
 
 def _outcome_fn(results, failed):
@@ -552,18 +550,16 @@ def _outcome_fn(results, failed):
     return classify
 
 
-class ZeroOutputStatusTest(_StageTestBase):
+class TestZeroOutputStatus(_StageTestBase):
     """零产出（全部失败）不刷新 lastSync/lastError，避免前端误报同步成功。"""
 
-    async def asyncSetUp(self):
-        await super().asyncSetUp()
+    @pytest.fixture(autouse=True)
+    async def _sub_setup(self):
         self.db = await aiosqlite.connect(":memory:")
         self.db.row_factory = aiosqlite.Row
         await self.db.execute("PRAGMA foreign_keys = ON")
         await init_schema(self.db)
-
-    async def asyncTearDown(self):
-        await super().asyncTearDown()
+        yield
         await self.db.close()
 
     async def _run(self, classify):
@@ -600,7 +596,7 @@ class ZeroOutputStatusTest(_StageTestBase):
             return ClassifyOutcome([], list(range(len(messages))))
 
         status_calls = await self._run(classify_all_failed)
-        self.assertEqual(status_calls, [])  # 不刷新 lastSync、不清 lastError
+        assert status_calls == []  # 不刷新 lastSync、不清 lastError
 
     async def test_all_skipped_refreshes_status(self):
         # 全部识别为闲聊（results/failed 均空）属正常成功：应刷新 lastSync，
@@ -609,9 +605,9 @@ class ZeroOutputStatusTest(_StageTestBase):
             return ClassifyOutcome([], [])
 
         status_calls = await self._run(classify_all_skipped)
-        self.assertEqual(len(status_calls), 1)
-        self.assertTrue(status_calls[0]["lastSync"])
-        self.assertEqual(status_calls[0]["lastError"], "")
+        assert len(status_calls) == 1
+        assert status_calls[0]["lastSync"]
+        assert status_calls[0]["lastError"] == ""
 
     async def test_partial_output_refreshes_status(self):
         async def classify_one_ok(messages):
@@ -621,12 +617,12 @@ class ZeroOutputStatusTest(_StageTestBase):
             )
 
         status_calls = await self._run(classify_one_ok)
-        self.assertEqual(len(status_calls), 1)
-        self.assertTrue(status_calls[0]["lastSync"])
-        self.assertEqual(status_calls[0]["lastError"], "")
+        assert len(status_calls) == 1
+        assert status_calls[0]["lastSync"]
+        assert status_calls[0]["lastError"] == ""
 
 
-class PostInsertHookProbeTest(_StageTestBase):
+class TestPostInsertHookProbe(_StageTestBase):
     """骨架对 post_insert 槽同样探测 before_run/after_run——rag 等后置
     阶段的锁外预嵌入/向量落库依赖此契约（回归：曾只遍历 dedup_stages）。"""
 
@@ -682,21 +678,19 @@ class PostInsertHookProbeTest(_StageTestBase):
                 )
         finally:
             await db.close()
-        self.assertEqual(calls, ["before", "after"])
+        assert calls == ["before", "after"]
 
 
-class IgnoreSelfFilterTest(_StageTestBase):
+class TestIgnoreSelfFilter(_StageTestBase):
     """IGNORE_SELF 入口过滤：is_self 消息在管道入口被丢弃，不进分类也不落 raw。"""
 
-    async def asyncSetUp(self):
-        await super().asyncSetUp()
+    @pytest.fixture(autouse=True)
+    async def _sub_setup(self):
         self.db = await aiosqlite.connect(":memory:")
         self.db.row_factory = aiosqlite.Row
         await self.db.execute("PRAGMA foreign_keys = ON")
         await init_schema(self.db)
-
-    async def asyncTearDown(self):
-        await super().asyncTearDown()
+        yield
         await self.db.close()
 
     async def _run(self, messages, classify, raw_rows):
@@ -739,8 +733,8 @@ class IgnoreSelfFilterTest(_StageTestBase):
                 classify,
                 raw_rows,
             )
-        self.assertEqual(seen, [["m2"]], "自消息不进分类")
-        self.assertEqual(raw_rows, ["m2"], "自消息不落 raw")
+        assert seen == [["m2"]], "自消息不进分类"
+        assert raw_rows == ["m2"], "自消息不落 raw"
 
     async def test_ignore_self_off_keeps_all(self):
         seen = []
@@ -761,8 +755,8 @@ class IgnoreSelfFilterTest(_StageTestBase):
                 classify,
                 raw_rows,
             )
-        self.assertEqual(seen, [["m1", "m2"]])
-        self.assertEqual(raw_rows, ["m1", "m2"])
+        assert seen == [["m1", "m2"]]
+        assert raw_rows == ["m1", "m2"]
 
     async def test_all_self_short_circuits(self):
         classify = AsyncMock()
@@ -774,24 +768,22 @@ class IgnoreSelfFilterTest(_StageTestBase):
                 raw_rows,
             )
         classify.assert_not_called()
-        self.assertEqual(raw_rows, [])
+        assert raw_rows == []
 
 
-class EmptyEnabledSessionsFilterTest(_StageTestBase):
+class TestEmptyEnabledSessionsFilter(_StageTestBase):
     """空启用集 → 全滤（保持原监听器语义）：无任何启用会话时所有消息在
     入口被过滤——不落 raw、不进分类、不标 processed，水位照常推进
     （return True）。upsert_session 默认 enabled=0 写入，全新安装或用户
     停用全部会话时 get_enabled_sessions 返回空集是常态路径。"""
 
-    async def asyncSetUp(self):
-        await super().asyncSetUp()
+    @pytest.fixture(autouse=True)
+    async def _sub_setup(self):
         self.db = await aiosqlite.connect(":memory:")
         self.db.row_factory = aiosqlite.Row
         await self.db.execute("PRAGMA foreign_keys = ON")
         await init_schema(self.db)
-
-    async def asyncTearDown(self):
-        await super().asyncTearDown()
+        yield
         await self.db.close()
 
     async def _run(self, messages, classify, raw_rows):
@@ -824,24 +816,22 @@ class EmptyEnabledSessionsFilterTest(_StageTestBase):
             raw_rows,
         )
         classify.assert_not_called()
-        self.assertEqual(raw_rows, [], "空启用集下消息不落 raw")
-        self.assertTrue(result, "空启用集全滤应走「过滤后无消息 return True」路径（水位照常推进）")
+        assert raw_rows == [], "空启用集下消息不落 raw"
+        assert result, "空启用集全滤应走「过滤后无消息 return True」路径（水位照常推进）"
 
 
-class ImageFilterWhenNoEnrichTest(_StageTestBase):
+class TestImageFilterWhenNoEnrich(_StageTestBase):
     """OCR 未启用（enrich 槽位为空）时，纯占位符图片消息在入口被屏蔽：
     不落 raw、不进分类、不标记 processed；图片+文字混合消息（content 非
     占位符）与启用 OCR 时（enrich 非空）不受影响。"""
 
-    async def asyncSetUp(self):
-        await super().asyncSetUp()
+    @pytest.fixture(autouse=True)
+    async def _sub_setup(self):
         self.db = await aiosqlite.connect(":memory:")
         self.db.row_factory = aiosqlite.Row
         await self.db.execute("PRAGMA foreign_keys = ON")
         await init_schema(self.db)
-
-    async def asyncTearDown(self):
-        await super().asyncTearDown()
+        yield
         await self.db.close()
 
     async def _run(self, messages, classify, raw_rows, install_enrich=False):
@@ -891,8 +881,8 @@ class ImageFilterWhenNoEnrichTest(_StageTestBase):
             classify,
             raw_rows,
         )
-        self.assertEqual(seen, [["m2"]], "纯占位符图片消息不进分类")
-        self.assertEqual(raw_rows, ["m2"], "纯占位符图片消息不落 raw")
+        assert seen == [["m2"]], "纯占位符图片消息不进分类"
+        assert raw_rows == ["m2"], "纯占位符图片消息不落 raw"
 
     async def test_mixed_image_text_kept_without_enrich(self):
         seen = []
@@ -908,8 +898,8 @@ class ImageFilterWhenNoEnrichTest(_StageTestBase):
                 classify,
                 raw_rows,
             )
-        self.assertEqual(seen, [["m1", "m2"]], "图片+文字混合消息照常处理")
-        self.assertEqual(raw_rows, ["m1", "m2"])
+        assert seen == [["m1", "m2"]], "图片+文字混合消息照常处理"
+        assert raw_rows == ["m1", "m2"]
 
     async def test_multi_placeholder_image_filtered_without_enrich(self):
         # "[图片][图片]" 多片段占位拼接同样视为纯占位符图片消息（正则重复形）
@@ -928,8 +918,8 @@ class ImageFilterWhenNoEnrichTest(_StageTestBase):
             classify,
             raw_rows,
         )
-        self.assertEqual(seen, [["m2"]], "多片段占位图片消息不进分类")
-        self.assertEqual(raw_rows, ["m2"], "多片段占位图片消息不落 raw")
+        assert seen == [["m2"]], "多片段占位图片消息不进分类"
+        assert raw_rows == ["m2"], "多片段占位图片消息不落 raw"
 
     async def test_mixed_placeholder_text_kept_without_enrich(self):
         # "[图片] 说明文字" 混合消息不受屏蔽（文字仍有信息价值）
@@ -949,8 +939,8 @@ class ImageFilterWhenNoEnrichTest(_StageTestBase):
                 classify,
                 raw_rows,
             )
-        self.assertEqual(seen, [["m1", "m2"]], "占位符+文字混合消息照常处理")
-        self.assertEqual(raw_rows, ["m1", "m2"])
+        assert seen == [["m1", "m2"]], "占位符+文字混合消息照常处理"
+        assert raw_rows == ["m1", "m2"]
 
     async def test_placeholder_image_kept_with_enrich(self):
         # OCR 启用（enrich 槽位非空）时纯占位符图片消息不屏蔽：交由 OCR 阶段识别
@@ -964,15 +954,15 @@ class ImageFilterWhenNoEnrichTest(_StageTestBase):
         await self._run(
             [self._img_msg("m1")], classify, raw_rows, install_enrich=True
         )
-        self.assertEqual(seen, [["m1"]])
-        self.assertEqual(raw_rows, ["m1"])
+        assert seen == [["m1"]]
+        assert raw_rows == ["m1"]
 
     async def test_all_images_filtered_short_circuits(self):
         classify = AsyncMock()
         raw_rows = []
         await self._run([self._img_msg("m1")], classify, raw_rows)
         classify.assert_not_called()
-        self.assertEqual(raw_rows, [])
+        assert raw_rows == []
 
     async def test_all_images_filtered_returns_true(self):
         """【核验 C1】全滤（纯占位符图片、OCR 未启用）时返回 True——**有意**
@@ -982,40 +972,40 @@ class ImageFilterWhenNoEnrichTest(_StageTestBase):
         classify = AsyncMock()
         raw_rows = []
         ok = await self._run([self._img_msg("m1")], classify, raw_rows)
-        self.assertTrue(ok)
+        assert ok
         classify.assert_not_called()
-        self.assertEqual(raw_rows, [])
+        assert raw_rows == []
 
 
-class MergeFieldHelpersTest(unittest.TestCase):
+class TestMergeFieldHelpers(unittest.TestCase):
     """合并字段拼接纯函数：quote 按行去重、key 去重、图片并集。"""
 
     def test_merge_quote_dedupes_lines(self):
         q = _merge_quote(["塔卡沙团购", "45元\n塔卡沙团购", "", "面交"])
-        self.assertEqual(q, "塔卡沙团购\n45元\n面交")
+        assert q == "塔卡沙团购\n45元\n面交"
 
     def test_merge_key_info_case_insensitive_dedupe(self):
         k = _merge_key_info(["45, 运费AA", "运费aa, 面交"])
-        self.assertEqual(k, "45, 运费AA, 面交")
+        assert k == "45, 运费AA, 面交"
 
     def test_merge_image_urls_union(self):
         u = _merge_image_urls(['["a.jpg", "b.jpg"]', '["b.jpg", "c.jpg"]', ""])
-        self.assertEqual(u, '["a.jpg", "b.jpg", "c.jpg"]')
-        self.assertEqual(_merge_image_urls(["", ""]), "")
+        assert u == '["a.jpg", "b.jpg", "c.jpg"]'
+        assert _merge_image_urls(["", ""]) == ""
 
     def test_merge_time_points_earliest_primary_others_structured(self):
         # 两个截止日：主值取最早，第二个以结构化条目进 extra_times（防丢失）
         start, end, rest = _merge_time_points(
             [("end", "2026-08-25"), ("end", "2026-08-24")], []
         )
-        self.assertEqual((start, end), ("", "2026-08-24"))
-        self.assertEqual(rest, [{"type": "end", "time": "2026-08-25", "label": ""}])
+        assert (start, end) == ("", "2026-08-24")
+        assert rest == [{"type": "end", "time": "2026-08-25", "label": ""}]
         # 两个开始时间同理
         start, end, rest = _merge_time_points(
             [("start", "2026-08-26 19:00"), ("start", "2026-08-25 14:00")], []
         )
-        self.assertEqual((start, end), ("2026-08-25 14:00", ""))
-        self.assertEqual(rest, [{"type": "start", "time": "2026-08-26 19:00", "label": ""}])
+        assert (start, end) == ("2026-08-25 14:00", "")
+        assert rest == [{"type": "start", "time": "2026-08-26 19:00", "label": ""}]
 
     def test_merge_time_points_dedupe_and_mixed_format_order(self):
         # date-only 视为当日 00:00：字典序即时间序；重复 (type,time) 去重
@@ -1023,11 +1013,11 @@ class MergeFieldHelpersTest(unittest.TestCase):
             [("end", "2026-08-25"), ("end", "2026-08-24 23:00")],
             [{"type": "end", "time": "2026-08-25", "label": "部门宣传视频"}],
         )
-        self.assertEqual(end, "2026-08-24 23:00")
-        self.assertEqual(rest, [{"type": "end", "time": "2026-08-25", "label": "部门宣传视频"}])
+        assert end == "2026-08-24 23:00"
+        assert rest == [{"type": "end", "time": "2026-08-25", "label": "部门宣传视频"}]
         # 全空
         start, end, rest = _merge_time_points([("start", ""), ("end", "")], [])
-        self.assertEqual((start, end, rest), ("", "", []))
+        assert (start, end, rest) == ("", "", [])
 
     def test_merge_time_points_combines_extras_from_both_cards(self):
         # 两卡各自带 extra_times：合并后全部保留（跨卡去重，label 保留首现）
@@ -1038,31 +1028,32 @@ class MergeFieldHelpersTest(unittest.TestCase):
                 {"type": "end", "time": "2026-08-17", "label": "部门宣传海报"},
             ],
         )
-        self.assertEqual((start, end), ("", "2026-07-31"))
-        self.assertEqual(rest, [
+        assert (start, end) == ("", "2026-07-31")
+        assert rest == [
             {"type": "end", "time": "2026-08-15", "label": "部门宣传视频"},
             {"type": "end", "time": "2026-08-17", "label": "部门宣传海报"},
-        ])
+        ]
 
     def test_parse_extra_json_tolerates_raw_and_dirty(self):
         raw = '[{"type":"end","time":"2026-08-15","label":"视频"}]'
-        self.assertEqual(_parse_extra_json(raw), [
+        assert _parse_extra_json(raw) == [
             {"type": "end", "time": "2026-08-15", "label": "视频"},
-        ])
-        self.assertEqual(_parse_extra_json([{"type": "start", "time": "2026-08-01", "label": None}]), [
+        ]
+        assert _parse_extra_json([{"type": "start", "time": "2026-08-01", "label": None}]) == [
             {"type": "start", "time": "2026-08-01", "label": ""},
-        ])
-        self.assertEqual(_parse_extra_json("not json"), [])
-        self.assertEqual(_parse_extra_json(None), [])
-        self.assertEqual(_parse_extra_json([{"type": "bad", "time": "x"}]), [])
+        ]
+        assert _parse_extra_json("not json") == []
+        assert _parse_extra_json(None) == []
+        assert _parse_extra_json([{"type": "bad", "time": "x"}]) == []
 
 
-class ConversationMergeStageTest(unittest.IsolatedAsyncioTestCase):
+class TestConversationMergeStage:
     """merge 阶段插件（内存 DB + mock 判官）：
     片段折入最早头卡、无关话题保留、提醒卡不参与、窗口/开关语义、缓存同步。
     """
 
-    async def asyncSetUp(self):
+    @pytest.fixture(autouse=True)
+    async def _autouse_setup(self):
         self.db = await aiosqlite.connect(":memory:")
         self.db.row_factory = aiosqlite.Row
         await self.db.execute("PRAGMA foreign_keys = ON")
@@ -1082,11 +1073,9 @@ class ConversationMergeStageTest(unittest.IsolatedAsyncioTestCase):
             register_stage=_noop_sync,
             dedup=self.dedup,
         )
-
-    async def asyncTearDown(self):
+        yield
         self._db_patch.stop()
         await self.db.close()
-
     @staticmethod
     def _msg(mid, ts, content):
         return InternalMessage(
@@ -1187,21 +1176,21 @@ class ConversationMergeStageTest(unittest.IsolatedAsyncioTestCase):
         merged, _ = await self._store(
             msg, result, True, new_title="塔卡沙a6方格40页团购（5本45元）"
         )
-        self.assertEqual(merged, 1)
+        assert merged == 1
         cursor = await self.db.execute("SELECT * FROM items")
         rows = await cursor.fetchall()
-        self.assertEqual(len(rows), 1)
-        self.assertEqual(rows[0]["id"], "c1")  # 存活 = 最早头卡
-        self.assertEqual(rows[0]["title"], "塔卡沙a6方格40页团购（5本45元）")  # 重拟标题
-        self.assertIn("45", rows[0]["key_info"])
-        self.assertIn("5本小红书现拍", rows[0]["source_quote"])
-        self.assertEqual(rows[0]["msg_time"], 100)
+        assert len(rows) == 1
+        assert rows[0]["id"] == "c1"  # 存活 = 最早头卡
+        assert rows[0]["title"] == "塔卡沙a6方格40页团购（5本45元）"  # 重拟标题
+        assert "45" in rows[0]["key_info"]
+        assert "5本小红书现拍" in rows[0]["source_quote"]
+        assert rows[0]["msg_time"] == 100
         cursor = await self.db.execute("SELECT COUNT(*) AS cnt FROM raw_messages")
-        self.assertEqual((await cursor.fetchone())["cnt"], 1)  # 片段 raw 行保留
+        assert (await cursor.fetchone())["cnt"] == 1  # 片段 raw 行保留
         # 去重缓存经 ctx.dedup 同步：删两张、按合并文本重加存活卡
-        self.assertIn(("remove", ["c1", "new-m2"]), self.dedup_calls)
+        assert ("remove", ["c1", "new-m2"]) in self.dedup_calls
         add_calls = [c for c in self.dedup_calls if c[0] == "add"]
-        self.assertEqual(add_calls[0][1], "c1")
+        assert add_calls[0][1] == "c1"
 
     async def test_judge_new_desc_uses_msg_content_not_quote(self):
         # 复核 P3-8：新卡判官证据须用 msg.content（完整原文），与头卡
@@ -1216,8 +1205,8 @@ class ConversationMergeStageTest(unittest.IsolatedAsyncioTestCase):
         _merged, judge_mock = await self._store(msg, result, True, new_title="塔卡沙团购（45元）")
         # judge_merge(title_a, desc_a, title_b, desc_b)：desc_b 是第 4 个位置参数
         args = judge_mock.call_args.args
-        self.assertIn("完整原文内容，包含价格45元", args[3], "new_desc 须用 msg.content")
-        self.assertNotIn("摘要：仅45元", args[3], "new_desc 不得用 result.quote")
+        assert "完整原文内容，包含价格45元" in args[3], "new_desc 须用 msg.content"
+        assert "摘要：仅45元" not in args[3], "new_desc 不得用 result.quote"
 
     async def test_folds_earlier_cand_into_newer_head(self):
         # 乱序：候选比新卡晚 → 新卡成为头卡，候选被吸收
@@ -1230,15 +1219,15 @@ class ConversationMergeStageTest(unittest.IsolatedAsyncioTestCase):
             key_info="", quote="塔卡沙a6方格40页团购",
         )
         merged, _ = await self._store(msg, result, True, new_title="塔卡沙团购（含运费）")
-        self.assertEqual(merged, 1)
+        assert merged == 1
         cursor = await self.db.execute("SELECT * FROM items")
         rows = await cursor.fetchall()
-        self.assertEqual(len(rows), 1)
-        self.assertNotEqual(rows[0]["id"], "c1")  # 存活 = 新卡
-        self.assertEqual(rows[0]["title"], "塔卡沙团购（含运费）")  # 重拟标题
-        self.assertIn("运费AA", rows[0]["key_info"])
-        self.assertIn("运费aa", rows[0]["source_quote"])
-        self.assertEqual(rows[0]["msg_time"], 180)
+        assert len(rows) == 1
+        assert rows[0]["id"] != "c1"  # 存活 = 新卡
+        assert rows[0]["title"] == "塔卡沙团购（含运费）"  # 重拟标题
+        assert "运费AA" in rows[0]["key_info"]
+        assert "运费aa" in rows[0]["source_quote"]
+        assert rows[0]["msg_time"] == 180
 
     async def test_merge_inherits_article_url_from_absorbed_card(self):
         # 审查回归：被吸收卡的原文链接不得随合并消失（存活卡无链接时继承）
@@ -1259,13 +1248,13 @@ class ConversationMergeStageTest(unittest.IsolatedAsyncioTestCase):
             key_info="", quote="讲座地点在B栋",
         )
         merged, _ = await self._store(msg, result, True)
-        self.assertEqual(merged, 1)
+        assert merged == 1
         cursor = await self.db.execute("SELECT id, article_url FROM items")
         rows = await cursor.fetchall()
-        self.assertEqual(len(rows), 1)
+        assert len(rows) == 1
         # 存活卡 = 最早头卡 c1；其自身无链接时继承被吸收卡的链接
-        self.assertEqual(rows[0]["id"], "c1")
-        self.assertEqual(rows[0]["article_url"], "https://example.com/b")
+        assert rows[0]["id"] == "c1"
+        assert rows[0]["article_url"] == "https://example.com/b"
 
     async def test_judge_false_keeps_both(self):
         await self._seed_cand("c1", 100, title="塔卡沙a6方格40页团购")
@@ -1275,9 +1264,9 @@ class ConversationMergeStageTest(unittest.IsolatedAsyncioTestCase):
             key_info="45", quote="5本小红书现拍，45",
         )
         merged, _ = await self._store(msg, result, False)
-        self.assertEqual(merged, 0)
+        assert merged == 0
         cursor = await self.db.execute("SELECT COUNT(*) AS cnt FROM items")
-        self.assertEqual((await cursor.fetchone())["cnt"], 2)
+        assert (await cursor.fetchone())["cnt"] == 2
 
     async def test_cand_with_reminder_skipped(self):
         await self._seed_cand("c1", 100, title="塔卡沙a6方格40页团购", remind_at="2026-08-02 09:00")
@@ -1287,7 +1276,7 @@ class ConversationMergeStageTest(unittest.IsolatedAsyncioTestCase):
             key_info="45", quote="5本小红书现拍，45",
         )
         merged, judge_mock = await self._store(msg, result, True)
-        self.assertEqual(merged, 0)
+        assert merged == 0
         judge_mock.assert_not_called()  # 有提醒的卡不参与合并
 
     async def test_out_of_window_not_merged(self):
@@ -1298,7 +1287,7 @@ class ConversationMergeStageTest(unittest.IsolatedAsyncioTestCase):
             key_info="45", quote="5本小红书现拍，45",
         )
         merged, judge_mock = await self._store(msg, result, True)
-        self.assertEqual(merged, 0)
+        assert merged == 0
         judge_mock.assert_not_called()  # 窗口外无候选
 
     async def test_merge_keeps_second_end_in_extra_times(self):
@@ -1318,16 +1307,16 @@ class ConversationMergeStageTest(unittest.IsolatedAsyncioTestCase):
             end="2026-08-24",
         )
         merged, _ = await self._store(msg, result, True)
-        self.assertEqual(merged, 1)
+        assert merged == 1
         cursor = await self.db.execute("SELECT * FROM items")
         row = await cursor.fetchone()
-        self.assertEqual(row["end"], "2026-08-24")  # 主值取最早
+        assert row["end"] == "2026-08-24"  # 主值取最早
         import json as _json
         extras = _json.loads(row["extra_times"])
-        self.assertEqual(extras, [
+        assert extras == [
             {"type": "end", "time": "2026-08-25", "label": ""},
-        ])
-        self.assertIn("2026-08-24 前私信", row["key_info"])
+        ]
+        assert "2026-08-24 前私信" in row["key_info"]
 
     async def test_merge_preserves_labeled_extra_times(self):
         # 候选卡带多个带标签的时间点（工作提醒场景），合并后全部保留且标签不丢
@@ -1348,17 +1337,17 @@ class ConversationMergeStageTest(unittest.IsolatedAsyncioTestCase):
             end="2026-08-20",
         )
         merged, _ = await self._store(msg, result, True)
-        self.assertEqual(merged, 1)
+        assert merged == 1
         cursor = await self.db.execute("SELECT * FROM items")
         row = await cursor.fetchone()
-        self.assertEqual(row["end"], "2026-07-31")  # 最早为主值
+        assert row["end"] == "2026-07-31"  # 最早为主值
         import json as _json
         extras = _json.loads(row["extra_times"])
-        self.assertEqual(extras, [
+        assert extras == [
             {"type": "end", "time": "2026-08-15", "label": "部门宣传视频"},
             {"type": "end", "time": "2026-08-17", "label": "部门宣传海报"},
             {"type": "end", "time": "2026-08-20", "label": ""},
-        ])
+        ]
 
     async def test_title_regeneration_failure_falls_back_to_head_title(self):
         # 重拟标题失败（None）时保守回退原标题（头句），不丢标题
@@ -1369,10 +1358,10 @@ class ConversationMergeStageTest(unittest.IsolatedAsyncioTestCase):
             key_info="45", quote="5本小红书现拍，45",
         )
         merged, _ = await self._store(msg, result, True, new_title=None)
-        self.assertEqual(merged, 1)
+        assert merged == 1
         cursor = await self.db.execute("SELECT * FROM items")
         row = await cursor.fetchone()
-        self.assertEqual(row["title"], "塔卡沙a6方格40页团购")
+        assert row["title"] == "塔卡沙a6方格40页团购"
 
     async def test_merge_disabled_when_window_zero(self):
         await self._seed_cand("c1", 100, title="塔卡沙a6方格40页团购")
@@ -1383,33 +1372,34 @@ class ConversationMergeStageTest(unittest.IsolatedAsyncioTestCase):
         )
         with patch.object(config, "merge_window_minutes", 0):
             merged, judge_mock = await self._store(msg, result, True)
-        self.assertEqual(merged, 0)
+        assert merged == 0
         judge_mock.assert_not_called()
 
 
-class ProcessingPausedGateTest(unittest.IsolatedAsyncioTestCase):
+class TestProcessingPausedGate:
     """benchmark 门闸（契约 E）：set_processing_paused(True) 后
     process_all_batches 直接返回 False，不触 DB/AI，批次保留待回填；
     恢复后行为复原。"""
 
-    def tearDown(self):
+    @pytest.fixture(autouse=True)
+    async def _autouse_teardown(self):
+        yield
         set_processing_paused(False)
-
     async def test_paused_returns_false_and_stays_paused(self):
         set_processing_paused(True)
         # 空批在未暂停时本应返回 True；暂停门闸优先，且状态不被消费（连续两次均 False）
         ok1 = await process_all_batches([], _pipeline_client(), origin="test")
         ok2 = await process_all_batches([], _pipeline_client(), origin="test")
-        self.assertFalse(ok1)
-        self.assertFalse(ok2, "暂停中不应被空批调用自动恢复")
+        assert not ok1
+        assert not ok2, "暂停中不应被空批调用自动恢复"
 
     async def test_resume_restores_true_for_empty_batch(self):
         set_processing_paused(False)
         ok = await process_all_batches([], _pipeline_client(), origin="test")
-        self.assertTrue(ok, "恢复后空批应回到默认快速路径")
+        assert ok, "恢复后空批应回到默认快速路径"
 
 
-class ProcessAllBatchesAllFailedReturnTest(_StageTestBase):
+class TestProcessAllBatchesAllFailedReturn(_StageTestBase):
     """零产出（全部分类失败）→ 返回 False：调用方不推进水位，
     失败消息由"最早未处理消息钉窗"在后续轮次找回（审计 #1）。"""
 
@@ -1452,10 +1442,10 @@ class ProcessAllBatchesAllFailedReturnTest(_StageTestBase):
                 )
         finally:
             await db.close()
-        self.assertFalse(ok)
+        assert not ok
 
 
-class MarkSkippedContractTest(unittest.IsolatedAsyncioTestCase):
+class TestMarkSkippedContract:
     """【复核 P2-4】outcome is None（classify 契约违约）不得当全批闲聊：
     整批不标记，零产出路径使 poll_cycle 跳过水位推进；模型显式全排除
     （outcome.results 为空但 outcome 非 None）才标记 processed。"""
@@ -1466,7 +1456,7 @@ class MarkSkippedContractTest(unittest.IsolatedAsyncioTestCase):
             client=_pipeline_client(),
         )
         await _mark_skipped(bctx, failed_set=set())
-        self.assertEqual(bctx.skipped, 0, "契约违约时不得把消息当闲聊标记")
+        assert bctx.skipped == 0, "契约违约时不得把消息当闲聊标记"
 
     async def test_explicit_all_excluded_marks_all(self):
         bctx = BatchContext(
@@ -1478,13 +1468,13 @@ class MarkSkippedContractTest(unittest.IsolatedAsyncioTestCase):
             "briefdesk.pipeline.mark_messages_processed", new=AsyncMock()
         ) as bulk:
             await _mark_skipped(bctx, failed_set=set())
-        self.assertEqual(bctx.skipped, 2)
+        assert bctx.skipped == 2
         bulk.assert_awaited_once_with(
             [("weflow-legacy", "m1"), ("weflow-legacy", "m2")]
         )
 
 
-class VisionWithoutOcrAnnouncementTest(unittest.IsolatedAsyncioTestCase):
+class TestVisionWithoutOcrAnnouncement(unittest.IsolatedAsyncioTestCase):
     """_check_vision_without_ocr 契约：announce 幂等 → 置位期间
     WARNING 仅一条；条件解除方撤销；撤销后复发重新告警。"""
 
@@ -1510,49 +1500,40 @@ class VisionWithoutOcrAnnouncementTest(unittest.IsolatedAsyncioTestCase):
         with self.assertLogs("briefdesk.pipeline", level="WARNING") as captured:
             for _ in range(3):
                 await _check_vision_without_ocr([])
-        self.assertEqual(len(captured.records), 1)
-        self.assertEqual(len(self.published), 1)
-        self.assertEqual(
-            [a["code"] for a in announcements.get_announcements()],
-            ["vision_without_ocr"],
-        )
+        assert len(captured.records) == 1
+        assert len(self.published) == 1
+        assert [a["code"] for a in announcements.get_announcements()] == ["vision_without_ocr"]
 
     async def test_condition_cleared_revokes_announcement(self):
         """OCR 启用（enrich 阶段非空）→ 公告被撤销且无新 WARNING。"""
         await _check_vision_without_ocr([])
-        self.assertEqual(len(announcements.get_announcements()), 1)
+        assert len(announcements.get_announcements()) == 1
         with self.assertNoLogs("briefdesk.pipeline", level="WARNING"):
             await _check_vision_without_ocr([Mock()])
-        self.assertNotIn(
-            "vision_without_ocr",
-            {a["code"] for a in announcements.get_announcements()},
-        )
+        assert "vision_without_ocr" not in {a["code"] for a in announcements.get_announcements()}
 
     async def test_revoke_then_retrigger_warns_again(self):
         """撤销后复发 → announce 重新置位（返回 True）且 WARNING 再现，
         无需模块级复位标志。"""
         await _check_vision_without_ocr([])
         await _check_vision_without_ocr([Mock()])
-        self.assertEqual(announcements.get_announcements(), [])
+        assert announcements.get_announcements() == []
         with self.assertLogs("briefdesk.pipeline", level="WARNING") as captured:
             await _check_vision_without_ocr([])
-        self.assertEqual(len(captured.records), 1)
+        assert len(captured.records) == 1
         # 置位(1) + 撤销(1) + 重新置位(1)——revoke 同样发布事件
-        self.assertEqual(len(self.published), 3)
-        self.assertEqual(
-            [a["code"] for a in announcements.get_announcements()],
-            ["vision_without_ocr"],
-        )
+        assert len(self.published) == 3
+        assert [a["code"] for a in announcements.get_announcements()] == ["vision_without_ocr"]
 
     async def test_vision_disabled_never_announces(self):
         """vision 关闭即条件不成立：不置位、不发事件、不告警。"""
         with patch.object(config, "ai_vision_enabled", False):
             await _check_vision_without_ocr([])
-        self.assertEqual(announcements.get_announcements(), [])
-        self.assertEqual(self.published, [])
+        assert announcements.get_announcements() == []
+        assert self.published == []
 
 
-class EnrichStagesSingleFetchTest(_StageTestBase):
+class TestEnrichStagesSingleFetch(_StageTestBase):
     """process_all_batches 对 enrich 槽位仅获取一次（运行期阶段
     集不变——register_stage 仅发生在装配期 setup_all）。"""
 
@@ -1591,8 +1572,8 @@ class EnrichStagesSingleFetchTest(_StageTestBase):
                 batch_size=10,
                 origin="test",
             )
-        self.assertFalse(result, "阶段缺失应整批保留（早退 False）")
-        self.assertEqual(calls.count("enrich"), 1, f"enrich 应仅获取一次: {calls}")
+        assert not result, "阶段缺失应整批保留（早退 False）"
+        assert calls.count("enrich") == 1, f"enrich 应仅获取一次: {calls}"
 
 
 if __name__ == "__main__":
