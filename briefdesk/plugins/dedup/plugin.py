@@ -45,6 +45,7 @@ class DedupPlugin(StagePlugin):
 
     def __init__(self) -> None:
         self._engine: DedupEngine | None = None
+        self._ctx: PluginContext | None = None
 
     async def setup(self, ctx: PluginContext) -> None:
         # 延迟导入：仅加载本插件依赖，且便于测试替换
@@ -55,7 +56,9 @@ class DedupPlugin(StagePlugin):
         # 避免首个批次在 _storage_lock 内触发全量嵌入阻塞整条管道）
         await engine.ensure_cache()
         self._engine = engine
+        self._ctx = ctx
         ctx.dedup = engine  # 服务端口：merge 阶段 / 其它插件经此同步缓存
+        # 事件订阅放注册序列最后（契约：可失败步骤先于全部注册）
         ctx.register_stage(self)
         ctx.subscribe_event(EVENT_ITEMS_DELETED, self._on_items_deleted)
 
@@ -145,13 +148,18 @@ class DedupPlugin(StagePlugin):
             )
 
     async def after_run(self, batch: BatchContext, ctx: PluginContext) -> None:
-        """锁外：批量持久化本批新增向量。"""
+        """持久化本批新增向量（内部持 storage_lock 过滤已删条目再 upsert，
+        锁内代价说明见 engine.flush_pending_embeddings）。"""
         if self._engine is not None:
             await self._engine.flush_pending_embeddings()
 
     async def activate(self, ctx: PluginContext) -> None: ...
 
     async def teardown(self) -> None:
+        if self._ctx is not None:
+            # 清掉自己注册的服务端口（teardown 幂等回收义务）
+            self._ctx.dedup = None
+            self._ctx = None
         self._engine = None
 
 

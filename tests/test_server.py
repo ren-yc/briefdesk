@@ -1,6 +1,8 @@
 """server 路由层与安全中间件测试（monkeypatch 隔离 DB/AI）。"""
 
 import asyncio
+import os
+import shutil
 import tempfile
 import time
 import unittest
@@ -16,6 +18,7 @@ import briefdesk.server as srv
 from briefdesk.events import EVENT_ITEMS_DELETED
 from briefdesk.plugins.calendar import router as calendar_router
 from briefdesk.plugins.reminders import router as reminders_router
+from briefdesk.server import routes_items as srv_routes
 
 
 def _client(**kwargs):
@@ -989,6 +992,100 @@ class BackupRestoreRouteTest(unittest.TestCase):
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(len(replaced), 1)
         self.assertTrue(replaced[0].endswith(".restore-pending"))
+
+
+class BackupTempFileLifecycleTest(unittest.TestCase):
+    """备份临时文件落 db 目录旁 + 登记清理 + 启动老化扫描。
+
+    整库副本（含全部聊天 PII）不得残留：正常退出由 atexit 兜底、强杀由
+    下次启动的同前缀 mtime 老化扫描兜底。
+    """
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self._old_db_path = srv_routes.config.db_path
+        srv_routes.config.db_path = os.path.join(self.tmpdir, "briefdesk.sqlite")
+
+    def tearDown(self):
+        srv_routes.config.db_path = self._old_db_path
+        srv_routes._BACKUP_TMP_PATHS.clear()
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def test_backup_tmp_lands_in_db_dir_and_removed_after_download(self):
+        client = _client()
+
+        def fake_backup(path):
+            self.assertIn(os.path.abspath(self.tmpdir), os.path.abspath(path))
+            with open(path, "wb") as f:
+                f.write(b"sqlite-bytes")
+
+        with patch(
+            "briefdesk.server.routes_items.backup_db_to",
+            AsyncMock(side_effect=fake_backup),
+        ):
+            resp = client.get("/api/backup")
+        client.close()
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.content, b"sqlite-bytes")
+        # 响应后台任务已删除临时文件且登记集合为空
+        self.assertEqual(srv_routes._BACKUP_TMP_PATHS, set())
+        self.assertEqual(
+            [n for n in os.listdir(self.tmpdir) if n.startswith("briefdesk-backup-")],
+            [],
+        )
+
+    def test_backup_failure_removes_tmp_and_clears_registry(self):
+        client = TestClient(
+            srv.app,
+            base_url="http://localhost",
+            headers={"Origin": "http://localhost"},
+            raise_server_exceptions=False,
+        )
+        with patch(
+            "briefdesk.server.routes_items.backup_db_to",
+            AsyncMock(side_effect=RuntimeError("模拟磁盘满")),
+        ):
+            resp = client.get("/api/backup")
+        client.close()
+        self.assertEqual(resp.status_code, 500)
+        self.assertEqual(srv_routes._BACKUP_TMP_PATHS, set())
+        self.assertEqual(os.listdir(self.tmpdir), [])
+
+    def test_atexit_cleanup_removes_registered_paths(self):
+        p = os.path.join(self.tmpdir, "briefdesk-backup-x.sqlite")
+        open(p, "wb").close()
+        srv_routes._BACKUP_TMP_PATHS.add(p)
+        srv_routes._cleanup_backup_temps()
+        self.assertFalse(os.path.exists(p))
+        self.assertEqual(srv_routes._BACKUP_TMP_PATHS, set())
+        # 已不存在的路径不抛错（OSError 静默）
+        srv_routes._BACKUP_TMP_PATHS.add(
+            os.path.join(self.tmpdir, "ghost.sqlite")
+        )
+        srv_routes._cleanup_backup_temps()
+
+    def test_stale_cleanup_only_removes_old_prefixed_files(self):
+        now = time.time()
+        old = os.path.join(self.tmpdir, "briefdesk-backup-old.sqlite")
+        young = os.path.join(self.tmpdir, "briefdesk-backup-young.sqlite")
+        other = os.path.join(self.tmpdir, "other.sqlite")
+        dbfile = os.path.join(self.tmpdir, "briefdesk.sqlite")
+        for p in (old, young, other, dbfile):
+            open(p, "wb").close()
+        os.utime(old, (now - 25 * 3600, now - 25 * 3600))
+        os.utime(young, (now - 3600, now - 3600))
+        removed = srv_routes.cleanup_stale_backup_temps()
+        self.assertEqual(removed, 1)
+        self.assertFalse(os.path.exists(old))
+        for p in (young, other, dbfile):
+            self.assertTrue(os.path.exists(p), p)
+
+    def test_gitignore_covers_restore_pending(self):
+        """`.gitignore` 必须覆盖 {db_path}.restore-pending（整库副本不入库）。"""
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(root, ".gitignore"), encoding="utf-8") as f:
+            rules = f.read()
+        self.assertIn("*.restore-pending", rules)
 
 
 class SessionToggleRouteTest(unittest.TestCase):

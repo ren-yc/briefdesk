@@ -30,8 +30,10 @@ from briefdesk.config import config
 from briefdesk.db import (
     ItemInput,
     get_all_item_texts,
+    get_existing_item_ids,
     load_embeddings,
     merge_source_group,
+    storage_lock,
     upsert_embeddings,
 )
 from briefdesk.masking import PLACEHOLDER_ONLY_RE, normalize_subject
@@ -306,7 +308,17 @@ class DedupEngine(DedupService):
         ]
 
     async def flush_pending_embeddings(self) -> None:
-        """把待落库向量一次性写入 item_embeddings（锁外调用，每批一次）。
+        """把待落库向量一次性写入 item_embeddings（持 storage_lock，每批一次）。
+
+        锁内先按 get_existing_item_ids 过滤再 upsert：item_embeddings 无外键
+        （须显式删），与全部持锁删除路径（路由 delete_items / 分类 purge /
+        merge 的 update_item_merged）串行化，消除「flush 摘出快照后条目被
+        删 → 已删条目的向量仍被写回」的孤儿行窗口——先删后查 → 被过滤；
+        先写后删 → 删除路径清掉刚写行。
+
+        已知代价（刻意接受）：upsert_embeddings 内部的写锁竞争重试
+        （最多 3 次、退避 0.1s/0.2s）会在持 storage_lock 状态下睡眠，高写
+        竞争时最坏把全局写路径阻塞约 0.3s。
 
         失败即丢弃：重启后 _ensure_cache 会检测缺失向量并重嵌。
         """
@@ -314,7 +326,14 @@ class DedupEngine(DedupService):
             return
         pending, self._pending_embeds = self._pending_embeds, []
         try:
-            await upsert_embeddings(pending)
+            async with storage_lock:
+                existing = await get_existing_item_ids(
+                    [row[0] for row in pending]
+                )
+                filtered = [row for row in pending if row[0] in existing]
+                if not filtered:
+                    return
+                await upsert_embeddings(filtered)
         except Exception:
             logger.warning("向量持久化失败，重启后由缓存加载补齐", exc_info=True)
 

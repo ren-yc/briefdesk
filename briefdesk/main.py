@@ -40,6 +40,7 @@ from briefdesk.poll_cycle import run_poll_cycle, upsert_sessions_from_infos
 from briefdesk.realtime import signal_shutdown
 from briefdesk.server import (
     app,
+    cleanup_stale_backup_temps,
     include_plugin_router,
     register_plugin_assets,
     set_plugin_meta_callback,
@@ -202,6 +203,10 @@ async def _run() -> None:
                 deleted,
                 fmt_dur(time_module.perf_counter() - phase_start),
             )
+
+        # 1.7 清理强杀残留的备份临时文件（仅 db 目录下同前缀且老化的
+        #     文件；atexit 只覆盖正常退出，不覆盖 SIGTERM/TerminateProcess）
+        cleanup_stale_backup_temps()
 
         # 2. 发现并装配插件（消息源经 ctx.register_source 注册，暂不启动监听；
         #    去重缓存预热由 dedup 插件在 setup 阶段完成——HTTP 服务启动前、

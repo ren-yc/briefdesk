@@ -21,6 +21,7 @@ from typing import Any
 
 from fastapi import APIRouter
 
+from briefdesk.db import storage_lock
 from briefdesk.events import EVENT_ITEMS_DELETED
 from briefdesk.plugin.base import (
     PluginContext,
@@ -54,6 +55,9 @@ class RagPlugin(StagePlugin, WebPlugin):
         self._engine: RagEngine | None = None
         self._backfill_task: asyncio.Task[None] | None = None
         self._gc_task: asyncio.Task[None] | None = None
+        # GC 在跑期间又到达删除事件 → 置脏，由 _run_gc 收尾时再调度一轮
+        # 对账（不滞留到下一个维护周期）
+        self._gc_dirty = False
         # 维护循环的唤醒事件：reindex/降级自愈在循环休眠期踢一脚时立即
         # 执行回填，而不是干等一个维护间隔（默认 1h）后才生效
         self._kick_event = asyncio.Event()
@@ -123,6 +127,11 @@ class RagPlugin(StagePlugin, WebPlugin):
         # 启动历史回填（fire-and-forget，逐轮有界；DB 已在 setup 前就绪）
         if self._engine is None:
             return
+        # 预热建表入锁：建 rag 表 + FTS 探测提前到装配期并持
+        # storage_lock——否则首次建表的 commit 会推迟到维护循环首个
+        # backfill_step 的锁外窗口。prepare 不关闭连接（get_db 共享单例）
+        async with storage_lock:
+            await self._engine.prepare()
         self._engine.on_backfill_kick = self._spawn_backfill
         self._spawn_backfill()
 
@@ -193,6 +202,7 @@ class RagPlugin(StagePlugin, WebPlugin):
             with contextlib.suppress(asyncio.CancelledError):
                 await self._gc_task
             self._gc_task = None
+        self._gc_dirty = False  # teardown 清脏标志，防残留状态跨生命周期
         if self._engine is not None:
             await self._engine.teardown()
         self._engine = None
@@ -206,7 +216,10 @@ class RagPlugin(StagePlugin, WebPlugin):
         周期，已删内容仍可被 /api/rag/ask 引用——复核 P2-24）。
         """
         if self._gc_task is not None and not self._gc_task.done():
-            return  # 已有待跑/在跑的 GC，本轮对账足以覆盖新删除
+            # 已有待跑/在跑的 GC：置脏由其收尾时再调度一轮，新删除不滞留
+            # 到下一个维护周期
+            self._gc_dirty = True
+            return
         self._gc_task = asyncio.get_running_loop().create_task(
             self._run_gc(), name="rag-delete-gc"
         )
@@ -223,6 +236,14 @@ class RagPlugin(StagePlugin, WebPlugin):
             raise
         except Exception:
             logger.exception("rag: 删除触发 GC 异常，待维护周期对账兜底")
+        # 正常与异常路径统一补账：GC 在跑期间到达的删除事件立即再调度
+        # 一轮对账。CancelledError 属 teardown 语义，不在此补账（teardown
+        # 负责清标志与任务引用）
+        if self._gc_dirty and self._engine is not None:
+            self._gc_dirty = False
+            self._gc_task = asyncio.get_running_loop().create_task(
+                self._run_gc(), name="rag-delete-gc"
+            )
 
     async def before_run(self, batch: BatchContext, ctx: PluginContext) -> None:
         # 锁外：批量嵌入（网络调用只允许发生在这里）

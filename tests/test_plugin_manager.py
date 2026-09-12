@@ -358,6 +358,41 @@ class FailureIsolationTest(_ManagerTestBase):
         self.assertEqual(manager.loaded, ["b"])
         self.assertEqual(manager.records()["a"].status, "failed")
 
+    async def test_setup_failure_runs_teardown_and_leaves_no_ports(self):
+        """守卫：setup 中先注册端口再抛错 → 框架仍调用 teardown、插件
+        标 failed、遵守契约的插件回收后 ctx.ai/ctx.dedup 无残留。"""
+
+        class _RegisterThenFailPlugin(FakePlugin):
+            def __init__(self, name, **kwargs):
+                super().__init__(name, **kwargs)
+                self._ctx = None
+
+            async def setup(self, ctx):
+                self.calls.append(("setup", self.name))
+                self._ctx = ctx
+                ctx.register_stage(self)
+                ctx.ai = object()  # 模拟端口注册
+                ctx.dedup = object()
+                raise RuntimeError("注册后爆炸")
+
+            async def teardown(self):
+                self.calls.append(("teardown", self.name))
+                # 契约合规的插件：teardown 幂等回收自己注册的端口
+                if self._ctx is not None:
+                    self._ctx.ai = None
+                    self._ctx.dedup = None
+                    self._ctx = None
+
+        manager = PluginManager(make_settings(plugins=["a"]))
+        plugin = _RegisterThenFailPlugin("a")
+        manager.register(plugin)
+        ctx = make_ctx()
+        await manager.setup_all(ctx)
+        self.assertIn(("teardown", "a"), plugin.calls, "框架须 best-effort teardown")
+        self.assertEqual(manager.records()["a"].status, "failed")
+        self.assertIsNone(ctx.ai, "按契约回收后 ctx.ai 不得残留")
+        self.assertIsNone(ctx.dedup, "按契约回收后 ctx.dedup 不得残留")
+
     async def test_unknown_dependency_disables(self):
         manager = PluginManager(make_settings(plugins=["a"]))
         manager.register(FakePlugin("a", dependencies=("ghost",)))

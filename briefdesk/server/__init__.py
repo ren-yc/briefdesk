@@ -25,6 +25,7 @@ from briefdesk.server.middleware import _local_security_guard as _local_security
 from briefdesk.server.middleware import _same_origin as _same_origin
 from briefdesk.server.routes_categories import _parse_flag as _parse_flag
 from briefdesk.server.routes_items import _FILTER_NOW_RE as _FILTER_NOW_RE
+from briefdesk.server.routes_items import cleanup_stale_backup_temps as cleanup_stale_backup_temps
 from briefdesk.server.static import _SpaStaticFiles as _SpaStaticFiles
 from briefdesk.server.static import _UI_DIR as _UI_DIR
 from briefdesk.server.web_plugins import _plugin_assets as _plugin_assets

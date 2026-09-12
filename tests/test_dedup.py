@@ -1,10 +1,15 @@
-"""去重辅助逻辑单元测试（不调用 AI / 不访问 DB）。"""
+"""去重辅助逻辑单元测试（不调用 AI / 不访问 DB——锁内落库用例除外，
+其用内存库打桩）。"""
 
 import asyncio
 import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
+import aiosqlite
+
+from briefdesk.db import delete_items, init_schema
+from briefdesk.plugins.dedup import engine as dedup_engine_module
 from briefdesk.plugins.dedup.engine import (
     JUDGE_PROMPT,
     CachedItem,
@@ -1707,6 +1712,104 @@ class DegradedChannelLogGateTest(unittest.IsolatedAsyncioTestCase):
         second = self._engine([0.1, 0.2])
         with self.assertLogs(self._LOGGER, level="WARNING"):
             await self._check(second, [0.1, 0.2, 0.3])
+
+
+class FlushPendingEmbeddingsLockTest(unittest.IsolatedAsyncioTestCase):
+    """flush_pending_embeddings 持 storage_lock 过滤已删条目
+    后再 upsert——item_embeddings 无外键，孤儿向量行零容忍。"""
+
+    async def asyncSetUp(self):
+        self.db = await aiosqlite.connect(":memory:")
+        self.db.row_factory = aiosqlite.Row
+        await init_schema(self.db)
+
+    async def asyncTearDown(self):
+        await self.db.close()
+
+    def _patch_db(self):
+        return (
+            patch("briefdesk.db.get_db", new=AsyncMock(return_value=self.db)),
+            patch("briefdesk.db.get_embed_db", new=AsyncMock(return_value=self.db)),
+        )
+
+    async def _insert_item(self, item_id: str) -> None:
+        await self.db.execute(
+            "INSERT INTO items (id, category, title, source_quote,"
+            " source_group, source_msg_id, created_at)"
+            " VALUES (?, '其他', 't', 'q', 'g', ?, '2026-01-01T00:00:00+00:00')",
+            (item_id, f"m-{item_id}"),
+        )
+        await self.db.commit()
+
+    async def _orphan_count(self) -> int:
+        cur = await self.db.execute(
+            "SELECT COUNT(*) AS n FROM item_embeddings"
+            " WHERE item_id NOT IN (SELECT id FROM items)"
+        )
+        row = await cur.fetchone()
+        return row["n"]
+
+    async def test_flush_skips_missing_items(self):
+        """pending 含不存在的 item_id → 只写存在的行。"""
+        await self._insert_item("a")
+        engine = DedupEngine()
+        engine._pending_embeds.extend(
+            [("a", "m1", [0.1]), ("ghost", "m1", [0.2])]
+        )
+        p1, p2 = self._patch_db()
+        with p1, p2:
+            await engine.flush_pending_embeddings()
+        cur = await self.db.execute("SELECT item_id FROM item_embeddings")
+        self.assertEqual([r["item_id"] for r in await cur.fetchall()], ["a"])
+        self.assertEqual(await self._orphan_count(), 0)
+
+    async def test_flush_runs_under_storage_lock(self):
+        """过滤与 upsert 必须发生在 storage_lock 临界区内（顺序断言）。"""
+        engine = DedupEngine()
+        engine._pending_embeds.append(("a", "m1", [0.1]))
+        events: list[str] = []
+
+        class _RecordingLock:
+            async def __aenter__(self):
+                events.append("enter")
+
+            async def __aexit__(self, *exc):
+                events.append("exit")
+
+        async def fake_existing(ids):
+            events.append("existing")
+            return set(ids)
+
+        async def fake_upsert(rows):
+            events.append("upsert")
+
+        with (
+            patch.object(dedup_engine_module, "storage_lock", _RecordingLock()),
+            patch.object(
+                dedup_engine_module, "get_existing_item_ids", fake_existing
+            ),
+            patch.object(dedup_engine_module, "upsert_embeddings", fake_upsert),
+        ):
+            await engine.flush_pending_embeddings()
+        self.assertEqual(events, ["enter", "existing", "upsert", "exit"])
+
+    async def test_flush_snapshot_then_delete_leaves_no_orphans(self):
+        """flush 快照后条目被删：持锁过滤使孤儿行恒为 0（交错场景）。"""
+        await self._insert_item("a")
+        await self._insert_item("b")
+        engine = DedupEngine()
+        engine._pending_embeds.extend(
+            [("a", "m1", [0.1]), ("b", "m1", [0.2])]
+        )
+        p1, p2 = self._patch_db()
+        with p1, p2:
+            # 生产中删除路径与 flush 持同一把 storage_lock 天然串行化；
+            # 这里以「先删后 flush」模拟交错序，验证被删条目被过滤
+            await delete_items(["b"])
+            await engine.flush_pending_embeddings()
+        cur = await self.db.execute("SELECT item_id FROM item_embeddings")
+        self.assertEqual([r["item_id"] for r in await cur.fetchall()], ["a"])
+        self.assertEqual(await self._orphan_count(), 0)
 
 
 if __name__ == "__main__":

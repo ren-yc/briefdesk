@@ -157,6 +157,16 @@ class RagEngine:
             self._schema_ready = True
         return db
 
+    async def prepare(self) -> None:
+        """装配期预热入口（唯一）：建 rag 表 + FTS 探测，提前到 activate。
+
+        调用方必须持 storage_lock（rag 插件在 activate 中锁内调用）——否则
+        首次建表 + set_meta 的 commit 发生在锁外，违反锁纪律。不承担连接
+        关闭责任：生产 _db_factory 即 get_db() 的模块级共享单例，全仓无人
+        关闭该连接；在此关闭会破坏单例（后续 run/ask 拿到已关连接）。
+        """
+        await self._ensure_db_ready()
+
     @staticmethod
     async def _allowed_sessions(
         db: aiosqlite.Connection, group_only: bool, session_id: str | None

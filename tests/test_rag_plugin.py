@@ -1,9 +1,10 @@
 """RAG 插件测试：装配自禁用、库层、索引、回填、检索、问答路由与审查回归。"""
 
+import asyncio
 import unittest
 from datetime import UTC
 from typing import ClassVar
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock, Mock, patch
 
 import aiosqlite
 
@@ -1390,4 +1391,146 @@ class DeleteEventGcTest(unittest.IsolatedAsyncioTestCase):
             self.assertIs(plugin._gc_task, task, "待跑/在跑 GC 期间不重复 spawn")
             await plugin._gc_task
         finally:
+            await plugin.teardown()
+
+    async def test_deletes_during_running_gc_get_extra_round(self):
+        """GC 在跑期间到达删除事件 → 置脏，收尾时再调度一轮，
+        新删除不滞留到下一个维护周期（总共执行 2 轮）。"""
+        ctx, *_ = _ctx(_embed_provider(True))
+        plugin = RagPlugin()
+        await plugin.setup(ctx)
+        rounds = 0
+        release = asyncio.Event()
+
+        async def slow_gc():
+            nonlocal rounds
+            rounds += 1
+            if rounds == 1:
+                await release.wait()  # 第一轮挂起，模拟 GC 在跑
+
+        plugin._engine.maintenance_gc = slow_gc
+        try:
+            plugin._on_items_deleted(["i1"])
+            first = plugin._gc_task
+            plugin._on_items_deleted(["i2"])  # GC 在跑期间的删除
+            self.assertTrue(plugin._gc_dirty, "在跑 GC 期间删除应置脏标志")
+            release.set()
+            await first
+            second = plugin._gc_task
+            self.assertIsNot(second, first, "收尾应补调度第二轮 GC")
+            await second
+            self.assertEqual(rounds, 2)
+            self.assertFalse(plugin._gc_dirty, "补账轮应清脏标志")
+        finally:
+            await plugin.teardown()
+
+    async def test_single_delete_runs_single_round(self):
+        """无并发删除 → 只跑 1 轮，脏标志保持 False。"""
+        ctx, *_ = _ctx(_embed_provider(True))
+        plugin = RagPlugin()
+        await plugin.setup(ctx)
+        plugin._engine.maintenance_gc = AsyncMock()
+        try:
+            plugin._on_items_deleted(["i1"])
+            await plugin._gc_task
+            plugin._engine.maintenance_gc.assert_awaited_once()
+            self.assertFalse(plugin._gc_dirty)
+        finally:
+            await plugin.teardown()
+
+    async def test_teardown_clears_dirty_flag_and_task(self):
+        """teardown 清脏标志与任务引用，之后不再调度补账轮。"""
+        ctx, *_ = _ctx(_embed_provider(True))
+        plugin = RagPlugin()
+        await plugin.setup(ctx)
+        plugin._engine.maintenance_gc = AsyncMock()
+        plugin._gc_dirty = True
+        await plugin.teardown()
+        self.assertFalse(plugin._gc_dirty)
+        self.assertIsNone(plugin._gc_task)
+
+
+class ActivatePrepareUnderLockTest(unittest.IsolatedAsyncioTestCase):
+    """activate 先持 storage_lock 预热建表，早于维护循环首个
+    backfill_step；prepare 不关闭共享连接；activate 失败不残留任务。"""
+
+    async def _memory_db(self):
+        db = await aiosqlite.connect(":memory:")
+        db.row_factory = aiosqlite.Row
+        await init_schema(db)
+        return db
+
+    async def test_activate_prepares_schema_under_lock_before_backfill(self):
+        ctx, *_ = _ctx(_embed_provider(True))
+        plugin = RagPlugin()
+        await plugin.setup(ctx)
+        memory_db = await self._memory_db()
+        events: list[str] = []
+
+        class _RecordingLock:
+            async def __aenter__(self):
+                events.append("enter")
+
+            async def __aexit__(self, *exc):
+                events.append("exit")
+
+        engine = plugin._engine
+        engine._db_factory = AsyncMock(return_value=memory_db)
+        orig_prepare = engine.prepare
+
+        async def spy_prepare():
+            events.append("prepare")
+            await orig_prepare()
+
+        engine.prepare = spy_prepare  # type: ignore[method-assign]
+
+        async def spy_backfill(now_ts):
+            events.append("backfill")
+            return 0
+
+        engine.backfill_step = spy_backfill  # type: ignore[method-assign]
+        engine.maintenance_gc = AsyncMock()
+        engine.warm_vectors = AsyncMock()
+        try:
+            # 注：briefdesk.plugins.rag 包的 `plugin` 属性被 __init__ 重绑定为
+            # 插件实例，必须用字符串 patch（经 sys.modules 解析模块本体）
+            with patch(
+                "briefdesk.plugins.rag.plugin.storage_lock", _RecordingLock()
+            ):
+                await plugin.activate(ctx)
+            await asyncio.sleep(0.05)  # 让维护循环跑到首个 backfill_step
+            self.assertTrue(engine._schema_ready, "预热应完成建表")
+            self.assertEqual(
+                events[:3], ["enter", "prepare", "exit"], "预热必须发生在锁内"
+            )
+            self.assertIn("backfill", events)
+            self.assertLess(
+                events.index("exit"), events.index("backfill"),
+                "预热必须早于维护循环首个 backfill_step",
+            )
+            # prepare 不承担 close 责任：主连接仍可用
+            cur = await memory_db.execute("SELECT 1 AS ok")
+            self.assertEqual((await cur.fetchone())["ok"], 1)
+        finally:
+            await memory_db.close()
+            await plugin.teardown()
+
+    async def test_activate_failure_leaves_no_task(self):
+        """prepare 抛错 → activate 失败上抛且不拉起维护循环任务。"""
+        ctx, *_ = _ctx(_embed_provider(True))
+        plugin = RagPlugin()
+        await plugin.setup(ctx)
+        memory_db = await self._memory_db()
+        plugin._engine._db_factory = AsyncMock(return_value=memory_db)
+
+        async def boom():
+            raise RuntimeError("预热失败")
+
+        plugin._engine.prepare = boom  # type: ignore[method-assign]
+        try:
+            with self.assertRaises(RuntimeError):
+                await plugin.activate(ctx)
+            self.assertIsNone(plugin._backfill_task, "失败路径不得残留任务")
+        finally:
+            await memory_db.close()
             await plugin.teardown()

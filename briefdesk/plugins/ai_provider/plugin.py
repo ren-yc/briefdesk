@@ -19,6 +19,7 @@ class AiProviderPlugin(Plugin, AIProvider):
 
     def __init__(self) -> None:
         self._provider: AIProvider | None = None
+        self._ctx: PluginContext | None = None
 
     async def setup(self, ctx: PluginContext) -> None:
         # 延迟导入：仅加载本插件依赖，且便于测试替换
@@ -26,12 +27,16 @@ class AiProviderPlugin(Plugin, AIProvider):
         from briefdesk.plugins.ai_provider import engine as ai_engine
 
         provider = ai_engine.Provider()
-        ai_ports.set_ai(provider)
-        ctx.ai = provider
         self._provider = provider
+        self._ctx = ctx
         # 嵌入未启用属持续性条件：setup 时按配置置位/撤销公告（可达性由
         # 运行时 embed 调用失败/成功探测，见 engine.embed_texts）
         await ai_engine.announce_embedding_state()
+        # 端口注册（ai_ports + ctx.ai）放在所有可失败步骤之后（契约：
+        # 资源获取先于注册，注册之后 setup 不再有可失败步骤——失败窗口
+        # 不残留半装配端口，teardown 仅作兜底回收）
+        ai_ports.set_ai(provider)
+        ctx.ai = provider
 
     async def activate(self, ctx: PluginContext) -> None: ...
 
@@ -39,6 +44,10 @@ class AiProviderPlugin(Plugin, AIProvider):
         from briefdesk import ai_ports
 
         ai_ports.set_ai(None)
+        if self._ctx is not None:
+            # 清掉自己注册的端口（teardown 幂等回收义务）
+            self._ctx.ai = None
+            self._ctx = None
         self._provider = None
 
     # AIProvider 端口（委托给内部 Provider 实例）

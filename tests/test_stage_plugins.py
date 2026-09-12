@@ -117,6 +117,31 @@ class StagePluginSetupTest(unittest.IsolatedAsyncioTestCase):
         fake_engine.ensure_cache.assert_awaited_once()
         self.assertIs(ctx.dedup, fake_engine)  # 服务端口注册
 
+    async def test_dedup_teardown_clears_ctx_dedup_port(self):
+        """teardown 幂等回收自己注册的 ctx.dedup 服务端口。"""
+        ctx, _ = _ctx()
+        fake_engine = Mock(remove_items=Mock())
+        fake_engine.ensure_cache = AsyncMock()
+        with patch("briefdesk.plugins.dedup.engine.DedupEngine", return_value=fake_engine):
+            plugin = DedupPlugin()
+            await plugin.setup(ctx)
+        self.assertIs(ctx.dedup, fake_engine)
+        await plugin.teardown()
+        self.assertIsNone(ctx.dedup)
+
+    async def test_dedup_setup_failure_window_leaves_no_ports(self):
+        """可失败步骤（ensure_cache）先于全部注册——抛错时 ctx.dedup
+        未注册、stage 未注册、事件未订阅。"""
+        ctx, subscribers = _ctx()
+        fake_engine = Mock(remove_items=Mock())
+        fake_engine.ensure_cache = AsyncMock(side_effect=RuntimeError("预热失败"))
+        with patch("briefdesk.plugins.dedup.engine.DedupEngine", return_value=fake_engine):
+            plugin = DedupPlugin()
+            with self.assertRaises(RuntimeError):
+                await plugin.setup(ctx)
+        self.assertIsNone(ctx.dedup)
+        self.assertEqual(subscribers, [], "失败窗口不得注册事件订阅")
+
     async def test_dedup_subscribes_items_deleted_and_clears_cache(self):
         ctx, subscribers = _ctx()
         fake_engine = Mock(remove_items=Mock())
@@ -208,6 +233,27 @@ class AiProviderPluginTest(unittest.IsolatedAsyncioTestCase):
             self.assertIs(ai_ports.get_ai(), fake_provider)
         finally:
             await plugin.teardown()
+        self.assertIsNone(ai_ports.get_ai())
+
+    async def test_setup_failure_window_leaves_no_ports(self):
+        """可失败步骤（announce）在端口注册之前——announce 抛错时
+        ctx.ai 未被设置；best-effort teardown 后 ai_ports 亦清空。"""
+        ctx, _ = _ctx()
+        fake_provider = Mock()
+        plugin = AiProviderPlugin()
+        with (
+            patch(
+                "briefdesk.plugins.ai_provider.engine.Provider",
+                return_value=fake_provider,
+            ),
+            patch(
+                "briefdesk.plugins.ai_provider.engine.announce_embedding_state",
+                new=AsyncMock(side_effect=RuntimeError("announce failed")),
+            ),self.assertRaises(RuntimeError)
+        ):
+            await plugin.setup(ctx)
+        self.assertIsNone(ctx.ai, "announce 失败窗口 ctx.ai 不得被注册")
+        await plugin.teardown()  # manager 装配失败路径的 best-effort 回收
         self.assertIsNone(ai_ports.get_ai())
 
     async def test_port_functions_forward_to_provider(self):

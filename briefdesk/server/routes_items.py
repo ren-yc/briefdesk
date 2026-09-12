@@ -3,9 +3,11 @@ status / stream 等。从原 server.py 拆出（P5 子包化），导入即注�
 """
 
 import asyncio
+import atexit
 import csv
 import io
 import json
+import logging
 import os
 import re
 import tempfile
@@ -54,6 +56,8 @@ from briefdesk.stages import get_context as _stage_context
 from briefdesk.status import get_listener, get_status_info
 from briefdesk.sync import trigger_sync
 from briefdesk.types import ContextMsg
+
+logger = logging.getLogger(__name__)
 
 _FILTER_NOW_RE = re.compile(
     r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$"
@@ -258,26 +262,94 @@ async def api_export_recat_samples(fmt: str = Query("jsonl", alias="format")):
 
 _RESTORE_MAX_BYTES = 1 << 30  # 1GB 上限
 
+# 备份临时文件与 /api/restore 的暂存文件同口径落 db 目录旁（整库副本、
+# 含全部聊天 PII）：系统 TEMP 与 DB_PATH 可能跨盘且不受 .gitignore 覆盖；
+# 可识别前缀供启动清理扫描。atexit 覆盖正常退出；进程被强杀（SIGTERM/
+# SIGKILL/Windows TerminateProcess）时由下次启动的老化扫描兜底（24h 阈值
+# 防误删并发下载中的活跃文件）。
+_BACKUP_TMP_PREFIX = "briefdesk-backup-"
+_BACKUP_TMP_SUFFIX = ".sqlite"
+_BACKUP_TMP_STALE_SECONDS = 24 * 3600
+_BACKUP_TMP_PATHS: set[str] = set()
+
+
+def _backup_tmp_dir() -> str:
+    return os.path.dirname(os.path.abspath(str(config.db_path)))
+
+
+def _remove_backup_tmp(path: str) -> None:
+    """删除备份临时文件并解除登记（后台任务/异常路径共用；OSError 静默）。"""
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+    _BACKUP_TMP_PATHS.discard(path)
+
+
+def _cleanup_backup_temps() -> None:
+    """atexit 兜底：解释器正常收尾时删除残留的备份临时文件。"""
+    for path in list(_BACKUP_TMP_PATHS):
+        _remove_backup_tmp(path)
+
+
+atexit.register(_cleanup_backup_temps)
+
+
+def cleanup_stale_backup_temps() -> int:
+    """启动清理：仅删除 db 目录下同前缀且 mtime 老化的遗留备份临时文件。
+
+    只匹配 {prefix}*.sqlite，不触碰目录内其它文件。返回删除数。
+    """
+    removed = 0
+    now = time.time()
+    try:
+        names = os.listdir(_backup_tmp_dir())
+    except OSError:
+        return 0
+    for name in names:
+        if not name.startswith(_BACKUP_TMP_PREFIX):
+            continue
+        if not name.endswith(_BACKUP_TMP_SUFFIX):
+            continue
+        path = os.path.join(_backup_tmp_dir(), name)
+        try:
+            if now - os.path.getmtime(path) < _BACKUP_TMP_STALE_SECONDS:
+                continue
+            os.remove(path)
+        except OSError:
+            continue
+        removed += 1
+    if removed:
+        logger.warning("启动清理：删除 %d 个强杀残留的备份临时文件", removed)
+    return removed
+
 
 @app.get("/api/backup")
 async def api_backup():
     """下载数据库在线备份（SQLite backup API，WAL 安全，可运行中执行）。"""
-    fd, tmp = tempfile.mkstemp(suffix=".sqlite")
+    fd, tmp = tempfile.mkstemp(
+        prefix=_BACKUP_TMP_PREFIX,
+        suffix=_BACKUP_TMP_SUFFIX,
+        dir=_backup_tmp_dir(),
+    )
     os.close(fd)
+    _BACKUP_TMP_PATHS.add(tmp)
     try:
         await backup_db_to(tmp)
     except BaseException:
-        # 响应未建立：清理临时文件（成功路径由 BackgroundTask 兜底删除）
-        os.remove(tmp)
+        # 响应未建立：清理临时文件（成功路径由后台包装函数删除）；
+        # 日志带目标路径——db 目录所在卷空间不足等失败需可定位
+        logger.exception("数据库备份失败，临时文件已清理: %s", tmp)
+        _remove_backup_tmp(tmp)
         raise
     filename = f"briefdesk-backup-{time.strftime('%Y%m%d-%H%M%S')}.sqlite"
     # 流式下发（复核 P2-10）：整库读入内存改为 FileResponse，响应完成后
-    # 由后台任务删除临时文件
+    # 由后台任务删除临时文件并解除登记
     return FileResponse(
         tmp,
         media_type="application/octet-stream",
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
-        background=BackgroundTask(os.remove, tmp),
+        background=BackgroundTask(_remove_backup_tmp, tmp),
     )
 
 

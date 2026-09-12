@@ -636,7 +636,9 @@ ready 帧，复位挂在首个事件上会让空闲群每次成功重连后退�
 
 #### briefdesk/plugins/rag/*
 
-`RagPlugin`（**双能力插件先例**：显式继承 StagePlugin + WebPlugin）：slot=post_insert（priority=10，恒排 merge 之后）做批次索引
+`RagPlugin`（**双能力插件先例**：显式继承 StagePlugin + WebPlugin）：**装配期预热建表（入锁）**——`activate` 先持 `storage_lock` 调
+`engine.prepare()`（唯一预热入口，建 rag 表 + FTS 探测；`prepare` 不承担连接关闭责任，生产 `_db_factory` 即 `get_db()` 共享单例），
+首次建表 + set_meta 的 commit 不再发生在锁外，也早于维护循环首个 `backfill_step`；slot=post_insert（priority=10，恒排 merge 之后）做批次索引
 —
 —`before_run` 锁外预嵌入、`run` 锁内纯 SQLite 落库（骨架对两存储槽统一探测可选钩子；post_insert 全程持 `_storage_lock`，run 内严禁网络调用）；
 路由 `/api/rag/ask|status|reindex`（ask 支持 `history` 多轮上下文：仅接受 user/assistant 角色、逐条截断 2000 字、至多 20 条；注入
@@ -748,6 +750,9 @@ WARNING）的日志噪音；`fmt_dur()` 统一耗时格式。
 - **失败隔离**：单插件失败只降级 disabled/failed 并记日志；setup/activate 异常路径先 best-effort teardown 回收半装配副作用再标
   failed（teardown 异常吞成 DEBUG 不掩盖原始错误；`PluginDisabledError` 自禁用不走此路径）；`PLUGINS_REQUIRED` 名单内的失败抛
   `PluginError` 致命中止启动。
+- **setup 失败补偿契约（规范性）**：资源获取先于注册；任何注册行为（`ctx.ai`/`ctx.dedup`/`register_stage`/`subscribe_event`/
+  `set_ai` 等）必须可被插件自身 teardown 幂等回收——setup 内所有可失败步骤完成后再做端口注册，失败窗口即不残留半装配端口
+  （内置 ai_provider/dedup 已按此实现：注册后无可失败步骤，teardown 清 `ai_ports`/`ctx.ai`/`ctx.dedup`）；第三方插件同受此约束。
 - **能力协议**：`SourcePlugin`（消息源，经 `ctx.register_source` 注册 `SourceRuntime`；零源降级启动）/ `StagePlugin`（管道槽位
   enrich → classify → dedup → post_insert，注册表 `briefdesk/stages.py`，骨架 `briefdesk/pipeline.py` 只做编排）/
   `DedupService`（`ctx.dedup` 服务端口，供 merge 阶段同步缓存）/ `AIProvider`（`briefdesk/ai_ports.py` 端口；
