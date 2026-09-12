@@ -14,6 +14,7 @@ import unittest
 from unittest.mock import AsyncMock, patch
 
 import httpx
+import pytest
 
 from briefdesk.plugins.weflow.client import (
     WeFlowAccountMismatchError,
@@ -116,7 +117,7 @@ class EnsureReadyTest(unittest.IsolatedAsyncioTestCase):
             ),
         ):
             await client.ensure_ready()
-        self.assertTrue(client._ready_checked)
+        assert client._ready_checked
 
     async def test_error_account_registers_and_rejection_not_memoized(self):
         """error 阶段：重新注册（error 不释放绑定但可原地重试）；被拒态不记忆化。"""
@@ -133,9 +134,9 @@ class EnsureReadyTest(unittest.IsolatedAsyncioTestCase):
             ) as register,
         ):
             await client.ensure_ready()
-            self.assertFalse(client._ready_checked)
+            assert not client._ready_checked
             await client.ensure_ready()  # 未记忆化 → 下轮重试
-        self.assertEqual(register.await_count, 2)
+        assert register.await_count == 2
 
     async def test_error_phase_logs_root_cause_from_detail_endpoint(self):
         """error 阶段：/health 只给标量，根因须从需鉴权的明细接口捞出并告警。
@@ -169,7 +170,7 @@ class EnsureReadyTest(unittest.IsolatedAsyncioTestCase):
         # 身份闸门取过一次，_log_account_errors 复用同一份，不得再打一次 GET
         accounts.assert_awaited_once()
         register.assert_awaited_once()  # 诊断不得挡住注册重试
-        self.assertTrue(any("页 1 HMAC 校验失败" in m for m in logs.output))
+        assert any("页 1 HMAC 校验失败" in m for m in logs.output)
 
     async def test_detail_endpoint_failure_does_not_block_registration(self):
         """明细接口不可用（鉴权/网络）：仅降级，注册照常发起。"""
@@ -189,7 +190,7 @@ class EnsureReadyTest(unittest.IsolatedAsyncioTestCase):
         ):
             await client.ensure_ready()
         register.assert_awaited_once()
-        self.assertTrue(client._ready_checked)
+        assert client._ready_checked
 
     async def test_account_conflict_propagates_from_register(self):
         """注册回 account_conflict：冒泡为账号不符，且不记忆化。
@@ -208,12 +209,12 @@ class EnsureReadyTest(unittest.IsolatedAsyncioTestCase):
                 AsyncMock(side_effect=WeFlowAccountMismatchError("已绑定 wxid_other")),
             ) as register,
         ):
-            with self.assertRaises(WeFlowAccountMismatchError):
+            with pytest.raises(WeFlowAccountMismatchError):
                 await client.ensure_ready()
-            self.assertFalse(client._ready_checked, "账号不符不得记忆化")
-            with self.assertRaises(WeFlowAccountMismatchError):
+            assert not client._ready_checked, "账号不符不得记忆化"
+            with pytest.raises(WeFlowAccountMismatchError):
                 await client.ensure_ready()  # 未记忆化 → 下轮重试
-        self.assertEqual(register.await_count, 2)
+        assert register.await_count == 2
 
     async def test_mismatch_error_is_not_a_not_ready_error(self):
         """最关键的防回归：账号不符**不能**被当成瞬态未就绪。
@@ -221,11 +222,8 @@ class EnsureReadyTest(unittest.IsolatedAsyncioTestCase):
         WeFlowNotReadyError 会被 poller/runtime 静默跳过本轮，若不符错误继承了
         它，这个修复就完全失效 —— 用户看不到 lastError，他人消息继续静默入库。
         """
-        self.assertTrue(issubclass(WeFlowAccountMismatchError, SourceError))
-        self.assertFalse(
-            issubclass(WeFlowAccountMismatchError, WeFlowNotReadyError),
-            "不符是稳态故障，必须冒泡，不能走瞬态静默跳过的路径",
-        )
+        assert issubclass(WeFlowAccountMismatchError, SourceError)
+        assert not issubclass(WeFlowAccountMismatchError, WeFlowNotReadyError), "不符是稳态故障，必须冒泡，不能走瞬态静默跳过的路径"
 
     # ── 身份闸门：/health 的标量阶段不含身份，短路前必须比对账号 ──
 
@@ -238,13 +236,13 @@ class EnsureReadyTest(unittest.IsolatedAsyncioTestCase):
             ),
             patch.object(client, "fetch_accounts", AsyncMock(return_value=_foreign())),
             patch.object(client, "register_account", AsyncMock()) as register,
-            self.assertRaises(WeFlowAccountMismatchError) as cm,
+            pytest.raises(WeFlowAccountMismatchError) as cm,
         ):
             await client.ensure_ready()
-        self.assertIn("wxid_other_0002", str(cm.exception))
-        self.assertIn("wxid_test_0001", str(cm.exception), "要给出本地配置值")
+        assert "wxid_other_0002" in str(cm.value)
+        assert "wxid_test_0001" in str(cm.value), "要给出本地配置值"
         register.assert_not_called()
-        self.assertFalse(client._ready_checked)
+        assert not client._ready_checked
 
     async def test_indexing_phase_with_foreign_account_raises(self):
         """indexing 阶段同样比对身份（别人的账号正在建索引）。"""
@@ -257,7 +255,7 @@ class EnsureReadyTest(unittest.IsolatedAsyncioTestCase):
                 client, "fetch_accounts", AsyncMock(return_value=_foreign("indexing"))
             ),
             patch.object(client, "register_account", AsyncMock()) as register,
-            self.assertRaises(WeFlowAccountMismatchError),
+            pytest.raises(WeFlowAccountMismatchError),
         ):
             await client.ensure_ready()
         register.assert_not_called()
@@ -273,7 +271,7 @@ class EnsureReadyTest(unittest.IsolatedAsyncioTestCase):
                 client, "fetch_accounts", AsyncMock(return_value=_foreign("error"))
             ),
             patch.object(client, "register_account", AsyncMock()) as register,
-            self.assertRaises(WeFlowAccountMismatchError),
+            pytest.raises(WeFlowAccountMismatchError),
         ):
             await client.ensure_ready()
         register.assert_not_called()
@@ -335,10 +333,10 @@ class EnsureReadyTest(unittest.IsolatedAsyncioTestCase):
                 client, "fetch_health", AsyncMock(side_effect=RuntimeError("boom"))
             ),
             patch.object(client, "register_account", AsyncMock()) as register,
-            self.assertRaises(RuntimeError),
+            pytest.raises(RuntimeError),
         ):
             await client.ensure_ready()
-        self.assertFalse(client._ready_checked)
+        assert not client._ready_checked
         register.assert_not_called()
 
     async def test_force_rechecks_health(self):
@@ -353,7 +351,7 @@ class EnsureReadyTest(unittest.IsolatedAsyncioTestCase):
         ):
             await client.ensure_ready()
             await client.ensure_ready(force=True)
-        self.assertEqual(health.await_count, 2)
+        assert health.await_count == 2
 
     async def test_force_after_restart_registers_again(self):
         """服务端重启（注册表清空）：force 重检发现零账号 → 重新注册。"""
@@ -377,7 +375,7 @@ class EnsureReadyTest(unittest.IsolatedAsyncioTestCase):
         register.assert_awaited_once()
 
 
-class AccountDetailTest(unittest.IsolatedAsyncioTestCase):
+class TestAccountDetail:
     """GET /api/v1/accounts —— 需鉴权的账号明细（/health 标量化后的去处）。"""
 
     async def test_fetch_accounts_sends_token_and_unwraps_list(self):
@@ -413,10 +411,10 @@ class AccountDetailTest(unittest.IsolatedAsyncioTestCase):
 
         with patch.object(real_client, "get", fake_get):
             accounts = await client.fetch_accounts()
-        self.assertEqual(captured["path"], "/api/v1/accounts")
-        self.assertIn("Authorization", captured["headers"])
-        self.assertEqual(len(accounts), 1)
-        self.assertEqual(accounts[0]["message_count"], 42)
+        assert captured["path"] == "/api/v1/accounts"
+        assert "Authorization" in captured["headers"]
+        assert len(accounts) == 1
+        assert accounts[0]["message_count"] == 42
 
     async def test_fetch_accounts_raises_on_http_error(self):
         """非 2xx（如 401）上抛 RuntimeError，由调用方决定是否降级。"""
@@ -436,12 +434,12 @@ class AccountDetailTest(unittest.IsolatedAsyncioTestCase):
                 "briefdesk.plugins.weflow.client.with_connect_retry",
                 AsyncMock(return_value=_Resp()),
             ),
-            self.assertRaises(RuntimeError),
+            pytest.raises(RuntimeError),
         ):
             await client.fetch_accounts()
 
 
-class RegisterConflictHttpTest(unittest.IsolatedAsyncioTestCase):
+class TestRegisterConflictHttp:
     """register_account 就地抛账号不符 —— 在 HTTP 层验证（不打桩该方法）。
 
     必须走 MockTransport：EnsureReadyTest 里 patch.object 把 register_account
@@ -472,10 +470,10 @@ class RegisterConflictHttpTest(unittest.IsolatedAsyncioTestCase):
 
         client = self._client_with(handler)
         try:
-            with self.assertRaises(WeFlowAccountMismatchError) as cm:
+            with pytest.raises(WeFlowAccountMismatchError) as cm:
                 await client.register_account()
-            self.assertIn("wxid_other_0002", str(cm.exception))
-            self.assertIn("wxid_test_0001", str(cm.exception))
+            assert "wxid_other_0002" in str(cm.value)
+            assert "wxid_test_0001" in str(cm.value)
         finally:
             await client.close()
 
@@ -487,9 +485,7 @@ class RegisterConflictHttpTest(unittest.IsolatedAsyncioTestCase):
 
         client = self._client_with(handler)
         try:
-            self.assertEqual(
-                await client.register_account(), ("accepted", "indexing")
-            )
+            assert await client.register_account() == ("accepted", "indexing")
         finally:
             await client.close()
 
@@ -505,14 +501,14 @@ class RegisterConflictHttpTest(unittest.IsolatedAsyncioTestCase):
 
         client = self._client_with(handler)
         try:
-            with self.assertRaises(RuntimeError) as cm:
+            with pytest.raises(RuntimeError) as cm:
                 await client.register_account()
-            self.assertNotIsInstance(cm.exception, WeFlowAccountMismatchError)
+            assert not isinstance(cm.value, WeFlowAccountMismatchError)
         finally:
             await client.close()
 
 
-class ReadyGateTest(unittest.IsolatedAsyncioTestCase):
+class TestReadyGate:
     """业务接口 503 就绪门控的瞬态语义与记忆化复位。"""
 
     async def test_503_resets_memoized_flag(self):
@@ -534,10 +530,10 @@ class ReadyGateTest(unittest.IsolatedAsyncioTestCase):
                 "briefdesk.plugins.weflow.client.with_connect_retry",
                 AsyncMock(return_value=_Resp()),
             ),
-            self.assertRaises(WeFlowNotReadyError),
+            pytest.raises(WeFlowNotReadyError),
         ):
             await client._get("/api/v1/sessions")
-        self.assertFalse(client._ready_checked)
+        assert not client._ready_checked
 
     async def test_404_with_not_found_ok_returns_none(self):
         """会话不存在（brandsessionholder 等）404 → None，由调用方降级。
@@ -563,11 +559,11 @@ class ReadyGateTest(unittest.IsolatedAsyncioTestCase):
             resp = await client.fetch_messages(
                 "brandsessionholder", None, not_found_ok=True
             )
-        self.assertEqual(resp["messages"], [])
-        self.assertFalse(resp["hasMore"])
+        assert resp["messages"] == []
+        assert not resp["hasMore"]
 
 
-class ListPaginationTest(unittest.IsolatedAsyncioTestCase):
+class TestListPagination:
     """列表端点分页：contacts 与 sessions 均按 offset 翻页取全量。"""
 
     async def test_contacts_paginate_until_exhausted(self):
@@ -597,10 +593,10 @@ class ListPaginationTest(unittest.IsolatedAsyncioTestCase):
             client, "_get", AsyncMock(side_effect=[page1, page2])
         ) as get:
             contacts = await client.fetch_contacts()
-        self.assertEqual(len(contacts), 1500)
+        assert len(contacts) == 1500
         offsets = [c.kwargs["params"]["offset"] for c in get.await_args_list]
-        self.assertEqual(offsets, [0, 1000])
-        self.assertEqual(contacts["wxid_1499"], "联系人1499")
+        assert offsets == [0, 1000]
+        assert contacts["wxid_1499"] == "联系人1499"
 
     async def test_sessions_first_page_uses_max_page_size(self):
         """sessions 按 offset 翻页，page_size=10000 = 上游 limit 硬上限。
@@ -619,10 +615,10 @@ class ListPaginationTest(unittest.IsolatedAsyncioTestCase):
             client, "_get", AsyncMock(return_value=page)
         ) as get:
             sessions = await client.fetch_sessions()
-        self.assertEqual(len(sessions), 3)
-        self.assertEqual(get.await_count, 1)
-        self.assertEqual(get.await_args.args[0], "/api/v1/sessions")
-        self.assertEqual(get.await_args.kwargs["params"], {"limit": 10000, "offset": 0})
+        assert len(sessions) == 3
+        assert get.await_count == 1
+        assert get.await_args.args[0] == "/api/v1/sessions"
+        assert get.await_args.kwargs["params"] == {"limit": 10000, "offset": 0}
 
     async def test_sessions_paginate_until_exhausted(self):
         """sessions 按 offset 翻页取尽：多页合并、username 去重、hasMore=false 终止。
@@ -649,13 +645,13 @@ class ListPaginationTest(unittest.IsolatedAsyncioTestCase):
             client, "_get", AsyncMock(side_effect=[page1, page2])
         ) as get:
             sessions = await client.fetch_sessions()
-        self.assertEqual(len(sessions), 1200)
+        assert len(sessions) == 1200
         offsets = [c.kwargs["params"]["offset"] for c in get.await_args_list]
-        self.assertEqual(offsets, [0, 1000])
-        self.assertEqual(sessions[1199]["username"], "wxid_1199")
+        assert offsets == [0, 1000]
+        assert sessions[1199]["username"] == "wxid_1199"
 
 
-class ControlEventStatsTest(unittest.IsolatedAsyncioTestCase):
+class TestControlEventStats:
     """控制事件（ready / sync / ping）不进管道、也不计入监听统计。"""
 
     async def test_control_events_skipped_without_inflating_stats(self):
@@ -687,9 +683,9 @@ class ControlEventStatsTest(unittest.IsolatedAsyncioTestCase):
             {"event": "ready", "status": "ok"}
         )
         await listener._handle_event({"event": "ping"})  # type: ignore[arg-type]
-        self.assertEqual(listener._stats_events, 0)
-        self.assertEqual(listener._stats_filtered, 0)
-        self.assertEqual(batches, [])
+        assert listener._stats_events == 0
+        assert listener._stats_filtered == 0
+        assert batches == []
 
         # 真实消息仍计入事件统计（证明跳过逻辑没有误伤 message.new）
         await listener._handle_event(  # type: ignore[arg-type]
@@ -704,29 +700,29 @@ class ControlEventStatsTest(unittest.IsolatedAsyncioTestCase):
                 "timestamp": 1700000000,
             }
         )
-        self.assertEqual(listener._stats_events, 1)
+        assert listener._stats_events == 1
 
 
 class SessionKindTest(unittest.TestCase):
     """会话类型判定：sessionType 权威 + 数字 type 兜底（枚举序）。"""
 
     def test_session_type_authoritative(self):
-        self.assertEqual(_session_kind({"sessionType": "group"}), (True, False))
-        self.assertEqual(_session_kind({"sessionType": "official"}), (False, True))
-        self.assertEqual(_session_kind({"sessionType": "private"}), (False, False))
-        self.assertEqual(_session_kind({"sessionType": "other"}), (False, False))
+        assert _session_kind({"sessionType": "group"}) == (True, False)
+        assert _session_kind({"sessionType": "official"}) == (False, True)
+        assert _session_kind({"sessionType": "private"}) == (False, False)
+        assert _session_kind({"sessionType": "other"}) == (False, False)
 
     def test_numeric_type_fallback_matches_enum_order(self):
         """sessionType 缺失时按 SessionKind 枚举序兜底：
         private=0 / group=1 / official=2 / other=3。"""
-        self.assertEqual(_session_kind({"type": 0}), (False, False))
-        self.assertEqual(_session_kind({"type": 1}), (True, False))
-        self.assertEqual(_session_kind({"type": 2}), (False, True))
-        self.assertEqual(_session_kind({"type": 3}), (False, False))
-        self.assertEqual(_session_kind({}), (False, False))
+        assert _session_kind({"type": 0}) == (False, False)
+        assert _session_kind({"type": 1}) == (True, False)
+        assert _session_kind({"type": 2}) == (False, True)
+        assert _session_kind({"type": 3}) == (False, False)
+        assert _session_kind({}) == (False, False)
 
 
-class SseSelfHealMismatchTest(unittest.IsolatedAsyncioTestCase):
+class TestSseSelfHealMismatch:
     """SSE 自愈检查遇账号不符时必须冒泡中止本轮监听（D5 止漏）。
 
     与 test_source_robustness.SseSelfHealMismatchTest 同构：stream_events 自建
@@ -755,10 +751,10 @@ class SseSelfHealMismatchTest(unittest.IsolatedAsyncioTestCase):
         client.ensure_ready = AsyncMock(  # type: ignore[method-assign]
             side_effect=WeFlowAccountMismatchError("已绑定另一个账号 wxid_other_0002")
         )
-        with self.assertRaises(WeFlowAccountMismatchError):
+        with pytest.raises(WeFlowAccountMismatchError):
             await self._collect(client)
         # 【P3-2】raise 绕过 stream_events 尾部收尾，状态必须已前置落 offline
-        self.assertEqual(client.connection_status, "offline")
+        assert client.connection_status == "offline"
 
     async def test_other_self_heal_failure_still_swallowed(self):
         """反向断言：普通自愈失败仍降级为 WARNING，不得连坐掐断实时流。"""
@@ -767,7 +763,7 @@ class SseSelfHealMismatchTest(unittest.IsolatedAsyncioTestCase):
             side_effect=WeFlowNotReadyError("索引中")
         )
         events = await self._collect(client)
-        self.assertEqual([e.get("rawid") for e in events], ["r1"])
+        assert [e.get("rawid") for e in events] == ["r1"]
 
 
 if __name__ == "__main__":

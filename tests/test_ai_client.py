@@ -4,6 +4,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
+import pytest
 from pydantic import SecretStr
 
 from briefdesk.config import config
@@ -30,7 +31,7 @@ def _fake_client():
     return client, create
 
 
-class ChatThinkingSwitchTest(unittest.IsolatedAsyncioTestCase):
+class TestChatThinkingSwitch:
     async def test_default_does_not_pass_reasoning_effort(self):
         client, create = _fake_client()
         with patch("briefdesk.plugins.ai_provider.engine.get_ai_client", return_value=client), patch.object(
@@ -41,10 +42,10 @@ class ChatThinkingSwitchTest(unittest.IsolatedAsyncioTestCase):
             await chat([], temperature=0.1, max_tokens=64)
 
         _, kwargs = create.call_args
-        self.assertNotIn("reasoning_effort", kwargs)
-        self.assertNotIn("response_format", kwargs)
-        self.assertEqual(kwargs["temperature"], 0.1)
-        self.assertEqual(kwargs["max_tokens"], 64)
+        assert "reasoning_effort" not in kwargs
+        assert "response_format" not in kwargs
+        assert kwargs["temperature"] == 0.1
+        assert kwargs["max_tokens"] == 64
 
     async def test_disabled_passes_reasoning_effort_none(self):
         client, create = _fake_client()
@@ -56,10 +57,10 @@ class ChatThinkingSwitchTest(unittest.IsolatedAsyncioTestCase):
             await chat([], temperature=0.1, max_tokens=64)
 
         _, kwargs = create.call_args
-        self.assertEqual(kwargs["reasoning_effort"], "none")
-        self.assertNotIn("response_format", kwargs)
-        self.assertEqual(kwargs["temperature"], 0.1)
-        self.assertEqual(kwargs["max_tokens"], 64)
+        assert kwargs["reasoning_effort"] == "none"
+        assert "response_format" not in kwargs
+        assert kwargs["temperature"] == 0.1
+        assert kwargs["max_tokens"] == 64
 
 
 class AltChannelClientTest(unittest.TestCase):
@@ -77,8 +78,8 @@ class AltChannelClientTest(unittest.TestCase):
         with patch(
             "briefdesk.plugins.ai_provider.engine.get_ai_client", return_value=client
         ):
-            self.assertIs(self._engine.get_alt_client("", ""), client)
-        self.assertEqual(self._engine._alt_clients, {})
+            assert self._engine.get_alt_client("", "") is client
+        assert self._engine._alt_clients == {}
 
     def test_same_override_pair_reuses_one_instance(self) -> None:
         with patch.object(config, "ai_api_key", SecretStr("main-key")), patch.object(
@@ -87,9 +88,9 @@ class AltChannelClientTest(unittest.TestCase):
             first = self._engine.get_alt_client("https://alt.invalid/v1", "alt-key")
             second = self._engine.get_alt_client("https://alt.invalid/v1", "alt-key")
             third = self._engine.get_alt_client("https://other.invalid/v1", "alt-key")
-        self.assertIs(first, second)
-        self.assertIsNot(first, third)
-        self.assertEqual(len(self._engine._alt_clients), 2)
+        assert first is second
+        assert first is not third
+        assert len(self._engine._alt_clients) == 2
 
     def test_single_override_falls_back_per_item(self) -> None:
         """只给 api_key 时 base 回退主配置（"只换 Key 不换端点"）。"""
@@ -97,7 +98,7 @@ class AltChannelClientTest(unittest.TestCase):
             config, "ai_api_base", "https://main.invalid/v1"
         ):
             self._engine.get_alt_client("", "alt-key")
-        self.assertIn(("https://main.invalid/v1", "alt-key"), self._engine._alt_clients)
+        assert ("https://main.invalid/v1", "alt-key") in self._engine._alt_clients
 
 
 class ClientRequestDefaultsTest(unittest.TestCase):
@@ -122,19 +123,19 @@ class ClientRequestDefaultsTest(unittest.TestCase):
         ):
             for getter in (self._engine.get_ai_client, self._engine.get_embed_client):
                 client = getter()
-                self.assertEqual(client.timeout, 120.0, getter.__name__)
-                self.assertEqual(client.max_retries, 2, getter.__name__)
+                assert client.timeout == 120.0, getter.__name__
+                assert client.max_retries == 2, getter.__name__
 
     def test_alt_client_has_explicit_defaults(self) -> None:
         with patch.object(config, "ai_api_key", SecretStr("main-key")), patch.object(
             config, "ai_api_base", "https://main.invalid/v1"
         ):
             client = self._engine.get_alt_client("https://alt.invalid/v1", "alt-key")
-        self.assertEqual(client.timeout, 120.0)
-        self.assertEqual(client.max_retries, 2)
+        assert client.timeout == 120.0
+        assert client.max_retries == 2
 
 
-class ChatTimeoutPassThroughTest(unittest.IsolatedAsyncioTestCase):
+class TestChatTimeoutPassThrough:
     """【复核 P1-1】判官类调用（锁内执行）经 chat 端口下传单请求短超时，
     限制存储锁的最坏持有时间；不传时不得附带 timeout（用客户端默认）。"""
 
@@ -144,7 +145,7 @@ class ChatTimeoutPassThroughTest(unittest.IsolatedAsyncioTestCase):
             "briefdesk.plugins.ai_provider.engine.get_ai_client", return_value=client
         ):
             await chat([{"role": "user", "content": "x"}], timeout=45.0)
-        self.assertEqual(create.call_args.kwargs.get("timeout"), 45.0)
+        assert create.call_args.kwargs.get("timeout") == 45.0
 
     async def test_chat_without_timeout_omits_kwarg(self):
         client, create = _fake_client()
@@ -152,10 +153,10 @@ class ChatTimeoutPassThroughTest(unittest.IsolatedAsyncioTestCase):
             "briefdesk.plugins.ai_provider.engine.get_ai_client", return_value=client
         ):
             await chat([{"role": "user", "content": "x"}])
-        self.assertNotIn("timeout", create.call_args.kwargs)
+        assert "timeout" not in create.call_args.kwargs
 
 
-class RagChatModelFallbackTest(unittest.IsolatedAsyncioTestCase):
+class TestRagChatModelFallback:
     """rag_chat 的 model override：留空回退 ai_model，给值则原样使用。"""
 
     async def test_empty_model_falls_back_to_ai_model(self):
@@ -168,7 +169,7 @@ class RagChatModelFallbackTest(unittest.IsolatedAsyncioTestCase):
             await rag_chat([], temperature=0.2, max_tokens=128)
 
         _, kwargs = create.call_args
-        self.assertEqual(kwargs["model"], "deepseek-v4-flash")
+        assert kwargs["model"] == "deepseek-v4-flash"
 
     async def test_explicit_model_is_used(self):
         client, create = _fake_client()
@@ -180,12 +181,12 @@ class RagChatModelFallbackTest(unittest.IsolatedAsyncioTestCase):
             await rag_chat([], temperature=0.2, max_tokens=128, model="qwen-plus")
 
         _, kwargs = create.call_args
-        self.assertEqual(kwargs["model"], "qwen-plus")
+        assert kwargs["model"] == "qwen-plus"
         # 问答走正文，不强制 JSON 外壳
-        self.assertNotIn("response_format", kwargs)
+        assert "response_format" not in kwargs
 
 
-class ChatJsonObjectTest(unittest.IsolatedAsyncioTestCase):
+class TestChatJsonObject:
     """严格 JSON 输出开关：ollama api key / deepseek-v4 模型传 response_format。"""
 
     async def _call(self, *, api_key: str, model: str, disable_thinking: bool):
@@ -202,35 +203,35 @@ class ChatJsonObjectTest(unittest.IsolatedAsyncioTestCase):
         kwargs = await self._call(
             api_key="ollama", model="qwen2.5:7b", disable_thinking=False
         )
-        self.assertEqual(kwargs["response_format"], {"type": "json_object"})
+        assert kwargs["response_format"] == {"type": "json_object"}
 
     async def test_ollama_with_thinking_disabled_still_passes(self):
         kwargs = await self._call(
             api_key="ollama", model="qwen2.5:7b", disable_thinking=True
         )
-        self.assertEqual(kwargs["response_format"], {"type": "json_object"})
-        self.assertEqual(kwargs["reasoning_effort"], "none")
+        assert kwargs["response_format"] == {"type": "json_object"}
+        assert kwargs["reasoning_effort"] == "none"
 
     async def test_deepseek_v4_flash_passes_response_format(self):
         kwargs = await self._call(
             api_key="deepseek", model="deepseek-v4-flash", disable_thinking=False
         )
-        self.assertEqual(kwargs["response_format"], {"type": "json_object"})
+        assert kwargs["response_format"] == {"type": "json_object"}
 
     async def test_vendor_prefixed_v4_model_passes(self):
         kwargs = await self._call(
             api_key="deepseek", model="vendor/deepseek-v4-pro", disable_thinking=False
         )
-        self.assertEqual(kwargs["response_format"], {"type": "json_object"})
+        assert kwargs["response_format"] == {"type": "json_object"}
 
     async def test_other_model_does_not_pass_response_format(self):
         kwargs = await self._call(
             api_key="deepseek", model="qwen3.5", disable_thinking=False
         )
-        self.assertNotIn("response_format", kwargs)
+        assert "response_format" not in kwargs
 
 
-class ChatJsonModeOverrideTest(unittest.IsolatedAsyncioTestCase):
+class TestChatJsonModeOverride:
     """AI_JSON_MODE 显式开关：on/off 优先于启发式，auto 回退启发式。"""
 
     async def _call(self, *, api_key: str, model: str, json_mode: str):
@@ -248,30 +249,30 @@ class ChatJsonModeOverrideTest(unittest.IsolatedAsyncioTestCase):
         kwargs = await self._call(
             api_key="deepseek", model="qwen3.5", json_mode="on"
         )
-        self.assertEqual(kwargs["response_format"], {"type": "json_object"})
+        assert kwargs["response_format"] == {"type": "json_object"}
 
     async def test_off_disables_json_object_for_heuristic_model(self):
         # deepseek-v4-flash 在启发式内，但 off 强制关闭
         kwargs = await self._call(
             api_key="deepseek", model="deepseek-v4-flash", json_mode="off"
         )
-        self.assertNotIn("response_format", kwargs)
+        assert "response_format" not in kwargs
 
     async def test_auto_falls_back_to_heuristic(self):
         # auto 保持原启发式行为
         kwargs = await self._call(
             api_key="deepseek", model="deepseek-v4-flash", json_mode="auto"
         )
-        self.assertEqual(kwargs["response_format"], {"type": "json_object"})
+        assert kwargs["response_format"] == {"type": "json_object"}
 
     async def test_auto_disables_for_non_heuristic_model(self):
         kwargs = await self._call(
             api_key="deepseek", model="qwen3.5", json_mode="auto"
         )
-        self.assertNotIn("response_format", kwargs)
+        assert "response_format" not in kwargs
 
 
-class EmbedBatchCountTest(unittest.IsolatedAsyncioTestCase):
+class TestEmbedBatchCount:
     """P2 修复：embed_texts 每 chunk 校验返回向量数量——供应商少返即抛错，
     绝不产生错位结果（错位向量会持久化进 item_embeddings，永久污染余弦通道）。"""
 
@@ -294,9 +295,9 @@ class EmbedBatchCountTest(unittest.IsolatedAsyncioTestCase):
         # 请求 2 条实返 1 条：必须抛 ValueError（调用方已有整批回退路径）
         client, create = self._client([SimpleNamespace(index=0, embedding=[0.1])])
         p_client, p_batch, p_sem = self._patches(client)
-        with p_client, p_batch, p_sem, self.assertRaises(ValueError):
+        with p_client, p_batch, p_sem, pytest.raises(ValueError):
             await embed_texts(["a", "b"])
-        self.assertEqual(len(create.call_args.kwargs["input"]), 2)
+        assert len(create.call_args.kwargs["input"]) == 2
 
     async def test_full_return_keeps_input_order(self):
         # 数量一致时按 index 排序还原输入顺序（既有防御性排序不受影响）
@@ -309,7 +310,7 @@ class EmbedBatchCountTest(unittest.IsolatedAsyncioTestCase):
         p_client, p_batch, p_sem = self._patches(client)
         with p_client, p_batch, p_sem:
             got = await embed_texts(["a", "b"])
-        self.assertEqual(got, [[0.1], [0.2]])
+        assert got == [[0.1], [0.2]]
 
     async def test_duplicate_index_raises_value_error(self):
         # 复核 P3-9：数量相符但 index 重复（如 [0,0,1]），排序后 index 序列
@@ -322,20 +323,21 @@ class EmbedBatchCountTest(unittest.IsolatedAsyncioTestCase):
             ]
         )
         p_client, p_batch, p_sem = self._patches(client)
-        with p_client, p_batch, p_sem, self.assertRaises(ValueError):
+        with p_client, p_batch, p_sem, pytest.raises(ValueError):
             await embed_texts(["a", "b", "c"])
 
 
-class EmbedAnnouncementTest(unittest.IsolatedAsyncioTestCase):
+class TestEmbedAnnouncement:
     """嵌入公告联动：失败置位 embedding_unreachable、成功撤销、未配置归 disabled。"""
 
-    def setUp(self) -> None:
+    @pytest.fixture(autouse=True)
+    def _autouse_setup(self):
         from briefdesk import announcements
 
         self.announcements = announcements
         announcements.reset_announcements()
-        self.addCleanup(announcements.reset_announcements)
-
+        yield
+        announcements.reset_announcements()
     def _embed_client(self, *, error: Exception | None = None):
         create = AsyncMock(
             return_value=SimpleNamespace(
@@ -361,12 +363,12 @@ class EmbedAnnouncementTest(unittest.IsolatedAsyncioTestCase):
     async def test_failure_announces_unreachable_and_reraises(self):
         client = self._embed_client(error=RuntimeError("connection refused"))
         p = self._patches(client, embed_base="http://embed.invalid/v1")
-        with p[0], p[1], p[2], p[3], p[4], self.assertRaises(RuntimeError):
+        with p[0], p[1], p[2], p[3], p[4], pytest.raises(RuntimeError):
             await embed_texts(["a"])
         items = self.announcements.get_announcements()
-        self.assertEqual([x["code"] for x in items], ["embedding_unreachable"])
-        self.assertEqual(items[0]["level"], "warning")
-        self.assertIn("http://embed.invalid/v1", items[0]["message"])
+        assert [x["code"] for x in items] == ["embedding_unreachable"]
+        assert items[0]["level"] == "warning"
+        assert "http://embed.invalid/v1" in items[0]["message"]
 
     async def test_success_revokes_stale_announcement(self):
         client = self._embed_client()
@@ -374,29 +376,27 @@ class EmbedAnnouncementTest(unittest.IsolatedAsyncioTestCase):
         await self.announcements.announce("embedding_unreachable", "warning", "stale")
         with p[0], p[1], p[2], p[3], p[4]:
             await embed_texts(["a"])
-        self.assertEqual(self.announcements.get_announcements(), [])
+        assert self.announcements.get_announcements() == []
 
     async def test_failure_when_disabled_announces_disabled_not_unreachable(self):
         client = self._embed_client(error=RuntimeError("boom"))
         p = self._patches(client, embed_base="")
-        with p[0], p[1], p[2], p[3], p[4], self.assertRaises(RuntimeError):
+        with p[0], p[1], p[2], p[3], p[4], pytest.raises(RuntimeError):
             await embed_texts(["a"])
-        self.assertEqual(
-            [x["code"] for x in self.announcements.get_announcements()],
-            ["embedding_disabled"],
-        )
+        assert [x["code"] for x in self.announcements.get_announcements()] == ["embedding_disabled"]
 
 
-class PluginSetupAnnouncementTest(unittest.IsolatedAsyncioTestCase):
+class TestPluginSetupAnnouncement:
     """ai_provider setup：按嵌入配置置位/撤销 embedding_disabled 公告。"""
 
-    def setUp(self) -> None:
+    @pytest.fixture(autouse=True)
+    def _autouse_setup(self):
         from briefdesk import announcements
 
         self.announcements = announcements
         announcements.reset_announcements()
-        self.addCleanup(announcements.reset_announcements)
-
+        yield
+        announcements.reset_announcements()
     async def _setup_plugin(self, *, embed_base: str):
         from briefdesk.plugin.base import PluginContext
         from briefdesk.plugins.ai_provider.plugin import AiProviderPlugin
@@ -421,17 +421,14 @@ class PluginSetupAnnouncementTest(unittest.IsolatedAsyncioTestCase):
     async def test_setup_without_embed_announces_disabled(self):
         plugin = await self._setup_plugin(embed_base="")
         try:
-            self.assertEqual(
-                [x["code"] for x in self.announcements.get_announcements()],
-                ["embedding_disabled"],
-            )
+            assert [x["code"] for x in self.announcements.get_announcements()] == ["embedding_disabled"]
         finally:
             await plugin.teardown()
 
     async def test_setup_with_embed_does_not_announce_disabled(self):
         plugin = await self._setup_plugin(embed_base="http://embed.invalid/v1")
         try:
-            self.assertEqual(self.announcements.get_announcements(), [])
+            assert self.announcements.get_announcements() == []
         finally:
             await plugin.teardown()
 

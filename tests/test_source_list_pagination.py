@@ -41,16 +41,16 @@ class _Recorder:
         return [c["offset"] for c in self.calls]
 
 
-class TerminationTest(unittest.IsolatedAsyncioTestCase):
+class TestTermination:
     """终止条件。"""
 
     async def test_single_short_page_stops_immediately(self):
         """首页不足 page_size：一次请求即结束。"""
         get = _Recorder([{"contacts": _rows(0, 5), "total": 5, "hasMore": False}])
         items = await fetch_all_pages(get, "/api/v1/contacts", key="contacts")
-        self.assertEqual(len(items), 5)
-        self.assertEqual(len(get.calls), 1)
-        self.assertEqual(get.calls[0]["limit"], LIST_PAGE_SIZE)
+        assert len(items) == 5
+        assert len(get.calls) == 1
+        assert get.calls[0]["limit"] == LIST_PAGE_SIZE
 
     async def test_has_more_drives_pagination(self):
         """hasMore=True 继续翻页，False 停止。"""
@@ -64,8 +64,8 @@ class TerminationTest(unittest.IsolatedAsyncioTestCase):
         items = await fetch_all_pages(
             get, "/api/v1/contacts", key="contacts", page_size=3
         )
-        self.assertEqual(len(items), 8)
-        self.assertEqual(get.offsets, [0, 3, 6])
+        assert len(items) == 8
+        assert get.offsets == [0, 3, 6]
 
     async def test_has_more_true_but_empty_page_stops(self):
         """上游 hasMore=True 却回空页（数据竞态）：空页即止，不无限循环。"""
@@ -78,8 +78,8 @@ class TerminationTest(unittest.IsolatedAsyncioTestCase):
         items = await fetch_all_pages(
             get, "/api/v1/contacts", key="contacts", page_size=3
         )
-        self.assertEqual(len(items), 3)
-        self.assertEqual(len(get.calls), 2)
+        assert len(items) == 3
+        assert len(get.calls) == 2
 
     async def test_missing_has_more_falls_back_to_short_page(self):
         """旧上游无 hasMore 字段：按「本页条数 < page_size」判末页。"""
@@ -92,14 +92,14 @@ class TerminationTest(unittest.IsolatedAsyncioTestCase):
         items = await fetch_all_pages(
             get, "/api/v1/contacts", key="contacts", page_size=3
         )
-        self.assertEqual(len(items), 4)
-        self.assertEqual(get.offsets, [0, 3])
+        assert len(items) == 4
+        assert get.offsets == [0, 3]
 
     async def test_missing_key_stops(self):
         """响应缺列表键：视为无数据，不抛错。"""
         get = _Recorder([{"success": True}])
         items = await fetch_all_pages(get, "/api/v1/contacts", key="contacts")
-        self.assertEqual(items, [])
+        assert items == []
 
 
 class DefenseTest(unittest.IsolatedAsyncioTestCase):
@@ -118,8 +118,8 @@ class DefenseTest(unittest.IsolatedAsyncioTestCase):
             get, "/api/v1/contacts", key="contacts", page_size=3
         )
         names = [i["username"] for i in items]
-        self.assertEqual(len(names), len(set(names)), f"无重复: {names}")
-        self.assertEqual(len(items), 4)
+        assert len(names) == len(set(names)), f"无重复: {names}"
+        assert len(items) == 4
 
     async def test_upstream_ignoring_offset_terminates_with_warning(self):
         """上游忽略 offset（版本过旧）→ 整页重复，立即终止并告警。
@@ -133,12 +133,9 @@ class DefenseTest(unittest.IsolatedAsyncioTestCase):
             items = await fetch_all_pages(
                 get, "/api/v1/contacts", key="contacts", page_size=3
             )
-        self.assertEqual(len(items), 3, "只保留第一页")
-        self.assertEqual(len(get.calls), 2, "第二页发现全重复即止")
-        self.assertTrue(
-            any("可能不支持 offset" in m for m in logs.output),
-            f"应告警上游不支持 offset: {logs.output}",
-        )
+        assert len(items) == 3, "只保留第一页"
+        assert len(get.calls) == 2, "第二页发现全重复即止"
+        assert any("可能不支持 offset" in m for m in logs.output), f"应告警上游不支持 offset: {logs.output}"
 
     async def test_version_included_in_warning(self):
         """告警带上游版本号，便于定位「对端二进制过旧」。"""
@@ -152,7 +149,7 @@ class DefenseTest(unittest.IsolatedAsyncioTestCase):
                 page_size=2,
                 upstream_version="0.2.0",
             )
-        self.assertTrue(any("0.2.0" in m for m in logs.output), logs.output)
+        assert any("0.2.0" in m for m in logs.output), logs.output
 
     async def test_items_without_dedup_key_all_kept(self):
         """列表项缺 dedup_key：不去重、全部保留（不静默丢数据）。"""
@@ -165,10 +162,10 @@ class DefenseTest(unittest.IsolatedAsyncioTestCase):
         items = await fetch_all_pages(
             get, "/api/v1/contacts", key="contacts", page_size=2
         )
-        self.assertEqual(len(items), 2)
+        assert len(items) == 2
 
 
-class ParamsTest(unittest.IsolatedAsyncioTestCase):
+class TestParams:
     """请求参数。"""
 
     async def test_extra_params_forwarded_on_every_page(self):
@@ -186,12 +183,12 @@ class ParamsTest(unittest.IsolatedAsyncioTestCase):
             page_size=2,
             extra_params={"keyword": "测试"},
         )
-        self.assertEqual(len(get.calls), 2)
+        assert len(get.calls) == 2
         for c in get.calls:
-            self.assertEqual(c["keyword"], "测试")
+            assert c["keyword"] == "测试"
 
 
-class SourceClientWiringTest(unittest.IsolatedAsyncioTestCase):
+class TestSourceClientWiring:
     """三个源的 contacts 取法符合各自上游能力。"""
 
     def test_weflow_and_qqflow_use_the_shared_helper(self):
@@ -207,11 +204,7 @@ class SourceClientWiringTest(unittest.IsolatedAsyncioTestCase):
 
         for cls in (WeFlowClient, QqFlowClient):
             src = inspect.getsource(cls.fetch_contacts)
-            self.assertIn(
-                "fetch_all_pages",
-                src,
-                f"{cls.__name__}.fetch_contacts 应走共享分页 helper",
-            )
+            assert "fetch_all_pages" in src, f"{cls.__name__}.fetch_contacts 应走共享分页 helper"
 
     def test_weflow_legacy_passes_max_limit(self):
         """weflow-legacy 上游（WeFlow 安装版）无 offset，只能传大 limit。"""
@@ -220,8 +213,8 @@ class SourceClientWiringTest(unittest.IsolatedAsyncioTestCase):
         from briefdesk.plugins.weflow_legacy.client import WeFlowLegacyClient
 
         src = inspect.getsource(WeFlowLegacyClient.fetch_contacts)
-        self.assertIn("LIST_MAX_LIMIT", src)
-        self.assertNotIn("fetch_all_pages", src, "该上游不支持 offset，不能翻页")
+        assert "LIST_MAX_LIMIT" in src
+        assert "fetch_all_pages" not in src, "该上游不支持 offset，不能翻页"
 
 
 if __name__ == "__main__":

@@ -5,6 +5,8 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
+import pytest
+
 from briefdesk import ai_ports, stages
 from briefdesk.config import Settings
 from briefdesk.events import EVENT_ITEMS_DELETED
@@ -62,31 +64,31 @@ class StagesRegistryTest(unittest.TestCase):
         s0 = _FakeStage("enrich", 0)
         stages.register_stage(s1)
         stages.register_stage(s0)
-        self.assertEqual(stages.get_stages("enrich"), [s0, s1])
+        assert stages.get_stages("enrich") == [s0, s1]
 
     def test_duplicate_registration_not_duplicated(self):
         s = _FakeStage("classify", 0)
         stages.register_stage(s)
         stages.register_stage(s)
-        self.assertEqual(len(stages.get_stages("classify")), 1)
+        assert len(stages.get_stages("classify")) == 1
 
     def test_get_stages_returns_snapshot(self):
         stages.register_stage(_FakeStage("classify", 0))
         snap = stages.get_stages("classify")
         snap.append(None)  # 修改快照不影响注册表
-        self.assertEqual(len(stages.get_stages("classify")), 1)
-        self.assertEqual(stages.get_stages("nope"), [])
+        assert len(stages.get_stages("classify")) == 1
+        assert stages.get_stages("nope") == []
 
     def test_context_set_and_reset(self):
         ctx, _ = _ctx()
-        self.assertIsNone(stages.get_context())
+        assert stages.get_context() is None
         stages.set_context(ctx)
-        self.assertIs(stages.get_context(), ctx)
+        assert stages.get_context() is ctx
         stages.reset()
-        self.assertIsNone(stages.get_context())
+        assert stages.get_context() is None
 
 
-class StagePluginSetupTest(unittest.IsolatedAsyncioTestCase):
+class TestStagePluginSetup:
     async def test_stage_plugins_register_with_correct_slots(self):
         registered = []
         ctx, _ = _ctx(register_stage=registered.append)
@@ -102,10 +104,7 @@ class StagePluginSetupTest(unittest.IsolatedAsyncioTestCase):
             await ClassifyPlugin().setup(ctx)
             await DedupPlugin().setup(ctx)
             await MergePlugin().setup(ctx)
-        self.assertEqual(
-            [s.slot for s in registered],
-            ["enrich", "classify", "dedup", "post_insert"],
-        )
+        assert [s.slot for s in registered] == ["enrich", "classify", "dedup", "post_insert"]
 
     async def test_dedup_setup_warms_cache_and_registers_service(self):
         ctx, _ = _ctx()
@@ -115,7 +114,7 @@ class StagePluginSetupTest(unittest.IsolatedAsyncioTestCase):
             plugin = DedupPlugin()
             await plugin.setup(ctx)
         fake_engine.ensure_cache.assert_awaited_once()
-        self.assertIs(ctx.dedup, fake_engine)  # 服务端口注册
+        assert ctx.dedup is fake_engine  # 服务端口注册
 
     async def test_dedup_teardown_clears_ctx_dedup_port(self):
         """teardown 幂等回收自己注册的 ctx.dedup 服务端口。"""
@@ -125,9 +124,9 @@ class StagePluginSetupTest(unittest.IsolatedAsyncioTestCase):
         with patch("briefdesk.plugins.dedup.engine.DedupEngine", return_value=fake_engine):
             plugin = DedupPlugin()
             await plugin.setup(ctx)
-        self.assertIs(ctx.dedup, fake_engine)
+        assert ctx.dedup is fake_engine
         await plugin.teardown()
-        self.assertIsNone(ctx.dedup)
+        assert ctx.dedup is None
 
     async def test_dedup_setup_failure_window_leaves_no_ports(self):
         """可失败步骤（ensure_cache）先于全部注册——抛错时 ctx.dedup
@@ -137,10 +136,10 @@ class StagePluginSetupTest(unittest.IsolatedAsyncioTestCase):
         fake_engine.ensure_cache = AsyncMock(side_effect=RuntimeError("预热失败"))
         with patch("briefdesk.plugins.dedup.engine.DedupEngine", return_value=fake_engine):
             plugin = DedupPlugin()
-            with self.assertRaises(RuntimeError):
+            with pytest.raises(RuntimeError):
                 await plugin.setup(ctx)
-        self.assertIsNone(ctx.dedup)
-        self.assertEqual(subscribers, [], "失败窗口不得注册事件订阅")
+        assert ctx.dedup is None
+        assert subscribers == [], "失败窗口不得注册事件订阅"
 
     async def test_dedup_subscribes_items_deleted_and_clears_cache(self):
         ctx, subscribers = _ctx()
@@ -150,7 +149,7 @@ class StagePluginSetupTest(unittest.IsolatedAsyncioTestCase):
             plugin = DedupPlugin()
             await plugin.setup(ctx)
         events = [e for e, _ in subscribers]
-        self.assertIn(EVENT_ITEMS_DELETED, events)
+        assert EVENT_ITEMS_DELETED in events
         handler = dict(subscribers)[EVENT_ITEMS_DELETED]
         handler(["i1", "i2"])
         fake_engine.remove_items.assert_called_once_with(["i1", "i2"])
@@ -179,17 +178,17 @@ class StagePluginSetupTest(unittest.IsolatedAsyncioTestCase):
 class StagePluginMetaTest(unittest.TestCase):
     def test_merge_declares_dedup_dependency(self):
         # 拓扑序保证 dedup 先 setup → ctx.dedup 就绪后 merge 才可能运行
-        self.assertEqual(MergePlugin.dependencies, ("dedup", "ai_provider"))
+        assert MergePlugin.dependencies == ("dedup", "ai_provider")
 
     def test_ai_dependent_plugins_declare_ai_provider(self):
         # 分类/去重/合并依赖 AI 供应商：ai_provider 被禁用时它们随依赖未就绪
         # 自动降级，pipeline 骨架的"阶段缺失"守卫保证消息不被误标记
-        self.assertEqual(ClassifyPlugin.dependencies, ("ai_provider",))
-        self.assertEqual(DedupPlugin.dependencies, ("ai_provider",))
+        assert ClassifyPlugin.dependencies == ("ai_provider",)
+        assert DedupPlugin.dependencies == ("ai_provider",)
 
     def test_slot_priorities_are_zero(self):
         for cls in (OcrPlugin, ClassifyPlugin, DedupPlugin, MergePlugin):
-            self.assertEqual(cls.priority, 0)
+            assert cls.priority == 0
 
 
 class TopKSimilarStableOrderTest(unittest.TestCase):
@@ -201,8 +200,8 @@ class TopKSimilarStableOrderTest(unittest.TestCase):
         hits = top_k_similar(
             [1.0, 0.0], [[1.0, 0.0], [1.0, 0.0], [0.0, 1.0]], top_k=3, threshold=0.5
         )
-        self.assertEqual([i for i, _ in hits], [0, 1])
-        self.assertAlmostEqual(hits[0][1], hits[1][1], places=6)
+        assert [i for i, _ in hits] == [0, 1]
+        assert round(abs(hits[0][1] - hits[1][1]), 6) == 0
 
     def test_descending_order_unchanged(self):
         from briefdesk.ai_ports import top_k_similar
@@ -210,16 +209,15 @@ class TopKSimilarStableOrderTest(unittest.TestCase):
         hits = top_k_similar(
             [1.0, 0.0], [[0.9, 0.1], [0.5, 0.5], [1.0, 0.0]], top_k=3, threshold=0.0
         )
-        self.assertEqual([i for i, _ in hits], [2, 0, 1])
+        assert [i for i, _ in hits] == [2, 0, 1]
 
 
-class AiProviderPluginTest(unittest.IsolatedAsyncioTestCase):
-    async def asyncSetUp(self):
+class TestAiProviderPlugin:
+    @pytest.fixture(autouse=True)
+    async def _autouse_setup(self):
         ai_ports.set_ai(None)
-
-    async def asyncTearDown(self):
+        yield
         ai_ports.set_ai(None)
-
     async def test_setup_registers_ctx_and_ports(self):
         ctx, _ = _ctx()
         fake_provider = Mock()
@@ -229,11 +227,11 @@ class AiProviderPluginTest(unittest.IsolatedAsyncioTestCase):
         ):
             await plugin.setup(ctx)
         try:
-            self.assertIs(ctx.ai, fake_provider)
-            self.assertIs(ai_ports.get_ai(), fake_provider)
+            assert ctx.ai is fake_provider
+            assert ai_ports.get_ai() is fake_provider
         finally:
             await plugin.teardown()
-        self.assertIsNone(ai_ports.get_ai())
+        assert ai_ports.get_ai() is None
 
     async def test_setup_failure_window_leaves_no_ports(self):
         """可失败步骤（announce）在端口注册之前——announce 抛错时
@@ -249,12 +247,12 @@ class AiProviderPluginTest(unittest.IsolatedAsyncioTestCase):
             patch(
                 "briefdesk.plugins.ai_provider.engine.announce_embedding_state",
                 new=AsyncMock(side_effect=RuntimeError("announce failed")),
-            ),self.assertRaises(RuntimeError)
+            ),pytest.raises(RuntimeError)
         ):
             await plugin.setup(ctx)
-        self.assertIsNone(ctx.ai, "announce 失败窗口 ctx.ai 不得被注册")
+        assert ctx.ai is None, "announce 失败窗口 ctx.ai 不得被注册"
         await plugin.teardown()  # manager 装配失败路径的 best-effort 回收
-        self.assertIsNone(ai_ports.get_ai())
+        assert ai_ports.get_ai() is None
 
     async def test_port_functions_forward_to_provider(self):
         # 引擎经 ai_ports 端口函数调用：chat/嵌入转发到注册的供应商
@@ -264,17 +262,17 @@ class AiProviderPluginTest(unittest.IsolatedAsyncioTestCase):
         fake_provider.is_embedding_enabled = Mock(return_value=True)
         fake_provider.embed_model_name = Mock(return_value="m")
         ai_ports.set_ai(fake_provider)
-        self.assertEqual(await ai_ports.chat([{"role": "user", "content": "hi"}], temperature=0.1, max_tokens=8), "resp")
-        self.assertEqual(await ai_ports.embed_texts(["x"]), [[0.1]])
-        self.assertTrue(ai_ports.is_embedding_enabled())
-        self.assertEqual(ai_ports.embed_model_name(), "m")
+        assert await ai_ports.chat([{"role": "user", "content": "hi"}], temperature=0.1, max_tokens=8) == "resp"
+        assert await ai_ports.embed_texts(["x"]) == [[0.1]]
+        assert ai_ports.is_embedding_enabled()
+        assert ai_ports.embed_model_name() == "m"
         fake_provider.chat.assert_awaited_once()
 
     async def test_unregistered_provider_raises_on_chat(self):
         ai_ports.set_ai(None)
-        with self.assertRaises(RuntimeError):
+        with pytest.raises(RuntimeError):
             await ai_ports.chat([], temperature=0.1, max_tokens=8)
-        self.assertFalse(ai_ports.is_embedding_enabled())  # 启用性检查安全返回 False
+        assert not ai_ports.is_embedding_enabled()  # 启用性检查安全返回 False
 
 
 class _NoEntryPoints(list):
@@ -292,7 +290,7 @@ def _mgr_settings(*, required=None):
     )
 
 
-class PluginManagerRollbackTest(unittest.IsolatedAsyncioTestCase):
+class TestPluginManagerRollback:
     """P2 修复：setup/activate 非 PluginDisabledError 失败时 best-effort 调一次
     plugin.teardown() 回收半装配副作用再标 failed；依赖方照常 disabled 降级、
     REQUIRED 名单失败仍致命（PluginError 中止装配）。"""
@@ -329,15 +327,14 @@ class PluginManagerRollbackTest(unittest.IsolatedAsyncioTestCase):
         async def activate(self, ctx): ...
         async def teardown(self): ...
 
-    def setUp(self):
+    @pytest.fixture(autouse=True)
+    def _autouse_setup(self):
         self._eps_patcher = patch(
             "importlib.metadata.entry_points", return_value=_NoEntryPoints([])
         )
         self._eps_patcher.start()
-
-    def tearDown(self):
+        yield
         self._eps_patcher.stop()
-
     async def test_setup_failure_triggers_teardown_and_dependent_disabled(self):
         boom = self._Boom(fail_in="setup")
         manager = PluginManager(_mgr_settings())
@@ -346,22 +343,22 @@ class PluginManagerRollbackTest(unittest.IsolatedAsyncioTestCase):
         ctx, _ = _ctx()
         await manager.setup_all(ctx)
         # 半装配副作用被回收：teardown 恰好一次（在标 failed 之前）
-        self.assertEqual(boom.events, ["setup", "teardown"])
-        self.assertEqual(manager.records()["boom"].status, "failed")
+        assert boom.events == ["setup", "teardown"]
+        assert manager.records()["boom"].status == "failed"
         # 后续依赖插件仍降级 disabled，不被波及为 fatal
         rec = manager.records()["dep"]
-        self.assertEqual(rec.status, "disabled")
-        self.assertIn("依赖未就绪", rec.reason)
+        assert rec.status == "disabled"
+        assert "依赖未就绪" in rec.reason
 
     async def test_required_setup_failure_fatal_after_teardown(self):
         boom = self._Boom(fail_in="setup")
         manager = PluginManager(_mgr_settings(required=["boom"]))
         manager.register(boom)
         ctx, _ = _ctx()
-        with self.assertRaises(PluginError):
+        with pytest.raises(PluginError):
             await manager.setup_all(ctx)
         # REQUIRED 致命路径同样先回收副作用
-        self.assertIn("teardown", boom.events)
+        assert "teardown" in boom.events
 
     async def test_activate_failure_best_effort_teardown(self):
         boom = self._Boom(fail_in="activate")
@@ -370,28 +367,27 @@ class PluginManagerRollbackTest(unittest.IsolatedAsyncioTestCase):
         ctx, _ = _ctx()
         await manager.setup_all(ctx)
         await manager.activate_all(ctx)
-        self.assertEqual(boom.events, ["setup", "activate", "teardown"])
+        assert boom.events == ["setup", "activate", "teardown"]
         rec = manager.records()["boom"]
-        self.assertEqual(rec.status, "failed")
-        self.assertIn("activate 失败", rec.reason)
+        assert rec.status == "failed"
+        assert "activate 失败" in rec.reason
         # 幂等叠加契约：该插件仍在 _load_order，关闭期 teardown_all 会按幂等
         # 契约再调一次 → teardown 总调用次数 == 2（best-effort 回收 + 收尾）
         await manager.teardown_all()
-        self.assertEqual(boom.events.count("teardown"), 2)
+        assert boom.events.count("teardown") == 2
 
 
-class PluginDisabledNoTeardownTest(unittest.IsolatedAsyncioTestCase):
+class TestPluginDisabledNoTeardown:
     """PluginDisabledError 自禁用发生在获取资源之前，不走 teardown 回收。"""
 
-    def setUp(self):
+    @pytest.fixture(autouse=True)
+    def _autouse_setup(self):
         self._eps_patcher = patch(
             "importlib.metadata.entry_points", return_value=_NoEntryPoints([])
         )
         self._eps_patcher.start()
-
-    def tearDown(self):
+        yield
         self._eps_patcher.stop()
-
     async def test_self_disable_skips_rollback_teardown(self):
         calls = []
 
@@ -417,11 +413,11 @@ class PluginDisabledNoTeardownTest(unittest.IsolatedAsyncioTestCase):
         manager.register(P())
         ctx, _ = _ctx()
         await manager.setup_all(ctx)
-        self.assertEqual(calls, ["setup"])  # 无 teardown 回收
-        self.assertEqual(manager.records()["p"].status, "disabled")
+        assert calls == ["setup"]  # 无 teardown 回收
+        assert manager.records()["p"].status == "disabled"
 
 
-class MergeAfterRunReembedTest(unittest.IsolatedAsyncioTestCase):
+class TestMergeAfterRunReembed:
     """【复核 P2-20】merge after_run 对存活卡补嵌并带向量重新登记。
 
     合并改写文本后 DB 侧向量已删，run 的 add_to_cache 不带向量——长驻
@@ -454,9 +450,9 @@ class MergeAfterRunReembedTest(unittest.IsolatedAsyncioTestCase):
             AsyncMock(return_value={"i1"}),
         ):
             await MergePlugin().after_run(batch, SimpleNamespace(dedup=engine))
-        self.assertEqual(engine._cache[0].title, "合并后标题")
-        self.assertEqual(engine._cache[0].source_quote, "合并后原文")
-        self.assertEqual(engine._cache[0].embedding, vec)
+        assert engine._cache[0].title == "合并后标题"
+        assert engine._cache[0].source_quote == "合并后原文"
+        assert engine._cache[0].embedding == vec
 
     async def test_after_run_noop_without_queue_or_service(self):
         from types import SimpleNamespace
@@ -497,31 +493,30 @@ class MergeAfterRunReembedTest(unittest.IsolatedAsyncioTestCase):
             await MergePlugin().after_run(batch, SimpleNamespace(dedup=engine))
         # i2 被过滤：不 add_to_cache，不产生幽灵条目
         cached_ids = {c.id for c in engine._cache}
-        self.assertNotIn("i2", cached_ids, "已删除卡不得复活进缓存")
-        self.assertIn("i1", cached_ids, "既有缓存条目不受影响")
+        assert "i2" not in cached_ids, "已删除卡不得复活进缓存"
+        assert "i1" in cached_ids, "既有缓存条目不受影响"
 
 
-class AiProviderPortsGuardTest(unittest.IsolatedAsyncioTestCase):
+class TestAiProviderPortsGuard:
     """未 setup 直接调用端口 → 显式 RuntimeError（非
     AssertionError，-O 下 assert 被剥离时同样可靠）。"""
 
-    def setUp(self):
+    @pytest.fixture(autouse=True)
+    def _autouse_setup(self):
         ai_ports.set_ai(None)
-
-    async def asyncTearDown(self):
+        yield
         ai_ports.set_ai(None)
-
     async def test_unsetup_port_calls_raise_runtime_error(self):
         plugin = AiProviderPlugin()
-        with self.assertRaises(RuntimeError):
+        with pytest.raises(RuntimeError):
             await plugin.chat(
                 [{"role": "user", "content": "x"}], temperature=0.1, max_tokens=1
             )
-        with self.assertRaises(RuntimeError):
+        with pytest.raises(RuntimeError):
             await plugin.rag_chat(
                 [{"role": "user", "content": "x"}], temperature=0.1, max_tokens=1
             )
-        with self.assertRaises(RuntimeError):
+        with pytest.raises(RuntimeError):
             await plugin.embed_texts(["x"])
-        with self.assertRaises(RuntimeError):
+        with pytest.raises(RuntimeError):
             plugin.embed_model_name()

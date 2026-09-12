@@ -7,6 +7,7 @@ from typing import ClassVar
 from unittest.mock import AsyncMock, Mock, patch
 
 import aiosqlite
+import pytest
 
 from briefdesk.config import Settings
 from briefdesk.db import init_schema
@@ -70,15 +71,15 @@ def _msg(msg_id="m1", content="周六6点开会有通知", ts=1700000000,
     )
 
 
-class RagSetupTest(unittest.IsolatedAsyncioTestCase):
+class TestRagSetup:
     async def test_setup_without_ai_self_disables(self):
         ctx, *_ = _ctx(None)
-        with self.assertRaises(PluginDisabledError):
+        with pytest.raises(PluginDisabledError):
             await RagPlugin().setup(ctx)
 
     async def test_setup_without_embedding_self_disables(self):
         ctx, *_ = _ctx(_embed_provider(enabled=False))
-        with self.assertRaises(PluginDisabledError):
+        with pytest.raises(PluginDisabledError):
             await RagPlugin().setup(ctx)
 
     async def test_setup_registers_stage_router_assets(self):
@@ -86,12 +87,12 @@ class RagSetupTest(unittest.IsolatedAsyncioTestCase):
         plugin = RagPlugin()
         await plugin.setup(ctx)
         try:
-            self.assertEqual(plugin.slot, "post_insert")
-            self.assertEqual(plugin.priority, 10)  # 恒排 merge(priority=0) 之后
-            self.assertEqual(stages_, [plugin])
-            self.assertEqual(len(routers), 1)
-            self.assertEqual(len(assets), 1)
-            self.assertEqual(assets[0][0], "rag")
+            assert plugin.slot == "post_insert"
+            assert plugin.priority == 10  # 恒排 merge(priority=0) 之后
+            assert stages_ == [plugin]
+            assert len(routers) == 1
+            assert len(assets) == 1
+            assert assets[0][0] == "rag"
         finally:
             await plugin.teardown()
 
@@ -104,11 +105,11 @@ class RagSetupTest(unittest.IsolatedAsyncioTestCase):
         engine = plugin._engine
         engine._vec_count_seen = 5
         try:
-            self.assertIsNotNone(get_engine())
+            assert get_engine() is not None
         finally:
             await plugin.teardown()
-        self.assertIsNone(get_engine())
-        self.assertEqual(engine._vec_count_seen, 0)  # teardown 链式清理引擎状态
+        assert get_engine() is None
+        assert engine._vec_count_seen == 0  # teardown 链式清理引擎状态
 
     async def test_hooks_noop_without_engine(self):
         plugin = RagPlugin()
@@ -125,32 +126,31 @@ class RagSetupTest(unittest.IsolatedAsyncioTestCase):
 
         ctx.register_router = _boom  # 注入故障点
         plugin = RagPlugin()
-        with self.assertRaises(TypeError):
+        with pytest.raises(TypeError):
             await plugin.setup(ctx)
         from briefdesk.plugins.rag.engine import get_engine
 
-        self.assertIsNone(get_engine())
+        assert get_engine() is None
 
 
-class RagMetaTest(unittest.TestCase):
+class TestRagMeta(unittest.TestCase):
     def test_declares_ai_provider_dependency(self):
-        self.assertEqual(RagPlugin.dependencies, ("ai_provider",))
+        assert RagPlugin.dependencies == ("ai_provider",)
 
 
-class RagDbTest(unittest.IsolatedAsyncioTestCase):
+class TestRagDb:
     """库层测试（内存库 + 核心 init_schema，不触碰应用数据库文件）。"""
 
-    async def asyncSetUp(self):
+    @pytest.fixture(autouse=True)
+    async def _autouse_setup(self):
         self.db = await aiosqlite.connect(":memory:")
         self.db.row_factory = aiosqlite.Row
         await init_schema(self.db)
         from briefdesk.plugins.rag.db import ensure_rag_schema
 
         await ensure_rag_schema(self.db)
-
-    async def asyncTearDown(self):
+        yield
         await self.db.close()
-
     @staticmethod
     def _row(msg_id="m1", content="周六6点开会有通知，别迟到", item_id="", ts=1700000000):
         from briefdesk.plugins.rag.db import ChunkRow
@@ -180,8 +180,8 @@ class RagDbTest(unittest.IsolatedAsyncioTestCase):
             row = await cursor.fetchone()
         finally:
             await cursor.close()
-        self.assertEqual(row["c"], 1)
-        self.assertEqual(row["item_id"], "i9")
+        assert row["c"] == 1
+        assert row["item_id"] == "i9"
 
     async def test_upsert_chunks_backfill_empty_item_id_preserves_existing(self):
         """复核 P0-1：回填重建的 ChunkRow 不带 item_id（空串），冲突覆盖不得
@@ -195,7 +195,7 @@ class RagDbTest(unittest.IsolatedAsyncioTestCase):
             row = await cursor.fetchone()
         finally:
             await cursor.close()
-        self.assertEqual(row["item_id"], "i9")  # 保留既有引用，不被清空
+        assert row["item_id"] == "i9"  # 保留既有引用，不被清空
 
     async def test_fts_trigram_long_query_hits(self):
         from briefdesk.plugins.rag.db import (
@@ -205,12 +205,12 @@ class RagDbTest(unittest.IsolatedAsyncioTestCase):
             upsert_chunks,
         )
 
-        self.assertTrue(await ensure_fts(self.db))
+        assert await ensure_fts(self.db)
         await _seed_session(self.db, "weflow-legacy", "s1", enabled=1, is_group=1)
         await upsert_chunks(self.db, [self._row()])  # 事实源先行（fts_search 读它）
         await sync_fts(self.db, [self._row()])
         hits = await fts_search(self.db, "有通知", limit=10)  # ≥3 字符走 FTS MATCH
-        self.assertEqual([h.msg_id for h in hits], ["m1"])
+        assert [h.msg_id for h in hits] == ["m1"]
 
     async def test_short_chinese_query_like_fallback(self):
         from briefdesk.plugins.rag.db import (
@@ -225,8 +225,8 @@ class RagDbTest(unittest.IsolatedAsyncioTestCase):
         await upsert_chunks(self.db, [self._row()])
         await sync_fts(self.db, [self._row()])
         hits = await fts_search(self.db, "开会", limit=10)  # 2 字符：trigram 盲区 → LIKE
-        self.assertEqual([h.msg_id for h in hits], ["m1"])
-        self.assertEqual(await fts_search(self.db, "%", limit=10), [])  # 通配符不越权
+        assert [h.msg_id for h in hits] == ["m1"]
+        assert await fts_search(self.db, "%", limit=10) == []  # 通配符不越权
 
     async def test_mixed_length_tokens_route_to_like(self):
         # 整串 ≥3 字但含 2 字词：逐词判定必须走 LIKE 兜底（否则 FTS 零命中）
@@ -242,7 +242,7 @@ class RagDbTest(unittest.IsolatedAsyncioTestCase):
         await upsert_chunks(self.db, [self._row()])
         await sync_fts(self.db, [self._row()])
         hits = await fts_search(self.db, "开会 别迟到", limit=10)
-        self.assertEqual([h.msg_id for h in hits], ["m1"])
+        assert [h.msg_id for h in hits] == ["m1"]
 
     async def test_fts_session_filter(self):
         from briefdesk.plugins.rag.db import (
@@ -263,13 +263,13 @@ class RagDbTest(unittest.IsolatedAsyncioTestCase):
             self.db, "有通知", limit=10, session_id="s1",
             enabled_group_only=True,
         )
-        self.assertEqual([h.msg_id for h in hits], ["m1"])
+        assert [h.msg_id for h in hits] == ["m1"]
         # session 收窄：s2 为启用群聊，收窄后返回 m2 而非 s1 的 m1
         narrowed = await fts_search(
             self.db, "有通知", limit=10, session_id="s2",
             enabled_group_only=True,
         )
-        self.assertEqual([h.msg_id for h in narrowed], ["m2"])
+        assert [h.msg_id for h in narrowed] == ["m2"]
         # 私聊会话被群聊作用域排除（enabled=1 但 is_group=0）
         cursor = await self.db.execute(
             "INSERT OR IGNORE INTO sessions VALUES('weflow-legacy','priv','p',0,0,1,"
@@ -284,7 +284,7 @@ class RagDbTest(unittest.IsolatedAsyncioTestCase):
             self.db, "有通知", limit=10, session_id="priv",
             enabled_group_only=True,
         )
-        self.assertEqual(none, [])
+        assert none == []
 
     async def test_embeddings_watermark_semantics_and_corrupt_row(self):
         from briefdesk.plugins.rag.db import (
@@ -302,29 +302,27 @@ class RagDbTest(unittest.IsolatedAsyncioTestCase):
         )
         raw, watermark = await fetch_new_embeddings(self.db, "old-model", "")
         entries, _bad = parse_embedding_rows(raw)
-        self.assertEqual([c.msg_id for c, _ in entries], ["m1", "m2"])
-        self.assertEqual(
-            [round(x, 5) for x in entries[0][1].tolist()], [0.1, 0.2]
-        )
-        self.assertEqual(watermark, "t0")
+        assert [c.msg_id for c, _ in entries] == ["m1", "m2"]
+        assert [round(x, 5) for x in entries[0][1].tolist()] == [0.1, 0.2]
+        assert watermark == "t0"
         # 闭区间 >=：同秒提交的新行不会被严格大于漏掉（W1/N3）
         await upsert_chunks(self.db, [self._row("m3")])
         await upsert_embeddings(self.db, [("weflow-legacy", "m3")], [[0.5]], "old-model", "t0")
         raw_same, _ = await fetch_new_embeddings(self.db, "old-model", watermark)
-        self.assertEqual([r["msg_id"] for r in raw_same], ["m1", "m2", "m3"])  # 闭区间幂等重取
+        assert [r["msg_id"] for r in raw_same] == ["m1", "m2", "m3"]  # 闭区间幂等重取
         # 同水位再拉：仍返回边界秒全部行（引擎侧按键覆盖去重，幂等无害）
         raw2, wm2 = await fetch_new_embeddings(self.db, "old-model", "t0")
-        self.assertEqual(sorted(r["msg_id"] for r in raw2), ["m1", "m2", "m3"])
-        self.assertEqual(wm2, "t0")
+        assert sorted(r["msg_id"] for r in raw2) == ["m1", "m2", "m3"]
+        assert wm2 == "t0"
         # 模型变更后旧行失配
         raw3, _ = await fetch_new_embeddings(self.db, "new-model", "")
-        self.assertEqual(raw3, [])
+        assert raw3 == []
         # 重嵌入覆盖（新水位）
         await upsert_embeddings(self.db, [("weflow-legacy", "m1")], [[0.9]], "new-model", "t1")
         raw4, wm4 = await fetch_new_embeddings(self.db, "new-model", "")
         entries4, _ = parse_embedding_rows(raw4)
-        self.assertEqual([c.msg_id for c, _ in entries4], ["m1"])
-        self.assertEqual(wm4, "t1")
+        assert [c.msg_id for c, _ in entries4] == ["m1"]
+        assert wm4 == "t1"
         # 脏 JSON 行：解析报坏键，删除后反连接下一轮自动重嵌入
         cursor = await self.db.execute(
             "UPDATE rag_chunk_embeddings SET embedding='not-json' WHERE msg_id='m1'"
@@ -333,8 +331,8 @@ class RagDbTest(unittest.IsolatedAsyncioTestCase):
         await self.db.commit()
         raw5, _ = await fetch_new_embeddings(self.db, "new-model", "")
         entries5, bad5 = parse_embedding_rows(raw5)
-        self.assertEqual(bad5, [("weflow-legacy", "m1")])
-        self.assertEqual(entries5, [])
+        assert bad5 == [("weflow-legacy", "m1")]
+        assert entries5 == []
 
     async def test_gc_orphans_across_connections(self):
         from briefdesk.plugins.rag.db import gc_orphans, upsert_chunks
@@ -342,13 +340,13 @@ class RagDbTest(unittest.IsolatedAsyncioTestCase):
         await self._seed_raw("keep")
         await upsert_chunks(self.db, [self._row("keep"), self._row("orphan")])
         removed = await gc_orphans(self.db, self.db)  # 主/向量同连（测试态）
-        self.assertGreaterEqual(removed, 1)
+        assert removed >= 1
         cursor = await self.db.execute("SELECT msg_id FROM rag_chunks")
         try:
             ids = {r["msg_id"] for r in await cursor.fetchall()}
         finally:
             await cursor.close()
-        self.assertEqual(ids, {"keep"})
+        assert ids == {"keep"}
 
     async def test_count_status_shape(self):
         from briefdesk.plugins.rag.db import count_status, ensure_fts, upsert_chunks
@@ -356,8 +354,8 @@ class RagDbTest(unittest.IsolatedAsyncioTestCase):
         await ensure_fts(self.db)
         await upsert_chunks(self.db, [self._row()])
         status = await count_status(self.db)
-        self.assertEqual(status["rag_chunks"], 1)
-        self.assertEqual(status["fts_tokenizer"], "trigram")
+        assert status["rag_chunks"] == 1
+        assert status["fts_tokenizer"] == "trigram"
 
     async def test_ensure_fts_reconciles_existing_table_tokenizer(self):
         # 历史 unicode61 表 + meta 缺失：不得误报 trigram（IF NOT EXISTS 短路）
@@ -368,18 +366,19 @@ class RagDbTest(unittest.IsolatedAsyncioTestCase):
         await cursor.close()
         from briefdesk.plugins.rag.db import ensure_fts, get_meta
 
-        self.assertTrue(await ensure_fts(self.db))
-        self.assertEqual(await get_meta(self.db, "fts_tokenizer"), "unicode61")
+        assert await ensure_fts(self.db)
+        assert await get_meta(self.db, "fts_tokenizer") == "unicode61"
 
 
 def _dynamic_embed(texts):
     return [[min(float(len(t)), 100.0), 0.0] for t in texts]
 
 
-class _MemoryEngineBase(unittest.IsolatedAsyncioTestCase):
+class _MemoryEngineBase:
     """公共基座：内存库 + 动态假嵌入供应商 + 会话白名单种子。"""
 
-    async def asyncSetUp(self):
+    @pytest.fixture(autouse=True)
+    async def _autouse_setup(self):
         from briefdesk import ai_ports
         from briefdesk.db import init_schema
         from briefdesk.plugins.rag.config import RagSettings as RS
@@ -400,14 +399,12 @@ class _MemoryEngineBase(unittest.IsolatedAsyncioTestCase):
 
         self.engine = RagEngine(RS(), db_factory=_factory, embed_factory=_factory)
         await _seed_session(self.db, "weflow-legacy", "s1", enabled=1, is_group=1)
-
-    async def asyncTearDown(self):
+        yield
         from briefdesk import ai_ports
 
         ai_ports.set_ai(None)
         await self.engine.teardown()
         await self.db.close()
-
     async def _index(self, messages, inserted_pairs=()):
         from briefdesk.types import ClassifyResult, InsertedRow
 
@@ -422,14 +419,14 @@ class _MemoryEngineBase(unittest.IsolatedAsyncioTestCase):
         return batch
 
 
-class RagIndexTest(_MemoryEngineBase):
+class TestRagIndex(_MemoryEngineBase):
     """索引路径：before_run 锁外预嵌入 / run 锁内落库。"""
 
     async def test_index_writes_chunks_fts_embeddings_and_item_map(self):
         m1 = _msg("m1", "周六6点开会有通知")
         m2 = _msg("m2", "学术讲座在周五下午", ts=1700003600)
         batch = await self._index([m1, m2], [(m1, "i1")])
-        self.assertEqual(batch.inserted[0].item_id, "i1")
+        assert batch.inserted[0].item_id == "i1"
 
         cursor = await self.db.execute(
             "SELECT msg_id, item_id FROM rag_chunks ORDER BY msg_id"
@@ -438,10 +435,10 @@ class RagIndexTest(_MemoryEngineBase):
             rows = [dict(r) for r in await cursor.fetchall()]
         finally:
             await cursor.close()
-        self.assertEqual(rows, [
+        assert rows == [
             {"msg_id": "m1", "item_id": "i1"},
             {"msg_id": "m2", "item_id": ""},
-        ])
+        ]
         cursor = await self.db.execute(
             "SELECT COUNT(*) AS c FROM rag_chunk_embeddings WHERE model='test-model'"
         )
@@ -449,14 +446,14 @@ class RagIndexTest(_MemoryEngineBase):
             row = await cursor.fetchone()
         finally:
             await cursor.close()
-        self.assertEqual(row["c"], 2)
+        assert row["c"] == 2
         cursor = await self.db.execute("SELECT COUNT(*) AS c FROM rag_fts")
         try:
             row = await cursor.fetchone()
         finally:
             await cursor.close()
-        self.assertEqual(row["c"], 2)
-        self.assertFalse(batch.preembeddings)  # 本批向量全部被消费
+        assert row["c"] == 2
+        assert not batch.preembeddings  # 本批向量全部被消费
 
     async def test_embed_failure_still_indexes_content_and_kicks_once(self):
         kicks: list[int] = []
@@ -468,11 +465,11 @@ class RagIndexTest(_MemoryEngineBase):
             row = await cursor.fetchone()
         finally:
             await cursor.close()
-        self.assertEqual(row["c"], 0)
+        assert row["c"] == 0
         # 内容已入索引；降级自愈踢一次，且失败未恢复前不重复踢
-        self.assertEqual(kicks, [1])
+        assert kicks == [1]
         await self._index([_msg("m2", "第二条消息")])
-        self.assertEqual(kicks, [1])
+        assert kicks == [1]
 
     async def test_placeholder_content_not_indexed(self):
         """纯占位符不入索引，口径与 pipeline 入口同源（多片段/非白名单变体）。"""
@@ -492,7 +489,7 @@ class RagIndexTest(_MemoryEngineBase):
             ids = {r["msg_id"] for r in await cursor.fetchall()}
         finally:
             await cursor.close()
-        self.assertEqual(ids, {"p2", "p6"})
+        assert ids == {"p2", "p6"}
 
     async def test_scope_excludes_disabled_session_at_ingest(self):
         await _seed_session(self.db, "weflow-legacy", "off", enabled=0, is_group=1)
@@ -505,16 +502,17 @@ class RagIndexTest(_MemoryEngineBase):
             ids = {r["msg_id"] for r in await cursor.fetchall()}
         finally:
             await cursor.close()
-        self.assertEqual(ids, {"a1"})
+        assert ids == {"a1"}
 
 
-class RagBackfillTest(_MemoryEngineBase):
+class TestRagBackfill(_MemoryEngineBase):
     """历史回填：窗口/预算/续跑/换模型重嵌入/守卫。"""
 
-    async def asyncSetUp(self):
-        await super().asyncSetUp()
+    @pytest.fixture(autouse=True)
+    async def _sub_setup(self):
         self.now = 1_800_000_000
         self.day = 86400
+        yield
 
     async def _seed(self, msg_id, age_days, session_id="s1", content=None):
         cursor = await self.db.execute(
@@ -557,7 +555,7 @@ class RagBackfillTest(_MemoryEngineBase):
         await self._seed("on1", 1, session_id="s1")
         await self._seed("off1", 1, session_id="off")
         await self.engine.backfill_step(self.now)
-        self.assertEqual(await self._chunk_ids(), ["on1"])
+        assert await self._chunk_ids() == ["on1"]
 
     async def test_group_only_excludes_private_at_backfill(self):
         """RAG_GROUP_ONLY 开启时私聊历史不入索引（回填侧 group_only 分支）。"""
@@ -569,7 +567,7 @@ class RagBackfillTest(_MemoryEngineBase):
         await self._seed("g1", 1, session_id="s1")
         await self._seed("p1", 1, session_id="priv")
         await self.engine.backfill_step(self.now)
-        self.assertEqual(await self._chunk_ids(), ["g1"])
+        assert await self._chunk_ids() == ["g1"]
 
     async def test_window_budget_resume_and_blank_exclusion(self):
         from briefdesk.plugins.rag.config import RagSettings as RS
@@ -580,10 +578,10 @@ class RagBackfillTest(_MemoryEngineBase):
         await self._seed("d3", 3)
         await self._seed("blank", 2, content="   ")  # 空白：SQL trim 过滤，不耗预算
         await self._seed("d1", 1)
-        self.assertEqual(await self.engine.backfill_step(self.now), 2)
-        self.assertEqual(sorted(await self._chunk_ids()), ["d1", "d3"])
-        self.assertEqual(await self.engine.backfill_step(self.now), 0)  # 排空完成
-        self.assertEqual(sorted(await self._chunk_ids()), ["d1", "d3"])
+        assert await self.engine.backfill_step(self.now) == 2
+        assert sorted(await self._chunk_ids()) == ["d1", "d3"]
+        assert await self.engine.backfill_step(self.now) == 0  # 排空完成
+        assert sorted(await self._chunk_ids()) == ["d1", "d3"]
 
     async def test_placeholder_rows_do_not_starve_budget_window(self):
         """审查回归：纯占位符行不可索引却永远满足反连接——旧实现中它们每轮
@@ -601,8 +599,8 @@ class RagBackfillTest(_MemoryEngineBase):
         await self._seed("ph2", 1, content="[图片][图片]")
         await self._seed("real", 3)
         # 第一轮：占位符被消费出队（登记 skipped），不入 chunks
-        self.assertEqual(await self.engine.backfill_step(self.now), 2)
-        self.assertEqual(await self._chunk_ids(), [])
+        assert await self.engine.backfill_step(self.now) == 2
+        assert await self._chunk_ids() == []
         cursor = await self.db.execute(
             "SELECT msg_id FROM rag_skipped ORDER BY msg_id"
         )
@@ -610,11 +608,11 @@ class RagBackfillTest(_MemoryEngineBase):
             skipped = [r["msg_id"] for r in await cursor.fetchall()]
         finally:
             await cursor.close()
-        self.assertEqual(skipped, ["ph1", "ph2"])
+        assert skipped == ["ph1", "ph2"]
         # 第二轮：skipped 排除后窗口推进到真实消息
-        self.assertEqual(await self.engine.backfill_step(self.now), 1)
-        self.assertEqual(await self._chunk_ids(), ["real"])
-        self.assertEqual(await self.engine.backfill_step(self.now), 0)
+        assert await self.engine.backfill_step(self.now) == 1
+        assert await self._chunk_ids() == ["real"]
+        assert await self.engine.backfill_step(self.now) == 0
 
     async def test_short_provider_return_guard(self):
         from briefdesk.plugins.rag.config import RagSettings as RS
@@ -634,12 +632,12 @@ class RagBackfillTest(_MemoryEngineBase):
         await self.engine.backfill_step(self.now)
         # 短返回批次整段截断：不留错位向量
         counts = await self._embed_count_by_model()
-        self.assertEqual(counts.get("test-model", 0), 0)
-        self.assertTrue(self.engine.last_cycle_embed_failed)
+        assert counts.get("test-model", 0) == 0
+        assert self.engine.last_cycle_embed_failed
         # 下一轮恢复正常：反连接重新选取并补齐
         await self.engine.backfill_step(self.now)
         counts = await self._embed_count_by_model()
-        self.assertEqual(counts.get("test-model"), 2)
+        assert counts.get("test-model") == 2
 
     async def _fts_ids(self):
         cursor = await self.db.execute("SELECT msg_id FROM rag_fts ORDER BY msg_id")
@@ -661,16 +659,16 @@ class RagBackfillTest(_MemoryEngineBase):
         await self._seed("h1", 1, content="羽毛球社周三训练")
         await self._seed("h2", 2, content="辩论社周五例会")
 
-        self.assertEqual(await self.engine.backfill_step(self.now), 2)
+        assert await self.engine.backfill_step(self.now) == 2
         # _fts_enabled 由 _ensure_db_ready 建表时定，故在回填之后断言
-        self.assertTrue(self.engine._fts_enabled, "本用例需要 FTS 可用")
-        self.assertEqual(await self._chunk_ids(), ["h1", "h2"])
-        self.assertEqual(await self._fts_ids(), ["h1", "h2"])
+        assert self.engine._fts_enabled, "本用例需要 FTS 可用"
+        assert await self._chunk_ids() == ["h1", "h2"]
+        assert await self._fts_ids() == ["h1", "h2"]
 
         # 端到端：只有 FTS 真的写进去了，纯关键词问题才检索得到
         hits = await self.engine.retrieve("辩论社")
-        self.assertIsNotNone(hits)
-        self.assertIn("h2", [h.chunk.msg_id for h in hits])
+        assert hits is not None
+        assert "h2" in [h.chunk.msg_id for h in hits]
 
     async def test_backfill_without_fts_still_indexes_chunks(self):
         """FTS 不可用（降级纯向量）时回填照常入 chunks，不因缺 FTS 中断。"""
@@ -679,27 +677,27 @@ class RagBackfillTest(_MemoryEngineBase):
         self.engine._fts_enabled = False
         self.engine.settings = RS(backfill_days=-1)
         await self._seed("n1", 1)
-        self.assertEqual(await self.engine.backfill_step(self.now), 1)
-        self.assertEqual(await self._chunk_ids(), ["n1"])
-        self.assertEqual(await self._embed_count_by_model(), {"test-model": 1})
+        assert await self.engine.backfill_step(self.now) == 1
+        assert await self._chunk_ids() == ["n1"]
+        assert await self._embed_count_by_model() == {"test-model": 1}
 
     async def test_full_off_and_model_switch(self):
         from briefdesk.plugins.rag.config import RagSettings as RS
 
         self.engine.settings = RS(backfill_days=0)
         await self._seed("x", 1)
-        self.assertEqual(await self.engine.backfill_step(self.now), 0)  # 关闭
+        assert await self.engine.backfill_step(self.now) == 0  # 关闭
         self.engine.settings = RS(backfill_days=-1)
         await self._seed("y", 2)
-        self.assertEqual(await self.engine.backfill_step(self.now), 2)  # 全量
+        assert await self.engine.backfill_step(self.now) == 2  # 全量
         self.provider.embed_model_name = Mock(return_value="model-b")
         # 换模型触发失配重嵌入（backfill_days=-1 不受影响）
-        self.assertEqual(await self.engine.backfill_step(self.now), 2)
+        assert await self.engine.backfill_step(self.now) == 2
         counts = await self._embed_count_by_model()
-        self.assertEqual(counts.get("model-b"), 2)
+        assert counts.get("model-b") == 2
 
 
-class RagRetrieveTest(_MemoryEngineBase):
+class TestRagRetrieve(_MemoryEngineBase):
     """混合检索：RRF 融合、会话白名单、拒答门。"""
 
     VECTORS: ClassVar[dict[str, list[float]]] = {
@@ -708,8 +706,8 @@ class RagRetrieveTest(_MemoryEngineBase):
         "二手自行车出售": [0.7, 0.7],
     }
 
-    async def asyncSetUp(self):
-        await super().asyncSetUp()
+    @pytest.fixture(autouse=True)
+    async def _sub_setup(self):
 
         def keyed(texts):
             return [list(self.VECTORS.get(t, [0.0, 0.0])) for t in texts]
@@ -722,37 +720,38 @@ class RagRetrieveTest(_MemoryEngineBase):
         ):
             await _seed_session(self.db, "weflow-legacy", session, enabled=1, is_group=1)
             await self._index([_msg(msg_id, content, session_id=session)])
+        yield
 
     async def test_vector_top1(self):
         hits = await self.engine.retrieve("周六6点开会有通知")
         assert hits is not None
-        self.assertEqual(hits[0].chunk.msg_id, "m1")
-        self.assertAlmostEqual(hits[0].cos, 1.0, places=5)
+        assert hits[0].chunk.msg_id == "m1"
+        assert round(abs(hits[0].cos - 1.0), 5) == 0
 
     async def test_empty_question_returns_none(self):
-        self.assertIsNone(await self.engine.retrieve("   "))
+        assert await self.engine.retrieve("   ") is None
 
     async def test_refusal_on_zero_similarity_without_fts(self):
-        self.assertIsNone(await self.engine.retrieve("完全不相关的问题"))
+        assert await self.engine.retrieve("完全不相关的问题") is None
 
     async def test_fts_rescues_low_cosine(self):
         hits = await self.engine.retrieve("开会有通知")
         assert hits is not None
-        self.assertEqual([h.chunk.msg_id for h in hits], ["m1"])
-        self.assertTrue(hits[0].has_fts)
+        assert [h.chunk.msg_id for h in hits] == ["m1"]
+        assert hits[0].has_fts
 
     async def test_query_embed_failure_degrades_to_fts_only(self):
         # F4：查询嵌入失败不再整体拒答——降级 FTS-only，可命中问题仍可回答
         self.provider.embed_texts = AsyncMock(side_effect=RuntimeError("端点不可达"))
         hits = await self.engine.retrieve("开会有通知")
         assert hits is not None
-        self.assertEqual([h.chunk.msg_id for h in hits], ["m1"])
-        self.assertTrue(hits[0].has_fts)
+        assert [h.chunk.msg_id for h in hits] == ["m1"]
+        assert hits[0].has_fts
 
     async def test_session_filter_scopes_both_legs(self):
         hits = await self.engine.retrieve("周六6点开会有通知", session_id="s2")
         assert hits is not None
-        self.assertEqual([h.chunk.msg_id for h in hits], ["m3"])
+        assert [h.chunk.msg_id for h in hits] == ["m3"]
 
     async def test_disabled_or_private_sessions_never_retrievable(self):
         await _seed_session(self.db, "weflow-legacy", "off", enabled=0, is_group=1)
@@ -762,12 +761,12 @@ class RagRetrieveTest(_MemoryEngineBase):
             _msg("p1", "周六6点开会有通知", session_id="priv"),
         ])
         # 停用/私聊内容即时不可问出（查询期现取白名单）
-        self.assertIsNone(await self.engine.retrieve("开会有通知", session_id="off"))
-        self.assertIsNone(await self.engine.retrieve("开会有通知", session_id="priv"))
+        assert await self.engine.retrieve("开会有通知", session_id="off") is None
+        assert await self.engine.retrieve("开会有通知", session_id="priv") is None
         hits = await self.engine.retrieve("开会有通知")
         assert hits is not None
-        self.assertNotIn("o1", [h.chunk.msg_id for h in hits])
-        self.assertNotIn("p1", [h.chunk.msg_id for h in hits])
+        assert "o1" not in [h.chunk.msg_id for h in hits]
+        assert "p1" not in [h.chunk.msg_id for h in hits]
 
 
 def _chat_response(text):
@@ -778,13 +777,13 @@ def _chat_response(text):
     )
 
 
-class RagAskTest(_MemoryEngineBase):
+class TestRagAsk(_MemoryEngineBase):
     """问答路径：引用抽取、无标注回退、拒答不调 AI、失败上抛。"""
 
-    VECTORS = RagRetrieveTest.VECTORS
+    VECTORS = TestRagRetrieve.VECTORS
 
-    async def asyncSetUp(self):
-        await super().asyncSetUp()
+    @pytest.fixture(autouse=True)
+    async def _sub_setup(self):
         self.provider.chat = AsyncMock(
             return_value=_chat_response("活动在周六6点举行 [1]。")
         )
@@ -794,23 +793,24 @@ class RagAskTest(_MemoryEngineBase):
 
         self.provider.embed_texts = AsyncMock(side_effect=keyed)
         await self._index([_msg("m1", "周六6点开会有通知")])
+        yield
 
     async def test_answer_with_citation_subset(self):
         result = await self.engine.ask("周六6点开会有通知")
-        self.assertFalse(result.refused)
-        self.assertEqual([c["msg_id"] for c in result.citations], ["m1"])
-        self.assertEqual(result.citations[0]["n"], 1)
+        assert not result.refused
+        assert [c["msg_id"] for c in result.citations] == ["m1"]
+        assert result.citations[0]["n"] == 1
 
     async def test_citation_fallback_when_unmarked(self):
         self.provider.chat = AsyncMock(return_value=_chat_response("活动在周六6点。"))
         result = await self.engine.ask("周六6点开会有通知")
         # 模型没标 [n]：回退全部证据，保持可核查（有意设计）
-        self.assertEqual([c["msg_id"] for c in result.citations], ["m1"])
+        assert [c["msg_id"] for c in result.citations] == ["m1"]
 
     async def test_refusal_skips_chat(self):
         result = await self.engine.ask("完全不相关的问题")
-        self.assertTrue(result.refused)
-        self.assertEqual(result.citations, [])
+        assert result.refused
+        assert result.citations == []
         self.provider.chat.assert_not_awaited()
 
     async def test_json_contract_answer(self):
@@ -821,13 +821,13 @@ class RagAskTest(_MemoryEngineBase):
             )
         )
         result = await self.engine.ask("周六6点开会有通知")
-        self.assertFalse(result.refused)
-        self.assertEqual(result.answer, "活动在周六6点举行 [1]。")
-        self.assertEqual([c["msg_id"] for c in result.citations], ["m1"])
+        assert not result.refused
+        assert result.answer == "活动在周六6点举行 [1]。"
+        assert [c["msg_id"] for c in result.citations] == ["m1"]
 
     async def test_chat_failure_propagates(self):
         self.provider.chat = AsyncMock(side_effect=RuntimeError("ai down"))
-        with self.assertRaises(RuntimeError):
+        with pytest.raises(RuntimeError):
             await self.engine.ask("周六6点开会有通知")
 
 
@@ -840,15 +840,15 @@ class RagAskTest(_MemoryEngineBase):
         await self._index([_msg("m9", long_content)])
         self.provider.chat = AsyncMock(return_value=_chat_response("答案 [1]。"))
         result = await self.engine.ask("长消息内容")
-        self.assertFalse(result.refused)
+        assert not result.refused
         messages = self.provider.chat.call_args.args[0]
         ev = messages[1]["content"].split("证据：\n")[1]
-        self.assertTrue(ev.endswith("…"))
-        self.assertIn(long_content[:50], ev)
-        self.assertNotIn("独特结尾句", ev)
+        assert ev.endswith("…")
+        assert long_content[:50] in ev
+        assert "独特结尾句" not in ev
 
 
-class PromptFlattenTest(unittest.TestCase):
+class TestPromptFlatten(unittest.TestCase):
     """证据块压平换行：多行原文无法伪造新的「[n] 发送者:」证据行。"""
 
     def test_multiline_content_flattened(self):
@@ -869,7 +869,7 @@ class PromptFlattenTest(unittest.TestCase):
         )
         user = messages[1]["content"]
         evidence_line = user.split("证据：\n")[1]
-        self.assertNotIn("\n", evidence_line)  # 单条证据恒为单行
+        assert "\n" not in evidence_line  # 单条证据恒为单行
 
     def test_history_included_in_prompt_within_cap(self):
         from datetime import datetime
@@ -891,9 +891,9 @@ class PromptFlattenTest(unittest.TestCase):
             ],
         )
         user = messages[1]["content"]
-        self.assertIn("对话历史：", user)
-        self.assertIn("xx活动周六吗", user)
-        self.assertIn("周六6点 [1]。", user)
+        assert "对话历史：" in user
+        assert "xx活动周六吗" in user
+        assert "周六6点 [1]。" in user
 
     def test_history_trimmed_over_cap(self):
         # P7：长历史裁剪——只保留最近 6 轮，并标注省略条数
@@ -907,9 +907,9 @@ class PromptFlattenTest(unittest.TestCase):
             datetime(2026, 1, 1, 12, 0, tzinfo=UTC), "问题？", [], history,
         )
         user = messages[1]["content"]
-        self.assertIn("更早的 4 条对话已省略", user)
-        self.assertNotIn("第0轮", user)
-        self.assertIn("第9轮", user)
+        assert "更早的 4 条对话已省略" in user
+        assert "第0轮" not in user
+        assert "第9轮" in user
 
 
     def test_evidence_truncated_over_cap(self):
@@ -929,9 +929,9 @@ class PromptFlattenTest(unittest.TestCase):
             [Hit(chunk=chunk, cos=1.0, rrf=1.0, has_fts=False)],
         )
         ev = messages[1]["content"].split("证据：\n")[1]
-        self.assertTrue(ev.endswith("…"))
-        self.assertIn(long_content[:600], ev)
-        self.assertNotIn("独特结尾句", ev)
+        assert ev.endswith("…")
+        assert long_content[:600] in ev
+        assert "独特结尾句" not in ev
 
     def test_evidence_not_truncated_within_cap(self):
         from datetime import datetime
@@ -950,14 +950,15 @@ class PromptFlattenTest(unittest.TestCase):
             [Hit(chunk=chunk, cos=1.0, rrf=1.0, has_fts=False)],
         )
         ev = messages[1]["content"].split("证据：\n")[1]
-        self.assertNotIn("…", ev)
-        self.assertIn(content, ev)
+        assert "…" not in ev
+        assert content in ev
 
 
-class RagRouterTest(unittest.IsolatedAsyncioTestCase):
+class TestRagRouter:
     """路由组：ask 形状/校验/503、status 键、reindex 202（TestClient）。"""
 
-    def setUp(self):
+    @pytest.fixture(autouse=True)
+    def _autouse_setup(self):
         from fastapi import FastAPI
         from fastapi.testclient import TestClient
 
@@ -967,7 +968,7 @@ class RagRouterTest(unittest.IsolatedAsyncioTestCase):
         app = FastAPI()
         app.include_router(rag_router_module.router)
         self.client = TestClient(app)
-
+        yield
     def _fake_engine(self):
         from briefdesk.plugins.rag.config import RagSettings as RS
         from briefdesk.plugins.rag.engine import AskResult
@@ -997,27 +998,24 @@ class RagRouterTest(unittest.IsolatedAsyncioTestCase):
         engine = self._fake_engine()
         with patch.object(self.router_module, "get_engine", return_value=engine):
             resp = self.client.post("/api/rag/ask", json={"question": "周六几点开会？"})
-        self.assertEqual(resp.status_code, 200)
+        assert resp.status_code == 200
         body = resp.json()
-        self.assertFalse(body["refused"])
-        self.assertEqual(body["answer"], "周六6点 [1]。")
-        self.assertEqual(body["citations"][0]["session_id"], "s1")
+        assert not body["refused"]
+        assert body["answer"] == "周六6点 [1]。"
+        assert body["citations"][0]["session_id"] == "s1"
 
     def test_ask_validation_and_unready(self):
         from unittest.mock import patch
 
         with patch.object(self.router_module, "get_engine", return_value=None):
             resp = self.client.post("/api/rag/ask", json={"question": "周六几点？"})
-            self.assertEqual(resp.status_code, 503)
+            assert resp.status_code == 503
         engine = self._fake_engine()
         with patch.object(self.router_module, "get_engine", return_value=engine):
-            self.assertEqual(
-                self.client.post("/api/rag/ask", json={"question": "短"}).status_code,
-                422,
-            )
+            assert self.client.post("/api/rag/ask", json={"question": "短"}).status_code == 422
             # 纯空白：min_length 放行但 strip 校验拦截 → 422 而非 200 拒答
             resp = self.client.post("/api/rag/ask", json={"question": "   "})
-            self.assertEqual(resp.status_code, 422)
+            assert resp.status_code == 422
             # history：非法角色/非字符串被滤除，合法条目被转发
             resp = self.client.post(
                 "/api/rag/ask",
@@ -1031,12 +1029,12 @@ class RagRouterTest(unittest.IsolatedAsyncioTestCase):
                     ],
                 },
             )
-            self.assertEqual(resp.status_code, 200)
+            assert resp.status_code == 200
             args = engine.ask.call_args.args
-            self.assertEqual(args[2], [
+            assert args[2] == [
                 {"role": "user", "content": "刚才问了活动"},
                 {"role": "assistant", "content": "好的"},
-            ])
+            ]
 
     async def test_status_and_reindex(self):
         from unittest.mock import AsyncMock, patch
@@ -1057,19 +1055,19 @@ class RagRouterTest(unittest.IsolatedAsyncioTestCase):
                 ),
             ):
                 status = self.client.get("/api/rag/status")
-                self.assertEqual(status.status_code, 200)
+                assert status.status_code == 200
                 for key in ("chunks", "embedded", "fts_tokenizer", "model",
                             "backfill_days"):
-                    self.assertIn(key, status.json())
+                    assert key in status.json()
                 reindex = self.client.post("/api/rag/reindex")
-                self.assertEqual(reindex.status_code, 202)
-                self.assertTrue(reindex.json()["kicked"])
+                assert reindex.status_code == 202
+                assert reindex.json()["kicked"]
                 engine.request_backfill.assert_called_once()
         finally:
             await db.close()
 
 
-class MaintenanceLoopTest(unittest.IsolatedAsyncioTestCase):
+class TestMaintenanceLoop:
     """维护循环：GC 对账 + 失败退避观测位（引擎层单元）。"""
 
     async def test_maintenance_gc_removes_orphans_on_both_connections(self):
@@ -1109,20 +1107,20 @@ class MaintenanceLoopTest(unittest.IsolatedAsyncioTestCase):
             await cursor.close()
             await edb.commit()
             removed = await engine.maintenance_gc()
-            self.assertGreaterEqual(removed, 1)
+            assert removed >= 1
             cursor = await edb.execute("SELECT COUNT(*) AS c FROM rag_chunk_embeddings")
             try:
                 row = await cursor.fetchone()
             finally:
                 await cursor.close()
-            self.assertEqual(row["c"], 0)
+            assert row["c"] == 0
             await engine.teardown()
         finally:
             await db.close()
             await edb.close()
 
 
-class RagCrossSourceScopeTest(_MemoryEngineBase):
+class TestRagCrossSourceScope(_MemoryEngineBase):
     """作用域判定按 (source, session_id) 元组——跨源撞名不放行（回归）。"""
 
     async def test_legacy_row_from_disabled_source_not_retrievable(self):
@@ -1154,10 +1152,10 @@ class RagCrossSourceScopeTest(_MemoryEngineBase):
         )
         await self.engine.warm_vectors()
         # 查询期白名单为 (qqflow,s1)：遗留 (weflow-legacy,s1) 行不可见（检索全哑→None）
-        self.assertIsNone(await self.engine.retrieve("周六6点开会有通知"))
+        assert await self.engine.retrieve("周六6点开会有通知") is None
 
 
-class RagWarmVectorsForceFullTest(_MemoryEngineBase):
+class TestRagWarmVectorsForceFull(_MemoryEngineBase):
     """复核 P1-4：warm_vectors(force_full=True) 必须按 key 差集剔除已删条目，
     否则「行数回退→整表重建」信号被归零计数吞掉，已删内容持续可检索。"""
 
@@ -1180,7 +1178,7 @@ class RagWarmVectorsForceFullTest(_MemoryEngineBase):
             self.db, [("weflow-legacy", "m1")], [[1.0, 0.0]], "test-model", "t0"
         )
         await self.engine.warm_vectors()
-        self.assertIn(("weflow-legacy", "m1"), self.engine._vec_entries)
+        assert ("weflow-legacy", "m1") in self.engine._vec_entries
 
         # 模拟 GC 删除向量行（chunk 保留，仅向量行被删）
         cursor = await self.db.execute(
@@ -1192,15 +1190,11 @@ class RagWarmVectorsForceFullTest(_MemoryEngineBase):
 
         # force_full 整表重建：已删 key 必须从内存缓存剔除
         await self.engine.warm_vectors(force_full=True)
-        self.assertNotIn(
-            ("weflow-legacy", "m1"),
-            self.engine._vec_entries,
-            "force_full 后已删向量 key 必须从内存缓存剔除",
-        )
-        self.assertEqual(len(self.engine._matrix_keys), 0, "矩阵须同步清空")
+        assert ("weflow-legacy", "m1") not in self.engine._vec_entries, "force_full 后已删向量 key 必须从内存缓存剔除"
+        assert len(self.engine._matrix_keys) == 0, "矩阵须同步清空"
 
 
-class RagFreshDbDays0Test(unittest.IsolatedAsyncioTestCase):
+class TestRagFreshDbDays0:
     """days=0 时维护路径在全新库上也安全空转（回归：早退先于建表曾致循环崩溃）。"""
 
     async def test_days0_fresh_db_safe(self):
@@ -1225,7 +1219,7 @@ class RagFreshDbDays0Test(unittest.IsolatedAsyncioTestCase):
         engine = RagEngine(RS(backfill_days=0), db_factory=_factory,
                            embed_factory=_factory)
         try:
-            self.assertEqual(await engine.backfill_step(1_800_000_000), 0)
+            assert await engine.backfill_step(1_800_000_000) == 0
             await engine.warm_vectors()      # 不应抛 no such table
             await engine.maintenance_gc()    # 同上
             cursor = await db.execute(
@@ -1235,14 +1229,14 @@ class RagFreshDbDays0Test(unittest.IsolatedAsyncioTestCase):
                 row = await cursor.fetchone()
             finally:
                 await cursor.close()
-            self.assertIsNotNone(row)  # days=0 也完成了建表
+            assert row is not None  # days=0 也完成了建表
         finally:
             await engine.teardown()
             ai_ports.set_ai(None)
             await db.close()
 
 
-class RagChatRoutingTest(unittest.IsolatedAsyncioTestCase):
+class TestRagChatRouting:
     """RAG 模型通道路由：供应商类声明 rag_chat → 走专用通道；否则回退复用 chat。"""
 
     async def test_uses_rag_chat_when_provider_implements(self):
@@ -1265,7 +1259,7 @@ class RagChatRoutingTest(unittest.IsolatedAsyncioTestCase):
         ai_ports.set_ai(p)  # type: ignore[arg-type]
         try:
             await ai_ports.rag_chat([{"role": "user", "content": "x"}])
-            self.assertEqual(p.used, "rag")
+            assert p.used == "rag"
         finally:
             ai_ports.set_ai(None)
 
@@ -1299,14 +1293,11 @@ class RagChatRoutingTest(unittest.IsolatedAsyncioTestCase):
                 api_base="https://example.invalid/v1",
                 api_key="rag-key",
             )
-            self.assertEqual(
-                p.seen,
-                {
+            assert p.seen == {
                     "model": "qwen-plus",
                     "api_base": "https://example.invalid/v1",
                     "api_key": "rag-key",
-                },
-            )
+                }
         finally:
             ai_ports.set_ai(None)
 
@@ -1324,7 +1315,7 @@ class RagChatRoutingTest(unittest.IsolatedAsyncioTestCase):
         ai_ports.set_ai(p)  # type: ignore[arg-type]
         try:
             await ai_ports.rag_chat([{"role": "user", "content": "x"}])
-            self.assertEqual(p.used, "chat")
+            assert p.used == "chat"
         finally:
             ai_ports.set_ai(None)
 
@@ -1352,12 +1343,12 @@ class RagChatRoutingTest(unittest.IsolatedAsyncioTestCase):
                 api_key="rag-key",
             )
             # chat 只收到通用参数，override 未泄漏为未知 kwarg（否则 TypeError）
-            self.assertEqual(p.kwargs, {"temperature": 0.2, "max_tokens": 1024})
+            assert p.kwargs == {"temperature": 0.2, "max_tokens": 1024}
         finally:
             ai_ports.set_ai(None)
 
 
-class DeleteEventGcTest(unittest.IsolatedAsyncioTestCase):
+class TestDeleteEventGc:
     """【复核 P2-24】卡片删除事件触发即时孤儿对账（此前最长滞留一个维护
     周期，已删内容仍可被 /api/rag/ask 引用——与停用会话即时生效不对齐）。"""
 
@@ -1371,9 +1362,9 @@ class DeleteEventGcTest(unittest.IsolatedAsyncioTestCase):
         await plugin.setup(ctx)
         plugin._engine.maintenance_gc = AsyncMock()
         try:
-            self.assertIn(EVENT_ITEMS_DELETED, subscribed)
+            assert EVENT_ITEMS_DELETED in subscribed
             plugin._on_items_deleted(["i1"])
-            self.assertIsNotNone(plugin._gc_task)
+            assert plugin._gc_task is not None
             await plugin._gc_task
             plugin._engine.maintenance_gc.assert_awaited_once()
         finally:
@@ -1388,7 +1379,7 @@ class DeleteEventGcTest(unittest.IsolatedAsyncioTestCase):
             plugin._on_items_deleted(["i1"])
             task = plugin._gc_task
             plugin._on_items_deleted(["i2"])
-            self.assertIs(plugin._gc_task, task, "待跑/在跑 GC 期间不重复 spawn")
+            assert plugin._gc_task is task, "待跑/在跑 GC 期间不重复 spawn"
             await plugin._gc_task
         finally:
             await plugin.teardown()
@@ -1413,14 +1404,14 @@ class DeleteEventGcTest(unittest.IsolatedAsyncioTestCase):
             plugin._on_items_deleted(["i1"])
             first = plugin._gc_task
             plugin._on_items_deleted(["i2"])  # GC 在跑期间的删除
-            self.assertTrue(plugin._gc_dirty, "在跑 GC 期间删除应置脏标志")
+            assert plugin._gc_dirty, "在跑 GC 期间删除应置脏标志"
             release.set()
             await first
             second = plugin._gc_task
-            self.assertIsNot(second, first, "收尾应补调度第二轮 GC")
+            assert second is not first, "收尾应补调度第二轮 GC"
             await second
-            self.assertEqual(rounds, 2)
-            self.assertFalse(plugin._gc_dirty, "补账轮应清脏标志")
+            assert rounds == 2
+            assert not plugin._gc_dirty, "补账轮应清脏标志"
         finally:
             await plugin.teardown()
 
@@ -1434,7 +1425,7 @@ class DeleteEventGcTest(unittest.IsolatedAsyncioTestCase):
             plugin._on_items_deleted(["i1"])
             await plugin._gc_task
             plugin._engine.maintenance_gc.assert_awaited_once()
-            self.assertFalse(plugin._gc_dirty)
+            assert not plugin._gc_dirty
         finally:
             await plugin.teardown()
 
@@ -1446,11 +1437,11 @@ class DeleteEventGcTest(unittest.IsolatedAsyncioTestCase):
         plugin._engine.maintenance_gc = AsyncMock()
         plugin._gc_dirty = True
         await plugin.teardown()
-        self.assertFalse(plugin._gc_dirty)
-        self.assertIsNone(plugin._gc_task)
+        assert not plugin._gc_dirty
+        assert plugin._gc_task is None
 
 
-class ActivatePrepareUnderLockTest(unittest.IsolatedAsyncioTestCase):
+class TestActivatePrepareUnderLock:
     """activate 先持 storage_lock 预热建表，早于维护循环首个
     backfill_step；prepare 不关闭共享连接；activate 失败不残留任务。"""
 
@@ -1499,18 +1490,13 @@ class ActivatePrepareUnderLockTest(unittest.IsolatedAsyncioTestCase):
             ):
                 await plugin.activate(ctx)
             await asyncio.sleep(0.05)  # 让维护循环跑到首个 backfill_step
-            self.assertTrue(engine._schema_ready, "预热应完成建表")
-            self.assertEqual(
-                events[:3], ["enter", "prepare", "exit"], "预热必须发生在锁内"
-            )
-            self.assertIn("backfill", events)
-            self.assertLess(
-                events.index("exit"), events.index("backfill"),
-                "预热必须早于维护循环首个 backfill_step",
-            )
+            assert engine._schema_ready, "预热应完成建表"
+            assert events[:3] == ["enter", "prepare", "exit"], "预热必须发生在锁内"
+            assert "backfill" in events
+            assert events.index("exit") < events.index("backfill"), "预热必须早于维护循环首个 backfill_step"
             # prepare 不承担 close 责任：主连接仍可用
             cur = await memory_db.execute("SELECT 1 AS ok")
-            self.assertEqual((await cur.fetchone())["ok"], 1)
+            assert (await cur.fetchone())["ok"] == 1
         finally:
             await memory_db.close()
             await plugin.teardown()
@@ -1528,9 +1514,9 @@ class ActivatePrepareUnderLockTest(unittest.IsolatedAsyncioTestCase):
 
         plugin._engine.prepare = boom  # type: ignore[method-assign]
         try:
-            with self.assertRaises(RuntimeError):
+            with pytest.raises(RuntimeError):
                 await plugin.activate(ctx)
-            self.assertIsNone(plugin._backfill_task, "失败路径不得残留任务")
+            assert plugin._backfill_task is None, "失败路径不得残留任务"
         finally:
             await memory_db.close()
             await plugin.teardown()
