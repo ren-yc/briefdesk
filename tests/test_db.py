@@ -1036,20 +1036,20 @@ class TestCloseDbLatch:
     """
 
     @pytest.fixture(autouse=True)
-    async def _autouse_setup(self):
+    async def _autouse_setup(self, temp_db):
         import briefdesk.db as db_module
 
         self._db_module = db_module
         self._saved_closed = db_module._db_closed
-        self._tmpdir = tempfile.TemporaryDirectory()
+        # 共享夹具 temp_db 提供真实文件库**路径**（生命周期由 tmp_path 托管）
+        self._db_path = temp_db
         # 门闩是模块级终态标志，测后必须复位，防污染同进程后续用例
         yield
-        self._tmpdir.cleanup()
         db_module._db_closed = self._saved_closed
     async def test_get_db_and_get_embed_db_rejected_after_close(self):
         from briefdesk.db import get_embed_db
 
-        db_path = os.path.join(self._tmpdir.name, "latch.sqlite")
+        db_path = self._db_path
         with patch.object(config, "db_path", db_path):
             await get_db()  # 真实连接（全新文件，_init_connection 幂等建表）
             assert not self._db_module._db_closed

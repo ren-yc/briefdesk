@@ -43,12 +43,6 @@ def _ctx(provider=None):
     return ctx, registered_stages, routers, assets
 
 
-def _embed_provider(enabled=True):
-    provider = Mock()
-    provider.is_embedding_enabled = Mock(return_value=enabled)
-    return provider
-
-
 async def _seed_session(db, source="weflow-legacy", session_id="s1", enabled=1, is_group=1):
     cursor = await db.execute(
         "INSERT OR IGNORE INTO sessions(source,session_id,name,is_group,"
@@ -77,13 +71,13 @@ class TestRagSetup:
         with pytest.raises(PluginDisabledError):
             await RagPlugin().setup(ctx)
 
-    async def test_setup_without_embedding_self_disables(self):
-        ctx, *_ = _ctx(_embed_provider(enabled=False))
+    async def test_setup_without_embedding_self_disables(self, fake_embed_provider):
+        ctx, *_ = _ctx(fake_embed_provider(False))
         with pytest.raises(PluginDisabledError):
             await RagPlugin().setup(ctx)
 
-    async def test_setup_registers_stage_router_assets(self):
-        ctx, stages_, routers, assets = _ctx(_embed_provider(True))
+    async def test_setup_registers_stage_router_assets(self, fake_embed_provider):
+        ctx, stages_, routers, assets = _ctx(fake_embed_provider(True))
         plugin = RagPlugin()
         await plugin.setup(ctx)
         try:
@@ -96,10 +90,12 @@ class TestRagSetup:
         finally:
             await plugin.teardown()
 
-    async def test_teardown_clears_engine_singleton_and_state(self):
+    async def test_teardown_clears_engine_singleton_and_state(
+        self, fake_embed_provider
+    ):
         from briefdesk.plugins.rag.engine import get_engine
 
-        ctx, *_ = _ctx(_embed_provider(True))
+        ctx, *_ = _ctx(fake_embed_provider(True))
         plugin = RagPlugin()
         await plugin.setup(ctx)
         engine = plugin._engine
@@ -111,15 +107,15 @@ class TestRagSetup:
         assert get_engine() is None
         assert engine._vec_count_seen == 0  # teardown 链式清理引擎状态
 
-    async def test_hooks_noop_without_engine(self):
+    async def test_hooks_noop_without_engine(self, fake_embed_provider):
         plugin = RagPlugin()
-        ctx, *_ = _ctx(_embed_provider(True))
+        ctx, *_ = _ctx(fake_embed_provider(True))
         await plugin.before_run(object(), ctx)  # type: ignore[arg-type]
         await plugin.run(object(), ctx)  # type: ignore[arg-type]
 
-    async def test_setup_failure_rolls_back_singleton(self):
+    async def test_setup_failure_rolls_back_singleton(self, fake_embed_provider):
         # router 注册抛错时不得残留半初始化单例
-        ctx, _stages, _routers, _assets = _ctx(_embed_provider(True))
+        ctx, _stages, _routers, _assets = _ctx(fake_embed_provider(True))
 
         def _boom(*args, **kwargs):
             raise TypeError("注入的注册故障")
@@ -1352,10 +1348,10 @@ class TestDeleteEventGc:
     """【复核 P2-24】卡片删除事件触发即时孤儿对账（此前最长滞留一个维护
     周期，已删内容仍可被 /api/rag/ask 引用——与停用会话即时生效不对齐）。"""
 
-    async def test_setup_subscribes_and_handler_runs_gc(self):
+    async def test_setup_subscribes_and_handler_runs_gc(self, fake_embed_provider):
         from briefdesk.events import EVENT_ITEMS_DELETED
 
-        ctx, *_ = _ctx(_embed_provider(True))
+        ctx, *_ = _ctx(fake_embed_provider(True))
         subscribed: list[str] = []
         ctx.subscribe_event = lambda ev, handler: subscribed.append(ev)
         plugin = RagPlugin()
@@ -1370,8 +1366,8 @@ class TestDeleteEventGc:
         finally:
             await plugin.teardown()
 
-    async def test_concurrent_delete_events_spawn_single_gc(self):
-        ctx, *_ = _ctx(_embed_provider(True))
+    async def test_concurrent_delete_events_spawn_single_gc(self, fake_embed_provider):
+        ctx, *_ = _ctx(fake_embed_provider(True))
         plugin = RagPlugin()
         await plugin.setup(ctx)
         plugin._engine.maintenance_gc = AsyncMock()
@@ -1384,10 +1380,10 @@ class TestDeleteEventGc:
         finally:
             await plugin.teardown()
 
-    async def test_deletes_during_running_gc_get_extra_round(self):
+    async def test_deletes_during_running_gc_get_extra_round(self, fake_embed_provider):
         """GC 在跑期间到达删除事件 → 置脏，收尾时再调度一轮，
         新删除不滞留到下一个维护周期（总共执行 2 轮）。"""
-        ctx, *_ = _ctx(_embed_provider(True))
+        ctx, *_ = _ctx(fake_embed_provider(True))
         plugin = RagPlugin()
         await plugin.setup(ctx)
         rounds = 0
@@ -1415,9 +1411,9 @@ class TestDeleteEventGc:
         finally:
             await plugin.teardown()
 
-    async def test_single_delete_runs_single_round(self):
+    async def test_single_delete_runs_single_round(self, fake_embed_provider):
         """无并发删除 → 只跑 1 轮，脏标志保持 False。"""
-        ctx, *_ = _ctx(_embed_provider(True))
+        ctx, *_ = _ctx(fake_embed_provider(True))
         plugin = RagPlugin()
         await plugin.setup(ctx)
         plugin._engine.maintenance_gc = AsyncMock()
@@ -1429,9 +1425,9 @@ class TestDeleteEventGc:
         finally:
             await plugin.teardown()
 
-    async def test_teardown_clears_dirty_flag_and_task(self):
+    async def test_teardown_clears_dirty_flag_and_task(self, fake_embed_provider):
         """teardown 清脏标志与任务引用，之后不再调度补账轮。"""
-        ctx, *_ = _ctx(_embed_provider(True))
+        ctx, *_ = _ctx(fake_embed_provider(True))
         plugin = RagPlugin()
         await plugin.setup(ctx)
         plugin._engine.maintenance_gc = AsyncMock()
@@ -1451,8 +1447,10 @@ class TestActivatePrepareUnderLock:
         await init_schema(db)
         return db
 
-    async def test_activate_prepares_schema_under_lock_before_backfill(self):
-        ctx, *_ = _ctx(_embed_provider(True))
+    async def test_activate_prepares_schema_under_lock_before_backfill(
+        self, fake_embed_provider
+    ):
+        ctx, *_ = _ctx(fake_embed_provider(True))
         plugin = RagPlugin()
         await plugin.setup(ctx)
         memory_db = await self._memory_db()
@@ -1501,9 +1499,9 @@ class TestActivatePrepareUnderLock:
             await memory_db.close()
             await plugin.teardown()
 
-    async def test_activate_failure_leaves_no_task(self):
+    async def test_activate_failure_leaves_no_task(self, fake_embed_provider):
         """prepare 抛错 → activate 失败上抛且不拉起维护循环任务。"""
-        ctx, *_ = _ctx(_embed_provider(True))
+        ctx, *_ = _ctx(fake_embed_provider(True))
         plugin = RagPlugin()
         await plugin.setup(ctx)
         memory_db = await self._memory_db()

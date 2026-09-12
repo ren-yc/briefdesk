@@ -77,7 +77,7 @@ StagePlugin 参与消息处理管道。管道骨架 `briefdesk/pipeline.py` 按�
 |------|----------|--------|----------------|
 | `enrich` | 入口过滤后、分类前（OCR 等输入增强）；`before_run` 锁外、`run` 锁内 | `before_run` 锁外（网络调用只允许在这里）；`run` 锁内 | 可选插件缺失/禁用时 enrich 槽为空：纯占位符图片消息被入口过滤，混合消息降级纯文本；置位 `vision_without_ocr` 公告 |
 | `classify` | enrich 之后；对每批消息调 AI 并把 `ClassifyOutcome` 写入 `batch.outcomes` | `run` 锁内（严禁网络调用——预计算放 `before_run`） | 引擎抛错 → 整批进 `failed` 保留待回填；`outcomes` 缺失按契约违约整批保留 |
-| `dedup` | classify 之后；判重/入库/缓存 | `run` 锁内；`after_run` 向量落库持 `storage_lock`（内部有写锁重试退避，见 T09 取舍） | 判重失败的消息保留待回填；`processed` 标记只给确定终态的行 |
+| `dedup` | classify 之后；判重/入库/缓存 | `run` 锁内；`after_run` 向量落库内部持 `storage_lock`（含写锁重试退避，见 `engine.flush_pending_embeddings` 的锁内代价说明） | 判重失败的消息保留待回填；`processed` 标记只给确定终态的行 |
 | `post_insert` | 入库后的派生处理（合并、rag 索引） | `run` 锁内 | 单阶段异常只记日志，不回滚已入库卡片 |
 
 通用规则：
@@ -187,14 +187,17 @@ def _on_items_deleted(self, item_ids: list[str]) -> None:
 ## 7. 测试建议
 
 - **测试位置**：放你自己的包里或随 `tests/` 提交均可；跑法与仓库一致（`python -m pytest tests/`）。
-- **unittest 惯例（pytest-asyncio 迁移完成前，见计划 T26）**：异步用例继承
-  `unittest.IsolatedAsyncioTestCase`；配置隔离用 `patch.object(config, ...)`；
-  内存库参考 `tests/test_db.py::_InMemoryDbTest` 的 `:memory:` + `init_schema` 样板。
-  事件循环与模块级单例（`db.get_db`、`stages`、`status`）在用例间需要显式复位——
-  各测试基类的 `asyncSetUp/asyncTearDown` 是现成模板。
-- **pytest 风格（迁移完成后）**：直接写 `async def test_x()`；共享夹具从
-  `tests/conftest.py` 导入（`memory_db`/`temp_db`/`fake_embed_provider`）——它们分别
-  提供内存库、临时文件库与可配 enabled 的假嵌入 Provider。
+- **默认用 pytest 风格**：测试类不继承 unittest，直接写 `async def test_x()`
+  （`asyncio_mode = "auto"`，见 `pyproject.toml`）；类名须为 `Test*` 才会被收集。
+  共享夹具从 `tests/conftest.py` 导入：**`memory_db`**（`:memory:` + `init_schema` 的连接，
+  用例结束自动关闭）、**`temp_db`**（真实文件库**路径**，供走 `get_db`/`get_embed_db`
+  或备份/恢复的用例自建连接）、**`fake_embed_provider`**（可配 enabled 的嵌入
+  Provider 工厂，调用 `fake_embed_provider(True)` 取实例）。配置隔离用
+  `patch.object(config, ...)`；模块级单例（`db.get_db`、`stages`、`status`）在用例间需显式复位。
+- **unittest 风格（少量历史用例）**：仓库仍有少数用例继承
+  `unittest.IsolatedAsyncioTestCase`——这些用例依赖 `assertLogs`/`assertNoLogs`
+  向目标 logger 挂 handler 并临时改级别的语义，改用 `caplog`（走 root handler +
+  propagation）**不等价**，故刻意保留。新写测试无需沿用此风格。
 - **不触碰真实环境**：不连真实上游、不写真实密钥、不发真实 AI 请求——用
   `unittest.mock.AsyncMock` / `httpx.MockTransport` 打桩（参考
   `tests/test_source_robustness.py` 的 SSE 真身测试）。

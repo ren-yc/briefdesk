@@ -30,19 +30,24 @@ async def memory_db():
 
 
 @pytest.fixture
-async def temp_db(tmp_path):
-    """临时文件库：真实文件路径场景（备份/恢复、WAL 行为）；用例结束关闭。"""
-    db = await aiosqlite.connect(str(tmp_path / "briefdesk-test.sqlite"))
-    db.row_factory = aiosqlite.Row
-    await init_schema(db)
-    yield db
-    await db.close()
+def temp_db(tmp_path):
+    """临时**库路径**（真实文件场景：走 get_db/get_embed_db 或备份/恢复）。
+
+    返回路径而非连接——需要真实文件库的用例（关闭门闩、备份/恢复、WAL）
+    都要求自己按各自口径建连接（部分还需同一文件的两条连接）；生命周期
+    由 pytest 的 tmp_path 托管，无需用例关闭连接。
+    """
+    return str(tmp_path / "briefdesk-test.sqlite")
 
 
 @pytest.fixture
 def fake_embed_provider():
-    """可配 enabled 的嵌入 Provider Mock（rag/去重用例的嵌入替身基座）。"""
+    """可配 enabled 的嵌入 Provider Mock **工厂**（对应 test_rag_plugin 的
+    _embed_provider 样板）：调用 fake_embed_provider(True/False) 取实例。"""
 
-    provider = Mock()
-    provider.is_embedding_enabled = Mock(return_value=False)
-    return provider
+    def _make(enabled: bool = False):
+        provider = Mock()
+        provider.is_embedding_enabled = Mock(return_value=enabled)
+        return provider
+
+    return _make
