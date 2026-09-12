@@ -10,6 +10,7 @@
 import time
 import unittest
 
+import pytest
 from pydantic import ValidationError
 
 from briefdesk.config import Settings, config
@@ -118,7 +119,7 @@ def _enabled(source: str) -> list[SessionInfo]:
     ]
 
 
-class WeFlowBackfillAllTest(unittest.IsolatedAsyncioTestCase):
+class TestWeFlowBackfillAll:
     async def test_pull_all_pages_and_keeps_old_messages(self):
         original = config.backfill_hours
         config.backfill_hours = -1
@@ -129,17 +130,17 @@ class WeFlowBackfillAllTest(unittest.IsolatedAsyncioTestCase):
 
             result = await we_poll(client, _enabled("weflow-legacy"), _no_processed)
 
-            self.assertEqual(len(result.messages), 501)
+            assert len(result.messages) == 501
             ids = {m.msg_id for m in result.messages}
-            self.assertIn("old", ids)  # 无年龄截止：极旧消息保留
+            assert "old" in ids  # 无年龄截止：极旧消息保留
             # start 一律不传（None，服务端不限时间），offset 按 0/500 翻页
-            self.assertIsNone(client.calls[0][1])
-            self.assertEqual([c[2] for c in client.calls], [0, 500])
+            assert client.calls[0][1] is None
+            assert [c[2] for c in client.calls] == [0, 500]
         finally:
             config.backfill_hours = original
 
 
-class QqFlowBackfillAllTest(unittest.IsolatedAsyncioTestCase):
+class TestQqFlowBackfillAll:
     async def test_pull_all_omits_start_and_pages_to_end(self):
         original = config.backfill_hours
         config.backfill_hours = -1
@@ -150,20 +151,20 @@ class QqFlowBackfillAllTest(unittest.IsolatedAsyncioTestCase):
 
             result = await qq_poll(client, _enabled("qqflow"), _no_processed)
 
-            self.assertEqual(len(result.messages), 501)
+            assert len(result.messages) == 501
             ids = {m.msg_id for m in result.messages}
-            self.assertIn("9999", ids)  # 无年龄截止：极旧消息保留
+            assert "9999" in ids  # 无年龄截止：极旧消息保留
             # start 一律不传（None），仅 hasMore 驱动翻页
-            self.assertTrue(all(s is None for s, _ in client.calls))
-            self.assertEqual([o for _, o in client.calls], [0, 500])
+            assert all(s is None for s, _ in client.calls)
+            assert [o for _, o in client.calls] == [0, 500]
         finally:
             config.backfill_hours = original
 
 
-class BackfillConfigValidationTest(unittest.TestCase):
+class TestBackfillConfigValidation(unittest.TestCase):
     def test_minus_one_allowed(self):
-        self.assertEqual(Settings(backfill_hours=-1).backfill_hours, -1)
+        assert Settings(backfill_hours=-1).backfill_hours == -1
 
     def test_below_minus_one_rejected(self):
-        with self.assertRaises(ValidationError):
+        with pytest.raises(ValidationError):
             Settings(backfill_hours=-2)

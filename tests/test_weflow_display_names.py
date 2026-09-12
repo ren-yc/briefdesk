@@ -18,7 +18,7 @@ from briefdesk.plugins.weflow.poller import poll
 from briefdesk.types import SessionInfo
 
 
-class NormalizeRestDisplayNameTest(unittest.TestCase):
+class TestNormalizeRestDisplayName(unittest.TestCase):
     def _msg(self, wxid: str, sender_name: str | None = None) -> dict:
         msg = {
             "serverId": "1001",
@@ -36,15 +36,15 @@ class NormalizeRestDisplayNameTest(unittest.TestCase):
         msgs = normalize_rest(
             self._msg("wxid_a", "上游名"), "s1", "项目群", {"wxid_a": "全局备注名"}
         )
-        self.assertEqual(len(msgs), 1)
-        self.assertEqual(msgs[0].sender_name, "上游名")
-        self.assertEqual(msgs[0].sender_id, "wxid_a")
+        assert len(msgs) == 1
+        assert msgs[0].sender_name == "上游名"
+        assert msgs[0].sender_id == "wxid_a"
 
     def test_dirty_sender_name_falls_back_to_contact(self):
         msgs = normalize_rest(
             self._msg("wxid_a", "\x01\x01"), "s1", "项目群", {"wxid_a": "全局备注名"}
         )
-        self.assertEqual(msgs[0].sender_name, "全局备注名")
+        assert msgs[0].sender_name == "全局备注名"
 
     def test_wxid_valued_sender_name_falls_back_to_contact(self):
         """上游名字链全退化时 senderName 即 wxid，应让位于 contacts。
@@ -55,21 +55,21 @@ class NormalizeRestDisplayNameTest(unittest.TestCase):
         msgs = normalize_rest(
             self._msg("wxid_a", "wxid_a"), "s1", "项目群", {"wxid_a": "会话显示名"}
         )
-        self.assertEqual(msgs[0].sender_name, "会话显示名")
+        assert msgs[0].sender_name == "会话显示名"
 
     def test_absent_sender_name_falls_back_to_contact(self):
         """旧上游无该字段（版本偏斜兜底）。"""
         msgs = normalize_rest(
             self._msg("wxid_a"), "s1", "项目群", {"wxid_a": "全局备注名"}
         )
-        self.assertEqual(msgs[0].sender_name, "全局备注名")
+        assert msgs[0].sender_name == "全局备注名"
 
     def test_missing_names_fall_back_to_wxid(self):
         msgs = normalize_rest(self._msg("wxid_a"), "s1", "项目群", {})
-        self.assertEqual(msgs[0].sender_name, "wxid_a")
+        assert msgs[0].sender_name == "wxid_a"
 
 
-class NormalizeSseImageLookupTest(unittest.IsolatedAsyncioTestCase):
+class TestNormalizeSseImageLookup:
     """[图片] 的 REST 回查预检（上游 v0.3.0 推送携带 media 元数据）三态保守语义。
 
     - media.type == "image" → 回查（元数据无 url，字节需 REST 导出回填）
@@ -99,7 +99,7 @@ class NormalizeSseImageLookupTest(unittest.IsolatedAsyncioTestCase):
             client,
         )
         client.fetch_message_media.assert_awaited_once()  # type: ignore[attr-defined]
-        self.assertEqual(msgs[0].image_urls, ["wxid_test_0001/images/abc.jpg"])
+        assert msgs[0].image_urls == ["wxid_test_0001/images/abc.jpg"]
 
     async def test_non_image_type_skips_lookup_and_drops(self):
         # 审查回归：type 非图片跳过回查后整条丢弃（纯占位符无信息价值，
@@ -111,7 +111,7 @@ class NormalizeSseImageLookupTest(unittest.IsolatedAsyncioTestCase):
             client,
         )
         client.fetch_message_media.assert_not_awaited()  # type: ignore[attr-defined]
-        self.assertEqual(msgs, [])
+        assert msgs == []
 
     async def test_absent_media_keeps_lookup(self):
         client = _FakeClient(contacts={}, messages=[])
@@ -153,7 +153,7 @@ class _FakeClient:
         return {"wxid_nonfriend": "群成员派生名"}
 
 
-class PollerDisplayNameTest(unittest.IsolatedAsyncioTestCase):
+class TestPollerDisplayName:
     def _enabled(self) -> list[SessionInfo]:
         return [
             SessionInfo(
@@ -187,18 +187,18 @@ class PollerDisplayNameTest(unittest.IsolatedAsyncioTestCase):
             contacts={"wxid_friend": "朋友"}, messages=[self._message()]
         )
         result = await self._poll(client)
-        self.assertEqual(len(result.messages), 1)
-        self.assertEqual(result.messages[0].sender_name, "上游名")
-        self.assertEqual(result.messages[0].sender_id, "wxid_nonfriend")
+        assert len(result.messages) == 1
+        assert result.messages[0].sender_name == "上游名"
+        assert result.messages[0].sender_id == "wxid_nonfriend"
 
     async def test_group_members_endpoint_not_called(self):
         """group-members 的两级候选都与 senderName 同源，不得再逐群请求。"""
         client = _FakeClient(contacts={}, messages=[self._message()])
         result = await self._poll(client)
-        self.assertEqual(len(result.messages), 1)
-        self.assertEqual(client.group_members_calls, [])
+        assert len(result.messages) == 1
+        assert client.group_members_calls == []
         # 未被请求 ⇒ 派生名不可能出现在结果里
-        self.assertEqual(result.messages[0].sender_name, "上游名")
+        assert result.messages[0].sender_name == "上游名"
 
 
 if __name__ == "__main__":

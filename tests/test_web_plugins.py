@@ -6,6 +6,7 @@ import unittest
 from pathlib import Path
 from typing import ClassVar
 
+import pytest
 from starlette.testclient import TestClient
 
 import briefdesk.server as srv
@@ -13,7 +14,7 @@ from briefdesk.plugins.calendar.plugin import CalendarPlugin
 from briefdesk.plugins.reminders.plugin import RemindersPlugin
 
 
-class PluginsApiTest(unittest.TestCase):
+class TestPluginsApi(unittest.TestCase):
     def setUp(self):
         self.client = TestClient(srv.app, base_url="http://localhost")
 
@@ -22,8 +23,8 @@ class PluginsApiTest(unittest.TestCase):
 
     def test_no_callback_returns_empty(self):
         resp = self.client.get("/api/plugins")
-        self.assertEqual(resp.status_code, 200)
-        self.assertEqual(resp.json(), {"plugins": []})
+        assert resp.status_code == 200
+        assert resp.json() == {"plugins": []}
 
     def test_callback_result_passthrough(self):
         def fake():
@@ -31,13 +32,13 @@ class PluginsApiTest(unittest.TestCase):
         srv.set_plugins_info_callback(fake)
         try:
             resp = self.client.get("/api/plugins")
-            self.assertEqual(resp.status_code, 200)
-            self.assertEqual(resp.json()["plugins"][0]["name"], "weflow-legacy")
+            assert resp.status_code == 200
+            assert resp.json()["plugins"][0]["name"] == "weflow-legacy"
         finally:
             srv.set_plugins_info_callback(None)
 
 
-class PluginAssetsTest(unittest.TestCase):
+class TestPluginAssets(unittest.TestCase):
     def setUp(self):
         self.client = TestClient(srv.app, base_url="http://localhost")
 
@@ -50,17 +51,17 @@ class PluginAssetsTest(unittest.TestCase):
             srv.register_plugin_assets("demo", tmp)
             try:
                 resp = self.client.get("/plugin-assets/demo/hello.txt")
-                self.assertEqual(resp.status_code, 200)
-                self.assertEqual(resp.text, "hi")
+                assert resp.status_code == 200
+                assert resp.text == "hi"
             finally:
                 srv._plugin_assets.pop("demo", None)
 
     def test_unknown_plugin_404(self):
         resp = self.client.get("/plugin-assets/nope/x.txt")
-        self.assertEqual(resp.status_code, 404)
+        assert resp.status_code == 404
         # 404 必须是非 JSON（text/plain）：浏览器严格 MIME 检查会拒绝
         # application/json 作为 <link>/<script> 响应并打控制台告警
-        self.assertTrue(resp.headers.get("content-type", "").startswith("text/plain"))
+        assert resp.headers.get("content-type", "").startswith("text/plain")
 
     def test_traversal_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -69,7 +70,7 @@ class PluginAssetsTest(unittest.TestCase):
             try:
                 for bad in ("../a.txt", "..%2Fa.txt", "x/../../a.txt", "..\\a.txt"):
                     resp = self.client.get(f"/plugin-assets/demo/{bad}")
-                    self.assertEqual(resp.status_code, 404, bad)
+                    assert resp.status_code == 404, bad
             finally:
                 srv._plugin_assets.pop("demo", None)
 
@@ -78,13 +79,13 @@ class PluginAssetsTest(unittest.TestCase):
             srv.register_plugin_assets("demo", tmp)
             try:
                 resp = self.client.get("/plugin-assets/demo/nope.txt")
-                self.assertEqual(resp.status_code, 404)
-                self.assertTrue(resp.headers.get("content-type", "").startswith("text/plain"))
+                assert resp.status_code == 404
+                assert resp.headers.get("content-type", "").startswith("text/plain")
             finally:
                 srv._plugin_assets.pop("demo", None)
 
 
-class PluginRouterPrefixGuardTest(unittest.TestCase):
+class TestPluginRouterPrefixGuard(unittest.TestCase):
     """【复核 P2-11】插件路由必须挂在 /api/ 下：middleware 仅对 /api/ 前缀
     的变更方法做同源校验，其它前缀会静默绕过 CSRF 防线——装配期硬失败。"""
 
@@ -99,11 +100,11 @@ class PluginRouterPrefixGuardTest(unittest.TestCase):
         async def _action() -> dict:  # pragma: no cover - 断言在装配期，handler 不会被调
             return {}
 
-        with self.assertRaisesRegex(RuntimeError, "/api/"):
+        with pytest.raises(RuntimeError, match="/api/"):
             include_plugin_router(router)
 
 
-class WebPluginSetupTest(unittest.IsolatedAsyncioTestCase):
+class TestWebPluginSetup:
     async def test_calendar_registers_router(self):
         registered = []
         assets = []
@@ -132,29 +133,26 @@ class WebPluginSetupTest(unittest.IsolatedAsyncioTestCase):
             {getattr(r, "path", "") for r in registered[0].routes}
             | {getattr(r, "path", "") for r in registered[1].routes}
         )
-        self.assertIn("/api/calendar", paths)
-        self.assertIn("/api/reminders/due", paths)
-        self.assertIn("/api/items/{item_id}/reminder", paths)
+        assert "/api/calendar" in paths
+        assert "/api/reminders/due" in paths
+        assert "/api/items/{item_id}/reminder" in paths
         # 前端资源随插件注册：calendar / reminders 均注册 ui 目录
-        self.assertEqual(
-            assets,
-            [
+        assert assets == [
                 ("calendar", str(CalendarPlugin().asset_dir())),
                 ("reminders", str(RemindersPlugin().asset_dir())),
-            ],
-        )
+            ]
 
     def test_web_plugins_expose_router_and_asset_dir(self):
         for cls in (CalendarPlugin, RemindersPlugin):
             plugin = cls()
-            self.assertIsNotNone(plugin.router())
-            self.assertIsNotNone(plugin.asset_dir())
-            self.assertTrue(plugin.asset_dir().is_dir())
-            self.assertTrue((plugin.asset_dir() / "ui.js").is_file())
-            self.assertTrue((plugin.asset_dir() / "ui.css").is_file())
+            assert plugin.router() is not None
+            assert plugin.asset_dir() is not None
+            assert plugin.asset_dir().is_dir()
+            assert (plugin.asset_dir() / "ui.js").is_file()
+            assert (plugin.asset_dir() / "ui.css").is_file()
 
 
-class CalendarAssetsTest(unittest.TestCase):
+class TestCalendarAssets(unittest.TestCase):
     """日历插件前端资源经 /plugin-assets/calendar/ 由核心提供。"""
 
     def test_calendar_ui_js_served(self):
@@ -164,9 +162,9 @@ class CalendarAssetsTest(unittest.TestCase):
             client = TestClient(srv.app, base_url="http://localhost")
             try:
                 resp = client.get("/plugin-assets/calendar/ui.js")
-                self.assertEqual(resp.status_code, 200)
-                self.assertIn("window.briefdeskPlugins", resp.text)
-                self.assertIn('"calendar"', resp.text)
+                assert resp.status_code == 200
+                assert "window.briefdeskPlugins" in resp.text
+                assert '"calendar"' in resp.text
             finally:
                 client.close()
         finally:
@@ -179,15 +177,15 @@ class CalendarAssetsTest(unittest.TestCase):
             client = TestClient(srv.app, base_url="http://localhost")
             try:
                 resp = client.get("/plugin-assets/calendar/ui.css")
-                self.assertEqual(resp.status_code, 200)
-                self.assertIn(".cal-chip", resp.text)
+                assert resp.status_code == 200
+                assert ".cal-chip" in resp.text
             finally:
                 client.close()
         finally:
             srv._plugin_assets.pop("calendar", None)
 
 
-class RemindersAssetsTest(unittest.TestCase):
+class TestRemindersAssets(unittest.TestCase):
     """提醒插件前端资源经 /plugin-assets/reminders/ 由核心提供。"""
 
     def test_reminders_ui_js_served(self):
@@ -197,9 +195,9 @@ class RemindersAssetsTest(unittest.TestCase):
             client = TestClient(srv.app, base_url="http://localhost")
             try:
                 resp = client.get("/plugin-assets/reminders/ui.js")
-                self.assertEqual(resp.status_code, 200)
-                self.assertIn("window.briefdeskPlugins", resp.text)
-                self.assertIn('"reminders"', resp.text)
+                assert resp.status_code == 200
+                assert "window.briefdeskPlugins" in resp.text
+                assert '"reminders"' in resp.text
             finally:
                 client.close()
         finally:
@@ -212,15 +210,15 @@ class RemindersAssetsTest(unittest.TestCase):
             client = TestClient(srv.app, base_url="http://localhost")
             try:
                 resp = client.get("/plugin-assets/reminders/ui.css")
-                self.assertEqual(resp.status_code, 200)
-                self.assertIn(".card-remind-menu", resp.text)
+                assert resp.status_code == 200
+                assert ".card-remind-menu" in resp.text
             finally:
                 client.close()
         finally:
             srv._plugin_assets.pop("reminders", None)
 
 
-class CoreFrontendBoundaryTest(unittest.TestCase):
+class TestCoreFrontendBoundary(unittest.TestCase):
     """前端边界守卫：插件前端全部随插件包分发，核心 ui/ 零插件残留。"""
 
     CORE_FILES: ClassVar[dict[str, list[str]]] = {
@@ -244,10 +242,10 @@ class CoreFrontendBoundaryTest(unittest.TestCase):
         for fname, markers in self.CORE_FILES.items():
             text = (ui_dir / fname).read_text(encoding="utf-8")
             for marker in markers:
-                self.assertNotIn(marker, text, f"{fname} 不应再包含 {marker}（插件前端已随插件分发）")
+                assert marker not in text, f"{fname} 不应再包含 {marker}（插件前端已随插件分发）"
 
 
-class PluginFrontendCoreHelperTest(unittest.TestCase):
+class TestPluginFrontendCoreHelper(unittest.TestCase):
     """反向边界守卫：插件前端复用的核心助手必须在 app.js 里以 `function` 声明存在。
 
     插件前端以同源 classic script 注入、与 app.js 共享全局作用域，因此可直接调用
@@ -260,7 +258,7 @@ class PluginFrontendCoreHelperTest(unittest.TestCase):
         root = Path(__file__).resolve().parents[1]
         app_js = (root / "ui" / "app.js").read_text(encoding="utf-8")
         plugin_js = sorted((root / "briefdesk" / "plugins").glob("*/ui/ui.js"))
-        self.assertTrue(plugin_js, "未找到任何插件前端，守卫失效")
+        assert plugin_js, "未找到任何插件前端，守卫失效"
 
         # 核心提供给插件的助手全集（新增复用时同步此表）
         exported = [
@@ -273,11 +271,7 @@ class PluginFrontendCoreHelperTest(unittest.TestCase):
             if f"function {name}(" in app_js:
                 continue
             # catColor 是顶层 let（Map），非函数：只要求存在同名顶层声明
-            self.assertRegex(
-                app_js,
-                rf"(?m)^(?:let|var|function)\s+{name}\b",
-                f"app.js 应保留顶层声明 {name}（插件前端依赖）",
-            )
+            assert re.search(rf"(?m)^(?:let|var|function)\s+{name}\b", app_js), f"app.js 应保留顶层声明 {name}（插件前端依赖）"
 
         # 插件实际用到的名字必须落在上表内，且在 app.js 里真的有声明
         used = set()
@@ -286,13 +280,9 @@ class PluginFrontendCoreHelperTest(unittest.TestCase):
             for name in exported:
                 if re.search(rf"\b{name}\s*\(", text):
                     used.add(name)
-        self.assertIn("lsSet", used, "calendar/reminders 应经 lsSet 写 localStorage")
+        assert "lsSet" in used, "calendar/reminders 应经 lsSet 写 localStorage"
         for name in sorted(used):
-            self.assertRegex(
-                app_js,
-                rf"(?m)^(?:let|var|function)\s+{name}\b",
-                f"插件前端调用了 {name}，但 app.js 顶层没有该声明",
-            )
+            assert re.search(rf"(?m)^(?:let|var|function)\s+{name}\b", app_js), f"插件前端调用了 {name}，但 app.js 顶层没有该声明"
 
     def test_plugin_frontends_do_not_assign_core_view_state(self):
         """插件不得直写核心视图状态：共享全局作用域让这种赋值语法上完全合法。
@@ -311,11 +301,7 @@ class PluginFrontendCoreHelperTest(unittest.TestCase):
             for name in core_state:
                 # 赋值（含复合赋值）而非比较：`=` 后不接 `=`，前不接 `=!<>+-*/`
                 hit = re.search(rf"(?<![=!<>+\-*/])\b{name}\s*=(?!=)", text)
-                self.assertIsNone(
-                    hit,
-                    f"{path.relative_to(root)} 直接赋值核心状态 {name}，"
-                    f"应改走核心入口（分类跳转用 gotoCategory）",
-                )
+                assert hit is None
 
     def test_core_row_containers_anchor_plugin_row_menus(self):
         """核心行容器须是定位上下文：插件行内菜单用 position:absolute 锚在其上。
@@ -330,11 +316,8 @@ class PluginFrontendCoreHelperTest(unittest.TestCase):
             blocks = re.findall(
                 rf"(?m)^{re.escape(selector)}\s*\{{(.*?)\}}", css, re.DOTALL
             )
-            self.assertTrue(blocks, f"style.css 未找到 {selector} 规则块")
-            self.assertTrue(
-                any("position: relative" in b for b in blocks),
-                f"{selector} 须声明 position: relative（插件行内菜单的定位锚点）",
-            )
+            assert blocks, f"style.css 未找到 {selector} 规则块"
+            assert any("position: relative" in b for b in blocks)
 
     def test_plugin_row_menus_are_absolutely_positioned(self):
         """与上一条配对：插件菜单确实依赖绝对定位，否则那条守卫就是空的。"""
@@ -345,21 +328,17 @@ class PluginFrontendCoreHelperTest(unittest.TestCase):
             for block in re.findall(r"\{([^}]*)\}", text):
                 if "position: absolute" in block:
                     found = True
-        self.assertTrue(found, "没有插件菜单用绝对定位，核心的定位锚点守卫需重新评估")
+        assert found, "没有插件菜单用绝对定位，核心的定位锚点守卫需重新评估"
 
     def test_plugin_frontends_do_not_touch_localstorage_directly(self):
         """插件不得裸用 localStorage：异常会中断事件处理函数（见 lsGet/lsSet 注释）。"""
         root = Path(__file__).resolve().parents[1]
         for path in sorted((root / "briefdesk" / "plugins").glob("*/ui/ui.js")):
             text = path.read_text(encoding="utf-8")
-            self.assertNotIn(
-                "localStorage.",
-                text,
-                f"{path.relative_to(root)} 应改用核心 lsGet/lsSet/lsGetJson/lsSetJson",
-            )
+            assert "localStorage." not in text, f"{path.relative_to(root)} 应改用核心 lsGet/lsSet/lsGetJson/lsSetJson"
 
 
-class IncludeRouterIdempotentTest(unittest.TestCase):
+class TestIncludeRouterIdempotent(unittest.TestCase):
     """审查修复 #10：include_plugin_router 对同一 router 重复调用幂等。"""
 
     def test_double_include_inserts_routes_once(self):
@@ -381,9 +360,9 @@ class IncludeRouterIdempotentTest(unittest.TestCase):
             )
 
         try:
-            self.assertEqual(count(), 1)
+            assert count() == 1
             srv.include_plugin_router(router)  # 第二次必须跳过
-            self.assertEqual(count(), 1, "重复 include 不应插入重复路由")
+            assert count() == 1, "重复 include 不应插入重复路由"
         finally:
             # 清理探针路由，避免污染其它测试的路由匹配
             srv.app.routes[:] = [

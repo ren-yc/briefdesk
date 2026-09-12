@@ -11,6 +11,7 @@ import unittest
 from unittest.mock import AsyncMock, patch
 
 import aiosqlite
+import pytest
 from fastapi import HTTPException
 
 from briefdesk.db import init_schema
@@ -59,7 +60,7 @@ RANGE_TO_EXCL = "2030-02-01"
 TARGET_END = "2030-01-05 10:00"  # 落在区间内
 
 
-class CalendarRangeTruncationTest(unittest.IsolatedAsyncioTestCase):
+class TestCalendarRangeTruncation:
     """区间卡片不得被超量 extra_times 干扰行挤出结果集。"""
 
     async def test_range_cards_survive_extra_times_flood(self):
@@ -84,7 +85,7 @@ class CalendarRangeTruncationTest(unittest.IsolatedAsyncioTestCase):
                 rows = await cal_db.get_calendar_items(RANGE_FROM, RANGE_TO_EXCL)
 
             got_ids = sorted(r["id"] for r in rows)
-            self.assertEqual(got_ids, sorted(target_ids))
+            assert got_ids == sorted(target_ids)
         finally:
             await conn.close()
 
@@ -103,12 +104,12 @@ class CalendarRangeTruncationTest(unittest.IsolatedAsyncioTestCase):
             with patch.object(cal_db, "get_db", fake_get_db):
                 rows = await cal_db.get_calendar_items(RANGE_FROM, RANGE_TO_EXCL)
 
-            self.assertEqual(len(rows), 1000)
+            assert len(rows) == 1000
         finally:
             await conn.close()
 
 
-class CalendarRouteDateValidationTest(unittest.IsolatedAsyncioTestCase):
+class TestCalendarRouteDateValidation:
     """/api/calendar 的 from/to 必须是真实存在的日历日期。"""
 
     async def test_impossible_from_date_rejected(self):
@@ -117,23 +118,23 @@ class CalendarRouteDateValidationTest(unittest.IsolatedAsyncioTestCase):
         with patch.object(
             cal_router, "get_calendar_items", new=AsyncMock(return_value=[])
         ):
-            with self.assertRaises(HTTPException) as ctx:
+            with pytest.raises(HTTPException) as ctx:
                 await cal_router.calendar(date_from="2026-02-30", date_to="2026-03-01")
-            self.assertEqual(ctx.exception.status_code, 400)
+            assert ctx.value.status_code == 400
 
     async def test_bad_format_rejected_and_valid_passes(self):
         from briefdesk.plugins.calendar import router as cal_router
 
         fetch = AsyncMock(return_value=[{"id": "x"}])
         with patch.object(cal_router, "get_calendar_items", new=fetch):
-            with self.assertRaises(HTTPException) as ctx:
+            with pytest.raises(HTTPException) as ctx:
                 await cal_router.calendar(date_from="2030/01/01", date_to="2030-02-01")
-            self.assertEqual(ctx.exception.status_code, 400)
+            assert ctx.value.status_code == 400
 
             result = await cal_router.calendar(
                 date_from="2030-01-01", date_to="2030-01-31"
             )
-            self.assertEqual(result, {"items": [{"id": "x"}]})
+            assert result == {"items": [{"id": "x"}]}
             fetch.assert_awaited_once()
 
 

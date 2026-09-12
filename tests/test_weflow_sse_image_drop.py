@@ -28,16 +28,16 @@ def _event(**overrides):
     return event
 
 
-class WeFlowSseImageDropTest(unittest.IsolatedAsyncioTestCase):
+class TestWeFlowSseImageDrop:
     async def test_lookup_miss_drops_placeholder(self):
         msgs = await normalize_sse(_event(), _NoMediaClient())
-        self.assertEqual(msgs, [])
+        assert msgs == []
 
     async def test_non_image_media_type_drops_placeholder(self):
         msgs = await normalize_sse(
             _event(media={"type": "video"}), _NoMediaClient()
         )
-        self.assertEqual(msgs, [])
+        assert msgs == []
 
     async def test_lookup_hit_keeps_image_message(self):
         class _HitClient:
@@ -46,16 +46,16 @@ class WeFlowSseImageDropTest(unittest.IsolatedAsyncioTestCase):
                 return "g/images/abc.jpg"
 
         msgs = await normalize_sse(_event(), _HitClient())
-        self.assertEqual(len(msgs), 1)
-        self.assertEqual(msgs[0].image_urls, ["g/images/abc.jpg"])
+        assert len(msgs) == 1
+        assert msgs[0].image_urls == ["g/images/abc.jpg"]
 
     async def test_mixed_text_image_lookup_miss_kept(self):
         # 图片+文字混合消息不受丢弃影响：文字仍有信息价值
         msgs = await normalize_sse(
             _event(content="[图片] 这是说明文字"), _NoMediaClient()
         )
-        self.assertEqual(len(msgs), 1)
-        self.assertEqual(msgs[0].content, "[图片] 这是说明文字")
+        assert len(msgs) == 1
+        assert msgs[0].content == "[图片] 这是说明文字"
 
 
 if __name__ == "__main__":

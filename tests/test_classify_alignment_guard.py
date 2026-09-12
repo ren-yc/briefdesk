@@ -13,6 +13,8 @@ ambiguous_out 交第二关。
 import unittest
 from unittest.mock import patch
 
+import pytest
+
 from briefdesk.plugins.classify import engine
 from briefdesk.plugins.classify.engine import (
     _char_quote_verdict,
@@ -21,7 +23,7 @@ from briefdesk.plugins.classify.engine import (
 from briefdesk.types import ClassifyResult
 
 
-class CharQuoteVerdictTest(unittest.TestCase):
+class TestCharQuoteVerdict(unittest.TestCase):
     """第一关：字面相对比较（同步、零成本）。"""
 
     def test_near_duplicate_correct_labeling_passes(self):
@@ -30,7 +32,7 @@ class CharQuoteVerdictTest(unittest.TestCase):
             "南模中学编程社招新，9月1日开始报名，联系王老师",
             "位育中学编程社招新，测试另一条",
         ]
-        self.assertIs(_char_quote_verdict("南模中学编程社招新", 0, contents), True)
+        assert _char_quote_verdict("南模中学编程社招新", 0, contents) is True
 
     def test_near_duplicate_drift_rejected(self):
         # 位育的 quote 标给南模：别人明显更像 → 拦下
@@ -38,7 +40,7 @@ class CharQuoteVerdictTest(unittest.TestCase):
             "南模中学编程社招新，9月1日开始报名，联系王老师",
             "位育中学编程社招新，测试另一条",
         ]
-        self.assertIs(_char_quote_verdict("位育中学编程社招新", 0, contents), False)
+        assert _char_quote_verdict("位育中学编程社招新", 0, contents) is False
 
     def test_incident_pair_drift_rejected(self):
         # 第一轮事故回归：自行车 quote 正确/漂移双向
@@ -46,8 +48,8 @@ class CharQuoteVerdictTest(unittest.TestCase):
             "大家好，出一个二手电脑，RTX4060的笔记本，机械革命牌子的，报价6000块，有意向的同学可以私聊",
             "大家好，出一个二手自行车，永久牌子的，500块，有意向的同学可以私聊",
         ]
-        self.assertIs(_char_quote_verdict(contents[1], 1, contents), True)
-        self.assertIs(_char_quote_verdict(contents[1], 0, contents), False)
+        assert _char_quote_verdict(contents[1], 1, contents) is True
+        assert _char_quote_verdict(contents[1], 0, contents) is False
 
     def test_long_content_paraphrase_passes(self):
         # 女装活动回归：长原文 + 轻度改写摘录（少写弯引号）→ 放行
@@ -56,48 +58,40 @@ class CharQuoteVerdictTest(unittest.TestCase):
             "下午四时在社团活动室举办“编程社老社长女装活动”，望准时参加。"
         )
         quote = "现定于2026年10月13日下午四时在社团活动室举办编程社老社长女装活动"
-        self.assertIs(_char_quote_verdict(quote, 0, [content]), True)
+        assert _char_quote_verdict(quote, 0, [content]) is True
 
     def test_curly_quotes_normalized(self):
         # 弯引号参与归一化：带/不带弯引号的同句互为子串
-        self.assertIs(
-            _char_quote_verdict(
+        assert _char_quote_verdict(
                 "举办“编程社老社长女装活动”",
                 0,
                 ["举办“编程社老社长女装活动”的通知"],
-            ),
-            True,
-        )
+            ) is True
 
     def test_single_batch_low_containment_rejected(self):
         # 单条批：quote 与内容几乎无字面交集（疑似幻觉）→ 打回（既有口径）
-        self.assertIs(
-            _char_quote_verdict(
+        assert _char_quote_verdict(
                 "出二手自行车九成新两百块", 0, ["下周三下午三点社团活动室面试"]
-            ),
-            False,
-        )
+            ) is False
 
     def test_single_batch_aligned_passes(self):
-        self.assertIs(
-            _char_quote_verdict("下周三面试", 0, ["下周三下午三点社团活动室面试"]),
-            True,
-        )
+        assert _char_quote_verdict("下周三面试", 0, ["下周三下午三点社团活动室面试"]) is True
 
     def test_exact_duplicates_tie_goes_to_referee(self):
         # 完全相同的两条消息：平票 → None（交语义裁判，最终由其放行）
         contents = ["摄影社招新", "摄影社招新"]
-        self.assertIs(_char_quote_verdict("摄影社招新", 0, contents), None)
+        assert _char_quote_verdict("摄影社招新", 0, contents) is None
 
     def test_empty_quote_passes(self):
-        self.assertIs(_char_quote_verdict("", 0, ["任意内容"]), True)
+        assert _char_quote_verdict("", 0, ["任意内容"]) is True
 
 
-class SemanticRefineGuardTest(unittest.IsolatedAsyncioTestCase):
+class TestSemanticRefineGuard:
     """第二关（经唯一生产入口 _semantic_refine）：嵌入余弦 argmax 复核；
     嵌入不可用/失败一律放行，漂移条目移出 results 进 retry。"""
 
-    def setUp(self) -> None:
+    @pytest.fixture(autouse=True)
+    def _autouse_setup(self):
         self.engine = engine
 
     async def test_drift_removed_to_retry_and_time(self):
@@ -118,9 +112,9 @@ class SemanticRefineGuardTest(unittest.IsolatedAsyncioTestCase):
                 [0], results, [7], [0, 1],
                 ["南模中学编程社纳新", "位育中学编程社纳新"],
             )
-        self.assertEqual([r.msg_index for r in out_results], [1])
-        self.assertEqual(retry, [7, 0])
-        self.assertEqual(time_idx, [1])
+        assert [r.msg_index for r in out_results] == [1]
+        assert retry == [7, 0]
+        assert time_idx == [1]
 
     async def test_aligned_result_kept(self):
         async def fake_embed(texts):
@@ -134,9 +128,9 @@ class SemanticRefineGuardTest(unittest.IsolatedAsyncioTestCase):
             out_results, retry, time_idx = await self.engine._semantic_refine(
                 [0], results, [], [], ["自己原文", "无关消息"]
             )
-        self.assertEqual([r.msg_index for r in out_results], [0])
-        self.assertEqual(retry, [])
-        self.assertEqual(time_idx, [])
+        assert [r.msg_index for r in out_results] == [0]
+        assert retry == []
+        assert time_idx == []
 
     async def test_embedding_failure_passes(self):
         async def fake_embed(texts):
@@ -152,8 +146,8 @@ class SemanticRefineGuardTest(unittest.IsolatedAsyncioTestCase):
             out_results, retry, _ = await self.engine._semantic_refine(
                 [0], results, [], [], ["a", "b"]
             )
-        self.assertEqual(len(out_results), 2, "裁判失效按放行处理，不阻塞分类")
-        self.assertEqual(retry, [])
+        assert len(out_results) == 2, "裁判失效按放行处理，不阻塞分类"
+        assert retry == []
 
     async def test_embedding_disabled_skips_and_never_calls_embed(self):
         called = []
@@ -172,39 +166,37 @@ class SemanticRefineGuardTest(unittest.IsolatedAsyncioTestCase):
             out_results, retry, _ = await self.engine._semantic_refine(
                 [0], results, [], [], ["a", "b"]
             )
-        self.assertEqual(called, [], "嵌入未启用时不得发起嵌入调用")
-        self.assertEqual(len(out_results), 2)
-        self.assertEqual(retry, [])
+        assert called == [], "嵌入未启用时不得发起嵌入调用"
+        assert len(out_results) == 2
+        assert retry == []
 
 
-class QuoteAlignedDirectTest(unittest.TestCase):
+class TestQuoteAlignedDirect(unittest.TestCase):
     """_quote_aligned 直接单测（纯函数，无需 mock 嵌入）。"""
 
     def test_own_closest_aligned(self):
         # own 与自身向量同向，他者正交 → 放行
-        self.assertIs(engine._quote_aligned([1.0, 0.0], [[0.9, 0.1], [0.0, 1.0]], 0), True)
+        assert engine._quote_aligned([1.0, 0.0], [[0.9, 0.1], [0.0, 1.0]], 0) is True
 
     def test_other_closest_drift(self):
         # own 更接近他者（超出容差） → 拦下
-        self.assertIs(engine._quote_aligned([0.0, 1.0], [[1.0, 0.0], [0.05, 1.0]], 0), False)
+        assert engine._quote_aligned([0.0, 1.0], [[1.0, 0.0], [0.05, 1.0]], 0) is False
 
     def test_margin_tie_passes(self):
         # own 略低于 best_other 但差距在 _SEMANTIC_ALIGN_MARGIN(0.05) 内 → 放行
         # own≈0.9798, best_other≈0.9950，差 ≈0.015 < 0.05 → 平票口径放行
-        self.assertIs(
-            engine._quote_aligned([1.0, 0.0], [[0.98, 0.2], [0.99, 0.1]], 0), True
-        )
+        assert engine._quote_aligned([1.0, 0.0], [[0.98, 0.2], [0.99, 0.1]], 0) is True
 
     def test_out_of_range_own_idx_treated_as_zero(self):
         # own_idx 越界按 0.0 处理：单一比较对象显著更高 → 拦下
-        self.assertIs(engine._quote_aligned([1.0, 0.0], [[1.0, 0.0]], 5), False)
+        assert engine._quote_aligned([1.0, 0.0], [[1.0, 0.0]], 5) is False
 
     def test_empty_cvecs_passes(self):
         # 无比较对象（best_other 默认 0.0）→ 放行
-        self.assertIs(engine._quote_aligned([1.0, 0.0], [], 0), True)
+        assert engine._quote_aligned([1.0, 0.0], [], 0) is True
 
 
-class ParseResponseAmbiguousOutTest(unittest.TestCase):
+class TestParseResponseAmbiguousOut(unittest.TestCase):
     """_parse_response 记录模糊条目：结果暂留、ambiguous_out 上报。"""
 
     def test_ambiguous_recorded_and_result_kept(self):
@@ -217,9 +209,9 @@ class ParseResponseAmbiguousOutTest(unittest.TestCase):
             contents=["摄影社招新", "摄影社招新"],
             ambiguous_out=ambiguous,
         )
-        self.assertEqual(ambiguous, [0])
-        self.assertEqual([r.msg_index for r in results], [0])
-        self.assertEqual(retry, [])
+        assert ambiguous == [0]
+        assert [r.msg_index for r in results] == [0]
+        assert retry == []
 
     def test_no_ambiguous_without_contents(self):
         ambiguous = []
@@ -229,14 +221,15 @@ class ParseResponseAmbiguousOutTest(unittest.TestCase):
             1,
             ambiguous_out=ambiguous,
         )
-        self.assertEqual(ambiguous, [])
-        self.assertEqual([r.msg_index for r in results], [0])
+        assert ambiguous == []
+        assert [r.msg_index for r in results] == [0]
 
 
-class SemanticRefineIntegrationTest(unittest.IsolatedAsyncioTestCase):
+class TestSemanticRefineIntegration:
     """端到端：语义裁判摘除漂移条目（results/time_indexes → retry）。"""
 
-    def setUp(self) -> None:
+    @pytest.fixture(autouse=True)
+    def _autouse_setup(self):
         self.engine = engine
 
     async def test_refine_demotes_drift(self):
@@ -253,9 +246,9 @@ class SemanticRefineIntegrationTest(unittest.IsolatedAsyncioTestCase):
             results, retry, times = await self.engine._semantic_refine(
                 [0], results, [], [0], ["南模原文", "位育原文"]
             )
-        self.assertEqual(results, [])
-        self.assertEqual(retry, [0])
-        self.assertEqual(times, [])
+        assert results == []
+        assert retry == [0]
+        assert times == []
 
     async def test_refine_keeps_aligned(self):
         async def fake_embed(texts):
@@ -270,9 +263,9 @@ class SemanticRefineIntegrationTest(unittest.IsolatedAsyncioTestCase):
             results, retry, times = await self.engine._semantic_refine(
                 [0], results, [], [0], ["自己原文", "无关消息"]
             )
-        self.assertEqual([r.msg_index for r in results], [0])
-        self.assertEqual(retry, [])
-        self.assertEqual(times, [0])
+        assert [r.msg_index for r in results] == [0]
+        assert retry == []
+        assert times == [0]
 
 
 if __name__ == "__main__":
