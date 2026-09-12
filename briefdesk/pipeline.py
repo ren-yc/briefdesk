@@ -340,7 +340,8 @@ async def process_all_batches(
         batch_size = config.realtime_batch_max_count
     batches = _split_batches(messages, batch_size)
 
-    enrich_stages = get_stages("enrich")
+    # enrich 阶段集已在入口 OCR 检查处获取（运行期不变：register_stage
+    # 仅发生在装配期 setup_all，无运行时注册），此处不再重复获取
     classify_stages = get_stages("classify")
     dedup_stages = get_stages("dedup")
     merge_stages = get_stages("post_insert")

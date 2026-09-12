@@ -154,7 +154,9 @@ def _group_messages(
 # index 前缀不动，AI 输出与消息的 index 对应关系不受影响。
 _MAX_MSG_CHARS = 800  # 单条消息字符上限（中文约 1 token/字）
 _MAX_BATCH_CHARS = 40000  # 整批 user 消息字符总量上限（防御性兜底）
-_BATCH_DELIMITER = "=" * 3  # 数据边界标记：框定群聊消息数据区（提示词注入缓解）
+# 数据边界标记：框定群聊消息数据区（提示词注入缓解）。三处引用同源
+# （常量，不写字面量）；群聊原文出现 "===" 不再构成可混淆的边界
+_BATCH_DELIMITER = "===BRIEFDESK_MSG_DATA==="
 
 
 def _build_user_message_ex(groups: list[dict]) -> tuple[str, list[int]]:

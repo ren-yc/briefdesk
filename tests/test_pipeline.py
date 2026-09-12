@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, Mock, patch
 import aiosqlite
 
 from briefdesk import announcements, stages
+from briefdesk import pipeline as pipeline_module
 from briefdesk.config import config
 from briefdesk.db import init_schema
 from briefdesk.pipeline import (
@@ -1556,6 +1557,49 @@ class VisionWithoutOcrAnnouncementTest(unittest.IsolatedAsyncioTestCase):
             await _check_vision_without_ocr([])
         self.assertEqual(announcements.get_announcements(), [])
         self.assertEqual(self.published, [])
+
+
+class EnrichStagesSingleFetchTest(_StageTestBase):
+    """process_all_batches 对 enrich 槽位仅获取一次（运行期阶段
+    集不变——register_stage 仅发生在装配期 setup_all）。"""
+
+    async def test_enrich_stage_fetched_once(self):
+        calls: list[str] = []
+        original = pipeline_module.get_stages
+
+        def counting_get_stages(slot):
+            calls.append(slot)
+            return original(slot)
+
+        with (
+            patch.object(pipeline_module, "get_stages", counting_get_stages),
+            patch.object(config, "ai_vision_enabled", False),
+            patch(
+                "briefdesk.pipeline.get_enabled_sessions",
+                new=AsyncMock(return_value=[{"session_id": "s"}]),
+            ),
+            patch(
+                "briefdesk.pipeline.get_enabled_categories",
+                new=AsyncMock(return_value=[{"name": "x"}]),
+            ),
+            patch(
+                "briefdesk.pipeline.are_messages_processed",
+                new=AsyncMock(return_value=set()),
+            ),
+            patch(
+                "briefdesk.pipeline.bulk_insert_raw_messages", new=AsyncMock()
+            ),
+        ):
+            # classify/dedup 未注册 → 骨架在阶段守卫处早退（整批保留）；
+            # enrich 的获取点（入口 OCR 检查）仍应只发生一次
+            result = await process_all_batches(
+                [_pipeline_msg("m1")],
+                _pipeline_client(),
+                batch_size=10,
+                origin="test",
+            )
+        self.assertFalse(result, "阶段缺失应整批保留（早退 False）")
+        self.assertEqual(calls.count("enrich"), 1, f"enrich 应仅获取一次: {calls}")
 
 
 if __name__ == "__main__":

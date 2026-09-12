@@ -23,6 +23,7 @@ from briefdesk.announcements import (
 )
 from briefdesk.config import config
 from briefdesk.plugins.classify.engine import (
+    _BATCH_DELIMITER,
     _MAX_BATCH_CHARS,
     _MAX_IMAGES_PER_REQUEST,
     _MAX_MSG_CHARS,
@@ -601,10 +602,34 @@ class UserMessageTruncationTest(unittest.TestCase):
 
     def test_delimiters_frame_data_region(self):
         msg = _build_user_message(self._groups("你好"))
-        self.assertTrue(msg.startswith("=" * 3 + "\n群聊消息开始"))
-        self.assertTrue(msg.endswith("群聊消息结束\n" + "=" * 3))
+        marker = _BATCH_DELIMITER
+        self.assertTrue(msg.startswith(marker + "\n群聊消息开始"))
+        self.assertTrue(msg.endswith("群聊消息结束\n" + marker))
         # 数据区（边界标记之间）包含消息行
         self.assertIn("0: A: 你好", msg)
+
+    def test_delimiter_survives_confusable_content(self):
+        """消息原文含 "===" 或完整边界标记时，数据区边界仍唯一
+        （边界标记不在消息行内重复出现为前提——三处引用同源常量）。"""
+        group = {
+            "groupName": "g",
+            "messages": [
+                {"index": 0, "senderName": "A", "content": "==="},
+                {"index": 1, "senderName": "A", "content": "===BRIEFDESK_MSG_DATA==="},
+            ],
+        }
+        lines = _build_user_message([group])
+        marker = _BATCH_DELIMITER
+        # 结构性边界出现在行首恰好 4 处（开始 2 + 结束 2）；消息行含完整标记
+        # 也无法伪造——行内容带 "index: sender: " 前缀，marker 不在行首
+        self.assertEqual(lines.count(marker), 5)  # 4 结构 + 1 消息行内
+        self.assertEqual(
+            len([ln for ln in lines.split("\n") if ln.startswith(marker)]),
+            4,
+            "行首结构性边界必须唯一",
+        )
+        self.assertIn("0: A: ===", lines)
+        self.assertIn("1: A: ===BRIEFDESK_MSG_DATA===", lines)
 
 
 class TimesResponseTest(unittest.TestCase):
