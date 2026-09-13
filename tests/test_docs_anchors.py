@@ -16,11 +16,12 @@ from pathlib import Path
 
 _ROOT = Path(__file__).resolve().parents[1]
 
-# 参与检查的文档（相对仓库根）；含插件自带的 API 文档（有 2 条锚点链接）
+# 参与检查的文档（相对仓库根）——限定为本仓库 authored 的文档。
+# briefdesk/plugins/*/*-api.md 是上游逐字节镜像（现已改为 GitHub 链接引用，不再入库），
+# 不可纳入本守卫：上游改标题会经镜像同步传导为本地假失败。
 _DOCS = (
     "docs/architecture.md",
     "docs/plugin-dev.md",
-    "briefdesk/plugins/weflow/weflow-server-api.md",
     "README.md",
     "USAGE.md",
 )
