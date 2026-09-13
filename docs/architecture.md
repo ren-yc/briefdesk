@@ -538,7 +538,7 @@ teardown 关闭 runtime。
 
 weflow 消息源（实现 `SourceRuntime`，接入 weflow-server 默认 :5033，微信 4.x 活库直读）。与 qqflow / weflow-legacy 同构六文件分
 层
-（config/client/sse/poller/normalize/runtime）。**契约与实测细节见插件内 vendored `weflow-server-api.md`（v0.5.0 对齐；
+（config/client/sse/poller/normalize/runtime）。**契约与实测细节见上游 API 文档 [weflow-server-api.md（v0.5.1）](https://github.com/ren-yc/weflow-server/blob/v0.5.1/docs/weflow-server-api.md)（本仓库不再镜像副本；
 原「下游实测补注」小节已并入文档正文并移除）**。要点：**账号引导注册**（`ensure_ready` 健康检查驱动：先读 `/health` 的**标量** `account` 阶段
 （`unregistered\|indexing\|ready\|error`，上游 v0.5.0 起不再下发账号数组——该接口免鉴权，账号清单等于向任何调用方枚举本机账号；明细改走需鉴权的
 `GET /api/v1/accounts`），**`ready`/`indexing` 短路前必须先过身份闸门**（详见「设计要点与陷阱」中「`/health` 的标量阶段不含身份」一条：标量阶段说
@@ -591,7 +591,8 @@ poller 用 `fetch_messages(not_found_ok=True)` 降级为空信封、静默跳过
 #### briefdesk/plugins/qqflow/
 
 qqflow 消息源（实现 `SourceRuntime`，接入 qqflow-server 默认 :5032）。与 weflow-legacy 同构六文件分层
-（config/client/sse/poller/normalize/runtime），差异源于 qqflow-server API：**媒体**（图片消息经 `mediaId` +
+（config/client/sse/poller/normalize/runtime）。**契约与实测细节见上游 API 文档
+[qqflow-server-api.md（v0.5.2）](https://github.com/ren-yc/qqflow-server/blob/v0.5.2/docs/qqflow-server-api.md)（本仓库不再镜像副本）**。差异源于 qqflow-server API：**媒体**（图片消息经 `mediaId` +
 `GET /api/v1/media/{id}` 获取字节做 OCR 与前端展示；`mediaId` 仅在上游注册可读取的本地缓存时提供——REST 与 SSE 同一规则、同一承诺（出现即保证可取）；
 SSE 事件直接携带 `mediaId`，`media` 对象为无路径元数据视图（上游推送不下发 `localPath`）；语音/视频无下游消费方仍整体过滤）、**引导注
 册**（`ensure_ready`：读 `/health` 的**标量** `account` 阶段（`unregistered\|indexing\|ready\|error`，上游 v0.5.0

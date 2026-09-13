@@ -157,9 +157,9 @@ briefdesk/
 │   ├── types.py            # 跨模块基础类型（含管道跨插件契约）
 │   ├── server/             # FastAPI 服务子包（app/中间件/核心路由/类别路由/媒体代理/静态托管/插件注入/回调）
 │   └── plugins/            # 内置插件（消息源 + AI 供应商 + 管道阶段 + Web 插件）
-│       ├── weflow/             # weflow 消息源（微信 4.x，weflow-server :5033；同构六文件分层 + weflow-server-api.md）
+│       ├── weflow/             # weflow 消息源（微信 4.x，weflow-server :5033；同构六文件分层；API 契约见上游文档）
 │       ├── weflow_legacy/      # WeFlow Legacy 消息源（plugin.py + client/config/normalize/poller/runtime/sse + weflow-legacy-api.md）
-│       ├── qqflow/             # qqflow 消息源（plugin.py + 同构六文件分层 + qqflow-server-api.md）
+│       ├── qqflow/             # qqflow 消息源（plugin.py + 同构六文件分层；API 契约见上游文档）
 │       ├── ai_provider/        # AI 供应商插件（plugin.py 注册端口 / engine.py OpenAI 兼容 chat + 嵌入）
 │       ├── ocr/                # OCR 阶段插件（plugin.py 槽位 enrich / engine.py RapidOCR；依赖可选，未安装时自禁用）
 │       ├── classify/           # AI 分类阶段插件（plugin.py 槽位 classify / engine.py 提示词与解析）

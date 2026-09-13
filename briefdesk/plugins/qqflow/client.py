@@ -522,7 +522,8 @@ class QqFlowClient(SourceClient):
     async def fetch_sessions(self) -> list[QqFlowSession]:
         """获取所有会话列表（按 offset 翻页取尽，与 fetch_contacts 同模式）。
 
-        上游 limit 默认 100 且按最后消息时间倒序（qqflow-server-api.md §4），
+        上游 limit 默认 100 且按最后消息时间倒序（上游 API 文档 §4：
+        https://github.com/ren-yc/qqflow-server/blob/v0.5.2/docs/qqflow-server-api.md），
         不翻页只会发现最近活跃的 100 个会话，更早的会话将永远无法被
         发现/启用/轮询。page_size=10000 = 上游 limit 硬上限：典型规模一个
         请求即取尽（与旧「显式大 limit」实现请求数相同）；旧上游若忽略
@@ -554,7 +555,8 @@ class QqFlowClient(SourceClient):
             offset: 分页偏移
             not_found_ok: 上游 404 时返回空信封而非抛错。按 v1 契约会话
                 不存在并不 404（返回 success=true 的空信封，见
-                qqflow-server-api.md「JSON 响应字段」），此开关兜底上游
+                上游 API 文档「JSON 响应字段」：
+                https://github.com/ren-yc/qqflow-server/blob/v0.5.2/docs/qqflow-server-api.md），此开关兜底上游
                 版本差异等异常 404；轮询路径应传 True（对齐 weflow
                 brandsessionholder 等系统会话的容错）
 
