@@ -60,6 +60,10 @@ dev = [
     # 测试套件的硬依赖：asyncio_mode = "auto"（见 [tool.pytest.ini_options]）
     # 生效前提，且 required_plugins 会在插件缺失时显式报错
     "pytest-asyncio>=1.4",
+    # starlette.testclient 首选 httpx2 作为 HTTP 后端；缺它则每次 import
+    # TestClient 都发 StarletteDeprecationWarning（见 quality-gates 的
+    #「新增 warning 视为失败」口径）。仅测试侧使用，生产仍用 httpx。
+    "httpx2>=2.12",
     "ruff>=0.9",
     "mypy>=1.11",
     "pip-tools>=7.4",
