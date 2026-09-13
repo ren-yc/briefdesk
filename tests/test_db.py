@@ -1833,6 +1833,12 @@ class TestEmbeddingsDb:
         main_close_mock.assert_awaited_once()
         assert db_module._embed_db is None
         assert db_module._db is None
+        # 本用例刻意让 embed 的 close 抛错、main 的 close 被 mock 掉，两条真实
+        # 连接从未关闭：必须显式收尾，否则事件循环关闭后其非 daemon worker
+        # 线程抛 RuntimeError('Event loop is closed')，被 pytest 记为
+        # PytestUnhandledThreadExceptionWarning（偶发红灯）。
+        await embed_db.close()
+        await main_db.close()
 
 
 # ── 审查修复回归测试（内存库，不触碰应用数据库文件）──

@@ -4,7 +4,8 @@
   嵌入 API 调用，避免在 _storage_lock 内 await 远程嵌入阻塞整条管道）；
 - run（存储锁内，由骨架持有锁）：逐行判重 → 重复则标记 processed /
   否则入库 + 缓存追加；
-- after_run（锁外）：批量持久化本批待落库向量（一次 DB 调用）。
+- after_run（批尾；内部持 storage_lock 过滤已删条目后批量落库）：持久化
+  本批待落库向量（一次 DB 调用）。
 
 setup：构造 DedupEngine、预热缓存（HTTP 服务启动前、源启动前），
 把引擎注册为 ctx.dedup 服务端口（供 merge 阶段与事件清理同步缓存），
