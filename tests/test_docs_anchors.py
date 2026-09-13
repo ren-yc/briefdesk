@@ -16,8 +16,14 @@ from pathlib import Path
 
 _ROOT = Path(__file__).resolve().parents[1]
 
-# 参与检查的文档（相对仓库根）
-_DOCS = ("docs/architecture.md", "docs/plugin-dev.md", "README.md", "USAGE.md")
+# 参与检查的文档（相对仓库根）；含插件自带的 API 文档（有 2 条锚点链接）
+_DOCS = (
+    "docs/architecture.md",
+    "docs/plugin-dev.md",
+    "briefdesk/plugins/weflow/weflow-server-api.md",
+    "README.md",
+    "USAGE.md",
+)
 
 _FENCE_RE = re.compile(r"^\s*```")
 _HEADING_RE = re.compile(r"^(#{1,6})\s+(.*)$")
@@ -75,8 +81,11 @@ class DocsAnchorGuardTest(unittest.TestCase):
         """architecture.md 头部 TOC 的每条锚点都可跳转。"""
         text = (_ROOT / "docs" / "architecture.md").read_text(encoding="utf-8")
         anchors = _anchors(text)
-        # TOC 位于文件头部：截取到第一个 `## 定位` 之前的链接
-        head = text.split("\n## 定位", 1)[0]
+        # TOC 位于文件头部：截取到第一个 `## 定位` 之前的链接。
+        # 先断言边界存在——否则 split 会退化成整篇文本，断言仍能通过而守卫静默失效。
+        marker = "\n## 定位"
+        self.assertIn(marker, text, "顶层章节「定位」缺失，TOC 边界判据失效")
+        head = text.split(marker, 1)[0]
         toc = _LINK_RE.findall(head)
         self.assertGreaterEqual(len(toc), 8, "TOC 应列出 8 个顶层章节")
         for target in toc:
@@ -86,7 +95,10 @@ class DocsAnchorGuardTest(unittest.TestCase):
         """核心模块表的「详见下文」锚点必须命中同名详解小节。"""
         text = (_ROOT / "docs" / "architecture.md").read_text(encoding="utf-8")
         anchors = _anchors(text)
-        table = text.split("### 核心模块详解", 1)[0]
+        # 同上：边界缺失会让取值退化为整篇文本，守卫静默失效
+        marker = "### 核心模块详解"
+        self.assertIn(marker, text, "「核心模块详解」小节缺失，模块表边界判据失效")
+        table = text.split(marker, 1)[0]
         links = [a for a in _LINK_RE.findall(table) if a.startswith("briefdesk")]
         self.assertGreaterEqual(len(links), 20, "模块表应含大量跳转")
         missing = sorted({a for a in links if a not in anchors})
