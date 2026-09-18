@@ -17,18 +17,53 @@ import pytest
 
 # 与 tests/test_fetch_icons_script.py 同口径：tests/ 为包，仓库根已在 sys.path 上
 from scripts.forbidden_refs import (
+    _added_lines,
     scan_commit_message,
+    scan_lines,
     scan_source,
     scan_tree,
 )
 
 _ROOT = Path(__file__).resolve().parents[1]
 
+# 增量扫描用例：diff 与文件内容是两路输入——diff 给行号，内容取自
+# 「新增侧」版本。用仓库内已跟踪的文件名，配合打桩内容精确验证定位逻辑。
+_DIFF_FILE = "scripts/secret_scan.py"
+
+_DIFF_HEADER = f"""diff --git a/{_DIFF_FILE} b/{_DIFF_FILE}
+--- a/{_DIFF_FILE}
++++ b/{_DIFF_FILE}
+"""
+
 
 def _ref(letter: str, number: int) -> str:
     """运行期拼接条目码：样例本身不能以字面量出现在源码里（否则被自身规则命中）。"""
     return f"{letter}{number}"
 
+
+def test_diff_scan_ignores_unchanged_old_lines() -> None:
+    """未改动的旧行不在新增行集合内：即使同文件别处有编号，也不得报出。"""
+    source = "\n".join(
+        [
+            f"# 复核 {_ref('P', 1)}-1 示例",
+            "# 本轮新增的无害注释",
+        ]
+    )
+    assert scan_lines("tests/test_db.py", source, {2}) == []
+
+
+def test_diff_scan_honours_diff_line_numbers() -> None:
+    """命中行号取自 diff 的新增侧（行号与内容两路输入，各司其职）。"""
+    source = "\n".join([f"# 复核 {_ref('P', 1)}-1 示例", "# 本轮新增的无害注释"])
+    hits = scan_lines("tests/test_db.py", source, {1, 2})
+    assert len(hits) == 1
+    assert hits[0].line == 1
+
+
+def test_diff_parser_maps_added_lines_to_new_file() -> None:
+    """diff 解析：新增行的行号按新文件计数（本用例只测解析器本身）。"""
+    diff = _DIFF_HEADER + "@@ -10,0 +12,2 @@\n+第一行\n+第二行\n"
+    assert _added_lines(diff) == {_DIFF_FILE: {12, 13}}
 
 def test_no_plan_references_anywhere() -> None:
     """全库注释 / 文档不得出现编号引用（审查报告条目号、计划产物编号、流水号批次）。"""

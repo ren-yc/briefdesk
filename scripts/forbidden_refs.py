@@ -360,26 +360,35 @@ def _file_at_rev(rev: str, path: str) -> str | None:
         return None
 
 
+def scan_lines(path: str, source: str, lines: set[int]) -> list[Hit]:
+    """在给定的行号集合上扫描该文件内容（增量定位的纯函数形态）。
+
+    与 scan_diff 的分工：这里只做「内容 → 命中 → 按行号过滤」，不碰 git；
+    这样增量定位逻辑可以被无副作用地单测，不需要改动索引或工作区。
+    """
+    return [hit for hit in scan_source(path, source) if hit.line in lines]
+
+
 def scan_diff(diff_text: str, *, rev: str | None, staged: bool) -> list[Hit]:
     """扫描增量变更：只报新增行上的命中。
 
     定位方式：先解析新增行行号，再取该文件的**完整版本**做语法分段，
     只保留落在新增行上的命中——这样 docstring 内的行号依然精确，
-    且规则 4 仍能按「注释 / 文档语境」判定。取不到完整版本时退化为
-    逐行宽松扫描（_looks_like_prose）。
+    且规则 4 仍能按「注释 / 文档语境」判定。
+
+    版本选择：行号是**新文件**（HEAD / 工作区）的行号，因此内容必须取
+    「新增侧」的版本——staged 取索引（:0），CI 比较基线...HEAD 时取 HEAD。
+    取基线 ref 会把新行号套到旧内容上，报出一堆「本轮已删除」的假命中。
+    取不到（文件为新增或删除）时跳过该文件。
     """
     hits: list[Hit] = []
     for path, lines in _added_lines(diff_text).items():
         if not lines:
             continue
-        source = _file_at_rev(":0" if staged else "HEAD", path) if rev is None else _file_at_rev(rev, path)
-        if source is None and rev is not None:
-            source = _file_at_rev("HEAD", path)
+        source = _file_at_rev(":0" if staged else "HEAD", path)
         if source is None:
             continue
-        for hit in scan_source(path, source):
-            if hit.line in lines:
-                hits.append(hit)
+        hits.extend(scan_lines(path, source, lines))
     return hits
 
 
