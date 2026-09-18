@@ -18,7 +18,7 @@
 ## 定位
 
 简报台（Brief Desk）is a local web app that monitors group chat messages via pluggable message sources
-(default: WeFlow HTTP API), classifies them with AI, deduplicates across groups, optionally OCRs
+(weflow / weflow-legacy / qqflow — each an optional plugin, none enabled by default), classifies them with AI, deduplicates across groups, optionally OCRs
 attached images (含图消息按模型能力路由：纯文本模型仅送 OCR 文本；`AI_VISION_ENABLED` 开启时把 OCR 文本连同图片一并送入视觉模型，见「图片与 OCR」陷阱小
 节), and displays structured, deduplicated information briefs (factory default categories: 13 — 活动通知/社
 团招新/学术/交易/实习 默认启用，另有 失物招领/求助互助/组队拼团/兼职家教/免费福利/房屋租售/志愿公益/奖助申报 出厂停用；空库播种全量，存量库由
@@ -133,8 +133,9 @@ Web 插件经 `ctx.register_router`/`ctx.register_plugin_assets` 注册；按名
 止——决策 ①=1B））→ Web 插件挂载（`include_plugin_router` 展开路由插到 SPA mount 前 + 静态资源注册 +
 `set_plugins_info_callback(manager.infos)` + `set_settings_schema_callback(manager.settings_schema)` +
 `set_plugin_meta_callback(manager.plugin_meta)` + `set_plugin_validation_callback(manager.validate_selection)`）
-→ start uvicorn → wait for `server.started` → `activate_all()` + 逐个 `source.start()`（启动实时监听）→
-background initial sync (`trigger_sync`). Registers SIGINT/SIGTERM graceful shutdown via
+→ start uvicorn（创建 `server.serve()` 任务）→ `activate_all()` + 逐个 `source.start()`（启动实时监听）→
+background initial sync (`trigger_sync`) → wait for `server.started`（随后才安装信号 handler，见下）.
+Registers SIGINT/SIGTERM graceful shutdown via
 `_install_signal_handlers` (Windows falls back to `signal.signal` + `call_soon_threadsafe`)，**安装在
 `server.started` 之后**——此前启动窗口期（DB 初始化/插件装配/去重预热）的 Ctrl+C 由 `asyncio.Runner` 自带的 SIGINT handler 取消主任务
 ，`_run` 的 finally（唯一清理点）照常跑完（finally 开头 `uncancel()` 吸收该取消请求，保证后续清理 await 不被打断）；清理 finally 开头再将
@@ -162,6 +163,12 @@ aiosqlite 线程挂死）。The Ctrl+C handler only does what must precede `shou
 ，guarded by `_poll_lock`)，供 `/api/sync` 与首轮回填共用；周期内错误写入 status。窗口规则：会话水位
 `sessions.last_poll_ts`（NULL=待回填 → 按 `BACKFILL_HOURS` 回填一次）与该会话最早未处理消息取 min，再减
 `POLL_OVERLAP_SECONDS`；仅含未处理消息的会话被其最久远未处理消息钉住窗口，其余会话水位不受影响。
+
+**已知限制（钉窗死状态）**：`get_oldest_unprocessed_by_session` 以「已落 raw_messages 且未标
+processed」为准。若某行在任何路径上都不会再被标记 processed——典型序列：`IGNORE_SELF=false` 期间自消息落
+raw 且分类失败 → 之后开启 `IGNORE_SELF`，三个 poller 预滤与 pipeline 入口过滤都不再让它进管道——该会话
+窗口下界会被永久钉在该行时间戳，每轮从该时刻全窗重拉重滤。不丢消息，仅浪费拉取；停用/启用会话清水位也解
+不了钉。现阶段接受该限制（真库探测：当前无启用会话处于钉窗）。
 
 #### briefdesk/types.py
 
@@ -888,7 +895,7 @@ Key behaviors:
 - Category sidebar with counts + 备忘录 (memo) / 已忽略 (ignored) views (from `/api/items`)
 - Item cards with three-state verification: 加入备忘录 (1) / 忽略 (-1) / 未处理 (0)
 - Expandable quote section (fetches context via `/api/context`)
-- Settings modal: sync button (`/api/sync`), session enable/disable with select-all; 群聊列表支持类型筛选（全部/群聊/私
+- Top bar: sync button (`/api/sync`, `ui/index.html` 的 `#sync-btn`); Settings modal: session enable/disable with select-all; 群聊列表支持类型筛选（全部/群聊/私
   聊/公众号，多选）与消息源筛选（多选，芯片按 `/api/status` 的 `sources` 实际启用源动态渲染，单源部署整行隐藏），两者与名称搜索、按时间过滤叠加生效（仅显示层，不影响保存
   diff）；行标签「群/私/公」按 is_group/is_official 渲染。**会话筛选单源 `createSessionFilter`**：设置「群聊筛选」与首次使用向导 step2 是同一套
   筛选（`sessionRowMatches` 的四维 AND：类型多选 + 源多选 + 名称搜索 + `last_active` 时间窗口，各维空集/空值 = 不筛选），两侧均由该工厂产出实例
@@ -1132,6 +1139,10 @@ Settings 经 `ClassVar KEYRING_FIELDS` 声明密钥字段继承之，位于 env 
 - **`add_to_cache` 的向量登记对新建/更新同口径**：两条分支（新建条目、同 id 幂等更新）先合流到同一个 `target`，再统一做一次「`embedding` 非空且
   `_embed_cache_ok` → 写 embedding + 追加 `_pending_embeds`」。更新分支只在并发/唯一键冲突重试路径上走到，漏登记的后果是该条永远不落库向量、重启后才由
   `_ensure_cache` 补齐，期间静默不参与余弦候选
+- **已知限制（跨群判重 × 会话停用）**：卡片只有一个原始会话（`items.session_id`），后续来源仅以群名并入
+  `source_group`。`_items_where` 按原始会话的 `enabled` 过滤，因此「A 群产生卡片 → 停用 A → 启用中的 B
+  群转发同一消息」时判重命中并合并进 A 的卡，卡片对用户不可见。数据不丢，重新启用 A 即可见。根治需引入
+  `item_sources` 来源表并配套 schema 迁移入口，另行立项；本地探测当前 0 张受影响。
 
 ### 管道并行与锁
 

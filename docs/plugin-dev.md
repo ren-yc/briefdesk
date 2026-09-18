@@ -128,7 +128,8 @@ StagePlugin 参与消息处理管道。管道骨架 `briefdesk/pipeline.py` 按�
 2. **PLUGIN_PATH**：环境变量 `PLUGIN_PATH` 指向一个含插件模块的目录（本地开发用），
    框架按同样约定发现 `plugin` 实例。
 
-**启用**：`PLUGINS` 环境变量为可选插件的显式白名单（逗号分隔，无通配语义）——
+**启用**：`PLUGINS` 环境变量为可选插件的显式白名单（JSON 数组，如
+`PLUGINS=["weflow","qqflow"]`；无通配语义）——
 
 - 不在列表中的可选插件被禁用（disabled，原因「未启用」）；未知名打 WARNING。
 - `core = True` 的核心插件**恒装配**，不受 PLUGINS 过滤。
@@ -143,7 +144,9 @@ StagePlugin 参与消息处理管道。管道骨架 `briefdesk/pipeline.py` 按�
 
 **事件订阅**：核心事件总线 `briefdesk.events`（模块级单例 `event_bus`，main 注入
 PluginContext）。插件在 setup 里经 `ctx.subscribe_event(event, handler)` 订阅；
-handler 为**同步**函数（发布方在持锁路径上同步调用，处理器异常只记日志不传播）。
+handler 同步/异步均可：`events.py` 的 `publish` 对协程函数与返回 awaitable 的同步函数都会
+await；处理器异常只记日志不传播。发布方可能持存储锁调用（如删除卡片），需要与锁内写入保持原子
+的处理器（如 dedup 清缓存）应实现为同步函数，避免锁内 await。
 
 ```python
 from briefdesk.events import EVENT_ITEMS_DELETED
@@ -176,7 +179,8 @@ def _on_items_deleted(self, item_ids: list[str]) -> None:
   用 `model_config` 设 `env_prefix`；字段注释写清对应环境变量与默认值。
 - **密钥字段**：`SecretStr` 类型 + 类级 `KEYRING_FIELDS` 映射（字段名 → 环境变量名）。
   解析链：**系统密钥环（keyring）→ 环境变量 → .env → 默认值**；`repr`/序列化自动掩码。
-- **密钥写入**：`briefdesk secrets set <NAME>`（CLI）或 UI「设置 → 密钥」密钥区；
+- **密钥写入**：`briefdesk secrets set <NAME>`（CLI）或 UI「设置 → 启动配置」面板底部的
+  「密钥（系统钥匙串）」区；
   **禁止把真实密钥写进 .env 之外的任何仓库文件、日志或示例**。
 - **设置面板**：在插件 setup 里把 schema 注册给设置页（参考 rag 插件的
   `build_settings_schema(RagSettings, plugin=...)`），字段类型/默认值/约束/密钥状态

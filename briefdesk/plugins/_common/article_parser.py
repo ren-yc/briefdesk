@@ -30,6 +30,11 @@ def _cdata(block: str, tag: str) -> str:
     或：
       <title>纯文本</title>
     形式出现。返回值会做 HTML 实体反转义（如 &amp; → &）。
+
+    注意：CDATA 分支与纯文本分支**都**做 `html.unescape`。按 XML 语义 CDATA 内是字面
+    文本，但真库探测（6,448 张链接卡）显示 CDATA 内 url/title/summary/des 字段无一含
+    实体（URL 内为裸 `&`），两种写法下现有解码结果均正确；改为仅解码纯文本分支没有
+    收益，保持现状以容错上游写法。
     """
     m = re.search(
         rf"<{tag}>\s*(?:<!\[CDATA\[(.*?)\]\]>|(.*?))\s*</{tag}>",
