@@ -82,7 +82,7 @@
     try {
       // 首次设提醒前同步申请桌面通知权限（页面后台时的到期提醒依赖它）：
       // Firefox 要求权限弹窗绑定 user activation，放到 await fetch 之后
-      // 激活态可能已被消费而静默不弹（审查 A4）。仅 default 态请求；点击
+      // 激活态可能已被消费而静默不弹。仅 default 态请求；点击
       // 菜单已是强意图信号，设置失败多弹一次可接受。拒绝/失败静默降级——
       // 前台 toast 提醒始终可用。
       if ("Notification" in window && Notification.permission === "default") {
@@ -246,7 +246,7 @@
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ at: null }),
         });
-        // 复核 P2-4：互斥判据改为响应体 cleared 字段——后端清除已无提醒的卡
+        // 互斥判据改为响应体 cleared 字段——后端清除已无提醒的卡
         // 返回 200 {"cleared": false}（而非 404），只有真正抢到清除权的标签页
         // 才通知，避免多标签页重复通知。
         if (!res.ok) continue;

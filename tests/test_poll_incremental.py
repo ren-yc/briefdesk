@@ -713,7 +713,7 @@ class TestPollCycleWatermark:
 
 
 class TestPollCyclePartialFailure:
-    """P0：源侧静默跳过的会话（PollResult.failed_sessions）不推进水位。
+    """源侧静默跳过的会话（PollResult.failed_sessions）不推进水位。
 
     qqflow 索引期 503 等瞬态失败若照常推进会话水位，被跳会话窗口内的消息
     既未落 raw 也未标 processed，钉窗机制看不到它们 → 永久漏拉。
@@ -772,7 +772,7 @@ class TestPollCyclePartialFailure:
 
 
 class TestQqFlowNotReadyFailure:
-    """P0：qqflow poller 在 503 静默跳过时把对应会话记入 failed_sessions。"""
+    """qqflow poller 在 503 静默跳过时把对应会话记入 failed_sessions。"""
 
     async def test_discovery_notready_marks_all_enabled_failed(self):
         # 发现阶段 503 早退：全部传入的启用会话视为未成功拉取
@@ -860,7 +860,7 @@ class TestAccountMismatchCycle:
 
 
 class TestSessionFailureIsolation:
-    """【复核 P2-5】单会话拉取失败不再中止整轮：记入 failed_sessions 与
+    """单会话拉取失败不再中止整轮：记入 failed_sessions 与
     session_errors，其余会话照常处理（此前整轮 raise 会让一个持续失败的
     坏会话饿死同源所有会话——已收集消息作废、全部水位不推进）。"""
 
@@ -892,7 +892,7 @@ class TestSessionFailureIsolation:
         assert "g2" in result.session_errors
 
     async def test_same_name_sessions_keep_both_errors(self):
-        """【核验 C2】同名群（如多个「通知群」）同轮失败：session_errors 以
+        """同名群（如多个「通知群」）同轮失败：session_errors 以
         session_id 为键互不覆盖（此前以显示名为键，后者覆盖前者，令应用层
         len(session_errors) 的 lastWarning 计数报少、首个失败原因丢失）。"""
         now = int(time.time())
@@ -927,7 +927,7 @@ class TestSessionFailureIsolation:
 
 
 class LegacyPagingGuardTest(unittest.IsolatedAsyncioTestCase):
-    """【核验 H2/A6】weflow-legacy 翻页去重与超窗计数的页内守卫。"""
+    """weflow-legacy 翻页去重与超窗计数的页内守卫。"""
 
     def setUp(self):
         self._hours = config.backfill_hours
@@ -1016,7 +1016,7 @@ class LegacyPagingGuardTest(unittest.IsolatedAsyncioTestCase):
 
 
 class TestPagingAgeEarlyStop:
-    """【复核 P2-12】页内碰到早于窗口的消息即止（响应按时间倒序），不再
+    """页内碰到早于窗口的消息即止（响应按时间倒序），不再
     深翻后续页——防御上游无视 start 参数返回历史全量（weflow 上限 40 万条、
     legacy 100 万条全量驻留内存）。"""
 

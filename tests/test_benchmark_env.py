@@ -59,7 +59,7 @@ class TestBenchmarkEnvCleanupScope:
 
 
 class TestProviderResourceAcquisitionFailure:
-    """连接创建失败也必须回收已获取资源与本次子目录（审查 A3）。
+    """连接创建失败也必须回收已获取资源与本次子目录。
 
     半程防护已下沉到 db.db_redirect 内部：第二条连接创建失败时由缝关闭
     第一条并上抛；本测试注入 _init_connection 第二次调用失败，验证该
@@ -110,7 +110,7 @@ if __name__ == "__main__":
 
 
 class TestDrainWait:
-    """【复核 P2-22】重定向前等待在途批次排空：pendingCount 归零即通过，
+    """重定向前等待在途批次排空：pendingCount 归零即通过，
     超时返回 False（调用方告警后放弃等待，行为可观测）。"""
 
     async def test_returns_true_when_drained(self):

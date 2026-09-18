@@ -86,7 +86,7 @@ class TestPluginAssets(unittest.TestCase):
 
 
 class TestPluginRouterPrefixGuard(unittest.TestCase):
-    """【复核 P2-11】插件路由必须挂在 /api/ 下：middleware 仅对 /api/ 前缀
+    """插件路由必须挂在 /api/ 下：middleware 仅对 /api/ 前缀
     的变更方法做同源校验，其它前缀会静默绕过 CSRF 防线——装配期硬失败。"""
 
     def test_non_api_prefix_rejected(self):

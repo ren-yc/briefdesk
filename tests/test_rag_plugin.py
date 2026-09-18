@@ -180,7 +180,7 @@ class TestRagDb:
         assert row["item_id"] == "i9"
 
     async def test_upsert_chunks_backfill_empty_item_id_preserves_existing(self):
-        """复核 P0-1：回填重建的 ChunkRow 不带 item_id（空串），冲突覆盖不得
+        """回填重建的 ChunkRow 不带 item_id（空串），冲突覆盖不得
         清空运行期已写入的「消息→卡片」引用（否则引用→卡片跳转永久丢失）。"""
         from briefdesk.plugins.rag.db import upsert_chunks
 
@@ -301,7 +301,7 @@ class TestRagDb:
         assert [c.msg_id for c, _ in entries] == ["m1", "m2"]
         assert [round(x, 5) for x in entries[0][1].tolist()] == [0.1, 0.2]
         assert watermark == "t0"
-        # 闭区间 >=：同秒提交的新行不会被严格大于漏掉（W1/N3）
+        # 闭区间 >=：同秒提交的新行不会被严格大于漏掉
         await upsert_chunks(self.db, [self._row("m3")])
         await upsert_embeddings(self.db, [("weflow-legacy", "m3")], [[0.5]], "old-model", "t0")
         raw_same, _ = await fetch_new_embeddings(self.db, "old-model", watermark)
@@ -737,7 +737,7 @@ class TestRagRetrieve(_MemoryEngineBase):
         assert hits[0].has_fts
 
     async def test_query_embed_failure_degrades_to_fts_only(self):
-        # F4：查询嵌入失败不再整体拒答——降级 FTS-only，可命中问题仍可回答
+        # 查询嵌入失败不再整体拒答——降级 FTS-only，可命中问题仍可回答
         self.provider.embed_texts = AsyncMock(side_effect=RuntimeError("端点不可达"))
         hits = await self.engine.retrieve("开会有通知")
         assert hits is not None
@@ -892,7 +892,7 @@ class TestPromptFlatten(unittest.TestCase):
         assert "周六6点 [1]。" in user
 
     def test_history_trimmed_over_cap(self):
-        # P7：长历史裁剪——只保留最近 6 轮，并标注省略条数
+        # 长历史裁剪——只保留最近 6 轮，并标注省略条数
         from datetime import UTC, datetime
 
         from briefdesk.plugins.rag.prompts import build_answer_prompt
@@ -1152,7 +1152,7 @@ class TestRagCrossSourceScope(_MemoryEngineBase):
 
 
 class TestRagWarmVectorsForceFull(_MemoryEngineBase):
-    """复核 P1-4：warm_vectors(force_full=True) 必须按 key 差集剔除已删条目，
+    """warm_vectors(force_full=True) 必须按 key 差集剔除已删条目，
     否则「行数回退→整表重建」信号被归零计数吞掉，已删内容持续可检索。"""
 
     async def test_force_full_purges_deleted_keys_from_cache(self):
@@ -1345,7 +1345,7 @@ class TestRagChatRouting:
 
 
 class TestDeleteEventGc:
-    """【复核 P2-24】卡片删除事件触发即时孤儿对账（此前最长滞留一个维护
+    """卡片删除事件触发即时孤儿对账（此前最长滞留一个维护
     周期，已删内容仍可被 /api/rag/ask 引用——与停用会话即时生效不对齐）。"""
 
     async def test_setup_subscribes_and_handler_runs_gc(self, fake_embed_provider):

@@ -383,7 +383,7 @@ class TestPollerDisplayName:
         assert client.group_members_calls == []
 
     async def test_messages_failure_isolated_to_session(self):
-        """【复核 P2-5】单会话拉取失败不再中止整轮：该会话记入
+        """单会话拉取失败不再中止整轮：该会话记入
         failed_sessions/session_errors（消息不入库），不再整轮 raise。"""
         client = _FailingMessagesClient(
             contacts={},
@@ -397,7 +397,7 @@ class TestPollerDisplayName:
         result = await poll(client, self._enabled(), no_processed)
         assert result.messages == []
         assert result.failed_sessions == {"10001"}
-        # session_errors 以 session_id 为键（同名群互不覆盖，核验 C2）
+        # session_errors 以 session_id 为键（同名群互不覆盖）
         assert "messages down" in result.session_errors["10001"]
 
     async def test_messages_503_skips_session(self):

@@ -261,7 +261,7 @@ class TestOcrEnrich:
         assert msg.content == "原文内容"
 
     async def test_ocr_mixed_message_appends_ocr_section(self):
-        # 图+文混合消息（复核 P2-21）：人工原文保留（信息密度更高），OCR 文本
+        # 图+文混合消息：人工原文保留（信息密度更高），OCR 文本
         # 作为附加段追加——此前整段替换会丢掉原文，分类/去重也失去该上下文
         msg = self._msg()
         await self._run(msg, self._client(), AsyncMock(return_value="识别文字"))
@@ -370,7 +370,7 @@ class TestStoreBatchFailed(_StageTestBase):
 
 
 class TestRawInsertHoldsStorageLock(_StageTestBase):
-    """复核 P1-2：raw 落库必须持有 storage_lock，锁外 commit 会击穿
+    """raw 落库必须持有 storage_lock，锁外 commit 会击穿
     「单连接 + 隐式事务 + 存储锁」不变量（把锁内多步写提前提交）。"""
 
     async def test_bulk_insert_raw_messages_called_under_lock(self):
@@ -397,7 +397,7 @@ class TestRawInsertHoldsStorageLock(_StageTestBase):
 
 
 class TestActiveBatchTracking(_StageTestBase):
-    """复核 P1-5：process_all_batches 执行期间 active_batches 计数为 1，
+    """process_all_batches 执行期间 active_batches 计数为 1，
     退出后归 0（benchmark 排空门闸据此捕捉「已过暂停检查、尚未计数」的批次）。"""
 
     async def test_active_batches_tracks_process_lifetime(self):
@@ -1193,7 +1193,7 @@ class TestConversationMergeStage:
         assert add_calls[0][1] == "c1"
 
     async def test_judge_new_desc_uses_msg_content_not_quote(self):
-        # 复核 P3-8：新卡判官证据须用 msg.content（完整原文），与头卡
+        # 新卡判官证据须用 msg.content（完整原文），与头卡
         # source_quote 对称；此前用 result.quote（AI 摘录），与观察记录
         # tail.source_quote 记的 msg.content 不一致。
         await self._seed_cand("c1", 100, title="塔卡沙团购", quote="塔卡沙团购")
@@ -1401,7 +1401,7 @@ class TestProcessingPausedGate:
 
 class TestProcessAllBatchesAllFailedReturn(_StageTestBase):
     """零产出（全部分类失败）→ 返回 False：调用方不推进水位，
-    失败消息由"最早未处理消息钉窗"在后续轮次找回（审计 #1）。"""
+    失败消息由"最早未处理消息钉窗"在后续轮次找回。"""
 
     async def test_all_failed_returns_false(self):
         db = await aiosqlite.connect(":memory:")
@@ -1446,7 +1446,7 @@ class TestProcessAllBatchesAllFailedReturn(_StageTestBase):
 
 
 class TestMarkSkippedContract:
-    """【复核 P2-4】outcome is None（classify 契约违约）不得当全批闲聊：
+    """outcome is None（classify 契约违约）不得当全批闲聊：
     整批不标记，零产出路径使 poll_cycle 跳过水位推进；模型显式全排除
     （outcome.results 为空但 outcome 非 None）才标记 processed。"""
 

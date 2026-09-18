@@ -244,7 +244,7 @@ pipeline 入口过滤共用——qqflow 同文异图消息防误判 SAME；本�
 程
 首批次一次性场景）→ 门禁分级（normal ≥ `DEDUP_EMBED_THRESHOLD` 走 strong 短路/加权多数票；weak 区间 [fallback, threshold) 仅当无
 normal 候选时参与，全员判 SAME 才判重）→ 同文本短路（≥ `DEDUP_STRONG_THRESHOLD` 候选 AI 判 SAME 即直接判重、判 DIFFERENT 只剔除该候选；
-strong 候选判定失败降级参与后续多数票（异常不抛穿、不构成短路命中——合并自远程审计 S1）→ 其余候选**并行**送 LLM（`gather(return_exceptions=True)`
+strong 候选判定失败降级参与后续多数票（异常不抛穿、不构成短路命中）→ 其余候选**并行**送 LLM（`gather(return_exceptions=True)`
 隔
 离：加权多数票中单候选 API 异常剔除出计权——既无 SAME 票也不占分母，全部失败退化为保守不判重——并打 WARNING，不中止整批；weak 复核中失败候选按反对票计；并行判定与异常整形单源
 于
@@ -271,7 +271,7 @@ strong 候选判定失败降级参与后续多数票（异常不抛穿、不构�
 （应合并为一张卡），输出裸对象 `{"merge": true\|false}`，失败保守返回 False（不合并）；`summarize_title` 在合并后依据「原标题+关键信息+原文引用」重拟
 概
 括性标题（输出裸对象 `{"title":"..."}`，失败/超长回退原标题）；两者解析器均兼容旧版 `{"task":"merge"\|"title","data":{...}}` 外壳。重拟标题
-user 消息为**单遍占位符替换**（`_fill_template` 正则单遍，数据值含 `{key_info}` 类字面量不会被二次替换，P6）。
+user 消息为**单遍占位符替换**（`_fill_template` 正则单遍，数据值含 `{key_info}` 类字面量不会被二次替换）。
 
 #### briefdesk/plugins/ocr/engine.py
 
@@ -364,7 +364,7 @@ raw_messages 批量落库（单事务）** → 切批 → 并行跑 enrich + cla
 串行（`_storage_lock` 内）：dedup 槽位（判重/入库/缓存）→ 跳过标记（未选中且非失败的消息标记 processed，含“无分类结果全批标记”路径）→ post_insert 槽
 位
 （会话内同话题合并）→ 批尾 dedup after_run（向量落库，内部自持 storage_lock）→ 计数/状态/实时通知。零产出（全部失败）不刷新 lastSync 且 `process_all_batches` 返回
-False——poll_cycle 据此跳过水位推进（实时路径忽略返回值）；零产出语义合并自远程审计 #1。被滤自消息不标记 processed（可恢复路径同纯占位符图片：重新停用/启用会话或全量回填
+False——poll_cycle 据此跳过水位推进（实时路径忽略返回值）；零产出语义以「返回值 False ⇒ 调用方跳过水位推进」表达。被滤自消息不标记 processed（可恢复路径同纯占位符图片：重新停用/启用会话或全量回填
 ，
 非自动重拉）。**benchmark 暂停门闸**：`set_processing_paused(paused)` 置位后本函数顶部直接返回 False（批次保留待回填，不触 DB/AI）
 ，benchmark 插件 Web/CLI 共用（见 `plugins/benchmark/` 行）。阶段实现见 `briefdesk/plugins/{ocr,classify,dedup,merge}/`。
@@ -397,7 +397,7 @@ sessions/contacts/processed_messages/raw_messages 以 `(source, id)` 复合主�
 close）；流式迭代（async for）用 `_cursor` 作用域，需 rowcount/lastrowid 的 DML 同样用 `_cursor`（须在 with 块内读取）
 ，executemany 后必须 `await cursor.close()`——未终结语句会残留连接并可能阻断后续 COMMIT。`close_db` 同时关闭主连接与向量连接（aiosqlite
 worker 线程非 daemon，漏关解释器退出挂死）；close 后置 `_db_closed` 终态门闩，`get_db`/`get_embed_db`
-一律抛 RuntimeError 拒绝重建——防关闭期残余任务复活连接（P3-3）。**多步写统一走 `atomic_transaction` 上下文管理器**（成功 commit、异常 rollback 后上抛——防悬挂事务
+一律抛 RuntimeError 拒绝重建——防关闭期残余任务复活连接。**多步写统一走 `atomic_transaction` 上下文管理器**（成功 commit、异常 rollback 后上抛——防悬挂事务
 被
 后续不相干 commit 收尾提交、部分写入提前可见；delete_items / update_item_merged / purge_expired_ignored /
 toggle_session / update_category / delete_category / bulk_insert_raw_messages / update_items_verify 八处）；IN 列表分块统一走
@@ -407,7 +407,7 @@ get_items_verified_flags / get_session_last_polls，update_items_verify/delete_i
 累
 计返回 rowcount，overload 按 fetch 字面量区分返回类型）；临时隔离库（基准运行）经 `db_redirect`——进出同步换/还原主/向量单例、半程失败关已建连接，应用已有连接
 不
-动）。**默认分类迁移（PRAGMA user_version 门控）**：v0→1 补齐 5→13 类；v1→2（C3）活动通知口径追加「面向全群的多项任务/材料提交截止通知（含各项截止日期）按本类
+动）。**默认分类迁移（PRAGMA user_version 门控）**：v0→1 补齐 5→13 类；v1→2 活动通知口径追加「面向全群的多项任务/材料提交截止通知（含各项截止日期）按本类
 收
 录」，仅更新仍等于旧版原文的行（尊重用户编辑），一次性不覆盖。
 
@@ -671,7 +671,7 @@ ready 帧，复位挂在首个事件上会让空闲群每次成功重连后退�
 —
 —`before_run` 锁外预嵌入、`run` 锁内纯 SQLite 落库（骨架对两存储槽统一探测可选钩子；post_insert 全程持 `_storage_lock`，run 内严禁网络调用）；
 路由 `/api/rag/ask|status|reindex`（ask 支持 `history` 多轮上下文：仅接受 user/assistant 角色、逐条截断 2000 字、至多 20 条；注入
-prompt 前再裁剪——仅保留最近 6 轮、单条 200 字并注明省略条数，P7）与「问一问」右侧聊天侧边栏（侧边栏 `#nav-top` 工具容器入口——搜索框正下方、日历之后，打开才显示——布局
+prompt 前再裁剪——仅保留最近 6 轮、单条 200 字并注明省略条数）与「问一问」右侧聊天侧边栏（侧边栏 `#nav-top` 工具容器入口——搜索框正下方、日历之后，打开才显示——布局
 内
 第三列推开列表而非覆盖、sticky 顶栏下沿与左侧栏同款行为；纯状态开合；**不注册插件视图、不触碰头部按钮区**，与 calendar 视图零耦合；引用芯片复用核心上下文浮层）。库层
 `db.py` 自管五表：`rag_chunks`/`rag_chunk_embeddings`/`rag_fts`(FTS5 trigram——逐词 ≥3 字符才走 MATCH，含短词走 LIKE
@@ -697,7 +697,7 @@ prompt 前再裁剪——仅保留最近 6 轮、单条 200 字并注明省略�
 循
 环休眠期可被 reindex/降级自愈经 `_kick_event` 唤醒立即执行回填（而非等满一个维护间隔）。守卫：`tests/test_rag_plugin.py` 的
 `RagBackfillTest` 断言回填后 FTS 与 chunks 等同且关键词检索真能命中、占位符行不阻塞预算窗口。检索=向量缓存（created_at 水位增量填充、解析在工作线程、模型切
-换/GC 行数回退整表重建）+FTS 双路 RRF 融合→拒答门（无 FTS 命中且 top1 余弦 < min_score 即 None）；**查询嵌入失败降级（F4）**：嵌入端点故障时不再整体拒
+换/GC 行数回退整表重建）+FTS 双路 RRF 融合→拒答门（无 FTS 命中且 top1 余弦 < min_score 即 None）；**查询嵌入失败降级**：嵌入端点故障时不再整体拒
 答
 ，降级 FTS-only（关键词可命中的问题仍可回答，日志 WARNING 标注）；回答强制 `[n]` 引用（未标注回退全部证据）并按 JSON 契约输出
 （`{"answer","citations"}`——deepseek 系 `json_object` 强制模式的兼容契约，引擎双态解析，纯文本供应商回退正则），证据块压平换行防伪造、单条超长截断

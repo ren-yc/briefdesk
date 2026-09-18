@@ -112,7 +112,7 @@ class LocalSecurityGuardTest(unittest.TestCase):
         self.assertEqual(resp.status_code, 400)
 
     def test_malformed_host_port_returns_400_not_500(self):
-        # 复核 P2-2：request.url.port 对「数字但超范围」端口（如 99999）抛
+        # request.url.port 对「数字但超范围」端口（如 99999）抛
         # ValueError，此前未被捕获导致 500；应统一 400（识别为非法 Host）。
         # 非数字端口（notaport 等）被 starlette 静默忽略（回退 scope server），
         # 不会抛异常，故不在本用例范围。
@@ -344,7 +344,7 @@ class ReminderApiTest(unittest.TestCase):
         mock.assert_awaited_once_with("i1", None)
 
     def test_clear_no_reminder_returns_200_cleared_false(self):
-        # 复核 P2-4：清除已无提醒的卡（卡片存在但 remind_at 已为 NULL）应返回
+        # 清除已无提醒的卡（卡片存在但 remind_at 已为 NULL）应返回
         # 200 {"cleared": false}，而非 404（此前两者同为 404，手动清除误导报错）。
         with patch(
             "briefdesk.plugins.reminders.router.set_item_reminder",
@@ -384,7 +384,7 @@ class ReminderApiTest(unittest.TestCase):
     def test_missing_item_returns_404(self):
         mock = AsyncMock(return_value=False)
         with patch("briefdesk.plugins.reminders.router.set_item_reminder", new=mock), patch(
-            # 复核 P2-4：清除未命中后复查存在性（卡片不存在 → 404）
+            # 清除未命中后复查存在性（卡片不存在 → 404）
             "briefdesk.db.get_existing_item_ids",
             new=AsyncMock(return_value=set()),
         ):
@@ -416,7 +416,7 @@ class ReminderApiTest(unittest.TestCase):
 
 
 class VerifyApiTest(unittest.TestCase):
-    """F3：/api/items/:id/verify 对不存在的卡片返回 404（不再静默成功）。"""
+    """/api/items/:id/verify 对不存在的卡片返回 404（不再静默成功）。"""
 
     def setUp(self):
         self.client = _client()
@@ -832,7 +832,7 @@ if __name__ == "__main__":
 
 
 class RecategorizeRouteTest(unittest.TestCase):
-    """【复核 P2-30/P2-6】recategorize 路由编排：存储锁内两步写、输入校验、404。"""
+    """recategorize 路由编排：存储锁内两步写、输入校验、404。"""
 
     def setUp(self):
         self.client = _client()
@@ -897,7 +897,7 @@ class RecategorizeRouteTest(unittest.TestCase):
 
 
 class CategoryDeleteRouteTest(unittest.TestCase):
-    """【复核 P2-30】类别删除路由编排：purge 分支在存储锁内发布 items_deleted。"""
+    """类别删除路由编排：purge 分支在存储锁内发布 items_deleted。"""
 
     def setUp(self):
         self.client = _client()
@@ -941,7 +941,7 @@ class CategoryDeleteRouteTest(unittest.TestCase):
 
 
 class BackupRestoreRouteTest(unittest.TestCase):
-    """【复核 P2-30/P2-10】备份流式下发与恢复校验路由编排。"""
+    """备份流式下发与恢复校验路由编排。"""
 
     def test_backup_streams_file(self):
         client = _client()
@@ -1089,7 +1089,7 @@ class BackupTempFileLifecycleTest(unittest.TestCase):
 
 
 class SessionToggleRouteTest(unittest.TestCase):
-    """【复核 P2-30】会话开关路由：锁内两步写、404、监听缓存失效。"""
+    """会话开关路由：锁内两步写、404、监听缓存失效。"""
 
     def setUp(self):
         self.client = _client()

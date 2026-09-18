@@ -478,7 +478,7 @@ class TestRegisterConflictHttp:
             await client.close()
 
     async def test_benign_state_still_returns_two_tuple(self):
-        """良性态返回 (state, status) 形状不变（D6 只加抛出，不改签名）。"""
+        """良性态返回 (state, status) 形状不变（只加抛出，不改签名）。"""
 
         def handler(request: httpx.Request) -> httpx.Response:
             return httpx.Response(200, json={"state": "accepted", "status": "indexing"})
@@ -723,7 +723,7 @@ class SessionKindTest(unittest.TestCase):
 
 
 class TestSseSelfHealMismatch:
-    """SSE 自愈检查遇账号不符时必须冒泡中止本轮监听（D5 止漏）。
+    """SSE 自愈检查遇账号不符时必须冒泡中止本轮监听。
 
     与 test_source_robustness.SseSelfHealMismatchTest 同构：stream_events 自建
     AsyncClient，故按 MockTransport 注入假构造器才能覆盖「HTTP 200 之后」那段。
@@ -753,7 +753,7 @@ class TestSseSelfHealMismatch:
         )
         with pytest.raises(WeFlowAccountMismatchError):
             await self._collect(client)
-        # 【P3-2】raise 绕过 stream_events 尾部收尾，状态必须已前置落 offline
+        # raise 绕过 stream_events 尾部收尾，状态必须已前置落 offline
         assert client.connection_status == "offline"
 
     async def test_other_self_heal_failure_still_swallowed(self):

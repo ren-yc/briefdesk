@@ -202,7 +202,7 @@ class ParseResponseTest(unittest.TestCase):
         with pytest.raises(TypeError):
             _parse_response('{"task":"classify","data":{}}', self.ALLOWED, 3)
 
-    # ── P1：显式 include 判定 ──
+    # ── 显式 include 判定 ──
 
     def test_include_false_skipped(self):
         # include:false 的消息不产生 result、不进 time_indexes
@@ -271,7 +271,7 @@ class ParseResponseTest(unittest.TestCase):
         assert times == [2]
 
     def test_missing_index_moved_to_retry(self):
-        # F1 覆盖校验：AI 漏回 index 2 → 并入 retry（防 _mark_skipped 静默标 processed）
+        # 覆盖校验：AI 漏回 index 2 → 并入 retry（防 _mark_skipped 静默标 processed）
         results, retry, times = _parse_response(
             '[{"index":0,"include":true,"category":"活动通知","quote":"讲座","time":true},'
             '{"index":1,"include":false}]',
@@ -282,7 +282,7 @@ class ParseResponseTest(unittest.TestCase):
         assert times == [0]
 
     def test_duplicate_index_raises(self):
-        # F1 覆盖校验：重复 index 属结构错误 → 整批重试（抛 TypeError）
+        # 覆盖校验：重复 index 属结构错误 → 整批重试（抛 TypeError）
         with pytest.raises(TypeError):
             _parse_response(
                 '[{"index":0,"include":true,"category":"活动通知"},'
@@ -291,7 +291,7 @@ class ParseResponseTest(unittest.TestCase):
             )
 
     def test_quote_mismatch_moved_to_retry(self):
-        # F2 索引漂移守卫：quote 与内容不对齐 → 该条转重试
+        # 索引漂移守卫：quote 与内容不对齐 → 该条转重试
         results, retry, _times = _parse_response(
             '[{"index":0,"include":true,"category":"活动通知",'
             '"quote":"出二手自行车九成新两百块"}]',
@@ -302,7 +302,7 @@ class ParseResponseTest(unittest.TestCase):
         assert retry == [0]
 
     def test_quote_aligning_kept(self):
-        # F2：quote 与内容一致（含标点/改写少许）→ 正常入库
+        # 字面关：quote 与内容一致（含标点/改写少许）→ 正常入库
         results, retry, _times = _parse_response(
             '[{"index":0,"include":true,"category":"活动通知",'
             '"quote":"摄影社下周三面试"}]',
@@ -313,7 +313,7 @@ class ParseResponseTest(unittest.TestCase):
         assert retry == []
 
     def test_quote_empty_skips_guard(self):
-        # F2：无 quote（未提供）不触发守卫，避免过度拒收
+        # 字面关：无 quote（未提供）不触发守卫，避免过度拒收
         results, retry, _times = _parse_response(
             '[{"index":0,"include":true,"category":"活动通知","quote":""}]',
             self.ALLOWED, 1,
@@ -323,7 +323,7 @@ class ParseResponseTest(unittest.TestCase):
         assert retry == []
 
     def test_quote_non_string_tolerated(self):
-        # 复核 P3-10：AI 脏输出给数字/dict 型 quote，此前 _norm_align_text
+        # AI 脏输出给数字/dict 型 quote，此前 _norm_align_text
         # （re.sub）抛 TypeError → 整批本轮抛弃；现收敛为 str 走正常判定。
         # 核心断言：不抛 TypeError、正常产出（具体 retry/results 取决于对齐判定）。
         results, retry, _times = _parse_response(
@@ -340,7 +340,7 @@ class ParseResponseTest(unittest.TestCase):
         assert len(results2) + len(retry2) == 1, "dict quote 应收敛并正常判定"
 
     def test_missing_index_covered_by_all_false_response(self):
-        # F1：include:false 也算覆盖该 index
+        # 覆盖校验：include:false 也算覆盖该 index
         results, retry, _times = _parse_response(
             '[{"index":0,"include":false},{"index":1,"include":false},'
             '{"index":2,"include":false}]',
@@ -350,7 +350,7 @@ class ParseResponseTest(unittest.TestCase):
         assert retry == []
 
     def test_task_field_missing_inside_shell_with_missing_index(self):
-        # F1 × 旧格式兼容：裸数组 + 缺 index 同样并入 retry
+        # 旧格式兼容 × 覆盖校验：裸数组 + 缺 index 同样并入 retry
         results, retry, _times = _parse_response(
             '[{"index":0,"include":true,"category":"活动通知"}]',
             self.ALLOWED, 3,
@@ -579,7 +579,7 @@ class QrNoiseTest(unittest.TestCase):
 
 
 class UserMessageTruncationTest(unittest.TestCase):
-    """F1：分类输入长度控制（单条截断 + 数据边界标记）。"""
+    """分类输入长度控制（单条截断 + 数据边界标记）。"""
 
     def _groups(self, content):
         return [
@@ -949,7 +949,7 @@ class TestSplitRetry:
         )
         assert chat.await_count == 3
         assert [r.msg_index for r in outcome.results] == [0, 1]
-        # F1：右半 AI 只回了 index 0（未知类别）→ 漏回的 index 3 同样并入重试
+        # 覆盖校验：右半 AI 只回了 index 0（未知类别）→ 漏回的 index 3 同样并入重试
         assert sorted(outcome.failed) == [2, 3]
 
     def test_unknown_category_only_marks_that_index_retry(self):
@@ -1250,7 +1250,7 @@ class TestExtractTimes:
         assert "必须忽略" in prompt
 
     async def test_uses_independent_max_tokens(self):
-        # F3：时间提取不再共享标题 2048，独立 4096 预算
+        # 时间提取不再共享标题 2048，独立 4096 预算
         results = [ClassifyResult(msg_index=0, category="活动通知")]
         with patch(
             "briefdesk.plugins.classify.engine.chat",
@@ -1265,7 +1265,7 @@ class TestExtractTimes:
         assert chat.await_args.kwargs["max_tokens"] == 4096
 
     async def test_truncation_splits_and_merges(self):
-        # F3：length 截断 → 拆半重试并合并（两半各自成功，index 按半拆分）
+        # length 截断 → 拆半重试并合并（两半各自成功，index 按半拆分）
         def ok(idx: int):
             return self._resp(
                 "stop",
@@ -1295,7 +1295,7 @@ class TestExtractTimes:
 
 
 class BatchBudgetTruncationTest(unittest.TestCase):
-    """S2：整批字符预算超限时整条剔除并报告被截 index（防静默丢失）。"""
+    """整批字符预算超限时整条剔除并报告被截 index（防静默丢失）。"""
 
     @staticmethod
     def _groups(contents: list[str]) -> list[dict]:
@@ -1388,7 +1388,7 @@ class TestClassifyBatchTruncationFailed:
             ),
         ):
             outcome = await classify_batch(messages)
-        # S2+F1：AI 只回了 index 0 → 被预算剔除的行与漏回的行（下游未见到）
+        # 预算剔除 + 覆盖校验：AI 只回了 index 0 → 被剔除的行与漏回的行（下游未见到）
         # 全部进 failed（回填重试），不得静默标 processed
         assert sorted(outcome.failed) == list(range(1, n))
         assert [r.msg_index for r in outcome.results] == [0]

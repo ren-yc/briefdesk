@@ -44,7 +44,7 @@ class JudgeUserMessageTest(unittest.TestCase):
         assert "{特殊}" in p
 
     def test_message_does_not_rescan_data_values(self):
-        # P6 同款缺陷守卫：数据值含模板占位符字面量时不得被二次替换
+        # 数据值含模板占位符字面量时不得被二次替换
         # （旧顺序 replace 链会把 desc_a 里的 "{desc_b}" 换成卡片B 内容）
         p = _build_judge_user_message("甲", "原文含 {desc_b} 字面量", "乙", "丙")
         assert "原文含 {desc_b} 字面量" in p
@@ -175,7 +175,7 @@ class TitleRegenerationTest(unittest.TestCase):
         assert "团购\n面交" in p
 
     def test_title_data_with_literal_placeholder_not_double_replaced(self):
-        # P6：数据值的占位符字面量不得被后续 replace 二次替换（单遍填充）
+        # 数据值的占位符字面量不得被后续 replace 二次替换（单遍填充）
         p = _build_title_user_message("{key_info}", "{quote}", "旧标题 {old_title}")
         assert "原标题：{key_info}" in p
         assert "关键信息：{quote}" in p
@@ -270,7 +270,7 @@ class TestSummarizeTitle:
 
 
 class TestAfterRunEmbeddingGate:
-    """【P3-11】after_run 补嵌入必须按 is_embedding_enabled 门控。
+    """after_run 补嵌入必须按 is_embedding_enabled 门控。
 
     EMBED_API_BASE 留空（默认配置）时 embed_api_base 回退 chat 端点，
     embed_texts 会打出一发注定失败的 /embeddings——每个含合并的批白发

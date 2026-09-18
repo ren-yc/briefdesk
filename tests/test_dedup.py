@@ -21,7 +21,7 @@ from briefdesk.plugins.dedup.engine import (
 
 
 class AskAiParseFailureTest(unittest.IsolatedAsyncioTestCase):
-    """【复核 P2-19】_ask_ai 两次解析失败返回 None（「判定未知」），**绝不
+    """_ask_ai 两次解析失败返回 None（「判定未知」），**绝不
     return False** 被当作明确的 DIFFERENT 票计入计权。调用方 _collect_verdicts
     按各自门禁处置该 None：normal 路径剔除计权、weak 复核当反对票。"""
 
@@ -55,7 +55,7 @@ class AskAiParseFailureTest(unittest.IsolatedAsyncioTestCase):
 
 
 class CollectVerdictsCancellationTest(unittest.IsolatedAsyncioTestCase):
-    """【核验 H1】_collect_verdicts 遇 CancelledError 必须向上传播，不得整形
+    """_collect_verdicts 遇 CancelledError 必须向上传播，不得整形
     为 None 当「判定失败」降级——取消是关闭/中断语义，不是判定失败。"""
 
     async def test_cancelled_child_error_propagates(self):
@@ -274,7 +274,7 @@ class EmbeddingTextTest(unittest.TestCase):
         assert _embedding_text("标题", "内容") == "标题 内容"
 
     def test_truncates_long_input(self):
-        """【复核 P2-17】超长输入截断至 2000 字符：防单条毒丸文本让嵌入
+        """超长输入截断至 2000 字符：防单条毒丸文本让嵌入
         通道整体降级且每次重启确定性复现。"""
         text = _embedding_text("标题", "x" * 5000)
         assert len(text) == 2000
@@ -1326,7 +1326,7 @@ class TestQuoteShortcut:
         merge_mock.assert_not_awaited()
 
 class TestLockEmbedFallback:
-    """P1 修复回归：q_emb 缺失（preembed 失败/未预嵌）时判重绝不触发远程嵌入。
+    """q_emb 缺失（preembed 失败/未预嵌）时判重绝不触发远程嵌入。
 
     check_dedup 运行于 pipeline 存储锁内：此前 q_emb=None 且嵌入就绪会逐条
     await embed_texts——嵌入端点挂起时以"行数 × SDK 超时"放大锁持有时间。
@@ -1400,7 +1400,7 @@ class TestLockEmbedFallback:
 class CandidateErrorIsolationTest(unittest.IsolatedAsyncioTestCase):
     """单候选 AI 异常不中止整批：gather 改 return_exceptions=True，
     加权多数票路径异常候选剔除出计权（既无 SAME 票也不占分母——远程
-    审计 S1 语义；全部失败退化为保守不判重）并打 WARNING。"""
+    全部失败退化为保守不判重）并打 WARNING。"""
 
     def _engine(self, items):
         engine = DedupEngine()
@@ -1503,7 +1503,7 @@ class CandidateErrorIsolationTest(unittest.IsolatedAsyncioTestCase):
         merge_mock.assert_awaited_once_with("n1", "新生2群")
 
 class TestAskAiFailureIsolation:
-    """S1 回归：单个候选 AI 判定失败不得抛穿 check_dedup 中止整轮管道。
+    """单个候选 AI 判定失败不得抛穿 check_dedup 中止整轮管道。
 
     失败候选按"无票"处理（剔除权重、不参与多数票），全部失败保守判
     不重复——与 classify（failed 重试）/merge（None 降级）的容错语义对齐。

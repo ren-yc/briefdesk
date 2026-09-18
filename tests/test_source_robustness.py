@@ -1,4 +1,4 @@
-"""消息源健壮性修复测试（审查报告 P1/P2/P3 项）。
+"""消息源健壮性修复测试：翻页穷尽、SSE 读超时、注册拒绝不记忆化、事件去重等。
 
 覆盖：
 - qqflow fetch_sessions 大 limit（会话发现截断坑，对齐 weflow-legacy 同接口）
@@ -75,7 +75,7 @@ def _qq_message_new_event(rawid: str = "r1") -> dict:
 
 
 class TestQqFlowFetchSessionsLimit:
-    """【1·P1】fetch_sessions 必须按大页大小翻页取尽，否则被上游默认 100 截断。
+    """fetch_sessions 必须按大页大小翻页取尽，否则被上游默认 100 截断。
 
     page_size=10000 = 上游 limit 硬上限：典型规模一个请求即取尽（与旧
     「显式大 limit」实现请求数相同）；旧上游若忽略 offset，共享「本页无
@@ -98,7 +98,7 @@ class TestQqFlowFetchSessionsLimit:
 
 
 class SseReadTimeoutTest(unittest.TestCase):
-    """【2·P1】两源 SSE 读超时：config 字段默认值 + 客户端 Timeout 构造。
+    """两源 SSE 读超时：config 字段默认值 + 客户端 Timeout 构造。
 
     默认值断言与进程环境隔离：patch.dict 下 pop 两个 READ_TIMEOUT 环境变量
     并以 `_env_file=None` 跳过 .env，只验证字段默认值；客户端级换算改为
@@ -161,7 +161,7 @@ class SseReadTimeoutTest(unittest.TestCase):
 
 
 class EnsureReadyRejectedStateTest(unittest.IsolatedAsyncioTestCase):
-    """【4·P2】ensure_ready 注册被拒（invalid_key 等）不得记忆化，下轮须重试。"""
+    """ensure_ready 注册被拒（invalid_key 等）不得记忆化，下轮须重试。"""
 
     def _make_client(
         self,
@@ -466,7 +466,7 @@ class TestRegisterConflictHttp:
             await client.close()
 
     async def test_benign_state_still_returned_plainly(self):
-        """良性态返回值形状不变（D6 只加抛出，不改签名）。"""
+        """良性态返回值形状不变（只加抛出，不改签名）。"""
 
         def handler(request: httpx.Request) -> httpx.Response:
             return httpx.Response(200, json={"state": "accepted"})
@@ -493,7 +493,7 @@ class TestRegisterConflictHttp:
 
 
 class TestLookupLimit:
-    """【5·P2】回查链路 limit 提升为 _LOOKUP_LIMIT=200 且显式关闭空结果重试。"""
+    """回查链路 limit 提升为 _LOOKUP_LIMIT=200 且显式关闭空结果重试。"""
 
     async def test_weflow_lookup_uses_limit_and_no_retry(self):
         client = WeFlowLegacyClient("http://127.0.0.1:5031", "tok")
@@ -526,7 +526,7 @@ class TestLookupLimit:
 
 
 class TestWeflowSseDedup:
-    """【6·P2】weflow-legacy 监听器按 (event, rawid) 去重：同一事件重投只消费一次。"""
+    """weflow-legacy 监听器按 (event, rawid) 去重：同一事件重投只消费一次。"""
 
     async def test_duplicate_event_consumed_once(self):
         received: list = []
@@ -578,7 +578,7 @@ class QqFlowEmptySenderKeptTest(unittest.TestCase):
 
 
 class TestLegacyMessagesNotFound:
-    """【复核 U1-1】legacy fetch_messages 暴露 not_found_ok：404 → 空信封
+    """legacy fetch_messages 暴露 not_found_ok：404 → 空信封
     （对齐 weflow/qqflow 的脏会话容错），轮询路径传 True。"""
 
     async def test_not_found_ok_returns_empty_envelope_and_propagates(self):
@@ -590,7 +590,7 @@ class TestLegacyMessagesNotFound:
         assert get_mock.call_args.kwargs.get("not_found_ok")
 
     async def test_retry_on_empty_404_with_not_found_ok_returns_none(self):
-        """复核 P3-16：retry_on_empty 的重试分支遇 404 且 not_found_ok=True
+        """retry_on_empty 的重试分支遇 404 且 not_found_ok=True
         应降级返回 None（与主路径同口径），而非 raise 令整会话失败。"""
 
         class _Empty:
@@ -627,7 +627,7 @@ class TestLegacyMessagesNotFound:
 
 
 class TestSseConnectLoopSurvivesGenericError:
-    """【复核 P1】_connect_loop 对非取消异常必须自愈：带栈记日志后退避重连。
+    """_connect_loop 对非取消异常必须自愈：带栈记日志后退避重连。
 
     此前只捕 CancelledError，畸形事件（如 data 帧为合法 JSON 但非对象时
     event.get 抛 AttributeError）会穿透 _listen 终结监听任务——实时通道
@@ -677,7 +677,7 @@ class TestSseConnectLoopSurvivesGenericError:
 
 
 class SseConnectLoopMismatchBackoffTest(unittest.IsolatedAsyncioTestCase):
-    """【P3-2】账号不符走 _connect_loop 专属长退避，不走通用指数退避。
+    """账号不符走 _connect_loop 专属长退避，不走通用指数退避。
 
     mismatch 是配置/运营问题（server 已绑定其他账号），指数退避的快速重试
     只会每轮重复 /health+/accounts 并刷 ERROR 栈。专属分支固定长退避、
@@ -748,7 +748,7 @@ class SseConnectLoopMismatchBackoffTest(unittest.IsolatedAsyncioTestCase):
 
 
 class TestStopDrainsBuffer:
-    """【8·P3】stop() 后冲刷批缓冲残余消息，aclose() 等待 in-flight 收尾。"""
+    """stop() 后冲刷批缓冲残余消息，aclose() 等待 in-flight 收尾。"""
 
     async def test_stop_flushes_buffered_message(self):
         received: list = []
@@ -869,7 +869,7 @@ class TestDrainTaskReset:
 
 
 class TestQqFlowControlEventStats:
-    """【9·P3】sync/ping 心跳不计入事件数与预过滤丢弃数。"""
+    """sync/ping 心跳不计入事件数与预过滤丢弃数。"""
 
     async def test_sync_and_ping_not_counted_as_events(self):
         """ping 喂的是手工构造帧：上游保活为注释行 `:ping`，而
@@ -937,7 +937,7 @@ class EndpointUrlPrefixTest(unittest.TestCase):
 
 
 class TestWeflowErrorBodySafeDecode:
-    """【10·P3】非 UTF-8 错误体不应让 UnicodeDecodeError 掩盖原始 API 错误。"""
+    """非 UTF-8 错误体不应让 UnicodeDecodeError 掩盖原始 API 错误。"""
 
     async def test_non_utf8_error_body_raises_runtime_error(self):
         def handler(request: httpx.Request) -> httpx.Response:
@@ -971,7 +971,7 @@ class _RecordingListener:
 
 
 class TestRuntimeCloseOrdering:
-    """【增量·P3】runtime.close()：stop → await listener.aclose → client.close。"""
+    """runtime.close()：stop → await listener.aclose → client.close。"""
 
     async def test_weflow_close_ordering_and_idempotent(self):
         from briefdesk.plugins.weflow_legacy.runtime import WeFlowLegacySource
@@ -1054,7 +1054,7 @@ class TestRuntimeCloseOrdering:
 
 
 class SseRawidGuardTest(unittest.TestCase):
-    """message.new 缺 rawid 的就地拦截（审查 A5）。
+    """message.new 缺 rawid 的就地拦截。
 
     rawid/serverId 是 msg_id 与 processed 标记的根基：缺失消息放行只会在
     去重键 ("message.new","") 碰撞与回填间反复投递，必须在 pre_filter 拦下。"""
@@ -1090,7 +1090,7 @@ class SseRawidGuardTest(unittest.TestCase):
 
 
 class TestSseSelfHealMismatch:
-    """SSE 自愈检查遇账号不符时必须冒泡中止本轮监听（D5 止漏）。
+    """SSE 自愈检查遇账号不符时必须冒泡中止本轮监听。
 
     这里跑的是 stream_events 真身：它自建 AsyncClient，故按 MockTransport 注入
     一个假的构造器，才能覆盖到「HTTP 200 之后」那段自愈逻辑。
@@ -1121,7 +1121,7 @@ class TestSseSelfHealMismatch:
         )
         with pytest.raises(QqFlowAccountMismatchError):
             await self._collect(client)
-        # 【P3-2】raise 绕过 stream_events 尾部收尾，状态必须已前置落 offline
+        # raise 绕过 stream_events 尾部收尾，状态必须已前置落 offline
         assert client.connection_status == "offline"
 
     async def test_other_self_heal_failure_still_swallowed(self):

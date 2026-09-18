@@ -744,7 +744,7 @@ class TestReminderAndCalendar:
         assert [d["id"] for d in in_cal] == [item]
 
     async def test_update_item_verify_missing_returns_false(self):
-        # F3：不存在的卡片应返回 False（server 层据此转 404），而非静默成功
+        # 不存在的卡片应返回 False（server 层据此转 404），而非静默成功
         with patch("briefdesk.db.get_db", new=AsyncMock(return_value=self.db)):
             assert not await update_item_verify("no-such-id", 1)
 
@@ -914,7 +914,7 @@ class TestGetGroupCount:
 
 
 class TestUpsertSession:
-    """F2：upsert_session 单语句 UPSERT 的插入/更新语义与并发原子性。"""
+    """upsert_session 单语句 UPSERT 的插入/更新语义与并发原子性。"""
 
     @pytest.fixture(autouse=True)
     async def _autouse_setup(self):
@@ -966,7 +966,7 @@ class TestUpsertSession:
 
 
 class TestBulkUpsertSessions:
-    """【H2】bulk_upsert_sessions 单事务批量 UPSERT，语义与单行版一致。
+    """bulk_upsert_sessions 单事务批量 UPSERT，语义与单行版一致。
 
     曾经由 poll_cycle 逐行调 upsert_session（每行一次 commit），会话数百级
     时 N×fsync 拉长调用方持有的存储锁窗口。
@@ -1028,7 +1028,7 @@ class TestBulkUpsertSessions:
 
 
 class TestCloseDbLatch:
-    """【P3-3】close_db 置终态门闩：此后 get_db/get_embed_db 拒绝重建连接。
+    """close_db 置终态门闩：此后 get_db/get_embed_db 拒绝重建连接。
 
     应用关闭序列里 _cancel_pending_tasks 兜底排在 close_db 之后，残余任务
     的清理路径若经 get_db 双检锁复活连接，其非 daemon aiosqlite worker
@@ -1062,7 +1062,7 @@ class TestCloseDbLatch:
 
 
 class TestGetItemTextsByIds:
-    """【复核 P2-18】按 id 取卡片文本（unverify 回加去重缓存的数据源）。"""
+    """按 id 取卡片文本（unverify 回加去重缓存的数据源）。"""
 
     @pytest.fixture(autouse=True)
     async def _autouse_setup(self):
@@ -1303,7 +1303,7 @@ class TestMergeHelpers:
 
 
 class TestBulkRawInsert:
-    """H1 回归：大批量 raw 落库不得触发 SQLite 变量上限。"""
+    """大批量 raw 落库不得触发 SQLite 变量上限。"""
 
     @pytest.fixture(autouse=True)
     async def _autouse_setup(self):
@@ -1343,7 +1343,7 @@ class TestBulkRawInsert:
 
 
 class TestInsertItemConflict:
-    """H2 回归：insert_item 唯一键冲突时返回已存在行的真实 id（非幽灵 id）。"""
+    """insert_item 唯一键冲突时返回已存在行的真实 id（非幽灵 id）。"""
 
     @pytest.fixture(autouse=True)
     async def _autouse_setup(self):
@@ -1679,7 +1679,7 @@ class TestSourceGroupsSplit:
 
 
 class TestMergeSourceGroup:
-    """merge_source_group：逗号分隔、精确匹配去重（C3：群名互为子串不误判）。"""
+    """merge_source_group：逗号分隔、精确匹配去重（群名互为子串不误判）。"""
 
     @pytest.fixture(autouse=True)
     async def _autouse_setup(self):
@@ -1706,7 +1706,7 @@ class TestMergeSourceGroup:
         return row["source_group"]
 
     async def test_substring_names_are_not_treated_as_present(self):
-        """C3：群名互为子串（"我们四个" vs "我们四个2"）→ 追加而非跳过。"""
+        """群名互为子串（"我们四个" vs "我们四个2"）→ 追加而非跳过。"""
         await self._insert("a", "我们四个")
         with patch("briefdesk.db.get_db", new=AsyncMock(return_value=self.db)):
             await merge_source_group("a", "我们四个2")
@@ -1746,7 +1746,7 @@ class TestEmbeddingsDb:
         self.tmpdir = tempfile.mkdtemp()
         self.old_db_path = config.db_path
         config.db_path = os.path.join(self.tmpdir, "embed.sqlite")
-        # 复位模块级单例与关闭门闩（P3-3），确保真实走临时库：本类每个用例
+        # 复位模块级单例与关闭门闩，确保真实走临时库：本类每个用例
         # 都在 tearDown 经 close_db 收尾，下个用例须可重新建库
         self._old_db = db_module._db
         self._old_embed_db = db_module._embed_db
@@ -1809,7 +1809,7 @@ class TestEmbeddingsDb:
         assert len(await load_embeddings("m")) == 150
 
     async def test_close_db_closes_main_even_if_embed_close_fails(self):
-        """【核验 H3】_embed_db.close 抛错不得阻断 _db.close：残留的非 daemon
+        """_embed_db.close 抛错不得阻断 _db.close：残留的非 daemon
         worker 线程会让解释器退出挂死（与关闭路径要防的故障同源），且两个
         全局引用都必须置 None，保证后续按需重建不悬挂旧连接。"""
         import briefdesk.db as db_module
@@ -2185,7 +2185,7 @@ class TestDeleteItemsRollback(_InMemoryDbTest):
 
 
 class TestAtomicTransactionCancel(_InMemoryDbTest):
-    """复核 P1-1：atomic_transaction 必须捕 CancelledError（BaseException 子类），
+    """atomic_transaction 必须捕 CancelledError（BaseException 子类），
     否则取消逃逸留下悬挂事务，被后续无关 commit 收尾提交。"""
 
     async def test_cancel_inside_transaction_rolls_back(self):
@@ -2335,7 +2335,7 @@ class TestDefaultCategoriesUpgrade(_InMemoryDbTest):
         assert row["cnt"] == 0, "迁移完成后用户的删除必须被尊重"
 
     async def test_activity_notice_prompt_migrates_once_respecting_edits(self):
-        # C3：活动通知口径 v1→v2——旧版原文才更新、已编辑行不动、只跑一次
+        # 活动通知口径 v1→v2——旧版原文才更新、已编辑行不动、只跑一次
         from briefdesk.db import (
             _ACTIVITY_NOTICE_NEW_PROMPT,
             _ACTIVITY_NOTICE_OLD_PROMPT,

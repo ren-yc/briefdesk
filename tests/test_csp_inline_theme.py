@@ -1,5 +1,5 @@
 """CSP 内联脚本守卫：index.html 的全部内联 <script> 的 sha256 必须出现在
-middleware 的 CSP script-src 白名单中（复核 P1-6）。
+middleware 的 CSP script-src 白名单中。
 
 背景：CSP `script-src 'self'` 会拦截无 src 的内联脚本，令 <head> 内联主题
 脚本静默失效（深色用户每次刷新先闪浅色）。本测试把「内联脚本 → hash」与

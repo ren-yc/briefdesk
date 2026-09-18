@@ -132,7 +132,7 @@ class SettingsFileTest(StagedFileTestCase):
         self.assertEqual(read_staged()["DB_PATH"], r"C:\data\app.db?x=1")
 
     def test_write_rejects_newline_value_and_keeps_file(self) -> None:
-        """【复核 P1-7】写入前断言拒绝换行值：防 KEY=VALUE 行格式被注入
+        """写入前断言拒绝换行值：防 KEY=VALUE 行格式被注入
         伪配置行（含密钥名）；失败时原文件保持不变。"""
         write_staged({"LOG_LEVEL": "DEBUG"})
         with self.assertRaises(ValueError):
@@ -445,7 +445,7 @@ class EnvRoutesTest(StagedFileTestCase):
         self.assertFalse(ai["keyringConfigured"])
 
     def test_keyring_empty_string_not_configured(self) -> None:
-        # 复核 P3-14：keyring 空串条目不得判「已配置」——`secrets set X ""`
+        # keyring 空串条目不得判「已配置」——`secrets set X ""`
         # 会在钥匙串留下空串，is not None 会误报已配置，与实际解析链相反。
         core_schema = [
             {**item, "configured": False}

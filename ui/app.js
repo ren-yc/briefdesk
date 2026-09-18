@@ -414,7 +414,7 @@ function bindNavEvents() {
   $content.addEventListener("click", (e) => {
     const link = e.target.closest(".reset-filter-link");
     // fetch-retry-btn 借用本类做样式（fetch 失败态重试），但不得触发清筛选：
-    // 否则点「重试」会静默清空搜索词与分类上下文（复核 P2-27）
+    // 否则点「重试」会静默清空搜索词与分类上下文
     if (!link || link.id === "fetch-retry-btn") return;
     e.preventDefault();
     exitPluginViews();
@@ -1524,7 +1524,7 @@ function connectRealtimeStream() {
 
   stream = new EventSource("/api/stream");
   // 连接成功即复位退避（下次断开从 2s 重新开始），并恢复状态栏常规文案
-  // （断线期间被「实时推送已断开」占位，复核 P2-28）
+  // （断线期间被「实时推送已断开」占位）
   stream.addEventListener("open", () => {
     sseBackoffMs = 2000;
     updateStatus(lastStatusInfo || {});
@@ -1565,7 +1565,7 @@ function connectRealtimeStream() {
       stream = null;
     }
     if (streamReconnectTimer) return;
-    // 断线可见性（复核 P2-28）：静默重连会让界面退化成长间隔兜底轮询而
+    // 断线可见性：静默重连会让界面退化成长间隔兜底轮询而
     // 用户毫不知情；状态栏明示，重连成功的 open 事件复位
     $statusText.classList.remove("hidden");
     $statusText.innerHTML = '实时推送已断开，重连中…';
@@ -1594,7 +1594,7 @@ function applySidebarData(data) {
 }
 
 // 插件视图（如日历）模式下补拉侧边栏/颜色数据（/api/items 的 limit=1 变体，
-// 只消费侧边栏字段，不渲染列表）：修复 F5 刷新插件视图 hash 时侧边栏空白、
+// 只消费侧边栏字段，不渲染列表）：修复刷新插件视图 hash 时侧边栏空白、
 // 视图 chip 颜色丢失。数据就绪后通知各插件视图（sidebarReady）自行重渲染。
 async function fetchSidebarData() {
   try {
@@ -2028,7 +2028,7 @@ async function renderOnboardEnv() {
   const srcs = Object.entries(status.sources || {});
   const srcHtml = srcs.length
     ? srcs.map(([name, s]) => {
-        // 复核 P2-5：收敛白名单 + 转义（与 _statusParts / openStatusPanel 同口径）
+        // 收敛白名单 + 转义（与 _statusParts / openStatusPanel 同口径）
         const raw = s.status || "offline";
         const st = Object.prototype.hasOwnProperty.call(_STATUS_LABELS, raw) ? raw : "offline";
         return `<span class="onboard-chip">${esc(name)} · ${esc(_STATUS_LABELS[st] || raw)}</span>`;
@@ -3464,7 +3464,7 @@ function _statusParts(status) {
     : states.some(st => st === "reconnecting") ? "reconnecting"
     : "offline";
   const parts = sources.map(([name, s]) => {
-    // 复核 P2-5：状态值收敛到已知白名单，未知一律按 offline 呈现（避免
+    // 状态值收敛到已知白名单，未知一律按 offline 呈现（避免
     // _STATUS_ICONS/_STATUS_LABELS 查表得 undefined）；与 openStatusPanel 同口径。
     const raw = s.status || "offline";
     const st = Object.prototype.hasOwnProperty.call(_STATUS_LABELS, raw) ? raw : "offline";
@@ -4295,7 +4295,7 @@ async function runSettingsOps(ops) {
 // 类别启用/停用已由后端持久化（categories.enabled），localStorage 只存刷新间隔
 function loadSettings() {
   // 存值可能是任意 JSON（含 null/数组/标量），故 || {} 兜住非对象后再取字段；
-  // 键名统一为点分风格（复核 P3），旧连字符键一次性搬迁
+  // 键名统一为点分风格，旧连字符键一次性搬迁
   const saved = (lsGetJson("briefdesk.settings", null)
     ?? lsGetJson("briefdesk-settings", {})) || {};
   refreshIntervalSec = Math.max(30, parseInt(saved.refreshInterval, 10) || 300);
@@ -5339,7 +5339,7 @@ function highlight(str) {
 
 function esc(str) {
   // 仅 null/undefined 归空（0 等 falsy 值原样转义为 "0"）：数字字段（计数、
-  // 时间戳）也走统一转义口径（复核 P3），esc(0)==="" 的旧守卫会把 0 计数吞掉
+  // 时间戳）也走统一转义口径，esc(0)==="" 的旧守卫会把 0 计数吞掉
   if (str == null) return "";
   const div = document.createElement("div");
   div.textContent = str;

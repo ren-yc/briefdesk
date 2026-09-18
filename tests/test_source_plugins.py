@@ -173,7 +173,7 @@ class TestWeFlowPlugin:
 
 
 class SseReconnectInitialMsValidationTest(unittest.TestCase):
-    """复核 P3-17：sse_reconnect_initial_ms 不得为 0（零间隔热重连风暴）。"""
+    """sse_reconnect_initial_ms 不得为 0（零间隔热重连风暴）。"""
 
     def test_zero_initial_ms_rejected(self):
         from pydantic import ValidationError

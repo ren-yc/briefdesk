@@ -291,7 +291,7 @@ def _mgr_settings(*, required=None):
 
 
 class TestPluginManagerRollback:
-    """P2 修复：setup/activate 非 PluginDisabledError 失败时 best-effort 调一次
+    """setup/activate 非 PluginDisabledError 失败时 best-effort 调一次
     plugin.teardown() 回收半装配副作用再标 failed；依赖方照常 disabled 降级、
     REQUIRED 名单失败仍致命（PluginError 中止装配）。"""
 
@@ -418,7 +418,7 @@ class TestPluginDisabledNoTeardown:
 
 
 class TestMergeAfterRunReembed:
-    """【复核 P2-20】merge after_run 对存活卡补嵌并带向量重新登记。
+    """merge after_run 对存活卡补嵌并带向量重新登记。
 
     合并改写文本后 DB 侧向量已删，run 的 add_to_cache 不带向量——长驻
     进程中存活卡就此退出余弦候选集直到重启；after_run 在锁外补嵌修复。
@@ -442,10 +442,10 @@ class TestMergeAfterRunReembed:
         with patch(
             "briefdesk.ai_ports.embed_texts", AsyncMock(return_value=[vec])
         ), patch(
-            # P3-11 门控：after_run 仅在嵌入启用时补嵌
+            # 门控：after_run 仅在嵌入启用时补嵌
             "briefdesk.ai_ports.is_embedding_enabled", return_value=True
         ), patch(
-            # after_run 补嵌前复查存在性（P1-3）；本测试 i1 仍存在
+            # after_run 补嵌前复查存在性；本测试 i1 仍存在
             "briefdesk.db.get_existing_item_ids",
             AsyncMock(return_value={"i1"}),
         ):
@@ -466,7 +466,7 @@ class TestMergeAfterRunReembed:
         await MergePlugin().after_run(batch, SimpleNamespace(dedup=None))
 
     async def test_after_run_skips_deleted_items(self):
-        """复核 P1-3：锁外补嵌前按 item_id 复查存在性，已删除的卡不得
+        """锁外补嵌前按 item_id 复查存在性，已删除的卡不得
         add_to_cache（否则复活幽灵缓存条目，相似消息被误判重静默丢失）。"""
         from types import SimpleNamespace
 

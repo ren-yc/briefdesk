@@ -121,7 +121,7 @@
     $calendarView.classList.add("hidden");
     if (sh) syncHash("push");
     // 仅日历真正激活过才补拉（进入时已拉取）：未激活的退出不再发请求，
-    // 消除每次导航/搜索的双倍 /api/items 请求（复核 P2-26）
+    // 消除每次导航/搜索的双倍 /api/items 请求
     if (wasActive) fetchData();
   }
 
@@ -445,7 +445,7 @@
     bindEvents();
     registerViewHook();
     inlineSvgIcons(); // 内联按钮图标（与核心图标一致）
-    // F5 刷新 #calendar：加载器注入晚于核心 hash 初始化，此处自查补进入
+    // 刷新 #calendar：加载器注入晚于核心 hash 初始化，此处自查补进入
     const v = parseHash();
     if (v && v.view === PLUGIN) enterCalendarMode({ syncHash: false });
   }

@@ -136,7 +136,7 @@ class ClientRequestDefaultsTest(unittest.TestCase):
 
 
 class TestChatTimeoutPassThrough:
-    """【复核 P1-1】判官类调用（锁内执行）经 chat 端口下传单请求短超时，
+    """判官类调用（锁内执行）经 chat 端口下传单请求短超时，
     限制存储锁的最坏持有时间；不传时不得附带 timeout（用客户端默认）。"""
 
     async def test_chat_forwards_per_request_timeout(self):
@@ -273,7 +273,7 @@ class TestChatJsonModeOverride:
 
 
 class TestEmbedBatchCount:
-    """P2 修复：embed_texts 每 chunk 校验返回向量数量——供应商少返即抛错，
+    """embed_texts 每 chunk 校验返回向量数量——供应商少返即抛错，
     绝不产生错位结果（错位向量会持久化进 item_embeddings，永久污染余弦通道）。"""
 
     def _client(self, data):
@@ -313,7 +313,7 @@ class TestEmbedBatchCount:
         assert got == [[0.1], [0.2]]
 
     async def test_duplicate_index_raises_value_error(self):
-        # 复核 P3-9：数量相符但 index 重复（如 [0,0,1]），排序后 index 序列
+        # 数量相符但 index 重复（如 [0,0,1]），排序后 index 序列
         # 非 0..n-1 连续，向量仍整体错位——必须整批失败防余弦通道污染。
         client, _ = self._client(
             [

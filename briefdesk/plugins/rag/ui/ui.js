@@ -164,7 +164,7 @@
         chip.className = "rag-cite-chip";
         chip.dataset.n = String(c.n);
         // .title 是属性赋值（不走 HTML 解析）：escAttr 的实体会按字面显示，
-        // 直接用原始字符串（复核 P3）
+        // 直接用原始字符串
         chip.title = (c.group_name ? c.group_name + " · " : "") + c.sender_name;
         chip.textContent = "[" + c.n + "] " + c.sender_name;
         chip.addEventListener("click", () => openCtx(c));

@@ -1,6 +1,6 @@
 """main 启动/关停生命周期回归测试。
 
-- _run 启动段清理保护（P1）：PLUGINS_REQUIRED 插件 setup 失败抛 PluginError
+- _run 启动段清理保护：PLUGINS_REQUIRED 插件 setup 失败抛 PluginError
   中止启动时，teardown_all / close_db 仍必须执行——否则 aiosqlite 非 daemon
   worker 线程不关闭，解释器退出时 join 挂死，只能强杀进程。
 - _reap_task 关停收尾四态：done 直返 / pending 取消等待 / 超时留 pending
@@ -19,7 +19,7 @@ from briefdesk.plugin.base import PluginError
 
 
 class TestPeriodicSyncLoop:
-    """【复核 P1-4】POLL_INTERVAL_SECONDS > 0 时周期触发 trigger_sync（与
+    """POLL_INTERVAL_SECONDS > 0 时周期触发 trigger_sync（与
     /api/sync 同路径；互斥由其返回 None 保证，不叠加触发）。"""
 
     async def test_loop_triggers_sync_periodically_and_exits_on_cancel(self):
