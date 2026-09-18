@@ -227,7 +227,7 @@ class RagEngine:
 
         向量写入 batch.preembeddings（批上下文级，每批新建天然隔离）——
         引擎级共享字典会在并发批次（实时批 flush 与回填同时跑）下互相
-        clear 丢向量（复核 P1-5）。
+        clear 丢向量。
         """
         candidates = [m for m in batch.messages if _indexable(m.content)]
         if not candidates:
@@ -406,7 +406,7 @@ class RagEngine:
         写库持 pipeline 存储锁 + 共享 embed 连接互斥锁（与 backfill_step
         同一纪律；reindex 端点同样经此方法，锁语义单点收口）。存储锁的必要性：
         主连接上的 DELETE+commit 若与管道/删除路径的隐式多语句事务交叉，
-        会把对方半程写入提前提交（复核 P2-23）；embed 锁的必要性：
+        会把对方半程写入提前提交；embed 锁的必要性：
         gc_orphans 直接在专用连接上写而不自持锁，互斥须由调用方给出。
         """
 
@@ -425,7 +425,7 @@ class RagEngine:
         水位/整表重建不交错（交错当前是良性的，但锁纪律名存实亡会诱使
         后续在 _refresh_vector_cache 中加入非幂等步骤）。
 
-        force_full 语义（复核 P1-4）：整表重建 = 拉全表后按 key 差集剔除
+        force_full 语义：整表重建 = 拉全表后按 key 差集剔除
         缓存内本次未 fetch 到的条目——否则「删除信号」被归零计数吞掉，
         已删内容持续可被检索。
         """
@@ -484,7 +484,7 @@ class RagEngine:
                 edb, model, self._vec_watermark, self.settings.group_only
             )
         if force_full:
-            # 整表重建（复核 P1-4）：本次 fetch 到的 key 集合之外，缓存内其余
+            # 整表重建：本次 fetch 到的 key 集合之外，缓存内其余
             # key 一律剔除——等价整表重建但省一次全量重嵌，且空表（全删）时
             # 也能清空残留。放在 raw_rows 判空之前，保证「删光了」也能收敛。
             # _vec_count_seen 由本方法末尾 self._vec_count_seen = total 统一
@@ -597,7 +597,7 @@ class RagEngine:
         try:
             q_vec = (await ai_ports.embed_texts([cleaned]))[0]
         except Exception:
-            # F4：嵌入端点故障不应连坐关键词问答——降级 FTS-only，仍可回答可命中问题
+            # 嵌入端点故障不应连坐关键词问答——降级 FTS-only，仍可回答可命中问题
             logger.warning(
                 "rag: 查询嵌入失败，降级为 FTS-only 检索（仅关键词可命中）",
                 exc_info=True,

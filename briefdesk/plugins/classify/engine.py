@@ -381,7 +381,7 @@ def _slice_json_root(text: str) -> str:
     return text
 
 
-# ── F2 索引漂移守卫（两道关）──
+# ── 索引漂移守卫（两道关）──
 # 第一关（字面，同步）：quote 归一化后在全批消息上做包含率相对比较——
 # 自己必须明显第一（领先 _CHAR_ALIGN_MARGIN 才确认），明显落后判漂移，
 # 接近/平票记入 ambiguous_out 交第二关。不做绝对阈值：摘录天然短于原文，
@@ -603,13 +603,13 @@ def _parse_response(
             retry_indexes.append(msg_index)
             continue
 
-        # F2 索引漂移守卫（第一关·字面）：quote 与自己内容明显不符而与
+        # 索引漂移守卫（第一关·字面）：quote 与自己内容明显不符而与
         # 其他消息更吻合 → 转重试；平票模糊条目记入 ambiguous_out，
         # 由 _classify_once 调第二关（语义裁判）复核
         if contents is not None:
             quote_raw = item.get("quote", "") or ""
             if not isinstance(quote_raw, str):
-                # 复核 P3-10：AI 脏输出可能给数字/dict 型 quote，直接传给
+                # AI 脏输出可能给数字/dict 型 quote，直接传给
                 # _norm_align_text（re.sub）会抛 TypeError → 整批本轮抛弃，
                 # 模型持续脏输出时会话陷入重试循环。收敛为 str 后走正常判定。
                 quote_raw = str(quote_raw)
@@ -648,7 +648,7 @@ def _parse_response(
         if time_flag in (True, "true", "True", 1, "1"):
             time_indexes.append(msg_index)
 
-    # F1 覆盖校验：重复 index 属结构错误（整批重试）；AI 漏回的 index
+    # 覆盖校验：重复 index 属结构错误（整批重试）；AI 漏回的 index
     # 并入 retry——否则调用方会把它当闲聊静默标 processed（永久丢失）。
     seen: list[int] = []
     for item in data:
@@ -933,7 +933,7 @@ def _apply_times_to_results(
     return filled
 
 
-# F3 韧性：时间提取独立预算（不再与标题概括共享 2048；思考模式挤压时
+# 时间提取独立预算（不再与标题概括共享 2048；思考模式挤压时
 # max_tokens 硬截断会把整批 start/end/times 丢弃）；截断时拆半重试并记录片段。
 _TIME_MAX_TOKENS = 4096
 _TIME_SPLIT_DEPTH = 2
@@ -1135,7 +1135,7 @@ async def _classify_once(
         logger.warning("AI 响应解析失败（本轮抛弃，下轮回填）: %s", e)
         return ClassifyOutcome([], [offset + i for i in range(len(messages))])
 
-    # F2 索引漂移守卫（第二关·语义）：字面模糊条目交嵌入余弦复核。
+    # 索引漂移守卫（第二关·语义）：字面模糊条目交嵌入余弦复核。
     # 置于 offset 合并前：ambiguous/contents 均为批内局部 index。
     if ambiguous:
         results, retry_indexes, time_indexes = await _semantic_refine(
@@ -1150,7 +1150,7 @@ async def _classify_once(
         retry_indexes = [i + offset for i in retry_indexes]
         time_indexes = [i + offset for i in time_indexes]
     if budget_dropped:
-        # S2 防静默丢失：被预算剔除的消息未送分类，必须并入 failed 由
+        # 防静默丢失：被预算剔除的消息未送分类，必须并入 failed 由
         # 回填重试——否则会被 _mark_skipped 当闲聊标记 processed
         logger.warning(
             "分类输入超出单批字符预算（%d），%d 条消息整条剔除待回填"

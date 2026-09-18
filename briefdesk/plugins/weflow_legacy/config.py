@@ -22,7 +22,7 @@ class WeFlowLegacySettings(KeyringSettingsBase):
     api_token: SecretStr = SecretStr("")
     sse_reconnect_initial_ms: int = Field(
         default=1000,
-        gt=0,  # env: WEFLOW_LEGACY_SSE_RECONNECT_INITIAL_MS（复核 P3-17：0 会退化为热重连风暴）
+        gt=0,  # env: WEFLOW_LEGACY_SSE_RECONNECT_INITIAL_MS（0 会退化为热重连风暴，故要求 >0）
     )
     sse_reconnect_max_ms: int = Field(
         default=60000,
@@ -30,7 +30,7 @@ class WeFlowLegacySettings(KeyringSettingsBase):
     )
     # SSE 读超时（毫秒）：该时长内未收到任何数据即判定连接失效、断开重连。
     # WeFlow Legacy 无心跳机制，默认 5 分钟；半开连接（对端假死/断网无 FIN）
-    # 下若无读超时，SSE 读循环会永久阻塞、监听静默死亡（审查报告【2·P1】）
+    # 下若无读超时，SSE 读循环会永久阻塞、监听静默死亡
     sse_read_timeout_ms: int = Field(
         default=300000,
         gt=0,  # env: WEFLOW_LEGACY_SSE_READ_TIMEOUT_MS

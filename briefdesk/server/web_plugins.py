@@ -4,7 +4,7 @@
 - `/plugin-assets/{name}/{path}`：插件静态资源（浏览器直连）
 - `include_plugin_router`：把插件路由展开插到 SPA mount 之前
 
-从原 server.py 拆出（P5 子包化）：本模块导入即向 `briefdesk.server.app`
+从原 server.py 拆出：本模块导入即向 `briefdesk.server.app`
 注册插件相关路由。
 """
 
@@ -116,7 +116,7 @@ def include_plugin_router(router: APIRouter) -> None:
     key = id(router)
     if key in _included_router_ids:
         return
-    # 同源校验契约（复核 P2-11）：middleware 仅对 /api/ 前缀的变更方法做
+    # 同源校验契约：middleware 仅对 /api/ 前缀的变更方法做
     # CSRF 校验——插件路由挂在其它前缀会静默失去防线，装配期硬失败
     for r in router.routes:
         if isinstance(r, APIRoute) and not r.path.startswith("/api/"):

@@ -159,7 +159,7 @@ _TITLE_PLACEHOLDER_RE = re.compile(r"\{([a-z_]+)\}")
 
 
 def _fill_template(template: str, mapping: dict[str, str]) -> str:
-    """单遍占位符填充：数据值里的字面量占位符不会被二次替换（P6）。
+    """单遍占位符填充：数据值里的字面量占位符不会被二次替换。
 
     顺序 replace 链在 old_title 含 "{key_info}" 之类的字面量时会误替换；
     单遍正则只命中模板自身的占位符，数据值不再扫描。

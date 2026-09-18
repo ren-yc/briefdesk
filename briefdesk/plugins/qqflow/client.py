@@ -141,7 +141,7 @@ _BOUND_PHASES = ("indexing", "ready", "error")
 
 # 按消息回查 REST（IGNORE_SELF 方向判定）的单页条数：倒序响应下目标消息
 # 之后 120s 窗口内的新消息会把它挤出首页，50 条在刷屏场景不够，
-# 放宽到 200（审查报告【5·P2】）
+# 放宽到 200：50 条在刷屏场景下不够用
 _LOOKUP_LIMIT = 200
 
 
@@ -432,7 +432,7 @@ class QqFlowClient(SourceClient):
                 self._db_path or "<默认>",
             )
             # account_conflict 由 register_account 就地抛 QqFlowAccountMismatchError
-            # （D6），不在此处分支。
+            # 只加抛出、不改签名），不在此处分支。
             state = await self.register_account(self._qq, self._key, self._db_path)
             if state in _BENIGN_STATES:
                 self._ready_checked = True

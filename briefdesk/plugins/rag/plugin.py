@@ -213,7 +213,7 @@ class RagPlugin(StagePlugin, WebPlugin):
 
         delete_items 会级联删 raw_messages → rag_chunks/FTS/向量随之孤儿化，
         gc_orphans 对账即清。事件驱动让删除秒级生效（此前最长滞留一个维护
-        周期，已删内容仍可被 /api/rag/ask 引用——复核 P2-24）。
+        周期，已删内容仍可被 /api/rag/ask 引用）。
         """
         if self._gc_task is not None and not self._gc_task.done():
             # 已有待跑/在跑的 GC：置脏由其收尾时再调度一轮，新删除不滞留
@@ -226,7 +226,7 @@ class RagPlugin(StagePlugin, WebPlugin):
 
     async def _run_gc(self) -> None:
         # handler 在存储锁内被调用：先让出执行权待发布方释放锁，
-        # maintenance_gc 自取存储锁（复核 P2-23）
+        # maintenance_gc 自取存储锁
         await asyncio.sleep(0)
         if self._engine is None:
             return

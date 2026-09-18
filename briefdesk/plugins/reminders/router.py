@@ -50,7 +50,7 @@ async def set_reminder(item_id: str, body: dict):
         updated = await set_item_reminder(item_id, remind_at)
     if not updated:
         if remind_at is None:
-            # 复核 P2-4：清除未命中需区分「卡片不存在」（404）与「卡片存在但
+            # 清除未命中需区分「卡片不存在」（404）与「卡片存在但
             # 无提醒可清」（200 cleared=false）——此前两者同为 404，手动清除
             # 已无提醒的卡会误显示「设置失败」。
             from briefdesk.db import get_existing_item_ids

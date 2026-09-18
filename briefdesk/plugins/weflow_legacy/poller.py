@@ -198,7 +198,7 @@ async def poll(
                     limit=_PAGE_LIMIT,
                     offset=offset,
                     media=True,
-                    # 脏会话 404 → 空信封，对齐 weflow/qqflow（复核 U1-1）
+                    # 脏会话 404 → 空信封，对齐 weflow/qqflow
                     not_found_ok=True,
                     # 首页保留「刚入库查不到」竞态兜底；翻页空结果即末页，
                     # 再重试只会给每个空闲会话固定加 500ms 串行延迟
@@ -209,7 +209,7 @@ async def poll(
                     break
                 for idx, m in enumerate(page_msgs):
                     # 响应按时间倒序：一旦碰到早于窗口的消息，本页其余只会更旧
-                    # ——对齐 qqflow 的 hit_old 早停（复核 P2-12）：防上游无视
+                    # ——对齐 qqflow 的 hit_old 早停：防上游无视
                     # start 参数时深翻历史（上限 100 万条全量驻留内存）
                     if m.get("createTime", 0) < cutoff:
                         session_old += len(page_msgs) - idx

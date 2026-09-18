@@ -1,4 +1,4 @@
-"""基准测试插件（P5 WebPlugin + P3 StagePlugin 双能力）— 路由 + 前端 + 处理时点记录。
+"""基准测试插件（WebPlugin + StagePlugin 双能力）— 路由 + 前端 + 处理时点记录。
 
 - Web 插件：/api/benchmark/* 路由 + 前端（ui/）+ CLI 入口；
 - 阶段插件（slot=post_insert，priority=1，在合并阶段之后、锁内运行）：

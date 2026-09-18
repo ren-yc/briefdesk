@@ -134,7 +134,7 @@ class OcrPlugin(StagePlugin):
                     msg.content = "[OCR]\n" + ocr_text
                 else:
                     # 图+文混合消息保留人工原文（信息密度更高，且是分类/去重
-                    # 的完整上下文），OCR 识别文本作为附加段追加（复核 P2-21）
+                    # 的完整上下文），OCR 识别文本作为附加段追加
                     msg.content = f"{msg.content}\n[OCR]\n{ocr_text}"
             logger.debug(
                 "OCR 完成: msg_id=%s, %d 图, %d bytes, 识别 %d 字 (%s)",

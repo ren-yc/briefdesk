@@ -154,7 +154,7 @@ _MAX_MEDIA_BYTES = 20 * 1024 * 1024
 
 # 按消息回查 REST（SSE 图片 mediaUrl / 文章卡片原始 XML）的单页条数：
 # 倒序响应下目标消息之后 120s 窗口内的新消息会把它挤出首页，
-# 50 条在刷屏场景不够，放宽到 200（审查报告【5·P2】）
+# 50 条在刷屏场景不够，放宽到 200
 _LOOKUP_LIMIT = 200
 
 
@@ -266,7 +266,7 @@ class WeFlowLegacyClient(SourceClient):
                     # 重试响应失败必须走与主路径相同的错误出口：静默保留
                     # 首次的空 data 会让调用方拿到"成功"的空结果，把上游
                     # 4xx/5xx 伪装成正常翻页终止（审查回归）。
-                    # 复核 P3-16：not_found_ok 的 404 降级同样适用于重试分支，
+                    # not_found_ok 的 404 降级同样适用于重试分支，
                     # 否则脏会话重试遇 404 本可降级空信封却令整会话失败。
                     if not_found_ok and resp.status_code == 404:
                         return None
@@ -288,7 +288,7 @@ class WeFlowLegacyClient(SourceClient):
         ——注意 WeFlow 在 media=True 时会把文章卡片 XML 渲染成占位符
         （如 "[视频号] 标题"），需要原始 XML 时必须用 media=False 回查。
         回查显式 retry_on_empty=False：miss 是常见路径，不应在监听/回填
-        热路径上为空结果白付 500ms 重试（审查报告【7·P2】）。
+        热路径上为空结果白付 500ms 重试。
         """
         start_ts = int((datetime.fromtimestamp(ts, tz=UTC) - timedelta(seconds=120)).timestamp())
 
@@ -532,7 +532,7 @@ class WeFlowLegacyClient(SourceClient):
             retry_on_empty: 空结果是否 500ms 后重试一次（回查链路应传 False；
                 轮询首页保留默认 True 以维持既有「刚入库查不到」竞态兜底）
             not_found_ok: 会话不存在（404）时返回空信封而非抛错；轮询路径应
-                传 True（对齐 weflow/qqflow 的脏会话容错，复核 U1-1）
+                传 True（对齐 weflow/qqflow 的脏会话容错）
 
         查询参数经 params= 由 httpx 编码（与 weflow/qqflow 客户端一致）：
         会话 ID 拼进查询串时若含保留字符（&、=、# 等）手拼会产生错误请求。

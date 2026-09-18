@@ -21,7 +21,7 @@ from briefdesk.types import ContextMsg
 
 _db: aiosqlite.Connection | None = None
 _embed_db: aiosqlite.Connection | None = None
-# close_db 已执行的终态标志（P3-3）：close_db 之后任何 get_db/get_embed_db
+# close_db 已执行的终态标志：close_db 之后任何 get_db/get_embed_db
 # 都必须拒绝重建连接——应用关闭序列里 _cancel_pending_tasks 兜底在 close_db
 # 之后，残余任务的清理路径若经双检锁复活连接，其非 daemon aiosqlite worker
 # 线程会让解释器退出 join 挂死。进程内单生命周期（main._run 仅跑一次），
@@ -471,12 +471,12 @@ async def _init_connection(
 async def get_db() -> aiosqlite.Connection:
     global _db
     if _db_closed:
-        # 关闭后拒绝重建（P3-3），见模块级 _db_closed 注释
+        # 关闭后拒绝重建，见模块级 _db_closed 注释
         raise RuntimeError("数据库已关闭（应用退出中），拒绝重建连接")
     if _db is None:
         async with _lock:
             if _db is None:
-                # 与向量连接对称（审计 B-1）：embed 连接持写锁落向量期间，
+                # 与向量连接对称：embed 连接持写锁落向量期间，
                 # 主连接的写操作短暂等待而非立即抛 "database is locked"
                 _db = await _init_connection(
                     config.db_path,
@@ -504,7 +504,7 @@ async def get_embed_db() -> aiosqlite.Connection:
     """
     global _embed_db
     if _db_closed:
-        # 关闭后拒绝重建（P3-3），与主连接同口径
+        # 关闭后拒绝重建，与主连接同口径
         raise RuntimeError("数据库已关闭（应用退出中），拒绝重建连接")
     if _embed_db is None:
         async with _lock:
@@ -570,7 +570,7 @@ async def close_db() -> None:
     不阻断另一连接——否则残留的非 daemon worker 线程会让解释器退出挂死
     （与关闭路径要防的故障同源）。
 
-    入口即置 _db_closed 终态（P3-3）：先于任何连接 close，覆盖两连接先后
+    入口即置 _db_closed 终态：先于任何连接 close，覆盖两连接先后
     关闭的中间窗口——此后 get_db/get_embed_db 一律拒绝重建，防止关闭期
     残余任务的清理路径复活连接（挂死同源）。进程内单生命周期，标志不复位。
     """
@@ -648,7 +648,7 @@ async def atomic_transaction(db: aiosqlite.Connection) -> AsyncIterator[aiosqlit
     except BaseException:
         # 必须捕 BaseException：CancelledError（Python 3.8 起）继承 BaseException
         # 而非 Exception，只捕 Exception 会让取消逃逸、留下开启的悬挂事务，
-        # 被后续无关路径的 commit 收尾提交（半程写提前可见且不可回退，复核 P1-1）。
+        # 被后续无关路径的 commit 收尾提交（半程写提前可见且不可回退）。
         await db.rollback()
         raise
 
@@ -986,7 +986,7 @@ async def _seed_default_categories(db: aiosqlite.Connection) -> None:
     await cursor.close()
 
 
-# C3：活动通知口径修订（user_version 1→2）。仅当现有行仍是旧版原文时更新——
+# 活动通知口径修订（user_version 1→2）。仅当现有行仍是旧版原文时更新——
 # 用户已自行编辑过该分类则尊重，绝不覆盖；幂等由 PRAGMA user_version 门控。
 _ACTIVITY_NOTICE_OLD_PROMPT = "宣布一场可到场参加的具体事件、教学日程或其变更声明。收录：①事件性内容（讲座、比赛、演出、聚会、社团活动、展览、运动会、课程安排、考试等）②具体时间③地点或线上平台④主题名称——①②必须满足，③④至少满足其一；原事件的改期、延期、取消声明即使新时间未定也收录。排除：各类找人召集（纳新成员、志愿者或工作人员、同伴拼团组队）、物品买卖转让求购、交材料申领资金的申报机会、零对价赠送领取、寻物寻主启事。判别：读者到场参与即完成参与→本类；比赛奖金只是诱因属性进关键词；含现场投递的宣讲会、义卖市集、招观众充场均按本类处理。"
 _ACTIVITY_NOTICE_NEW_PROMPT = "宣布一场可到场参加的具体事件、教学日程或其变更声明。收录：①事件性内容（讲座、比赛、演出、聚会、社团活动、展览、运动会、课程安排、考试等）②具体时间③地点或线上平台④主题名称——①②必须满足，③④至少满足其一；原事件的改期、延期、取消声明即使新时间未定也收录。排除：各类找人召集（纳新成员、志愿者或工作人员、同伴拼团组队）、物品买卖转让求购、交材料申领资金的申报机会、零对价赠送领取、寻物寻主启事。判别：读者到场参与即完成参与→本类；比赛奖金只是诱因属性进关键词；含现场投递的宣讲会、义卖市集、招观众充场均按本类处理。；面向全群的多项任务/材料提交截止通知（含各项截止日期）按本类收录。"
@@ -1886,7 +1886,7 @@ async def get_oldest_unprocessed_by_session(source: str) -> dict[str, int]:
 
 
 # 单行与批量共用的会话 UPSERT：enabled/last_poll_ts 不在 DO UPDATE 更新列中，
-# 保留用户启用状态与会话水位（语义锚点见 tests/test_db.py F2）
+# 保留用户启用状态与会话水位（语义锚点见 tests/test_db.py 的会话 UPSERT 用例）
 _SESSIONS_UPSERT_SQL = (
     "INSERT INTO sessions "
     "(source, session_id, name, is_group, is_official, enabled, last_seen, last_active) "
@@ -2339,7 +2339,7 @@ async def get_context_messages(
 async def merge_source_group(item_id: str, new_group: str) -> None:
     """把消息来源群名并入存活卡的 source_group（逗号分隔、精确匹配去重）。
 
-    精确去重而非子串匹配（C3）：群名互为子串（如"我们四个" vs "我们四个2"、
+    精确去重而非子串匹配：群名互为子串（如"我们四个" vs "我们四个2"、
     "篮球社" vs "篮球社团招新群"）时不再误判"已包含"而丢失来源记录。
     """
     db = await get_db()
@@ -2383,7 +2383,7 @@ async def get_all_item_texts() -> list[ItemText]:
 
 async def get_item_texts_by_ids(item_ids: list[str]) -> list[ItemText]:
     """按 id 取卡片文本（形状同 get_all_item_texts），供 unverify 后回加
-    去重缓存（复核 P2-18）。IN 列表按 900 分块防 SQLite 变量上限。"""
+    去重缓存。IN 列表按 900 分块防 SQLite 变量上限。"""
     if not item_ids:
         return []
     db = await get_db()
@@ -2401,7 +2401,7 @@ async def get_item_texts_by_ids(item_ids: list[str]) -> list[ItemText]:
 
 
 async def get_existing_item_ids(item_ids: list[str]) -> set[str]:
-    """按 id 批量查仍存在的卡片 id 集合（复核 P1-3）。
+    """按 id 批量查仍存在的卡片 id 集合。
 
     供 merge.after_run 锁外复查：锁释放后用户可能已删卡，add_to_cache
     之前按此过滤掉已删除 id，防止复活幽灵缓存条目。IN 列表分块防变量上限。

@@ -7,7 +7,7 @@ briefdesk/types.py。模块级单例与包装函数保留（实验脚本兼容�
 
 批量判定容错：`_collect_verdicts` 是唯一的并行判定入口，异常整形为 None 并打
 WARNING、不中止整批；策略差异留在调用点——加权多数票把 None 剔除出计权
-（既无 SAME 票也不占分母，全部失败退化为保守不判重——远程审计 S1 语义），
+（既无 SAME 票也不占分母，全部失败退化为保守不判重），
 weak 全员一致复核把 None 当反对票（语义等效）。判重命中统一走 `_hit`，
 「判 SAME 却漏合并 source_group」在结构上不可能发生。
 """
@@ -146,7 +146,7 @@ JUDGE_PROMPT = """你是一个信息去重助手。本提示词是唯一的规�
 def _embedding_text(title: str, quote: str) -> str:
     """嵌入用文本：标题 + 原文，查询与缓存加载共用同一格式，保证可比性。
 
-    截断至 2000 字符（复核 P2-17）：嵌入语义集中在前部，截断不影响判重
+    截断至 2000 字符：嵌入语义集中在前部，截断不影响判重
     可比性；不设上限时一条超长文本（如长截图 OCR）会让 embed API 抛错 →
     _ensure_cache 整体降级且每次重启确定性复现。单点截断，查询/缓存口径
     自动一致。存量超长文本的旧向量按全文计算，与新口径有一次性偏差
@@ -619,7 +619,7 @@ class DedupEngine(DedupService):
         source_quote: str = "",
     ) -> DedupResult:
         """判重检查。q_emb 由调用方在锁外预计算（批内一次 API 调用）；
-        None 时不再锁内补嵌（P1 修复），直接降级字符重叠通道。image_urls 参与
+        None 时不再锁内补嵌，直接降级字符重叠通道。image_urls 参与
         图片精确短路，仅当查询与缓存条目同属 _IMAGE_SHORTCUT_SOURCES
         （当前仅 weflow-legacy）时生效；source_quote 参与原文哈希精确短路
         （非空且非纯占位符原文，哈希全等时生效）。"""
@@ -660,11 +660,11 @@ class DedupEngine(DedupService):
         """候选选取：嵌入余弦 Top-K（启用且加载成功）或字符重叠单候选（回退/兜底）。
 
         返回 (候选列表, 度量名)；空列表表示已打无候选 DEBUG 诊断、调用方直接
-        判不重复。纯内存计算，不触网（理由见下方 P1 注释）。
+        判不重复。纯内存计算，不触网（理由见下方分级注释）。
         """
         # 余弦以 fallback 阈值召回（含弱候选区间 [fallback, threshold)），
         # normal/weak 分层在判定前拆分；字符重叠在余弦零候选时兜底。
-        # P1 修复：check_dedup 运行于 pipeline 存储锁内，此处严禁远程嵌入——
+        # check_dedup 运行于 pipeline 存储锁内，此处严禁远程嵌入——
         # q_emb 缺失（批内 preembed_batch 失败或调用方未预嵌）一律降级字符重叠
         # 通道，绝不在此 await embed_texts（否则嵌入端点挂起会以"行数 × SDK
         # 超时"串行放大锁持有时间，阻塞管道与卡片删除路由）。
@@ -924,7 +924,7 @@ class DedupEngine(DedupService):
         # 判定更可信——SAME 权重和 > 总权重一半才命中，抑制低置信票的干扰
         # （实验：串行「任一候选 same 即命中」会把相似但不同信息的噪声放大成
         # 误判）；等权时退化为原 >K/2 规则，单候选退化为一次判定。
-        # S1 容错：失败候选剔除出计权（既无 SAME 票也不占分母），
+        # 失败候选剔除出计权（既无 SAME 票也不占分母），
         # 全部失败时退化为保守不判重——异常绝不抛穿中止整轮管道
         verdicts = await self._collect_verdicts(
             candidates, title, source_quote, "剔除该候选票"

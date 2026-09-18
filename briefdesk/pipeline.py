@@ -49,7 +49,7 @@ _processing_paused = False
 # 暂停门闸的首次 INFO 已落日志标志：暂停期间后续批次降级 DEBUG，防刷屏；
 # 恢复时复位，保证下一轮暂停仍有一条 INFO。
 _paused_logged_once = False
-# 活动批次计数（复核 P1-5）：process_all_batches 执行期间 +1、退出 -1。
+# 活动批次计数：process_all_batches 执行期间 +1、退出 -1。
 # benchmark 排空门闸以「pendingCount==0 且 active_batches==0」为排空信号——
 # 否则暂停置位后「已过暂停检查、尚未 note_sync_batch_start 计数」的批次
 # 不反映在 pendingCount 里，被误判排空（存储相写进临时库、去重缓存留幽灵）。
@@ -62,7 +62,7 @@ def get_active_batches() -> int:
 
 
 def _track_active_batches(fn):
-    """process_all_batches 装饰器：执行期间维护活动批次计数（复核 P1-5）。"""
+    """process_all_batches 装饰器：执行期间维护活动批次计数。"""
 
     @functools.wraps(fn)
     async def wrapper(*args, **kwargs):
@@ -166,7 +166,7 @@ async def process_all_batches(
     返回 bool：True = 消息已处理或无需处理（调用方可推进会话水位）；
     False = 调用方必须跳过本轮水位推进——包括存在未落 raw 的保留消息
     （无启用类别/阶段插件缺失早退），以及零产出（全部消息分类失败，
-    审计 #1：失败消息由"最早未处理消息钉窗"在后续轮次找回）。
+    失败消息由"最早未处理消息钉窗"在后续轮次找回）。
 
         Args:
             messages: 待处理消息
@@ -298,7 +298,7 @@ async def process_all_batches(
         # 纳入 storage_lock：bulk_insert_raw_messages 内部 atomic_transaction
         # 会 commit，锁外 commit 会把锁内其它多步写（如 delete_items 级联、
         # update_item_merged 的 UPDATE→DELETE）提前提交，击穿「单连接 + 隐式
-        # 事务 + 存储锁」不变量（复核 P1-2）。读路径（get_enabled_sessions /
+        # 事务 + 存储锁」不变量。读路径（get_enabled_sessions /
         # are_messages_processed）保持锁外，不扩大锁范围。
         async with _storage_lock:
             await bulk_insert_raw_messages(
@@ -490,7 +490,7 @@ async def process_all_batches(
         )
     else:
         logger.warning("本轮零产出：%d 条失败待回填，不刷新 lastSync", total_failed)
-    # 返回值语义（审计 #1）：零产出（全部消息分类失败）返回 False——
+    # 返回值语义：零产出（全部消息分类失败）返回 False——
     # poll_cycle 据此跳过本轮水位推进，失败待回填的消息由
     # "最早未处理消息钉窗"机制在后续轮次找回；实时路径忽略返回值。
     processed_any = total_inserted + total_dupes + total_skipped > 0

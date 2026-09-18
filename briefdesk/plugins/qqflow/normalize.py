@@ -113,7 +113,7 @@ def pre_filter_sse(event: QqFlowEvent) -> bool:
         return False
     if not event.get("rawid"):
         # 无 rawid 无法生成 msg_id/标记 processed——就地丢弃，防去重键
-        # ("message.new","") 碰撞误吞后续正常事件（审查 A5）
+        # ("message.new","") 碰撞误吞后续正常事件
         logger.debug("丢弃 SSE: message.new 缺 rawid")
         return False
     # 发送者为空不再丢弃（决策 ②=保留未知，与 weflow/legacy 统一）：

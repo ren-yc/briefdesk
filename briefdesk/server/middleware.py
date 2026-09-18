@@ -1,6 +1,6 @@
 """本地访问守卫：Host 白名单（防 DNS rebinding）+ 变更接口同源校验 + 安全响应头。
 
-从原 server.py 拆出（P5 子包化）：本模块导入即向 `briefdesk.server.app`
+从原 server.py 拆出：本模块导入即向 `briefdesk.server.app`
 注册 http 中间件。
 """
 
@@ -44,7 +44,7 @@ async def _local_security_guard(request: Request, call_next):
     Host 白名单阻断 DNS rebinding（恶意域名解析到 127.0.0.1）；
     Origin/Referer 校验阻断浏览器跨站表单/fetch 对变更接口的 CSRF 调用。
     """
-    # 复核 P2-2：request.url 的 hostname/port 解析对畸形 Host（超范围端口
+    # request.url 的 hostname/port 解析对畸形 Host（超范围端口
     # 99999 / 非数字端口）抛 ValueError，发生在 call_next 之前无人捕获 → 500。
     # 整个解析包 try 收敛为 400。
     try:
@@ -78,7 +78,7 @@ async def _local_security_guard(request: Request, call_next):
     response.headers.setdefault(
         "Content-Security-Policy",
         # script-src 的 sha256 白名单放行 ui/index.html 的 <head> 内联主题脚本
-        # （防首绘闪烁：深色用户必须在首次绘制前落定 data-theme，复核 P1-6）。
+        # （防首绘闪烁：深色用户必须在首次绘制前落定 data-theme）。
         # 该 hash 与 tests/test_csp_inline_theme.py 的守卫测试对齐——未来若改动
         # 内联脚本内容，守卫测试会失败并提示重算。
         "default-src 'self'; "

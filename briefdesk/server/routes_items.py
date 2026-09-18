@@ -1,5 +1,5 @@
 """核心数据路由（server 子包）：items / verify / sessions / sync / context /
-status / stream 等。从原 server.py 拆出（P5 子包化），导入即注册路由。
+status / stream 等。从原 server.py 拆出，导入即注册路由。
 """
 
 import asyncio
@@ -155,7 +155,7 @@ def _export_attachment(content: str, media_type: str, filename: str) -> Response
 
 
 # 公式注入前缀：Excel/LibreOffice 会把以此开头的单元格当公式执行（CSV injection；
-# 审计 #9 补充：\r 开头同样可能被表格应用解释，一并纳入）
+# \r 开头同样可能被表格应用解释，一并纳入）
 _CSV_FORMULA_PREFIXES = ("=", "+", "-", "@", "\t", "\r", "\n")
 
 
@@ -343,7 +343,7 @@ async def api_backup():
         _remove_backup_tmp(tmp)
         raise
     filename = f"briefdesk-backup-{time.strftime('%Y%m%d-%H%M%S')}.sqlite"
-    # 流式下发（复核 P2-10）：整库读入内存改为 FileResponse，响应完成后
+    # 流式下发：整库读入内存改为 FileResponse，响应完成后
     # 由后台任务删除临时文件并解除登记
     return FileResponse(
         tmp,
@@ -369,7 +369,7 @@ async def api_restore(file: Annotated[UploadFile, File()]):
     os.close(fd)
     total = 0
     try:
-        # 逐块落盘（复核 P2-10）：不再整体攒 chunks 列表，内存占用恒定 chunk 级；
+        # 逐块落盘：不再整体攒 chunks 列表，内存占用恒定 chunk 级；
         # open/close/write 均走 to_thread，避免事件循环线程做阻塞文件操作
         f = await asyncio.to_thread(open, tmp, "wb")
         try:
@@ -489,7 +489,7 @@ async def api_items_batch(body: dict):
             elif action == "unverify":
                 # 恢复的卡片回归 is_verified >= 0 判重口径：回加去重内存
                 # 缓存，否则相似新消息不再与它判重、重复卡片持续到重启
-                # （复核 P2-18；不带向量，与 merge 登记口径一致，重启补齐）
+                # （不带向量，与 merge 登记口径一致，重启补齐）
                 svc_ctx = _stage_context()
                 if svc_ctx is not None and svc_ctx.dedup is not None:
                     for row in await get_item_texts_by_ids(ids):

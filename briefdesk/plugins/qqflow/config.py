@@ -30,7 +30,7 @@ class QqFlowSettings(KeyringSettingsBase):
     db_path: str = ""
     sse_reconnect_initial_ms: int = Field(
         default=1000,
-        gt=0,  # env: QQFLOW_SSE_RECONNECT_INITIAL_MS（复核 P3-17：0 会退化为热重连风暴）
+        gt=0,  # env: QQFLOW_SSE_RECONNECT_INITIAL_MS（0 会退化为热重连风暴，故要求 >0）
     )
     sse_reconnect_max_ms: int = Field(
         default=60000,
@@ -38,7 +38,7 @@ class QqFlowSettings(KeyringSettingsBase):
     )
     # SSE 读超时（毫秒）：上游每 25 秒发送 KeepAlive ping，60s（≈2.4 个心跳
     # 周期）内未收到任何数据即判定连接失效、断开重连——防网络半开导致
-    # 实时监听永久静默死亡（审查报告【2·P1】），兼作半开连接的自愈检测时限
+    # 实时监听永久静默死亡，兼作半开连接的自愈检测时限
     sse_read_timeout_ms: int = Field(
         default=60000,
         gt=0,  # env: QQFLOW_SSE_READ_TIMEOUT_MS

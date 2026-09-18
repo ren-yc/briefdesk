@@ -245,7 +245,7 @@ class PluginManager:
             try:
                 await plugin.activate(ctx)
             except Exception as e:
-                # P2 修复：activate 失败同样 best-effort 回滚（该插件仍在
+                # activate 失败同样 best-effort 回滚（该插件仍在
                 # _load_order，关闭时 teardown_all 会按幂等契约再调一次）
                 await self._best_effort_teardown(name, plugin)
                 self._mark(name, "failed", f"activate 失败: {e!r}")

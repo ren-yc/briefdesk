@@ -326,7 +326,7 @@ async def upsert_chunks(db: aiosqlite.Connection, rows: list[ChunkRow]) -> None:
         "content=excluded.content, "
         # item_id 条件覆盖：回填（backfill）重建的 ChunkRow 不携带 item_id
         # （空串），无条件覆盖会把运行期已写入的「消息→卡片」引用永久清空
-        # （复核 P0-1）。空串时保留既有值，非空时（消息重处理）才覆盖。
+        # 空串时保留既有值，非空时（消息重处理）才覆盖。
         "item_id=CASE WHEN excluded.item_id='' THEN rag_chunks.item_id "
         "ELSE excluded.item_id END",
         [

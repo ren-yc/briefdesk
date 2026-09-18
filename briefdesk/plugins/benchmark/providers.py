@@ -43,13 +43,13 @@ _DRAIN_POLL_INTERVAL = 0.05
 
 
 async def _wait_pipelines_drained(timeout_s: float = 120.0) -> bool:
-    """等待在途批次排空（复核 P2-22 + P1-5）：暂停只拦新批，已在分类阶段的批次仍会
+    """等待在途批次排空：暂停只拦新批，已在分类阶段的批次仍会
     进入存储相——不排空就重定向会把它们的卡片写进临时库，并在生产去重缓存
     留下指向临时库的幽灵条目（后续相似消息被误吸收）。
 
     以「pendingCount==0 且 activeBatches==0」为排空信号：pendingCount 覆盖已
     计数的批次；activeBatches 覆盖「已过暂停检查、尚未计数」的窗口批次
-    （复核 P1-5，否则该窗口批次被误判排空）。返回是否在超时前排空。
+    （否则该窗口批次被误判排空）。返回是否在超时前排空。
     """
     from briefdesk.pipeline import get_active_batches
 
@@ -95,7 +95,7 @@ async def bench_environment(
         # 实时消息不入库也不标 processed，延后到下轮回填自然恢复。
         # 置于 try 内保证任何后续失败都走 finally 的复位与子目录清理。
         pipeline.set_processing_paused(True)
-        # 等待在途批次排空（复核 P2-22），见 _wait_pipelines_drained。
+        # 等待在途批次排空，见 _wait_pipelines_drained。
         # 必须先于 db_redirect：在途批次仍持生产连接，未排空即重定向会让
         # 半程批次的后续写落到临时基准库。
         if not await _wait_pipelines_drained():

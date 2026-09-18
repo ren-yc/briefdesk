@@ -1,6 +1,6 @@
 """SPA 静态托管（server 子包）：/ 与 ui/ 静态文件 + SPA 兜底。
 
-从原 server.py 拆出（P5 子包化）：本模块导入即向 `briefdesk.server.app`
+从原 server.py 拆出：本模块导入即向 `briefdesk.server.app`
 注册 / 路由并挂载兜底 mount（必须位于插件路由之后——include_plugin_router
 会把插件路由插到本 mount 之前）。
 """

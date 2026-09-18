@@ -1,6 +1,6 @@
 """类别管理路由（server 子包）：categories CRUD + 级联删除 + 事件通知。
 
-从原 server.py 拆出（P5 子包化），导入即注册路由。
+从原 server.py 拆出，导入即注册路由。
 """
 
 import re
@@ -21,7 +21,7 @@ from briefdesk.realtime import publish_items_updated
 from briefdesk.server.app import app
 
 _NAME_MAX = 20
-# F5: 50 字上限与默认类别 prompt（均 >50 字，含"①…②…"细则）矛盾，导致现有类别
+# 50 字上限与默认类别 prompt（均 >50 字，含"①…②…"细则）矛盾，导致现有类别
 # 无法经 UI 编辑（任何整句重写要么超限被拒、要么丢失细则）。放宽为 200。
 _PROMPT_MAX = 200
 _COLOR_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
