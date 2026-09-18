@@ -69,6 +69,29 @@ powershell -ExecutionPolicy Bypass -File scripts/install-hooks.ps1
 - 仓库中不应出现已跟踪的 `tmp_*` / `*_stub*.js` 等调试文件；发现时应随清理任务移除
 - 协作者或其 agent 创建本地独立计划文件（如 `IMPLEMENTATION-PLAN-*.md`、`PLAN-*.md`、`TODO-*.md` 等）时，必须写入项目目录之外（如系统临时目录或用户主目录），禁止落入仓库工作区；仓库内发现的此类文件应删除，不得提交
 
+### 注释、文档与提交信息规范（禁止编号引用）
+
+- **禁止编号引用**：代码注释、docstring、测试的文档串、仓库文档与提交信息中，不得写入指向仓库之外一次性材料的条目号。典型形态：
+  - 审查报告 / 计划的条目码（形如「字母码 + 数字」，或「中文方括号 + 序号 + 条目码」）；
+  - 用「复核 / 审查报告 / 审计 / 排期」等词做归因、后面跟一个编号；
+  - 计划 / 会话产物路径（本地计划文件名、会话产物目录名）；
+  - 流水号批次（「第 N 批」之类）。
+- **为什么**：这些编号指向仓库外的审查报告或计划文件，仓库读者无法据此还原上下文，报告改版后编号还会失效。注释要说明**为什么这样做**与**失败模式**；提交信息要说明**行为变化**。
+- **替代写法**：把编号换成「原因 + 失败模式 + 仓库内的回归位置」。
+
+  ```text
+  反例：复核 <字母码><数字>：atomic_transaction 必须捕 CancelledError
+  正例：CancelledError 是 BaseException 子类必须显式捕获——否则 conn.commit() 永不执行，
+        连接带未提交事务被归还（回归见 tests/test_db.py 的 atomic_transaction 用例）
+  ```
+
+- **豁免**（不视为编号引用）：可跟踪的 issue / PR 编号（如 `Fixes #123`，便于外部读者回查）、编码名与标准编号（UTF-8、RFC 5987）、静态检查码（`noqa: F401` 一类）、依赖版本号（小写 `v1.2.3`）、控制字符名（C0 / C1）、领域指标名（如 F 值类指标）。
+- **例外**：确实需要在注释里保留某个编号时，在同一行写 `allow-plan-ref` 并说明理由。
+- **工具与门禁**：
+  - 本地提交：`scripts/install-hooks.ps1` 安装的 pre-commit（密钥 + 编号）与 commit-msg（提交信息）钩子；
+  - 命令行：`python scripts/forbidden_refs.py`（扫描 staged）、`--ref origin/master`（扫描差异）、`--tree`（全量）、`--message-file <路径>`（提交信息）；
+  - 门禁：`tests/test_no_plan_refs.py` 随 pytest 一起跑，对全库注释 / 文档 **0 容忍**（存量已清理完毕）。
+
 ### 隐私与敏感数据扫描
 
 - 本项目会处理真实群聊消息，禁止把真实聊天内容、手机号、QQ/微信 ID、地址、Token、Key 写入 commit、测试、文档或示例
@@ -95,6 +118,7 @@ powershell -ExecutionPolicy Bypass -File scripts/install-hooks.ps1
 - [ ] `git status --short` 中没有临时文件、缓存、数据库、本地 env 文件
 - [ ] `git diff --cached` 中没有真实密钥、Token、聊天记录、手机号等敏感信息
 - [ ] 只提交与任务相关的文件，没有 `tmp_*` / 调试脚本 / 无关文件
+- [ ] 新增的注释 / 文档 / 提交信息中没有编号引用（审查报告条目号、计划产物编号、流水号批次），或已按规范改写
 
 ### 完成后的简要 Review 与 Commit Message
 
@@ -110,6 +134,7 @@ powershell -ExecutionPolicy Bypass -File scripts/install-hooks.ps1
   docs(agents): 更新协作规范中的 commit message 要求
   ```
 - commit message 应概括改动文件、行为变化与测试/文档更新；不要写入真实密钥、Token 或敏感信息。
+- commit message（subject 与 body）不得包含编号引用与流水号批次（详见上文「注释、文档与提交信息规范」）；用行为变化描述代替。
 
 ## 架构指引
 

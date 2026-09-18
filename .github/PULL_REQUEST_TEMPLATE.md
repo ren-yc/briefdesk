@@ -1,7 +1,8 @@
 ## 改动说明
 
 <!-- 概括做了什么、为什么。PR 标题请用 Conventional Commits 格式（type/scope 英文，subject 中文），
-     如 `feat(ai): 支持通过 AI_DISABLE_THINKING 禁用思考模式`。关联 issue 请写 `Fixes #123`。 -->
+     如 `feat(ai): 支持通过 AI_DISABLE_THINKING 禁用思考模式`。关联 issue 请写 `Fixes #123`。
+     标题与描述都不要夹带审查报告条目号、计划产物编号或「第 N 批」流水号——仓库读者无法据此回查。 -->
 
 ## 改动类型
 
@@ -16,6 +17,7 @@
 - [ ] `python -m pytest tests/`
 - [ ] `git diff --check`（无空白错误 / 冲突标记）
 - [ ] 敏感信息自查：不含真实密钥、Token、聊天记录、手机号等 PII
+- [ ] 注释 / 文档 / 提交信息中没有编号引用（`python scripts/forbidden_refs.py --tree` 无新增命中）
 
 ## 测试
 

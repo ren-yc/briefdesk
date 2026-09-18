@@ -83,6 +83,26 @@ jobs:
           fi
           python scripts/secret_scan.py --ref "$before"
 
+      # AGENTS.md「注释、文档与提交信息规范」：本地钩子覆盖提交前，但可被 --no-verify
+      # 绕过，CI 是共享兜底。ref 口径与上方密钥扫描一致；与钩子不同，这里只看差异，
+      # 因此存量基线不受影响。
+      - name: Forbidden plan-reference scan (PR diff)
+        if: github.event_name == 'pull_request'
+        run: |
+          git fetch origin master
+          python scripts/forbidden_refs.py --ref origin/master
+
+      - name: Forbidden plan-reference scan (push diff)
+        if: github.event_name == 'push'
+        shell: bash
+        run: |
+          before="${{ github.event.before }}"
+          if [ -z "$before" ] || [ "$before" = "0000000000000000000000000000000000000000" ]; then
+            git fetch origin master
+            before="origin/master"
+          fi
+          python scripts/forbidden_refs.py --ref "$before"
+
       # AGENTS.md's 4th gate. The pre-commit hook only runs the secret scan, so
       # without this step the check rests on the author remembering it.
       # Diffing against the empty-tree SHA covers every tracked file instead of
