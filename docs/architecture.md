@@ -898,7 +898,8 @@ Key behaviors:
   `postVerify(id, value)` 收敛卡片标记的 4 处调用点）。错误形状唯一——非 2xx 抛 `HTTP <code>`；「失败静默降级」由调用点显式写
   `.catch(() => null)`，不藏进各自的 `res.ok` 分支。保留裸 `fetch` 的场景各自在注释注明原因：插件资源/favicon 非 JSON、`/api/restore` 是
    multipart、`/api/sync` 要按 409 分流状态码、CSV 导出要读响应头取文件名。**前端测试的 fetch 桩必须带 `ok`/`status`**——缺 `ok` 会被判成失败
-  请求，把契约缺口伪装成业务 bug（`tests/ui_harness.mjs` 是共用的 DOM/BOM 桩）
+  请求，把契约缺口伪装成业务 bug（`tests/ui_harness.mjs` 是共用的 DOM/BOM 桩）。**`fetchData` 的 `catch` 同样受 `fetchSeq` 守卫**：
+  过期请求的失败不覆盖最新连接状态（此前只有成功路径与 finally 有守卫，快速切换查询时旧请求晚失败会把状态胶囊改成「连接失败」并覆盖已渲染的新数据提示）
 - Category sidebar with counts + 备忘录 (memo) / 已忽略 (ignored) views (from `/api/items`)
 - Item cards with three-state verification: 加入备忘录 (1) / 忽略 (-1) / 未处理 (0)
 - Expandable quote section (fetches context via `/api/context`)

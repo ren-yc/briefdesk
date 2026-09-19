@@ -1754,6 +1754,7 @@ async function fetchData() {
     renderItems(loaded, { full: isFull });
     renderFilterBar();
   } catch (err) {
+    if (seq !== fetchSeq) return; // 过期请求的失败不覆盖最新状态
     console.error("Fetch error:", err);
     $statusIndicator.className = "status offline";
     $statusText.innerHTML = '连接失败 <button type="button" class="status-retry">重试</button>';
