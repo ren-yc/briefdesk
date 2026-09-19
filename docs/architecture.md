@@ -439,7 +439,7 @@ sessions toggle、recategorize（`update_item_category` 读-改-写多步事务�
 `GET /api/export/recat-samples`（导出人工改类样本 jsonl/csv，内容已脱敏；两处导出均经 `_csv_cell` 公式注入转义—
 —`=`/`+`/`-`/`@`/TAB/CR/LF 前缀前置单引号）, `GET /api/backup`（SQLite 在线备份下载，WAL 安全可运行中执行）/
 `POST /api/restore`（上传校验后暂存 `{db_path}.restore-pending`，重启应用生效；临时文件必须落在库文件同目录——`os.replace` 不允许跨文件系统
-，mkstemp 缺省走系统 TEMP 时与 DB_PATH 跨盘（Windows 典型）必然 WinError 17 使恢复整体不可用；启动应用时原库先改名为 `{db_path}.pre-restore`（三件）再替换，替换失败自动改回并保留 pending；副本只留最近一代、下次恢复覆盖，含隐私数据，与 `*.sqlite` 同口径 gitignore）, `GET /api/sessions`,
+，mkstemp 缺省走系统 TEMP 时与 DB_PATH 跨盘（Windows 典型）必然 WinError 17 使恢复整体不可用；启动应用时原库先改名为 `{db_path}.pre-restore`（三件）再替换，替换失败自动改回并保留 pending（改回本身失败也不抛出：副本与 pending 都保留，下次启动检测到「主库缺失且存在副本」先补完回滚再重试恢复——否则下次启动会把这份唯一副本当上一代副本删掉）；副本只留最近一代、下次恢复覆盖，含隐私数据，与 `*.sqlite` 同口径 gitignore）, `GET /api/sessions`,
 `POST /api/sessions/:source/:session_id/toggle`, `POST /api/sessions/refresh`, `POST /api/sync`,
 `GET /api/context`（`source`+`session_id` 查询参数）, `GET /api/status`, `GET /api/stream` (SSE push
 channel), `GET /api/media/:source/:path` (媒体代理，经对应源的 `SourceClient.download_media` 转发；`MediaError` →

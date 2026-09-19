@@ -1546,6 +1546,49 @@ class TestBackupRestore:
         assert os.path.exists(self.main_path + ".restore-pending")
         assert not os.path.exists(self.main_path + ".pre-restore")
 
+    async def test_rollback_failure_keeps_copy_and_next_start_completes_it(self):
+        """回滚本身也失败时不抛出、不丢原库；下次启动先补完回滚再重试恢复。
+
+        此前回滚的 os.replace 无保护：抛出后进程退出，磁盘上主库缺失、原库只剩
+        .pre-restore；下次启动第 1 步会把这份唯一副本当上一代副本删掉。
+        """
+        await self._build_db(self.main_path, "主库A")
+        await self._build_db(self.bak_path, "备份B")
+        shutil.copyfile(self.bak_path, self.main_path + ".restore-pending")
+        config.db_path = self.main_path
+
+        real_replace = os.replace
+
+        def failing_replace(src, dst):
+            # 替换与回滚都被「占用」：模拟杀软/备份工具锁住整个目录
+            if str(src).endswith((".restore-pending", ".pre-restore")):
+                raise OSError("locked")
+            return real_replace(src, dst)
+
+        with patch("os.replace", side_effect=failing_replace):
+            assert not await apply_pending_restore()
+        assert not os.path.exists(self.main_path), "前置：回滚失败后主库缺失"
+        assert await self._titles(self.main_path + ".pre-restore") == ["主库A"]
+        assert os.path.exists(self.main_path + ".restore-pending")
+
+        # 下次启动（占用解除）：先补完回滚，再正常恢复；原库仍以副本形态保留
+        assert await apply_pending_restore()
+        assert await self._titles(self.main_path) == ["备份B"]
+        assert await self._titles(self.main_path + ".pre-restore") == ["主库A"]
+        assert not os.path.exists(self.main_path + ".restore-pending")
+
+    async def test_stale_copy_not_moved_back_when_main_exists(self):
+        """主库存在时 .pre-restore 只是上一代副本，绝不能改回覆盖主库。"""
+        await self._build_db(self.main_path, "主库A")
+        await self._build_db(self.main_path + ".pre-restore", "旧副本")
+        await self._build_db(self.bak_path, "备份B")
+        shutil.copyfile(self.bak_path, self.main_path + ".restore-pending")
+        config.db_path = self.main_path
+
+        assert await apply_pending_restore()
+        assert await self._titles(self.main_path) == ["备份B"]
+        assert await self._titles(self.main_path + ".pre-restore") == ["主库A"]
+
     async def test_second_restore_overwrites_previous_copy(self):
         """副本只保留最近一代：第二次恢复覆盖第一次的副本。"""
         await self._build_db(self.main_path, "第一代")

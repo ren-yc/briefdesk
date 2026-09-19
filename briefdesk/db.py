@@ -826,6 +826,25 @@ async def apply_pending_restore() -> bool:
         return False
     backup = f"{config.db_path}.pre-restore"
     suffixes = ("", "-wal", "-shm")
+
+    def _rollback(moved_suffixes: list[str]) -> None:
+        """把已改名的原库件改回主库名；单件失败只记日志，继续其余件。"""
+        for suffix in moved_suffixes:
+            try:
+                os.replace(backup + suffix, config.db_path + suffix)
+            except OSError as e:
+                logger.error(
+                    "回滚原库失败: %s → %s（%s）；副本保留，下次启动自动补完",
+                    backup + suffix, config.db_path + suffix, e,
+                )
+
+    # 0) 上次恢复的回滚阶段失败会留下「主库缺失、原库只剩 .pre-restore」的状态。
+    #    此时若照常走第 1 步，会把这份唯一副本当上一代副本删掉——原库彻底丢失。
+    #    先把副本改回主库名补完回滚，再按正常流程重试恢复。只在主库缺失时触发：
+    #    主库存在时 .pre-restore 是上一代副本或已成功恢复后的原库，改回即错配。
+    if not os.path.exists(config.db_path) and os.path.exists(backup):
+        logger.warning("主库缺失但存在恢复前副本 %s：补完上次未完成的回滚后再重试恢复", backup)
+        _rollback([s for s in suffixes if os.path.exists(backup + s)])
     # 1) 原库三件改名为 .pre-restore 三件（覆盖上一代副本；SQLite 以 <db>-wal/-shm
     #    命名附属文件，副本沿用同规则，必要时可直接用 sqlite 打开 .pre-restore 检视）
     moved: list[str] = []
@@ -838,13 +857,13 @@ async def apply_pending_restore() -> bool:
             moved.append(suffix)
     # 2) 替换；失败则把三件改回去，pending 保留供下次启动重试。
     #    此前先 os.remove 主库再 os.replace：替换失败（权限/杀软占用）时原库已删、
-    #    pending 仍在——下次启动没有可用数据库。
+    #    pending 仍在——下次启动没有可用数据库。回滚本身失败（同一占用往往波及
+    #    同目录其它文件）也不抛出：副本与 pending 都保留，由第 0 步在下次启动补完。
     try:
         os.replace(pending, config.db_path)
     except OSError as e:
         logger.error("应用恢复备份失败（%s），已回滚原库；待恢复文件保留，下次启动重试", e)
-        for suffix in moved:
-            os.replace(backup + suffix, config.db_path + suffix)
+        _rollback(moved)
         return False
     logger.info(
         "已应用恢复备份: %s（原库保留为 %s，下次恢复时覆盖；含隐私数据）",
