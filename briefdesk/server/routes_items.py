@@ -397,6 +397,37 @@ async def api_restore(file: Annotated[UploadFile, File()]):
     }
 
 
+async def _resync_dedup_cache(ids: list[str], verified: int) -> None:
+    """卡片审核态变更后同步去重内存缓存；调用方须持 storage_lock。
+
+    忽略（-1）→ 发布 items_deleted 让 dedup 插件清缓存（预热口径 is_verified >= 0）；
+    未处理/备忘（0/1）→ 幂等回加（add_to_cache 同 id 更新不叠加；不带向量，与
+    merge 登记口径一致，重启由预热补齐）。dedup 未装配时静默跳过。
+
+    此前只有单卡 verified == -1 与批量 ignore/unverify 三条路径各自处理，单卡
+    恢复与批量转备忘漏回加——退出忽略态的卡不在缓存里，相似新消息会再建一张卡
+    直到重启。
+    """
+    if verified == -1:
+        await event_bus.publish(EVENT_ITEMS_DELETED, ids)
+        return
+    svc_ctx = _stage_context()
+    if svc_ctx is None or svc_ctx.dedup is None:
+        return
+    for row in await get_item_texts_by_ids(ids):
+        try:
+            imgs = json.loads(row["image_urls"]) if row["image_urls"] else None
+        except json.JSONDecodeError:
+            imgs = None
+        svc_ctx.dedup.add_to_cache(
+            row["id"],
+            row["title"],
+            image_urls=imgs,
+            source=row["source"] or "",
+            source_quote=row["source_quote"] or "",
+        )
+
+
 @app.post("/api/items/{item_id}/verify")
 async def api_verify(item_id: str, body: dict):
     verified = body.get("verified")
@@ -413,10 +444,8 @@ async def api_verify(item_id: str, body: dict):
     async with storage_lock:
         if not await update_item_verify(item_id, verified):
             raise HTTPException(404, "Item not found")
-        if verified == -1:
-            # 忽略后卡片退出去重缓存的预热口径（is_verified >= 0）：
-            # 同步清缓存，否则被忽略卡仍参与判重，相似新消息被永久跳过
-            await event_bus.publish(EVENT_ITEMS_DELETED, [item_id])
+        # 忽略（-1）清缓存；恢复/备忘（0/1）回加缓存，见 _resync_dedup_cache
+        await _resync_dedup_cache([item_id], verified)
     cat_counts = await get_category_counts()
     all_count = await get_all_category_count()
     ignored_count = await get_ignored_count()
@@ -481,33 +510,8 @@ async def api_items_batch(body: dict):
         # 防止单连接隐式事务被并发 commit 交叉提交
         async with storage_lock:
             affected = await update_items_verify(ids, verified)
-            if action == "ignore":
-                # 忽略后卡片退出 is_verified >= 0 口径：同步清去重内存
-                # 缓存，否则被忽略卡继续参与判重、相似新消息不再显示
-                # （直到重启重预热），与 delete 的清缓存语义对齐
-                await event_bus.publish(EVENT_ITEMS_DELETED, ids)
-            elif action == "unverify":
-                # 恢复的卡片回归 is_verified >= 0 判重口径：回加去重内存
-                # 缓存，否则相似新消息不再与它判重、重复卡片持续到重启
-                # （不带向量，与 merge 登记口径一致，重启补齐）
-                svc_ctx = _stage_context()
-                if svc_ctx is not None and svc_ctx.dedup is not None:
-                    for row in await get_item_texts_by_ids(ids):
-                        try:
-                            imgs = (
-                                json.loads(row["image_urls"])
-                                if row["image_urls"]
-                                else None
-                            )
-                        except json.JSONDecodeError:
-                            imgs = None
-                        svc_ctx.dedup.add_to_cache(
-                            row["id"],
-                            row["title"],
-                            image_urls=imgs,
-                            source=row["source"] or "",
-                            source_quote=row["source_quote"] or "",
-                        )
+            # 忽略（-1）清缓存；恢复/备忘（0/1）回加缓存，见 _resync_dedup_cache
+            await _resync_dedup_cache(ids, verified)
     return {"success": True, "affected": affected}
 
 

@@ -427,8 +427,8 @@ FastAPI HTTP 服务子包（按职责分组的模块）：`app.py`（FastAPI 实
 胡
 ；`# ruff: noqa: I001` 豁免排序）。Routes: `GET /api/items`, `POST /api/items/:id/verify`,
 `POST /api/items/:id/recategorize`（手动修正分类，仅允许改到启用类别）, `POST /api/items/batch`（批量
-memo/ignore/unverify/delete；delete 在存储锁内删库并发布 `EVENT_ITEMS_DELETED` 清去重内存缓存，非 delete 分支同样持锁，批量
-ignore 亦锁内发布该事件清缓存）。**server 写路径统一持 pipeline 存储锁**：类别 create/update/toggle/delete 全端点、api_verify、
+memo/ignore/unverify/delete；delete 在存储锁内删库并发布 `EVENT_ITEMS_DELETED` 清去重内存缓存，非 delete 分支同样持锁；审核态变更统一经
+`_resync_dedup_cache`：进入忽略态发 `items_deleted` 清缓存，退出忽略态（unverify/memo，单卡与批量同口径）幂等回加缓存——此前单卡恢复与批量转备忘漏回加，相似新消息会重复建卡直到重启）。**server 写路径统一持 pipeline 存储锁**：类别 create/update/toggle/delete 全端点、api_verify、
 sessions toggle、recategorize（`update_item_category` 读-改-写多步事务）、上述 batch，以及 reminders 的 set_reminder
 与
  sessions/refresh 的落库段（后者回调内持锁、网络拉取在锁外）——单连接隐式事务下锁外 commit 会把管道未完成的多步写一并提交（部分写入提前可见）；verify(-1) 同样在锁内

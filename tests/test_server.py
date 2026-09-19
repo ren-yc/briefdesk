@@ -829,6 +829,86 @@ class IgnoreClearsDedupCacheEventTest(unittest.TestCase):
         self.assertEqual(resp.status_code, 200)
         publish.assert_not_awaited()
 
+    def _patch_verify(self, verified, dedup):
+        """单卡 verify 的公共 patch：返回 (client, publish, add_to_cache)。"""
+        publish = AsyncMock()
+        add_to_cache = Mock()
+        svc_ctx = None if dedup is None else SimpleNamespace(dedup=dedup)
+        patches = patch.multiple(
+            "briefdesk.server.routes_items",
+            event_bus=SimpleNamespace(publish=publish),
+            update_item_verify=AsyncMock(return_value=True),
+            get_category_counts=AsyncMock(return_value=[]),
+            get_all_category_count=AsyncMock(return_value=0),
+            get_ignored_count=AsyncMock(return_value=0),
+            get_memo_count=AsyncMock(return_value=0),
+            _stage_context=Mock(return_value=svc_ctx),
+            get_item_texts_by_ids=AsyncMock(
+                return_value=[
+                    {
+                        "id": "i1",
+                        "title": "t",
+                        "image_urls": "",
+                        "source": "weflow",
+                        "source_quote": "q",
+                    }
+                ]
+            ),
+        )
+        client = _client()
+        with patches:
+            resp = client.post("/api/items/i1/verify", json={"verified": verified})
+        client.close()
+        self.assertEqual(resp.status_code, 200)
+        return publish, add_to_cache
+
+    def test_single_verify_unverify_readds_to_dedup_cache(self):
+        """恢复（0）的卡片必须回到去重缓存，否则相似新消息再建一张卡。"""
+        dedup = SimpleNamespace(add_to_cache=Mock())
+        publish, _ = self._patch_verify(0, dedup)
+        dedup.add_to_cache.assert_called_once()
+        self.assertEqual(dedup.add_to_cache.call_args.args[0], "i1")
+        publish.assert_not_awaited()
+
+    def test_single_verify_memo_readds_to_dedup_cache(self):
+        dedup = SimpleNamespace(add_to_cache=Mock())
+        publish, _ = self._patch_verify(1, dedup)
+        dedup.add_to_cache.assert_called_once()
+        publish.assert_not_awaited()
+
+    def test_resync_without_dedup_service_is_noop(self):
+        """dedup 插件未装配（_stage_context 为 None）时静默跳过，不抛错。"""
+        publish, _ = self._patch_verify(0, None)
+        publish.assert_not_awaited()
+
+    def test_batch_memo_readds_to_dedup_cache(self):
+        dedup = SimpleNamespace(add_to_cache=Mock())
+        with patch.multiple(
+            "briefdesk.server.routes_items",
+            event_bus=SimpleNamespace(publish=AsyncMock()),
+            update_items_verify=AsyncMock(return_value=1),
+            storage_lock=asyncio.Lock(),
+            _stage_context=Mock(return_value=SimpleNamespace(dedup=dedup)),
+            get_item_texts_by_ids=AsyncMock(
+                return_value=[
+                    {
+                        "id": "i1",
+                        "title": "t",
+                        "image_urls": "",
+                        "source": "weflow",
+                        "source_quote": "q",
+                    }
+                ]
+            ),
+        ):
+            client = _client()
+            resp = client.post(
+                "/api/items/batch", json={"ids": ["i1"], "action": "memo"}
+            )
+            client.close()
+        self.assertEqual(resp.status_code, 200)
+        dedup.add_to_cache.assert_called_once()
+
 
 if __name__ == "__main__":
     unittest.main()
