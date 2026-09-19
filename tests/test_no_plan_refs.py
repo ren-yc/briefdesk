@@ -22,6 +22,8 @@ from scripts.forbidden_refs import (
     scan_lines,
     scan_source,
     scan_tree,
+    strip_git_commentary,
+    tracked_files,
 )
 
 _ROOT = Path(__file__).resolve().parents[1]
@@ -108,6 +110,14 @@ _CASES: list[tuple[str, bool]] = [
     (f"# {_ref('XY', 3)} allow-plan-ref 保留理由", False),
     # 归因词后接中文量词属于自然行文，不构成编号引用
     ("# 审计第三次发现该问题", False),
+    # 归因词后接四位年份：正则不得截断年份绕过量词排除
+    ("# 安全审计 2026 年复查", False),
+    # 常见技术缩写与条目码同形，白名单放过
+    ("# 用 ES6 模块语法与 MD5 摘要，P95 延迟", False),
+    # 豁免是剥离片段而非整行放行：同行夹带的真实编号仍须命中
+    (f"# noqa: F401 —— 见复核 {_ref('P', 2)}-18", True),
+    (f"# 精确率与召回率的调和平均 F1，另见 {_ref('F', 2)}", True),
+    (f"# 参考 RFC 5987 与 {_ref('H', 2)}", True),
     # 普通注释
     ("# 关闭后拒绝重建连接，防止残余任务复活", False),
 ]
@@ -124,6 +134,15 @@ def test_rule_matching(text: str, expected: bool) -> None:
     [
         (f"fix(ui): 修复浮层焦点栈与断线可见性（{_ref('P', 2)}-30 第一批）", True),
         ("fix(sources): 排期7b——翻页早停与 404 容错", True),
+        # git 注释行与 scissors 之后的 diff 不会进入提交，不得据此拦截
+        (
+            (
+                "fix(x): 说明\n\n# 第 3 批 模板注释\n"
+                "# ------------------------ >8 ------------------------\n"
+                f"diff --git a/x.js b/x.js\n+// 复核 {_ref('P', 1)}-1\n"
+            ),
+            False,
+        ),
         ("fix(dedup): 嵌入截断防毒丸，缺失向量降级字符重叠", False),
         ("feat(ai): 支持通过 AI_DISABLE_THINKING 禁用思考模式", False),
     ],
@@ -131,3 +150,36 @@ def test_rule_matching(text: str, expected: bool) -> None:
 def test_commit_message_matching(message: str, expected: bool) -> None:
     """提交信息（subject）同样禁止流水号与编号指针。"""
     assert bool(scan_commit_message(message)) is expected
+
+
+@pytest.mark.parametrize(
+    ("line", "expected"),
+    [
+        # 行内尾注释此前完全不扫描
+        (f"let a = 1; // 复核 {_ref('P', 1)}-1", True),
+        (f"fetch('http://a'); // 见 {_ref('F', 2)}", True),
+        # 字符串里的 // 与 URL 的 :// 不是注释起点
+        ('const u = "http://x//y"; // 普通注释', False),
+        ("let b = 2; // 普通注释", False),
+    ],
+)
+def test_js_trailing_comment_is_scanned(line: str, expected: bool) -> None:
+    """JS 代码行末尾的 // 注释与整行注释同口径。"""
+    assert bool(scan_source("<sample>.js", line)) is expected
+
+
+def test_strip_git_commentary_keeps_only_message_body() -> None:
+    raw = "subject\n\nbody\n# comment\n# ------------------------ >8 ------------------------\ndiff\n"
+    assert strip_git_commentary(raw) == "subject\n\nbody"
+
+
+def test_tracked_files_independent_of_cwd(monkeypatch: pytest.MonkeyPatch) -> None:
+    """全量扫描的 git ls-files 须在仓库根执行：从子目录跑 pytest 时路径拼接才正确。
+
+    此前在 cwd 执行，从 tests/ 目录运行会得到相对 tests/ 的路径，拼到根目录后
+    文件不存在被静默跳过，全量扫描零命中「通过」——等于没扫。
+    """
+    monkeypatch.chdir(_ROOT / "tests")
+    files = tracked_files(_ROOT)
+    assert "scripts/forbidden_refs.py" in files
+    assert all((_ROOT / f).exists() for f in files)

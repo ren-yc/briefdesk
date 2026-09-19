@@ -13,8 +13,11 @@
   6. 流水号批次：第 N 批。
 
 豁免（不构成编号引用）：编码名（UTF-8）、RFC 编号、sha256、C0/C1 控制字符、
+静态检查码指令及其码表、少量固定技术缩写（见 _EXEMPT）、指标语境下的 F 值名，
 可跟踪的 issue 编号（形如「#123」，无归因信号词时本就不会命中）、依赖版本号，
-以及行内显式豁免标记 allow-plan-ref（用于确实需要保留编号的场景）。
+以及行内显式豁免标记 allow-plan-ref（用于确实需要保留编号的场景）。豁免片段
+是**剥离后再扫**，同行其它编号照常判定。JS 的行内尾注释与整行注释同样纳入。
+提交信息只扫会真正进入提交的部分（`#` 注释行与 scissors 之后的 diff 不算）。
 
 用法：
   python scripts/forbidden_refs.py            # 扫描 staged 新增内容（pre-commit）
@@ -51,7 +54,8 @@ _R_COMBO = r"【\s*\d+\s*[·・]\s*P?\d+\s*】"
 _R_ATTRIB = (
     r"(?:复核|审查报告|审计|排期)\s*[【#]?\s*"
     r"(?:P\d+(?:[-\u2013\u2014·]\d+)?|[A-Z]{1,2}-?\d{1,3}|#?\d{1,4})"
-    r"(?!\s*[次条个轮遍张])"
+    # (?!\d) 防回溯：四位年份不能被截成前三位而绕过后面的量词排除
+    r"(?!\d)(?!\s*[次条个轮遍张年月日])"
 )
 # 规则 3：条目码（1-2 个大写字母 + 数字，可带次级编号）。仅大写：小写 v1 之类',
 # 依赖版本号不命中；三字母以上的缩写（RFC8601）因前缀长度限制不命中。
@@ -76,22 +80,35 @@ _RULES: tuple[tuple[str, re.Pattern[str]], ...] = (
 # 规则 4 只在「注释 / 文档」语境下生效：代码里的分支标签（如 case 缩写码）不是编号引用。
 _COLON_RULE_ONLY_PROSE = True
 
+# 豁免片段：命中后从文本中**剥离**再套规则，而不是整行放行——整行放行会让
+# 「静态检查码指令 —— 见复核 <条目码>」这类同行夹带的真实编号也一起溜过。
 _EXEMPT = tuple(
     re.compile(p, re.IGNORECASE)
     for p in (
-        r"UTF-8",
+        r"UTF-\d+",
         r"RFC\s*\d+",
-        r"\bsha256\b",
+        r"\bsha\d+\b",
         r"\bC0\b",
         r"\bC1\b",
-        r"\bnoqa\b",  # 静态检查码（ruff / flake8）不是编号引用
+        # 静态检查码（ruff / flake8）连同其后的码表一起剥掉
+        r"\bnoqa\b:?\s*(?:[A-Z]+\d+(?:\s*,\s*[A-Z]+\d+)*)?",
+        # 常见技术词：形态与条目码相同（1-2 个大写字母 + 1-2 位数字），但仓库
+        # 读者一望即知不是编号。白名单只收固定写法；季度/芯片型号这类既是
+        # 术语又是真实条目码形态的**不**收，需要时用 allow-plan-ref。
+        r"\bES\d+\b",  # ES6 / ES2015
+        r"\bMD5\b",
+        r"\bMP[34]\b",
+        r"\bP(?:50|75|90|95|99)\b",  # 延迟分位
+        r"\bA4\b",  # 纸张
+        r"\bEC2\b",
     )
 )
-# 领域术语豁免：F1 既是审查条目码，也是分类/判重指标（精确率与召回率的调和平均），
-# 出现在指标语境中不是编号引用。
+# 领域术语：F1 既是审查条目码，也是分类/判重指标（精确率与召回率的调和平均），
+# 出现在指标语境中不是编号引用——只剥离该指标名本身，同行其它编号照常判定。
 _DOMAIN_TERM = re.compile(
     r"(?:精确率|召回率|混淆|调和|accuracy|precision|recall)", re.IGNORECASE
 )
+_DOMAIN_TOKEN = re.compile(r"\bF1\b")
 # 行内豁免标记：确实需要保留编号时（如引用仓库内文件里的真实标识符）
 _ALLOW_MARKER = "allow-plan-ref"
 
@@ -124,15 +141,16 @@ def _collect_hits(path: str, line: int, text: str, *, prose: bool = True) -> lis
     """对单个「注释 / 文档片段」套用全部规则。"""
     if _ALLOW_MARKER in text:
         return []
-    if any(rx.search(text) for rx in _EXEMPT):
-        return []
-    if _DOMAIN_TERM.search(text):
-        return []
+    stripped = text
+    for rx in _EXEMPT:
+        stripped = rx.sub(" ", stripped)
+    if _DOMAIN_TERM.search(stripped):
+        stripped = _DOMAIN_TOKEN.sub(" ", stripped)
     matched: list[str] = []
     for rule, rx in _RULES:
         if rule == "字母码+冒号" and (_COLON_RULE_ONLY_PROSE and not prose):
             continue
-        if rx.search(text):
+        if rx.search(stripped):
             matched.append(rule)
     if not matched:
         return []
@@ -179,6 +197,36 @@ def _line_comment_segments(source: str, markers: tuple[str, ...]) -> list[tuple[
     ]
 
 
+_JS_LINE_START = ("//", "*", "/*")
+
+
+def _js_trailing_comment_segments(source: str) -> list[tuple[int, str]]:
+    """提取 JS 代码行末尾的 `// ...` 注释（整行注释由 _line_comment_segments 负责）。
+
+    `//` 之前的代码里三种引号都成对时才视为注释起点，排除字符串/模板串内的
+    `//`（如 URL）；`://` 视为 URL 不切。正则字面量里的 `//` 极少见，不处理。
+    此前只扫整行注释，`let a = 1; // <条目码>` 在三种模式下都放行。
+    """
+    segments: list[tuple[int, str]] = []
+    for lineno, line in enumerate(source.splitlines(), 1):
+        if line.lstrip().startswith(_JS_LINE_START):
+            continue
+        start = 0
+        while True:
+            idx = line.find("//", start)
+            if idx < 0:
+                break
+            prefix = line[:idx]
+            if idx > 0 and line[idx - 1] == ":":
+                start = idx + 2
+                continue
+            if all(prefix.count(q) % 2 == 0 for q in ('"', "'", "`")):
+                segments.append((lineno, line[idx:]))
+                break
+            start = idx + 2
+    return segments
+
+
 def _block_comment_segments(
     source: str, opener: str, closer: str
 ) -> list[tuple[int, str]]:
@@ -216,8 +264,10 @@ def iter_segments(path: str, source: str) -> list[tuple[int, str]]:
     if suffix == ".py":
         return _python_segments(source)
     if suffix in (".js", ".mjs"):
-        return _line_comment_segments(source, ("//", "*", "/*")) + _block_comment_segments(
-            source, "/*", "*/"
+        return (
+            _line_comment_segments(source, _JS_LINE_START)
+            + _js_trailing_comment_segments(source)
+            + _block_comment_segments(source, "/*", "*/")
         )
     if suffix == ".md":
         return _fenced_lines(source)
@@ -247,9 +297,10 @@ def scan_text(path: str, text: str) -> list[Hit]:
     return hits
 
 
-def _git(args: list[str]) -> str:
+def _git(args: list[str], *, cwd: Path | None = None) -> str:
     proc = subprocess.run(
         ["git", *args],
+        cwd=cwd,
         capture_output=True,
         text=True,
         encoding="utf-8",
@@ -261,9 +312,14 @@ def _git(args: list[str]) -> str:
     return proc.stdout
 
 
-def tracked_files() -> list[str]:
-    """列出纳入扫描的跟踪文件（排除未跟踪的本地计划产物）。"""
-    out = _git(["ls-files"])
+def tracked_files(root: Path | None = None) -> list[str]:
+    """列出纳入扫描的跟踪文件（排除未跟踪的本地计划产物）。
+
+    在 root 下执行 git：ls-files 输出相对**当前目录**的路径，若从子目录
+    （如 tests/）跑 pytest 而 git 仍在 cwd 执行，拼到 root 后文件不存在，
+    读取失败被静默跳过，全量扫描零命中「通过」——等于没扫。
+    """
+    out = _git(["ls-files"], cwd=root)
     return [
         line
         for line in out.splitlines()
@@ -275,7 +331,7 @@ def scan_tree(root: Path | None = None) -> list[Hit]:
     """全量扫描跟踪文件（收口核查用；基线机制见 tests/test_no_plan_refs.py）。"""
     base = root or Path.cwd()
     hits: list[Hit] = []
-    for rel in tracked_files():
+    for rel in tracked_files(base):
         path = base / rel
         try:
             source = path.read_text(encoding="utf-8")
@@ -392,9 +448,29 @@ def scan_diff(diff_text: str, *, rev: str | None, staged: bool) -> list[Hit]:
     return hits
 
 
+_SCISSORS = "------------------------ >8 ------------------------"
+
+
+def strip_git_commentary(message: str) -> str:
+    """去掉 COMMIT_EDITMSG 里不会进入提交的部分：`#` 注释行与 scissors 之后的 diff。
+
+    `git commit -v` 会把 diff 附在 scissors 线之后、模板注释以 `#` 开头，git 生成
+    提交时全部剥掉；钩子若照扫，diff 里代码的技术缩写会拦下一个根本不会入库
+    的内容。与 git 默认 commit.cleanup=strip 同口径（自定义 commentChar 不处理）。
+    """
+    kept: list[str] = []
+    for line in message.splitlines():
+        if line.startswith("#"):
+            if _SCISSORS in line:
+                break
+            continue
+        kept.append(line)
+    return "\n".join(kept)
+
+
 def scan_commit_message(message: str) -> list[Hit]:
-    """扫描提交信息（subject + body）。"""
-    return scan_text("<commit-message>", message)
+    """扫描提交信息（subject + body；git 注释行与 scissors 之后不算）。"""
+    return scan_text("<commit-message>", strip_git_commentary(message))
 
 
 def _format(hits: Iterable[Hit]) -> str:

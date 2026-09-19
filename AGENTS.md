@@ -86,7 +86,7 @@ powershell -ExecutionPolicy Bypass -File scripts/install-hooks.ps1
         连接带未提交事务被归还（回归见 tests/test_db.py 的 atomic_transaction 用例）
   ```
 
-- **豁免**（不视为编号引用）：可跟踪的 issue / PR 编号（如 `Fixes #123`，便于外部读者回查）、编码名与标准编号（UTF-8、RFC 5987）、静态检查码（`noqa: F401` 一类）、依赖版本号（小写 `v1.2.3`）、控制字符名（C0 / C1）、领域指标名（如 F 值类指标）。
+- **豁免**（不视为编号引用）：可跟踪的 issue / PR 编号（如 `Fixes #123`，便于外部读者回查）、编码名与标准编号（UTF-8、RFC 5987）、静态检查码（`noqa: F401` 一类）、依赖版本号（小写 `v1.2.3`）、控制字符名（C0 / C1）、领域指标名（如 F 值类指标）、少量固定技术缩写（ES6、MD5、延迟分位等，名单见 `scripts/forbidden_refs.py` 的 `_EXEMPT`）。豁免是**剥离片段后再扫**：同一行夹带的其它编号照常判定。JS 代码行末尾的 `//` 注释与整行注释同口径。提交信息只扫真正入库的部分（`#` 注释行与 `git commit -v` 的 diff 不算）。
 - **例外**：确实需要在注释里保留某个编号时，在同一行写 `allow-plan-ref` 并说明理由。
 - **工具与门禁**：
   - 本地提交：`scripts/install-hooks.ps1` 安装的 pre-commit（密钥 + 编号）与 commit-msg（提交信息）钩子；

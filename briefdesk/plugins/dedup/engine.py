@@ -879,7 +879,7 @@ class DedupEngine(DedupService):
             strong_cand, strong_score = strong[0]
             try:
                 verdict = await self._ask_ai(strong_cand, title, source_quote)
-            except Exception as e:  # noqa: BLE001 — S1 容错：短路判定失败降级参与多数票
+            except Exception as e:  # noqa: BLE001 — 容错：短路判定失败降级参与多数票
                 logger.warning(
                     '  [strong] "%s" 判定失败（%s），该候选保留参与后续多数票',
                     strong_cand.title,

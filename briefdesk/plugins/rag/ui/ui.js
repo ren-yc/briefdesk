@@ -228,7 +228,7 @@
     const body = document.getElementById("rag-ctx-body");
     body.innerHTML = '<p class="text-muted">加载中…</p>';
     $ctxModal.classList.remove("hidden");
-    pushModalFocus($ctxModal); // 与核心模态同一焦点栈（复核 P2-25）
+    pushModalFocus($ctxModal); // 与核心模态同一焦点栈：挡快捷键/圈闭 Tab
     fetchContext(body, cite.source, cite.session_id, cite.time, cite.msg_id);
   }
   function hideCtxModal() {

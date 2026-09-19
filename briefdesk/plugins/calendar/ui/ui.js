@@ -110,7 +110,7 @@
     calYear = now.getFullYear();
     calMonth = now.getMonth() + 1;
     loadCalendar();
-    fetchSidebarData(); // 侧边栏/颜色数据只随 /api/items 下发：进入日历即补拉（覆盖 F5 刷新）
+    fetchSidebarData(); // 侧边栏/颜色数据只随 /api/items 下发：进入日历即补拉（覆盖浏览器刷新）
   }
 
   function exitCalendarMode({ syncHash: sh = true } = {}) {
@@ -270,7 +270,7 @@
     $calDetailBody.innerHTML = renderItemRow(item, { cls: "cal-detail-row", showSubject: true, collapsible: false, showArticleLink: false });
     $calDetailModal.classList.remove("hidden");
     syncBodyScrollLock();
-    pushModalFocus($calDetailModal); // 与核心模态同一焦点栈：挡快捷键/圈闭 Tab（复核 P2-25）
+    pushModalFocus($calDetailModal); // 与核心模态同一焦点栈：挡快捷键/圈闭 Tab
     const row = $calDetailBody.querySelector(".cal-detail-row");
     if (row) {
       const ctxDiv = row.querySelector(".card-quote-context");
