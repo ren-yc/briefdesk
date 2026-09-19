@@ -492,7 +492,7 @@ tests/test_web_plugins.py 的核心前端边界守卫测试覆盖）。`GET /api
 批量补查合并 `is_verified`（核心查询契约不变、游标纪律收口在 db.py；前端据此决定「查看」跳转目标）；`POST .../reminder` 清除分支限定
 `remind_at IS NOT NULL`——对无提醒卡片清除返回 False（多标签页「先清后通知」互斥判据）；前端首次设提醒申请桌面通知权限，到期「查看」定位跳转（备忘录卡进备忘录视图，其余卡
 定
-位主列表高亮）。
+位主列表高亮）。到期检查在页面隐藏且无桌面通知权限时**不清除**（否则提醒被静默消费），`visibilitychange` 回到前台立即补查；重设提醒会清掉本地「已通知」标记，同卡可再次触发。
 
 #### briefdesk/plugins/benchmark/
 

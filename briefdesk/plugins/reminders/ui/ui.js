@@ -95,6 +95,9 @@
       });
       if (!res.ok) throw new Error("HTTP " + res.status);
       const data = await res.json();
+      // 重设 = 新一次提醒：清掉本地「已通知」标记，否则同卡在本页会话内
+      // 永不再触发（此前只增不删）
+      if (atOrNull) notifiedReminders.delete(String(id));
       const it = currentItems.find(x => String(x.id) === id);
       if (it) it.remind_at = data.remind_at || null;
       document.querySelectorAll(".card-remind-menu").forEach(m => m.classList.add("hidden"));
@@ -239,6 +242,11 @@
       if (notifiedReminders.has(String(it.id))) continue;
       const at = parseLocalTime(it.remind_at);
       if (!at || at.getTime() > now.getTime()) continue;
+      // 无法投递就不消费：页面隐藏且没有桌面通知权限时，清除会把提醒静默吞掉；
+      // 留到页面可见（visibilitychange 立即补查）再清除并展示
+      const canDeliver = !document.hidden
+        || ("Notification" in window && Notification.permission === "granted");
+      if (!canDeliver) continue;
       // 先清后通知：多标签页同时到点时，只有抢到清除权的那个负责通知
       try {
         const res = await fetch("/api/items/" + encodeURIComponent(it.id) + "/reminder", {
@@ -294,6 +302,10 @@
       },
     });
     document.addEventListener("keydown", onEscCapture, true);
+    // 回到前台立即补查：隐藏期间不可投递的到期提醒在此清除并展示
+    document.addEventListener("visibilitychange", () => {
+      if (!document.hidden) checkDueReminders();
+    });
     startReminderTimer();
   }
 
