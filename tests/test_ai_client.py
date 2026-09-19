@@ -157,6 +157,49 @@ class TestChatTimeoutPassThrough:
         assert "timeout" not in create.call_args.kwargs
 
 
+class TestClientLifecycle:
+    """teardown 关闭三类惰性客户端并复位缓存/信号量。"""
+
+    def setup_method(self):
+        from briefdesk.plugins.ai_provider import engine
+
+        self.engine = engine
+        engine._client = None
+        engine._embed_client = None
+        engine._alt_clients.clear()
+        engine._ai_semaphore = None
+
+    async def test_close_clients_closes_all_and_resets(self):
+        engine = self.engine
+        main = SimpleNamespace(close=AsyncMock())
+        embed = SimpleNamespace(close=AsyncMock())
+        alt = SimpleNamespace(close=AsyncMock())
+        engine._client = main
+        engine._embed_client = embed
+        engine._alt_clients[("https://alt.invalid/v1", "k")] = alt
+        engine._ai_semaphore = asyncio.Semaphore(1)
+
+        await engine.close_clients()
+
+        for c in (main, embed, alt):
+            c.close.assert_awaited_once()
+        assert engine._client is None
+        assert engine._embed_client is None
+        assert engine._alt_clients == {}
+        assert engine._ai_semaphore is None
+
+    async def test_close_clients_dedups_same_instance(self):
+        engine = self.engine
+        main = SimpleNamespace(close=AsyncMock())
+        engine._client = main
+        # 备用通道缓存里放了与主客户端同一对象（默认 base/key 时即如此）
+        engine._alt_clients[("https://main.invalid/v1", "k")] = main
+
+        await engine.close_clients()
+
+        main.close.assert_awaited_once()
+
+
 class TestChatRetryOverride:
     """判官类调用的 SDK 重试覆盖：with_options(max_retries=0) 走独立客户端，
     默认调用不得引入 with_options（保持既有客户端直接调用路径）。"""

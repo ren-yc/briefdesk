@@ -216,7 +216,7 @@ JSON 输出**（`_use_json_object`：ollama api key 或 deepseek-v4-flash/pro �
 启
 用、按 `EMBED_BATCH_SIZE` 分批；每 chunk 校验返回向量数量、不符抛 ValueError——防向量错位被持久化进 item_embeddings 永久污染余弦通道，调用方整批
 回
-退字符重叠）。`Provider` 类显式实现 AIProvider 端口（薄封装委托）。`loads_json`/`top_k_similar` re-export（实验脚本兼容）。
+退字符重叠）。`Provider` 类显式实现 AIProvider 端口（薄封装委托）。`loads_json`/`top_k_similar` re-export（实验脚本兼容）。`close_clients()`：插件 teardown 关闭主/嵌入/备用三类惰性客户端（按对象身份去重）并复位缓存与信号量。
 
 #### briefdesk/plugins/classify/engine.py
 
@@ -383,7 +383,7 @@ False——poll_cycle 据此跳过水位推进（实时路径忽略返回值）�
 
 All SQLite via `aiosqlite`. **双连接 + WAL mode + foreign keys + busy_timeout（5000ms，双侧对称）**：连接初始化统一经
 `_init_connection`（aiosqlite 连接 + row_factory + 默认 PRAGMA（WAL/busy_timeout/synchronous=NORMAL）+
-schema 幂等初始化，异常路径关闭连接再上抛；主连接额外 `validate_schema` 与 `foreign_keys=ON`，向量连接免验证）——主连接（`get_db` 单例）+ 向量持
+schema 幂等初始化；`_init_connection` 自 connect 起全程受 try 保护并捕 `BaseException`（含取消）——PRAGMA 循环与 commit 也在 try 内，任一失败即关连接再上抛（aiosqlite 连接带非 daemon worker 线程，泄漏会让退出挂死）；主连接额外 `validate_schema` 与 `foreign_keys=ON`，向量连接免验证）——主连接（`get_db` 单例）+ 向量持
 久
 化专用连接（`get_embed_db`，`load_embeddings`/`upsert_embeddings` 走它，`_embed_lock` 语句级串行、游标先 close 再 commit、
 锁竞争指数退避重试 3 次——杜绝活动语句阻断 COMMIT 的 `cannot commit transaction - SQL statements in progress`）。DB path

@@ -44,6 +44,11 @@ class AiProviderPlugin(Plugin, AIProvider):
         from briefdesk import ai_ports
 
         ai_ports.set_ai(None)
+        # 关闭惰性缓存的 OpenAI 客户端（含备用通道），释放 http 连接池；
+        # 幂等：close_clients 内部清空全部缓存并复位信号量
+        from briefdesk.plugins.ai_provider import engine as ai_engine
+
+        await ai_engine.close_clients()
         if self._ctx is not None:
             # 清掉自己注册的端口（teardown 幂等回收义务）
             self._ctx.ai = None

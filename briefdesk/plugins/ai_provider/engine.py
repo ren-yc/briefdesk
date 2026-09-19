@@ -7,6 +7,7 @@ loads_json / top_k_similar 为供应商无关工具，定义收归 briefdesk.ai_
 """
 
 import asyncio
+import logging
 from typing import cast
 
 from openai import AsyncOpenAI
@@ -17,6 +18,8 @@ from briefdesk import announcements
 from briefdesk.ai_ports import loads_json, top_k_similar  # noqa: F401 — re-export
 from briefdesk.config import config
 from briefdesk.plugin.base import AIProvider, ChatResponse
+
+logger = logging.getLogger(__name__)
 
 _client: AsyncOpenAI | None = None
 _ai_semaphore: asyncio.Semaphore | None = None
@@ -176,6 +179,30 @@ async def chat(
         return await _create()
     finally:
         sem.release()
+
+
+async def close_clients() -> None:
+    """关闭并清空全部惰性缓存的 OpenAI 客户端（插件 teardown 调用；同一实例只关一次）。
+
+    AsyncOpenAI 持有底层 http 连接池，进程内不复用却继续存活会让退出时残留
+    连接；_alt_clients 按 (base_url, api_key) 去重，同一实例可能同时在主缓存
+    与备用缓存里，按对象身份去重后再关。
+    """
+    global _client, _embed_client, _ai_semaphore
+    targets = {
+        id(c): c
+        for c in (_client, _embed_client, *_alt_clients.values())
+        if c is not None
+    }
+    _client = None
+    _embed_client = None
+    _alt_clients.clear()
+    _ai_semaphore = None
+    for c in targets.values():
+        try:
+            await c.close()
+        except Exception as e:  # noqa: BLE001 — 关闭失败不阻断 teardown
+            logger.debug("关闭 AI 客户端失败（忽略）: %r", e)
 
 
 async def rag_chat(

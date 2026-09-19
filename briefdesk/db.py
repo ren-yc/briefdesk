@@ -435,23 +435,23 @@ async def _init_connection(
         SystemExit: schema 不匹配时拒绝启动
     """
     conn = await aiosqlite.connect(path)
-    conn.row_factory = aiosqlite.Row
-
-    # 默认 PRAGMA 设置
-    default_pragmas = {
-        "journal_mode": "WAL",
-        "busy_timeout": "5000",
-        "synchronous": "NORMAL",  # WAL 下 NORMAL 仅掉电丢最近一次提交
-    }
-    all_pragmas = {**default_pragmas, **(extra_pragmas or {})}
-
-    for key, value in all_pragmas.items():
-        cursor = await conn.execute(f"PRAGMA {key} = {value}")
-        await cursor.close()
-    await conn.commit()
-
-    # Schema 初始化/验证
     try:
+        conn.row_factory = aiosqlite.Row
+
+        # 默认 PRAGMA 设置
+        default_pragmas = {
+            "journal_mode": "WAL",
+            "busy_timeout": "5000",
+            "synchronous": "NORMAL",  # WAL 下 NORMAL 仅掉电丢最近一次提交
+        }
+        all_pragmas = {**default_pragmas, **(extra_pragmas or {})}
+
+        for key, value in all_pragmas.items():
+            cursor = await conn.execute(f"PRAGMA {key} = {value}")
+            await cursor.close()
+        await conn.commit()
+
+        # Schema 初始化/验证
         if validate_schema_flag:
             await validate_schema(conn)
         await init_schema(conn)  # 幂等：补建缺失的表
@@ -459,9 +459,10 @@ async def _init_connection(
         logger.critical("数据库 schema 不匹配，拒绝启动: %s", e)
         await conn.close()
         raise SystemExit(1) from e
-    except Exception:
-        # init 其余异常（磁盘满/库损坏等）：关闭本连接再上抛，
-        # 否则泄漏的 aiosqlite 连接（非 daemon worker 线程）滞留
+    except BaseException:
+        # 含 CancelledError（BaseException 子类，不被 except Exception 覆盖）：
+        # 取消/任何失败都不能泄漏连接——aiosqlite 连接带非 daemon worker 线程，
+        # 退出时会让解释器挂死。PRAGMA 循环与 commit 同样纳入 try。
         await conn.close()
         raise
 

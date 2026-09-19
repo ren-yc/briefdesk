@@ -218,6 +218,24 @@ class TestAiProviderPlugin:
         ai_ports.set_ai(None)
         yield
         ai_ports.set_ai(None)
+
+    async def test_teardown_closes_clients(self):
+        """teardown 必须释放惰性缓存的 OpenAI 客户端（http 连接池）。"""
+        ctx, _ = _ctx()
+        plugin = AiProviderPlugin()
+        with (
+            patch(
+                "briefdesk.plugins.ai_provider.engine.Provider",
+                return_value=Mock(),
+            ),
+            patch(
+                "briefdesk.plugins.ai_provider.engine.close_clients",
+                new=AsyncMock(),
+            ) as close_clients,
+        ):
+            await plugin.setup(ctx)
+            await plugin.teardown()
+        close_clients.assert_awaited_once()
     async def test_setup_registers_ctx_and_ports(self):
         ctx, _ = _ctx()
         fake_provider = Mock()

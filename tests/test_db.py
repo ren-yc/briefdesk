@@ -7,6 +7,7 @@ import shutil
 import tempfile
 import unittest
 import uuid
+from types import SimpleNamespace
 from typing import Any, cast
 from unittest.mock import AsyncMock, patch
 
@@ -2075,6 +2076,58 @@ class TestDbRedirect:
             assert closed["v"], "半程失败的 main_conn 未被关闭"
             assert db_mod._db is saved_main
             assert db_mod._embed_db is saved_embed
+
+
+class TestInitConnectionCleanup:
+    """_init_connection 自 connect 起全程受 try 保护，失败即关连接。"""
+
+    async def test_closes_on_pragma_failure(self):
+        import briefdesk.db as db_mod
+
+        conn = SimpleNamespace(
+            execute=AsyncMock(side_effect=RuntimeError("pragma")),
+            close=AsyncMock(),
+        )
+        with (
+            patch.object(db_mod.aiosqlite, "connect", AsyncMock(return_value=conn)),
+            patch.object(db_mod, "init_schema", AsyncMock()),
+            patch.object(db_mod, "validate_schema", AsyncMock()),
+            pytest.raises(RuntimeError),
+        ):
+            await db_mod._init_connection(":memory:")
+        conn.close.assert_awaited_once()
+
+    async def test_closes_on_cancel_during_schema(self):
+        """schema 初始化期间被取消同样不得泄漏连接（CancelledError 是
+        BaseException，except Exception 覆盖不到）。"""
+        import briefdesk.db as db_mod
+
+        with tempfile.TemporaryDirectory() as d:
+            real_init = db_mod._init_connection
+            closed = {"v": False}
+
+            real_connect = aiosqlite.connect
+
+            async def spy_connect(path):
+                conn = await real_connect(path)
+                orig_close = conn.close
+
+                async def spy_close():
+                    closed["v"] = True
+                    await orig_close()
+
+                conn.close = spy_close
+                return conn
+
+            with (
+                patch.object(db_mod.aiosqlite, "connect", spy_connect),
+                patch.object(
+                    db_mod, "init_schema", AsyncMock(side_effect=asyncio.CancelledError())
+                ),
+                pytest.raises(asyncio.CancelledError),
+            ):
+                await real_init(os.path.join(d, "cancel.sqlite"))
+            assert closed["v"], "取消路径未关闭连接"
 
 
 class TestDeleteItemsRollback(_InMemoryDbTest):
