@@ -460,9 +460,11 @@ async def process_all_batches(
         for t in classify_tasks:
             if not t.done():
                 t.cancel()
-        # 异常/取消路径兜底：清掉尚未完成批次的 pending，避免进度指示器卡死
-        # （正常完成时 completed_in_batch == len(messages），此分支不触发）
-        remaining = len(messages) - completed_in_batch
+        # 异常/取消路径兜底：清掉尚未完成批次的 pending，避免进度指示器卡死。
+        # 以 to_store（入口实际计入 note_sync_batch_start 的集合）为准：正常完成时
+        # completed_in_batch == len(to_store)，此分支不触发；用 messages（过滤前）
+        # 会把入口过滤掉的条数也扣一遍，正常完成路径也提前把 pending 减到 0。
+        remaining = len(to_store) - completed_in_batch
         if remaining > 0:
             note_sync_batch_done(remaining)
             await publish_sync_progress(get_sync_progress())

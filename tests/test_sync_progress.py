@@ -268,7 +268,7 @@ class TestPipelineSyncProgressCounts:
         reset_sync_progress()
         await self.db.close()
         stages.reset()
-    async def _process(self, messages, categories, install_stages=None):
+    async def _process(self, messages, categories, install_stages=None, processed=None):
         install_stages = install_stages or (lambda: None)
         install_stages()
         with patch(
@@ -281,7 +281,7 @@ class TestPipelineSyncProgressCounts:
             new=AsyncMock(return_value=categories),
         ), patch(
             "briefdesk.pipeline.are_messages_processed",
-            new=AsyncMock(return_value=set()),
+            new=AsyncMock(return_value=set(processed or ())),
         ), patch(
             "briefdesk.pipeline.bulk_insert_raw_messages", new=AsyncMock()
         ), patch(
@@ -340,6 +340,28 @@ class TestPipelineSyncProgressCounts:
         assert not ok
         sp = get_sync_progress()
         assert sp["newCount"] == 0
+
+
+    async def test_filtered_messages_do_not_double_settle(self):
+        """入口过滤掉的条数不得参与收尾结算。
+
+        note_sync_batch_start 只计入过滤后的 to_store，兜底 remaining 若按过滤前
+        的 messages 计算会把过滤掉的条数也扣一遍——正常完成路径也提前把 pending
+        减到 0，前端提前显示「已同步」。
+        """
+        note_sync_batch_start(5)  # 另有 5 条在途（并发突发）
+        ok = await self._process(
+            [_pipeline_msg("m_old"), _pipeline_msg("m_new")],
+            [{"name": "x"}],
+            install_stages=self._normal_stages(1),
+            processed={"m_old"},
+        )
+        assert ok
+        sp = get_sync_progress()
+        assert sp["newCount"] == 6
+        assert sp["pendingCount"] == 5
+        assert sp["processedCount"] == 1
+        assert not sp["done"]
 
 
 if __name__ == "__main__":
