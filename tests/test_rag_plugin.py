@@ -3,6 +3,7 @@
 import asyncio
 import unittest
 from datetime import UTC
+from types import SimpleNamespace
 from typing import ClassVar
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -825,6 +826,58 @@ class TestRagAsk(_MemoryEngineBase):
         self.provider.chat = AsyncMock(side_effect=RuntimeError("ai down"))
         with pytest.raises(RuntimeError):
             await self.engine.ask("周六6点开会有通知")
+
+    async def test_explicit_empty_citations_not_backfilled(self):
+        # JSON 契约显式给出 citations: [] = 模型声明「无依据」，不得回退全部证据
+        self.provider.chat = AsyncMock(
+            return_value=_chat_response('{"answer":"没有相关依据。","citations":[]}')
+        )
+        result = await self.engine.ask("周六6点开会有通知")
+        assert not result.refused
+        assert result.citations == []
+
+    async def test_empty_choices_is_refused(self):
+        self.provider.chat = AsyncMock(return_value=SimpleNamespace(choices=[]))
+        result = await self.engine.ask("周六6点开会有通知")
+        assert result.refused
+        assert result.citations == []
+        assert result.answer
+
+    async def test_blank_answer_is_refused(self):
+        self.provider.chat = AsyncMock(
+            return_value=_chat_response('{"answer":"  ","citations":[1]}')
+        )
+        result = await self.engine.ask("周六6点开会有通知")
+        assert result.refused
+        assert result.citations == []
+
+    async def test_integral_float_citation_accepted(self):
+        """JSON 模式下部分供应商把整数输出为浮点：1.0 须按 1 接受，1.5 拒绝。"""
+        self.provider.chat = AsyncMock(
+            return_value=_chat_response('{"answer":"x","citations":[1.0]}')
+        )
+        result = await self.engine.ask("周六6点开会有通知")
+        assert [c["msg_id"] for c in result.citations] == ["m1"]
+
+        self.provider.chat = AsyncMock(
+            return_value=_chat_response('{"answer":"x","citations":[1.5]}')
+        )
+        result = await self.engine.ask("周六6点开会有通知")
+        assert result.citations == []
+
+    async def test_bool_citation_rejected(self):
+        self.provider.chat = AsyncMock(
+            return_value=_chat_response('{"answer":"x","citations":[true]}')
+        )
+        result = await self.engine.ask("周六6点开会有通知")
+        # True 是 bool 不是编号；显式列表令其不回退（无有效引用即空）
+        assert result.citations == []
+
+        self.provider.chat = AsyncMock(
+            return_value=_chat_response('{"answer":"x","citations":["1"]}')
+        )
+        result = await self.engine.ask("周六6点开会有通知")
+        assert [c["msg_id"] for c in result.citations] == ["m1"]
 
 
     async def test_evidence_chars_setting_truncates_prompt(self):

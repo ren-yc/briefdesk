@@ -95,6 +95,24 @@ class _FusionEntry:
     has_fts: bool = False
 
 
+def _citation_index(n: object) -> int | None:
+    """引用编号：接受 int（排除 bool）、整数值浮点与纯数字字符串；其它一律拒绝。
+
+    此前 int(n) 把 True 当 1、把 "1" 当 1、任意异常类型静默跳过，语义不明确。
+    整数值浮点（1.0）必须接受：JSON 模式下部分供应商把整数输出为浮点，拒绝
+    会让显式引用列表整个落空、回答显示为无依据。
+    """
+    if isinstance(n, bool):
+        return None
+    if isinstance(n, int):
+        return n
+    if isinstance(n, float) and n.is_integer():
+        return int(n)
+    if isinstance(n, str) and n.strip().isdigit():
+        return int(n.strip())
+    return None
+
+
 @dataclass
 class AskResult:
     """一次问答的产出（refused=True 时 answer 为拒答文案、citations 为空）。"""
@@ -717,31 +735,41 @@ class RagEngine:
             api_key=self.settings.api_key.get_secret_value(),
         )
         content = ""
-        if getattr(resp, "choices", None):
-            content = (resp.choices[0].message.content or "").strip()
+        choices = getattr(resp, "choices", None) or []
+        if choices:
+            content = (choices[0].message.content or "").strip()
+        if not content:
+            # 空 choices / 空答案：按拒答返回，不伪装成「已答但无引用」
+            logger.warning("rag: 模型返回空响应（choices=%d），按拒答处理", len(choices))
+            return AskResult(refused=True, answer="模型未返回内容，请稍后重试。")
         # 双态解析：deepseek 系强制 json_object 输出 → 优先 JSON 契约；
         # 其它供应商纯文本 → 回退 [n] 正则（兼容两路）
         answer = content
         cited: set[int] = set()
+        explicit = False  # 模型给出了 citations 列表（含空列表）→ 不再回退全部证据
         parsed = ai_ports.loads_json(content)
         if isinstance(parsed, dict) and isinstance(parsed.get("answer"), str):
             answer = parsed["answer"].strip()
+            if not answer:
+                logger.warning("rag: JSON 契约下 answer 为空，按拒答处理")
+                return AskResult(refused=True, answer="模型未返回内容，请稍后重试。")
             nums = parsed.get("citations")
             if isinstance(nums, list):
+                explicit = True
                 for n in nums:
-                    try:
-                        v = int(n)
-                    except (TypeError, ValueError):
-                        continue
-                    if 1 <= v <= len(hits):
+                    v = _citation_index(n)
+                    if v is not None and 1 <= v <= len(hits):
                         cited.add(v)
-        if not cited:
+        if not cited and not explicit:
             cited = {
                 int(m.group(1))
                 for m in self._CITE_RE.finditer(content)
                 if 1 <= int(m.group(1)) <= len(hits)
             }
-        nums = sorted(cited) if cited else list(range(1, len(hits) + 1))
+        if explicit:
+            nums = sorted(cited)
+        else:
+            nums = sorted(cited) if cited else list(range(1, len(hits) + 1))
         citations = [self._citation(n, hits[n - 1]) for n in nums]
         return AskResult(refused=False, answer=answer, citations=citations)
 
