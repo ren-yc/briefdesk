@@ -735,7 +735,7 @@ REST 历史回填（**按会话窗口**：`window_start_by_session` 提供各会
 `poll_cycle` 统一完成；只轮询传入的已启用会话，`is_processed` 为应用层注入的已处理查询端口；每会话必打 INFO 汇总行（含 0 条，标注窗口=增量/回填/全量）。会话类型
 来
 自 chatlab 格式（`id`/`name`/`type`，channel→公众号）。**IGNORE_SELF 预滤**：`isSend==1` 的消息在候选循环直接丢弃并独立计数（`X 自己`）
-，不标记 processed；同时检测整轮是否含 isSend 字段，缺失打 WARNING（该 WeFlow 版本过滤未生效）。翻页仅首页（offset=0）保留 `retry_on_empty`
+，不标记 processed；同时检测整轮是否含 isSend 字段，缺失打 WARNING（该 WeFlow 版本过滤未生效）。占位符卡回查 XML 后的拆条已处理判定改为**一次批量 `is_processed`**（此前逐卡一次，N 张卡 N 次 DB 往返；首轮 `msg_ids` 批量查不变）。翻页仅首页（offset=0）保留 `retry_on_empty`
 竞
 态兜底，翻页空结果即末页不再重试（否则每个空闲会话每轮固定多付 500ms 串行延迟）。**文章占位符回查**：回填固定 `media=True`（图片 OCR），而 WeFlow 在
 media=True 时把文章卡片 XML 渲染成占位符（如 `[视频号] 标题`）——poller 对 localType=文章卡片且 content 非 XML 的候选调

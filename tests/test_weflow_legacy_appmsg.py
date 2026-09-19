@@ -340,6 +340,44 @@ class TestPollerPlaceholderLookback:
         assert len(client.lookups) == 0
         assert len(result.messages) == 0
 
+    async def test_split_processed_queried_once_for_many_placeholders(self):
+        """多张占位符卡的拆条已处理判定合并为一次 is_processed。
+
+        此前逐卡各查一次（N 张卡 N 次 DB 往返）；首轮 msg_ids 批量查不受影响。
+        """
+        import time
+
+        placeholder = {
+            "serverId": "s1",
+            "localType": _APPMSG_LOCAL_TYPE,
+            "createTime": int(time.time()),
+            "senderUsername": "gh_x",
+            "content": "[视频号] 占位符",
+        }
+        raw = {**placeholder, "content": _MULTI_XML}
+        client = _PlaceholderClient(placeholder, raw)
+
+        async def many_messages(*_args, **_kwargs):
+            return {
+                "messages": [
+                    {**placeholder, "serverId": f"s{i}"} for i in (1, 2, 3)
+                ],
+                "hasMore": False,
+            }
+
+        client.fetch_messages = many_messages  # type: ignore[method-assign]
+        # fetch_message_raw 需按 serverId 逐卡回查：三张卡都返回同一多图文 XML
+        calls: list[list[str]] = []
+
+        async def tracking(ids):
+            calls.append(list(ids))
+            return set()
+
+        result = await poll(client, self._enabled(), tracking)
+        assert len(client.lookups) == 3, "三张占位符卡各回查一次（网络调用不可避免）"
+        assert len(calls) == 2, f"应只两次批量查（首轮 + 拆条），实际: {calls}"
+        assert len(result.messages) == 6, "三张卡各拆 2 条"
+
     async def test_partially_processed_article_kept_as_candidate(self):
         """仅部分拆条已处理：整条保留为候选（pipeline 入口按拆条过滤已处理部分）。"""
         import time

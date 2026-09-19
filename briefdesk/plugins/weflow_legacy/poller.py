@@ -310,6 +310,8 @@ async def poll(
                     logger.debug("%s群成员命中本轮缓存", log_prefix)
                 group_members = group_members_cache[session_id]
 
+            # 第一段：占位符卡回查 XML（逐卡网络调用不可避免），收集全部拆条 id
+            split_ids_by_msg: dict[str, list[str]] = {}
             for msg in candidates:
                 # media=True 回填时 WeFlow 会把文章卡片 XML 渲染成占位符
                 # （如 "[视频号] 标题"）；内容非 XML 时回查 media=False 的
@@ -333,20 +335,27 @@ async def poll(
                             "文章卡片占位符回查未命中: %s（按原文处理）",
                             msg["serverId"],
                         )
-                # 占位符回查后的文章卡片：拆条全部已处理 → 计"已处理"并跳过
-                # （此时才拿到 XML、可知拆条数；部分处理仍走 normalize，
-                # 由 pipeline 入口按拆条过滤）
                 if msg.get("localType") == _APPMSG_LOCAL_TYPE:
                     articles = parse_appmsg_xml(msg.get("content", ""))
                     if articles:
-                        split_ids = [
+                        split_ids_by_msg[msg["serverId"]] = [
                             f"{msg['serverId']}_{i}"
                             for i in range(1, len(articles) + 1)
                         ]
-                        split_processed = await is_processed(split_ids)
-                        if all(pid in split_processed for pid in split_ids):
-                            session_processed += 1
-                            continue
+            # 一次批量查（此前逐卡一次 is_processed：N 张占位符卡 N 次 DB 往返）
+            split_processed: set[str] = set()
+            if split_ids_by_msg:
+                split_processed = await is_processed(
+                    [pid for ids in split_ids_by_msg.values() for pid in ids]
+                )
+            # 第二段：判定与归一化。占位符回查后的文章卡片拆条全部已处理 →
+            # 计"已处理"并跳过（此时才拿到 XML、可知拆条数；部分处理仍走
+            # normalize，由 pipeline 入口按拆条过滤）
+            for msg in candidates:
+                ids = split_ids_by_msg.get(msg["serverId"])
+                if ids and all(pid in split_processed for pid in ids):
+                    session_processed += 1
+                    continue
                 # 文章卡片拆条后返回多条；解析失败返回空列表（维持丢弃语义）
                 normalized_list = normalize_rest(
                     msg, session_id, label, contacts, group_members
