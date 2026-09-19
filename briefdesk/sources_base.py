@@ -12,9 +12,10 @@ entry point 组 briefdesk.plugins；消息源为可选插件，启用走 PLUGINS
 """
 
 import asyncio
+import json
 import logging
 import time as time_module
-from collections.abc import Awaitable, Callable, Coroutine
+from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine
 from typing import Any, Literal, Protocol
 
 import httpx
@@ -96,6 +97,77 @@ def make_sse_timeout(read_timeout_s: float) -> httpx.Timeout:
 # 无换行流会让 buffer 无限膨胀。超限记 WARNING 并结束本次流，交给既有
 # 重连退避（上游恢复后自愈）。
 MAX_SSE_BUFFER_BYTES = 1 << 20
+
+
+async def iter_sse_data_events(
+    resp: httpx.Response,
+    *,
+    log: logging.Logger,
+    max_buffer_bytes: int = MAX_SSE_BUFFER_BYTES,
+) -> AsyncIterator[dict[str, Any]]:
+    """按 SSE 规范切帧并产出 `data:` 行的 JSON 对象（三源共用）。
+
+    - 只把 LF 当行结束符，行尾多余的 CR 剥掉（兼容 CRLF）；U+0085/U+2028/U+2029
+      等 `str.splitlines` 会当作换行的字符不再拆行——httpx 的 aiter_lines 走
+      splitlines 语义，会把含这些字符的 JSON 拆断（上游 serde_json 不转义非 ASCII，
+      真库复现：两条事件只收到一条）。
+    - 空行为事件边界；`id:` / `event:` / `:` 注释行忽略；每个 `data:` 行单独
+      解析并逐个产出（与此前行为一致，上游每帧恰一行 data）。
+    - 缓冲超过 max_buffer_bytes → 记 WARNING「SSE 缓冲超限」并结束生成器，交给
+      监听器的退避重连。计量口径是**帧内累计字节**（已切出、尚未成帧的行 +
+      未切行的残留），帧结束即归零：只量未切行的残留会漏掉「行连续但始终不
+      出现空行」的畸形流——每行切出后缓冲就归零，上限永远撞不到（基线按累计
+      喂入量计量，能抓到这一类）。代价是帧内累计超限的**合法**大帧同样会被
+      掐断（真库实测正文最大 335 B，比 1 MiB 低三个数量级，实际不可达）。
+    - JSON 解析失败记 WARNING（不打印内容，只打字节数）并跳过；非对象 JSON 同样跳过。
+
+    产出类型为通用 dict：各源的 TypedDict 事件类型由调用点 cast 收敛
+    （载荷就是上游 data 行的 JSON 对象）。
+    """
+    buffer = bytearray()
+    pending_lines: list[bytes] = []
+    pending_bytes = 0  # 帧内累计字节（含行尾 LF）；帧结束归零
+    async for chunk in resp.aiter_bytes():
+        buffer.extend(chunk)
+        while True:
+            nl = buffer.find(b"\n")
+            if nl < 0:
+                break
+            # 按字节切行不会撕裂多字节 UTF-8：0x0A 不会出现在多字节序列内部
+            line = bytes(buffer[:nl]).rstrip(b"\r")
+            del buffer[: nl + 1]
+            if line:
+                pending_lines.append(line)
+                pending_bytes += len(line) + 1
+                continue
+            # 空行 = 帧结束
+            for raw_line in pending_lines:
+                if not raw_line.startswith(b"data:"):
+                    continue
+                payload = raw_line[5:]
+                if payload.startswith(b" "):
+                    payload = payload[1:]
+                try:
+                    event = json.loads(payload.decode("utf-8"))
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    log.warning("SSE 数据行 JSON 解析失败，跳过（%d 字节）", len(payload))
+                    continue
+                if isinstance(event, dict):
+                    yield event
+                else:
+                    log.warning("SSE 数据行不是 JSON 对象，跳过")
+            pending_lines.clear()
+            pending_bytes = 0
+        # 超限判定放在切帧之后：完整帧先产出，再对尚未成帧的部分判超限
+        # （畸形流才会走到这里），与此前 aiter_lines 版本语义一致。
+        # 必须把 pending_lines 的累计字节一并计入：只量 buffer 时，「行连续但
+        # 无空行」的畸形流每行切出即归零、永远撞不到上限（基线能抓到）。
+        if pending_bytes + len(buffer) > max_buffer_bytes:
+            log.warning(
+                "SSE 缓冲超限（>%d 字节，疑似畸形流），结束本次流等待重连",
+                max_buffer_bytes,
+            )
+            return
 
 
 def build_endpoint_url(base_url: str, path: str) -> str:

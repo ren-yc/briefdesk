@@ -14,6 +14,7 @@
 """
 
 import asyncio
+import json
 import os
 import unittest
 from unittest.mock import AsyncMock, Mock, patch
@@ -1184,3 +1185,51 @@ class SseBufferCapTest(unittest.IsolatedAsyncioTestCase):
                     events = await self._collect(module_name, client)
                 # 超限前的合法事件照常产出，随后流被掐断
                 assert [e.get("rawid") for e in events] == ["r1"]
+
+
+class SseLineSeparatorRegressionTest(unittest.IsolatedAsyncioTestCase):
+    """data 行内的 U+2028 不得拆断事件（三源共用 iter_sse_data_events）。
+
+    httpx 的 aiter_lines 走 str.splitlines 语义（U+0085/U+2028/U+2029 均当换行），
+    上游 serde_json 不转义非 ASCII——真库复现：两条事件只收到一条。
+    """
+
+    async def _collect(self, module_name, client, ensure_ready=None):
+        def handler(request: httpx.Request) -> httpx.Response:
+            frames = "".join(
+                "data: " + json.dumps(payload, ensure_ascii=False) + "\n\n"
+                for payload in (
+                    {"event": "message.new", "rawid": "r1", "content": "a\u2028b"},
+                    {"event": "message.new", "rawid": "r2", "content": "c"},
+                )
+            )
+            return httpx.Response(
+                200,
+                headers={"content-type": "text/event-stream"},
+                content=frames.encode("utf-8"),
+            )
+
+        real_cls = httpx.AsyncClient
+        patch_target = f"briefdesk.plugins.{module_name}.client.httpx.AsyncClient"
+        if ensure_ready is not None:
+            client.ensure_ready = AsyncMock()  # type: ignore[method-assign]
+        with patch(
+            patch_target,
+            lambda **_kw: real_cls(transport=httpx.MockTransport(handler)),
+        ):
+            return [event async for event in client.stream_events()]
+
+    async def test_weflow_keeps_event_with_line_separator(self):
+        client = WeFlowClient("http://127.0.0.1:5033", "tok", wxid="wx")
+        events = await self._collect("weflow", client)
+        self.assertEqual([e["rawid"] for e in events], ["r1", "r2"])
+
+    async def test_legacy_keeps_event_with_line_separator(self):
+        client = WeFlowLegacyClient("http://127.0.0.1:5031", "tok")
+        events = await self._collect("weflow_legacy", client)
+        self.assertEqual([e["rawid"] for e in events], ["r1", "r2"])
+
+    async def test_qqflow_keeps_event_with_line_separator(self):
+        client = QqFlowClient("http://127.0.0.1:5032", "tok", qq="1", key="k" * 16)
+        events = await self._collect("qqflow", client, ensure_ready=True)
+        self.assertEqual([e["rawid"] for e in events], ["r1", "r2"])

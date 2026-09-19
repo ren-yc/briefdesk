@@ -521,7 +521,8 @@ getattr 探测调用）——server 只依赖它；`SourceRuntime`（`client`/`l
 失败统一抛 `MediaError`，server 据此映射 404）；**`with_connect_retry`**（连接类失败短退避重试：捕获
 `httpx.ConnectError`/`ConnectTimeout`，0.5s/1s 共 2 次等待、3 次尝试，耗尽原样上抛；不重试 HTTP 状态错误与 503 门控、不用于 SSE 流（监听器已有退
 避
-重连））。**另提供共享 `BatchBuffer`（实时批缓冲）/`DrainableListenerMixin`（关停冲刷收尾）与 `make_sse_timeout`（SSE 读超时构造）
+重连））。**`iter_sse_data_events(resp, log=...)`：三源 SSE 帧解析的唯一实现**——按字节以 LF 切行（剥行尾 CR），空行分帧，逐 `data:` 行 JSON 解析；
+  **不用 `aiter_lines`**（其 `splitlines` 语义把 U+0085/U+2028/U+2029 当换行，会拆断含这些字符的 JSON——上游 serde_json 不转义它们）；解析失败 WARNING（只记字节数）；缓冲上限按**帧内累计字节**计量（已切出未成帧的行 + 未切行残留，帧结束归零）——只量未切行残留会漏掉「行连续但无空行」的畸形流（每行切出即归零，上限永远撞不到），超限记 WARNING 后结束流。**另提供共享 `BatchBuffer`（实时批缓冲）/`DrainableListenerMixin`（关停冲刷收尾）与 `make_sse_timeout`（SSE 读超时构造）
 ，weflow-legacy/qqflow 监听器共用**；`session_log_prefix(index, total, label)` 为会话级日志行首（`  [3/12] 群名: `）的单源
 定
 义，三个轮询器共 15 处日志共用（缩进宽度/分隔符改一处即全局生效，见「日志行格式与来源列」）。**列表端点分页**：`fetch_all_pages(get, path, key=...)` 按
@@ -809,7 +810,7 @@ WARNING）的日志噪音；`fmt_dur()` 统一耗时格式。
 - **三源行为契约（weflow / weflow-legacy / qqflow）**：同构六文件分层，已统一——必填配置缺失/空值即装配期 `PluginDisabledError` 自禁用（零源降级
   启动兜底，决策 ①=1B）、空发送者消息保留（归一化回退 sender_name="未知"，决策 ②）、会话级拉取失败记入
   `PollResult.failed_sessions`/`session_errors` 不中止整轮、翻页 age 早停（`hit_old`）、脏会话 404→空信封
-  （`not_found_ok=True`）、SSE `(event, rawid)` FIFO 去重。**legacy REST/SSE 过滤口径统一**：`pre_filter_rest` 的附件占位符过滤
+  （`not_found_ok=True`）、SSE `(event, rawid)` FIFO 去重、SSE 帧解析共用 `iter_sse_data_events`。**legacy REST/SSE 过滤口径统一**：`pre_filter_rest` 的附件占位符过滤
   （`_ATTACHMENT_RE`）与图片 `mediaType == "image"` 校验与 SSE 路径同口径——同一消息不因到达路径（实时 SSE/回填 REST）不同而入库结果不同。
   **URL 拼接契约**：`*_API_BASE`（base_url）必须是**服务根地址或反代
   子路径前缀**，不得携带查询串、不得填完整端点路径；三源 SSE/媒体经共享助手 `sources_base.build_endpoint_url` 按 base 的路径前缀拼接
