@@ -815,7 +815,7 @@ WARNING）的日志噪音；`fmt_dur()` 统一耗时格式。
   道」）。
 - **三源行为契约（weflow / weflow-legacy / qqflow）**：同构六文件分层，已统一——必填配置缺失/空值即装配期 `PluginDisabledError` 自禁用（零源降级
   启动兜底，决策 ①=1B）、空发送者消息保留（归一化回退 sender_name="未知"，决策 ②）、会话级拉取失败记入
-  `PollResult.failed_sessions`/`session_errors` 不中止整轮、翻页 age 早停（`hit_old`）、脏会话 404→空信封
+  `PollResult.failed_sessions`/`session_errors` 不中止整轮（翻页守卫触顶同样记入：水位不推进，保留尾部消息的可恢复性；但该状态**不会自愈**——翻页只能从最新向旧推进、窗口只增不减，下轮必再触顶，需调大翻页上限或停用再启用会话缩小回填窗口；`lastWarning` 附带首个会话的原因文案。真库最大会话 6 万条，上限 40 万）、翻页 age 早停（`hit_old`）、脏会话 404→空信封
   （`not_found_ok=True`）、SSE `(event, rawid)` FIFO 去重、SSE 帧解析共用 `iter_sse_data_events`。**legacy REST/SSE 过滤口径统一**：`pre_filter_rest` 的附件占位符过滤
   （`_ATTACHMENT_RE`）与图片 `mediaType == "image"` 校验与 SSE 路径同口径——同一消息不因到达路径（实时 SSE/回填 REST）不同而入库结果不同。
   **URL 拼接契约**：`*_API_BASE`（base_url）必须是**服务根地址或反代

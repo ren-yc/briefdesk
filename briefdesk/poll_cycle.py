@@ -131,12 +131,15 @@ async def run_poll_cycle(source: SourceRuntime) -> None:
                 )
         if result.session_errors:
             # 会话级失败已隔离（不再整轮 raise）：UI 侧保留可见性——详细
-            # 原因带栈记录在 poller 日志，lastError 仍专属整轮失败
+            # 原因带栈记录在 poller 日志，lastError 仍专属整轮失败。附带首个
+            # 原因：瞬态错误下轮自动重试，翻页触顶则不会自愈，一律写「自动重试」
+            # 会让用户等一个不会来的恢复。
+            first_reason = next(iter(result.session_errors.values()))
             set_status(
                 {
                     "lastWarning": (
                         f"{len(result.session_errors)} 个会话本轮拉取失败"
-                        "（水位未推进，下轮自动重试）"
+                        f"（水位未推进）：{first_reason[:120]}"
                     )
                 }
             )

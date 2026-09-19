@@ -100,7 +100,9 @@ class PollResult:
     # 索引期 503）。poll_cycle 对这些会话跳过水位推进：它们的消息未落
     # raw_messages，钉窗机制看不到，若照常推进水位会造成窗口内消息永久漏拉。
     # 单会话拉取失败（非 503）同样走此集合 + session_errors 记原因，不再整轮
-    # 上抛——否则一个持续失败的坏会话会饿死同源其它会话。
+    # 上抛——否则一个持续失败的坏会话会饿死同源其它会话。翻页守卫触顶也记入：
+    # 该状态不会自愈（翻页只能从最新向旧推进，窗口只增不减），session_errors
+    # 的文案须说明解法；poll_cycle 把首个原因带进 lastWarning。
     session_errors: dict[str, str] = field(default_factory=dict)
 
 

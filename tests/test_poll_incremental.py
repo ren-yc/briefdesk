@@ -795,6 +795,55 @@ class TestQqFlowNotReadyFailure:
         assert result.failed_sessions == set()
 
 
+class TestPagingCapMarksSessionFailed:
+    """翻页触顶必须记入 failed_sessions，让 poll_cycle 跳过该会话水位推进。
+
+    只告警不记失败时，窗口内未拉到的更早消息会因水位照常推进而永久漏拉。
+    已收集的消息仍照常返回（processed 去重保证不重复处理）。
+    """
+
+    async def test_qqflow_paging_cap_marks_failed(self):
+        now = int(time.time())
+        msgs = [_qqflow_msg(i, now - 10) for i in range(501)]
+        client = _QqFlowClient(msgs)
+        with patch("briefdesk.plugins.qqflow.poller._MAX_PAGES", 1):
+            result = await qq_poll(
+                client, _enabled("qqflow", "g1"), _no_processed,
+                window_start_by_session={"g1": now - _DAY},
+            )
+        assert result.failed_sessions == {"g1"}
+        assert "g1" in result.session_errors
+        assert "翻页" in result.session_errors["g1"]
+        # 触顶不会自愈：文案必须给出解法，poll_cycle 会把它带进 lastWarning
+        assert "不会自愈" in result.session_errors["g1"]
+        assert "调大" in result.session_errors["g1"]
+        assert len(result.messages) == 500  # 部分结果照常返回
+
+    async def test_weflow_paging_cap_marks_failed(self):
+        now = int(time.time())
+        msgs = [_weflow_msg(f"m{i}", now - 10) for i in range(WF_PAGE_LIMIT + 1)]
+        client = _WeFlowClient(msgs)
+        with patch("briefdesk.plugins.weflow.poller._MAX_PAGES", 1):
+            result = await wf_poll(
+                client, _enabled("weflow", "g1"), _no_processed,
+                window_start_by_session={"g1": now - _DAY},
+            )
+        assert result.failed_sessions == {"g1"}
+        assert len(result.messages) == WF_PAGE_LIMIT
+
+    async def test_legacy_paging_cap_marks_failed(self):
+        now = int(time.time())
+        msgs = [_weflow_msg(f"m{i}", now - 10) for i in range(501)]
+        client = _WeFlowLegacyClient(msgs)
+        with patch("briefdesk.plugins.weflow_legacy.poller._MAX_PAGES", 1):
+            result = await we_poll(
+                client, _enabled("weflow-legacy", "g1"), _no_processed,
+                window_start_by_session={"g1": now - _DAY},
+            )
+        assert result.failed_sessions == {"g1"}
+        assert len(result.messages) == 500
+
+
 class TestAccountMismatchCycle:
     """账号不符必须走「整轮中止 + lastError + 不推水位」，与 503 的静默跳过相反。
 
@@ -857,6 +906,64 @@ class TestAccountMismatchCycle:
     async def test_cycle_does_not_crash_out(self):
         """兜底出口吞掉异常本身：不符不该让调度协程整个死掉。"""
         await self._run(QqFlowAccountMismatchError("绑定不符"))  # 不抛即通过
+
+
+class TestPagingCapReasonReachesUi:
+    """翻页触顶的原因文案必须抵达 lastWarning：该状态不会自愈，一律写
+    「下轮自动重试」会让用户等一个不会来的恢复。端到端走真 poller +
+    run_poll_cycle，同时钉住水位不推进。"""
+
+    async def test_cap_reason_in_last_warning_and_watermark_held(self):
+        now = int(time.time())
+        client = _QqFlowClient([_qqflow_msg(i, now - 10) for i in range(501)])
+        client.ensure_ready = AsyncMock()  # type: ignore[method-assign]
+        source = Mock()
+        source.name = "qqflow"
+        source.client = client
+        source.fetch_history = lambda enabled, is_processed, **kw: qq_poll(
+            client,  # type: ignore[arg-type]
+            enabled,
+            is_processed,
+            **kw,
+        )
+        status: list[dict] = []
+        with patch("briefdesk.plugins.qqflow.poller._MAX_PAGES", 1), patch(
+            "briefdesk.poll_cycle.get_enabled_sessions",
+            new=AsyncMock(
+                return_value=[
+                    {
+                        "source": "qqflow",
+                        "session_id": "g1",
+                        "name": "g",
+                        "is_group": 1,
+                        "is_official": 0,
+                    }
+                ]
+            ),
+        ), patch(
+            "briefdesk.poll_cycle._compute_session_windows",
+            new=AsyncMock(return_value={"g1": now - _DAY}),
+        ), patch(
+            "briefdesk.poll_cycle.are_messages_processed",
+            new=AsyncMock(return_value=set()),
+        ), patch(
+            "briefdesk.poll_cycle.bulk_upsert_contacts", new=AsyncMock()
+        ), patch(
+            "briefdesk.poll_cycle.upsert_sessions_from_infos", new=AsyncMock()
+        ), patch(
+            "briefdesk.poll_cycle.process_all_batches",
+            new=AsyncMock(return_value=True),
+        ), patch(
+            "briefdesk.poll_cycle.set_status", side_effect=status.append
+        ), patch(
+            "briefdesk.poll_cycle.update_session_last_polls", new=AsyncMock()
+        ) as upd:
+            await run_poll_cycle(source)
+        upd.assert_not_awaited()  # 唯一会话触顶 → 无可推进的水位
+        warnings = [d["lastWarning"] for d in status if "lastWarning" in d]
+        assert warnings, "触顶必须写 lastWarning"
+        assert "不会自愈" in warnings[-1]
+        assert "自动重试" not in warnings[-1]
 
 
 class TestSessionFailureIsolation:
