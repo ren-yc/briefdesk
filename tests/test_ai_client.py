@@ -1,8 +1,9 @@
 """AI 客户端统一调用的思考模式开关测试（不触发真实网络请求）。"""
 
+import asyncio
 import unittest
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 from pydantic import SecretStr
@@ -154,6 +155,62 @@ class TestChatTimeoutPassThrough:
         ):
             await chat([{"role": "user", "content": "x"}])
         assert "timeout" not in create.call_args.kwargs
+
+
+class TestChatRetryOverride:
+    """判官类调用的 SDK 重试覆盖：with_options(max_retries=0) 走独立客户端，
+    默认调用不得引入 with_options（保持既有客户端直接调用路径）。"""
+
+    async def test_max_retries_zero_uses_with_options(self):
+        client, _ = _fake_client()
+        client2, create2 = _fake_client()
+        client.with_options = Mock(return_value=client2)
+        with patch(
+            "briefdesk.plugins.ai_provider.engine.get_ai_client", return_value=client
+        ):
+            await chat([{"role": "user", "content": "x"}], timeout=45.0, max_retries=0)
+        client.with_options.assert_called_once_with(max_retries=0)
+        assert create2.await_count == 1
+
+    async def test_default_does_not_call_with_options(self):
+        client, create = _fake_client()
+        client.with_options = Mock()
+        with patch(
+            "briefdesk.plugins.ai_provider.engine.get_ai_client", return_value=client
+        ):
+            await chat([{"role": "user", "content": "x"}])
+        client.with_options.assert_not_called()
+        assert create.await_count == 1
+
+
+class TestChatSemaphoreWait:
+    """判官类调用的许可等待计入 timeout：锁内最坏持有 = 排队 + 请求。"""
+
+    async def test_acquire_bounded_by_timeout(self):
+        client, create = _fake_client()
+        sem = asyncio.Semaphore(1)
+        await sem.acquire()  # 预先占满，后续 acquire 只能等待
+        with patch(
+            "briefdesk.plugins.ai_provider.engine.get_ai_client", return_value=client
+        ), patch(
+            "briefdesk.plugins.ai_provider.engine.get_ai_semaphore", return_value=sem
+        ), pytest.raises(TimeoutError):
+            await chat([{"role": "user", "content": "x"}], timeout=0.05)
+        assert create.await_count == 0
+
+    async def test_release_after_create(self):
+        client, create = _fake_client()
+        sem = asyncio.Semaphore(1)
+        with patch(
+            "briefdesk.plugins.ai_provider.engine.get_ai_client", return_value=client
+        ), patch(
+            "briefdesk.plugins.ai_provider.engine.get_ai_semaphore", return_value=sem
+        ):
+            await chat([{"role": "user", "content": "x"}], timeout=5.0)
+        # 许可已归还：可立即再次 acquire
+        assert await asyncio.wait_for(sem.acquire(), 0.1) is True
+        sem.release()
+        assert create.await_count == 1
 
 
 class TestRagChatModelFallback:

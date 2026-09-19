@@ -146,6 +146,18 @@ class TestJudgeMerge:
         assert "运费aa" in msgs[1]["content"]
         assert "面交" in msgs[1]["content"]
 
+    async def test_judge_disables_sdk_retry(self):
+        """判官在存储锁内执行：SDK 重试必须关（否则最坏 3×45s 锁占用）。"""
+        from briefdesk.plugins.merge.engine import _JUDGE_TIMEOUT
+
+        chat_mock = AsyncMock(
+            return_value=_resp('{"task":"merge","data":{"merge": true}}')
+        )
+        with patch("briefdesk.plugins.merge.engine.chat", new=chat_mock):
+            await judge_merge("a", "b", "c", "d")
+        assert chat_mock.call_args.kwargs["max_retries"] == 0
+        assert chat_mock.call_args.kwargs["timeout"] == _JUDGE_TIMEOUT
+
     async def test_long_desc_is_clipped_before_send(self):
         # 超长描述在判官 user 消息里被截断，尾部不再送入
         long_desc = "x" * 1000
@@ -236,6 +248,15 @@ class TitleRegenerationTest(unittest.TestCase):
 
 
 class TestSummarizeTitle:
+    async def test_title_disables_sdk_retry(self):
+        """标题重拟同样在锁内执行：SDK 重试必须关。"""
+        chat_mock = AsyncMock(
+            return_value=_resp('{"task":"title","data":{"title":"新标题"}}')
+        )
+        with patch("briefdesk.plugins.merge.engine.chat", new=chat_mock):
+            await summarize_title("旧", "k", "q")
+        assert chat_mock.call_args.kwargs["max_retries"] == 0
+
     async def test_success(self):
         with patch(
             "briefdesk.plugins.merge.engine.chat",

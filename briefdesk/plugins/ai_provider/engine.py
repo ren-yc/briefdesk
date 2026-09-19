@@ -111,12 +111,18 @@ async def chat(
     temperature: float = 0.3,
     max_tokens: int = 4096,
     timeout: float | None = None,
+    max_retries: int | None = None,
 ) -> ChatCompletion:
     """统一 AI 调用入口，模型名从 config.ai_model 读取。
 
     timeout：单请求超时覆盖（秒），None 用客户端默认（_REQUEST_TIMEOUT）。
+    max_retries：重试次数覆盖（None 用客户端默认 _REQUEST_MAX_RETRIES）；
+    判官类调用传 0——SDK 默认重试 2 次会把锁内单次判官的最坏耗时放大 3 倍。
     """
     client = get_ai_client()
+    if max_retries is not None:
+        # 共享底层 http 连接池，仅覆盖该次调用的重试策略
+        client = client.with_options(max_retries=max_retries)
     per_request: dict = {"timeout": timeout} if timeout is not None else {}
 
     async def _create() -> ChatCompletion:
@@ -160,8 +166,16 @@ async def chat(
     sem = get_ai_semaphore()
     if sem is None:
         return await _create()
-    async with sem:
+    if timeout is None:
+        async with sem:
+            return await _create()
+    # 判官类调用：许可等待也计入 timeout，锁内最坏持有 = timeout（请求）+ timeout（排队）。
+    # 此前 async with sem 的排队等待不在任何超时之内。
+    await asyncio.wait_for(sem.acquire(), timeout)
+    try:
         return await _create()
+    finally:
+        sem.release()
 
 
 async def rag_chat(
@@ -343,6 +357,7 @@ class Provider(AIProvider):
         temperature: float,
         max_tokens: int,
         timeout: float | None = None,
+        max_retries: int | None = None,
     ) -> ChatResponse:
         return cast(
             ChatResponse,
@@ -351,6 +366,7 @@ class Provider(AIProvider):
                 temperature=temperature,
                 max_tokens=max_tokens,
                 timeout=timeout,
+                max_retries=max_retries,
             ),
         )
 

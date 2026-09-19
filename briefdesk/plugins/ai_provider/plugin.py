@@ -58,10 +58,16 @@ class AiProviderPlugin(Plugin, AIProvider):
             raise RuntimeError("ai_provider 未完成 setup")
         return self._provider
 
-    async def chat(self, messages, *, temperature, max_tokens, timeout=None):
+    async def chat(
+        self, messages, *, temperature, max_tokens, timeout=None, max_retries=None
+    ):
         provider = self._require_provider()
         return await provider.chat(
-            messages, temperature=temperature, max_tokens=max_tokens, timeout=timeout
+            messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            timeout=timeout,
+            max_retries=max_retries,
         )
 
     async def rag_chat(

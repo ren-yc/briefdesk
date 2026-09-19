@@ -205,6 +205,8 @@ AI 供应商端口：ai_provider 插件在 setup 阶段把实例注册到 `ctx.a
 点/Key 以 override 参数由调用方传入（端口不认识 `RAG_` 前缀），供应商未实现时回退复用 `chat` 并**静默丢弃 override**。未注册时 chat/embed 抛
 RuntimeError（配置错误明示），`embed_model_name` 回退 config、`is_embedding_enabled` 安全返回 False（引擎/实验离线可用）。
 `loads_json`（JSON 修复解析）与 `top_k_similar`（余弦 Top-K）为供应商无关工具，亦收于本模块。模块级单例，测试用 `set_ai(None)` 复位。
+判官类调用额外传 `max_retries=0` 且许可等待纳入 `timeout`：锁内单次判官最坏持有 ≈ 2×45s（排队 + 请求），此前 SDK 默认 2 次重试且排队不计时，最坏可达数分钟。
+`AIProvider.chat` 的 `max_retries` 为可选参数，第三方供应商可忽略。
 
 #### briefdesk/plugins/ai_provider/engine.py
 
@@ -1155,7 +1157,8 @@ Settings 经 `ClassVar KEYRING_FIELDS` 声明密钥字段继承之，位于 env 
 - Batch classification runs in parallel (`asyncio.create_task` + `as_completed`, one task per batch,
   enrich+classify stages); DB writes are serialized under `_storage_lock` in the pipeline skeleton
   (dedup stage + skipped marking + merge stage as one atomic section)；server 写路径共用同一把锁（类别 CRUD 全端点、
-  api_verify、batch 非 delete 分支、sessions toggle），见「核心模块」server 行
+  api_verify、batch 非 delete 分支、sessions toggle），见「核心模块」server 行。**锁内判官的耗时有界**：dedup 判票/strong、merge 判官/标题均传
+  `max_retries=0`（关掉 SDK 默认 2 次重试）且 `timeout` 同时约束信号量排队与请求本身，单次判官最坏锁内持有 ≈ 2×45s
 - 启用会话过滤、已处理过滤与 raw_messages 落库统一在 pipeline 入口（`process_all_batches`）完成，每批实时查询（无缓存）；
   `RealtimeListener.invalidate_session_cache()` 保留为 no-op 兼容调用。`SourceRuntime.refresh_sessions()` 返回
   `list[SessionInfo]` 由应用层（main 的 `_refresh_all`）统一写库；`fetch_history(enabled_sessions)` 的启用会话由

@@ -166,7 +166,8 @@ def _on_items_deleted(self, item_ids: list[str]) -> None:
 
 - `ctx.dedup`：`DedupService` 端口（dedup 插件 setup 注册）——同进程内共享去重缓存，
   merge 等后置阶段经此查询。
-- `ctx.ai`：`AIProvider` 端口（ai_provider 插件 setup 注册）——`chat`/`embed_texts` 等。
+- `ctx.ai`：`AIProvider` 端口（ai_provider 插件 setup 注册）——`chat`/`embed_texts` 等
+  （`chat` 可选 `timeout`/`max_retries`）。
   **引擎代码不要直接 import 供应商插件**：`briefdesk.ai_ports` 提供函数式端口
   （`ai_ports.chat(...)` 等），插件未装配时结构化报错。
 

@@ -116,6 +116,7 @@ async def judge_merge(
                 temperature=0.1,
                 max_tokens=64,
                 timeout=_JUDGE_TIMEOUT,
+                max_retries=0,  # SDK 重试会把锁内单次判官最坏耗时放大 3 倍
             )
         except Exception as e:  # noqa: BLE001 — 判官失败应保守不合并，不能中断管道
             logger.warning("合并判官请求失败（保守不合并）: %s", e)
@@ -220,6 +221,7 @@ async def summarize_title(old_title: str, key_info: str, quote: str) -> str | No
             temperature=0.1,
             max_tokens=64,
             timeout=_JUDGE_TIMEOUT,
+            max_retries=0,  # 标题重拟同样在锁内，禁用 SDK 重试
         )
     except Exception as e:  # noqa: BLE001 — 标题重拟失败应回退原标题，不能中断合并
         logger.warning("重拟标题请求失败（回退原标题）: %s", e)

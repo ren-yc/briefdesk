@@ -157,7 +157,9 @@ def _embedding_text(title: str, quote: str) -> str:
 
 # 判定请求超时（秒）：判定在存储锁内执行——与入库/add_to_cache 有批内顺序
 # 依赖（先行消息入库后后续判定要能看到）、并发批次也靠锁串行化，不能移出
-# 锁外；以短超时限制锁的最坏持有时间，防上游挂起冻结管道与卡片管理路由
+# 锁外；以短超时限制锁的最坏持有时间，防上游挂起冻结管道与卡片管理路由。
+# SDK 重试已关（max_retries=0），信号量等待亦受本超时约束，单次判官最坏
+# 锁内持有 ≈ 2×45s（排队 + 请求）。
 _JUDGE_TIMEOUT = 45.0
 
 
@@ -475,6 +477,7 @@ class DedupEngine(DedupService):
                     temperature=0.1,
                     max_tokens=128,
                     timeout=_JUDGE_TIMEOUT,
+                    max_retries=0,  # SDK 重试会把锁内单次判官最坏耗时放大 3 倍
                 )
             except Exception as e:
                 # 仅 DEBUG：判定失败是被容错的（调用方 _judge_* 按"该候选降级/

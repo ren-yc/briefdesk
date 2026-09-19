@@ -158,6 +158,27 @@ class TestAskAiMaxTokens:
         assert result
         assert chat_mock.call_args.kwargs["max_tokens"] == 128
 
+    async def test_ask_ai_disables_sdk_retry(self):
+        """判官在存储锁内执行：SDK 重试必须关（否则最坏 3×45s 锁占用）。"""
+        from briefdesk.plugins.dedup.engine import _JUDGE_TIMEOUT
+
+        engine = DedupEngine()
+        resp = SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(content='{"task":"dedup","data":{"same": true}}'),
+                    finish_reason="stop",
+                )
+            ]
+        )
+        chat_mock = AsyncMock(return_value=resp)
+        with patch("briefdesk.plugins.dedup.engine.chat", new=chat_mock):
+            await engine._ask_ai(
+                SimpleNamespace(title="a", source_quote="b"), "c", "d"
+            )
+        assert chat_mock.call_args.kwargs["max_retries"] == 0
+        assert chat_mock.call_args.kwargs["timeout"] == _JUDGE_TIMEOUT
+
 
 class ParseSameTest(unittest.TestCase):
     def setUp(self):
