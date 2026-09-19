@@ -504,7 +504,7 @@ tests/test_web_plugins.py 的核心前端边界守卫测试覆盖）。`GET /api
 询门控——仅设置弹窗打开或基准运行中保活 3s 轮询）+ CLI 入口（`python -m briefdesk.plugins.benchmark.cli`）。运行环境
 `providers.bench_environment`（Web 与 CLI 共用同一套门闸）：进入即 `pipeline.set_processing_paused(True)` 暂停生产管道
 （process_all_batches 顶部直接返回 False，实时消息不入库不标 processed、延后下轮回填恢复）并发布 `benchmark_running` 公告——运行期间全部 UI
-写路由落在临时库、退出即丢，公告提示用户勿在此期间操作界面（退出 finally 撤销公告）、排空后经 `db.db_redirect(bench.sqlite)` 官方缝把主/向量连接重定向到临时库
+写路由落在临时库、退出即丢，公告提示用户勿在此期间操作界面（退出 finally 撤销公告）、排空后经 `db.db_redirect(bench.sqlite)` 官方缝把主/向量连接重定向到临时库（**排空超时 120s 直接抛错中止本次基准**，不再带警告继续重定向——继续会让在途批次写落进临时库并在生产去重缓存留下幽灵条目）
 （
 窗口内 get_db/get_embed_db 调用均落临时库；缝内半程失败自动关闭已建连接）；DB 重定向退出时先同步还原单例再关临时连接（先于本 finally），finally 只做公告撤销→复
 位

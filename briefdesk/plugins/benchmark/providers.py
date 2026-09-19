@@ -99,8 +99,12 @@ async def bench_environment(
         # 必须先于 db_redirect：在途批次仍持生产连接，未排空即重定向会让
         # 半程批次的后续写落到临时基准库。
         if not await _wait_pipelines_drained():
-            logger.warning(
-                "benchmark: 等待在途批次排空超时（120s），基准结果可能污染生产缓存"
+            # 直接中止：带警告继续会在途批次的后续写落进临时基准库，并在生产
+            # 去重缓存留下幽灵条目。位于 try 内，finally 照常复位（公告此时
+            # 尚未发布，revoke 为幂等 no-op）；路由层捕获异常写入 _last_result。
+            raise RuntimeError(
+                "benchmark: 等待在途批次排空超时（120s），已中止本次基准以免"
+                "在途批次写入临时库/污染生产去重缓存；稍后重试"
             )
         try:
             await announcements.announce(

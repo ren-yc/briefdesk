@@ -10,7 +10,7 @@ ProviderResourceAcquisitionFailureTest）。
 """
 
 import unittest
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -124,3 +124,32 @@ class TestDrainWait:
             providers, "get_sync_progress", return_value={"pendingCount": 3}
         ):
             assert not await providers._wait_pipelines_drained(timeout_s=0.1)
+
+
+class TestDrainTimeoutAborts:
+    """排空超时必须直接中止基准，不得带警告继续重定向。
+
+    继续重定向会让在途批次的后续写落进临时基准库，并在生产去重缓存留下
+    幽灵条目（去重缓存是进程级内存态，切库不会清）。
+    """
+
+    async def test_drain_timeout_aborts_before_redirect(self):
+        root = providers._TMP_ROOT
+        before = set(root.glob("bench-*"))
+        with (
+            patch.object(
+                providers, "_wait_pipelines_drained",
+                new=AsyncMock(return_value=False),
+            ),
+            patch.object(providers, "db_redirect") as redirect,
+            patch("briefdesk.pipeline.set_processing_paused") as paused,
+            pytest.raises(RuntimeError, match="排空超时"),
+        ):
+            async with providers.bench_environment(register_ai=False):
+                pass  # 不可达：排空前即中止
+        redirect.assert_not_called()
+        assert [c.args for c in paused.call_args_list] == [(True,), (False,)]
+        assert set(root.glob("bench-*")) == before, "中止路径必须清理运行目录"
+        from briefdesk import pipeline as _pipeline
+
+        assert not _pipeline._processing_paused
