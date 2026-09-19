@@ -2,6 +2,7 @@
 
 import asyncio
 import os
+import re
 import shutil
 import tempfile
 import time
@@ -19,6 +20,8 @@ from briefdesk.events import EVENT_ITEMS_DELETED
 from briefdesk.plugins.calendar import router as calendar_router
 from briefdesk.plugins.reminders import router as reminders_router
 from briefdesk.server import routes_items as srv_routes
+
+_ROOT = Path(__file__).resolve().parents[1]
 
 
 def _client(**kwargs):
@@ -938,6 +941,63 @@ class CategoryDeleteRouteTest(unittest.TestCase):
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(resp.json()["deletedItems"], 0)
         publish.assert_not_awaited()
+
+
+class CategoryPromptLimitTest(unittest.TestCase):
+    """类别提示词上限三处一致（后端常量、新建框、编辑框）。
+
+    上限 200 而后端 maxlength 50 的年代表述已过时：13 个默认提示词全部超过
+    50 字，编辑框无法插入字符，其中 5 类保存必 400。此处用静态比对钉住
+    后端常量与前端两处 maxlength 不再漂移。
+    """
+
+    def setUp(self):
+        self.client = _client()
+
+    def tearDown(self):
+        self.client.close()
+
+    def _post_prompt(self, prompt):
+        with patch.multiple(
+            "briefdesk.server.routes_categories",
+            storage_lock=asyncio.Lock(),
+            insert_category=AsyncMock(return_value={"id": 1, "name": "x"}),
+            publish_items_updated=AsyncMock(),
+        ):
+            return self.client.post(
+                "/api/categories",
+                json={"name": "x", "prompt": prompt, "color": "#123456"},
+            )
+
+    def test_prompt_at_limit_accepted(self):
+        from briefdesk.server.routes_categories import _PROMPT_MAX
+
+        resp = self._post_prompt("提" * _PROMPT_MAX)
+        self.assertEqual(resp.status_code, 200, resp.text)
+
+    def test_prompt_over_limit_rejected(self):
+        from briefdesk.server.routes_categories import _PROMPT_MAX
+
+        resp = self._post_prompt("提" * (_PROMPT_MAX + 1))
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn(f"<= {_PROMPT_MAX}", resp.text)
+
+    def test_frontend_maxlength_matches_backend(self):
+        from briefdesk.server.routes_categories import _PROMPT_MAX
+
+        index = (_ROOT / "ui" / "index.html").read_text(encoding="utf-8")
+        app = (_ROOT / "ui" / "app.js").read_text(encoding="utf-8")
+        add = re.search(
+            r'id="cat-add-prompt"[^>]*maxlength="(\d+)"', index
+        )
+        edit = re.search(
+            r'class="cat-edit-prompt"[^>]*maxlength="(\d+)"', app
+        )
+        self.assertIsNotNone(add, "index.html 的 cat-add-prompt 应有 maxlength")
+        self.assertIsNotNone(edit, "app.js 的 cat-edit-prompt 应有 maxlength")
+        self.assertEqual(int(add.group(1)), _PROMPT_MAX)
+        self.assertEqual(int(edit.group(1)), _PROMPT_MAX)
+        self.assertIn(f"（≤{_PROMPT_MAX} 字）", index, "placeholder 应标注同一上限")
 
 
 class BackupRestoreRouteTest(unittest.TestCase):

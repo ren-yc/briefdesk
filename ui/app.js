@@ -4037,7 +4037,7 @@ function renderCategoryToggles() {
       ${isPendingDel ? "" : `
       <div class="cat-edit-form hidden">
         <input type="text" class="cat-edit-name" value="${escAttr(c.name)}" maxlength="20">
-        <textarea class="cat-edit-prompt" rows="3" maxlength="50">${esc(c.prompt)}</textarea>
+        <textarea class="cat-edit-prompt" rows="3" maxlength="400">${esc(c.prompt)}</textarea>
         <div class="cat-palette"></div>
         <div class="cat-edit-actions">
           <button class="cat-edit-save">确认</button>

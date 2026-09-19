@@ -21,17 +21,18 @@ from briefdesk.realtime import publish_items_updated
 from briefdesk.server.app import app
 
 _NAME_MAX = 20
-# 50 字上限与默认类别 prompt（均 >50 字，含"①…②…"细则）矛盾，导致现有类别
-# 无法经 UI 编辑（任何整句重写要么超限被拒、要么丢失细则）。放宽为 200。
-_PROMPT_MAX = 200
+# 提示词上限 400：最长默认提示词 293 字（活动通知），前端两处 maxlength 与此常量
+# 保持一致（静态守卫测试钉住）。此前上限 200 而前端 maxlength=50——13 个默认提示词
+# 全部超过 50 字，编辑框无法插入任何字符，其中 5 类（活动通知/交易/实习/兼职家教/
+# 求助互助）保存必 400。
+_PROMPT_MAX = 400
 _COLOR_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
 
 
 def _validate_category_fields(body: dict, *, name_required: bool = False) -> str | None:
     """校验类别字段，非法时返回错误消息（None 表示通过）。
 
-    名称 strip 后非空、≤20 字；提示词 ≤200 字；颜色匹配 #RRGGBB。
-    名称上限与前端 maxlength 一致；提示词 200 为后端放宽（前端仍 50，见 ui/index.html）。
+    名称 strip 后非空、≤20 字；提示词 ≤400 字，与前端 maxlength 一致；颜色匹配 #RRGGBB。
     """
     name_raw = body.get("name")
     prompt = body.get("prompt")
