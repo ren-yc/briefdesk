@@ -1191,11 +1191,22 @@ class TestExtractTimes:
         assert "0: 张三" in msg
         assert "1:" not in msg  # time=true 才进
 
+    def test_time_truncation_limit_is_800(self):
+        """截断上限与分类侧 _MAX_MSG_CHARS 对齐（此前 300，长尾时间线索丢失）。"""
+        from briefdesk.plugins.classify.engine import _TIME_MAX_MSG_CHARS
+
+        assert _TIME_MAX_MSG_CHARS == 800
+        results = [ClassifyResult(msg_index=0, category="活动通知")]
+        msg = _build_time_user_message(results, [0], [self._msg("长" * 799)])
+        assert "…" not in msg, "799 字不应触发截断"
+
     def test_build_user_message_truncates_long_content(self):
         from briefdesk.plugins.classify.engine import _TIME_MAX_MSG_CHARS
 
         results = [ClassifyResult(msg_index=0, category="活动通知")]
-        msg = _build_time_user_message(results, [0], [self._msg("长" * 500)])
+        msg = _build_time_user_message(
+            results, [0], [self._msg("长" * (_TIME_MAX_MSG_CHARS + 100))]
+        )
         assert "…" in msg
         assert "长" * (_TIME_MAX_MSG_CHARS + 1) not in msg
 

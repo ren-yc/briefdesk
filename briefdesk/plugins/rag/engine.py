@@ -336,15 +336,20 @@ class RagEngine:
         # 满足反连接却永远不被消费，不排除会每轮占满预算窗口，令更早的
         # 真实消息饿死（审查回归）
         scope, scope_params = scope_sql(self.settings.group_only, alias="r")
+        # 内容以既有 chunk 优先：raw_messages 在管道入口（OCR 之前）落库，而实时
+        # 索引写入的是 OCR 增强后的文本；换嵌入模型回填时若用原文覆盖，会把 OCR
+        # 文本从索引里抹掉，纯图片消息的原文还是占位符（_indexable 为假 → 登记
+        # rag_skipped），旧向量永不更新。
         sql = (
             "SELECT r.source, r.msg_id, r.session_id, r.group_name, "
-            "r.sender_name, r.timestamp AS msg_time, r.content "
+            "r.sender_name, r.timestamp AS msg_time, "
+            "COALESCE(c.content, r.content) AS content "
             "FROM raw_messages r "
             "LEFT JOIN rag_chunks c ON c.source = r.source AND c.msg_id = r.msg_id "
             "LEFT JOIN rag_chunk_embeddings e ON e.source = r.source "
             "AND e.msg_id = r.msg_id "
             "WHERE (c.msg_id IS NULL OR e.msg_id IS NULL OR e.model <> ?)"
-            " AND trim(r.content, ' ' || char(9)) <> ''"
+            " AND trim(COALESCE(c.content, r.content), ' ' || char(9)) <> ''"
             " AND NOT EXISTS (SELECT 1 FROM rag_skipped k "
             "WHERE k.source = r.source AND k.msg_id = r.msg_id)"
             + scope

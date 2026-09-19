@@ -678,6 +678,53 @@ class TestRagBackfill(_MemoryEngineBase):
         assert await self._chunk_ids() == ["n1"]
         assert await self._embed_count_by_model() == {"test-model": 1}
 
+    async def test_model_switch_backfill_keeps_enriched_chunk_content(self):
+        """换模型回填不得用 raw 原文覆盖实时索引写入的 OCR 增强文本。"""
+        from briefdesk.plugins.rag.config import RagSettings as RS
+
+        await self._seed("m1", 1, content="通知正文")
+        # 实时索引写入带 OCR 的 chunk（+ test-model 向量）
+        await self._index([_msg("m1", "通知正文\n[OCR]\n海报文字")])
+        self.provider.embed_model_name = Mock(return_value="model-b")
+        self.engine.settings = RS(backfill_days=-1)
+
+        assert await self.engine.backfill_step(self.now) == 1
+        cursor = await self.db.execute(
+            "SELECT content FROM rag_chunks WHERE msg_id='m1'"
+        )
+        try:
+            content = (await cursor.fetchone())["content"]
+        finally:
+            await cursor.close()
+        assert "[OCR]" in content, "回填不得以原文覆盖 OCR 增强文本"
+        assert await self._embed_count_by_model() == {"model-b": 1}
+
+    async def test_model_switch_backfill_placeholder_raw_uses_chunk(self):
+        """纯图片消息：raw 是占位符但 chunk 有 OCR 文本，回填须沿用 chunk。"""
+        from briefdesk.plugins.rag.config import RagSettings as RS
+
+        await self._seed("m1", 1, content="[图片]")
+        await self._index([_msg("m1", "[OCR]\n海报文字")])
+        cursor = await self.db.execute(
+            "SELECT COUNT(*) AS c FROM rag_chunks WHERE msg_id='m1'"
+        )
+        try:
+            assert (await cursor.fetchone())["c"] == 1, "前置：chunk 已由实时索引写入"
+        finally:
+            await cursor.close()
+        self.provider.embed_model_name = Mock(return_value="model-b")
+        self.engine.settings = RS(backfill_days=-1)
+
+        assert await self.engine.backfill_step(self.now) == 1
+        cursor = await self.db.execute(
+            "SELECT msg_id FROM rag_skipped WHERE msg_id='m1'"
+        )
+        try:
+            assert await cursor.fetchone() is None, "已有可索引 chunk 的不得登记 skipped"
+        finally:
+            await cursor.close()
+        assert await self._embed_count_by_model() == {"model-b": 1}
+
     async def test_full_off_and_model_switch(self):
         from briefdesk.plugins.rag.config import RagSettings as RS
 

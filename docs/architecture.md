@@ -229,7 +229,8 @@ sysc；解析失败/超长同样整段本轮抛弃，不标 processed）。两�
 `_parse_response` 对结构错误抛错（整段本轮抛弃）、对未知类别（AI 幻觉，不在 allowed 集合）逐条 defer 进 retry_indexes：均不标记 processed、
 由
 下一轮回填重试。`finish_reason=length` 输出截断按消息数拆半递归重试（不可再拆则本轮抛弃）；传输失败/空响应/解析失败同样整段本轮抛弃。整批字符预算
-`_MAX_BATCH_CHARS` 超限时超限消息**整条剔除**并并入 failed 重试（防"未分类却被标 processed"的静默丢失）。**多时间点**：prompt 要求含多个时间点的消
+`_MAX_BATCH_CHARS` 超限时超限消息**整条剔除**并并入 failed 重试（防"未分类却被标 processed"的静默丢失）。**时间提取截断 800 字**（`_TIME_MAX_MSG_CHARS`，与分类侧
+`_MAX_MSG_CHARS` 对齐）：真库中约 1/8 的超 300 字消息其时间线索落在 300 字之后。**多时间点**：prompt 要求含多个时间点的消
 息
 把全部时间点列入可选 `times` 数组（{type,time,label}），`_parse_extra_times` 逐项校验（脏项丢弃、与主字段 (type,time) 去重、上限 20 项、
 label 折叠截断 40 字）；key 中的时间必须写绝对日期（合并后相对时间失去锚点）。**无年份日期推断**：“X月X日/号”取与消息发送时刻**最接近**的那一次（无论已过还是未来）——任务清
@@ -692,7 +693,9 @@ prompt 前再裁剪——仅保留最近 6 轮、单条 200 字并注明省略�
 会
 话恒为前提（查询期现取，停用即时失效）；`RAG_GROUP_ONLY` 默认仅群聊；作用域 SQL 谓词由 `db.scope_sql(alias=...)` 单源提供——检索侧过滤 chunks（
 别
-名 c）、回填侧过滤 raw_messages（别名 r），隐私边界只有一处定义。**落库单一出口 `_persist_chunks`**：实时批次（`run`）与历史回填
+名 c）、回填侧过滤 raw_messages（别名 r），隐私边界只有一处定义。**回填 SELECT 以既有 chunk 内容优先**（`COALESCE(c.content, r.content)`）：
+raw_messages 在管道入口（OCR 之前）落库，实时索引写入的是 OCR 增强文本；换模型重嵌入时若用原文覆盖会抹掉 OCR 文本，
+纯图片消息的原文还是占位符（`_indexable` 为假 → 登记 `rag_skipped`），旧向量永不更新。**落库单一出口 `_persist_chunks`**：实时批次（`run`）与历史回填
 （`backfill_step`）共用同一串「`upsert_chunks` → `_fts_enabled` 时 `sync_fts` → 向量走专用连接 `upsert_embeddings`」，
 令
 「入了 chunks 却漏同步 FTS」在结构上不可能发生——那种漏同步不报任何错，只让 FTS 索引与 chunks 静默分叉、检索少一条腿，且维护循环的反连接补不回来（它只看向量缺失，不看 FTS）

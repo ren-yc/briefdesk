@@ -832,7 +832,9 @@ def _build_time_system_prompt() -> str:
     return _TIME_PROMPT_TEMPLATE
 
 
-_TIME_MAX_MSG_CHARS = 300  # 每条消息送入时间提取的内容截断长度
+# 时间提取的内容截断长度，与 _MAX_MSG_CHARS 对齐：真库探测显示超 300 字的
+# 消息中约 1/8 的时间线索落在 300 字之后（仅此一项成本作用于 0.23% 的消息）
+_TIME_MAX_MSG_CHARS = 800
 
 
 def _build_time_user_message(
