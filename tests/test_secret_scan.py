@@ -5,9 +5,13 @@
 - 防误报：空值环境变量（模板）、普通代码不命中
 """
 
+import contextlib
+import io
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
-from scripts.secret_scan import scan_text
+from scripts.secret_scan import _git_diff, main, scan_text
 
 
 class SecretScanTest(unittest.TestCase):
@@ -57,6 +61,37 @@ class SecretScanTest(unittest.TestCase):
     def test_diff_header_lines_ignored(self) -> None:
         diff = "+++ b/.env.example\n+AI_API_KEY=\n+---\n"
         self.assertEqual(scan_text(diff), [])
+
+
+class SecretScanFailClosedTest(unittest.TestCase):
+    """扫描未执行必须拒绝放行，且命中值不得回显到日志。"""
+
+    def test_git_failure_returns_2(self) -> None:
+        with patch(
+            "scripts.secret_scan.subprocess.run",
+            return_value=SimpleNamespace(
+                returncode=128, stdout="", stderr="fatal: bad revision"
+            ),
+        ):
+            self.assertIsNone(_git_diff(["nope"]))
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                self.assertEqual(main(["--ref", "nope"]), 2)
+        self.assertIn("拒绝放行", stderr.getvalue())
+
+    def test_hit_output_does_not_echo_secret(self) -> None:
+        # 运行期拼接，避免字面量命中扫描规则（钩子会扫本文件自身的新增行）
+        secret = "sk-" + "a" * 32
+        stdout = io.StringIO()
+        with patch(
+            "scripts.secret_scan._git_diff", return_value="+" + secret + "\n"
+        ), contextlib.redirect_stdout(stdout):
+            code = main([])
+        out = stdout.getvalue()
+        self.assertEqual(code, 1)
+        self.assertNotIn(secret, out)
+        self.assertIn("sk-a…", out)
+        self.assertIn("OpenAI", out)
 
 
 if __name__ == "__main__":

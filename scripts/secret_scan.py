@@ -1,5 +1,8 @@
 """预提交密钥扫描 — 在 staged diff 中查找疑似密钥形态，命中即退出码 1。
 
+退出码语义：0 = 无命中（放行）；1 = 命中（拒绝提交）；2 = 扫描未执行
+（git diff 失败，拒绝放行——空 diff 不等于干净）。
+
 与 AGENTS.md「隐私与敏感数据扫描」的手动命令等价，自动化到 pre-commit 钩子
 （安装：scripts/install-hooks.ps1）。只扫描**新增行**（diff 中 `+` 前缀的行）：
 删除行不进入仓库、不构成风险；也避免误伤测试桩（如已提交的 sk- 形态假值）。
@@ -68,11 +71,16 @@ def scan_text(diff_text: str) -> list[tuple[int, str, str]]:
     return hits
 
 
-def _staged_added_diff() -> str:
+def _staged_added_diff() -> str | None:
     return _git_diff(["--cached"])
 
 
-def _git_diff(rev_args: list[str]) -> str:
+def _git_diff(rev_args: list[str]) -> str | None:
+    """执行 git diff；失败返回 None（调用方据此拒绝放行，不得当成空 diff）。
+
+    此前失败返回空串，scan_text("") 必然无命中 → main 返回 0：CI 里 git fetch
+    失败或基线引用无效时会「扫描没跑却放行」。
+    """
     proc = subprocess.run(
         ["git", "diff", *rev_args, "-U0"],
         capture_output=True,
@@ -83,11 +91,17 @@ def _git_diff(rev_args: list[str]) -> str:
     )
     if proc.returncode != 0:
         print(
-            f"[secret-scan] git diff 执行失败（exit {proc.returncode}），跳过扫描",
+            f"[secret-scan] git diff 执行失败（exit {proc.returncode}）："
+            f"{(proc.stderr or '')[:200]}",
             file=sys.stderr,
         )
-        return ""
+        return None
     return proc.stdout
+
+
+def _mask(snippet: str) -> str:
+    """命中片段脱敏：只保留首 4 字符与总长，避免 CI 日志回显密钥。"""
+    return f"{snippet[:4]}…（共 {len(snippet)} 字符）"
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -101,12 +115,19 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     diff = _git_diff([f"{args.ref}...HEAD"]) if args.ref else _staged_added_diff()
+    if diff is None:
+        print(
+            "[secret-scan] 扫描未执行，拒绝放行；请检查 git 环境/基线引用后重试",
+            file=sys.stderr,
+        )
+        return 2
     hits = scan_text(diff)
     if hits:
         target = f"相对 {args.ref} 的差异" if args.ref else "staged 新增内容"
         print(f"检测到疑似密钥/敏感信息（{target}），请先移除或脱敏后再提交：")
         for line, label, snippet in hits:
-            print(f"  - 第 {line} 行 [{label}]: {snippet}")
+            # 只回显脱敏片段：命中值原样打到 stdout 会让 CI 日志成为密钥泄露面
+            print(f"  - 第 {line} 行 [{label}]: {_mask(snippet)}")
         print(
             "\n确认为误报时，请人工复核后使用 `git commit --no-verify` 跳过（谨慎）。"
         )

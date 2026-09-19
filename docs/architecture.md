@@ -1079,7 +1079,8 @@ Settings 经 `ClassVar KEYRING_FIELDS` 声明密钥字段继承之，位于 env 
   `KeyringSource._key_for_field` 按别名输出键规避此陷阱（守卫测试：`tests/test_secrets_store.py` 的优先级链用例）。
 - **预提交密钥扫描**：`scripts/secret_scan.py` 只扫描 staged 新增行中的密钥形态（`sk-`/`AKIA`/PEM 私钥块/本项目密钥环境变量非空赋值），命中即拒绝提交
   ；经 `scripts/install-hooks.ps1` 安装为 pre-commit 钩子（守卫测试：`tests/test_secret_scan.py`；Windows 控制台 cp1252
-  下 stdout 重配 utf-8/replace，中文输出不再 UnicodeEncodeError）。
+  下 stdout 重配 utf-8/replace，中文输出不再 UnicodeEncodeError）。git diff 失败以退出码 2 拒绝放行（不是静默通过——空 diff 不等于干净）；
+  命中输出只含行号/规则名与脱敏片段（首 4 字符 + 总长），CI 日志不回显密钥。
 
 ## 设计要点与陷阱
 
