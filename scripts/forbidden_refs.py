@@ -23,6 +23,10 @@
   python scripts/forbidden_refs.py            # 扫描 staged 新增内容（pre-commit）
   python scripts/forbidden_refs.py --ref origin/master   # CI：相对基线的差异
   python scripts/forbidden_refs.py --tree     # 全量工作区（收口核查）
+  python scripts/forbidden_refs.py --message-file <路径> # 提交信息（commit-msg）
+
+退出码：0 = 无命中；1 = 命中；2 = 扫描未执行（git 取差异失败，拒绝放行——
+空 diff 不等于干净，与 scripts/secret_scan.py 同口径）。
 """
 
 from __future__ import annotations
@@ -341,45 +345,6 @@ def scan_tree(root: Path | None = None) -> list[Hit]:
     return hits
 
 
-def counts_by_file(hits: Iterable[Hit]) -> dict[str, int]:
-    """按文件汇总命中行数（同一行只计一次，见 _collect_hits）。"""
-    counts: dict[str, int] = {}
-    for hit in hits:
-        counts[hit.path] = counts.get(hit.path, 0) + 1
-    return counts
-
-
-def read_baseline(path: Path) -> dict[str, int]:
-    """读取基线文件（制表符分隔的「路径<空格>上限」；# 开头为注释）。"""
-    baseline: dict[str, int] = {}
-    if not path.exists():
-        return baseline
-    for raw in path.read_text(encoding="utf-8").splitlines():
-        line = raw.rstrip()
-        if not line.strip() or line.lstrip().startswith("#"):
-            continue
-        parts = line.split("\t")
-        if len(parts) != 2 or not parts[1].strip().isdigit():
-            raise ValueError(f"基线文件格式非法（应为「路径<TAB>上限」）：{raw}")
-        baseline[parts[0].strip()] = int(parts[1])
-    return baseline
-
-
-def baseline_regressions(
-    current: dict[str, int], baseline: dict[str, int]
-) -> list[tuple[str, int, int]]:
-    """返回超出基线的文件：[(路径, 当前条数, 基线上限), ...]。"""
-    return sorted(
-        (
-            (path, count, baseline.get(path, 0))
-            for path, count in current.items()
-            if count > baseline.get(path, 0)
-        ),
-        key=lambda item: item[1] - item[2],
-        reverse=True,
-    )
-
-
 _HUNK_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
 
 
@@ -492,51 +457,33 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--ref", default=None, help="扫描相对该基线的差异（CI 用）")
     parser.add_argument("--tree", action="store_true", help="全量扫描跟踪文件")
     parser.add_argument("--message-file", default=None, help="扫描提交信息文件")
-    parser.add_argument(
-        "--baseline",
-        default=None,
-        help="存量基线文件：只禁止新增（超基线即失败），基线内允许保留",
-    )
     args = parser.parse_args(argv)
 
-    if args.baseline:
-        baseline = read_baseline(Path(args.baseline))
-        current = counts_by_file(scan_tree())
-        regressions = baseline_regressions(current, baseline)
-        if regressions:
-            print("编号引用超出存量基线（禁止新增；请改为说明「为什么」与失败模式）：")
-            for path, count, limit in regressions:
-                print(f"  {path}: {count} 条（基线上限 {limit}）")
-            print(
-                "\n编号指向仓库外不可访问的文档，读者无法据此还原上下文。"
-                "\n确需保留时，请在同行加注释 allow-plan-ref（并在 review 中说明理由）。"
-            )
-            return 1
-        improved = [
-            (path, count, baseline[path])
-            for path, count in current.items()
-            if count < baseline.get(path, 0)
-        ]
-        if improved:
-            print("以下文件已低于基线，可同步收紧基线（收口阶段将要求清零）：")
-            for path, count, limit in sorted(improved):
-                print(f"  {path}: {count} 条（基线 {limit}）")
-        print("编号引用未超出存量基线")
-        return 0
-
-    if args.message_file:
-        text = Path(args.message_file).read_text(encoding="utf-8", errors="replace")
-        hits = scan_commit_message(text)
-        target = f"提交信息 {args.message_file}"
-    elif args.tree:
-        hits = scan_tree()
-        target = "全量跟踪文件"
-    elif args.ref:
-        hits = scan_diff(_range_diff(args.ref), rev=args.ref, staged=False)
-        target = f"相对 {args.ref} 的差异"
-    else:
-        hits = scan_diff(_staged_diff(), rev=None, staged=True)
-        target = "staged 新增内容"
+    # git 取不到差异时必须拒绝放行：当作空 diff 会「扫描没跑却通过」，
+    # 与 scripts/secret_scan.py 同口径（退出码 2）。CI 里 fetch 失败或基线
+    # 引用无效都会走到这里，静默通过等于门禁失守。
+    try:
+        if args.message_file:
+            text = Path(args.message_file).read_text(encoding="utf-8", errors="replace")
+            hits = scan_commit_message(text)
+            target = f"提交信息 {args.message_file}"
+        elif args.tree:
+            hits = scan_tree()
+            target = "全量跟踪文件"
+        elif args.ref:
+            hits = scan_diff(_range_diff(args.ref), rev=args.ref, staged=False)
+            target = f"相对 {args.ref} 的差异"
+        else:
+            hits = scan_diff(_staged_diff(), rev=None, staged=True)
+            target = "staged 新增内容"
+    except (RuntimeError, OSError) as e:
+        # OSError：提交信息文件读不到（钩子参数错误等）——同样属于「扫描没跑」
+        print(
+            f"[forbidden-refs] 扫描未执行，拒绝放行：{e}\n"
+            "请检查 git 环境/基线引用/提交信息文件后重试",
+            file=sys.stderr,
+        )
+        return 2
 
     if hits:
         print(f"检测到编号引用（{target}），请改为说明「为什么」与失败模式：")

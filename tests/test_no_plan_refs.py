@@ -11,6 +11,7 @@ test_icon_manifest.py 同属「仓库不变量」测试。
 注意：本文件的自证样例在运行期拼接编号（见 _ref），避免测试自身被规则命中。
 """
 
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -171,6 +172,84 @@ def test_js_trailing_comment_is_scanned(line: str, expected: bool) -> None:
 def test_strip_git_commentary_keeps_only_message_body() -> None:
     raw = "subject\n\nbody\n# comment\n# ------------------------ >8 ------------------------\ndiff\n"
     assert strip_git_commentary(raw) == "subject\n\nbody"
+
+
+def test_git_failure_refuses_to_pass(monkeypatch: pytest.MonkeyPatch) -> None:
+    """git 取不到差异时必须退出码 2（扫描未执行），不得当作空 diff 放行。
+
+    此前 _git 抛 RuntimeError 直上 main 之外，靠 traceback 以退 1 结束；
+    语义上与「命中」不可区分，也让调用方无法判断「扫描没跑」。与
+    scripts/secret_scan.py 同口径。
+    """
+    from scripts import forbidden_refs
+
+    def _boom(args: list[str], *, cwd: Path | None = None) -> str:
+        raise RuntimeError("git diff 失败")
+
+    monkeypatch.setattr(forbidden_refs, "_git", _boom)
+    assert forbidden_refs.main([]) == 2
+
+
+def _commit_range(base: str) -> list[str]:
+    """返回 base..HEAD 的提交 sha 列表（无提交时为空）。"""
+    out = subprocess.run(
+        ["git", "log", "--format=%H", f"{base}..HEAD"],
+        cwd=_ROOT,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+    )
+    return out.stdout.split()
+
+
+def _commit_message(sha: str) -> str:
+    out = subprocess.run(
+        ["git", "show", "-s", "--format=%B", sha],
+        cwd=_ROOT,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+    )
+    return out.stdout
+
+
+def test_local_commit_messages_are_clean() -> None:
+    """本地领先 origin/master 的提交信息不得含编号引用。
+
+    commit-msg 钩子覆盖提交前，但可被 --no-verify 绕过，且直接推 master 的
+    路径没有 CI 兜底（CI 侧的提交信息扫描见 quality-gates.yml 的对应 step）。
+    基线不可得时 skip 并说明原因：浅克隆/新建仓库没有 origin/master，
+    此时报错会逼人 --no-verify，比跳过更糟。
+    """
+    base = "origin/master"
+    probe = subprocess.run(
+        ["git", "rev-parse", "--verify", "--quiet", base],
+        cwd=_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if probe.returncode != 0:
+        pytest.skip(f"本地无 {base} 基线（浅克隆或新建仓库），跳过提交信息检查")
+
+    offenders = [
+        (sha[:8], hit)
+        for sha in _commit_range(base)
+        for hit in scan_commit_message(_commit_message(sha))
+    ]
+    if offenders:
+        detail = "\n".join(
+            f"  {sha} [{hit.rule}] {hit.text[:120]}" for sha, hit in offenders
+        )
+        pytest.fail(
+            "本地提交信息含编号引用（仓库外读者无法据此还原上下文）：\n"
+            f"{detail}\n"
+            "请用「行为变化」描述取代，勿写审查报告条目号 / 计划产物编号 / 流水号。"
+        )
 
 
 def test_tracked_files_independent_of_cwd(monkeypatch: pytest.MonkeyPatch) -> None:

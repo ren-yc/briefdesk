@@ -88,10 +88,14 @@ powershell -ExecutionPolicy Bypass -File scripts/install-hooks.ps1
 
 - **豁免**（不视为编号引用）：可跟踪的 issue / PR 编号（如 `Fixes #123`，便于外部读者回查）、编码名与标准编号（UTF-8、RFC 5987）、静态检查码（`noqa: F401` 一类）、依赖版本号（小写 `v1.2.3`）、控制字符名（C0 / C1）、领域指标名（如 F 值类指标）、少量固定技术缩写（ES6、MD5、延迟分位等，名单见 `scripts/forbidden_refs.py` 的 `_EXEMPT`）。豁免是**剥离片段后再扫**：同一行夹带的其它编号照常判定。JS 代码行末尾的 `//` 注释与整行注释同口径。提交信息只扫真正入库的部分（`#` 注释行与 `git commit -v` 的 diff 不算）。
 - **例外**：确实需要在注释里保留某个编号时，在同一行写 `allow-plan-ref` 并说明理由。
+- **扫描面**（决定「漏写会不会被拦」，改动本节时须同步 `iter_segments`）：
+  - **在面内**：`.py .js .mjs .md .yml .yaml .toml .ps1 .sh` 的注释与文档正文，以及提交信息（subject + body，`#` 注释行与 scissors 之后的 diff 不算）。JS 的行内尾注释与整行注释同口径。
+  - **不在面内**：无此类片段的文件（`.html .css .svg .json .example` 等，含 `ui/index.html` 的 HTML 注释与 `ui/style.css` 的 `/* */`）——扫描器对它们返回空片段。往这些文件写注释时不享受门禁兜底，需人工复核。
+  - `_EXEMPT` 白名单按**实际命中**增补（当前含少量仓库内暂未出现的防御项）；新增条目要写明它为什么与条目码同形却不是编号。
 - **工具与门禁**：
   - 本地提交：`scripts/install-hooks.ps1` 安装的 pre-commit（密钥 + 编号）与 commit-msg（提交信息）钩子；
-  - 命令行：`python scripts/forbidden_refs.py`（扫描 staged）、`--ref origin/master`（扫描差异）、`--tree`（全量）、`--message-file <路径>`（提交信息）；
-  - 门禁：`tests/test_no_plan_refs.py` 随 pytest 一起跑，对全库注释 / 文档 **0 容忍**（存量已清理完毕）。
+  - 命令行：`python scripts/forbidden_refs.py`（扫描 staged）、`--ref origin/master`（扫描差异）、`--tree`（全量）、`--message-file <路径>`（提交信息）。退出码：0 = 无命中、1 = 命中、**2 = 扫描未执行（git 取差异失败，拒绝放行——空 diff 不等于干净）**；
+  - 门禁：`tests/test_no_plan_refs.py` 随 pytest 一起跑，对全库注释 / 文档 **0 容忍**（存量已清理完毕），并覆盖本地领先 `origin/master` 的提交信息（无基线时 skip）；CI 另有独立的提交信息扫描 step，覆盖直接推 master 的路径。
 
 ### 隐私与敏感数据扫描
 

@@ -103,7 +103,27 @@ jobs:
           fi
           python scripts/forbidden_refs.py --ref "$before"
 
-      # AGENTS.md's 4th gate. The pre-commit hook only runs the secret scan, so
+      # AGENTS.md「注释、文档与提交信息规范」：提交信息只能靠 rebase 事后修订，
+      # 本地 commit-msg 钩子可被 --no-verify 绕过；直接推 master 的路径也没有 PR
+      # 审查兜底，只有 CI 能拦。范围口径与上方两个差异扫描一致（PR 用 origin/master，
+      # push 用 event.before），逐条取出提交信息文本交给扫描器。
+      - name: Forbidden plan-reference scan (commit messages)
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            git fetch origin master
+            base="origin/master"
+          else
+            base="${{ github.event.before }}"
+            if [ -z "$base" ] || [ "$base" = "0000000000000000000000000000000000000000" ]; then
+              git fetch origin master
+              base="origin/master"
+            fi
+          fi
+          for sha in $(git log --format=%H "$base"..HEAD); do
+            git show -s --format=%B "$sha" > "$RUNNER_TEMP/commit-msg.txt"
+            python scripts/forbidden_refs.py --message-file "$RUNNER_TEMP/commit-msg.txt" || exit 1
+          done      # AGENTS.md's 4th gate. The pre-commit hook only runs the secret scan, so
       # without this step the check rests on the author remembering it.
       # Diffing against the empty-tree SHA covers every tracked file instead of
       # a push range: same behaviour on push and PR, and no all-zeros base to
