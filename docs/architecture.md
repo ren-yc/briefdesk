@@ -793,8 +793,9 @@ WARNING）的日志噪音；`fmt_dur()` 统一耗时格式。
 - **生命周期**：`setup_all`（HTTP 启动前、DB 就绪后）→ `activate_all`（服务器就绪后）→ `teardown_all`（逆序幂等）。消息源预热（去重缓存等）与监听启动
   等顺序约束由该阶段划分承载。
 - **失败隔离**：单插件失败只降级 disabled/failed 并记日志；setup/activate 异常路径先 best-effort teardown 回收半装配副作用再标
-  failed（teardown 异常吞成 DEBUG 不掩盖原始错误；`PluginDisabledError` 自禁用不走此路径）；`PLUGINS_REQUIRED` 名单内的失败抛
-  `PluginError` 致命中止启动。
+  failed（teardown 异常吞成 DEBUG 不掩盖原始错误；`PluginDisabledError` 自禁用不走此路径）。`PLUGINS_REQUIRED` 校验贯穿**发现 → 装配 → 激活**：
+  名单内插件未发现、未列入 `PLUGINS`、互斥落选、未知依赖/依赖环、setup/activate 失败、**依赖插件 activate 失败**，任一情形都抛
+  `PluginError` 致命中止；可选插件的依赖 activate 失败时依赖方一并标 failed（`_verify_required` 在 `setup_all`/`activate_all` 末尾各核对一次）。
 - **setup 失败补偿契约（规范性）**：资源获取先于注册；任何注册行为（`ctx.ai`/`ctx.dedup`/`register_stage`/`subscribe_event`/
   `set_ai` 等）必须可被插件自身 teardown 幂等回收——setup 内所有可失败步骤完成后再做端口注册，失败窗口即不残留半装配端口
   （内置 ai_provider/dedup 已按此实现：注册后无可失败步骤，teardown 清 `ai_ports`/`ctx.ai`/`ctx.dedup`）；第三方插件同受此约束。

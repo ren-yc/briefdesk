@@ -137,8 +137,9 @@ StagePlugin 参与消息处理管道。管道骨架 `briefdesk/pipeline.py` 按�
 - `conflicts` 声明互斥（如 weflow 与 weflow-legacy 二选一）：互斥对同时入选时按
   PLUGINS 列表位置先列者保留，落选者 disabled 并注明原因；**与核心插件互斥时可选侧
   让位**（核心恒胜）。
-- `PLUGINS_REQUIRED` 名单内的插件装配失败会抛 `PluginError` 致命中止启动（默认为空，
-  全部失败隔离降级）。
+- `PLUGINS_REQUIRED` 名单内的插件**未发现、未列入 `PLUGINS`、互斥落选、未知依赖/依赖环、
+  setup/activate 失败、依赖插件 activate 失败**都会抛 `PluginError` 致命中止启动（默认为空，
+  全部失败隔离降级）；可选插件自身失败不额外连坐依赖方，但依赖方会因「依赖激活失败」标 failed。
 
 ## 5. 事件订阅与端口获取
 

@@ -234,6 +234,9 @@ class PluginManager:
             self._initialized.add(name)
             self._load_order.append(name)
             logger.info("插件已加载: %s %s", name, rec.version)
+        # 收口核对：PLUGINS_REQUIRED 名单内未发现/未列入 PLUGINS/互斥落选/未知
+        # 依赖/依赖环都不会走到上面的四个分支，只有这里能拦住
+        self._verify_required("装配")
 
     async def activate_all(self, ctx: PluginContext) -> None:
         """按加载序 activate；失败插件降级 failed（required 致命）。"""
@@ -241,6 +244,20 @@ class PluginManager:
             rec = self._records[name]
             plugin = rec.plugin
             if plugin is None:
+                continue
+            # 依赖插件 activate 失败时依赖方不可用：_load_order 是拓扑序，检查时
+            # 依赖状态已定。继续 activate 会让依赖方在残缺环境里保持 loaded。
+            failed_deps = [
+                d
+                for d in rec.dependencies
+                if self._records.get(d) is not None
+                and self._records[d].status == "failed"
+            ]
+            if failed_deps:
+                await self._best_effort_teardown(name, plugin)
+                self._mark(name, "failed", f"依赖激活失败: {', '.join(failed_deps)}")
+                logger.error("插件 %s 因依赖激活失败而不可用: %s", name, rec.reason)
+                self._fail_if_required(name)
                 continue
             try:
                 await plugin.activate(ctx)
@@ -251,6 +268,7 @@ class PluginManager:
                 self._mark(name, "failed", f"activate 失败: {e!r}")
                 logger.exception("插件 %s activate 失败", name)
                 self._fail_if_required(name)
+        self._verify_required("激活")
 
     async def teardown_all(self) -> None:
         """按 setup 逆序 teardown（幂等）；单插件失败不影响其余。"""
@@ -522,3 +540,23 @@ class PluginManager:
     def _fail_if_required(self, name: str) -> None:
         if name in self._settings.plugins_required:
             raise PluginError(f"必选插件 {name} 装配失败: {self._records[name].reason}")
+
+    def _verify_required(self, phase: str) -> None:
+        """PLUGINS_REQUIRED 逐项核对（setup_all / activate_all 末尾各一次）。
+
+        未发现（entry point 缺失/ PLUGIN_PATH 未指到）或最终状态非 loaded
+        （未列入 PLUGINS 的自禁用、互斥落选、未知依赖、依赖环、setup/activate
+        失败、依赖激活失败）都在此致命中止——这些分支的既有 _fail_if_required
+        调用只在「名字确实在记录里且恰好走到该分支」时才触发。
+        """
+        for name in self._settings.plugins_required:
+            rec = self._records.get(name)
+            if rec is None:
+                raise PluginError(
+                    f"必选插件 {name} 未发现（{phase}）：检查 entry point 或 PLUGIN_PATH"
+                )
+            if rec.status != "loaded":
+                raise PluginError(
+                    f"必选插件 {name} 在{phase}后未就绪（{rec.status}）: "
+                    f"{rec.reason or '未启用'}"
+                )

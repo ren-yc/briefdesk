@@ -176,6 +176,74 @@ class TestSetupOrder(_ManagerTestBase):
         assert "未启用" in manager.records()["opt"].reason
 
 
+class TestRequiredCoverage(_ManagerTestBase):
+    """PLUGINS_REQUIRED 校验贯穿发现 → 装配 → 激活。
+
+    只覆盖到 setup 四个分支与 activate except 时，未发现/未列入 PLUGINS/互斥
+    落选/未知依赖/依赖环/依赖激活失败都会静默降级——启动看似成功，必需的
+    消息源却不在运行时里。
+    """
+
+    async def test_required_unknown_name_raises(self):
+        manager = PluginManager(make_settings(plugins_required=["ghost"]))
+        with pytest.raises(PluginError, match="未发现"):
+            await manager.setup_all(make_ctx())
+
+    async def test_required_optional_not_selected_raises(self):
+        manager = PluginManager(make_settings(plugins=[], plugins_required=["a"]))
+        manager.register(FakePlugin("a"))
+        with pytest.raises(PluginError, match="未启用"):
+            await manager.setup_all(make_ctx())
+
+    async def test_required_unknown_dependency_raises(self):
+        manager = PluginManager(make_settings(plugins=["a"], plugins_required=["a"]))
+        manager.register(FakePlugin("a", dependencies=("nope",)))
+        with pytest.raises(PluginError, match="未就绪"):
+            await manager.setup_all(make_ctx())
+
+    async def test_required_cycle_raises(self):
+        manager = PluginManager(
+            make_settings(plugins=["a", "b"], plugins_required=["a"])
+        )
+        manager.register(FakePlugin("a", dependencies=("b",)))
+        manager.register(FakePlugin("b", dependencies=("a",)))
+        with pytest.raises(PluginError, match="未就绪"):
+            await manager.setup_all(make_ctx())
+
+    async def test_required_conflict_loser_raises(self):
+        manager = PluginManager(
+            make_settings(plugins=["b", "a"], plugins_required=["a"])
+        )
+        manager.register(FakePlugin("a", conflicts=("b",)))
+        manager.register(FakePlugin("b", conflicts=("a",)))
+        with pytest.raises(PluginError, match="未就绪"):
+            await manager.setup_all(make_ctx())
+
+    async def test_dependency_activate_failure_marks_dependent_failed(self):
+        calls: list = []
+        manager = PluginManager(make_settings(plugins=["b", "a"]))
+        manager.register(
+            FakePlugin("a", calls=calls, activate_error=RuntimeError("boom"))
+        )
+        manager.register(FakePlugin("b", dependencies=("a",), calls=calls))
+        await manager.setup_all(make_ctx())
+        await manager.activate_all(make_ctx())
+        rec = manager.records()["b"]
+        assert rec.status == "failed"
+        assert "a" in (rec.reason or "")
+        assert ("teardown", "b") in calls, "依赖方须 best-effort 回收"
+
+    async def test_dependency_activate_failure_raises_when_dependent_required(self):
+        manager = PluginManager(
+            make_settings(plugins=["b", "a"], plugins_required=["b"])
+        )
+        manager.register(FakePlugin("a", activate_error=RuntimeError("boom")))
+        manager.register(FakePlugin("b", dependencies=("a",)))
+        await manager.setup_all(make_ctx())
+        with pytest.raises(PluginError, match="依赖激活失败"):
+            await manager.activate_all(make_ctx())
+
+
 class TestFilter(_ManagerTestBase):
     async def test_allowlist_filters_optional_plugins(self):
         calls: list = []
