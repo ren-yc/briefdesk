@@ -1227,6 +1227,14 @@ class BackupTempFileLifecycleTest(unittest.TestCase):
             rules = f.read()
         self.assertIn("*.restore-pending", rules)
 
+    def test_gitignore_covers_pre_restore(self):
+        """恢复前原库副本（含 PII）同样不得入库。"""
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(root, ".gitignore"), encoding="utf-8") as f:
+            rules = f.read()
+        for pattern in ("*.pre-restore", "*.pre-restore-wal", "*.pre-restore-shm"):
+            self.assertIn(pattern, rules)
+
 
 class SessionToggleRouteTest(unittest.TestCase):
     """会话开关路由：锁内两步写、404、监听缓存失效。"""

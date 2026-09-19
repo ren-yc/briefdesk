@@ -108,3 +108,4 @@ A: 需同时满足：`AI_VISION_ENABLED=true`、`ocr` 插件已启用、模型�
 
 - 所有数据存于本地 SQLite（`briefdesk.sqlite`，可经 `DB_PATH` 配置）；消息内容经脱敏后处理，密钥走系统钥匙串不落明文。
 - 导出与备份：`GET /api/export/items`（CSV）、`GET /api/backup`（SQLite 备份下载）、`POST /api/restore`（上传恢复，重启生效）。
+  恢复时原库会保留为 `{DB_PATH}.pre-restore`（只留最近一代，含隐私数据，已在 `.gitignore` 中排除），替换失败会自动回滚并保留待恢复文件。

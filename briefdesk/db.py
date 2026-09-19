@@ -806,9 +806,9 @@ async def validate_restore_file(path: str) -> str | None:
 async def apply_pending_restore() -> bool:
     """启动时应用待恢复备份（{db_path}.restore-pending）→ 覆盖正式库。
 
-    校验通过才替换（并清理旧 -wal/-shm，避免旧 WAL 污染新文件）；
-    校验失败则删除 pending 并记录错误，不阻断启动。
-    返回是否发生了替换。
+    校验通过才替换：原库改名保留一代副本（{db_path}.pre-restore，三件）→ 替换；
+    替换失败回滚并保留 pending（下次启动重试）。校验失败则删除 pending 并记录
+    错误，不阻断启动。返回是否发生了替换。
     """
     import os
 
@@ -823,12 +823,32 @@ async def apply_pending_restore() -> bool:
         except OSError:
             pass
         return False
-    for suffix in ("", "-wal", "-shm"):
-        p = config.db_path + suffix
-        if os.path.exists(p):
-            os.remove(p)
-    os.replace(pending, config.db_path)
-    logger.info("已应用恢复备份: %s", config.db_path)
+    backup = f"{config.db_path}.pre-restore"
+    suffixes = ("", "-wal", "-shm")
+    # 1) 原库三件改名为 .pre-restore 三件（覆盖上一代副本；SQLite 以 <db>-wal/-shm
+    #    命名附属文件，副本沿用同规则，必要时可直接用 sqlite 打开 .pre-restore 检视）
+    moved: list[str] = []
+    for suffix in suffixes:
+        src, dst = config.db_path + suffix, backup + suffix
+        if os.path.exists(dst):
+            os.remove(dst)
+        if os.path.exists(src):
+            os.replace(src, dst)
+            moved.append(suffix)
+    # 2) 替换；失败则把三件改回去，pending 保留供下次启动重试。
+    #    此前先 os.remove 主库再 os.replace：替换失败（权限/杀软占用）时原库已删、
+    #    pending 仍在——下次启动没有可用数据库。
+    try:
+        os.replace(pending, config.db_path)
+    except OSError as e:
+        logger.error("应用恢复备份失败（%s），已回滚原库；待恢复文件保留，下次启动重试", e)
+        for suffix in moved:
+            os.replace(backup + suffix, config.db_path + suffix)
+        return False
+    logger.info(
+        "已应用恢复备份: %s（原库保留为 %s，下次恢复时覆盖；含隐私数据）",
+        config.db_path, backup,
+    )
     return True
 
 

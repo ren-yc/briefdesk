@@ -1493,25 +1493,76 @@ class TestBackupRestore:
         finally:
             await conn.close()
 
+    async def _titles(self, path: str) -> list[str]:
+        conn = await aiosqlite.connect(path)
+        try:
+            conn.row_factory = aiosqlite.Row
+            cursor = await conn.execute("SELECT title FROM items")
+            return [r["title"] for r in await cursor.fetchall()]
+        finally:
+            await conn.close()
+
     async def test_apply_pending_restore_replaces_main(self):
         await self._build_db(self.main_path, "主库A")
         await self._build_db(self.bak_path, "备份B")
 
-        async def _titles(path: str) -> list[str]:
-            conn = await aiosqlite.connect(path)
-            try:
-                conn.row_factory = aiosqlite.Row
-                cursor = await conn.execute("SELECT title FROM items")
-                return [r["title"] for r in await cursor.fetchall()]
-            finally:
-                await conn.close()
-
-        assert await _titles(self.main_path) == ["主库A"]
+        assert await self._titles(self.main_path) == ["主库A"]
         shutil.copyfile(self.bak_path, self.main_path + ".restore-pending")
         config.db_path = self.main_path
         assert await apply_pending_restore()
         assert not os.path.exists(self.main_path + ".restore-pending")
-        assert await _titles(self.main_path) == ["备份B"]
+        assert await self._titles(self.main_path) == ["备份B"]
+
+    async def test_apply_pending_restore_keeps_pre_restore_copy(self):
+        """替换成功后原库保留为 .pre-restore，供人工回退。"""
+        await self._build_db(self.main_path, "主库A")
+        await self._build_db(self.bak_path, "备份B")
+        shutil.copyfile(self.bak_path, self.main_path + ".restore-pending")
+        config.db_path = self.main_path
+
+        assert await apply_pending_restore()
+        assert await self._titles(self.main_path) == ["备份B"]
+        assert os.path.exists(self.main_path + ".pre-restore")
+        assert await self._titles(self.main_path + ".pre-restore") == ["主库A"]
+
+    async def test_apply_pending_restore_rolls_back_when_replace_fails(self):
+        """替换失败必须回滚原库并保留 pending，不能留下无可用数据库的状态。"""
+        await self._build_db(self.main_path, "主库A")
+        await self._build_db(self.bak_path, "备份B")
+        shutil.copyfile(self.bak_path, self.main_path + ".restore-pending")
+        config.db_path = self.main_path
+
+        real_replace = os.replace
+
+        def failing_replace(src, dst):
+            if str(src).endswith(".restore-pending"):
+                raise OSError("locked")
+            return real_replace(src, dst)
+
+        with patch("os.replace", side_effect=failing_replace):
+            assert not await apply_pending_restore()
+        assert await self._titles(self.main_path) == ["主库A"]
+        assert os.path.exists(self.main_path + ".restore-pending")
+        assert not os.path.exists(self.main_path + ".pre-restore")
+
+    async def test_second_restore_overwrites_previous_copy(self):
+        """副本只保留最近一代：第二次恢复覆盖第一次的副本。"""
+        await self._build_db(self.main_path, "第一代")
+        await self._build_db(self.bak_path, "备份一")
+        config.db_path = self.main_path
+
+        shutil.copyfile(self.bak_path, self.main_path + ".restore-pending")
+        assert await apply_pending_restore()
+        assert await self._titles(self.main_path) == ["备份一"]
+        assert await self._titles(self.main_path + ".pre-restore") == ["第一代"]
+
+        # 第二次备份在独立文件上构建（bak_path 复用会把上一次的条目带进来）
+        second = os.path.join(self.tmpdir, "bak2.sqlite")
+        await self._build_db(second, "备份二")
+        shutil.copyfile(second, self.main_path + ".restore-pending")
+        assert await apply_pending_restore()
+        assert await self._titles(self.main_path) == ["备份二"]
+        assert await self._titles(self.main_path + ".pre-restore") == ["备份一"]
 
     async def test_invalid_pending_ignored(self):
         await self._build_db(self.main_path, "主库A")
