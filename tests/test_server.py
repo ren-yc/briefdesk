@@ -910,6 +910,105 @@ class IgnoreClearsDedupCacheEventTest(unittest.TestCase):
         dedup.add_to_cache.assert_called_once()
 
 
+class EventPublishFollowsActualEffectTest(unittest.TestCase):
+    """批量/级联操作只在确有变更时发布事件或回写去重缓存。
+
+    无条件发布时，affected == 0 的操作会把订阅方按「这些 id 已被删除」处理：
+    基准窗口内批量删除/忽略作用于临时库（affected == 0），而生产去重缓存是
+    进程级内存态——照常清掉生产卡片后，相似新消息会重复建卡直到重启；批量
+    备忘/恢复则会把临时库的合成文本灌成生产缓存里的幽灵条目。
+    """
+
+    def _batch(self, action, affected):
+        publish = AsyncMock()
+        dedup = SimpleNamespace(add_to_cache=Mock())
+        with patch.multiple(
+            "briefdesk.server.routes_items",
+            event_bus=SimpleNamespace(publish=publish),
+            delete_items=AsyncMock(return_value=affected),
+            update_items_verify=AsyncMock(return_value=affected),
+            storage_lock=asyncio.Lock(),
+            _stage_context=Mock(return_value=SimpleNamespace(dedup=dedup)),
+            get_item_texts_by_ids=AsyncMock(
+                return_value=[
+                    {
+                        "id": "i1",
+                        "title": "t",
+                        "image_urls": "",
+                        "source": "weflow",
+                        "source_quote": "q",
+                    }
+                ]
+            ),
+        ):
+            client = _client()
+            resp = client.post(
+                "/api/items/batch", json={"ids": ["i1"], "action": action}
+            )
+            client.close()
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()["affected"], affected)
+        return publish, dedup
+
+    def test_delete_without_effect_publishes_nothing(self):
+        publish, _ = self._batch("delete", 0)
+        publish.assert_not_awaited()
+
+    def test_delete_with_effect_publishes(self):
+        publish, _ = self._batch("delete", 1)
+        publish.assert_awaited_once_with(EVENT_ITEMS_DELETED, ["i1"])
+
+    def test_ignore_without_effect_publishes_nothing(self):
+        publish, _ = self._batch("ignore", 0)
+        publish.assert_not_awaited()
+
+    def test_memo_without_effect_skips_dedup_resync(self):
+        _, dedup = self._batch("memo", 0)
+        dedup.add_to_cache.assert_not_called()
+
+    def test_memo_with_effect_readds_to_dedup_cache(self):
+        _, dedup = self._batch("memo", 1)
+        dedup.add_to_cache.assert_called_once()
+
+    def test_category_cascade_delete_without_items_publishes_nothing(self):
+        publish = AsyncMock()
+        with patch.multiple(
+            "briefdesk.server.routes_categories",
+            delete_category=AsyncMock(return_value=({"id": 3, "name": "虚构类别"}, [])),
+            event_bus=SimpleNamespace(publish=publish),
+            storage_lock=asyncio.Lock(),
+            publish_items_updated=AsyncMock(),
+        ):
+            client = _client()
+            resp = client.post(
+                "/api/categories/3/delete", json={"purgeItems": True}
+            )
+            client.close()
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()["deletedItems"], 0)
+        publish.assert_not_awaited()
+
+    def test_category_cascade_delete_with_items_publishes(self):
+        publish = AsyncMock()
+        with patch.multiple(
+            "briefdesk.server.routes_categories",
+            delete_category=AsyncMock(
+                return_value=({"id": 3, "name": "虚构类别"}, ["a", "b"])
+            ),
+            event_bus=SimpleNamespace(publish=publish),
+            storage_lock=asyncio.Lock(),
+            publish_items_updated=AsyncMock(),
+        ):
+            client = _client()
+            resp = client.post(
+                "/api/categories/3/delete", json={"purgeItems": True}
+            )
+            client.close()
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()["deletedItems"], 2)
+        publish.assert_awaited_once_with(EVENT_ITEMS_DELETED, ["a", "b"])
+
+
 if __name__ == "__main__":
     unittest.main()
 
