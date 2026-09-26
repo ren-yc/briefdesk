@@ -232,7 +232,7 @@ class RunAvailabilityTest(unittest.TestCase):
     """运行期间界面照常可用——子进程模式的**机制保证**。
 
     两条用户可见收益都系在同一个不变量上：父进程**从不重定向**自己的连接，
-    因此 `db.in_redirect()` 恒为假，中间件的写闸门与读黑名单整段不生效。这里
+    界面侧也没有任何闸门（写闸门与读黑名单已随窗口机制删除）。这里
     断言的就是这个不变量，以及它带来的可观测后果（写请求会走到处理器而不是被
     409 拦下）。
 
@@ -246,7 +246,6 @@ class RunAvailabilityTest(unittest.TestCase):
         from starlette.testclient import TestClient
 
         import briefdesk.server as srv
-        from briefdesk import db as briefdesk_db
         from briefdesk.plugins.benchmark import router as bench_router
         from briefdesk.plugins.benchmark import supervisor
 
@@ -272,12 +271,7 @@ class RunAvailabilityTest(unittest.TestCase):
                         self.assertEqual(resp.status_code, 200, resp.text)
                         self.assertTrue(resp.json()["started"])
 
-                        # 运行期间：没有重定向（这就是闸门不生效的原因）
-                        self.assertFalse(
-                            briefdesk_db.in_redirect(),
-                            "子进程模式不得重定向父进程的连接",
-                        )
-                        # 写请求走到处理器（400 = body 非法）而不是被闸门 409
+                        # 写请求走到处理器（400 = body 非法），不是被任何闸门拦下
                         blocked = client.post(
                             "/api/items/batch", json={"ids": [], "action": "ignore"}
                         )

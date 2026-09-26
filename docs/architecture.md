@@ -415,11 +415,7 @@ toggle_session / update_category / delete_category / bulk_insert_raw_messages / 
 SQLite 变量上限整批崩；用点：are_messages_processed / delete_category 级联 / get_item_texts_by_ids /
 get_items_verified_flags / get_session_last_polls，update_items_verify/delete_items 已迁（fetch=False 逐块
 累
-计返回 rowcount，overload 按 fetch 字面量区分返回类型）；临时隔离库（基准运行）经 `db_redirect`——进出都在 `storage_lock` 内交换/还原主/向量单例并同步置位/清除
-`in_redirect()`（交换段内不得插入 await，否则出现「标志已置位而单例仍是生产库」的分叉窗口；锁内交换同时消除「一部分写落生产库、一部分落临时库」的
-跨事务交错），还原**不依赖取锁成功**、两条临时连接在外层 finally 关闭（取消落在退出取锁 await 上时漏关 = 非 daemon worker 线程让解释器退出挂死），半程失败关
-已建连接，应用已有连接不动。**`in_redirect()` 是窗口判据**（布尔标志，不可嵌套；持 `storage_lock` 调用 `db_redirect` 会自锁死）：去重缓存挂起、RAG 维护跳过、备份的数据库层
-防线、导出产出点守卫与 server 写闸门共用它判窗口）。**默认分类迁移（PRAGMA user_version 门控）**：v0→1 补齐 5→13 类；v1→2 活动通知口径追加「面向全群的多项任务/材料提交截止通知（含各项截止日期）按本类
+计返回 rowcount，overload 按 fetch 字面量区分返回类型）。**默认分类迁移（PRAGMA user_version 门控）**：v0→1 补齐 5→13 类；v1→2 活动通知口径追加「面向全群的多项任务/材料提交截止通知（含各项截止日期）按本类
 收
 录」，仅更新仍等于旧版原文的行（尊重用户编辑），一次性不覆盖。
 
@@ -439,8 +435,7 @@ sessions toggle、recategorize（`update_item_category` 读-改-写多步事务�
  sessions/refresh 的落库段（后者回调内持锁、网络拉取在锁外）——单连接隐式事务下锁外 commit 会把管道未完成的多步写一并提交（部分写入提前可见）；verify(-1) 同样在锁内
 发布 `EVENT_ITEMS_DELETED` 同步清去重内存缓存, `GET /api/export/items`（CSV 导出，筛选参数与 `/api/items` 一致）,
 `GET /api/export/recat-samples`（导出人工改类样本 jsonl/csv，内容已脱敏；两处导出均经 `_csv_cell` 公式注入转义—
-—`=`/`+`/`-`/`@`/TAB/CR/LF 前缀前置单引号）, `GET /api/backup`（SQLite 在线备份下载，WAL 安全可运行中执行；基准窗口内 409——`backup_db_to` 在取源连接**之前**判 `in_redirect()` 并抛
-`BackupDuringRedirectError`，路由转 409 且只清理、不记 ERROR；临时库能通过恢复校验的全部三项，假备份「日后恢复即整库替换」，必须在产出点拦）/
+—`=`/`+`/`-`/`@`/TAB/CR/LF 前缀前置单引号）, `GET /api/backup`（SQLite 在线备份下载，WAL 安全可运行中执行）/
 `POST /api/restore`（上传校验后暂存 `{db_path}.restore-pending`，重启应用生效；临时文件必须落在库文件同目录——`os.replace` 不允许跨文件系统
 ，mkstemp 缺省走系统 TEMP 时与 DB_PATH 跨盘（Windows 典型）必然 WinError 17 使恢复整体不可用；启动应用时原库先改名为 `{db_path}.pre-restore`（三件）再替换，替换失败自动改回并保留 pending（改回本身失败也不抛出：副本与 pending 都保留，下次启动检测到「主库缺失且存在副本」先补完回滚再重试恢复——否则下次启动会把这份唯一副本当上一代副本删掉）；副本只留最近一代、下次恢复覆盖，含隐私数据，与 `*.sqlite` 同口径 gitignore）, `GET /api/sessions`,
 `POST /api/sessions/:source/:session_id/toggle`, `POST /api/sessions/refresh`, `POST /api/sync`,
@@ -507,24 +502,7 @@ tests/test_web_plugins.py 的核心前端边界守卫测试覆盖）。`GET /api
 `briefdesk/plugins/benchmark/config.py`（`BENCHMARK_` 前缀归插件所有，经 `settings_schema()` 自动出现在设置页）。运行环境
 `providers.bench_environment`（Web 与 CLI 共用同一套门闸）分两个阶段：
 
-1. **准备阶段（DB 仍是生产库）**：`pipeline.set_processing_paused(True)` 暂停生产管道（process_all_batches 顶部直接返回 False，实时消息不入库不标
-   processed、延后下轮回填恢复），发布 `benchmark_preparing` 公告，然后等待在途批次排空。等待用**无进展阈值**而非总时长上限：进展信号（`pendingCount` /
-   `activeBatches`）都是批粒度的，只在批边界变化，而单批内部的两段 AI 调用可能比任何固定总超时都慢，固定超时会误杀正常推进的慢批——计数连续无变化达
-   `BENCHMARK_DRAIN_STALL_SECONDS`（默认 720s）才抛错中止本次基准（不再带警告继续重定向：继续会让在途批次写落进临时库并在生产去重缓存留下幽灵条目）。
-   该公告**不得**声称拒绝写操作——此阶段写操作自洽且安全；
-2. **窗口阶段（DB 已重定向）**：排空后发布 `benchmark_running` 公告，再经 `db.db_redirect(bench.sqlite)` 官方缝把主/向量连接重定向到临时库（缝内
-   半程失败自动关闭已建连接；窗口内 `get_db`/`get_embed_db` 调用均落临时库）。此时全部 UI 写路由、备份与导出被 server 中间件的闸门拒绝（见
-   `briefdesk/server/`），与 DB 耦合的内存派生状态同步挂起：去重缓存的 `add_to_cache`/`remove_items` 直接 no-op（否则生产卡片退出判重、或灌入幽灵
-   条目），RAG 维护循环以 5s 短轮询安静跳过、引擎内 `maintenance_gc`/`_refresh_vector_cache` 加守卫且 `force_full` 的水位归零下移到守卫之后（归零会让
-   删除检测恒为假）。**周期同步不是 HTTP 路由**，闸门挡不住它——它写入的同样是临时库（随后丢弃），无害但不要以为所有写者都被冻住。
-
-退出 finally 逆序收尾：撤销两条公告（幂等，排空中止路径只有「准备中」）→ 复位暂停标志 → 还原 AI 端口 → 删子目录；`db_redirect` 的还原先于本 finally。
-撤销公告是本段**唯一**的可取消点，而 `CancelledError` 是 `BaseException` 子类、`except Exception` 拦不住（插件 teardown 会取消运行中的基准任务）——故复位段包在**外层
-`try/finally`** 里，取消落在 `revoke` 上时两个复位仍必达；两者相邻且其间无 await，事件循环内原子（顺序不得调整，否则会新开「管道已放行而 AI 端口未还原」的窗口）。
-删子目录留在保护段之外：取消路径上不值得为它多付一次线程跳转与磁盘删除，遗留的运行目录（插件包 `.tmp/` 内、已 gitignore）属接受项。
-**插件 teardown 会取消并限时等待运行中的基准任务**（本地实现，超时 5s）：关闭序列是 teardown_all → close_db，若任务活到 close_db 之后才被取消，
-`db_redirect` 会把单例还原为**从未关闭的生产连接**，残留的 aiosqlite 非 daemon worker 线程让解释器退出挂死。临时库落本次运行专属 uuid 子目录
-`.tmp/bench-<hex>/bench.sqlite`（插件包内 `.tmp/`），退出只删该子目录——共享 `.tmp` 根内其它内容（如并行 CLI 目录）不受影响。
+基准运行的隔离与生命周期见 `briefdesk/plugins/benchmark/supervisor.py`（父进程侧：spawn 子进程、运行目录与 `meta.json` 终态记录、无进展看门狗、取消入口、目录轮转）与 `briefdesk/plugins/benchmark/runner.py`（子进程侧：自己的 scratch 库与产物清单）。父进程**不再**重定向自己的连接，界面侧没有任何闸门；运行期间只是把生产管道暂停（`benchmark_paused` 公告），实时消息延后到下轮回填。
 
 #### briefdesk/sources_base.py
 

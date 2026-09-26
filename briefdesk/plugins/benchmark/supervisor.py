@@ -40,8 +40,7 @@ logger = logging.getLogger(__name__)
 RUN_ROOT = Path(__file__).resolve().parent / ".tmp" / "runs"
 CASES_SRC = Path(__file__).resolve().parent / "cases"
 
-# 子进程模式专用的公告码：**不能**复用 benchmark_running——前端是按这个码把列表区
-# 整块替换成占位的，子进程模式下列表区应当照常可用。
+# 基准暂停公告码（前端据此提示「消息处理已暂停」）。
 ANNOUNCE_CODE = "benchmark_paused"
 ANNOUNCE_TEXT = (
     "基准运行中：消息处理已暂停，结束后如未开启周期同步，请点一次同步补齐"

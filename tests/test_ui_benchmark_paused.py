@@ -1,7 +1,7 @@
-"""子进程模式运行期间列表区照常可用（通过 Node vm 执行 ui_benchmark_paused_test.mjs）。
+"""基准运行期间列表区照常可用（通过 Node vm 执行 ui_benchmark_paused_test.mjs）。
 
-旧公告码（benchmark_running）会让前端把列表整块替换成占位——那是进程内路径的语义；
-子进程模式改发 benchmark_paused，列表区必须继续渲染真实卡片，否则运行期间界面等于瘫痪。
+运行只发 benchmark_paused 公告（消息处理暂停）；列表区不因该公告改变，必须继续渲染
+真实卡片，否则运行期间界面等于瘫痪。
 """
 
 import shutil

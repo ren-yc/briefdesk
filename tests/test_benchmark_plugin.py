@@ -902,9 +902,7 @@ class TestTeardownStopsRun:
     """关闭期收口：插件 teardown 必须把运行先停下来（两种模式都要管）。
 
     关闭序列是 teardown_all → close_db。进程内运行期间单例指向临时库，若任务
-    活到 close_db 之后才被取消，db_redirect 的 finally 会把单例还原为**从未
-    关闭的生产连接**，其残留的 aiosqlite 非 daemon worker 线程让解释器退出
-    挂死；子进程模式下则要先把子进程收掉，它才不会继续往 run_dir 里写。
+    活到 close_db 之后才被取消，收尾会去动已经关闭的连接。
     """
 
     async def test_teardown_stops_running_benchmark(self):

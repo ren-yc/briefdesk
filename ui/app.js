@@ -41,9 +41,9 @@ let selectAllBusy = false;
 let saveBusy = false; // 设置弹窗保存防重入
 let isSyncing = false; // 最近一次 fetchData 响应中的 status.syncing
 let pendingChanges = null; // 同步中保存的待应用操作列表（同步完成后执行）
-// 基准运行窗口标志：由公告列表推导（见 renderAnnouncements）。窗口内后端以
-// 写闸门拒绝一切变更请求，列表里是临时基准库的内容——两者都据此提示。
-let benchmarkRunning = false;
+// 基准暂停标志：由公告列表推导（见 renderAnnouncements）。基准运行期间消息处理
+// 会被暂停（界面照常可用），结束时提示用户补一次同步。
+let benchmarkPaused = false;
 let fetchSeq = 0;
 let stream = null;
 let streamReconnectTimer = null;
@@ -778,14 +778,6 @@ function bindSyncButtonEvents() {
       // reqJson 把所有非 2xx 抹平成同一个 Error，拿不回状态码。
       const res = await fetch("/api/sync", { method: "POST" });
       if (res.status === 409) {
-        // 409 有两种成因：已在同步中，或基准窗口内被写闸门拒绝。不读响应体
-        // 会把后者说成「同步已在后台进行中」，用户会一直等一个不会来的结果。
-        let payload = null;
-        try { payload = await res.json(); } catch { /* 非 JSON 响应忽略 */ }
-        if (payload && payload.detail && payload.detail.code === "benchmark_running") {
-          showToast(BENCHMARK_BUSY_MSG, { type: "info", duration: 5000 });
-          return;
-        }
         showToast("同步已在后台进行中，无需重复触发", { type: "info", duration: 4000 });
         return;
       }
@@ -1847,23 +1839,6 @@ function renderItems(items, { full = false } = {}) {
   $emptyState.classList.add("hidden");
   $filteredEmptyState.classList.add("hidden");
 
-  // 基准窗口期：单例指向临时基准库，列表里是由真实聊天派生的合成卡。
-  // 既不展示（避免被当成真实卡片操作），也不走空态分支（窗口内列表常常
-  // 非空）。写操作此时也被后端闸门拒绝，故整块替换为提示。
-  if (benchmarkRunning) {
-    $itemsContainer.innerHTML =
-      '<div class="empty-state"><p>基准运行中，列表暂不可用</p>' +
-      '<p class="text-muted">基准结束后列表会自动恢复。</p></div>';
-    groupMap.clear();
-    viewCounts.chatGroups = 0;
-    updateListCount();
-    updateLoadMore();
-    updateSubsBadge();
-    syncBatchGroupStates();
-    rebuildKbUnits();
-    syncOverlayWithData();
-    return [];
-  }
 
   // 黑名单（显示层过滤）：命中卡片从可见集剔除，工具栏提示隐藏数；
   // 不改变服务端分页/计数口径（「共 N 条」仍是服务端总数）
@@ -3599,11 +3574,10 @@ function renderAnnouncements(announcements) {
     ? announcements.filter(a => a && a.message)
     : null;
   if (raw) {
-    // 窗口标志取**未过滤**的原始列表：用户点掉「基准运行中」横幅只是本会话
-    // 隐藏它，不该因此让列表区重新显示基准临时库里的合成卡
-    const wasRunning = benchmarkRunning;
-    benchmarkRunning = raw.some(a => a.code === "benchmark_running");
-    if (wasRunning && !benchmarkRunning) {
+    // 标志取**未过滤**的原始列表：用户点掉横幅只是本会话隐藏它，暂停状态本身不变
+    const wasPaused = benchmarkPaused;
+    benchmarkPaused = raw.some(a => a.code === "benchmark_paused");
+    if (wasPaused && !benchmarkPaused) {
       // 标志由有变无 = 基准刚结束：暂停期消息需一次同步补齐（默认无周期同步）
       showToast("基准已结束；如未开启周期同步，建议点一次同步",
         { type: "info", duration: 6000 });
@@ -3635,17 +3609,15 @@ function renderAnnouncements(announcements) {
   });
 }
 
-// 公告的 SSE 推送入口：窗口标志切换时列表区必须立即重绘。
+// 公告的 SSE 推送入口：暂停标志切换时列表区立即重绘。
 // renderAnnouncements 在 fetchData 中途也会被调用（那里其后本就跟着 renderItems），
 // 所以刷新只能挂在这条**不走 fetchData** 的推送上——否则要等下一次定时刷新
-// （默认 300s），期间用户会同时看到「基准已结束」提示和「基准运行中，列表暂不
-// 可用」占位；窗口开始时也有对称延迟（列表仍显示窗口前的生产卡片）。
-// 只重新拉取、不做本地重渲染：窗口内 viewSourceItems 装的是临时基准库的合成卡，
-// 就地重渲染会把它们又画回列表。
+// （默认 300s），期间用户会看到「基准已结束」提示却仍是暂停期的旧列表。
+// 只重新拉取、不做本地重渲染。
 function onAnnouncementsPushed(announcements) {
-  const wasRunning = benchmarkRunning;
+  const wasPaused = benchmarkPaused;
   renderAnnouncements(announcements);
-  if (wasRunning !== benchmarkRunning) fetchData();
+  if (wasPaused !== benchmarkPaused) fetchData();
 }
 
 // ── Timer ──
@@ -4315,27 +4287,9 @@ function deleteJson(url) {
   return reqJson(url, { method: "DELETE" });
 }
 
-// 基准窗口期的统一判据：后端在写路由闸门、备份防线与导出产出点守卫上返回
-// 409 + {"detail": {"code": "benchmark_running"}}。detail 也可能是普通字符串
-// （其它 409），故逐层取用而非直接读 .code。
-function isBenchmarkBusy(err) {
-  return !!(
-    err && err.payload && err.payload.detail &&
-    err.payload.detail.code === "benchmark_running"
-  );
-}
-
-const BENCHMARK_BUSY_MSG = "基准运行中，界面写操作暂不可用，请等运行结束后重试";
-
-// 写操作失败的统一出口：基准窗口内所有变更路由都会被后端闸门拒绝，
-// 提示必须与「真的失败」区分——否则用户会反复重试，而重试在窗口结束前
-// 不可能成功。其余错误保持调用点原文案与 error 级别（errorDuration 供
-// 长文案调用点沿用原时长）。
+// 写操作失败的统一出口：保留调用点原文案与 error 级别（errorDuration 供长文案
+// 调用点沿用原时长）。
 function showWriteError(err, fallbackMsg, errorDuration = 4000) {
-  if (isBenchmarkBusy(err)) {
-    showToast(BENCHMARK_BUSY_MSG, { type: "info", duration: 5000 });
-    return;
-  }
   showToast(fallbackMsg, { type: "error", duration: errorDuration });
 }
 
@@ -4469,13 +4423,6 @@ async function saveAllSettings() {
   } catch (err) {
     console.error("Save settings error:", err);
     showWriteError(err, "保存失败，部分更改可能未生效，请重试", 6000);
-    if (staged === "committed" && isBenchmarkBusy(err)) {
-      // 暂存段在白名单内、窗口期是成功的，被拒的只有类别/会话 ops。
-      // 只报「写操作暂不可用」会让用户以为连启动配置也没保存，故补一条独立
-      // 提示与上式各表其事（不合并进 showWriteError：那条是通用写失败出口）。
-      showToast("启动配置已暂存（重启应用后生效）；类别/会话更改因基准运行中未保存",
-        { type: "info", duration: 6000 });
-    }
     // 已应用的前缀操作（如删除）不可回滚：重载草稿对齐服务端真相，
     // 避免基于过期草稿重复操作（对已删类别再删 → 404）；暂存若已提交
     // 也一并刷新面板显示
@@ -5727,12 +5674,6 @@ async function downloadExport(url) {
     showToast("导出已开始", { type: "success", duration: 2000 });
   } catch (err) {
     console.error("Export error:", err);
-    // 窗口内备份 / 导出被后端拒绝：必须与一般导出失败区分，否则用户只看到
-    // 「导出失败」会反复重试，而重试在窗口结束前不可能成功
-    if (isBenchmarkBusy(err)) {
-      showToast("基准运行中，备份/导出暂不可用，请结束后重试", { type: "info", duration: 4000 });
-      return;
-    }
     showToast("导出失败，请重试", { type: "error", duration: 4000 });
   }
 }
@@ -5907,28 +5848,16 @@ function closeBatchConfirm() {
 // 撤销保护必须对等（单卡已有撤销）。恢复走逐张 verify（本地量级通常 <100）。
 async function restoreBatch(prev) {
   let restored = 0;
-  let blocked = false;
   for (const [id, value] of prev) {
     try {
       await postVerify(id, value);
       restored++;
-    } catch (err) {
-      // 单张失败不中断，结束统一汇报；基准窗口内逐张都会被拒，
-      // 只记标志、只提示一次，避免 N 张卡刷 N 条相同 toast
-      if (isBenchmarkBusy(err)) blocked = true;
+    } catch {
+      // 单张失败不中断，结束统一汇报
     }
   }
   lastQueryKey = "";
   fetchData();
-  if (blocked) {
-    // 窗口恰在循环中途开始时会出现「部分成功 + 部分被拒」：只报「写操作不可用」
-    // 会把已经生效的那几条一起说成未执行
-    showToast(restored > 0
-      ? `已撤销 ${restored}/${prev.size} 条；其余因基准运行中未执行，请结束后重试`
-      : BENCHMARK_BUSY_MSG,
-      { type: "info", duration: 5000 });
-    return;
-  }
   const ok = restored === prev.size;
   showToast(ok ? `已撤销 ${restored} 条` : `已撤销 ${restored}/${prev.size} 条，其余失败`,
     { type: ok ? "success" : "error", duration: 3000 });

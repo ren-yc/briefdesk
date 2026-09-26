@@ -10,7 +10,6 @@ import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
-from pathlib import Path
 from typing import Any, Literal, NotRequired, TypedDict, cast, overload
 
 import aiosqlite
@@ -40,12 +39,6 @@ _embed_lock = asyncio.Lock()
 # 加锁顺序恒为 storage_lock → _embed_lock（dedup 向量落库、rag GC 均按此序）；
 # 禁止反向嵌套——两把锁跨连接，反向会与既有持锁路径形成环（死锁）。
 storage_lock = asyncio.Lock()
-
-# 基准重定向窗口标志：由 db_redirect 进入时置位、退出时清除，与单例交换在
-# 同一段同步代码内完成（中间不得插入 await，否则会出现「标志已置位而单例
-# 仍是生产库」或反过来的分叉窗口）。布尔而非计数：db_redirect 不支持嵌套
-# （见 in_redirect 的说明）。
-_redirect_active = False
 
 logger = logging.getLogger(__name__)
 
@@ -522,109 +515,6 @@ async def get_embed_db() -> aiosqlite.Connection:
                     validate_schema_flag=False,  # 主连接已验证
                 )
     return _embed_db
-
-
-def in_redirect() -> bool:
-    """当前是否处于 db_redirect 窗口内（benchmark 运行期的进程内隔离窗口）。
-
-    窗口内单例指向临时库，一切与 DB 耦合的进程内存派生状态都必须同步挂起，
-    否则会写坏生产内存状态：去重缓存会按临时库内容增删（生产卡片因此退出
-    判重或产生幽灵条目），RAG 向量缓存的水位/删除检测会被归零，备份与导出
-    会把临时库落成用户手里的文件。调用点统一走模块属性（db.in_redirect()）
-    而非 from 导入，便于测试打桩。
-
-    前置条件（由 **db_redirect 的调用方**保证，无法在函数内校验；持锁读一次
-    本函数是无害的，下面两条约束针对的是进入/退出窗口的那一方）：
-    - **不可嵌套**：本标志是布尔，db_redirect 不支持嵌套，嵌套会让内层退出
-      提前清除外层的窗口状态；
-    - **不得持有 storage_lock 调用 db_redirect**：db_redirect 进入与退出都要
-      取该锁，持锁调用会自锁死。
-    """
-    return _redirect_active
-
-
-@asynccontextmanager
-async def db_redirect(
-    path: str | Path,
-) -> AsyncIterator[tuple[aiosqlite.Connection, aiosqlite.Connection]]:
-    """把主/向量连接整体重定向到 path 指向的独立库，退出时原样还原。
-
-    官方隔离缝（取代 benchmark 曾用的 get_db/get_embed_db 模块属性补丁）：
-    进入时按 get_db/get_embed_db 同口径在 path 上新建两条连接（主连接
-    validate_schema + foreign_keys=ON，向量连接免验证），并在 storage_lock
-    内把模块级单例指向它们、置位 in_redirect()——窗口内所有经
-    get_db()/get_embed_db() 的调用都落到临时库；退出在锁内原样还原单例并
-    清除标志，随后关闭两条临时连接。应用已有连接不关闭、不改动，退出后
-    继续使用。
-
-    锁内交换关闭的是**跨事务交错**：所有写路由都持 storage_lock，交换瞬间
-    没有写请求处于锁内中途，因此不会出现「一部分写落生产库、一部分落临时库」
-    的生产侧状态不一致。代价是新增了两处可取消点（进出各一次取锁）。
-
-    还原不依赖取锁成功：退出侧先还原单例、清除标志，再决定是否释放锁——
-    取消落在取锁 await 上时还原仍然必达。两条临时连接的关闭放在外层
-    finally，无论还原段是否被取消都会执行——遗漏会泄漏 aiosqlite 非 daemon
-    worker 线程，导致解释器退出 join 挂死。
-
-    调用方须自行保证窗口语义（benchmark 门闸：先暂停管道并排空在途批次
-    再进入；窗口内变更路由被 server 中间件的写闸门拒绝，备份与导出另有
-    数据库层 / 产出点守卫兜底）。不得在持有 storage_lock 时调用本函数
-    （会自锁死）；不支持嵌套。
-    """
-    global _db, _embed_db, _redirect_active
-    main_conn = await _init_connection(
-        str(path), validate_schema_flag=True, extra_pragmas={"foreign_keys": "ON"}
-    )
-    try:
-        embed_conn = await _init_connection(str(path), validate_schema_flag=False)
-    except BaseException:
-        # 半程失败防护：第二条连接创建失败必须关闭第一条，
-        # 否则泄漏的 aiosqlite 连接（非 daemon worker 线程）滞留
-        await main_conn.close()
-        raise
-    try:
-        await storage_lock.acquire()
-    except BaseException:
-        # 取锁失败/被取消同样必须关掉刚建好的两条连接：泄漏的非 daemon
-        # worker 线程会让解释器退出挂死
-        await embed_conn.close()
-        await main_conn.close()
-        raise
-    try:
-        saved_main, saved_embed = _db, _embed_db
-        _db, _embed_db = main_conn, embed_conn
-        _redirect_active = True
-    finally:
-        storage_lock.release()
-
-    try:
-        yield main_conn, embed_conn
-    finally:
-        try:
-            # 关闭「跨事务」交错：交换/还原与写路由的锁内段互斥
-            acquired = False
-            try:
-                await storage_lock.acquire()
-                acquired = True
-            finally:
-                # 还原不依赖取锁成功：取消落在上面的 await 时也必达
-                _db, _embed_db = saved_main, saved_embed
-                _redirect_active = False
-                if acquired:
-                    storage_lock.release()
-        finally:
-            # 必须在外层 finally：否则取消落在取锁 await 上时本节被跳过，
-            # 两条临时连接泄漏（非 daemon worker 线程）→ 解释器退出挂死
-            try:
-                await embed_conn.close()
-            except Exception:  # 关闭失败不阻断另一连接与还原（记录日志的处理豁免 BLE001）
-                logger.debug("db_redirect: 临时向量连接关闭失败", exc_info=True)
-            try:
-                await main_conn.close()
-            except Exception:  # 同上
-                logger.debug("db_redirect: 临时主连接关闭失败", exc_info=True)
-
-
 async def close_db() -> None:
     """关闭数据库连接（主连接 + 向量专用连接），停止 aiosqlite 后台 worker 线程。
 
@@ -824,25 +714,12 @@ async def _cursor(
 # ── 备份 / 恢复（在线备份 API，WAL 安全）──
 
 
-class BackupDuringRedirectError(Exception):
-    """基准窗口内请求备份：源连接是临时库，产物是「日后恢复即整库替换」的假备份。
-
-    临时库由 _init_connection 按完整 schema 建成，validate_restore_file 的
-    完整性 / schema / 含应用表三项校验对它全部通过，用户拿到的文件名与正常
-    备份无异——所以必须在产出点拦下，而不是事后靠恢复校验识别。
-    """
-
-
 async def backup_db_to(path: str) -> None:
     """把当前数据库在线备份到指定文件（SQLite backup API，运行中安全）。
 
-    窗口内拒绝：此时 get_db() 指向临时基准库。检查必须在取源连接**之前**
-    且与它之间不得插入 await——中间件闸门在请求入口判断，若请求刚过闸门、
-    交换随即发生、之后才取连接，就会备份到临时库。已起步的备份不受影响：
-    开头取定源连接后全程使用它。
+    开头取定源连接后全程使用它：备份进行中即便单例被换掉，产物也仍是发起时
+    那个库的一致快照。
     """
-    if _redirect_active:
-        raise BackupDuringRedirectError("基准运行中，拒绝备份临时库")
     src = await get_db()
     dst = await aiosqlite.connect(path)
     try:

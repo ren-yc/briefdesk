@@ -214,9 +214,7 @@
       }
     } catch (err) {
       thinking.remove();
-      addMsg("assistant", isBenchmarkBusy(err)
-        ? "基准运行中，问答暂不可用，请等运行结束后重试。"
-        : "问答服务暂时不可用，请稍后再试。");
+      addMsg("assistant", "问答服务暂时不可用，请稍后再试。");
       // 失败后把问题填回输入框：finally 里无条件清空，用户想重试
       // 就得整句重打一遍（问题虽已回显在对话里，但不可编辑）
       $input.value = question;

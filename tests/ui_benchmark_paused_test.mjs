@@ -1,18 +1,16 @@
-// 基准运行期间列表区必须照常可用：新公告码（benchmark_paused）不得触发占位。
+// 基准运行期间列表区必须照常可用。
 //
-// 背景：ui/app.js 是按公告列表里「有没有 code === "benchmark_running" 的条目」来置位
-// 运行标志、并把列表区整块替换成「列表暂不可用」的。子进程模式的运行不再发那个码，
-// 只发 benchmark_paused（表达「消息处理已暂停，结束后请点一次同步」），因此：
-// 公告条照常显示，但列表区必须继续渲染真实卡片。
-//
-// 旧码的占位行为由 tests/ui_write_guard_test.mjs 守着（双轨期的进程内路径仍会发它）。
+// 背景：前端曾按公告码把列表区整块替换成「列表暂不可用」占位——那是进程内运行路径的
+// 语义（列表里是临时基准库的合成卡）。窗口机制删除后占位分支也已移除；运行只发
+// benchmark_paused（表达「消息处理已暂停，结束后请点一次同步」），因此公告条照常显示，
+// 列表区必须继续渲染真实卡片。
 
 import assert from "node:assert/strict";
 import { loadAppJs } from "./ui_harness.mjs";
 
 {
   const { sandbox, getElement } = loadAppJs();
-  // 占位分支会调用这些助手；先确认存在再替换为 noop（拼错名字会在此暴露）
+  // renderItems 会调用这些助手；先确认存在再替换为 noop（拼错名字会在此暴露）
   for (const name of [
     "updateListCount", "updateLoadMore", "updateSubsBadge",
     "syncBatchGroupStates", "rebuildKbUnits", "syncOverlayWithData",

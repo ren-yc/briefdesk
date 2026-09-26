@@ -83,10 +83,10 @@ class WriteErrorHelperGuardTest(unittest.TestCase):
         self.assertNotIn('(data.detail || ("HTTP " + res.status))', ui)
         self.assertEqual(ui.count("detailText(data, res.status)"), 3)
 
-    def test_plugin_uis_read_body_for_window_detection(self):
+    def test_plugin_uis_have_failure_fallbacks(self):
         for name, fallback in (
             ("reminders", 'showWriteError(err, "提醒设置失败，请重试")'),
-            ("rag", "isBenchmarkBusy(err)"),
+            ("rag", "问答服务暂时不可用"),
         ):
             ui = (
                 _ROOT / "briefdesk" / "plugins" / name / "ui" / "ui.js"
@@ -94,7 +94,7 @@ class WriteErrorHelperGuardTest(unittest.TestCase):
             self.assertIn(
                 "err.payload = await res.json()",
                 ui,
-                f"{name} 插件前端必须读响应体才能识别基准窗口",
+                f"{name} 插件前端必须读响应体并给出失败文案",
             )
             self.assertIn(fallback, ui)
 

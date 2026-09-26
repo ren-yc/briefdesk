@@ -1,7 +1,7 @@
-"""前端写操作提示分流回归（通过 Node vm 执行 ui_write_guard_test.mjs）。
+"""写操作失败提示回归（通过 Node vm 执行 ui_write_guard_test.mjs）。
 
-基准窗口内写路由一律 409；前端必须按 detail.code 分流成「基准运行中」的
-info 提示，而不是普通失败或「同步已在后台进行中」。
+应用层不再有「基准运行中」的写闸门：写失败一律按调用点原文案与 error 级别提示，
+同时静态断言窗口期的判据符号没有回归。
 """
 
 import shutil
@@ -15,8 +15,8 @@ _NODE = shutil.which("node")
 
 
 @unittest.skipUnless(_NODE, "Node.js not available; skipping frontend vm regression test")
-class UiWriteGuardTest(unittest.TestCase):
-    def test_benchmark_busy_write_hints(self):
+class UiWriteErrorTest(unittest.TestCase):
+    def test_write_error_message_and_no_window_symbols(self):
         result = subprocess.run(
             [_NODE, str(_SCRIPT)],
             cwd=_ROOT,
