@@ -499,10 +499,29 @@ tests/test_web_plugins.py 的核心前端边界守卫测试覆盖）。`GET /api
 
 实验性基准插件（可选插件，默认禁用，显式实现 WebPlugin + StagePlugin 双能力）：`/api/benchmark/*` 路由 + 自带前端（设置弹窗内运行，前端
 轮询门控——仅设置弹窗打开或基准运行中保活 3s 轮询）+ CLI 入口（`python -m briefdesk.plugins.benchmark.cli`）+ 插件自有配置
-`briefdesk/plugins/benchmark/config.py`（`BENCHMARK_` 前缀归插件所有，经 `settings_schema()` 自动出现在设置页）。运行环境
-`providers.bench_environment`（Web 与 CLI 共用同一套门闸）分两个阶段：
+`briefdesk/plugins/benchmark/config.py`（`BENCHMARK_` 前缀归插件所有，经 `settings_schema()` 自动出现在设置页）。
 
-基准运行的隔离与生命周期见 `briefdesk/plugins/benchmark/supervisor.py`（父进程侧：spawn 子进程、运行目录与 `meta.json` 终态记录、无进展看门狗、取消入口、目录轮转）与 `briefdesk/plugins/benchmark/runner.py`（子进程侧：自己的 scratch 库与产物清单）。父进程**不再**重定向自己的连接，界面侧没有任何闸门；运行期间只是把生产管道暂停（`benchmark_paused` 公告），实时消息延后到下轮回填。
+**基准运行的进程级隔离**（`supervisor.py` 父进程侧 + `runner.py` 子进程侧）：
+
+1. **启动**：`supervisor.start()` 在「判定 → 登记」之间不留 await，两个并发 POST 只会起一个运行；
+   随后建运行目录 `.tmp/runs/<时间戳>-<run_id 前 8 位>/`、把 `meta.json` **先落盘**（被杀/崩溃的运行
+   也要能被识别成「历史结果」而不是残目录）、把 `cases/` 快照进运行目录、关闭父进程侧的 `run.log` 句柄，
+   再 spawn 子进程（`python -m briefdesk.plugins.benchmark.runner`）。父进程**生效中**的非密钥 AI 配置经环境变量下传：
+   设置页改动是「暂存、重启后生效」，子进程若自己读 `.env` 会拿到旧值；密钥不下传，子进程走自己的钥匙串。
+2. **运行期**：父进程只做三件事——按 `progress.jsonl` 的**行数增长**判进展（阈值按
+   `BENCHMARK_RUN_STALL_SECONDS × --progress-every` 放大，因为进度是节流写入的）、终态行落盘后的宽限 kill、
+   可选的总时长上限；取消/超时/无进展一律经**本进程持有的句柄**终止。子进程在自己的库上跑
+   （`--db` 就是它自己的路径，起进程时单例为空，不可能碰到生产库），产物写进运行目录：
+   `progress.jsonl` / `report.json` / `report.html` / `run.log`。
+3. **收尾**：判定三态——`completed`（终态行 + 两份报告齐全）/ `failed-recorded`（有 error 终态行，
+   报告可能缺失）/ `aborted`（没有终态行，父进程在 `meta.json` 里补记原因）。退出码只承诺
+   「0 成功 / 2 用法错误 / 非 0 其它」。报告端点只认最近一次 **completed** 的运行目录；轮转保留
+   `BENCHMARK_KEEP_RUNS` 个，但**最新一个已完成的永不删除**（报告页依赖它）。
+
+界面侧：运行期间父进程**不重定向自己的连接**、也没有任何闸门，界面照常可用；只是把生产管道暂停
+（`benchmark_paused` 公告）——实时消息延后到下轮回填，结束后如未开启周期同步需点一次同步。手工 CLI
+（`python -m briefdesk.plugins.benchmark.cli`）与子进程同口径：自建临时目录作库、改指 `config.db_path`、
+建表并按数据集换类别、注入 AI 端口，退出先关连接再还原路径与删目录。
 
 #### briefdesk/sources_base.py
 
