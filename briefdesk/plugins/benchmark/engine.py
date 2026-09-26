@@ -329,6 +329,9 @@ def _build_payload(
         "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         "model": config.ai_model,
         "ai_api_base": config.ai_api_base,
+        # 推理强度与模型、端点同级记录：同一模型在不同强度下的结果不可互比，
+        # 报告必须自带这一项，否则事后无法判断某次运行到底发了什么参数
+        "reasoning_effort": config.ai_reasoning_effort,
         "concurrency": max(1, concurrency),
         "elapsed_sec": total_elapsed,
         "features": {

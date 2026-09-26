@@ -69,6 +69,7 @@ def _header(payload: dict[str, Any]) -> str:
         ("模型", payload.get("model", "")),
         ("API", payload.get("ai_api_base", "")),
         ("并发", str(payload.get("concurrency", ""))),
+        ("推理强度", payload.get("reasoning_effort", "")),
         ("总用时", _dur(payload.get("elapsed_sec"))),
     ]
     parts = ['<h1>LLM 功能基准报告</h1><p class="meta">']

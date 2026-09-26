@@ -506,6 +506,8 @@ class TestScratchPreparation:
         assert evals == {}
         assert isinstance(payload["elapsed_sec"], float)
         assert payload["elapsed_sec"] >= 0
+        # 报告自描述：推理强度与模型同级落盘，便于对账同一模型的不同强度
+        assert payload["reasoning_effort"] == config.ai_reasoning_effort
 
 
 class TestProgress:
