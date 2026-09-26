@@ -17,7 +17,11 @@ from briefdesk.plugins.benchmark.charts import (
     confusion_svg,
     overview_bar_svg,
 )
-from briefdesk.plugins.benchmark.report import _FEATURE_METRIC_LABELS, _FEATURE_TITLES
+from briefdesk.plugins.benchmark.report import (
+    _FEATURE_METRIC_LABELS,
+    _FEATURE_TITLES,
+    format_metric,
+)
 
 _CSS = """
 body { font-family: "Microsoft YaHei", "PingFang SC", sans-serif; margin: 24px;
@@ -117,21 +121,9 @@ def _overview(payload: dict[str, Any]) -> str:
     )
 
 
-_RATE_KEYS = {
-    "category_accuracy", "category_precision", "category_recall", "category_f1",
-    "time_msg_accuracy", "time_point_recall", "time_point_precision",
-    "failure_rate", "summary_fill_rate",
-    "accuracy", "precision", "recall", "f1",
-    "exact_match_rate", "keyword_hit_rate",
-}
-
-
 def _metric_value(key: str, value: Any) -> str:
-    if key in _RATE_KEYS:
-        return f"{float(value or 0) * 100:.1f}%"
-    if key == "avg_len":
-        return f"{float(value or 0):.1f} 字"
-    return _esc(value)
+    # 与终端报告共用同一套口径（比例 / 字数 / 计数），否则两处渲染会各说各话
+    return _esc(format_metric(key, value))
 
 
 def _metric_table(feature: str, summary: dict[str, Any], elapsed_sec: float | None = None) -> str:

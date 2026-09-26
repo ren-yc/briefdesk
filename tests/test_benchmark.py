@@ -689,6 +689,35 @@ class ChartsTest(unittest.TestCase):
         lines = render_feature_block("dedup", [], summary)
         assert not any("测试用时" in ln for ln in lines)
 
+    def test_title_metrics_render_avg_len_as_length_not_ratio(self):
+        """平均长度是**字数**，不是比例。
+
+        按比例渲染会把它乘 100 再加百分号：实测一轮真实基准里 avg_len=23.79
+        被打印成「平均长度(字) 2379.0%」。同一张表里的比例项（命中率/准确率）
+        必须照旧带百分号，所以两者要走同一个格式化入口、用键名分流。
+        """
+        from briefdesk.plugins.benchmark.report import render_metrics
+
+        lines = render_metrics(
+            "title",
+            {
+                "cases": 63,
+                "error_cases": 0,
+                "exact_match_rate": 0.0,
+                "exact_match_cases": 63,
+                "keyword_hit_rate": 0.6607,
+                "keyword_hit_cases": 56,
+                "avg_len": 23.79,
+                "too_long_count": 9,
+                "fallback_count": 1,
+            },
+        )
+        text = "\n".join(lines)
+        assert "23.8 字" in text, text
+        assert "2379" not in text, text
+        assert "66.1%" in text, text
+        assert "平均长度(字)" in text, text
+
     def test_save_html_report(self):
         from briefdesk.plugins.benchmark.html_report import save_html_report
 
