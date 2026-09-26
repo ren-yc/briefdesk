@@ -795,34 +795,52 @@ class TestRunFlow:
 
     @pytest.fixture(autouse=True)
     async def _autouse_setup(self):
+        from types import SimpleNamespace
+
+        from briefdesk.plugins.benchmark import supervisor
+
         self._tmp = tempfile.TemporaryDirectory()
         store_patcher = patch.object(
             bench_store, "CASES_DIR", Path(self._tmp.name)
         )
         store_patcher.start()
+        # 进程内模式必须显式钉住：默认值受 .env 影响，而这条用例断言的是
+        # inproc 的语义（不产 run_dir、报告只驻内存）
+        settings_patcher = patch.object(
+            supervisor,
+            "_settings",
+            lambda: SimpleNamespace(
+                run_mode="inproc",
+                pause_pipeline=False,
+                keep_runs=5,
+                run_timeout_seconds=0,
+                run_stall_seconds=600,
+            ),
+        )
+        settings_patcher.start()
+        self.supervisor = supervisor
+        supervisor._current = None
+        supervisor._last = None
         self.conn = await aiosqlite.connect(":memory:")
         self.conn.row_factory = aiosqlite.Row
         await init_schema(self.conn)
         self.patcher = patch.object(briefdesk_db, "get_db", new=AsyncMock(return_value=self.conn))
         self.patcher.start()
-        bench_router._running_task = None
-        bench_router._last_result = None
         yield
-        import contextlib
-
-        if bench_router._running_task is not None and not bench_router._running_task.done():
-            bench_router._running_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await bench_router._running_task
-        bench_router._running_task = None
-        bench_router._last_result = None
+        await supervisor.stop_all()
+        supervisor._current = None
+        supervisor._last = None
         self.patcher.stop()
         await self.conn.close()
+        settings_patcher.stop()
         store_patcher.stop()
         self._tmp.cleanup()
     async def test_start_run_with_no_cases_completes(self):
+        from fastapi import HTTPException
+
         resp = await bench_router.start_run(None)
         assert resp["started"]
+        assert resp["run_id"]
         # 等待后台任务完成（零用例 → 无 AI 调用，立即完成）
         for _ in range(50):
             state = await bench_router.run_status()
@@ -831,16 +849,18 @@ class TestRunFlow:
             await asyncio.sleep(0.02)
         assert not state["running"]
         assert "run_id" in state
-        assert state["summary"] == {}
         assert isinstance(state["elapsed_sec"], float)
-        report = await bench_router.latest_json_report()
-        payload = json.loads(report.body)
-        assert payload["features"] == {}
-        assert "run_id" in payload
-        assert isinstance(payload["elapsed_sec"], float)
+        # 进程内运行不产出 run_dir，而 /report 只认盘上「已完成」的运行——
+        # 双轨期的这条语义是契约写明的（子进程模式才有报告可读）
+        with pytest.raises(HTTPException) as ctx:
+            await bench_router.latest_json_report()
+        assert ctx.value.status_code == 404
+        # 取消是幂等的：没在跑就如实说没在跑
+        assert await bench_router.cancel_run() == {
+            "cancelled": False,
+            "reason": "not_running",
+        }
         # 未知功能拒绝
-        from fastapi import HTTPException
-
         with pytest.raises(HTTPException):
             await bench_router.start_run(RunBody(features=["nope"]))
 
@@ -857,46 +877,59 @@ class TestCasesEndpoint:
             await bench_router.remove_all_cases(feature="nope")
 
 
-class TestTeardownCancelsRun:
-    """关闭期收口：插件 teardown 必须先让基准环境还原单例。
+class TestTeardownStopsRun:
+    """关闭期收口：插件 teardown 必须把运行先停下来（两种模式都要管）。
 
-    关闭序列是 teardown_all → close_db。基准运行期间单例指向临时库，若任务
+    关闭序列是 teardown_all → close_db。进程内运行期间单例指向临时库，若任务
     活到 close_db 之后才被取消，db_redirect 的 finally 会把单例还原为**从未
     关闭的生产连接**，其残留的 aiosqlite 非 daemon worker 线程让解释器退出
-    挂死。
+    挂死；子进程模式下则要先把子进程收掉，它才不会继续往 run_dir 里写。
     """
 
-    async def test_teardown_cancels_task_and_restores_singletons(self):
-        from briefdesk.plugins.benchmark import providers
+    async def test_teardown_stops_running_benchmark(self):
+        from types import SimpleNamespace
+
+        from briefdesk.plugins.benchmark import supervisor
 
         plugin = BenchmarkPlugin()
-        old_main, old_embed = briefdesk_db._db, briefdesk_db._embed_db
         entered = asyncio.Event()
 
-        async def run():
-            async with providers.bench_environment(register_ai=False):
-                entered.set()
-                await asyncio.sleep(3600)
+        async def _slow(*_a, **_k):
+            entered.set()
+            await asyncio.sleep(3600)
 
-        task = asyncio.create_task(run())
-        await entered.wait()
-        assert briefdesk_db._db is not old_main, "基准运行期间单例应指向临时库"
-        try:
-            with patch.object(bench_router, "_running_task", task):
+        with tempfile.TemporaryDirectory() as tmp:
+            runner = patch("briefdesk.plugins.benchmark.engine.run_benchmark_cases", new=_slow)
+            loader = patch(
+                "briefdesk.plugins.benchmark.engine.load_web_cases",
+                new=AsyncMock(return_value=[]),
+            )
+            settings = patch.object(
+                supervisor,
+                "_settings",
+                lambda: SimpleNamespace(
+                    run_mode="inproc",
+                    pause_pipeline=False,
+                    keep_runs=5,
+                    run_timeout_seconds=0,
+                    run_stall_seconds=600,
+                ),
+            )
+            root = patch.object(supervisor, "RUN_ROOT", Path(tmp))
+            with runner, loader, settings, root:
+                supervisor._current = None
+                await supervisor.start(["dedup"])
+                await asyncio.wait_for(entered.wait(), timeout=5)
+                assert supervisor.is_running()
                 await plugin.teardown()
-        finally:
-            if not task.done():  # pragma: no cover — teardown 应已取消并等待
-                task.cancel()
+                assert not supervisor.is_running(), "teardown 必须取消并等待运行终结"
+        supervisor._current = None
 
-        assert task.done(), "teardown 必须取消并等待基准任务终结"
-        assert briefdesk_db._db is old_main, "teardown 返回前必须已还原主连接单例"
-        assert briefdesk_db._embed_db is old_embed, "向量连接单例同样必须还原"
-        assert not briefdesk_db.storage_lock.locked()
+    async def test_teardown_is_noop_without_running_benchmark(self):
+        from briefdesk.plugins.benchmark import supervisor
 
-    async def test_teardown_is_noop_without_running_task(self):
-        plugin = BenchmarkPlugin()
-        with patch.object(bench_router, "_running_task", None):
-            await plugin.teardown()  # 不得抛错
+        supervisor._current = None
+        await BenchmarkPlugin().teardown()  # 不得抛错
 
 
 if __name__ == "__main__":

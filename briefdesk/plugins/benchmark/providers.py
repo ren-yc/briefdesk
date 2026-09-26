@@ -157,7 +157,8 @@ async def bench_environment(
         if not await _wait_pipelines_drained(stall_seconds):
             # 直接中止：带警告继续会在途批次的后续写落进临时基准库，并在生产
             # 去重缓存留下幽灵条目（去重缓存是进程级内存态，切库不会清）。
-            # 位于 try 内，finally 照常复位；路由层捕获异常写入 _last_result。
+            # 位于 try 内，finally 照常复位；supervisor 会把这次中止记进 meta.json
+            # 的终态记录（state=aborted + reason），/run 与运行目录都能看到。
             raise RuntimeError(
                 f"benchmark: 等待在途批次排空时连续 {stall_seconds}s 无进展，"
                 "已中止本次基准以免在途批次写入临时库/污染生产去重缓存；"

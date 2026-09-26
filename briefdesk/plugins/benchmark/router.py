@@ -8,9 +8,11 @@
   POST /api/benchmark/export-recorded 导出为 cases/<feature>.fromweb.json
   （覆盖式，含判重/合并命中的正向用例——按卡片最终状态导出观察不到）；
 - Web 运行从 cases/*.fromweb.json 加载；
-- 运行在后台任务中执行（真实 AI 调用可能耗时数分钟），状态经
-  GET /api/benchmark/run 轮询；结果（payload + HTML 报告）驻留内存，
-  经 /api/benchmark/report(.json) 取回；
+- 运行生命周期交给 supervisor（两种模式：inproc 与 subprocess，见该模块）；
+  本模块只做 HTTP 面：POST 启动、GET 轮询、DELETE 取消；
+- /report(.json) 一律读盘——只认最近一次 **completed** 的 run_dir。子进程运行
+  天然落盘；进程内运行不产出 run_dir，双轨期它的报告只驻内存（不在这里暴露），
+  这是契约里写明的过渡语义；
 - 运行期间经 db.db_redirect 把主/向量连接重定向到临时库，并经
   pipeline.set_processing_paused 暂停生产处理管道——实时消息延后到下一轮
   回填窗口处理，不丢失。窗口内变更路由与备份/导出被 server 中间件的写闸门/
@@ -20,7 +22,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import time
 from typing import Any, cast
@@ -30,19 +31,14 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
 
 from briefdesk.db import get_items_page
-from briefdesk.plugins.benchmark import engine as bench_engine
 from briefdesk.plugins.benchmark import recorder as bench_recorder
 from briefdesk.plugins.benchmark import store as bench_store
-from briefdesk.plugins.benchmark.html_report import build_html_report
+from briefdesk.plugins.benchmark import supervisor
 from briefdesk.plugins.benchmark.schema import FEATURES
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
-
-# 单进程内存态：最近一次运行结果 + 运行中任务
-_running_task: asyncio.Task | None = None
-_last_result: dict[str, Any] | None = None  # {"run_id", "payload", "html", "error"}
 
 
 # ── 请求模型 ──
@@ -211,72 +207,49 @@ async def export_recorded() -> dict[str, Any]:
 # ── 运行与报告 ──
 
 
-def _run_state() -> dict[str, Any]:
-    """运行状态（running / 最近结果摘要），供前端轮询。"""
-    state: dict[str, Any] = {"running": False}
-    if _running_task is not None and not _running_task.done():
-        state["running"] = True
-    if _last_result is not None:
-        state["run_id"] = _last_result["run_id"]
-        state["summary"] = {
-            f: data.get("summary", {})
-            for f, data in _last_result["payload"].get("features", {}).items()
-        }
-        state["error"] = _last_result.get("error")
-        state["started_at"] = _last_result.get("started_at")
-        state["elapsed_sec"] = _last_result["payload"].get("elapsed_sec")
-    return state
-
-
 @router.get("/api/benchmark/run")
 async def run_status() -> dict[str, Any]:
-    return _run_state()
+    """运行状态（running / 上次结果摘要 / 当前进度），供前端轮询。"""
+    return supervisor.state()
 
 
 @router.post("/api/benchmark/run")
 async def start_run(body: RunBody | None = None) -> dict[str, Any]:
-    global _running_task
-    if _running_task is not None and not _running_task.done():
-        raise HTTPException(409, "基准正在运行中")
     features = list(body.features) if body and body.features else list(FEATURES)
     invalid = [f for f in features if f not in FEATURES]
     if invalid:
         raise HTTPException(400, f"未知功能: {invalid}")
+    try:
+        return await supervisor.start(features)
+    except RuntimeError as e:
+        # 已有运行未结束：沿用既有的 409 与文案（前端 ui.js 按该分支处理，
+        # 不要改成 200——那会让「重复点击」看起来像启动成功）
+        raise HTTPException(409, str(e)) from e
 
-    async def _run() -> None:
-        global _last_result
-        _last_result = {"run_id": "", "payload": {}, "html": "", "started_at": ""}
-        try:
-            cases_by_feature: dict[str, list[Any]] = {}
-            for f in features:
-                cases_by_feature[f] = await bench_engine.load_web_cases(f)
-            payload, _evals = await bench_engine.run_benchmark_cases(cases_by_feature)
-            _last_result = {
-                "run_id": payload["run_id"],
-                "payload": payload,
-                "html": build_html_report(payload),
-                "started_at": payload["generated_at"],
-                "error": None,
-            }
-        except Exception as e:
-            logger.exception("基准运行失败")
-            _last_result["error"] = f"{type(e).__name__}: {e}"
 
-    _running_task = asyncio.create_task(_run())
-    return {"started": True, "features": features}
+@router.delete("/api/benchmark/run")
+async def cancel_run() -> dict[str, Any]:
+    """取消当前运行（幂等）。
+
+    没有它，卡死或超时的运行只能靠重启应用才能解除 409 与管道暂停——而重启会把
+    子进程变成没人管的孤儿。
+    """
+    return await supervisor.cancel()
 
 
 @router.get("/api/benchmark/report")
 async def latest_html_report() -> HTMLResponse:
-    """最近一次运行的 HTML 图表报告（自包含，浏览器直接打开/另存）。"""
-    if _last_result is None or not _last_result.get("html"):
+    """最近一次**已完成**运行的 HTML 图表报告（自包含，浏览器直接打开/另存）。"""
+    html = supervisor.report_html()
+    if not html:
         raise HTTPException(404, "尚无运行结果")
-    return HTMLResponse(_last_result["html"])
+    return HTMLResponse(html)
 
 
 @router.get("/api/benchmark/report.json")
 async def latest_json_report() -> JSONResponse:
-    """最近一次运行的完整结果 payload（指标 + 逐用例明细）。"""
-    if _last_result is None or not _last_result.get("payload"):
+    """最近一次**已完成**运行的完整结果 payload（指标 + 逐用例明细）。"""
+    payload = supervisor.report_payload()
+    if not payload:
         raise HTTPException(404, "尚无运行结果")
-    return JSONResponse(_last_result["payload"])
+    return JSONResponse(payload)
