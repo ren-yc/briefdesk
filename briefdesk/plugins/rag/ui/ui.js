@@ -197,7 +197,13 @@
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ question, history: turnHistory }),
       });
-      if (!res.ok) throw new Error("HTTP " + res.status);
+      if (!res.ok) {
+        // 基准窗口内 /api/rag/ask 被写闸门拒绝（409 + detail.code）：读响应体
+        // 才能说明真实原因，否则用户以为问答服务坏了
+        const err = new Error("HTTP " + res.status);
+        try { err.payload = await res.json(); } catch { /* 非 JSON 响应忽略 */ }
+        throw err;
+      }
       const data = await res.json();
       thinking.remove();
       if (data.refused) {
@@ -206,9 +212,11 @@
         addMsg("assistant", data.answer, data);
         history.push({ role: "assistant", content: data.answer });
       }
-    } catch {
+    } catch (err) {
       thinking.remove();
-      addMsg("assistant", "问答服务暂时不可用，请稍后再试。");
+      addMsg("assistant", isBenchmarkBusy(err)
+        ? "基准运行中，问答暂不可用，请等运行结束后重试。"
+        : "问答服务暂时不可用，请稍后再试。");
       // 失败后把问题填回输入框：finally 里无条件清空，用户想重试
       // 就得整句重打一遍（问题虽已回显在对话里，但不可编辑）
       $input.value = question;

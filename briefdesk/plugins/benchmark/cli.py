@@ -6,7 +6,7 @@
     python -m briefdesk.plugins.benchmark.cli --charts
 
 基准运行会真实调用 AI（读 .env 的 AI_API_KEY/AI_API_BASE/AI_MODEL），
-临时库经补丁隔离（不动应用库连接）。文件数据集在 cases/ 目录
+临时库经 db.db_redirect 重定向（不动应用库连接）。文件数据集在 cases/ 目录
 （<feature>.json 优先，其次网页导出的 <feature>.fromweb.json，示例为
 <feature>.example.json）。
 """

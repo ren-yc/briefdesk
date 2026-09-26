@@ -343,7 +343,7 @@ AI 模型等。插件专属配置（`WEFLOW_*`/`WEFLOW_LEGACY_*`/`QQFLOW_*`/`RAG
 
 #### briefdesk/settings_base.py
 
-`KeyringSettingsBase`——app 级与 weflow/weflow-legacy/qqflow/rag 五个 Settings 的公共基类：
+`KeyringSettingsBase`——六个 Settings（app 级与 weflow/weflow-legacy/qqflow/rag/benchmark）的公共基类：
 `settings_customise_sources` 单点实现（来源优先级 init > 密钥环 > 环境变量 > .env > 默认值）与统一 `env_file` 列表。子类以
 `ClassVar KEYRING_FIELDS`（字段名 → 环境变量名）声明密钥字段即自动挂 `KeyringSource`（非空才挂）；`model_config` 须注解
 `ClassVar[SettingsConfigDict]`（经中间基类继承时 ruff 对 pydantic 模型的 RUF012 豁免不再传导），其余键（env_file/extra 等）由
@@ -415,16 +415,19 @@ toggle_session / update_category / delete_category / bulk_insert_raw_messages / 
 SQLite 变量上限整批崩；用点：are_messages_processed / delete_category 级联 / get_item_texts_by_ids /
 get_items_verified_flags / get_session_last_polls，update_items_verify/delete_items 已迁（fetch=False 逐块
 累
-计返回 rowcount，overload 按 fetch 字面量区分返回类型）；临时隔离库（基准运行）经 `db_redirect`——进出同步换/还原主/向量单例、半程失败关已建连接，应用已有连接
-不
-动）。**默认分类迁移（PRAGMA user_version 门控）**：v0→1 补齐 5→13 类；v1→2 活动通知口径追加「面向全群的多项任务/材料提交截止通知（含各项截止日期）按本类
+计返回 rowcount，overload 按 fetch 字面量区分返回类型）；临时隔离库（基准运行）经 `db_redirect`——进出都在 `storage_lock` 内交换/还原主/向量单例并同步置位/清除
+`in_redirect()`（交换段内不得插入 await，否则出现「标志已置位而单例仍是生产库」的分叉窗口；锁内交换同时消除「一部分写落生产库、一部分落临时库」的
+跨事务交错），还原**不依赖取锁成功**、两条临时连接在外层 finally 关闭（取消落在退出取锁 await 上时漏关 = 非 daemon worker 线程让解释器退出挂死），半程失败关
+已建连接，应用已有连接不动。**`in_redirect()` 是窗口判据**（布尔标志，不可嵌套；持 `storage_lock` 调用 `db_redirect` 会自锁死）：去重缓存挂起、RAG 维护跳过、备份的数据库层
+防线、导出产出点守卫与 server 写闸门共用它判窗口）。**默认分类迁移（PRAGMA user_version 门控）**：v0→1 补齐 5→13 类；v1→2 活动通知口径追加「面向全群的多项任务/材料提交截止通知（含各项截止日期）按本类
 收
 录」，仅更新仍等于旧版原文的行（尊重用户编辑），一次性不覆盖。
 
 #### briefdesk/server/
 
-FastAPI HTTP 服务子包（按职责分组的模块）：`app.py`（FastAPI 实例）、`middleware.py`（Host 白名单 + 同源校验 + CSP 头；CSRF 收口：
-/api 变更请求 Origin/Referer 双缺失直接 403，不再静默放行）、`web_plugins.py`（Web 插件注入点）、`routes_items.py`（核心数据路由）、
+FastAPI HTTP 服务子包（按职责分组的模块）：`app.py`（FastAPI 实例）、`middleware.py`（Host 白名单 + 同源校验 + CSP 头 + 基准窗口闸门；CSRF 收口：
+/api 变更请求 Origin/Referer 双缺失直接 403，不再静默放行）、`window_guard.py`（基准窗口期的 HTTP 契约：写路由白名单 / 读路由黑名单 / 统一 409 detail；**只含常量与纯函数**，
+不 import db/app，故无循环导入且可被测试直接 import）、`web_plugins.py`（Web 插件注入点）、`routes_items.py`（核心数据路由）、
 `routes_categories.py`（类别管理）、`media.py`（媒体代理）、`static.py`（SPA 托管）、`callbacks.py`（会话刷新回调）。**组装顺序有语义**：
 `__init__.py` 按 中间件 → 插件路由 → 核心路由 → 类别路由 → 媒体代理 → SPA mount 依次导入（web_plugins 必须先于 static，否则被 SPA 兜底截
 胡
@@ -437,7 +440,8 @@ sessions toggle、recategorize（`update_item_category` 读-改-写多步事务�
  sessions/refresh 的落库段（后者回调内持锁、网络拉取在锁外）——单连接隐式事务下锁外 commit 会把管道未完成的多步写一并提交（部分写入提前可见）；verify(-1) 同样在锁内
 发布 `EVENT_ITEMS_DELETED` 同步清去重内存缓存, `GET /api/export/items`（CSV 导出，筛选参数与 `/api/items` 一致）,
 `GET /api/export/recat-samples`（导出人工改类样本 jsonl/csv，内容已脱敏；两处导出均经 `_csv_cell` 公式注入转义—
-—`=`/`+`/`-`/`@`/TAB/CR/LF 前缀前置单引号）, `GET /api/backup`（SQLite 在线备份下载，WAL 安全可运行中执行）/
+—`=`/`+`/`-`/`@`/TAB/CR/LF 前缀前置单引号）, `GET /api/backup`（SQLite 在线备份下载，WAL 安全可运行中执行；基准窗口内 409——`backup_db_to` 在取源连接**之前**判 `in_redirect()` 并抛
+`BackupDuringRedirectError`，路由转 409 且只清理、不记 ERROR；临时库能通过恢复校验的全部三项，假备份「日后恢复即整库替换」，必须在产出点拦）/
 `POST /api/restore`（上传校验后暂存 `{db_path}.restore-pending`，重启应用生效；临时文件必须落在库文件同目录——`os.replace` 不允许跨文件系统
 ，mkstemp 缺省走系统 TEMP 时与 DB_PATH 跨盘（Windows 典型）必然 WinError 17 使恢复整体不可用；启动应用时原库先改名为 `{db_path}.pre-restore`（三件）再替换，替换失败自动改回并保留 pending（改回本身失败也不抛出：副本与 pending 都保留，下次启动检测到「主库缺失且存在副本」先补完回滚再重试恢复——否则下次启动会把这份唯一副本当上一代副本删掉）；副本只留最近一代、下次恢复覆盖，含隐私数据，与 `*.sqlite` 同口径 gitignore）, `GET /api/sessions`,
 `POST /api/sessions/:source/:session_id/toggle`, `POST /api/sessions/refresh`, `POST /api/sync`,
@@ -462,7 +466,15 @@ Content-Disposition attachment——扩展名不可信，封死伪装 SVG/HTML �
 查告警）、`GET /plugin-assets/{name}/{path}`（插件静态资源，目录穿越/非法路径一律 404，且 404 返回纯文本而非 JSON——本端点服务
 `<link>`/`<script>` 资源请求）、`register_plugin_assets`/`set_plugins_info_callback`/`set_settings_schema_callback`/`include_plugin_router`（
 展开 APIRoute 插到 SPA mount 之前——新版 Starlette 的惰性 `_IncludedRouter` 会被 SPA 兜底截胡；按 `id(router)` 幂等，重复挂载跳过）
-。日历/提醒路由位于 `plugins/{calendar,reminders}`。`/api/items` 接受 `sourceGroup`/`minMsgTime`/`hideExpired`/`filterNow`，
+**基准窗口闸门**：中间件在 Host 校验与（变更请求的）同源校验**通过之后**查 `db.in_redirect()`——变更请求按
+`window_guard.is_blocked_write` 默认拒绝（白名单逐条列举：`/api/settings/env`、`/api/settings/secrets`、`/api/restore` 与基准控制路由；
+`/api/benchmark/import-current` **刻意不在其中**——它读的是重定向后的临时库并覆盖式写坏用户用例文件），产出文件的 GET（backup / export/items /
+export/recat-samples）按 `window_guard.is_blocked_read` 拦截，两者共用同一份 `{"detail":{"code":"benchmark_running"}}` 的 409。闸门在跨站校验之后，
+跨站请求先拿 403，不会成为探测「基准是否在运行」的旁路（GET 不经同源校验，但跨站读不到响应内容）。读侧是**默认放行**口径（纯显示类读路由在窗口内显示临时库内容，
+由前端列表区提示覆盖），故另有 `routes_items._export_attachment` 的**无条件产出点守卫**（不依赖名单内容，拦的是「请求已过中间件、交换后才走到导出」）与
+`tests/test_benchmark_window_gate.py` 的 **AST 静态守卫**（`briefdesk/server/**` 与 `briefdesk/plugins/**` 的 GET 处理器凡含
+`_export_attachment(`/`FileResponse(`/`Content-Disposition` 者必须登记到「读黑名单 ∪ 白名单」，否则测试失败——这是唯一能拦住将来新增下载路由的机制）。
+日历/提醒路由位于 `plugins/{calendar,reminders}`。`/api/items` 接受 `sourceGroup`/`minMsgTime`/`hideExpired`/`filterNow`，
 并返回与完整过滤条件一致的 `totalCount`/`groupCount`/`sourceGroups`/`hasMore`/`nextOffset`/`filterNow`；启用隐藏截止时，客户
 端
 在同一分页链复用服务端首次返回的 `filterNow` 以固定时间边界。侧边栏计数仍为全局口径。Serves `ui/` with SPA fallback（三修：except 改捕
@@ -500,16 +512,28 @@ tests/test_web_plugins.py 的核心前端边界守卫测试覆盖）。`GET /api
 #### briefdesk/plugins/benchmark/
 
 实验性基准插件（可选插件，默认禁用，显式实现 WebPlugin + StagePlugin 双能力）：`/api/benchmark/*` 路由 + 自带前端（设置弹窗内运行，前端
-轮
-询门控——仅设置弹窗打开或基准运行中保活 3s 轮询）+ CLI 入口（`python -m briefdesk.plugins.benchmark.cli`）。运行环境
-`providers.bench_environment`（Web 与 CLI 共用同一套门闸）：进入即 `pipeline.set_processing_paused(True)` 暂停生产管道
-（process_all_batches 顶部直接返回 False，实时消息不入库不标 processed、延后下轮回填恢复）并发布 `benchmark_running` 公告——运行期间全部 UI
-写路由落在临时库、退出即丢，公告提示用户勿在此期间操作界面（退出 finally 撤销公告）、排空后经 `db.db_redirect(bench.sqlite)` 官方缝把主/向量连接重定向到临时库（**排空超时 120s 直接抛错中止本次基准**，不再带警告继续重定向——继续会让在途批次写落进临时库并在生产去重缓存留下幽灵条目）
-（
-窗口内 get_db/get_embed_db 调用均落临时库；缝内半程失败自动关闭已建连接）；DB 重定向退出时先同步还原单例再关临时连接（先于本 finally），finally 只做公告撤销→复
-位
-管道标志→AI 端口还原→删子目录。临时库落本次运行专属 uuid 子目录 `.tmp/bench-<hex>/bench.sqlite`（插件包内 `.tmp/`），退出只删该子目录——共享
-`.tmp` 根内其它内容（如并行 CLI 目录）不受影响。
+轮询门控——仅设置弹窗打开或基准运行中保活 3s 轮询）+ CLI 入口（`python -m briefdesk.plugins.benchmark.cli`）+ 插件自有配置
+`briefdesk/plugins/benchmark/config.py`（`BENCHMARK_` 前缀归插件所有，经 `settings_schema()` 自动出现在设置页）。运行环境
+`providers.bench_environment`（Web 与 CLI 共用同一套门闸）分两个阶段：
+
+1. **准备阶段（DB 仍是生产库）**：`pipeline.set_processing_paused(True)` 暂停生产管道（process_all_batches 顶部直接返回 False，实时消息不入库不标
+   processed、延后下轮回填恢复），发布 `benchmark_preparing` 公告，然后等待在途批次排空。等待用**无进展阈值**而非总时长上限：进展信号（`pendingCount` /
+   `activeBatches`）都是批粒度的，只在批边界变化，而单批内部的两段 AI 调用可能比任何固定总超时都慢，固定超时会误杀正常推进的慢批——计数连续无变化达
+   `BENCHMARK_DRAIN_STALL_SECONDS`（默认 720s）才抛错中止本次基准（不再带警告继续重定向：继续会让在途批次写落进临时库并在生产去重缓存留下幽灵条目）。
+   该公告**不得**声称拒绝写操作——此阶段写操作自洽且安全；
+2. **窗口阶段（DB 已重定向）**：排空后发布 `benchmark_running` 公告，再经 `db.db_redirect(bench.sqlite)` 官方缝把主/向量连接重定向到临时库（缝内
+   半程失败自动关闭已建连接；窗口内 `get_db`/`get_embed_db` 调用均落临时库）。此时全部 UI 写路由、备份与导出被 server 中间件的闸门拒绝（见
+   `briefdesk/server/`），与 DB 耦合的内存派生状态同步挂起：去重缓存的 `add_to_cache`/`remove_items` 直接 no-op（否则生产卡片退出判重、或灌入幽灵
+   条目），RAG 维护循环以 5s 短轮询安静跳过、引擎内 `maintenance_gc`/`_refresh_vector_cache` 加守卫且 `force_full` 的水位归零下移到守卫之后（归零会让
+   删除检测恒为假）。**周期同步不是 HTTP 路由**，闸门挡不住它——它写入的同样是临时库（随后丢弃），无害但不要以为所有写者都被冻住。
+
+退出 finally 逆序收尾：撤销两条公告（幂等，排空中止路径只有「准备中」）→ 复位暂停标志 → 还原 AI 端口 → 删子目录；`db_redirect` 的还原先于本 finally。
+撤销公告是本段**唯一**的可取消点，而 `CancelledError` 是 `BaseException` 子类、`except Exception` 拦不住（插件 teardown 会取消运行中的基准任务）——故复位段包在**外层
+`try/finally`** 里，取消落在 `revoke` 上时两个复位仍必达；两者相邻且其间无 await，事件循环内原子（顺序不得调整，否则会新开「管道已放行而 AI 端口未还原」的窗口）。
+删子目录留在保护段之外：取消路径上不值得为它多付一次线程跳转与磁盘删除，遗留的运行目录（插件包 `.tmp/` 内、已 gitignore）属接受项。
+**插件 teardown 会取消并限时等待运行中的基准任务**（本地实现，超时 5s）：关闭序列是 teardown_all → close_db，若任务活到 close_db 之后才被取消，
+`db_redirect` 会把单例还原为**从未关闭的生产连接**，残留的 aiosqlite 非 daemon worker 线程让解释器退出挂死。临时库落本次运行专属 uuid 子目录
+`.tmp/bench-<hex>/bench.sqlite`（插件包内 `.tmp/`），退出只删该子目录——共享 `.tmp` 根内其它内容（如并行 CLI 目录）不受影响。
 
 #### briefdesk/sources_base.py
 
@@ -1044,6 +1068,7 @@ required field of `weflow`/`qqflow` → that plugin self-disables via `PluginDis
 | `RAG_BACKFILL_BATCH` / `RAG_BACKFILL_BUDGET_PER_CYCLE` | `256` / `2000` | rag 回填嵌入子批大小 / 单轮总预算（超预算下轮续跑） |
 | `RAG_GROUP_ONLY` | `true` | rag 仅索引/检索群聊会话（启用会话恒为前提；停用会话即时不可问出） |
 | `RAG_MAINTENANCE_INTERVAL_SECONDS` | `3600` | rag 维护循环空闲间隔（GC 对账 + 缓存预热周期） |
+| `BENCHMARK_DRAIN_STALL_SECONDS` | `720` | benchmark 插件：排空在途批次时的**无进展**阈值（秒）——进展信号（待处理批次数/在途批次数）连续无变化达该值才中止基准。取值覆盖「单批中两段串行 AI 调用在常规退化下的耗时」（分类最坏 120s×3 次尝试 = 360s，其后「时间提取 ∥ 标题概括」并行段再 360s），**不应低于单请求最坏耗时 360s**；入库判官按条数叠加、OCR 与嵌入请求、两处拆半递归未覆盖，这些场景需调大。每次进入基准环境重新实例化，设置页改动无需重启即生效 |
 | `BACKFILL_HOURS` | `24` | REST 回填窗口：会话启用/从未轮询时按该窗口回填一次，此后按会话增量；`-1` = pull all history (warns at startup, pages to hasMore end) |
 | `IGNORED_EXPIRY_HOURS` | `0` (disabled) | On startup, purge ignored items older than this many hours (deletes from `items` + `raw_messages`, keeps `processed_messages`) |
 | `IGNORE_SELF` | `true` | 过滤本账号自己发送的消息（所有消息入口：SSE 实时 + REST 回填）。weflow-legacy REST 按 `isSend` 判定（SSE 上游已不推送自消息）；qqflow REST 按自身 UID（`u_<QQFLOW_QQ>`）判定，SSE 事件无发送者标识、开启后按消息回查 REST（每消息 +1 次本机 HTTP）。**注意 qqflow 的 `self_uid` 由配置推导而非取自上游**：服务端若绑着别的账号，自过滤会静默失效（把对方的消息当别人发的收进来，同时漏掉真正的自消息）——这是账号身份闸门在 qqflow 侧比 weflow 更要紧的原因（weflow 用数据自带的 `isSend`，不受影响） |
@@ -1065,8 +1090,8 @@ required field of `weflow`/`qqflow` → that plugin self-disables via `PluginDis
 
 配置按优先级解析：**系统密钥环（仅密钥）> 环境变量 > UI 暂存文件 > `.env` > 默认值**（实现：`briefdesk/secrets_store.py` +
 `briefdesk/settings_env.py` + `briefdesk/settings_base.py`；`KeyringSource` 由
-`KeyringSettingsBase.settings_customise_sources` 单点挂载，app 级与 weflow/weflow-legacy/qqflow/rag 五个
-Settings 经 `ClassVar KEYRING_FIELDS` 声明密钥字段继承之，位于 env 源之前；五个 Settings 的 `env_file` 均为
+`KeyringSettingsBase.settings_customise_sources` 单点挂载，六个 Settings（app 级与 weflow/weflow-legacy/qqflow/rag/benchmark）
+经 `ClassVar KEYRING_FIELDS` 声明密钥字段继承之，位于 env 源之前；六者的 `env_file` 均为
 `[项目根 .env, 暂存文件]`（基类统一声明、子类经 pydantic 自动合并继承），pydantic-settings 多文件**后加载优先**）。
 
 - **UI 暂存文件**：`platformdirs.user_config_dir("briefdesk")/settings.env`（Windows

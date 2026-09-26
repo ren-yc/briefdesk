@@ -20,6 +20,15 @@
   let pollTimer = null;
   let runActive = false; // 最近一次状态轮询的运行中标记（驱动轮询保活）
 
+  // 错误体里的 detail 可能是对象（写闸门 / 备份防线 / 导出守卫的 409 都是
+  // {code, message}）；直接拼进提示会得到 "[object Object]"。对象取 message，
+  // 缺省退回 HTTP 状态码。
+  function detailText(data, status) {
+    const d = data && data.detail;
+    if (d && typeof d === "object") return d.message || ("HTTP " + status);
+    return d || ("HTTP " + status);
+  }
+
   // ── 设置弹窗「关于」面板注入基准区块 ──
   function buildSection() {
     const about = document.querySelector('.settings-panel[data-panel="about"]');
@@ -34,7 +43,8 @@
       + '或开启「记录处理过程」在管道真实处理时点采集判定记录'
       + '（含判重/合并命中的正向用例），逐功能覆盖写入插件目录'
       + ' cases/*.fromweb.json，不写数据库。用例数与列表规模成正比，'
-      + '请先用筛选控制规模。运行会真实调用 AI，期间请勿触发同步。</p>'
+      + '请先用筛选控制规模。运行会真实调用 AI；运行期间界面写操作、备份与'
+      + '导出暂不可用。</p>'
       + '<div class="about-sources settings-btn-row">'
       + '<button id="bench-import-btn" class="settings-outline-btn">导出当前列表为基准用例</button>'
       + '<button id="bench-record-btn" class="settings-outline-btn">记录处理过程</button>'
@@ -90,7 +100,7 @@
         const st = await res.json();
         if (st.running) {
           runActive = true;
-          $status.innerHTML = "运行中（用例：" + esc(casesText) + "）…请勿触发同步"
+          $status.innerHTML = "运行中（用例：" + esc(casesText) + "）"
             + (recordText ? "；" + esc(recordText) : "");
           return;
         }
@@ -171,7 +181,7 @@
       });
       const data = await res.json().catch(() => ({}));
       if (!res.ok) {
-        showToast("导出失败：" + (data.detail || ("HTTP " + res.status)), { type: "error", duration: 5000 });
+        showToast("导出失败：" + detailText(data, res.status), { type: "error", duration: 5000 });
         $status.textContent = "导出失败";
         return;
       }
@@ -226,7 +236,7 @@
       const res = await fetch("/api/benchmark/export-recorded", { method: "POST" });
       const data = await res.json().catch(() => ({}));
       if (!res.ok) {
-        showToast("导出失败：" + (data.detail || ("HTTP " + res.status)), { type: "error", duration: 5000 });
+        showToast("导出失败：" + detailText(data, res.status), { type: "error", duration: 5000 });
         $status.textContent = "导出失败";
         return;
       }
@@ -270,10 +280,10 @@
       });
       if (!res.ok) {
         const data = await res.json().catch(() => ({}));
-        showToast("启动失败：" + (data.detail || ("HTTP " + res.status)), { type: "error", duration: 4000 });
+        showToast("启动失败：" + detailText(data, res.status), { type: "error", duration: 4000 });
         return;
       }
-      $status.textContent = "运行中…请勿触发同步";
+      $status.textContent = "运行中…";
       runActive = true;
       syncPolling(true);
     } catch (err) {

@@ -264,6 +264,7 @@ class TestPluginFrontendCoreHelper(unittest.TestCase):
         exported = [
             "esc", "escAttr", "showToast", "reqJson", "getJson", "postJson", "putJson",
             "deleteJson", "postVerify", "lsGet", "lsSet", "lsGetJson", "lsSetJson",
+            "showWriteError", "isBenchmarkBusy",
             "makeItemQuery", "catColor", "renderItemRow", "registerPluginView",
             "registerItemRowExtension", "gotoCategory",
         ]

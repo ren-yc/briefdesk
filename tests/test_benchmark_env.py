@@ -9,6 +9,8 @@
 ProviderResourceAcquisitionFailureTest）。
 """
 
+import asyncio
+import shutil
 import unittest
 from unittest.mock import AsyncMock, patch
 
@@ -110,20 +112,38 @@ if __name__ == "__main__":
 
 
 class TestDrainWait:
-    """重定向前等待在途批次排空：pendingCount 归零即通过，
-    超时返回 False（调用方告警后放弃等待，行为可观测）。"""
+    """重定向前等待在途批次排空：计数归零即通过，无进展达阈值才中止。
+
+    判据是**无进展**阈值而非总时长上限：进展信号只在批边界变化，而单批
+    内部的 AI 调用可能比任何固定总超时都慢（分类最坏 360s，其后还有一段
+    并行双调用），总超时会误杀正常推进的慢批。
+    """
 
     async def test_returns_true_when_drained(self):
         with patch.object(
             providers, "get_sync_progress", return_value={"pendingCount": 0}
         ):
-            assert await providers._wait_pipelines_drained(timeout_s=0.1)
+            assert await providers._wait_pipelines_drained(0.1)
 
-    async def test_returns_false_on_timeout(self):
+    async def test_returns_false_when_stalled(self):
         with patch.object(
             providers, "get_sync_progress", return_value={"pendingCount": 3}
         ):
-            assert not await providers._wait_pipelines_drained(timeout_s=0.1)
+            assert not await providers._wait_pipelines_drained(0.1)
+
+    async def test_keeps_waiting_while_progress_continues(self):
+        """计数持续变化时不得中止——即使累计耗时已远超阈值。"""
+        scripted = [3, 2, 1, 0]
+        calls = {"n": 0}
+
+        def progress():
+            value = scripted[min(calls["n"], len(scripted) - 1)]
+            calls["n"] += 1
+            return {"pendingCount": value}
+
+        # 阈值取到与单次轮询同量级：按总时长实现的版本会在中途就返回 False
+        with patch.object(providers, "get_sync_progress", side_effect=progress):
+            assert await providers._wait_pipelines_drained(0.05)
 
 
 class TestDrainTimeoutAborts:
@@ -143,7 +163,7 @@ class TestDrainTimeoutAborts:
             ),
             patch.object(providers, "db_redirect") as redirect,
             patch("briefdesk.pipeline.set_processing_paused") as paused,
-            pytest.raises(RuntimeError, match="排空超时"),
+            pytest.raises(RuntimeError, match="无进展"),
         ):
             async with providers.bench_environment(register_ai=False):
                 pass  # 不可达：排空前即中止
@@ -153,3 +173,135 @@ class TestDrainTimeoutAborts:
         from briefdesk import pipeline as _pipeline
 
         assert not _pipeline._processing_paused
+
+
+class TestBenchmarkAnnouncements:
+    """双公告：准备中先于等待发布且不声称拒绝写操作；撤销失败不阻断还原。"""
+
+    async def test_preparing_announced_before_wait_without_block_claim(self):
+        from briefdesk import ai_ports, announcements
+
+        announcements.reset_announcements()
+        preparing_seen: list[str] = []
+        ai_sentinel = object()
+
+        async def fake_wait(stall_seconds):
+            # 等待开始时「准备中」必须已发布：这一段最长可达无进展阈值
+            snapshot = {
+                a["code"]: a["message"] for a in announcements.get_announcements()
+            }
+            preparing_seen.append(snapshot.get("benchmark_preparing", ""))
+            return True
+
+        try:
+            with (
+                patch.object(providers, "_wait_pipelines_drained", new=fake_wait),
+                patch("briefdesk.pipeline.set_processing_paused"),
+                patch.object(providers.ai_ports, "get_ai", return_value=ai_sentinel),
+                patch.object(providers.ai_ports, "set_ai") as set_ai,
+            ):
+                async with providers.bench_environment(register_ai=False):
+                    inside = {a["code"] for a in announcements.get_announcements()}
+                    assert "benchmark_running" in inside
+            assert preparing_seen == [
+                "基准准备中：消息处理已暂停，正在等待在途批次排空"
+            ]
+            # 排空阶段 DB 仍是生产库，写操作自洽且安全——公告不得声称被拒绝
+            for forbidden in ("不可用", "拒绝", "暂不", "请勿"):
+                assert forbidden not in preparing_seen[0], (
+                    "准备中公告不得暗示写操作被拒绝（该阶段写是允许的）"
+                )
+            assert announcements.get_announcements() == [], "退出必须撤销两条公告"
+            assert set_ai.call_args_list[-1].args == (ai_sentinel,)
+        finally:
+            announcements.reset_announcements()
+            ai_ports.set_ai(None)
+
+    async def test_revoke_failure_still_restores_pause_flag_and_ai(self):
+        from briefdesk import ai_ports
+
+        ai_sentinel = object()
+        with (
+            patch.object(
+                providers,
+                "_wait_pipelines_drained",
+                new=AsyncMock(return_value=True),
+            ),
+            patch("briefdesk.pipeline.set_processing_paused") as paused,
+            patch.object(providers.ai_ports, "get_ai", return_value=ai_sentinel),
+            patch.object(providers.ai_ports, "set_ai") as set_ai,
+            patch.object(providers.announcements, "announce", new=AsyncMock()),
+            patch.object(
+                providers.announcements,
+                "revoke",
+                new=AsyncMock(side_effect=RuntimeError("公告通道故障")),
+            ),
+        ):
+            async with providers.bench_environment(register_ai=False):
+                pass
+
+        assert [c.args for c in paused.call_args_list] == [(True,), (False,)], (
+            "撤销公告抛错时管道暂停标志仍必须复位（否则管道一直停着）"
+        )
+        assert set_ai.call_args_list[-1].args == (ai_sentinel,), (
+            "撤销公告抛错时 AI 端口仍必须还原"
+        )
+        ai_ports.set_ai(None)
+
+    async def test_cancel_during_revoke_still_restores_pause_flag_and_ai(self):
+        """取消落在 revoke 的 await 上时，暂停标志与 AI 端口仍必须复位。
+
+        revoke 是收尾段里唯一的可取消点，而 CancelledError 是 BaseException
+        子类——内层 except Exception 拦不住，取消落在它上面会让紧随其后的
+        两条复位一起被跳过：管道永久停在暂停态、AI 端口仍指向基准供应商。
+        插件 teardown 会取消运行中的基准任务，该路径因此可达。
+
+        用例走**真实取消机制**：让 revoke 挂起，确认 task 已停在该挂起点后
+        再 cancel，而不是在桩里直接抛 CancelledError。
+        """
+        from briefdesk import ai_ports
+
+        ai_sentinel = object()
+        entered = asyncio.Event()
+
+        async def blocking_revoke(code: str) -> None:
+            entered.set()
+            await asyncio.sleep(3600)  # 挂起点：取消将落在这里
+
+        async def _enter_env() -> None:
+            async with providers.bench_environment(register_ai=False):
+                pass  # 正常走完 body，收尾段随即进入 revoke
+
+        root = providers._TMP_ROOT
+        before = set(root.glob("bench-*"))
+        try:
+            with (
+                patch.object(
+                    providers,
+                    "_wait_pipelines_drained",
+                    new=AsyncMock(return_value=True),
+                ),
+                patch("briefdesk.pipeline.set_processing_paused") as paused,
+                patch.object(providers.ai_ports, "get_ai", return_value=ai_sentinel),
+                patch.object(providers.ai_ports, "set_ai") as set_ai,
+                patch.object(providers.announcements, "announce", new=AsyncMock()),
+                patch.object(providers.announcements, "revoke", new=blocking_revoke),
+            ):
+                task = asyncio.create_task(_enter_env())
+                await asyncio.wait_for(entered.wait(), timeout=5)
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+
+            assert [c.args for c in paused.call_args_list] == [(True,), (False,)], (
+                "取消落在 revoke 上时暂停标志仍必须复位（否则管道一直停着）"
+            )
+            assert set_ai.call_args_list[-1].args == (ai_sentinel,), (
+                "取消落在 revoke 上时 AI 端口仍必须还原"
+            )
+        finally:
+            # 收尾段的运行目录清理不在保护范围内，这条路径会遗留本次目录
+            # （接受项）：用例自行回收，避免反复运行堆积
+            for leftover in set(root.glob("bench-*")) - before:
+                shutil.rmtree(leftover, ignore_errors=True)
+            ai_ports.set_ai(None)

@@ -9,7 +9,9 @@ from urllib.parse import urlsplit
 from fastapi import Request
 from fastapi.responses import JSONResponse
 
+from briefdesk import db
 from briefdesk.config import config
+from briefdesk.server import window_guard
 from briefdesk.server.app import app
 
 _ALLOWED_HOSTNAMES = frozenset({"localhost", "127.0.0.1", "::1"})
@@ -73,6 +75,20 @@ async def _local_security_guard(request: Request, call_next):
             return JSONResponse(
                 {"detail": "Cross-origin request rejected"}, status_code=403
             )
+        # 基准窗口写闸门放在同源校验之后：跨站请求先拿到 403 而非 409，
+        # 否则它会成为探测「基准是否正在运行」的旁路
+        if db.in_redirect() and window_guard.is_blocked_write(
+            request.method, request.url.path
+        ):
+            return window_guard.benchmark_busy_response()
+
+    # 读路由默认放行（纯显示类读路由在窗口内显示临时库内容，由列表区提示
+    # 覆盖），只有会把临时库内容落成用户可保存文件的三条被点名拦截。
+    # GET 不经同源校验，但跨站页面读不到响应内容，不构成探测面。
+    if db.in_redirect() and window_guard.is_blocked_read(
+        request.method, request.url.path
+    ):
+        return window_guard.benchmark_busy_response()
 
     response = await call_next(request)
     response.headers.setdefault(

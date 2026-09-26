@@ -42,22 +42,42 @@ _TMP_ROOT = Path(__file__).resolve().parent / ".tmp"
 _DRAIN_POLL_INTERVAL = 0.05
 
 
-async def _wait_pipelines_drained(timeout_s: float = 120.0) -> bool:
-    """等待在途批次排空：暂停只拦新批，已在分类阶段的批次仍会
-    进入存储相——不排空就重定向会把它们的卡片写进临时库，并在生产去重缓存
-    留下指向临时库的幽灵条目（后续相似消息被误吸收）。
+def _drain_progress() -> tuple[int, int]:
+    """排空进展信号（批粒度）：(待处理批次数, 在途批次数)。
 
-    以「pendingCount==0 且 activeBatches==0」为排空信号：pendingCount 覆盖已
-    计数的批次；activeBatches 覆盖「已过暂停检查、尚未计数」的窗口批次
-    （否则该窗口批次被误判排空）。返回是否在超时前排空。
+    pendingCount 覆盖已计数的批次；activeBatches 覆盖「已过暂停检查、尚未
+    计数」的窗口批次——只看前者会把该窗口批次误判为已排空。
     """
     from briefdesk.pipeline import get_active_batches
 
-    deadline = asyncio.get_running_loop().time() + timeout_s
+    return (get_sync_progress().get("pendingCount", 0), get_active_batches())
+
+
+async def _wait_pipelines_drained(stall_seconds: float) -> bool:
+    """等待在途批次排空：暂停只拦新批，已在分类阶段的批次仍会进入存储相——
+    不排空就重定向会把它们的卡片写进临时库，并在生产去重缓存留下指向临时库
+    的幽灵条目（后续相似消息被误吸收）。
+
+    判据是**无进展超时**而非总时长上限。进展信号都是批粒度的，只在批边界
+    变化，而单批内部的 AI 调用可能比任何固定总超时都慢（分类最坏
+    120s × 3 次尝试 = 360s，其后还有「时间提取 ∥ 标题概括」并行段）：用总
+    超时会误中止正常推进的慢批，用无进展阈值则只要批次还在推进就一直等，
+    真正卡死的场景仍被兜住。
+
+    返回是否在无进展超时前排空。阈值取值与未覆盖场景见
+    benchmark/config.BenchmarkSettings.drain_stall_seconds。
+    """
+    loop = asyncio.get_running_loop()
+    last: tuple[int, int] | None = None
+    last_change = loop.time()
     while True:
-        if get_sync_progress().get("pendingCount") == 0 and get_active_batches() == 0:
+        cur = _drain_progress()
+        if cur == (0, 0):
             return True
-        if asyncio.get_running_loop().time() >= deadline:
+        now = loop.time()
+        if cur != last:
+            last, last_change = cur, now
+        elif now - last_change >= stall_seconds:
             return False
         await asyncio.sleep(_DRAIN_POLL_INTERVAL)
 
@@ -85,7 +105,10 @@ async def bench_environment(
     退出恢复顺序见 finally 内注释；不动 config.db_path、不关闭应用已有的数据库连接。
     """
     from briefdesk import pipeline
+    from briefdesk.plugins.benchmark.config import BenchmarkSettings
 
+    # 每次进入都重新实例化：设置页改动后无需重启即可生效
+    stall_seconds = BenchmarkSettings().drain_stall_seconds
     old_ai = ai_ports.get_ai()
     run_dir = _TMP_ROOT / f"bench-{uuid.uuid4().hex[:8]}"
     db_path = str(run_dir / "bench.sqlite")
@@ -95,24 +118,36 @@ async def bench_environment(
         # 实时消息不入库也不标 processed，延后到下轮回填自然恢复。
         # 置于 try 内保证任何后续失败都走 finally 的复位与子目录清理。
         pipeline.set_processing_paused(True)
+        # 「准备中」公告必须位于等待之前：这一段最长可达无进展阈值（默认
+        # 720s），期间用户完全看不到反馈。措辞**不得**声称拒绝写操作——
+        # 排空阶段 DB 仍是生产库，写操作自洽且安全，会被写闸门挡住的只有
+        # 之后的**重定向窗口期**。
+        try:
+            await announcements.announce(
+                "benchmark_preparing",
+                "warning",
+                "基准准备中：消息处理已暂停，正在等待在途批次排空",
+            )
+        except Exception:  # 公告失败不阻断基准运行
+            logger.debug("基准公告发布失败", exc_info=True)
         # 等待在途批次排空，见 _wait_pipelines_drained。
         # 必须先于 db_redirect：在途批次仍持生产连接，未排空即重定向会让
         # 半程批次的后续写落到临时基准库。
-        if not await _wait_pipelines_drained():
+        if not await _wait_pipelines_drained(stall_seconds):
             # 直接中止：带警告继续会在途批次的后续写落进临时基准库，并在生产
-            # 去重缓存留下幽灵条目。位于 try 内，finally 照常复位（公告此时
-            # 尚未发布，revoke 为幂等 no-op）；路由层捕获异常写入 _last_result。
+            # 去重缓存留下幽灵条目（去重缓存是进程级内存态，切库不会清）。
+            # 位于 try 内，finally 照常复位；路由层捕获异常写入 _last_result。
             raise RuntimeError(
-                "benchmark: 等待在途批次排空超时（120s），已中止本次基准以免"
-                "在途批次写入临时库/污染生产去重缓存；稍后重试"
+                f"benchmark: 等待在途批次排空时连续 {stall_seconds}s 无进展，"
+                "已中止本次基准以免在途批次写入临时库/污染生产去重缓存；"
+                "可调大 BENCHMARK_DRAIN_STALL_SECONDS 后重试"
             )
         try:
             await announcements.announce(
                 "benchmark_running",
                 "warning",
-                "基准运行中：生产管道已暂停，UI 写操作（备忘/忽略/改分类/"
-                "提醒等）将落在临时基准库并在运行结束后丢弃，请勿在此期间"
-                "操作界面。",
+                "基准运行中：界面写操作、备份与导出暂不可用；消息处理已暂停，"
+                "结束后如未开启周期同步，请点一次同步补齐",
             )
         except Exception:  # 公告失败不阻断基准运行
             logger.debug("基准公告发布失败", exc_info=True)
@@ -127,9 +162,26 @@ async def bench_environment(
         # finally），此处再复位管道标志——不存在"管道已放行而 DB 未还原"
         # 的窗口；AI 端口复位与标志复位之间无 await 点，事件循环内原子。
         try:
-            await announcements.revoke("benchmark_running")
-        except Exception:  # 撤销失败不影响环境还原
-            logger.debug("基准公告撤销失败", exc_info=True)
-        pipeline.set_processing_paused(False)
-        ai_ports.set_ai(old_ai)
+            # 两条公告都在此撤销（幂等）：排空中止路径只发布过「准备中」，
+            # 正常路径两条都有
+            for code in ("benchmark_running", "benchmark_preparing"):
+                try:
+                    await announcements.revoke(code)
+                except Exception:  # 撤销失败不影响环境还原
+                    logger.debug("基准公告撤销失败", exc_info=True)
+        finally:
+            # 必须在外层 finally：revoke 是本段唯一的可取消点，而
+            # CancelledError 是 BaseException 子类，上面的 except Exception
+            # 拦不住（插件 teardown 会取消运行中的基准任务，兜底清理还会补发
+            # 取消）。漏掉下面两行，管道会永久停在暂停态、AI 端口也仍指向
+            # 基准供应商。
+            # 两条复位保持相邻且不得移出本 finally：它们之间没有 await，事件
+            # 循环内原子——分开或上移会新开「管道已放行而 AI 端口未还原」的
+            # 窗口，届时新批次会用基准供应商处理。
+            pipeline.set_processing_paused(False)
+            ai_ports.set_ai(old_ai)
+        # 运行目录清理留在保护段之外：它不是环境还原的必要条件，取消路径上
+        # 不值得为它多付一次线程跳转与磁盘删除（遗留目录在插件包 .tmp/ 内，
+        # 已 gitignore）。因此取消恰落在 revoke 上时本次目录会留存——接受的
+        # 残留；第二次取消落在这里同样是接受项。
         await asyncio.to_thread(shutil.rmtree, run_dir, ignore_errors=True)

@@ -55,5 +55,49 @@ class DynamicSelectorEscapeGuardTest(unittest.TestCase):
         )
 
 
+class WriteErrorHelperGuardTest(unittest.TestCase):
+    """写操作失败一律经 showWriteError：窗口期 409 必须与真实失败区分。
+
+    各调用点曾各自 showToast("...失败...")，窗口内后端闸门拒绝时会把
+    「基准运行中、现在重试不会成功」说成普通失败，用户反复重试。
+    """
+
+    def test_app_js_write_sites_use_shared_helper(self):
+        app = (_ROOT / "ui" / "app.js").read_text(encoding="utf-8")
+        self.assertIn(
+            "function showWriteError(err, fallbackMsg, errorDuration = 4000)", app
+        )
+        # 定义 1 处 + 7 个调用点（单卡/撤销/批量/改分类/时间线/会话发现/设置保存）
+        self.assertEqual(app.count("showWriteError("), 8)
+        # 旧写法不得残留
+        self.assertNotIn('showToast("批量操作失败，请重试"', app)
+        self.assertNotIn('showToast("分类修改失败，请重试"', app)
+
+    def test_benchmark_plugin_ui_formats_detail_objects(self):
+        ui = (
+            _ROOT / "briefdesk" / "plugins" / "benchmark" / "ui" / "ui.js"
+        ).read_text(encoding="utf-8")
+        self.assertIn("function detailText(", ui)
+        # detail 为对象（写闸门 / 备份防线 / 导出守卫的 409）时直接拼接会
+        # 渲染成 "[object Object]"
+        self.assertNotIn('(data.detail || ("HTTP " + res.status))', ui)
+        self.assertEqual(ui.count("detailText(data, res.status)"), 3)
+
+    def test_plugin_uis_read_body_for_window_detection(self):
+        for name, fallback in (
+            ("reminders", 'showWriteError(err, "提醒设置失败，请重试")'),
+            ("rag", "isBenchmarkBusy(err)"),
+        ):
+            ui = (
+                _ROOT / "briefdesk" / "plugins" / name / "ui" / "ui.js"
+            ).read_text(encoding="utf-8")
+            self.assertIn(
+                "err.payload = await res.json()",
+                ui,
+                f"{name} 插件前端必须读响应体才能识别基准窗口",
+            )
+            self.assertIn(fallback, ui)
+
+
 if __name__ == "__main__":
     unittest.main()

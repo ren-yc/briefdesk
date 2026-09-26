@@ -18,6 +18,7 @@ import json
 import logging
 from dataclasses import dataclass
 
+from briefdesk import db as db_mod
 from briefdesk.ai_ports import (
     chat,
     embed_model_name,
@@ -201,6 +202,13 @@ class DedupEngine(DedupService):
             await self._ensure_cache()
 
     async def _ensure_cache(self) -> None:
+        """从当前连接加载全量卡片与嵌入，重建缓存。
+
+        **窗口挂起不覆盖本方法**：基准判重用例经 _ProbeDedupEngine（本类子类）
+        走 check_dedup → ensure_cache → 本方法，从临时基准库加载卡片——这是基准
+        正确性的前提。若在此加 db_mod.in_redirect() 守卫，基准缓存恒空、判重全判
+        False，指标会静默出错。挂起只加在 add_to_cache / remove_items 上。
+        """
         items = await get_all_item_texts()
         self._cache = [
             CachedItem(
@@ -262,7 +270,14 @@ class DedupEngine(DedupService):
         source_quote 参与原文哈希精确短路（content_hash 同步按原文重算）；
         未传入/为空时该条不参与。
         同 id 重复追加（并发/唯一键冲突路径）幂等：更新已有条目而非叠加。
+
+        窗口内直接 no-op：管道已暂停，此时调用方看到的都是临时基准库的数据，
+        变更生产缓存只会让生产卡片退出判重（相似新消息重复建卡直到重启）或
+        灌入生产库不存在的幽灵条目（吸收真实消息、静默丢卡）。
         """
+        if db_mod.in_redirect():
+            logger.debug("窗口内跳过去重缓存变更: add_to_cache(%s)", item_id)
+            return
         images = _parse_images(image_urls)
         content_hash = self._content_hash(source_quote)
         target: CachedItem | None = None
@@ -298,8 +313,14 @@ class DedupEngine(DedupService):
 
         同步重建列表（无 await），单线程事件循环下与其它协程安全；
         缺失条目静默跳过。重启后 _ensure_cache 从 DB 重载，两路径收敛。
+
+        窗口内直接 no-op：批量删除/忽略在窗口内作用于临时库（affected == 0），
+        若照常清生产缓存，生产卡片会退出判重。
         """
         if not item_ids:
+            return
+        if db_mod.in_redirect():
+            logger.debug("窗口内跳过去重缓存变更: remove_items(%d)", len(item_ids))
             return
         ids = set(item_ids)
         self._cache = [it for it in self._cache if it.id not in ids]

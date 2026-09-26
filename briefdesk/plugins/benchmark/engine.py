@@ -6,7 +6,8 @@
 
 执行与生产同引擎路径：classify_batch / DedupEngine.check_dedup /
 judge_merge / summarize_title，经 briefdesk.ai_ports 端口调用真实供应商；
-运行环境见 providers.bench_environment（补丁式临时库，不动应用连接）。
+运行环境见 providers.bench_environment（经 db.db_redirect 把主/向量连接重定向
+到临时库，不动应用已有连接）。
 """
 
 from __future__ import annotations

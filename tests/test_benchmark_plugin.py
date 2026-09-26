@@ -857,5 +857,47 @@ class TestCasesEndpoint:
             await bench_router.remove_all_cases(feature="nope")
 
 
+class TestTeardownCancelsRun:
+    """关闭期收口：插件 teardown 必须先让基准环境还原单例。
+
+    关闭序列是 teardown_all → close_db。基准运行期间单例指向临时库，若任务
+    活到 close_db 之后才被取消，db_redirect 的 finally 会把单例还原为**从未
+    关闭的生产连接**，其残留的 aiosqlite 非 daemon worker 线程让解释器退出
+    挂死。
+    """
+
+    async def test_teardown_cancels_task_and_restores_singletons(self):
+        from briefdesk.plugins.benchmark import providers
+
+        plugin = BenchmarkPlugin()
+        old_main, old_embed = briefdesk_db._db, briefdesk_db._embed_db
+        entered = asyncio.Event()
+
+        async def run():
+            async with providers.bench_environment(register_ai=False):
+                entered.set()
+                await asyncio.sleep(3600)
+
+        task = asyncio.create_task(run())
+        await entered.wait()
+        assert briefdesk_db._db is not old_main, "基准运行期间单例应指向临时库"
+        try:
+            with patch.object(bench_router, "_running_task", task):
+                await plugin.teardown()
+        finally:
+            if not task.done():  # pragma: no cover — teardown 应已取消并等待
+                task.cancel()
+
+        assert task.done(), "teardown 必须取消并等待基准任务终结"
+        assert briefdesk_db._db is old_main, "teardown 返回前必须已还原主连接单例"
+        assert briefdesk_db._embed_db is old_embed, "向量连接单例同样必须还原"
+        assert not briefdesk_db.storage_lock.locked()
+
+    async def test_teardown_is_noop_without_running_task(self):
+        plugin = BenchmarkPlugin()
+        with patch.object(bench_router, "_running_task", None):
+            await plugin.teardown()  # 不得抛错
+
+
 if __name__ == "__main__":
     unittest.main()

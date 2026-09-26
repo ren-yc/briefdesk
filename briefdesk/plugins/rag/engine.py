@@ -25,6 +25,7 @@ import aiosqlite
 import numpy as np
 
 from briefdesk import ai_ports
+from briefdesk import db as db_mod
 from briefdesk.db import get_db, get_embed_db, get_embed_lock, storage_lock
 from briefdesk.masking import PLACEHOLDER_ONLY_RE
 from briefdesk.plugins.rag.config import RagSettings
@@ -435,6 +436,12 @@ class RagEngine:
 
         db = await self._db_factory()
         edb = await self._embed_factory()
+        # 守卫在取到连接之后：只有连接身份确定后，判断才拦得住「检查时未开始、
+        # 使用时已开始」。临时库没有 rag 四表，继续会抛 no such table。
+        # 本文件有名为 db 的局部变量，故用模块别名而非裸 db。
+        if db_mod.in_redirect():
+            logger.debug("rag: 基准窗口内跳过 GC 对账")
+            return 0
         async with storage_lock, get_embed_lock():
             removed = await gc_orphans(db, edb)
         if removed:
@@ -451,11 +458,12 @@ class RagEngine:
         force_full 语义：整表重建 = 拉全表后按 key 差集剔除
         缓存内本次未 fetch 到的条目——否则「删除信号」被归零计数吞掉，
         已删内容持续可被检索。
+
+        force_full 的水位归零已下移到 _refresh_vector_cache 内、窗口守卫之后：
+        归零会让「行数回退 → 整表重建」的删除检测恒为假，窗口内归零会使窗口
+        结束后被删除的内容最长一个维护周期（默认 3600s）内仍可被问答引用。
         """
 
-        if force_full:
-            self._vec_watermark = ""
-            self._vec_count_seen = 0
         async with self._refresh_lock:
             await self._refresh_vector_cache(force_full=force_full)
 
@@ -494,6 +502,15 @@ class RagEngine:
             self._vec_cache_clear()
             self._vec_model = model
         edb = await self._embed_factory()
+        # 守卫紧跟在两个 factory 之后、任何 SQL 之前：临时库没有
+        # rag_chunk_embeddings，SELECT COUNT(*) 直接抛 no such table。且
+        # force_full 的水位归零必须在守卫之后——见 warm_vectors 的说明。
+        if db_mod.in_redirect():
+            logger.debug("rag: 基准窗口内跳过向量缓存刷新")
+            return
+        if force_full:
+            self._vec_watermark = ""
+            self._vec_count_seen = 0
         # 共享 embed 连接上的读也持互斥锁：本方法结尾的 bad-key 删除会 commit，
         # 不持锁的 commit 可能把 dedup 未完成的批量向量写入提前提交
         async with get_embed_lock():
