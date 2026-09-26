@@ -6,8 +6,8 @@
 
 执行与生产同引擎路径：classify_batch / DedupEngine.check_dedup /
 judge_merge / summarize_title，经 briefdesk.ai_ports 端口调用真实供应商；
-运行环境见 providers.bench_environment（经 db.db_redirect 把主/向量连接重定向
-到临时库，不动应用已有连接）。
+运行环境由**调用方**负责：runner 子进程经 providers.prepare_scratch 备好自己的
+scratch 库与 AI 端口；CLI 手工运行同样自建临时库（见 cli.run_benchmark）。
 """
 
 from __future__ import annotations
@@ -31,7 +31,6 @@ from briefdesk.plugins.benchmark.metrics import (
     aggregate_title,
     evaluate_classify_case,
 )
-from briefdesk.plugins.benchmark.providers import bench_environment
 from briefdesk.plugins.benchmark.schema import (
     BaseCase,
     CategoryDef,
@@ -52,13 +51,6 @@ from briefdesk.types import ClassifyResult
 logger = logging.getLogger(__name__)
 
 FEATURES: tuple[str, ...] = ("classify", "dedup", "merge", "title")
-
-# 运行环境归属：managed = 本函数自己包 bench_environment（inproc 路径，行为不变）；
-# caller = 调用方已备好 scratch 库与 AI 端口（基准子进程）。默认必须是 managed——
-# inproc 调用方不套任何环境直接调本函数，改成 caller 会让它在默认路径下失去隔离。
-ENV_MANAGED = "managed"
-ENV_CALLER = "caller"
-ENVIRONMENTS: tuple[str, ...] = (ENV_MANAGED, ENV_CALLER)
 
 FROMWEB_SOURCE_LABEL = "cases/*.fromweb.json"  # 网页导出用例的 dataset 标识（报告/JSON 溯源）
 
@@ -267,7 +259,6 @@ async def run_benchmark_cases(
     dataset_label: str | dict[str, str] = FROMWEB_SOURCE_LABEL,
     progress: Callable[[CaseProgress], None] | None = None,
     run_id: str | None = None,
-    environment: str = ENV_MANAGED,
 ) -> tuple[dict[str, Any], dict[str, list[Any]]]:
     """在基准环境内运行指定功能用例。
 
@@ -277,16 +268,8 @@ async def run_benchmark_cases(
     CLI 传各数据集文件路径），写入报告供溯源。
     progress（可选）：每条用例 settle 后回调一次（成功/失败都算），
     CLI 据此输出评估进度；缺省无进度输出。
-    environment：运行环境归属，见 ENV_MANAGED / ENV_CALLER。
     run_id：结果标识，缺省落回本地时间戳（父进程给定时以它为准）。
     """
-    if environment not in ENVIRONMENTS:
-        # 响亮失败：拼错的环境名若被当成 managed 会静默走重定向，
-        # 子进程里那意味着白白多建一个临时库、报告还落在别处。
-        raise ValueError(
-            f"未知 environment={environment!r}，只接受 {ENVIRONMENTS}："
-            "managed 由本函数包 bench_environment，caller 表示调用方已备好环境"
-        )
     started = time.monotonic()
 
     async def _run_all() -> tuple[
@@ -305,11 +288,7 @@ async def run_benchmark_cases(
             evals_by_feature[feature] = evals
         return summaries, evals_by_feature, elapsed
 
-    if environment == ENV_CALLER:
-        summaries, evals_by_feature, elapsed = await _run_all()
-    else:
-        async with bench_environment(categories=category_defs):
-            summaries, evals_by_feature, elapsed = await _run_all()
+    summaries, evals_by_feature, elapsed = await _run_all()
     payload = _build_payload(
         summaries,
         evals_by_feature,

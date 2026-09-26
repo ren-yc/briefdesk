@@ -799,18 +799,23 @@ class TestRunFlow:
 
         from briefdesk.plugins.benchmark import supervisor
 
-        self._tmp = tempfile.TemporaryDirectory()
-        store_patcher = patch.object(
-            bench_store, "CASES_DIR", Path(self._tmp.name)
-        )
+        self._tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        cases_dir = Path(self._tmp.name) / "cases"
+        cases_dir.mkdir()
+        run_root = Path(self._tmp.name) / "runs"
+        run_root.mkdir()
+        store_patcher = patch.object(bench_store, "CASES_DIR", cases_dir)
         store_patcher.start()
-        # 进程内模式必须显式钉住：默认值受 .env 影响，而这条用例断言的是
-        # inproc 的语义（不产 run_dir、报告只驻内存）
+        # 快照源与运行根都必须钉住：默认值分别指向插件目录里的 cases/ 与 .tmp/runs/，
+        # 前者会快照用户导出的真实用例（真发 AI 请求），后者会把产物写进仓库
+        cases_patcher = patch.object(supervisor, "CASES_SRC", cases_dir)
+        run_root_patcher = patch.object(supervisor, "RUN_ROOT", run_root)
+        cases_patcher.start()
+        run_root_patcher.start()
         settings_patcher = patch.object(
             supervisor,
             "_settings",
             lambda: SimpleNamespace(
-                run_mode="inproc",
                 pause_pipeline=False,
                 keep_runs=5,
                 run_timeout_seconds=0,
@@ -833,6 +838,8 @@ class TestRunFlow:
         self.patcher.stop()
         await self.conn.close()
         settings_patcher.stop()
+        run_root_patcher.stop()
+        cases_patcher.stop()
         store_patcher.stop()
         self._tmp.cleanup()
     async def test_start_run_with_no_cases_completes(self):
@@ -841,20 +848,18 @@ class TestRunFlow:
         resp = await bench_router.start_run(None)
         assert resp["started"]
         assert resp["run_id"]
-        # 等待后台任务完成（零用例 → 无 AI 调用，立即完成）
-        for _ in range(50):
+        # 等待子进程跑完（零用例 → 无 AI 调用，只剩启动开销）
+        for _ in range(400):
             state = await bench_router.run_status()
             if not state["running"]:
                 break
-            await asyncio.sleep(0.02)
+            await asyncio.sleep(0.05)
         assert not state["running"]
         assert "run_id" in state
         assert isinstance(state["elapsed_sec"], float)
-        # 进程内运行不产出 run_dir，而 /report 只认盘上「已完成」的运行——
-        # 双轨期的这条语义是契约写明的（子进程模式才有报告可读）
-        with pytest.raises(HTTPException) as ctx:
-            await bench_router.latest_json_report()
-        assert ctx.value.status_code == 404
+        # 子进程运行天然落盘：零用例也产出报告（features 为空），/report 可读
+        report = await bench_router.latest_json_report()
+        assert json.loads(report.body)["features"] == {}
         # 取消是幂等的：没在跑就如实说没在跑
         assert await bench_router.cancel_run() == {
             "cancelled": False,
@@ -877,6 +882,22 @@ class TestCasesEndpoint:
             await bench_router.remove_all_cases(feature="nope")
 
 
+class _FakeProc:
+    """假子进程句柄：只提供监控与取消会用到的成员（terminate 后立刻置退出码）。"""
+
+    def __init__(self) -> None:
+        self.returncode: int | None = None
+
+    def terminate(self) -> None:
+        self.returncode = 1
+
+    def kill(self) -> None:
+        self.terminate()
+
+    async def wait(self) -> int | None:
+        return self.returncode
+
+
 class TestTeardownStopsRun:
     """关闭期收口：插件 teardown 必须把运行先停下来（两种模式都要管）。
 
@@ -887,28 +908,25 @@ class TestTeardownStopsRun:
     """
 
     async def test_teardown_stops_running_benchmark(self):
+        """teardown → stop_all → cancel → 等收尾。
+
+        运行用假句柄钉在「已起、未退出」上：空用例的真子进程不到一秒就跑完，
+        等不到 teardown 就已经不在跑了，断言会退化成恒真。
+        """
         from types import SimpleNamespace
 
         from briefdesk.plugins.benchmark import supervisor
 
         plugin = BenchmarkPlugin()
-        entered = asyncio.Event()
 
-        async def _slow(*_a, **_k):
-            entered.set()
-            await asyncio.sleep(3600)
+        async def _spawn(run) -> None:
+            run.proc = _FakeProc()
 
-        with tempfile.TemporaryDirectory() as tmp:
-            runner = patch("briefdesk.plugins.benchmark.engine.run_benchmark_cases", new=_slow)
-            loader = patch(
-                "briefdesk.plugins.benchmark.engine.load_web_cases",
-                new=AsyncMock(return_value=[]),
-            )
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             settings = patch.object(
                 supervisor,
                 "_settings",
                 lambda: SimpleNamespace(
-                    run_mode="inproc",
                     pause_pipeline=False,
                     keep_runs=5,
                     run_timeout_seconds=0,
@@ -916,15 +934,13 @@ class TestTeardownStopsRun:
                 ),
             )
             root = patch.object(supervisor, "RUN_ROOT", Path(tmp))
-            with runner, loader, settings, root:
+            spawn = patch.object(supervisor, "_spawn", new=_spawn)
+            with settings, root, spawn:
                 supervisor._current = None
                 await supervisor.start(["dedup"])
-                await asyncio.wait_for(entered.wait(), timeout=5)
                 assert supervisor.is_running()
                 await plugin.teardown()
                 assert not supervisor.is_running(), "teardown 必须取消并等待运行终结"
-        supervisor._current = None
-
     async def test_teardown_is_noop_without_running_benchmark(self):
         from briefdesk.plugins.benchmark import supervisor
 

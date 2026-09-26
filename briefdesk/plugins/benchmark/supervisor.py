@@ -11,12 +11,8 @@
 - failed-recorded：最后一行是 error 终态行（报告可缺）；
 - aborted：没有任何终态行（被杀/超时/崩溃），原因由这里补记。
 
-两种运行模式（BENCHMARK_RUN_MODE）：
-
-- inproc：与生产同进程跑，隔离交给 bench_environment（重定向 + 暂停 + 排空），
-  行为与改造前逐位一致；不产出 run_dir，结果只驻内存（双轨期 /report 因此返回
-  最近一次子进程运行的结果或 404——这是契约里写明的过渡语义）；
-- subprocess：spawn runner 子进程，父进程只负责生命周期与读盘。
+运行方式是 spawn 一个 runner 子进程：父进程只负责生命周期（启动/状态/取消/回收/轮转）
+与读盘，子进程在自己的进程里建 scratch 库、跑用例、写产物。
 
 取消/超时/宽限 kill 一律只经本进程持有的句柄执行，不做探活、不用 os.kill(pid, 0)。
 """
@@ -44,9 +40,6 @@ logger = logging.getLogger(__name__)
 RUN_ROOT = Path(__file__).resolve().parent / ".tmp" / "runs"
 CASES_SRC = Path(__file__).resolve().parent / "cases"
 
-INPROC = "inproc"
-SUBPROCESS = "subprocess"
-
 # 子进程模式专用的公告码：**不能**复用 benchmark_running——前端是按这个码把列表区
 # 整块替换成占位的，子进程模式下列表区应当照常可用。
 ANNOUNCE_CODE = "benchmark_paused"
@@ -64,19 +57,16 @@ _CREATE_NO_WINDOW = 0x08000000
 class _Run:
     run_id: str
     run_dir: Path
-    mode: str
     features: list[str]
     started_at: str
     t0: float
     progress_every: int = 1
     proc: Any | None = None
-    task: asyncio.Task[None] | None = None
     monitor: asyncio.Task[None] | None = None
     fh: IO[bytes] | None = None
     error: str | None = None
     aborted_reason: str | None = None
     exit_code: int | None = None
-    payload: dict[str, Any] | None = None  # inproc 模式的内存结果
     html: str = ""
     pause: bool = True
     finished: bool = False
@@ -298,19 +288,14 @@ async def start(features: list[str]) -> dict[str, Any]:
     if is_running():
         raise RuntimeError("基准正在运行中")
     settings = _settings()
-    mode = settings.run_mode if settings.run_mode in (INPROC, SUBPROCESS) else INPROC
     run_id = _new_run_id()
     started_at = time.strftime("%Y-%m-%d %H:%M:%S")
     stamp = started_at.replace("-", "").replace(":", "").replace(" ", "-")
     run_dir = RUN_ROOT / f"{stamp}-{run_id[:8]}"
-    # 只有子进程模式才落下 run_dir：inproc 的结果只驻内存，凭空建一个目录只会
-    # 被轮转与清理当成一次「aborted 运行」，污染保留策略与 /report 的候选集
-    if mode == SUBPROCESS:
-        run_dir.mkdir(parents=True, exist_ok=True)
+    run_dir.mkdir(parents=True, exist_ok=True)
     run = _Run(
         run_id=run_id,
         run_dir=run_dir,
-        mode=mode,
         features=list(features),
         started_at=started_at,
         t0=time.monotonic(),
@@ -323,20 +308,15 @@ async def start(features: list[str]) -> dict[str, Any]:
         "pid": os.getpid(),
         "db_path": "",
         "source": "fromweb",
-        "mode": mode,
     }
     # meta 必须先落盘：被杀/崩溃的运行也要能被识别成「历史结果」而不是残目录
-    if mode == SUBPROCESS:
-        _write_json(run_dir / "meta.json", run.meta)
+    _write_json(run_dir / "meta.json", run.meta)
     _current = run
     try:
-        if mode == SUBPROCESS:
-            if run.pause:
-                pipeline.set_processing_paused(True)
-            await _announce()
-            await _spawn(run)
-        else:
-            run.task = asyncio.create_task(_run_inproc(run))
+        if run.pause:
+            pipeline.set_processing_paused(True)
+        await _announce()
+        await _spawn(run)
         run.monitor = asyncio.create_task(_monitor(run, settings))
     except Exception as e:
         run.error = f"{type(e).__name__}: {e}"
@@ -397,31 +377,6 @@ async def _spawn(run: _Run) -> None:
     run.fh.close()
     run.fh = None
 
-async def _run_inproc(run: _Run) -> None:
-    """进程内运行：环境（暂停/排空/重定向/AI 端口）由 bench_environment 自理，
-    行为与改造前逐位一致；不产出 run_dir。"""
-    from briefdesk.plugins.benchmark import engine as bench_engine
-    from briefdesk.plugins.benchmark.html_report import build_html_report
-
-    try:
-        cases_by_feature: dict[str, list[Any]] = {}
-        for feature in run.features:
-            cases_by_feature[feature] = await bench_engine.load_web_cases(feature)
-        payload, _evals = await bench_engine.run_benchmark_cases(
-            cases_by_feature, run_id=run.run_id
-        )
-        run.payload = payload
-        run.html = build_html_report(payload)
-        run.terminal = "completed"
-    except asyncio.CancelledError:
-        run.aborted_reason = "取消"
-        raise
-    except Exception as e:
-        logger.exception("基准运行失败")
-        run.error = f"{type(e).__name__}: {e}"
-        run.terminal = "failed-recorded"
-
-
 async def _monitor(run: _Run, settings: Any) -> None:
     """三条出口：终态行落盘后的宽限 kill、无进展看门狗、总时长兜底。
 
@@ -437,37 +392,28 @@ async def _monitor(run: _Run, settings: Any) -> None:
         while not run.finished:
             await asyncio.sleep(_POLL_SECONDS)
             now = time.monotonic()
-            if run.mode == SUBPROCESS:
-                proc = run.proc
-                if proc is None or getattr(proc, "returncode", None) is not None:
-                    break
-                lines = _line_count(run.run_dir / "progress.jsonl")
-                if lines != last_lines:
-                    last_lines, last_change = lines, now
-                state, _ = _classify(run.run_dir)
-                if state in ("completed", "failed-recorded"):
-                    if grace_from is None:
-                        grace_from = now
-                    elif now - grace_from >= _GRACE_SECONDS:
-                        run.aborted_reason = "终态行已落盘但进程未退出（宽限超时）"
-                        await _terminate(proc)
-                        break
-                elif now - last_change >= stall:
-                    run.aborted_reason = f"无进展超过 {stall}s"
+            proc = run.proc
+            if proc is None or getattr(proc, "returncode", None) is not None:
+                break
+            lines = _line_count(run.run_dir / "progress.jsonl")
+            if lines != last_lines:
+                last_lines, last_change = lines, now
+            state, _ = _classify(run.run_dir)
+            if state in ("completed", "failed-recorded"):
+                if grace_from is None:
+                    grace_from = now
+                elif now - grace_from >= _GRACE_SECONDS:
+                    run.aborted_reason = "终态行已落盘但进程未退出（宽限超时）"
                     await _terminate(proc)
                     break
-                if timeout and now - run.t0 >= timeout:
-                    run.aborted_reason = f"总时长超过 {timeout}s"
-                    await _terminate(proc)
-                    break
-            else:
-                task = run.task
-                if task is None or task.done():
-                    break
-                if timeout and now - run.t0 >= timeout:
-                    run.aborted_reason = f"总时长超过 {timeout}s"
-                    task.cancel()
-                    break
+            elif now - last_change >= stall:
+                run.aborted_reason = f"无进展超过 {stall}s"
+                await _terminate(proc)
+                break
+            if timeout and now - run.t0 >= timeout:
+                run.aborted_reason = f"总时长超过 {timeout}s"
+                await _terminate(proc)
+                break
     except asyncio.CancelledError:
         # 监控自身被取消（关闭期）：仍要把运行收尾，否则暂停标志与公告留在原地
         await asyncio.shield(_finish(run))
@@ -483,31 +429,25 @@ async def _finish(run: _Run) -> None:
     run.finished = True
     aborted = run.aborted_reason is not None
     payload: dict[str, Any] | None = None
-    if run.mode == SUBPROCESS:
-        run.exit_code = getattr(run.proc, "returncode", None)
-        state, terminal = _classify(run.run_dir)
-        run.terminal = "aborted" if aborted else state
-        if terminal is not None and terminal.get("type") == "error":
-            run.error = str(terminal.get("message") or run.error or "运行失败")
-        if run.pause:
-            pipeline.set_processing_paused(False)
-        await _revoke()
-    elif run.terminal is None:
-        run.terminal = "aborted" if aborted else "failed-recorded"
+    run.exit_code = getattr(run.proc, "returncode", None)
+    state, terminal = _classify(run.run_dir)
+    run.terminal = "aborted" if aborted else state
+    if terminal is not None and terminal.get("type") == "error":
+        run.error = str(terminal.get("message") or run.error or "运行失败")
+    if run.pause:
+        pipeline.set_processing_paused(False)
+    await _revoke()
     if run.terminal == "completed":
         payload, _html = _reports(run.run_dir)
-        if payload is None:
-            payload = run.payload
-    if run.mode == SUBPROCESS:
-        run.meta["terminal"] = {
-            "type": "done" if run.terminal == "completed" else "error",
-            "state": run.terminal,
-            "exit_code": run.exit_code,
-            "reason": run.aborted_reason,
-            "finished_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-        }
-        _write_json(run.run_dir / "meta.json", run.meta)
-    source = payload if payload is not None else (run.payload or {})
+    run.meta["terminal"] = {
+        "type": "done" if run.terminal == "completed" else "error",
+        "state": run.terminal,
+        "exit_code": run.exit_code,
+        "reason": run.aborted_reason,
+        "finished_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    _write_json(run.run_dir / "meta.json", run.meta)
+    source = payload or {}
     summary = {
         f: (data or {}).get("summary", {})
         for f, data in source.get("features", {}).items()
@@ -522,8 +462,8 @@ async def _finish(run: _Run) -> None:
     }
     if _current is run:
         _current = None
-    if run.mode == SUBPROCESS:
-        await _rotate()
+    await _rotate()
+
 
 def _last_from_disk() -> dict[str, Any] | None:
     """父进程重启后仍要能显示「最近一次运行」——内存里已经没有它了，从盘上捞。"""
@@ -552,10 +492,9 @@ def state() -> dict[str, Any]:
         out["run_id"] = run.run_id
         out["started_at"] = run.started_at
         out["elapsed_sec"] = round(time.monotonic() - run.t0, 3)
-        if run.mode == SUBPROCESS:
-            progress = _progress(run.run_dir / "progress.jsonl")
-            if progress is not None:
-                out["progress"] = progress
+        progress = _progress(run.run_dir / "progress.jsonl")
+        if progress is not None:
+            out["progress"] = progress
     last = _last if _last is not None else _last_from_disk()
     if last:
         # 运行中时 run_id/started_at/elapsed 以当前运行为准，摘要仍显示上一次的结果
@@ -591,18 +530,16 @@ async def cancel() -> dict[str, Any]:
     if run is None or run.finished:
         return {"cancelled": False, "reason": "not_running"}
     run.aborted_reason = "用户取消"
-    if run.mode == SUBPROCESS and run.proc is not None:
+    if run.proc is not None:
         await _terminate(run.proc)
-    elif run.task is not None:
-        run.task.cancel()
     return {"cancelled": True, "run_id": run.run_id}
 
 
 async def stop_all() -> None:
     """teardown 调用：取消当前运行并等它收尾。
 
-    两种模式都要管：双轨期回退到 inproc 时若只取消子进程，进程内任务会在
-    close_db 之后把单例还原成未关闭的生产连接，解释器退出时 join 挂死。
+    关闭期不能只发 terminate 就走：运行还握着父进程侧的暂停标志与公告，必须等
+    监控任务把 _finish 走完（含 meta 终态记录与复位）；等不到就强制收尾一次。
     """
     run = _current
     if run is None or run.finished:

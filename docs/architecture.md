@@ -1068,7 +1068,6 @@ required field of `weflow`/`qqflow` → that plugin self-disables via `PluginDis
 | `RAG_BACKFILL_BATCH` / `RAG_BACKFILL_BUDGET_PER_CYCLE` | `256` / `2000` | rag 回填嵌入子批大小 / 单轮总预算（超预算下轮续跑） |
 | `RAG_GROUP_ONLY` | `true` | rag 仅索引/检索群聊会话（启用会话恒为前提；停用会话即时不可问出） |
 | `RAG_MAINTENANCE_INTERVAL_SECONDS` | `3600` | rag 维护循环空闲间隔（GC 对账 + 缓存预热周期） |
-| `BENCHMARK_DRAIN_STALL_SECONDS` | `720` | benchmark 插件：排空在途批次时的**无进展**阈值（秒）——进展信号（待处理批次数/在途批次数）连续无变化达该值才中止基准。取值覆盖「单批中两段串行 AI 调用在常规退化下的耗时」（分类最坏 120s×3 次尝试 = 360s，其后「时间提取 ∥ 标题概括」并行段再 360s），**不应低于单请求最坏耗时 360s**；入库判官按条数叠加、OCR 与嵌入请求、两处拆半递归未覆盖，这些场景需调大。每次进入基准环境重新实例化，设置页改动无需重启即生效 |
 | `BACKFILL_HOURS` | `24` | REST 回填窗口：会话启用/从未轮询时按该窗口回填一次，此后按会话增量；`-1` = pull all history (warns at startup, pages to hasMore end) |
 | `IGNORED_EXPIRY_HOURS` | `0` (disabled) | On startup, purge ignored items older than this many hours (deletes from `items` + `raw_messages`, keeps `processed_messages`) |
 | `IGNORE_SELF` | `true` | 过滤本账号自己发送的消息（所有消息入口：SSE 实时 + REST 回填）。weflow-legacy REST 按 `isSend` 判定（SSE 上游已不推送自消息）；qqflow REST 按自身 UID（`u_<QQFLOW_QQ>`）判定，SSE 事件无发送者标识、开启后按消息回查 REST（每消息 +1 次本机 HTTP）。**注意 qqflow 的 `self_uid` 由配置推导而非取自上游**：服务端若绑着别的账号，自过滤会静默失效（把对方的消息当别人发的收进来，同时漏掉真正的自消息）——这是账号身份闸门在 qqflow 侧比 weflow 更要紧的原因（weflow 用数据自带的 `isSend`，不受影响） |

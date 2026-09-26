@@ -5,8 +5,9 @@
     python -m briefdesk.plugins.benchmark.cli --feature classify
     python -m briefdesk.plugins.benchmark.cli --charts
 
-基准运行会真实调用 AI（读 .env 的 AI_API_KEY/AI_API_BASE/AI_MODEL），
-临时库经 db.db_redirect 重定向（不动应用库连接）。文件数据集在 cases/ 目录
+基准运行会真实调用 AI（读 .env 的 AI_API_KEY/AI_API_BASE/AI_MODEL）。隔离方式是
+**自建临时库**：本进程把 config.db_path 改指到临时目录、建表换类别、注入 AI 端口，
+结束关闭连接并删目录——全程不碰生产库（见 _run_isolated）。文件数据集在 cases/ 目录
 （<feature>.json 优先，其次网页导出的 <feature>.fromweb.json，示例为
 <feature>.example.json）。
 """
@@ -17,14 +18,20 @@ import argparse
 import asyncio
 import json
 import logging
+import shutil
 import sys
+import tempfile
 import time
 from collections.abc import Callable
 from pathlib import Path
 
+from briefdesk import ai_ports
 from briefdesk.config import config
+from briefdesk.db import close_db
 from briefdesk.logger import fmt_dur
+from briefdesk.plugins.ai_provider.engine import Provider
 from briefdesk.plugins.benchmark import engine as bench_engine
+from briefdesk.plugins.benchmark import providers as bench_providers
 from briefdesk.plugins.benchmark.html_report import build_html_report, save_html_report
 from briefdesk.plugins.benchmark.report import render_feature_block, save_json_report
 from briefdesk.plugins.benchmark.schema import (
@@ -186,6 +193,43 @@ def _progress_printer(started: float) -> Callable[[bench_engine.CaseProgress], N
     return _print
 
 
+async def _run_isolated(
+    cases_by_feature: dict[str, list[BaseCase]],
+    categories: list[CategoryDef] | None,
+    *,
+    concurrency: int,
+    dataset_label: dict[str, str],
+) -> tuple[dict, dict]:
+    """在自建临时库里跑一轮，**绝不碰生产库**。
+
+    隔离此前由 providers.bench_environment（进程内重定向缝）提供；那条路径已随
+    进程级隔离删除，所以手工 CLI 必须自建：临时目录作库、config.db_path 改指、
+    建表 + 按数据集声明换类别、注入真实 AI 端口。
+
+    结束顺序固定：先 close_db（单例连接必须先关——aiosqlite 的 worker 线程不是
+    daemon，漏关会让解释器在退出阶段挂死），再还原 config.db_path，最后删目录。
+    因此**一个进程只能跑一次**（close_db 置位的 _db_closed 没有复位通道）。
+    """
+    run_dir = Path(tempfile.mkdtemp(prefix="bench-cli-"))
+    old_db_path = config.db_path
+    try:
+        config.db_path = str(run_dir / "bench.sqlite")
+        await bench_providers.prepare_scratch(categories)
+        ai_ports.set_ai(Provider())
+        payload, evals_by_feature = await bench_engine.run_benchmark_cases(
+            cases_by_feature,
+            categories,
+            concurrency=concurrency,
+            dataset_label=dataset_label,
+            progress=_progress_printer(time.monotonic()),
+        )
+        return payload, evals_by_feature
+    finally:
+        await close_db()
+        config.db_path = old_db_path
+        await asyncio.to_thread(shutil.rmtree, run_dir, ignore_errors=True)
+
+
 async def run_benchmark(args: argparse.Namespace) -> dict:
     features = list(args.feature)
     if "all" in features:
@@ -204,12 +248,11 @@ async def run_benchmark(args: argparse.Namespace) -> dict:
     for f in features:
         print(f"\n>>> 运行 {f}：{len(cases_by_feature.get(f, []))} 条用例")
 
-    payload, evals_by_feature = await bench_engine.run_benchmark_cases(
+    payload, evals_by_feature = await _run_isolated(
         cases_by_feature,
         categories,
         concurrency=max(1, args.concurrency),
         dataset_label=dataset_label,
-        progress=_progress_printer(time.monotonic()),
     )
     for f, data in payload["features"].items():
         for line in render_feature_block(

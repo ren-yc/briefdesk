@@ -259,7 +259,6 @@ async def _export_gate() -> tuple[int | None, bool]:
 
 def _subprocess_settings() -> SimpleNamespace:
     return SimpleNamespace(
-        run_mode="subprocess",
         pause_pipeline=False,
         keep_runs=5,
         run_timeout_seconds=0,

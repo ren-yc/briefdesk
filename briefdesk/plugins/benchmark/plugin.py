@@ -51,32 +51,20 @@ class BenchmarkPlugin(WebPlugin, StagePlugin):
             BenchmarkSettings,
             plugin=self.name,
             labels={
-                "run_mode": "运行模式（inproc / subprocess）",
                 "pause_pipeline": "运行期间暂停消息处理",
                 "keep_runs": "保留的运行目录数",
                 "run_timeout_seconds": "总时长上限（秒，0 = 不限）",
                 "run_stall_seconds": "无进展阈值（秒）",
-                "drain_stall_seconds": "排空无进展阈值（秒）",
             },
             hints={
-                "run_mode": (
-                    "inproc 与生产同进程跑（默认，隔离走 db 重定向）；"
-                    "subprocess 交给独立子进程，父子只经文件交换。"
-                    "每次启动基准时重新读取，无需重启应用"
-                ),
                 "keep_runs": (
-                    "只约束子进程模式的运行目录：超出后按启动时间从旧到新删除，"
+                    "超出后按启动时间从旧到新删除运行目录，"
                     "但**最新一个已完成**的运行永不删除（报告页依赖它）"
                 ),
                 "run_stall_seconds": (
                     "子进程运行期以 progress.jsonl 的行数增长判进展（用例粒度），"
                     "并要求 ≥ 单个用例最坏耗时（分类 120s × 3 次重试 = 360s）；"
                     "父进程还会按 --progress-every 线性放大本值"
-                ),
-                "drain_stall_seconds": (
-                    "inproc 模式在途批次排空时，进展信号（待处理批次数/在途批次数）"
-                    "连续无变化达到本值才中止基准；不要低于单请求最坏耗时"
-                    "（120s × 3 次尝试 = 360s）"
                 ),
             },
         )
@@ -118,13 +106,11 @@ class BenchmarkPlugin(WebPlugin, StagePlugin):
         await supervisor.gc_orphans()
 
     async def teardown(self) -> None:
-        """取消并限时等待运行中的基准（两种模式都收）。
+        """取消并限时等待运行中的基准。
 
-        关闭序列是 teardown_all → close_db。inproc 运行期间单例指向临时库，
-        close_db 关掉的是**临时**连接；若此时任务仍活着，它被取消后
-        db_redirect 的 finally 会把单例还原为**从未关闭的生产连接**，其残留的
-        aiosqlite 非 daemon worker 线程让解释器退出 join 挂死。子进程模式同理：
-        收干净之后它才不会再往 run_dir 里写。
+        关闭序列是 teardown_all → close_db。运行活过 close_db 时，它的收尾会去动
+        已经关闭的连接（父进程侧还有暂停标志与公告要复位）；子进程也一样，收干净
+        之后它才不会再往 run_dir 里写。
         """
         from briefdesk.plugins.benchmark import supervisor
 

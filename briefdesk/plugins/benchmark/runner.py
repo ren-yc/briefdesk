@@ -318,7 +318,6 @@ async def _run(args: argparse.Namespace, run_dir: Path, run_id: str) -> int:
             dataset_label=dataset_label,
             progress=lambda p: log.progress(p.feature, p.done, p.total, p.failed),
             run_id=run_id,
-            environment=bench_engine.ENV_CALLER,
         )
         _write_json(run_dir / "report.json", payload)
         (run_dir / "report.html").write_text(

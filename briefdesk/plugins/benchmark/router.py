@@ -8,11 +8,9 @@
   POST /api/benchmark/export-recorded 导出为 cases/<feature>.fromweb.json
   （覆盖式，含判重/合并命中的正向用例——按卡片最终状态导出观察不到）；
 - Web 运行从 cases/*.fromweb.json 加载；
-- 运行生命周期交给 supervisor（两种模式：inproc 与 subprocess，见该模块）；
-  本模块只做 HTTP 面：POST 启动、GET 轮询、DELETE 取消；
-- /report(.json) 一律读盘——只认最近一次 **completed** 的 run_dir。子进程运行
-  天然落盘；进程内运行不产出 run_dir，双轨期它的报告只驻内存（不在这里暴露），
-  这是契约里写明的过渡语义；
+- 运行生命周期交给 supervisor（见该模块）；本模块只做 HTTP 面：POST 启动、
+  GET 轮询、DELETE 取消；
+- /report(.json) 一律读盘——只认最近一次 **completed** 的 run_dir（运行天然落盘）；
 - 运行期间经 db.db_redirect 把主/向量连接重定向到临时库，并经
   pipeline.set_processing_paused 暂停生产处理管道——实时消息延后到下一轮
   回填窗口处理，不丢失。窗口内变更路由与备份/导出被 server 中间件的写闸门/

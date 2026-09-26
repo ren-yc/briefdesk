@@ -1,8 +1,8 @@
-"""基准运行监管（supervisor）与双轨语义的回归。
+"""基准运行监管（supervisor）的回归。
 
-覆盖：判定→登记原子性（重复启动只起一个运行）、inproc 与 subprocess 的状态与取消、
-run_dir 生命周期（meta 先落盘、回收补终态记录、轮转保底）、gc_orphans 的 best-effort，
-以及双轨期「结果分类看三态、/report 只认 completed」这两条契约。
+覆盖：判定→登记原子性（重复启动只起一个运行）、运行态的状态与取消、run_dir 生命周期
+（meta 先落盘、回收补终态记录、轮转保底）、gc_orphans 的 best-effort，以及「结果分类
+看三态、/report 只认 completed」这两条契约。
 
 子进程模式的用例把 CASES_SRC 指到临时夹具目录（快照就是这么来的），因此跑的是零重叠
 的离线用例：不发 chat 请求，也不碰用户导出的真实用例。
@@ -18,7 +18,7 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import AsyncMock, patch
+from unittest.mock import patch
 
 from fastapi import HTTPException
 
@@ -55,9 +55,30 @@ _OFFLINE_CASE = {
 }
 
 
-def _settings(mode: str = "inproc", **over: object) -> SimpleNamespace:
+class _FakeProc:
+    """假子进程句柄：只提供监控与取消会用到的成员。
+
+    terminate 后立刻置退出码，取消用例因此不必真等一个真进程；Windows 上
+    terminate 就是硬杀，退出码同样不承诺具体值。
+    """
+
+    def __init__(self) -> None:
+        self.returncode: int | None = None
+        self.terminated = False
+
+    def terminate(self) -> None:
+        self.terminated = True
+        self.returncode = 1
+
+    def kill(self) -> None:
+        self.terminate()
+
+    async def wait(self) -> int | None:
+        return self.returncode
+
+
+def _settings(**over: object) -> SimpleNamespace:
     base: dict[str, object] = {
-        "run_mode": mode,
         "pause_pipeline": False,
         "keep_runs": 2,
         "run_timeout_seconds": 0,
@@ -114,35 +135,24 @@ class SupervisorTest(unittest.IsolatedAsyncioTestCase):
         supervisor._last = None
         self._tmp.cleanup()
 
-    def _pin_inproc(self, *, slow: bool = True):
-        """把 inproc 路径钉在「加载用例为空 + 运行体可控」上。
+    def _pin_spawn(self):
+        """把运行钉在「子进程已起、尚未退出」上：只替换 spawn 一步。
 
-        真跑 run_benchmark_cases 会经环境缝打开生产库；用例里必须替换掉它，
-        否则测试会往真实库里写合成卡片。
+        真等一轮子进程既慢又与这两条断言无关（要测的是运行态的取消与重复启动），
+        所以句柄交给 _FakeProc 顶替；监控、取消与收尾仍走生产代码。
         """
-        entered = asyncio.Event()
 
-        async def _body(*_a, **_k):
-            entered.set()
-            if slow:
-                await asyncio.sleep(3600)
-            return {"run_id": "x", "features": {}, "elapsed_sec": 0.0}, {}
+        async def _spawn(run) -> None:
+            run.proc = _FakeProc()
 
-        return entered, [
-            patch(
-                "briefdesk.plugins.benchmark.engine.load_web_cases",
-                new=AsyncMock(return_value=[]),
-            ),
-            patch("briefdesk.plugins.benchmark.engine.run_benchmark_cases", new=_body),
-        ]
+        return [patch.object(supervisor, "_spawn", new=_spawn)]
 
-    async def test_inproc_start_state_and_idempotent_cancel(self) -> None:
-        entered, patchers = self._pin_inproc()
+    async def test_start_state_and_idempotent_cancel(self) -> None:
+        patchers = self._pin_spawn()
         for p in patchers:
             p.start()
         try:
             info = await supervisor.start(["dedup"])
-            await asyncio.wait_for(entered.wait(), timeout=5)
             state = supervisor.state()
             self.assertTrue(state["running"])
             self.assertEqual(state["run_id"], info["run_id"])
@@ -152,10 +162,10 @@ class SupervisorTest(unittest.IsolatedAsyncioTestCase):
                 await supervisor.cancel(),
                 {"cancelled": True, "run_id": info["run_id"]},
             )
-            for _ in range(100):
+            for _ in range(400):
                 if not supervisor.is_running():
                     break
-                await asyncio.sleep(0.02)
+                await asyncio.sleep(0.05)
             self.assertFalse(supervisor.is_running())
         finally:
             for p in patchers:
@@ -165,12 +175,11 @@ class SupervisorTest(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_double_start_conflicts_at_router(self) -> None:
-        entered, patchers = self._pin_inproc()
+        patchers = self._pin_spawn()
         for p in patchers:
             p.start()
         try:
             await supervisor.start(["dedup"])
-            await asyncio.wait_for(entered.wait(), timeout=5)
             with self.assertRaises(RuntimeError):
                 await supervisor.start(["dedup"])
             with self.assertRaises(HTTPException) as ctx:
@@ -216,75 +225,6 @@ class SupervisorTest(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(state["running"])
         self.assertEqual(state["run_id"], info["run_id"])
         self.assertIn("summary", state)
-
-    async def test_dual_track_payload_isomorphic(self) -> None:
-        """双轨同构：同一批离线用例，inproc 与 subprocess 的 payload 结构必须一致。
-
-        比较口径按契约取「顶层键集合 + features[*].summary 键集合」：报告是由同一段
-        聚合代码产出的，模式差异只应体现在运行环境，不应体现在结果形状上。
-        """
-        import aiosqlite
-
-        from briefdesk import db as briefdesk_db
-        from briefdesk.db import init_schema
-        from briefdesk.plugins.benchmark import store as bench_store
-
-        cases, _errors = bench_store.parse_cases_with_errors(
-            "dedup", [{"feature": "dedup", **_OFFLINE_CASE}]
-        )
-        self.assertTrue(cases)
-        conn = await aiosqlite.connect(":memory:")
-        conn.row_factory = aiosqlite.Row
-        await init_schema(conn)
-        # inproc 这一半必须钉住库与用例来源：真跑会经环境缝打开生产库，
-        # 并从包内 cases/ 读到用户导出的真实用例（那会发真实 AI 请求）
-        patchers = [
-            patch.object(briefdesk_db, "get_db", new=AsyncMock(return_value=conn)),
-            patch(
-                "briefdesk.plugins.benchmark.engine.load_web_cases",
-                new=AsyncMock(return_value=cases),
-            ),
-            patch(
-                "briefdesk.plugins.dedup.engine.is_embedding_enabled",
-                return_value=False,
-            ),
-        ]
-        for p in patchers:
-            p.start()
-        try:
-            await supervisor.start(["dedup"])
-            for _ in range(300):
-                if not supervisor.is_running():
-                    break
-                await asyncio.sleep(0.02)
-            self.assertFalse(supervisor.is_running(), "inproc 运行未结束")
-            self.assertIsNotNone(supervisor._last)
-            assert supervisor._last is not None
-            inproc_summary = supervisor._last["summary"]["dedup"]
-        finally:
-            for p in patchers:
-                p.stop()
-            await conn.close()
-
-        self.settings = _settings(mode="subprocess")
-        env = dict(os.environ)
-        env["EMBED_API_BASE"] = ""
-        with patch.object(supervisor, "_child_env", lambda: env):
-            await supervisor.start(["dedup"])
-            for _ in range(1200):
-                if not supervisor.is_running():
-                    break
-                await asyncio.sleep(0.1)
-        payload = supervisor.report_payload()
-        assert payload is not None
-        sub_summary = payload["features"]["dedup"]["summary"]
-
-        self.assertEqual(set(inproc_summary), set(sub_summary))
-        self.assertEqual(inproc_summary["cases"], sub_summary["cases"])
-        self.assertTrue(
-            {"run_id", "generated_at", "model", "concurrency", "elapsed_sec", "features"}
-            <= set(payload)
-        )
 
     async def test_rotation_keeps_latest_completed(self) -> None:
         _make_completed(self.run_root / "20260101-000000-aaaa0001", "2026-01-01 00:00:00", "r1")

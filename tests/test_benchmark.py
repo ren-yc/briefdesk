@@ -1,7 +1,7 @@
 """基准测试插件单元测试（不调用 AI，不触碰应用库）。
 
-覆盖：测试集 schema 校验、指标计算、dry-run 文件解析、基准环境的
-临时数据库隔离（补丁式）与 dedup 预筛跳过路径（离线可测部分）。
+覆盖：测试集 schema 校验、指标计算、dry-run 文件解析、临时 scratch 库的准备
+（与 CLI 手工运行同口径）与 dedup 预筛跳过路径（离线可测部分）。
 """
 
 import contextlib
@@ -28,7 +28,6 @@ from briefdesk.plugins.benchmark.metrics import (
     aggregate_title,
     evaluate_classify_case,
 )
-from briefdesk.plugins.benchmark.providers import bench_environment
 from briefdesk.plugins.benchmark.schema import (
     FEATURES,
     CategoryDef,
@@ -402,26 +401,59 @@ class DryRunTest(unittest.TestCase):
             assert path.name == "classify.fromweb.json"
 
 
-class TestBenchEnvironment:
-    async def test_env_redirects_db_and_restores(self):
-        """官方缝重定向：不改 config.db_path、不动应用连接，窗口内调用落
-        临时库（含类别替换生效），退出即还原模块级单例。"""
+@contextlib.asynccontextmanager
+async def _scratch_db(categories: list[CategoryDef] | None = None):
+    """临时 scratch 库：config.db_path 指到临时文件、建表、按需换类别，退出还原。
+
+    进程内运行时的隔离缝（providers.bench_environment：暂停管道 + 排空 + 库重定向）
+    已随进程级隔离删除，测试改为自建，与 CLI 手工运行同口径（见 cli._run_isolated）：
+    换连接前先把模块级单例清空，退出时**先关连接再删目录**（Windows 上文件仍被占用
+    会让 TemporaryDirectory 清理报 WinError 32）。
+    """
+    import briefdesk.db as briefdesk_db
+    from briefdesk.plugins.benchmark.providers import prepare_scratch
+
+    old_main, old_embed = briefdesk_db._db, briefdesk_db._embed_db
+    old_path = config.db_path
+    with tempfile.TemporaryDirectory() as d:
+        briefdesk_db._db = briefdesk_db._embed_db = None
+        config.db_path = str(Path(d) / "bench.sqlite")
+        try:
+            await prepare_scratch(categories)
+            yield
+        finally:
+            # 两条连接都要关：只用主连接（get_db）时向量连接可能已被 dedup 惰性打开，
+            # 漏关会让 aiosqlite 的非 daemon 线程把 pytest 卡在退出阶段
+            for conn in (briefdesk_db._db, briefdesk_db._embed_db):
+                if conn is not None:
+                    await conn.close()
+            briefdesk_db._db = old_main
+            briefdesk_db._embed_db = old_embed
+            config.db_path = old_path
+
+
+class TestScratchPreparation:
+    async def test_prepare_scratch_replaces_categories(self):
+        """scratch 库准备：建表 + 按数据集声明替换类别（默认类别被整份换掉）。"""
         import briefdesk.db as briefdesk_db
 
-        old_main, old_embed = briefdesk_db._db, briefdesk_db._embed_db
-        old_path = config.db_path
-        async with bench_environment(
-            [CategoryDef(name="自定义类别", prompt="测试说明")], register_ai=False
-        ):
-            assert briefdesk_db._db is not old_main  # 已重定向
+        async with _scratch_db([CategoryDef(name="自定义类别", prompt="测试说明")]):
             conn = await briefdesk_db.get_db()
             cursor = await conn.execute("SELECT name FROM categories ORDER BY id")
             rows = await cursor.fetchall()
             await cursor.close()
             assert [r["name"] for r in rows] == ["自定义类别"]
-        assert briefdesk_db._db is old_main  # 已还原
-        assert briefdesk_db._embed_db is old_embed
-        assert config.db_path == old_path
+
+    async def test_prepare_scratch_keeps_default_categories_without_dataset(self):
+        """数据集没声明类别时保留 init_schema 播下的默认类别（空表会让分类直接抛错）。"""
+        import briefdesk.db as briefdesk_db
+
+        async with _scratch_db():
+            conn = await briefdesk_db.get_db()
+            cursor = await conn.execute("SELECT COUNT(*) FROM categories")
+            row = await cursor.fetchone()
+            await cursor.close()
+            assert row[0] > 0
 
     async def test_dedup_disjoint_pair_skips_ai_offline(self):
         """预筛跳过路径离线可测：标题无重叠 → 不触发 AI，保守判 false。"""
@@ -431,14 +463,15 @@ class TestBenchEnvironment:
             query=MessageIn(msg_id="q1", content="求购考研数学书", title="求购考研数学书"),
             expected=SameExpected(same=False),
         )
-        async with bench_environment(register_ai=False):
+        async with _scratch_db():
             ev = await engine._run_dedup(case)
         assert not ev.predicted
         assert ev.skipped
 
     async def test_run_benchmark_cases_empty_records_elapsed(self):
         """零用例运行不触发 AI，但 payload 仍带测试用时（顶层 + 逐功能）。"""
-        payload, evals = await engine.run_benchmark_cases({})
+        async with _scratch_db():
+            payload, evals = await engine.run_benchmark_cases({})
         assert payload["features"] == {}
         assert evals == {}
         assert isinstance(payload["elapsed_sec"], float)
@@ -487,9 +520,12 @@ class TestProgress:
             expected=SameExpected(same=False),
         )
         events: list[engine.CaseProgress] = []
-        payload, evals = await engine.run_benchmark_cases(
-            {"dedup": [case]}, progress=events.append
-        )
+        # 判重引擎会经 get_db 惰性建缓存：没有 scratch 库就会打到真实生产库
+        # （进程内运行时由已删的 bench_environment 兜着，现在必须自带）
+        async with _scratch_db():
+            payload, evals = await engine.run_benchmark_cases(
+                {"dedup": [case]}, progress=events.append
+            )
         assert len(events) == 1
         assert events[0].feature == "dedup"
         assert (events[0].done, events[0].total, events[0].failed) == (1, 1, 0)
