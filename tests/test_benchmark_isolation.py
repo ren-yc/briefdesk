@@ -19,8 +19,11 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import aiosqlite
 
@@ -191,6 +194,140 @@ class BenchmarkIsolationTest(unittest.TestCase):
             # **不含**生产库那条自建类别——它若出现就说明生产库被读了。
             self.assertNotIn("生产类别", cats, "scratch 库读到了生产库的类别（隔离失效）")
             self.assertIn("活动通知", cats, "scratch 库没有播种默认类别")
+
+
+class _FakeProc:
+    """假子进程句柄：只提供监控与取消会用到的那几个成员。
+
+    用它把运行「按住」在 running 状态——真跑一轮离线夹具几秒就结束了，
+    断言窗口太窄，而在运行态上做断言才是这两条保证的意义所在。
+    """
+
+    def __init__(self) -> None:
+        self.returncode: int | None = None
+        self.terminated = False
+
+    def terminate(self) -> None:
+        self.terminated = True
+        # Windows 上 terminate 就是硬杀，退出码同样是 1（语义不承诺）
+        self.returncode = 1
+
+    def kill(self) -> None:
+        self.terminate()
+
+    async def wait(self) -> int | None:
+        return self.returncode
+
+
+def _subprocess_settings() -> SimpleNamespace:
+    return SimpleNamespace(
+        run_mode="subprocess",
+        pause_pipeline=False,
+        keep_runs=5,
+        run_timeout_seconds=0,
+        run_stall_seconds=600,
+    )
+
+
+class RunAvailabilityTest(unittest.TestCase):
+    """运行期间界面照常可用——子进程模式的**机制保证**。
+
+    两条用户可见收益都系在同一个不变量上：父进程**从不重定向**自己的连接，
+    因此 `db.in_redirect()` 恒为假，中间件的写闸门与读黑名单整段不生效。这里
+    断言的就是这个不变量，以及它带来的可观测后果（写请求会走到处理器而不是被
+    409 拦下）。
+
+    为什么不在这一层断言「GET /api/items 返回真实卡片」：那条路径会经
+    `get_db()` 打开 `config.db_path` 指向的真实生产库，测试进程里留下一条
+    aiosqlite 连接（非 daemon 线程）会把 pytest 卡在退出阶段。渲染层面的验收
+    留给人工完整验证；这里断言的是让渲染成立的那个机制。
+    """
+
+    def test_run_does_not_block_writes_or_reads(self) -> None:
+        from starlette.testclient import TestClient
+
+        import briefdesk.server as srv
+        from briefdesk import db as briefdesk_db
+        from briefdesk.plugins.benchmark import router as bench_router
+        from briefdesk.plugins.benchmark import supervisor
+
+        srv.include_plugin_router(bench_router.router)
+        with tempfile.TemporaryDirectory() as tmp:
+            run_root = Path(tmp) / "runs"
+            run_root.mkdir()
+            supervisor._current = None
+            supervisor._last = None
+            try:
+                with patch.object(supervisor, "RUN_ROOT", run_root), patch.object(
+                    supervisor, "_settings", _subprocess_settings
+                ), patch.object(supervisor, "_spawn", new=_fake_spawn):
+                    client = TestClient(
+                        srv.app,
+                        base_url="http://localhost",
+                        headers={"Origin": "http://localhost"},
+                    )
+                    with client:
+                        resp = client.post(
+                            "/api/benchmark/run", json={"features": ["dedup"]}
+                        )
+                        self.assertEqual(resp.status_code, 200, resp.text)
+                        self.assertTrue(resp.json()["started"])
+
+                        # 运行期间：没有重定向（这就是闸门不生效的原因）
+                        self.assertFalse(
+                            briefdesk_db.in_redirect(),
+                            "子进程模式不得重定向父进程的连接",
+                        )
+                        # 写请求走到处理器（400 = body 非法）而不是被闸门 409
+                        blocked = client.post(
+                            "/api/items/batch", json={"ids": [], "action": "ignore"}
+                        )
+                        self.assertNotEqual(blocked.status_code, 409, blocked.text)
+                        self.assertEqual(blocked.status_code, 400, blocked.text)
+                        # 产出文件的读路由同理：黑名单本身只在窗口内生效，
+                        # 而窗口的前提（重定向）已经不成立。这里不去真打那条路由——
+                        # 它会经 get_db() 打开真实生产库。
+                        from briefdesk.server import window_guard
+
+                        self.assertTrue(
+                            window_guard.is_blocked_read("GET", "/api/export/items"),
+                            "导出路由本就在读黑名单里（窗口内应被拦）",
+                        )
+                        self.assertFalse(
+                            briefdesk_db.in_redirect(),
+                            "窗口未开启，黑名单因此不生效",
+                        )
+
+                        state = client.get("/api/benchmark/run").json()
+                        self.assertTrue(state["running"])
+
+                        # 取消 → 状态回落，且 meta 补记 aborted（这次运行没有终态行）
+                        cancelled = client.delete("/api/benchmark/run")
+                        self.assertEqual(cancelled.status_code, 200)
+                        self.assertTrue(cancelled.json()["cancelled"])
+                        for _ in range(100):
+                            if not client.get("/api/benchmark/run").json()["running"]:
+                                break
+                            time.sleep(0.05)
+                        self.assertFalse(
+                            client.get("/api/benchmark/run").json()["running"],
+                            "取消后状态必须回落",
+                        )
+                    run_dir = next(run_root.iterdir())
+                    meta = json.loads(
+                        (run_dir / "meta.json").read_text(encoding="utf-8")
+                    )
+                    self.assertEqual(meta["terminal"]["state"], "aborted")
+                    self.assertIn("取消", str(meta["terminal"]["reason"]))
+                    # 被取消的运行目录保留（供排查），不被当成残目录清掉
+                    self.assertTrue(run_dir.exists())
+            finally:
+                supervisor._current = None
+                supervisor._last = None
+
+
+async def _fake_spawn(run) -> None:
+    run.proc = _FakeProc()
 
 
 if __name__ == "__main__":
