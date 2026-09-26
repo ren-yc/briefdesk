@@ -593,7 +593,7 @@ WARNING 暴露根因——标量化后这是唯一的根因来源，诊断失败
 中止，监听器以 60s 固定长退避（`_MISMATCH_RETRY_SECONDS`，WARNING 无栈、不递增
 指数退避计数），解除占用或改配置后自动恢复、无需重启）、**503 就绪门控**（索引期瞬态，`WeFlowNotReadyError` 静默跳过不污染
 lastError；503 复位 `_ready_checked` 以自愈服务端重启导致的内存注册表丢失——不会引发注册风暴，因下轮先查 health 会命中 indexing 短路）、**密
-钥**（26 个库各自独立 SQLCipher enc_key，整份 JSON 映射拆两段存系统钥匙串，见 `config.py`）、**媒体**（图片经 `media=1&image=1` 触发上游
+钥**（26 个库各自独立 SQLCipher enc_key，整份 JSON 映射按 `DB_KEYS_SEGMENT_LIMIT`（1100B）在字符边界切成动态多段存系统钥匙串（段名规范名 + `_2`/`_3`…，读取时按序拼接），见 `config.py`）、**媒体**（图片经 `media=1&image=1` 触发上游
 导
 出，消息 `media` 对象回填完整 URL → `_extract_media_path` 取相对路径 → `GET /api/v1/media/{talker}/{type}/{file}` 取
 字
