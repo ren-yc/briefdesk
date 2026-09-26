@@ -123,7 +123,9 @@ jobs:
           for sha in $(git log --format=%H "$base"..HEAD); do
             git show -s --format=%B "$sha" > "$RUNNER_TEMP/commit-msg.txt"
             python scripts/forbidden_refs.py --message-file "$RUNNER_TEMP/commit-msg.txt" || exit 1
-          done      # AGENTS.md's 4th gate. The pre-commit hook only runs the secret scan, so
+          done
+
+      # AGENTS.md's 4th gate. The pre-commit hook only runs the secret scan, so
       # without this step the check rests on the author remembering it.
       # Diffing against the empty-tree SHA covers every tracked file instead of
       # a push range: same behaviour on push and PR, and no all-zeros base to
@@ -141,3 +143,42 @@ jobs:
 
       - name: Test (pytest)
         run: python -m pytest tests/
+
+  # 独立的 Linux 冒烟 job：只覆盖 POSIX 侧的子进程与终止语义（Windows job 跑不到
+  # 这些差异），不扩全量矩阵——全量仍只在 windows-latest 跑。选中的两个文件是纯
+  # Python（不需要 Node），也不跑 ruff/mypy：那两项与平台无关，Windows job 已覆盖。
+  isolation-smoke:
+    name: Isolation smoke (linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      # headless runner 没有 Secret Service：让密钥层走「未配置」分支，避免与
+      # Windows 行为不同的 keyring 后端把冒烟 job 弄红
+      BRIEFDESK_KEYRING: "0"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+
+      # 依赖口径：先用锁文件（与全量 job 一致）——它顺带验证「锁文件在 3.12 + Linux
+      # 上也能装」。锁文件由 3.14 解析生成，若这里因 rapidocr/onnxruntime 之类重包在
+      # 3.12/Ubuntu 上缺轮子而装不上，收窄为 pip install -e ".[dev]"（本 job 不跑 OCR
+      # 用例，装 [ocr] 重包是纯风险），并在本注释里记录原因与适用范围，不要默默改回去。
+      - name: Install dependencies (lockfile + editable package)
+        run: |
+          pip install -r requirements-dev.txt
+          pip install -e . --no-deps
+
+      # 只跑进程监管与隔离这一组：直接给路径而不是 -k 选择器——避免随将来新增文件
+      # 意外扩缩，也不依赖 nodeid 子串匹配
+      - name: Test (benchmark runner contract + isolation)
+        run: |
+          python -m pytest tests/test_benchmark_runner_contract.py tests/test_benchmark_isolation.py
