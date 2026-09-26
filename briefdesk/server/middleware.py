@@ -74,10 +74,6 @@ async def _local_security_guard(request: Request, call_next):
                 {"detail": "Cross-origin request rejected"}, status_code=403
             )
 
-    # 读路由默认放行（纯显示类读路由在窗口内显示临时库内容，由列表区提示
-    # 覆盖），只有会把临时库内容落成用户可保存文件的三条被点名拦截。
-    # GET 不经同源校验，但跨站页面读不到响应内容，不构成探测面。
-
     response = await call_next(request)
     response.headers.setdefault(
         "Content-Security-Policy",

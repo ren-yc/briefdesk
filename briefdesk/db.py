@@ -717,8 +717,7 @@ async def _cursor(
 async def backup_db_to(path: str) -> None:
     """把当前数据库在线备份到指定文件（SQLite backup API，运行中安全）。
 
-    开头取定源连接后全程使用它：备份进行中即便单例被换掉，产物也仍是发起时
-    那个库的一致快照。
+    开头取定源连接后全程使用它：中途换连接会让快照跨两个库，产物不可恢复。
     """
     src = await get_db()
     dst = await aiosqlite.connect(path)

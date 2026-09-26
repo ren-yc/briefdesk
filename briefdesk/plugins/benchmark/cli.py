@@ -212,6 +212,7 @@ async def _run_isolated(
     """
     run_dir = Path(tempfile.mkdtemp(prefix="bench-cli-"))
     old_db_path = config.db_path
+    old_ai = ai_ports.get_ai()
     try:
         config.db_path = str(run_dir / "bench.sqlite")
         await bench_providers.prepare_scratch(categories)
@@ -225,9 +226,14 @@ async def _run_isolated(
         )
         return payload, evals_by_feature
     finally:
-        await close_db()
-        config.db_path = old_db_path
-        await asyncio.to_thread(shutil.rmtree, run_dir, ignore_errors=True)
+        try:
+            await close_db()
+        finally:
+            # 还原与清理必须必达：即使关闭连接抛错，也不该把临时库路径与 AI 端口
+            # 留在原地（后者会让后续调用打到已经废弃的临时库上）
+            config.db_path = old_db_path
+            ai_ports.set_ai(old_ai)
+            await asyncio.to_thread(shutil.rmtree, run_dir, ignore_errors=True)
 
 
 async def run_benchmark(args: argparse.Namespace) -> dict:

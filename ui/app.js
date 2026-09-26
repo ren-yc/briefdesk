@@ -5653,12 +5653,7 @@ async function downloadExport(url) {
   try {
     const res = await fetch(url);
     if (!res.ok) {
-      const err = new Error("HTTP " + res.status);
-      // 只对 409 读响应体：基准窗口提示需要 detail.code，其余非 2xx 维持原样
-      if (res.status === 409) {
-        try { err.payload = await res.json(); } catch { /* 非 JSON 响应忽略 */ }
-      }
-      throw err;
+      throw new Error("HTTP " + res.status);
     }
     const blob = await res.blob();
     const cd = res.headers.get("Content-Disposition") || "";
