@@ -36,7 +36,7 @@ class BenchmarkSettings(KeyringSettingsBase):
     """
 
     drain_stall_seconds: int = Field(default=720, ge=1)  # env: BENCHMARK_DRAIN_STALL_SECONDS
-    run_mode: str = Field(default="inproc")  # env: BENCHMARK_RUN_MODE（inproc|subprocess）
+    run_mode: str = Field(default="subprocess")  # env: BENCHMARK_RUN_MODE（inproc|subprocess）
     pause_pipeline: bool = Field(default=True)  # env: BENCHMARK_PAUSE_PIPELINE
     keep_runs: int = Field(default=5, ge=1)  # env: BENCHMARK_KEEP_RUNS
     run_timeout_seconds: int = Field(default=0, ge=0)  # env: BENCHMARK_RUN_TIMEOUT_SECONDS

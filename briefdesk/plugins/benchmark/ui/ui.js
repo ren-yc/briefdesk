@@ -43,8 +43,8 @@
       + '或开启「记录处理过程」在管道真实处理时点采集判定记录'
       + '（含判重/合并命中的正向用例），逐功能覆盖写入插件目录'
       + ' cases/*.fromweb.json，不写数据库。用例数与列表规模成正比，'
-      + '请先用筛选控制规模。运行会真实调用 AI；运行期间界面写操作、备份与'
-      + '导出暂不可用。</p>'
+      + '请先用筛选控制规模。运行会真实调用 AI，可能耗时数分钟；运行期间消息'
+      + '处理会暂停（界面照常可用），结束后如未开启周期同步，请点一次同步补齐。</p>'
       + '<div class="about-sources settings-btn-row">'
       + '<button id="bench-import-btn" class="settings-outline-btn">导出当前列表为基准用例</button>'
       + '<button id="bench-record-btn" class="settings-outline-btn">记录处理过程</button>'
@@ -100,7 +100,15 @@
         const st = await res.json();
         if (st.running) {
           runActive = true;
-          $status.innerHTML = "运行中（用例：" + esc(casesText) + "）"
+          // progress 来自进度文件，是「当前正在评估的那个功能」的计数；
+          // 无进度（尚未开始 / 进程内模式）时退回只显示用例数
+          let progText = "";
+          const p = st.progress;
+          if (p && typeof p.done === "number") {
+            progText = "（" + esc(String(p.feature || "")) + " " + p.done + "/" + p.total
+              + (p.failed ? "，失败 " + p.failed : "") + "）";
+          }
+          $status.innerHTML = "运行中" + progText + "（用例：" + esc(casesText) + "）"
             + (recordText ? "；" + esc(recordText) : "");
           return;
         }

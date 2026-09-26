@@ -898,7 +898,7 @@ framework.
 200+ 个顶层 `function` 不同口径）；② **`setupEvents` 里的调用顺序 = 注册顺序 = 同 target 同事件类型的触发顺序**，`document` 上有多个
 `click`/`keydown`（状态面板、引用折叠、「⋯」菜单、Esc、搜索历史 `mousedown`）彼此顺序敏感，新增区块只往后追加、不要插队；③ 区块局部的 `$元素`常量留在各自函数内（当
 前 19 个），跨区块引用就该报 `ReferenceError`——这是拆分换来的唯一结构性保证。**这一带没有任何自动化守卫**：`tests/ui_harness.mjs` 的
-`addEventListener` 是空函数、`querySelectorAll()` 返回 `[]`、`closest()` 返回 `null`，五个 `ui_*_test.mjs` 只取纯函数，
+`addEventListener` 是空函数、`querySelectorAll()` 返回 `[]`、`closest()` 返回 `null`，各 `ui_*_test.mjs` 只取纯函数，
 且**无任何测试调用 `setupEvents`**，pytest 也不启浏览器——搬错一个 handler 不会有任何 gate 报警，只在用户点到那个控件时现形。故再动这批函数时，务必用「按
 `setupEvents` 调用顺序拼接各函数体、逐字节比对改动前」的往返校验兜住顺序与内容，另查「深度 1 声明不被区间外引用」兜住作用域。
 
