@@ -11,11 +11,9 @@
 - 运行生命周期交给 supervisor（见该模块）；本模块只做 HTTP 面：POST 启动、
   GET 轮询、DELETE 取消；
 - /report(.json) 一律读盘——只认最近一次 **completed** 的 run_dir（运行天然落盘）；
-- 运行期间经 db.db_redirect 把主/向量连接重定向到临时库，并经
-  pipeline.set_processing_paused 暂停生产处理管道——实时消息延后到下一轮
-  回填窗口处理，不丢失。窗口内变更路由与备份/导出被 server 中间件的写闸门/
-  读黑名单拒绝（白名单见 server/window_guard.py），故界面写操作不会静默落进
-  临时库；周期同步不是路由，闸门挡不住它，但它写临时库同样被丢弃。
+- 运行期间经 pipeline.set_processing_paused 暂停生产处理管道——实时消息延后到
+  下一轮回填窗口处理，不丢失；界面侧照常可用（运行在自己的子进程里，父子只经
+  文件交换）。周期同步不是路由：它若在运行期间触发，处理会被暂停挡下，不会丢消息。
 """
 
 from __future__ import annotations
@@ -74,10 +72,9 @@ async def remove_all_cases(feature: str | None = None) -> dict[str, Any]:
     return {"deleted": deleted}
 
 
-# 本路由**不得**加入基准窗口的写白名单（见 server/window_guard.py）：它是插件内
-# 唯一的 get_items_page 调用点，窗口内会读到重定向后的临时库（内含基准合成卡），
-# 并**覆盖式**写 cases/*.fromweb.json——放行即用合成数据覆盖用户的真实用例数据集。
-# 白名单一律逐条列举，禁止改成 "/api/benchmark/" 前缀通配。
+# 本路由是插件内唯一的 get_items_page 调用点，并**覆盖式**写 cases/*.fromweb.json：
+# 它读的是生产库当前列表，用户的真实用例数据集就是被它覆盖的。改这里要格外小心——
+# 一旦改成读别处（例如基准自己的 scratch 库），导出出来的会变成合成数据。
 @router.post("/api/benchmark/import-current")
 async def import_current_list(
     category: str = Query(None),

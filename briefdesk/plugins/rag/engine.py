@@ -25,7 +25,6 @@ import aiosqlite
 import numpy as np
 
 from briefdesk import ai_ports
-from briefdesk import db as db_mod
 from briefdesk.db import get_db, get_embed_db, get_embed_lock, storage_lock
 from briefdesk.masking import PLACEHOLDER_ONLY_RE
 from briefdesk.plugins.rag.config import RagSettings
@@ -439,9 +438,6 @@ class RagEngine:
         # 守卫在取到连接之后：只有连接身份确定后，判断才拦得住「检查时未开始、
         # 使用时已开始」。临时库没有 rag 四表，继续会抛 no such table。
         # 本文件有名为 db 的局部变量，故用模块别名而非裸 db。
-        if db_mod.in_redirect():
-            logger.debug("rag: 基准窗口内跳过 GC 对账")
-            return 0
         async with storage_lock, get_embed_lock():
             removed = await gc_orphans(db, edb)
         if removed:
@@ -505,9 +501,6 @@ class RagEngine:
         # 守卫紧跟在两个 factory 之后、任何 SQL 之前：临时库没有
         # rag_chunk_embeddings，SELECT COUNT(*) 直接抛 no such table。且
         # force_full 的水位归零必须在守卫之后——见 warm_vectors 的说明。
-        if db_mod.in_redirect():
-            logger.debug("rag: 基准窗口内跳过向量缓存刷新")
-            return
         if force_full:
             self._vec_watermark = ""
             self._vec_count_seen = 0

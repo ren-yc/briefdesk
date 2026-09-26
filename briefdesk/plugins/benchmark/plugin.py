@@ -9,12 +9,11 @@
 - 用例：文件存储（不触碰数据库）——网页「导出当前列表为基准用例」把当前
   筛选的卡片逐功能覆盖导出到 cases/*.fromweb.json（classify/dedup/merge/
   title 四类用例，期望=卡片当前状态），前端无需手动用例管理；
-- 运行：与生产同引擎同 AI 供应商（真实调用，耗时数分钟，后台任务执行）；
-  运行期间经 db.db_redirect 把主/向量连接重定向到临时库，并经
+- 运行：与生产同引擎同 AI 供应商（真实调用，耗时数分钟），交给独立子进程；
+  父进程只负责生命周期与读盘，界面侧不受影响。运行期间经
   pipeline.set_processing_paused 暂停生产处理管道——实时消息延后到下一轮
-  回填窗口处理，不丢失。窗口内变更路由与备份/导出被 server 中间件拒绝
-  （见 server/window_guard.py），故界面写操作不会静默落进临时库；teardown
-  会取消并限时等待运行中的基准任务，保证环境在 close_db 之前还原。
+  回填窗口处理，不丢失；teardown 会取消并限时等待运行收尾，保证父进程侧的
+  暂停标志与公告都复位。
 - CLI：python -m briefdesk.plugins.benchmark.cli。
 """
 

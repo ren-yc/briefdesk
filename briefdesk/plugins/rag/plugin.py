@@ -21,7 +21,6 @@ from typing import Any
 
 from fastapi import APIRouter
 
-from briefdesk import db as db_mod
 from briefdesk.db import storage_lock
 from briefdesk.events import EVENT_ITEMS_DELETED
 from briefdesk.plugin.base import (
@@ -40,10 +39,6 @@ from briefdesk.types import BatchContext
 
 logger = logging.getLogger(__name__)
 
-# 基准窗口内的短轮询间隔（秒）：维护循环在窗口内安静跳过而非报错退避。
-# 用 sleep(5) 而不是 sleep(0)——后者会让循环空转占满 CPU；也不改用
-# _kick_event 等待——维护间隔默认 3600s，那样窗口结束后最坏 1 小时才恢复。
-_REDIRECT_POLL_SECONDS = 5
 
 
 class RagPlugin(StagePlugin, WebPlugin):
@@ -160,11 +155,6 @@ class RagPlugin(StagePlugin, WebPlugin):
 
         backoff_step = 0
         while self._engine is not None:
-            if db_mod.in_redirect():
-                # 窗口内单例指向临时库，它没有 rag 四表，继续会在 SQL 上报
-                # no such table。安静跳过并短轮询，不计入嵌入失败退避。
-                await asyncio.sleep(_REDIRECT_POLL_SECONDS)
-                continue
             processed = 0
             failed = False
             try:
@@ -184,11 +174,6 @@ class RagPlugin(StagePlugin, WebPlugin):
             backoff_step = 0
             if processed > 0:
                 continue  # 仍有存量，立即继续排空
-            if db_mod.in_redirect():
-                # 窗口可能在 backfill_step 期间才开始：再判一次，否则这一轮
-                # 的 GC/预热会白跑在临时库上
-                await asyncio.sleep(_REDIRECT_POLL_SECONDS)
-                continue
             try:
                 await self._engine.maintenance_gc()
                 await self._engine.warm_vectors(force_full=True)
@@ -245,10 +230,6 @@ class RagPlugin(StagePlugin, WebPlugin):
         # maintenance_gc 自取存储锁
         await asyncio.sleep(0)
         if self._engine is None:
-            return
-        if db_mod.in_redirect():
-            # 窗口内临时库同 main 连接无 RAG 表，GC 会抛 no such table。
-            # 保留 _gc_dirty：遗漏的对账由下个维护周期兜底
             return
         try:
             await self._engine.maintenance_gc()

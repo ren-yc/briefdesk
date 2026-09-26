@@ -10,7 +10,6 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field, field_validator
 
 from briefdesk import ai_ports
-from briefdesk import db as db_mod
 from briefdesk.db import get_db
 from briefdesk.plugins.rag.db import count_status
 from briefdesk.plugins.rag.engine import RagEngine, get_engine
@@ -90,24 +89,9 @@ async def rag_ask(req: AskRequest) -> AskResponse:
 
 @router.get("/api/rag/status")
 async def rag_status() -> dict:
-    """索引状态：条数/嵌入模型/FTS 可用性/回填窗口。
-
-    基准窗口内临时库没有 rag 四表，直接查库会抛 no such table。状态查询
-    不适合返回 409（读侧默认放行，且它不是写操作），故降级为 available:
-    False，让调用方据此判断而不是拿到 500。
-    本函数有名为 db 的局部变量，故用模块别名而非裸 db。
-    """
+    """索引状态：条数/嵌入模型/FTS 可用性/回填窗口。"""
 
     engine = _require_engine()
-    if db_mod.in_redirect():
-        return {
-            "chunks": 0,
-            "embedded": 0,
-            "fts_tokenizer": "",
-            "model": ai_ports.embed_model_name(),
-            "backfill_days": engine.settings.backfill_days,
-            "available": False,
-        }
     db = await get_db()
     st = await count_status(db)
     return {

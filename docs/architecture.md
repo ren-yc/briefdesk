@@ -425,9 +425,8 @@ get_items_verified_flags / get_session_last_polls，update_items_verify/delete_i
 
 #### briefdesk/server/
 
-FastAPI HTTP 服务子包（按职责分组的模块）：`app.py`（FastAPI 实例）、`middleware.py`（Host 白名单 + 同源校验 + CSP 头 + 基准窗口闸门；CSRF 收口：
-/api 变更请求 Origin/Referer 双缺失直接 403，不再静默放行）、`window_guard.py`（基准窗口期的 HTTP 契约：写路由白名单 / 读路由黑名单 / 统一 409 detail；**只含常量与纯函数**，
-不 import db/app，故无循环导入且可被测试直接 import）、`web_plugins.py`（Web 插件注入点）、`routes_items.py`（核心数据路由）、
+FastAPI HTTP 服务子包（按职责分组的模块）：`app.py`（FastAPI 实例）、`middleware.py`（Host 白名单 + 同源校验 + CSP 头；CSRF 收口：
+/api 变更请求 Origin/Referer 双缺失直接 403，不再静默放行）、`web_plugins.py`（Web 插件注入点）、`routes_items.py`（核心数据路由）、
 `routes_categories.py`（类别管理）、`media.py`（媒体代理）、`static.py`（SPA 托管）、`callbacks.py`（会话刷新回调）。**组装顺序有语义**：
 `__init__.py` 按 中间件 → 插件路由 → 核心路由 → 类别路由 → 媒体代理 → SPA mount 依次导入（web_plugins 必须先于 static，否则被 SPA 兜底截
 胡
@@ -466,14 +465,6 @@ Content-Disposition attachment——扩展名不可信，封死伪装 SVG/HTML �
 查告警）、`GET /plugin-assets/{name}/{path}`（插件静态资源，目录穿越/非法路径一律 404，且 404 返回纯文本而非 JSON——本端点服务
 `<link>`/`<script>` 资源请求）、`register_plugin_assets`/`set_plugins_info_callback`/`set_settings_schema_callback`/`include_plugin_router`（
 展开 APIRoute 插到 SPA mount 之前——新版 Starlette 的惰性 `_IncludedRouter` 会被 SPA 兜底截胡；按 `id(router)` 幂等，重复挂载跳过）
-**基准窗口闸门**：中间件在 Host 校验与（变更请求的）同源校验**通过之后**查 `db.in_redirect()`——变更请求按
-`window_guard.is_blocked_write` 默认拒绝（白名单逐条列举：`/api/settings/env`、`/api/settings/secrets`、`/api/restore` 与基准控制路由；
-`/api/benchmark/import-current` **刻意不在其中**——它读的是重定向后的临时库并覆盖式写坏用户用例文件），产出文件的 GET（backup / export/items /
-export/recat-samples）按 `window_guard.is_blocked_read` 拦截，两者共用同一份 `{"detail":{"code":"benchmark_running"}}` 的 409。闸门在跨站校验之后，
-跨站请求先拿 403，不会成为探测「基准是否在运行」的旁路（GET 不经同源校验，但跨站读不到响应内容）。读侧是**默认放行**口径（纯显示类读路由在窗口内显示临时库内容，
-由前端列表区提示覆盖），故另有 `routes_items._export_attachment` 的**无条件产出点守卫**（不依赖名单内容，拦的是「请求已过中间件、交换后才走到导出」）与
-`tests/test_benchmark_window_gate.py` 的 **AST 静态守卫**（`briefdesk/server/**` 与 `briefdesk/plugins/**` 的 GET 处理器凡含
-`_export_attachment(`/`FileResponse(`/`Content-Disposition` 者必须登记到「读黑名单 ∪ 白名单」，否则测试失败——这是唯一能拦住将来新增下载路由的机制）。
 日历/提醒路由位于 `plugins/{calendar,reminders}`。`/api/items` 接受 `sourceGroup`/`minMsgTime`/`hideExpired`/`filterNow`，
 并返回与完整过滤条件一致的 `totalCount`/`groupCount`/`sourceGroups`/`hasMore`/`nextOffset`/`filterNow`；启用隐藏截止时，客户
 端

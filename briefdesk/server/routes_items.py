@@ -24,10 +24,8 @@ from fastapi.responses import (
 from starlette.background import BackgroundTask
 
 import briefdesk.server.callbacks as _callbacks
-from briefdesk import db
 from briefdesk.config import config
 from briefdesk.db import (
-    BackupDuringRedirectError,
     backup_db_to,
     category_exists,
     delete_items,
@@ -53,7 +51,6 @@ from briefdesk.db import (
 )
 from briefdesk.events import EVENT_ITEMS_DELETED, event_bus
 from briefdesk.realtime import get_shutdown_event, subscribe, unsubscribe
-from briefdesk.server import window_guard
 from briefdesk.server.app import app
 from briefdesk.stages import get_context as _stage_context
 from briefdesk.status import get_listener, get_status_info
@@ -150,15 +147,11 @@ _ITEM_EXPORT_COLS = [
 ]
 
 def _export_attachment(content: str, media_type: str, filename: str) -> Response:
-    """导出产出的唯一出口：窗口期内无条件拒绝。
+    """导出产出的唯一出口：统一挂 Content-Disposition 供浏览器另存。
 
-    与读路由黑名单无关的第二道防线，拦的是「请求已过中间件、交换之后才走到
-    这里」的竞态——此前会静默把临时基准库的内容（含由真实聊天派生的合成卡）
-    落成用户手里的文件。本函数是同步函数，抛 HTTPException 由 FastAPI 默认
-    处理器产出与中间件同构的 {"detail": {...}}。
+    单点收口，便于审计「会把内容落成用户可保存文件」的响应：新增导出路由
+    一律经它返回。
     """
-    if db.in_redirect():
-        raise HTTPException(409, detail=window_guard.benchmark_busy_detail())
     return Response(
         content=content,
         media_type=media_type,
@@ -348,15 +341,6 @@ async def api_backup():
     _BACKUP_TMP_PATHS.add(tmp)
     try:
         await backup_db_to(tmp)
-    except BackupDuringRedirectError:
-        # 基准窗口内：源连接是临时库，产物是「日后恢复即整库替换」的假备份。
-        # 中间件闸门在请求入口判断，挡不住「过闸门后才交换」的竞态，故在
-        # 数据库层再判一次。只清理、不记 ERROR——每次窗口期点备份都带堆栈的
-        # ERROR 误报会淹没真实故障。
-        _remove_backup_tmp(tmp)
-        raise HTTPException(
-            409, detail=window_guard.benchmark_busy_detail()
-        ) from None
     except BaseException:
         # 响应未建立：清理临时文件（成功路径由后台包装函数删除）；
         # 日志带目标路径——db 目录所在卷空间不足等失败需可定位

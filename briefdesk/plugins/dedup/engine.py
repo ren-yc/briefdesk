@@ -18,7 +18,6 @@ import json
 import logging
 from dataclasses import dataclass
 
-from briefdesk import db as db_mod
 from briefdesk.ai_ports import (
     chat,
     embed_model_name,
@@ -204,10 +203,8 @@ class DedupEngine(DedupService):
     async def _ensure_cache(self) -> None:
         """从当前连接加载全量卡片与嵌入，重建缓存。
 
-        **窗口挂起不覆盖本方法**：基准判重用例经 _ProbeDedupEngine（本类子类）
-        走 check_dedup → ensure_cache → 本方法，从临时基准库加载卡片——这是基准
-        正确性的前提。若在此加 db_mod.in_redirect() 守卫，基准缓存恒空、判重全判
-        False，指标会静默出错。挂起只加在 add_to_cache / remove_items 上。
+        缓存只从**当前连接**加载：基准判重用例经 _ProbeDedupEngine（本类子类）走
+        check_dedup → ensure_cache → 本方法，从基准自己的 scratch 库取卡片。
         """
         items = await get_all_item_texts()
         self._cache = [
@@ -275,9 +272,6 @@ class DedupEngine(DedupService):
         变更生产缓存只会让生产卡片退出判重（相似新消息重复建卡直到重启）或
         灌入生产库不存在的幽灵条目（吸收真实消息、静默丢卡）。
         """
-        if db_mod.in_redirect():
-            logger.debug("窗口内跳过去重缓存变更: add_to_cache(%s)", item_id)
-            return
         images = _parse_images(image_urls)
         content_hash = self._content_hash(source_quote)
         target: CachedItem | None = None
@@ -318,9 +312,6 @@ class DedupEngine(DedupService):
         若照常清生产缓存，生产卡片会退出判重。
         """
         if not item_ids:
-            return
-        if db_mod.in_redirect():
-            logger.debug("窗口内跳过去重缓存变更: remove_items(%d)", len(item_ids))
             return
         ids = set(item_ids)
         self._cache = [it for it in self._cache if it.id not in ids]
