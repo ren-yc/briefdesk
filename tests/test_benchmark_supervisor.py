@@ -228,6 +228,23 @@ class SupervisorTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(state["run_id"], info["run_id"])
         self.assertIn("summary", state)
 
+    def test_child_env_carries_effective_ai_config(self) -> None:
+        """子进程环境必须带生效的推理强度：_child_env 是唯一的配置下传通道。
+
+        直接调真实实现——既有的子进程用例会把 _child_env mock 掉，用它断言等于
+        什么都没测（下传键名改错也不会红）。
+        """
+        from briefdesk.config import config
+
+        with patch.object(config, "ai_reasoning_effort", "off"), patch.object(
+            config, "ai_model", "m1"
+        ):
+            env = supervisor._child_env()
+        self.assertEqual(env.get("AI_REASONING_EFFORT"), "off")
+        self.assertEqual(env.get("AI_MODEL"), "m1")
+        # 刻意不断言旧键缺席：env 是父进程环境的拷贝，宿主若导出过该变量会照样带过去
+        # （子进程侧它是未知键，pydantic 直接忽略），断言它只会测到宿主环境
+
     async def test_state_does_not_scan_disk_while_running(self) -> None:
         """运行期间 state() 不扫盘：这是 3s 轮询的热路径，而扫盘是同步 I/O。
 

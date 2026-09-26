@@ -10,7 +10,12 @@ import asyncio
 import logging
 from typing import Any, cast
 
-from openai import AsyncOpenAI
+from openai import (
+    APIStatusError,
+    AsyncOpenAI,
+    BadRequestError,
+    UnprocessableEntityError,
+)
 from openai.types import CreateEmbeddingResponse
 from openai.types.chat import ChatCompletion, ChatCompletionMessageParam
 
@@ -126,13 +131,68 @@ def _effort_key(base: str, model: str) -> tuple[str, str]:
 def _reasoning_kwargs(key: tuple[str, str]) -> dict[str, Any]:
     """按 AI_REASONING_EFFORT 给出要发送的推理强度参数（{} = 不发送）。
 
-    auto / omit：不发送；off：发送 "none" 尽力关闭思考（端点明确拒收时由调用方改为
-    不发送）；其余取值固定发送该强度。key 供降级路径记录「该端点拒收过该参数」。
+    auto / omit：不发送；off：发送 "none" 尽力关闭思考——但**命中能力记忆**（该端点
+    曾明确拒收过该参数）时改为不发送，省略即交给服务端默认；其余取值固定发送该强度。
     """
     mode = config.ai_reasoning_effort
     if mode in ("auto", "omit"):
         return {}
-    return {"reasoning_effort": "none" if mode == "off" else mode}
+    if mode == "off":
+        # 记忆命中 = 该端点曾明确拒收该参数：不再发送，省掉每次都撞一次 400
+        return {} if key in _effort_rejected else {"reasoning_effort": "none"}
+    return {"reasoning_effort": mode}
+
+
+# 端点能力记忆：键 = (归一化端点, 生效模型)，命中即不再发送该参数。
+# 进程内不落盘：这是「一次请求就能确认」的端点事实，落盘会因换 provider、走代理或改
+# API_BASE 而过期；重启后多付一次探测即可。
+_effort_rejected: set[tuple[str, str]] = set()
+
+
+def _names_reasoning_effort(exc: APIStatusError) -> bool:
+    """报错是否点名 reasoning_effort。
+
+    结构化优先（error.param == "reasoning_effort"），退化为整串匹配——真实 SDK 会把
+    整个 error body 拼进 str(exc)，形如
+    Error code: 400 - {'error': {..., 'param': 'reasoning_effort'}}。
+    **刻意不放宽到裸 "reasoning"**：那会把「reasoning_tokens 超限」一类无关 400 误判成
+    参数不兼容，进而让好端点在后续调用里静默不关思考。代价是「既不点名、body 里也不给
+    param」的端点不会被自动降级——那种情况请显式设 AI_REASONING_EFFORT=omit。
+    """
+    if exc.status_code not in (400, 422):
+        return False
+    try:
+        param = str((exc.response.json().get("error") or {}).get("param") or "").lower()
+    except Exception:  # noqa: BLE001 — 响应不是 JSON：直接退回字符串匹配，无需记录
+        return "reasoning_effort" in str(exc).lower()
+    if param == "reasoning_effort":
+        return True
+    return "reasoning_effort" in str(exc).lower()
+
+
+async def _create_with_effort_fallback(key: tuple[str, str], call: Any) -> ChatCompletion:
+    """带一次能力降级的调用（**必须在已持有并发许可处调用**，内部不再取许可）。
+
+    只对「端点明确拒收 reasoning_effort」降级：改为不发送该参数并记住，避免后续每次
+    调用都撞一次 400（该参数在 OpenAI 规范里是 Optional，省略即交给服务端默认）。
+    其它错误原样抛出——把无关 400 也吞成重试会掩盖真配置错误。
+    并发首撞时各请求都会各重试一次（可接受的启动成本），但记忆与告警只落一次：
+    check 与 add 之间没有 await，事件循环内原子。
+    """
+    effort = _reasoning_kwargs(key)
+    try:
+        return await call(effort)
+    except (BadRequestError, UnprocessableEntityError) as e:
+        if not effort or not _names_reasoning_effort(e):
+            raise
+        if key not in _effort_rejected:
+            _effort_rejected.add(key)
+            logger.warning(
+                "端点 %s 不接受 reasoning_effort=%r（模型 %s）：本进程起省略该参数，"
+                "改由服务端默认；要固定取值请设 AI_REASONING_EFFORT。原始错误：%s",
+                key[0], effort["reasoning_effort"], key[1], e,
+            )
+        return await call({})
 
 
 async def chat(
@@ -160,16 +220,19 @@ async def chat(
     async def _create() -> ChatCompletion:
         json_object = _use_json_object()
         extra: dict = {"response_format": {"type": "json_object"}} if json_object else {}
-        return await client.chat.completions.create(
-            model=config.ai_model,
-            messages=messages,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            # SDK 的 create() 把 reasoning_effort 声明成字面量联合，动态拼参数会让
-            # mypy 判定「没有匹配的重载」；这里显式放宽为 Any，语义不变
-            **cast(Any, _reasoning_kwargs(key)),
-            **extra,
-            **per_request,
+        return await _create_with_effort_fallback(
+            key,
+            lambda effort: client.chat.completions.create(
+                model=config.ai_model,
+                messages=messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                # SDK 的 create() 把 reasoning_effort 声明成字面量联合，动态拼参数会让
+                # mypy 判定「没有匹配的重载」；这里显式放宽为 Any，语义不变
+                **cast(Any, effort),
+                **extra,
+                **per_request,
+            ),
         )
 
     sem = get_ai_semaphore()
@@ -234,12 +297,15 @@ async def rag_chat(
     key = _effort_key(api_base or config.ai_api_base, chat_model)
 
     async def _create() -> ChatCompletion:
-        return await client.chat.completions.create(
-            model=chat_model,
-            messages=messages,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            **cast(Any, _reasoning_kwargs(key)),
+        return await _create_with_effort_fallback(
+            key,
+            lambda effort: client.chat.completions.create(
+                model=chat_model,
+                messages=messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                **cast(Any, effort),
+            ),
         )
 
     sem = get_ai_semaphore()
