@@ -125,6 +125,7 @@ class SupervisorTest(unittest.IsolatedAsyncioTestCase):
             p.start()
         supervisor._current = None
         supervisor._last = None
+        supervisor._last_cache = None
 
     async def asyncTearDown(self) -> None:
         # 任何还在跑的运行都要收掉，否则子进程会活过测试进程
@@ -133,6 +134,7 @@ class SupervisorTest(unittest.IsolatedAsyncioTestCase):
             p.stop()
         supervisor._current = None
         supervisor._last = None
+        supervisor._last_cache = None
         self._tmp.cleanup()
 
     def _pin_spawn(self):
@@ -225,6 +227,47 @@ class SupervisorTest(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(state["running"])
         self.assertEqual(state["run_id"], info["run_id"])
         self.assertIn("summary", state)
+
+    async def test_state_does_not_scan_disk_while_running(self) -> None:
+        """运行期间 state() 不扫盘：这是 3s 轮询的热路径，而扫盘是同步 I/O。
+
+        前端在运行中只读 running/progress；上一次的摘要等运行结束（_finish 把
+        _last 写进内存）自然会给出。
+        """
+        patchers = self._pin_spawn()
+        for p in patchers:
+            p.start()
+        try:
+            await supervisor.start(["dedup"])
+            with patch.object(supervisor, "latest_report_dir") as scan:
+                st = supervisor.state()
+            self.assertTrue(st["running"])
+            scan.assert_not_called()
+        finally:
+            for p in patchers:
+                p.stop()
+
+    async def test_last_from_disk_is_cached(self) -> None:
+        """同一份报告不重复解析：state() 在轮询路径上，解析结果应按戳命中缓存。"""
+        run_dir = self.run_root / "20260101-000000-aaaa"
+        _make_completed(run_dir, "2026-01-01 00:00:00", "aaaa")
+        (run_dir / "report.json").write_text(
+            json.dumps(
+                {
+                    "run_id": "aaaa",
+                    "elapsed_sec": 1.5,
+                    "features": {"dedup": {"summary": {"cases": 3}}},
+                }
+            ),
+            encoding="utf-8",
+        )
+        with patch.object(supervisor, "_reports", wraps=supervisor._reports) as parse:
+            first = supervisor.state()
+            second = supervisor.state()
+        self.assertEqual(parse.call_count, 1, "第二次 state() 应命中缓存")
+        self.assertEqual(first["run_id"], "aaaa")
+        self.assertEqual(first["summary"], {"dedup": {"cases": 3}})
+        self.assertEqual(first, second)
 
     async def test_rotation_keeps_latest_completed(self) -> None:
         _make_completed(self.run_root / "20260101-000000-aaaa0001", "2026-01-01 00:00:00", "r1")

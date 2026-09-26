@@ -464,26 +464,74 @@ async def _finish(run: _Run) -> None:
     await _rotate()
 
 
+# 「最近一次运行」摘要的缓存：state() 在前端 3s 轮询的热路径上，而解析它要扫运行
+# 目录、逐个分类并解析 report.json（几十到上百 KB，且是同步 I/O——会阻塞事件循环）。
+# 键里带上运行根 mtime（增删运行目录都会变，含轮转删除）与报告文件的 (mtime, size)
+# （同一目录重跑会变），任一不符即视为失效。
+_last_cache: tuple[tuple[str, int | None, int, int], dict[str, Any] | None] | None = None
+
+
+def _root_stamp() -> int | None:
+    try:
+        return RUN_ROOT.stat().st_mtime_ns
+    except OSError:
+        return None
+
+
+def _stamp(run_dir: Path) -> tuple[str, int | None, int, int] | None:
+    """缓存键；报告文件读不到（已被轮转删除等）时返回 None，表示不可缓存。"""
+    try:
+        st = (run_dir / "report.json").stat()
+    except OSError:
+        return None
+    return (str(run_dir), _root_stamp(), st.st_mtime_ns, st.st_size)
+
+
+def _cached_last() -> dict[str, Any] | None:
+    """只用缓存、**不扫盘**：新鲜度靠两次 stat 校验（见 _last_cache 的说明）。"""
+    if _last_cache is None:
+        return None
+    key = _stamp(Path(_last_cache[0][0]))
+    return _last_cache[1] if key is not None and key == _last_cache[0] else None
+
+
 def _last_from_disk() -> dict[str, Any] | None:
-    """父进程重启后仍要能显示「最近一次运行」——内存里已经没有它了，从盘上捞。"""
+    """父进程重启后仍要能显示「最近一次运行」——内存里已经没有它了，从盘上捞。
+
+    结果连同缓存键一起存下：命中时不重扫目录、不重解析报告（见 _last_cache）。
+    """
+    global _last_cache
     run_dir = latest_report_dir()
     if run_dir is None:
+        _last_cache = None
         return None
+    key = _stamp(run_dir)
+    if key is None:
+        return None
+    if _last_cache is not None and _last_cache[0] == key:
+        return _last_cache[1]
     meta = _read_json(run_dir / "meta.json") or {}
     payload, _html = _reports(run_dir)
     features = (payload or {}).get("features", {})
     summary = {f: (d or {}).get("summary", {}) for f, d in features.items()}
-    return {
+    value = {
         "run_id": meta.get("run_id"),
         "summary": summary or None,
         "error": None,
         "started_at": meta.get("started_at"),
         "elapsed_sec": (payload or {}).get("elapsed_sec"),
     }
+    _last_cache = (key, value)
+    return value
 
 
 def state() -> dict[str, Any]:
-    """GET /api/benchmark/run 的载荷：形状与改造前一致，只多一个 progress。"""
+    """GET /api/benchmark/run 的载荷：形状与改造前一致，只多一个 progress。
+
+    运行期间**不扫盘**取上一次的摘要：这是前端 3s 轮询的热路径，而扫盘是同步 I/O
+    （会阻塞事件循环）；前端在运行中只读 running/progress，摘要要等运行结束——那时
+    _finish 已把 _last 写进内存。缓存命中时照常给出，零 I/O。
+    """
     out: dict[str, Any] = {"running": False}
     run = _current
     if run is not None and not run.finished:
@@ -494,7 +542,12 @@ def state() -> dict[str, Any]:
         progress = _progress(run.run_dir / "progress.jsonl")
         if progress is not None:
             out["progress"] = progress
-    last = _last if _last is not None else _last_from_disk()
+    if _last is not None:
+        last: dict[str, Any] | None = _last
+    elif out["running"]:
+        last = _cached_last()
+    else:
+        last = _last_from_disk()
     if last:
         # 运行中时 run_id/started_at/elapsed 以当前运行为准，摘要仍显示上一次的结果
         for key in ("run_id", "started_at", "elapsed_sec"):
