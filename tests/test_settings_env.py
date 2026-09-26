@@ -191,6 +191,18 @@ class PriorityChainTest(unittest.TestCase):
                 self.assertEqual(settings2.log_level, "WARNING")
 
 
+class ReasoningEffortConfigTest(unittest.TestCase):
+    """推理强度的取值校验：非法值在配置加载期即报错，而不是静默按 auto 处理。"""
+
+    def test_invalid_value_rejected_at_load(self) -> None:
+        from pydantic import ValidationError
+
+        from briefdesk.config import Settings
+
+        with self.assertRaises(ValidationError):
+            Settings(_env_file=[], AI_REASONING_EFFORT="bogus")
+
+
 class EnvRoutesTest(StagedFileTestCase):
     def setUp(self) -> None:
         super().setUp()
@@ -416,6 +428,23 @@ class EnvRoutesTest(StagedFileTestCase):
             if field.alias and field.annotation is not SecretStr
         }
         self.assertTrue(expected <= keys)
+
+    def test_ai_reasoning_effort_is_select_with_all_values(self) -> None:
+        """推理强度必须渲染成下拉：options 按环境键名登记，否则只是文本框。"""
+        from briefdesk.config import REASONING_EFFORT_VALUES
+
+        res = self.client.get("/api/settings/env")
+        item = next(
+            i for i in res.json()["items"] if i["key"] == "AI_REASONING_EFFORT"
+        )
+        self.assertEqual(item["type"], "select")
+        self.assertEqual(item["options"], list(REASONING_EFFORT_VALUES))
+
+    def test_ai_reasoning_effort_rejects_unknown_value(self) -> None:
+        res = self.client.put(
+            "/api/settings/env", json={"items": {"AI_REASONING_EFFORT": "bogus"}}
+        )
+        self.assertEqual(res.status_code, 422)
 
     def test_put_rejects_unknown_key(self) -> None:
         res = self.client.put(

@@ -3,7 +3,7 @@
 from pathlib import Path
 from typing import ClassVar
 
-from pydantic import Field, SecretStr
+from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import SettingsConfigDict
 
 from briefdesk.settings_base import KeyringSettingsBase
@@ -12,6 +12,15 @@ from briefdesk.settings_base import KeyringSettingsBase
 # 保证从任意工作目录启动（python main.py / python -m briefdesk / briefdesk）读到同一份配置，
 # 避免 console script 在其它目录运行时静默丢失 .env 或把数据库建到错误位置。
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+# 推理强度取值：CLI（--reasoning-effort 的 choices）与设置页下拉共用这一份清单，
+# 避免两处手抄漂移；新增取值只改这里。
+REASONING_EFFORT_VALUES: tuple[str, ...] = (
+    "auto",   # 不干预：不发送该参数，交给服务端/模型默认
+    "off",    # 尽力关闭思考：发送 "none"
+    "omit",   # 永不发送该参数（零探测）
+    "minimal", "low", "medium", "high", "xhigh", "max",   # 固定强度
+)
 
 
 class Settings(KeyringSettingsBase):
@@ -45,9 +54,23 @@ class Settings(KeyringSettingsBase):
     """AI 请求最大并发（chat 与嵌入共用），0 = 不限制。默认 4：不设限时大回填
     会一次性放行全部批次形成请求风暴（429 → 整批 failed → 钉窗重拉放大）。"""
 
-    ai_disable_thinking: bool = Field(default=False, alias="AI_DISABLE_THINKING")
-    """设为 true 时，AI 请求会附带 reasoning_effort="none"，
-    用于关闭 Qwen3 / Qwen3.5 等模型的思考模式。"""
+    ai_reasoning_effort: str = Field(default="auto", alias="AI_REASONING_EFFORT")
+    """推理强度意图（取值见 REASONING_EFFORT_VALUES）。
+
+    auto：不发送 reasoning_effort，交给服务端/模型默认（改造前 AI_DISABLE_THINKING
+    为 false 时的行为）；off：发送 "none" 尽力关闭思考——该参数在 OpenAI 规范里是
+    Optional、取值又是 model-dependent，第三方兼容端点差异更大，故端点明确拒收时由
+    ai_provider 改为不发送（见 engine 的降级路径）；omit：永不发送；其余固定发送。
+    非法值在启动期报错（响亮失败，避免拼错后静默按 auto 处理）。"""
+
+    @field_validator("ai_reasoning_effort")
+    @classmethod
+    def _validate_reasoning_effort(cls, value: str) -> str:
+        if value not in REASONING_EFFORT_VALUES:
+            raise ValueError(
+                f"非法取值 {value!r}；可选：{'、'.join(REASONING_EFFORT_VALUES)}"
+            )
+        return value
 
     ai_json_mode: str = Field(default="auto", alias="AI_JSON_MODE")
     """JSON 严格输出模式（response_format={"type": "json_object"}）：

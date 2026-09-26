@@ -362,6 +362,36 @@ class TitleMetricsTest(unittest.TestCase):
         assert ev.too_long
 
 
+class CliReasoningEffortTest(unittest.TestCase):
+    """CLI 的 --reasoning-effort：给了才覆盖配置，不给不动（与 --model 同风格）。"""
+
+    def _args(self, *, model=None, reasoning_effort=None):
+        from types import SimpleNamespace
+
+        return SimpleNamespace(model=model, reasoning_effort=reasoning_effort)
+
+    def test_flag_overrides_config(self):
+        with patch.object(config, "ai_reasoning_effort", "auto"):
+            cli._apply_ai_overrides(self._args(reasoning_effort="low"))
+            assert config.ai_reasoning_effort == "low"
+
+    def test_absent_flag_keeps_config(self):
+        with patch.object(config, "ai_reasoning_effort", "auto"):
+            cli._apply_ai_overrides(self._args())
+            assert config.ai_reasoning_effort == "auto"
+
+    def test_model_flag_still_applies(self):
+        with patch.object(config, "ai_model", "old-model"):
+            cli._apply_ai_overrides(self._args(model="new-model"))
+            assert config.ai_model == "new-model"
+
+    def test_unknown_value_rejected_by_argparse(self):
+        """取值清单与配置共用：非法值由 argparse 以用法错误（退出码 2）拒绝。"""
+        with self.assertRaises(SystemExit) as ctx:
+            cli.main(["--reasoning-effort", "bogus"])
+        assert ctx.exception.code == 2
+
+
 class DryRunTest(unittest.TestCase):
     def test_dry_run_example_datasets(self):
         # 隔离到只含示例文件的临时目录，避免本机网页导出的 *.fromweb.json 干扰

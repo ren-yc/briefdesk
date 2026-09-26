@@ -8,7 +8,7 @@ loads_json / top_k_similar 为供应商无关工具，定义收归 briefdesk.ai_
 
 import asyncio
 import logging
-from typing import cast
+from typing import Any, cast
 
 from openai import AsyncOpenAI
 from openai.types import CreateEmbeddingResponse
@@ -108,6 +108,33 @@ def _use_json_object() -> bool:
     return "deepseek-v4-flash" in config.ai_model or "deepseek-v4-pro" in config.ai_model
 
 
+def _norm_base(base: str) -> str:
+    """端点归一化：去尾斜杠并小写——同一端点的两种写法不应各记一份能力。"""
+    return (base or "").strip().rstrip("/").lower()
+
+
+def _effort_key(base: str, model: str) -> tuple[str, str]:
+    """推理强度的「端点 + 模型」标识。
+
+    用**生效值**而不是原始入参：rag_chat 的 override 留空会回退到主客户端与
+    config.ai_model（见 get_alt_client 与 chat_model），否则主通道与 RAG 会被当成
+    两个端点；自适应降级的能力记忆也以它为键。
+    """
+    return (_norm_base(base or config.ai_api_base), (model or config.ai_model).strip())
+
+
+def _reasoning_kwargs(key: tuple[str, str]) -> dict[str, Any]:
+    """按 AI_REASONING_EFFORT 给出要发送的推理强度参数（{} = 不发送）。
+
+    auto / omit：不发送；off：发送 "none" 尽力关闭思考（端点明确拒收时由调用方改为
+    不发送）；其余取值固定发送该强度。key 供降级路径记录「该端点拒收过该参数」。
+    """
+    mode = config.ai_reasoning_effort
+    if mode in ("auto", "omit"):
+        return {}
+    return {"reasoning_effort": "none" if mode == "off" else mode}
+
+
 async def chat(
     messages: list[ChatCompletionMessageParam],
     *,
@@ -128,41 +155,20 @@ async def chat(
         client = client.with_options(max_retries=max_retries)
     per_request: dict = {"timeout": timeout} if timeout is not None else {}
 
+    key = _effort_key(config.ai_api_base, config.ai_model)
+
     async def _create() -> ChatCompletion:
         json_object = _use_json_object()
-        if config.ai_disable_thinking:
-            if json_object:
-                return await client.chat.completions.create(
-                    model=config.ai_model,
-                    messages=messages,
-                    temperature=temperature,
-                    max_tokens=max_tokens,
-                    reasoning_effort="none",
-                    response_format={"type": "json_object"},
-                    **per_request,
-                )
-            return await client.chat.completions.create(
-                model=config.ai_model,
-                messages=messages,
-                temperature=temperature,
-                max_tokens=max_tokens,
-                reasoning_effort="none",
-                **per_request,
-            )
-        if json_object:
-            return await client.chat.completions.create(
-                model=config.ai_model,
-                messages=messages,
-                temperature=temperature,
-                max_tokens=max_tokens,
-                response_format={"type": "json_object"},
-                **per_request,
-            )
+        extra: dict = {"response_format": {"type": "json_object"}} if json_object else {}
         return await client.chat.completions.create(
             model=config.ai_model,
             messages=messages,
             temperature=temperature,
             max_tokens=max_tokens,
+            # SDK 的 create() 把 reasoning_effort 声明成字面量联合，动态拼参数会让
+            # mypy 判定「没有匹配的重载」；这里显式放宽为 Any，语义不变
+            **cast(Any, _reasoning_kwargs(key)),
+            **extra,
             **per_request,
         )
 
@@ -220,25 +226,20 @@ async def rag_chat(
     ——避免 ai_provider 反向依赖依赖它的插件。
 
     与 chat 的差异：不强制 JSON 外壳（问答为正文；引用由 RAG prompt 约束）；
-    仍遵守 ai_disable_thinking 与并发信号量。
+    仍遵守 AI_REASONING_EFFORT 与并发信号量。
     """
     client = get_alt_client(api_base, api_key)
     chat_model = model or config.ai_model
 
+    key = _effort_key(api_base or config.ai_api_base, chat_model)
+
     async def _create() -> ChatCompletion:
-        if config.ai_disable_thinking:
-            return await client.chat.completions.create(
-                model=chat_model,
-                messages=messages,
-                temperature=temperature,
-                max_tokens=max_tokens,
-                reasoning_effort="none",
-            )
         return await client.chat.completions.create(
             model=chat_model,
             messages=messages,
             temperature=temperature,
             max_tokens=max_tokens,
+            **cast(Any, _reasoning_kwargs(key)),
         )
 
     sem = get_ai_semaphore()

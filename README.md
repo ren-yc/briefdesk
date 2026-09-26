@@ -114,7 +114,7 @@ OCR 依赖为**可选**（`pip install -e ".[ocr]"`）：
 | `IGNORE_SELF` | `true` | 过滤本账号自己发送的消息（SSE 实时 + REST 回填） |
 | `MAX_CLASSIFY_TOKENS` | `8192` | 单次 AI 分类最大输出 token（触顶截断会破坏 JSON） |
 | `AI_MAX_CONCURRENCY` | `4` | AI 请求最大并发，`0` = 不限制（本地模型建议设 1） |
-| `AI_DISABLE_THINKING` | `false` | 关闭思考模式（Qwen3/Qwen3.5 等；DeepSeek 等思考系模型强烈建议开启，思考输出挤占 max_tokens 会截断丢批） |
+| `AI_REASONING_EFFORT` | `auto` | 推理强度：`auto` 不干预 / `off` 尽力关闭思考（发送 `reasoning_effort="none"`，端点明确拒收时自动改为不发送）/ `omit` 永不发送 / `minimal`…`max` 固定强度。DeepSeek 等思考系模型建议 `off`：思考输出挤占 max_tokens 会截断丢批（取值必须全小写） |
 | `AI_VISION_ENABLED` | `false` | 视觉模型开关：AI_MODEL 支持图片输入时开启，含图消息将 OCR 文本连同图片一并送入分类（需启用 ocr 插件；端点不支持图片时自动降级纯文本重试并公告提示） |
 | `AI_VISION_MAX_IMAGES` | `4` | 单条消息随分类请求附图上限（1–20；多图超出部分只发 OCR 文本） |
 | `REALTIME_BATCH_MAX_COUNT` / `REALTIME_BATCH_TIMEOUT_MS` | `1` / `180000` | 实时批缓冲（攒够条数 / 超时毫秒触发处理） |

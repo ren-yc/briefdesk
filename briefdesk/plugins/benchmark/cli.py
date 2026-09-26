@@ -4,6 +4,7 @@
     python -m briefdesk.plugins.benchmark.cli --dry-run
     python -m briefdesk.plugins.benchmark.cli --feature classify
     python -m briefdesk.plugins.benchmark.cli --charts
+    python -m briefdesk.plugins.benchmark.cli --feature title --reasoning-effort low
 
 基准运行会真实调用 AI（读 .env 的 AI_API_KEY/AI_API_BASE/AI_MODEL）。隔离方式是
 **自建临时库**：本进程把 config.db_path 改指到临时目录、建表换类别、注入 AI 端口，
@@ -26,7 +27,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 from briefdesk import ai_ports
-from briefdesk.config import config
+from briefdesk.config import REASONING_EFFORT_VALUES, config
 from briefdesk.db import close_db
 from briefdesk.logger import fmt_dur
 from briefdesk.plugins.ai_provider.engine import Provider
@@ -236,15 +237,27 @@ async def _run_isolated(
             await asyncio.to_thread(shutil.rmtree, run_dir, ignore_errors=True)
 
 
+def _apply_ai_overrides(args: argparse.Namespace) -> None:
+    """命令行覆盖 AI 配置：给了才改，不给就沿用 .env / 环境变量。
+
+    --reasoning-effort 用 is not None 判断而非真值：将来若放开 choices，空串不该被
+    静默当成「没给」。抽成独立函数是为了能脱离数据集与 AI 直接测这两条分支。
+    """
+    if args.model:
+        config.ai_model = args.model
+    if args.reasoning_effort is not None:
+        config.ai_reasoning_effort = args.reasoning_effort
+
+
 async def run_benchmark(args: argparse.Namespace) -> dict:
     features = list(args.feature)
     if "all" in features:
         features = list(FEATURES)
-    if args.model:
-        config.ai_model = args.model
-    if args.disable_thinking:
-        config.ai_disable_thinking = True
-    print(f"AI 模型: {config.ai_model}（并发 {max(1, args.concurrency)}）")
+    _apply_ai_overrides(args)
+    print(
+        f"AI 模型: {config.ai_model}（并发 {max(1, args.concurrency)}，"
+        f"推理强度 {config.ai_reasoning_effort}）"
+    )
 
     loaded = _load_file_features(features, Path(args.cases_dir), args.dataset)
     cases_by_feature = {f: item[0] for f, item in loaded.items()}
@@ -313,9 +326,10 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--model", default=None, help="覆盖 AI_MODEL（评估不同模型时用）"
     )
     parser.add_argument(
-        "--disable-thinking",
-        action="store_true",
-        help="等价于 AI_DISABLE_THINKING=true（Qwen 系关闭思考模式）",
+        "--reasoning-effort",
+        choices=REASONING_EFFORT_VALUES,
+        default=None,
+        help="覆盖 AI_REASONING_EFFORT（默认沿用 .env / 环境变量；off = 尽力关闭思考）",
     )
     parser.add_argument(
         "--dry-run",

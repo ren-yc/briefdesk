@@ -36,7 +36,7 @@ class TestChatThinkingSwitch:
     async def test_default_does_not_pass_reasoning_effort(self):
         client, create = _fake_client()
         with patch("briefdesk.plugins.ai_provider.engine.get_ai_client", return_value=client), patch.object(
-            config, "ai_disable_thinking", False
+            config, "ai_reasoning_effort", "auto"
         ), patch.object(config, "ai_api_key", SecretStr("deepseek")), patch.object(
             config, "ai_model", "qwen3.5"
         ):
@@ -48,10 +48,10 @@ class TestChatThinkingSwitch:
         assert kwargs["temperature"] == 0.1
         assert kwargs["max_tokens"] == 64
 
-    async def test_disabled_passes_reasoning_effort_none(self):
+    async def test_off_passes_reasoning_effort_none(self):
         client, create = _fake_client()
         with patch("briefdesk.plugins.ai_provider.engine.get_ai_client", return_value=client), patch.object(
-            config, "ai_disable_thinking", True
+            config, "ai_reasoning_effort", "off"
         ), patch.object(config, "ai_api_key", SecretStr("deepseek")), patch.object(
             config, "ai_model", "qwen3.5"
         ):
@@ -59,6 +59,32 @@ class TestChatThinkingSwitch:
 
         _, kwargs = create.call_args
         assert kwargs["reasoning_effort"] == "none"
+
+    async def test_omit_never_passes_reasoning_effort(self):
+        """omit：永不发送该参数（用于已知端点拒收、且不想付一次探测的场合）。"""
+        client, create = _fake_client()
+        with patch("briefdesk.plugins.ai_provider.engine.get_ai_client", return_value=client), patch.object(
+            config, "ai_reasoning_effort", "omit"
+        ), patch.object(config, "ai_api_key", SecretStr("deepseek")), patch.object(
+            config, "ai_model", "qwen3.5"
+        ):
+            await chat([], temperature=0.1, max_tokens=64)
+
+        _, kwargs = create.call_args
+        assert "reasoning_effort" not in kwargs
+
+    async def test_explicit_effort_passed_through(self):
+        """显式强度原样透传（顺带提供「不关思考但降低强度」的能力）。"""
+        client, create = _fake_client()
+        with patch("briefdesk.plugins.ai_provider.engine.get_ai_client", return_value=client), patch.object(
+            config, "ai_reasoning_effort", "low"
+        ), patch.object(config, "ai_api_key", SecretStr("deepseek")), patch.object(
+            config, "ai_model", "qwen3.5"
+        ):
+            await chat([], temperature=0.1, max_tokens=64)
+
+        _, kwargs = create.call_args
+        assert kwargs["reasoning_effort"] == "low"
         assert "response_format" not in kwargs
         assert kwargs["temperature"] == 0.1
         assert kwargs["max_tokens"] == 64
@@ -263,7 +289,7 @@ class TestRagChatModelFallback:
         client, create = _fake_client()
         with patch(
             "briefdesk.plugins.ai_provider.engine.get_alt_client", return_value=client
-        ), patch.object(config, "ai_disable_thinking", False), patch.object(
+        ), patch.object(config, "ai_reasoning_effort", "auto"), patch.object(
             config, "ai_model", "deepseek-v4-flash"
         ):
             await rag_chat([], temperature=0.2, max_tokens=128)
@@ -275,7 +301,7 @@ class TestRagChatModelFallback:
         client, create = _fake_client()
         with patch(
             "briefdesk.plugins.ai_provider.engine.get_alt_client", return_value=client
-        ), patch.object(config, "ai_disable_thinking", False), patch.object(
+        ), patch.object(config, "ai_reasoning_effort", "auto"), patch.object(
             config, "ai_model", "deepseek-v4-flash"
         ):
             await rag_chat([], temperature=0.2, max_tokens=128, model="qwen-plus")
@@ -289,10 +315,10 @@ class TestRagChatModelFallback:
 class TestChatJsonObject:
     """严格 JSON 输出开关：ollama api key / deepseek-v4 模型传 response_format。"""
 
-    async def _call(self, *, api_key: str, model: str, disable_thinking: bool):
+    async def _call(self, *, api_key: str, model: str, reasoning_effort: str = "auto"):
         client, create = _fake_client()
         with patch("briefdesk.plugins.ai_provider.engine.get_ai_client", return_value=client), patch.object(
-            config, "ai_disable_thinking", disable_thinking
+            config, "ai_reasoning_effort", reasoning_effort
         ), patch.object(config, "ai_api_key", SecretStr(api_key)), patch.object(
             config, "ai_model", model
         ):
@@ -301,32 +327,32 @@ class TestChatJsonObject:
 
     async def test_ollama_api_key_passes_response_format(self):
         kwargs = await self._call(
-            api_key="ollama", model="qwen2.5:7b", disable_thinking=False
+            api_key="ollama", model="qwen2.5:7b", reasoning_effort="auto"
         )
         assert kwargs["response_format"] == {"type": "json_object"}
 
-    async def test_ollama_with_thinking_disabled_still_passes(self):
+    async def test_ollama_with_off_still_passes(self):
         kwargs = await self._call(
-            api_key="ollama", model="qwen2.5:7b", disable_thinking=True
+            api_key="ollama", model="qwen2.5:7b", reasoning_effort="off"
         )
         assert kwargs["response_format"] == {"type": "json_object"}
         assert kwargs["reasoning_effort"] == "none"
 
     async def test_deepseek_v4_flash_passes_response_format(self):
         kwargs = await self._call(
-            api_key="deepseek", model="deepseek-v4-flash", disable_thinking=False
+            api_key="deepseek", model="deepseek-v4-flash", reasoning_effort="auto"
         )
         assert kwargs["response_format"] == {"type": "json_object"}
 
     async def test_vendor_prefixed_v4_model_passes(self):
         kwargs = await self._call(
-            api_key="deepseek", model="vendor/deepseek-v4-pro", disable_thinking=False
+            api_key="deepseek", model="vendor/deepseek-v4-pro", reasoning_effort="auto"
         )
         assert kwargs["response_format"] == {"type": "json_object"}
 
     async def test_other_model_does_not_pass_response_format(self):
         kwargs = await self._call(
-            api_key="deepseek", model="qwen3.5", disable_thinking=False
+            api_key="deepseek", model="qwen3.5", reasoning_effort="auto"
         )
         assert "response_format" not in kwargs
 

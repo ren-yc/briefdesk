@@ -216,7 +216,7 @@ def _child_env() -> dict[str, str]:
     env["AI_MODEL"] = str(config.ai_model)
     env["AI_API_BASE"] = str(config.ai_api_base)
     env["AI_MAX_CONCURRENCY"] = str(config.ai_max_concurrency)
-    env["AI_DISABLE_THINKING"] = "true" if config.ai_disable_thinking else "false"
+    env["AI_REASONING_EFFORT"] = config.ai_reasoning_effort
     return env
 
 

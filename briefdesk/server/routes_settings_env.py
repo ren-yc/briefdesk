@@ -19,7 +19,7 @@ from typing import Any
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
-from briefdesk.config import Settings, config
+from briefdesk.config import REASONING_EFFORT_VALUES, Settings, config
 from briefdesk.secrets_store import (
     DB_KEYS_BASE,
     SECRET_NAMES,
@@ -72,7 +72,11 @@ _CORE_UI: dict[str, dict[str, Any]] = {
     "AI_API_BASE": {"label": "AI API 地址"},
     "AI_MODEL": {"label": "AI 模型"},
     "AI_MAX_CONCURRENCY": {"label": "AI 请求最大并发", "hint": "0 = 不限制；本地模型建议设为 1"},
-    "AI_DISABLE_THINKING": {"label": "禁用 AI 思考模式", "hint": "Qwen3/Qwen3.5 等模型的 thinking 关闭"},
+    "AI_REASONING_EFFORT": {
+        "label": "AI 推理强度",
+        "hint": "auto=不干预；off=关闭思考（端点拒收该参数时自动改为不发送）；"
+                "omit=不发送该参数；其余为固定强度",
+    },
     "AI_VISION_ENABLED": {
         "label": "AI 支持图片输入（视觉模型）",
         "hint": "开启后含图消息将 OCR 文本连同图片一并送入 AI_MODEL；需启用 ocr 插件",
@@ -111,7 +115,12 @@ _CORE_SCHEMA = build_settings_schema(
     labels={key: value["label"] for key, value in _CORE_UI.items() if "label" in value},
     hints={key: value["hint"] for key, value in _CORE_UI.items() if "hint" in value},
     warnings={key: value["warn"] for key, value in _CORE_UI.items() if "warn" in value},
-    options={"LOG_LEVEL": ["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]},
+    options={
+        "LOG_LEVEL": ["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
+        # 必须按环境键名登记：settings_schema 以 key 判 select，否则字段只会渲染成
+        # 文本框（见 _field_type 的兜底分支）
+        "AI_REASONING_EFFORT": list(REASONING_EFFORT_VALUES),
+    },
 )
 for _item in _CORE_SCHEMA:
     _item.update(_CORE_UI.get(_item["key"], {}))
