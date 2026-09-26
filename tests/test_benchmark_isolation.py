@@ -219,6 +219,44 @@ class _FakeProc:
         return self.returncode
 
 
+async def _export_gate() -> tuple[int | None, bool]:
+    """直调访问守卫中间件，返回 (中间件最终返回的状态码, 桩处理器是否被调用)。
+
+    中间件是 `@app.middleware("http")` 注册的**普通协程函数**（Starlette 的装饰器
+    原样返回它），因此可以脱离 HTTP 栈直接调用；call_next 用桩代替真实处理器，
+    这样导出路由不会经 get_db() 打开真实生产库。
+
+    直调而不是拼两条独立事实，是因为真正要守的是**组合判定**「窗口开着 且 命中
+    黑名单」：只断言「黑名单成员为真」与「未重定向」各自成立，中间件即使丢掉
+    `in_redirect()` 前置条件（黑名单无条件生效）也照样绿。
+    """
+    from fastapi.responses import JSONResponse
+    from starlette.requests import Request
+
+    from briefdesk.server import middleware
+
+    called = False
+
+    async def _stub(_request: object) -> JSONResponse:
+        nonlocal called
+        called = True
+        return JSONResponse({"ok": True})
+
+    request = Request(
+        {
+            "type": "http",
+            "method": "GET",
+            "path": "/api/export/items",
+            "query_string": b"",
+            "scheme": "http",
+            "server": ("localhost", 80),
+            "headers": [(b"host", b"localhost")],
+        }
+    )
+    response = await middleware._local_security_guard(request, _stub)
+    return getattr(response, "status_code", None), called
+
+
 def _subprocess_settings() -> SimpleNamespace:
     return SimpleNamespace(
         run_mode="subprocess",
@@ -236,6 +274,9 @@ class RunAvailabilityTest(unittest.TestCase):
     因此 `db.in_redirect()` 恒为假，中间件的写闸门与读黑名单整段不生效。这里
     断言的就是这个不变量，以及它带来的可观测后果（写请求会走到处理器而不是被
     409 拦下）。
+
+    读半侧走「直调中间件 + 桩处理器」两态对照（`_export_gate`）：断言的是组合判定
+    本身，且不必真打导出路由。
 
     为什么不在这一层断言「GET /api/items 返回真实卡片」：那条路径会经
     `get_db()` 打开 `config.db_path` 指向的真实生产库，测试进程里留下一条
@@ -284,19 +325,18 @@ class RunAvailabilityTest(unittest.TestCase):
                         )
                         self.assertNotEqual(blocked.status_code, 409, blocked.text)
                         self.assertEqual(blocked.status_code, 400, blocked.text)
-                        # 产出文件的读路由同理：黑名单本身只在窗口内生效，
-                        # 而窗口的前提（重定向）已经不成立。这里不去真打那条路由——
-                        # 它会经 get_db() 打开真实生产库。
-                        from briefdesk.server import window_guard
-
-                        self.assertTrue(
-                            window_guard.is_blocked_read("GET", "/api/export/items"),
-                            "导出路由本就在读黑名单里（窗口内应被拦）",
-                        )
-                        self.assertFalse(
-                            briefdesk_db.in_redirect(),
-                            "窗口未开启，黑名单因此不生效",
-                        )
+                        # 读半侧：直调访问守卫中间件，两态对照。正例证明它不误伤
+                        # （运行期间导出照常放行），反例证明它没失效（窗口内必须 409，
+                        # 且不再往下走）。断言的是中间件的组合判定，不是两条各自
+                        # 恒真的独立事实。
+                        # 放行时中间件原样返回处理器的响应（桩给 200）
+                        code, called = asyncio.run(_export_gate())
+                        self.assertEqual(code, 200, "运行期间导出路由不该被拦")
+                        self.assertTrue(called, "运行期间导出请求必须走到处理器")
+                        with patch.object(briefdesk_db, "_redirect_active", True):
+                            code, called = asyncio.run(_export_gate())
+                        self.assertEqual(code, 409, "窗口内导出路由必须被拦")
+                        self.assertFalse(called, "被拦时不得调用处理器")
 
                         state = client.get("/api/benchmark/run").json()
                         self.assertTrue(state["running"])
