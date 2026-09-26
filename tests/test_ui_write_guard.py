@@ -1,7 +1,6 @@
 """写操作失败提示回归（通过 Node vm 执行 ui_write_guard_test.mjs）。
 
-应用层不再有「基准运行中」的写闸门：写失败一律按调用点原文案与 error 级别提示，
-同时静态断言窗口期的判据符号没有回归。
+应用层不再有「基准运行中」的写闸门：写失败一律按调用点原文案与 error 级别提示。
 """
 
 import shutil
@@ -16,7 +15,7 @@ _NODE = shutil.which("node")
 
 @unittest.skipUnless(_NODE, "Node.js not available; skipping frontend vm regression test")
 class UiWriteErrorTest(unittest.TestCase):
-    def test_write_error_message_and_no_window_symbols(self):
+    def test_write_error_keeps_call_site_message(self):
         result = subprocess.run(
             [_NODE, str(_SCRIPT)],
             cwd=_ROOT,
