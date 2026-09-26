@@ -62,9 +62,15 @@ _CASE_MODELS: dict[str, Any] = {
 }
 
 
-def fromweb_path(feature: str) -> Path:
-    """某功能的网页导出文件路径：cases/<feature>.fromweb.json。"""
-    return CASES_DIR / f"{feature}{FROMWEB_SUFFIX}"
+def fromweb_path(feature: str, cases_dir: Path | None = None) -> Path:
+    """某功能的网页导出文件路径：cases/<feature>.fromweb.json。
+
+    cases_dir 显式传入时覆盖包内默认目录：基准子进程要读父进程给的用例快照，
+    测试也要喂夹具而不是覆盖用户导出的真实用例——两条路径都必须能改目录，
+    否则 fromweb 这条 Web 主路径无法被隔离测试覆盖。
+    """
+    base = CASES_DIR if cases_dir is None else Path(cases_dir)
+    return base / f"{feature}{FROMWEB_SUFFIX}"
 
 
 def new_case_id() -> str:
@@ -139,9 +145,11 @@ async def export_fromweb(
     return path
 
 
-def _read_fromweb(feature: str) -> list[dict[str, Any]]:
+def _read_fromweb(
+    feature: str, cases_dir: Path | None = None
+) -> list[dict[str, Any]]:
     """读取某功能的 fromweb 用例（文件缺失/非法 → 空列表 + WARNING）。"""
-    path = fromweb_path(feature)
+    path = fromweb_path(feature, cases_dir)
     if not path.exists():
         return []
     try:
@@ -162,12 +170,14 @@ def _read_fromweb(feature: str) -> list[dict[str, Any]]:
     return out
 
 
-async def list_fromweb(feature: str | None = None) -> list[dict[str, Any]]:
+async def list_fromweb(
+    feature: str | None = None, cases_dir: Path | None = None
+) -> list[dict[str, Any]]:
     """列出 cases/*.fromweb.json 中的用例（每项含 feature 字段；缺失/非法文件跳过）。"""
     features = [feature] if feature else list(_CASE_MODELS)
     out: list[dict[str, Any]] = []
     for f in features:
-        out.extend(_read_fromweb(f))
+        out.extend(_read_fromweb(f, cases_dir))
     return out
 
 

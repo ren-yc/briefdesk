@@ -28,7 +28,7 @@ from pathlib import Path
 import aiosqlite
 
 from briefdesk import ai_ports, announcements
-from briefdesk.db import db_redirect
+from briefdesk.db import db_redirect, get_db
 from briefdesk.plugins.ai_provider.engine import Provider
 from briefdesk.plugins.benchmark.schema import CategoryDef
 from briefdesk.status import get_sync_progress
@@ -94,6 +94,27 @@ async def _replace_categories(
         [(d.name, d.prompt, d.color or "#2563EB") for d in defs],
     )
     await conn.commit()
+
+
+async def prepare_scratch(categories: list[CategoryDef] | None = None) -> None:
+    """子进程侧的基准库准备：在 `config.db_path` 上建库 + 按数据集声明替换类别。
+
+    与 `bench_environment` 的分工：环境缝是**父进程**为了「不打断自己的轮询/
+    实时链路」才发明的隔离手段，子进程不需要——它可以直接把 `config.db_path`
+    指到自己的 scratch 文件上。所以这里只做建库与换类别，不做暂停/排空/公告/
+    重定向，也不碰 AI 端口（由调用方按运行参数注入）。
+
+    建表必须走 `db.get_db()` 这条公开路径：它内部经 `_init_connection` →
+    `init_schema` 幂等补建全部表，并在末尾 `_seed_default_categories` 种入默认
+    类别。自带建表 SQL 会让 categories 表为空，classify 随后以「没有启用的类别」
+    直接抛错。
+
+    返回前不关闭连接：它落在模块级单例上，**调用方必须在退出前 `close_db()`**
+    ——aiosqlite 的 worker 线程不是 daemon 线程，漏关会让解释器在退出阶段挂死。
+    """
+    conn = await get_db()
+    if categories:
+        await _replace_categories(conn, categories)
 
 
 @asynccontextmanager

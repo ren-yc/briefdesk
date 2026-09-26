@@ -53,6 +53,13 @@ logger = logging.getLogger(__name__)
 
 FEATURES: tuple[str, ...] = ("classify", "dedup", "merge", "title")
 
+# 运行环境归属：managed = 本函数自己包 bench_environment（inproc 路径，行为不变）；
+# caller = 调用方已备好 scratch 库与 AI 端口（基准子进程）。默认必须是 managed——
+# inproc 调用方不套任何环境直接调本函数，改成 caller 会让它在默认路径下失去隔离。
+ENV_MANAGED = "managed"
+ENV_CALLER = "caller"
+ENVIRONMENTS: tuple[str, ...] = (ENV_MANAGED, ENV_CALLER)
+
 FROMWEB_SOURCE_LABEL = "cases/*.fromweb.json"  # 网页导出用例的 dataset 标识（报告/JSON 溯源）
 
 
@@ -230,14 +237,19 @@ def load_file_dataset(path: str | Path) -> DatasetFile:
     return load_dataset_file(path)
 
 
-async def load_web_cases(feature: str) -> list[BaseCase]:
+async def load_web_cases(
+    feature: str, cases_dir: str | Path | None = None
+) -> list[BaseCase]:
     """从 cases/<feature>.fromweb.json（网页导出）加载某功能全部用例。
 
     逐条校验，非法项跳过并告警；文件缺失/不可读返回空列表（见 store.list_fromweb）。
+    cases_dir 覆盖包内默认目录，见 store.fromweb_path。
     """
     from briefdesk.plugins.benchmark import store as bench_store
 
-    raw_cases = await bench_store.list_fromweb(feature)
+    raw_cases = await bench_store.list_fromweb(
+        feature, None if cases_dir is None else Path(cases_dir)
+    )
     cases, errors = bench_store.parse_cases_with_errors(feature, raw_cases)
     for err in errors:
         logger.warning("网页导出用例跳过: %s", err)
@@ -254,6 +266,8 @@ async def run_benchmark_cases(
     concurrency: int = 1,
     dataset_label: str | dict[str, str] = FROMWEB_SOURCE_LABEL,
     progress: Callable[[CaseProgress], None] | None = None,
+    run_id: str | None = None,
+    environment: str = ENV_MANAGED,
 ) -> tuple[dict[str, Any], dict[str, list[Any]]]:
     """在基准环境内运行指定功能用例。
 
@@ -263,9 +277,21 @@ async def run_benchmark_cases(
     CLI 传各数据集文件路径），写入报告供溯源。
     progress（可选）：每条用例 settle 后回调一次（成功/失败都算），
     CLI 据此输出评估进度；缺省无进度输出。
+    environment：运行环境归属，见 ENV_MANAGED / ENV_CALLER。
+    run_id：结果标识，缺省落回本地时间戳（父进程给定时以它为准）。
     """
+    if environment not in ENVIRONMENTS:
+        # 响亮失败：拼错的环境名若被当成 managed 会静默走重定向，
+        # 子进程里那意味着白白多建一个临时库、报告还落在别处。
+        raise ValueError(
+            f"未知 environment={environment!r}，只接受 {ENVIRONMENTS}："
+            "managed 由本函数包 bench_environment，caller 表示调用方已备好环境"
+        )
     started = time.monotonic()
-    async with bench_environment(categories=category_defs):
+
+    async def _run_all() -> tuple[
+        dict[str, dict[str, float | int]], dict[str, list[Any]], dict[str, float]
+    ]:
         summaries: dict[str, dict[str, float | int]] = {}
         evals_by_feature: dict[str, list[Any]] = {}
         elapsed: dict[str, float] = {}
@@ -277,6 +303,13 @@ async def run_benchmark_cases(
             elapsed[feature] = round(time.monotonic() - f_start, 3)
             summaries[feature] = _aggregate(feature, evals)
             evals_by_feature[feature] = evals
+        return summaries, evals_by_feature, elapsed
+
+    if environment == ENV_CALLER:
+        summaries, evals_by_feature, elapsed = await _run_all()
+    else:
+        async with bench_environment(categories=category_defs):
+            summaries, evals_by_feature, elapsed = await _run_all()
     payload = _build_payload(
         summaries,
         evals_by_feature,
@@ -284,6 +317,7 @@ async def run_benchmark_cases(
         dataset_label,
         elapsed=elapsed,
         total_elapsed=round(time.monotonic() - started, 3),
+        run_id=run_id,
     )
     return payload, evals_by_feature
 
@@ -296,6 +330,7 @@ def _build_payload(
     *,
     elapsed: dict[str, float] | None = None,
     total_elapsed: float | None = None,
+    run_id: str | None = None,
 ) -> dict[str, Any]:
     """结果 payload（run_id/模型信息/逐功能 summary+逐用例明细/测试用时）。
 
@@ -309,7 +344,9 @@ def _build_payload(
         return dataset_label
 
     return {
-        "run_id": time.strftime("%Y%m%d-%H%M%S"),
+        # run_id 由调用方给定时以它为准（父进程生成 → POST 响应、目录名与报告三处同源）；
+        # 缺省（手工/独立运行）才落回本地时间戳。
+        "run_id": run_id or time.strftime("%Y%m%d-%H%M%S"),
         "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         "model": config.ai_model,
         "ai_api_base": config.ai_api_base,
