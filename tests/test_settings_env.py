@@ -252,6 +252,94 @@ class EnvRoutesTest(StagedFileTestCase):
         self.assertEqual(res.status_code, 200)
         self.assertEqual(read_staged()["PLUGINS"], '["weflow","qqflow"]')
 
+    def test_put_rejects_required_plugin_not_enabled(self) -> None:
+        """必选但未启用：暂存时就要拦下，不能等到下次启动才中止。
+
+        两个键由面板分别写入，单独看都合法、合起来矛盾；一旦落盘，用户只能在
+        启动失败后回头比对两份名单。
+        """
+        res = self.client.put(
+            "/api/settings/env",
+            json={
+                "items": {
+                    "PLUGINS": json.dumps(["weflow"]),
+                    "PLUGINS_REQUIRED": json.dumps(["benchmark"]),
+                }
+            },
+        )
+        self.assertEqual(res.status_code, 409)
+        issues = res.json()["detail"]["issues"]
+        self.assertTrue(
+            any(
+                i["type"] == "required_not_enabled" and i["plugin"] == "benchmark"
+                for i in issues
+            ),
+            issues,
+        )
+        # 拒绝时不落盘：暂存态保持调用前原样
+        self.assertNotIn("PLUGINS_REQUIRED", read_staged())
+
+    def test_put_rejects_dropping_a_required_plugin(self) -> None:
+        """已暂存的必选插件，不能被后续写入挤出启用列表。"""
+        ok = self.client.put(
+            "/api/settings/env",
+            json={
+                "items": {
+                    "PLUGINS": json.dumps(["weflow", "benchmark"]),
+                    "PLUGINS_REQUIRED": json.dumps(["benchmark"]),
+                }
+            },
+        )
+        self.assertEqual(ok.status_code, 200)
+        res = self.client.put(
+            "/api/settings/env",
+            json={"items": {"PLUGINS": json.dumps(["weflow"])}},
+        )
+        self.assertEqual(res.status_code, 409)
+        issues = res.json()["detail"]["issues"]
+        self.assertTrue(
+            any(
+                i["type"] == "required_not_enabled" and i["plugin"] == "benchmark"
+                for i in issues
+            ),
+            issues,
+        )
+        # 写入被拒：先前的暂存态原样保留（必选仍在，插件仍在启用列表）
+        staged = read_staged()
+        self.assertEqual(staged["PLUGINS_REQUIRED"], json.dumps(["benchmark"]))
+        self.assertIn("benchmark", json.loads(staged["PLUGINS"]))
+
+    def test_put_rejects_unknown_required_plugin(self) -> None:
+        """必选名单里的未知名同样要在暂存期拦下（启动期只会说「未发现」）。
+
+        没有管理器可校验时（测试进程常见）拿不到插件清单，类型会落到
+        「必选但未启用」那一类——关键是**拒绝并点名**，而不是放行到启动期才炸。
+        """
+        res = self.client.put(
+            "/api/settings/env",
+            json={"items": {"PLUGINS_REQUIRED": json.dumps(["no-such-plugin"])}},
+        )
+        self.assertEqual(res.status_code, 409)
+        issues = res.json()["detail"]["issues"]
+        self.assertTrue(
+            any(i["plugin"] == "no-such-plugin" for i in issues),
+            issues,
+        )
+
+    def test_put_accepts_required_plugin_when_enabled(self) -> None:
+        """自洽的组合照常放行：必选插件同时在启用列表里。"""
+        res = self.client.put(
+            "/api/settings/env",
+            json={
+                "items": {
+                    "PLUGINS": json.dumps(["weflow", "benchmark"]),
+                    "PLUGINS_REQUIRED": json.dumps(["benchmark"]),
+                }
+            },
+        )
+        self.assertEqual(res.status_code, 200)
+        self.assertEqual(read_staged()["PLUGINS_REQUIRED"], json.dumps(["benchmark"]))
+
     def test_dynamic_plugin_schema_is_rendered_validated_and_saved(self) -> None:
         dynamic = [
             {

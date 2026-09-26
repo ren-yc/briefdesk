@@ -214,6 +214,51 @@ def _desired_plugins(staged: dict[str, str]) -> list[str]:
     return parsed
 
 
+def _required_plugin_issues(staged: dict[str, str]) -> list[dict[str, str]]:
+    """PLUGINS_REQUIRED 与 PLUGINS 的自洽复检（写入暂存之前的快返回）。
+
+    两个键由「插件」面板分别写入：单独看各自合法，合起来却可能矛盾——某插件被
+    勾成必选却不在启用列表里。这种组合在暂存时看不出来，要等到**下次启动**才由
+    PluginManager 抛「必选插件未就绪」，用户得回头比对两份名单才知道该改哪个。
+    这里提前拦下，并按依赖复检同一形状回 issue 明细。
+
+    核心插件恒装配，列入必选视为恒满足（面板也不提供它们的必选芯片）。
+    """
+    raw = staged.get("PLUGINS_REQUIRED")
+    if raw is None:
+        return []
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(parsed, list):
+        return []
+    required = [n for n in parsed if isinstance(n, str)]
+    if not required:
+        return []
+    known = {p.get("name") for p in get_plugins_info() if p.get("name")}
+    core = {p.get("name") for p in get_plugins_info() if p.get("core")}
+    desired = set(_desired_plugins(staged))
+    issues: list[dict[str, str]] = []
+    for name in required:
+        if known and name not in known:
+            issues.append(
+                {"type": "unknown", "plugin": name, "detail": f"未知插件名: {name}"}
+            )
+        elif name not in core and name not in desired:
+            issues.append(
+                {
+                    "type": "required_not_enabled",
+                    "plugin": name,
+                    "detail": (
+                        f"被勾成必选但不在启用列表里: {name}"
+                        "（下次启动会因必选插件未就绪而中止）"
+                    ),
+                }
+            )
+    return issues
+
+
 def _plugin_toggle_data(staged: dict[str, str]) -> list[dict[str, Any]]:
     """「插件」面板数据：声明元数据 + 期望启用态 + 当前进程装配状态。
 
@@ -351,22 +396,36 @@ async def api_settings_env_put(payload: EnvPutPayload):
         if not isinstance(raw, str):
             raise HTTPException(422, f"{key}: 值须为字符串或 null")
         updates[key] = _normalize(key, raw)
-    # PLUGINS 变更先做依赖/互斥复检（暂存前失败快返回，409 携带 issue 明细）
-    if "PLUGINS" in updates:
-        raw = updates["PLUGINS"]
-        if raw is None:
-            desired: list[str] = list(config.plugins)
-        else:
-            try:
-                parsed = json.loads(raw)
-            except json.JSONDecodeError as exc:
-                raise HTTPException(422, f"PLUGINS: 校验失败（{exc}）") from exc
-            if not isinstance(parsed, list) or not all(
-                isinstance(n, str) for n in parsed
-            ):
-                raise HTTPException(422, "PLUGINS: 值须为 JSON 字符串数组")
-            desired = parsed
-        issues = validate_plugin_selection(desired)
+    # 插件相关键的组合复检（暂存前失败快返回，409 携带 issue 明细）。
+    # 单键合法 ≠ 组合合法：PLUGINS 的依赖/互斥复检，与 PLUGINS_REQUIRED ⊆ PLUGINS
+    # 的自洽检查，都必须按「本次写入之后的暂存态」成对看。
+    if {"PLUGINS", "PLUGINS_REQUIRED"} & set(updates):
+        issues: list[dict[str, str]] = []
+        if "PLUGINS" in updates:
+            raw = updates["PLUGINS"]
+            if raw is None:
+                desired: list[str] = list(config.plugins)
+            else:
+                try:
+                    parsed = json.loads(raw)
+                except json.JSONDecodeError as exc:
+                    raise HTTPException(422, f"PLUGINS: 校验失败（{exc}）") from exc
+                if not isinstance(parsed, list) or not all(
+                    isinstance(n, str) for n in parsed
+                ):
+                    raise HTTPException(422, "PLUGINS: 值须为 JSON 字符串数组")
+                desired = parsed
+            # 包装层约定：无管理器可校验时返回 None（测试/未装配），不是「无问题」
+            # 的语义——这里统一成列表，避免下面的 += 变成 None + list
+            issues = list(validate_plugin_selection(desired) or [])
+        # 复检用「写后暂存态」：null 表示删键（回落启动快照）
+        merged = dict(read_staged())
+        for key, value in updates.items():
+            if value is None:
+                merged.pop(key, None)
+            else:
+                merged[key] = value
+        issues += _required_plugin_issues(merged)
         if issues:
             raise HTTPException(status_code=409, detail={"issues": issues})
     async with _write_lock:
