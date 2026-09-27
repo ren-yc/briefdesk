@@ -17,7 +17,12 @@ from unittest.mock import patch
 
 import httpx
 import pytest
-from openai import BadRequestError, InternalServerError, RateLimitError
+from openai import (
+    BadRequestError,
+    InternalServerError,
+    RateLimitError,
+    UnprocessableEntityError,
+)
 from pydantic import SecretStr
 
 from briefdesk.config import config
@@ -176,6 +181,30 @@ async def test_rag_shares_memory_when_override_empty():
     assert "reasoning_effort" not in rag_calls[0]
 
 
+async def test_422_also_degrades():
+    """422 与 400 同口径：端点用 422 报「参数不合法」时同样降级（提交信息承诺了 400/422）。"""
+    client, calls = _client(error=_http_error(cls=UnprocessableEntityError, status=422))
+    with _configured(), patch.object(engine, "get_ai_client", return_value=client):
+        await chat([], temperature=0.1, max_tokens=64)
+
+    assert [("reasoning_effort" in c) for c in calls] == [True, False]
+    assert len(engine._effort_rejected) == 1
+
+
+async def test_explicit_effort_is_not_silently_degraded():
+    """显式强度是契约：端点拒收就响亮报错，不静默省略、也不污染 off 的能力记忆。"""
+    client, calls = _client()
+    with (
+        _configured(ai_reasoning_effort="low"),
+        patch.object(engine, "get_ai_client", return_value=client),
+        pytest.raises(BadRequestError),
+    ):
+        await chat([], temperature=0.1, max_tokens=64)
+
+    assert len(calls) == 1
+    assert engine._effort_rejected == set()
+
+
 async def test_warning_logged_once_under_concurrency(caplog):
     """并发首撞：真并发下多个请求各自探测一次，但记忆与告警只落一次。
 
@@ -211,6 +240,7 @@ async def test_warning_logged_once_under_concurrency(caplog):
     # 「还没看到的各探测一次」两种交错都合法（真端点上还受网络往返影响）
     with_param = [c for c in calls if "reasoning_effort" in c]
     without_param = [c for c in calls if "reasoning_effort" not in c]
+    # 上界 3 = 「最多三个请求各探测一次」；改成 == 3 会变成依赖调度顺序，不要收紧
     assert 1 <= len(with_param) <= 3, calls
     assert without_param, "至少有一个请求走了省略路径"
     assert len(engine._effort_rejected) == 1

@@ -183,7 +183,13 @@ async def _create_with_effort_fallback(key: tuple[str, str], call: Any) -> ChatC
     try:
         return await call(effort)
     except (BadRequestError, UnprocessableEntityError) as e:
-        if not effort or not _names_reasoning_effort(e):
+        if (
+            # 只有 off 是「尽力关思考」，可以降级；显式强度是用户给出的契约——端点拒收
+            # 就让它响亮报错，既不静默省略，也不把该端点记进 off 的能力记忆
+            config.ai_reasoning_effort != "off"
+            or not effort
+            or not _names_reasoning_effort(e)
+        ):
             raise
         if key not in _effort_rejected:
             _effort_rejected.add(key)
