@@ -508,9 +508,9 @@ async def api_items_batch(body: dict):
             affected = await delete_items(ids)
             # 发布 items_deleted：去重插件订阅后同步清理内存缓存
             # （同步处理器，发布期间仍持有存储锁，保持原子）。
-            # 仅在确有删除时发布：基准窗口内批量删除作用于临时库
-            # （affected == 0），无条件发布会把生产卡片从生产缓存里清掉——
-            # 此后相似新消息重复建卡直到重启。
+            # 仅在确有删除时发布：affected == 0 表示没有任何行被删，
+            # 无条件发布会把卡片从生产去重缓存里清掉——此后相似新消息
+            # 重复建卡直到重启。
             if affected:
                 await event_bus.publish(EVENT_ITEMS_DELETED, ids)
     else:
@@ -520,9 +520,8 @@ async def api_items_batch(body: dict):
         async with storage_lock:
             affected = await update_items_verify(ids, verified)
             # 忽略（-1）清缓存；恢复/备忘（0/1）回加缓存，见 _resync_dedup_cache。
-            # 仅在确有变更时同步：affected == 0 表示这些 id 不在当前库里
-            # （基准窗口内作用于临时库即如此），此时 resync 会拿临时库文本
-            # 去改生产缓存，制造生产库不存在的幽灵条目。
+            # 仅在确有变更时同步：affected == 0 表示这些 id 不在库里，
+            # 此时 resync 会拿并不存在的文本去改缓存，制造幽灵条目。
             if affected:
                 await _resync_dedup_cache(ids, verified)
     return {"success": True, "affected": affected}

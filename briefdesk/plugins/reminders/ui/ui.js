@@ -94,11 +94,7 @@
         body: JSON.stringify({ at: atOrNull }),
       });
       if (!res.ok) {
-        // 基准窗口内写闸门返回 409 + {detail:{code}}：不读响应体会把它说成
-        // 普通失败，用户会反复重试，而重试在窗口结束前不可能成功
-        const err = new Error("HTTP " + res.status);
-        try { err.payload = await res.json(); } catch { /* 非 JSON 响应忽略 */ }
-        throw err;
+        throw new Error("HTTP " + res.status);
       }
       const data = await res.json();
       // 重设 = 新一次提醒：清掉本地「已通知」标记，否则同卡在本页会话内

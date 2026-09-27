@@ -267,10 +267,6 @@ class DedupEngine(DedupService):
         source_quote 参与原文哈希精确短路（content_hash 同步按原文重算）；
         未传入/为空时该条不参与。
         同 id 重复追加（并发/唯一键冲突路径）幂等：更新已有条目而非叠加。
-
-        窗口内直接 no-op：管道已暂停，此时调用方看到的都是临时基准库的数据，
-        变更生产缓存只会让生产卡片退出判重（相似新消息重复建卡直到重启）或
-        灌入生产库不存在的幽灵条目（吸收真实消息、静默丢卡）。
         """
         images = _parse_images(image_urls)
         content_hash = self._content_hash(source_quote)
@@ -307,9 +303,6 @@ class DedupEngine(DedupService):
 
         同步重建列表（无 await），单线程事件循环下与其它协程安全；
         缺失条目静默跳过。重启后 _ensure_cache 从 DB 重载，两路径收敛。
-
-        窗口内直接 no-op：批量删除/忽略在窗口内作用于临时库（affected == 0），
-        若照常清生产缓存，生产卡片会退出判重。
         """
         if not item_ids:
             return

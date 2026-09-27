@@ -101,7 +101,7 @@
         if (st.running) {
           runActive = true;
           // progress 来自进度文件，是「当前正在评估的那个功能」的计数；
-          // 无进度（尚未开始 / 进程内模式）时退回只显示用例数
+          // 无进度（尚未开始）时退回只显示用例数
           let progText = "";
           const p = st.progress;
           if (p && typeof p.done === "number") {

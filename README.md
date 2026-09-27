@@ -216,7 +216,7 @@ briefdesk/
   面板「自动提醒」控件与到期轮询全在 `reminders/ui/`（`ui.js` 注册核心
   `registerItemRowExtension` 行内扩展接入卡片动作区与 `handleRowAction`，
   经 `data-plugin-slot` 注入设置面板）；核心 `ui/` 只留通用加载器与两类
-  扩展钩子（`CoreFrontendBoundaryTest` 守卫），不写死任何插件功能入口
+  扩展钩子（`TestCoreFrontendBoundary` 守卫），不写死任何插件功能入口
 
 当前阶段：消息源、管道四阶段、AI 供应商与 Web 插件全部插件化，
 插件化改造完成（本体只保留存储、管道骨架、HTTP 与状态总线等核心）。

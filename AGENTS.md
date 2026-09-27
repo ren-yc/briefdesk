@@ -130,7 +130,7 @@ powershell -ExecutionPolicy Bypass -File scripts/install-hooks.ps1
 - 完成修改并通过质量门禁后，必须对本次改动做一轮简要 review：检查改动是否最小、是否引入无关文件、是否与源码/文档一致、是否遗漏测试。
 - Review 结束后，必须向用户输出一条推荐的、格式合理的 commit message，使用 Conventional Commits 格式（type 和 scope 保持英文，subject 使用中文），例如：
   ```text
-  feat(ai): 支持通过 AI_DISABLE_THINKING 禁用思考模式
+  feat(ai): 支持通过 AI_REASONING_EFFORT 选择推理强度
   ```
   其它示例：
   ```text

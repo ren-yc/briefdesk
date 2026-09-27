@@ -1,7 +1,7 @@
 ## 改动说明
 
 <!-- 概括做了什么、为什么。PR 标题请用 Conventional Commits 格式（type/scope 英文，subject 中文），
-     如 `feat(ai): 支持通过 AI_DISABLE_THINKING 禁用思考模式`。关联 issue 请写 `Fixes #123`。
+     如 `feat(ai): 支持通过 AI_REASONING_EFFORT 选择推理强度`。关联 issue 请写 `Fixes #123`。
      标题与描述都不要夹带审查报告条目号、计划产物编号或「第 N 批」流水号——仓库读者无法据此回查。 -->
 
 ## 改动类型

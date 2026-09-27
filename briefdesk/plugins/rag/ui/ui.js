@@ -198,11 +198,7 @@
         body: JSON.stringify({ question, history: turnHistory }),
       });
       if (!res.ok) {
-        // 基准窗口内 /api/rag/ask 被写闸门拒绝（409 + detail.code）：读响应体
-        // 才能说明真实原因，否则用户以为问答服务坏了
-        const err = new Error("HTTP " + res.status);
-        try { err.payload = await res.json(); } catch { /* 非 JSON 响应忽略 */ }
-        throw err;
+        throw new Error("HTTP " + res.status);
       }
       const data = await res.json();
       thinking.remove();

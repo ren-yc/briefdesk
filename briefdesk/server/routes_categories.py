@@ -136,8 +136,8 @@ async def api_delete_category(cat_id: int, body: dict):
         if row is not None and purge_items and deleted_ids:
             # 发布 items_deleted：去重插件订阅后同步清理内存缓存，
             # 避免相似新消息被误判重复而永久不显示。
-            # deleted_ids 为空时无删除发生（如空类别，或基准窗口内作用于
-            # 临时库），空列表发布只会让订阅方白跑一轮对账
+            # deleted_ids 为空时无删除发生（如空类别），空列表发布只会让
+            # 订阅方白跑一轮对账
             await event_bus.publish(EVENT_ITEMS_DELETED, deleted_ids)
     if row is None:
         raise HTTPException(404, "Category not found")

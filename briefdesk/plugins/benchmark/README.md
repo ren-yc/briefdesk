@@ -68,7 +68,8 @@ API：`GET/DELETE /api/benchmark/cases`（列出/删除导出用例）、
 `GET/POST /api/benchmark/record`（记录状态/开关）、
 `POST /api/benchmark/export-recorded`（导出处理记录）、
 `DELETE /api/benchmark/record`（丢弃记录）、
-`POST/GET /api/benchmark/run`（运行/状态）、`GET /api/benchmark/report(.json)`（结果）。
+`POST/GET/DELETE /api/benchmark/run`（运行/状态/取消）、
+`GET /api/benchmark/report(.json)`（结果）。
 
 ## 用法二：CLI
 

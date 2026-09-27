@@ -84,6 +84,7 @@ class WriteErrorHelperGuardTest(unittest.TestCase):
         self.assertEqual(ui.count("detailText(data, res.status)"), 3)
 
     def test_plugin_uis_have_failure_fallbacks(self):
+        """插件前端必须给出各自的失败文案（「读响应体识别窗口」的判据已随窗口机制删除）。"""
         for name, fallback in (
             ("reminders", 'showWriteError(err, "提醒设置失败，请重试")'),
             ("rag", "问答服务暂时不可用"),
@@ -91,11 +92,6 @@ class WriteErrorHelperGuardTest(unittest.TestCase):
             ui = (
                 _ROOT / "briefdesk" / "plugins" / name / "ui" / "ui.js"
             ).read_text(encoding="utf-8")
-            self.assertIn(
-                "err.payload = await res.json()",
-                ui,
-                f"{name} 插件前端必须读响应体并给出失败文案",
-            )
             self.assertIn(fallback, ui)
 
 
