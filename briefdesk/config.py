@@ -5,7 +5,7 @@ from typing import ClassVar
 from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import SettingsConfigDict
 
-from briefdesk import paths
+from briefdesk import paths, settings_env
 from briefdesk.settings_base import KeyringSettingsBase
 
 # 推理强度取值：CLI（--reasoning-effort 的 choices）与设置页下拉共用这一份清单，
@@ -184,3 +184,8 @@ def _load_config() -> Settings:
 
 
 config = _load_config()
+
+# 启动快照来源：与 config 同时点反推并缓存，供设置页展示。
+# 运行期改文件不会改变本进程实际生效的值（配置无热应用），
+# 「下次启动生效」由设置页的 expected_* 单独表达。
+settings_env.capture_startup_sources(Settings)

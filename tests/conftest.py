@@ -32,7 +32,19 @@ import aiosqlite
 import pytest
 import pytest_asyncio  # noqa: F401
 
+from briefdesk import paths
 from briefdesk.db import init_schema
+
+
+@pytest.fixture(autouse=True)
+def _without_project_dotenv(monkeypatch):
+    """项目根 .env 不是测试输入：默认按 wheel 模式（不读隐式 .env）。
+
+    为什么必须全局：`.env` 只在开发机存在（CI 没有），一旦它参与解析，用例就会
+    随开发机内容变红或变绿——典型的「只在开发机失败」。需要验证源码模式行为的
+    用例自行 patch `paths.project_dotenv_path()` 到临时文件即可覆盖本夹具。
+    """
+    monkeypatch.setattr(paths, "project_dotenv_path", lambda: None)
 
 
 @pytest.fixture

@@ -19,14 +19,17 @@ from unittest.mock import patch
 
 import keyring
 from keyring.backend import KeyringBackend
-from pydantic import SecretStr
+from pydantic import Field, SecretStr
 from starlette.testclient import TestClient
 
 import briefdesk.server as srv
 from briefdesk import paths, settings_env
 from briefdesk.config import Settings
 from briefdesk.server import routes_settings_env as settings_routes
+from briefdesk.settings_base import KeyringSettingsBase
 from briefdesk.settings_env import (
+    SOURCE_DOTENV,
+    field_env_key,
     get_settings_file,
     read_staged,
     source_of,
@@ -158,16 +161,17 @@ class SettingsFileTest(StagedFileTestCase):
         self.assertEqual(read_staged(), {"LOG_LEVEL": "DEBUG"})
 
     def test_source_of_priority(self) -> None:
-        # 环境变量 > override（暂存文件）> .env > default
+        # 环境变量 > 项目 .env > override（暂存文件）> default
         with tempfile.TemporaryDirectory() as d:
             env_root = Path(d)
-            (env_root / ".env").write_text(
-                "POLL_OVERLAP_SECONDS=99\n", encoding="utf-8"
+            project = env_root / ".env"
+            project.write_text(
+                "POLL_OVERLAP_SECONDS=99\nLOG_LEVEL=INFO\n", encoding="utf-8"
             )
-            with _env_without("LOG_LEVEL", "SERVER_PORT", "IGNORE_SELF"), patch.object(
-                settings_env, "PROJECT_ROOT", env_root
-            ):
-                self.assertEqual(source_of("LOG_LEVEL"), "default")
+            with _env_without(
+                "LOG_LEVEL", "SERVER_PORT", "IGNORE_SELF", "POLL_OVERLAP_SECONDS"
+            ), patch.object(paths, "project_dotenv_path", return_value=project):
+                self.assertEqual(source_of("SERVER_PORT"), "default")
                 write_staged({"SERVER_PORT": "3001"})
                 self.assertEqual(source_of("SERVER_PORT"), "override")
                 with patch.dict(os.environ, {"IGNORE_SELF": "false"}):
@@ -176,7 +180,9 @@ class SettingsFileTest(StagedFileTestCase):
                 with patch.dict(os.environ, {"IGNORE_SELF": "false"}):
                     self.assertEqual(source_of("IGNORE_SELF"), "env")
                 self.assertEqual(source_of("POLL_OVERLAP_SECONDS"), "dotenv")
-                self.assertEqual(source_of("LOG_LEVEL"), "default")
+                # 项目 .env 高于暂存：同名键在暂存里也写了，来源仍报 dotenv
+                write_staged({"LOG_LEVEL": "DEBUG"})
+                self.assertEqual(source_of("LOG_LEVEL"), "dotenv")
 
 
 class PriorityChainTest(unittest.TestCase):
@@ -665,7 +671,7 @@ class PluginToggleRoutesTest(StagedFileTestCase):
         self.assertNotIn("*", data["pluginOptions"])
 
     def test_get_enabled_follows_staged_value(self) -> None:
-        # 排除宿主环境 PLUGINS（env > 暂存 > .env > 默认）：来源判定若被宿主
+        # 排除宿主环境 PLUGINS（env > .env > 暂存 > 默认）：来源判定若被宿主
         # PLUGINS 抢占，pluginsSource 会返回 'env' 而非本用例期望的 'override'
         with _env_without("PLUGINS"):
             write_staged({"PLUGINS": '["weflow"]'})
@@ -755,3 +761,143 @@ class FrontendGuardTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SourceLayerTest(StagedFileTestCase):
+    """来源判定的边界：大小写、空串、显式层序（回归：小写键曾被漏看）。"""
+
+    def test_lowercase_key_is_reported_as_dotenv(self) -> None:
+        # 已复现的漂移：解析按 case_sensitive=False 采纳小写键，判定却精确匹配大写，
+        # 结果「显示的来源」与「实际生效值」互相矛盾。
+        with tempfile.TemporaryDirectory() as d:
+            project = Path(d) / ".env"
+            project.write_text("db_path=lower-value\n", encoding="utf-8")
+            with patch.object(paths, "project_dotenv_path", return_value=project):
+                self.assertEqual(source_of("DB_PATH"), "dotenv")
+
+    def test_empty_value_counts_as_provided(self) -> None:
+        # `KEY=` 会以空串覆盖默认值（普通 str 字段得到 ''），因此算「已提供」
+        with tempfile.TemporaryDirectory() as d:
+            project = Path(d) / ".env"
+            project.write_text("LOG_LEVEL=\n", encoding="utf-8")
+            with patch.object(paths, "project_dotenv_path", return_value=project):
+                self.assertEqual(source_of("LOG_LEVEL"), "dotenv")
+
+    def test_explicit_layers_replace_default_order(self) -> None:
+        # 显式 `_env_file` 构造时，展示侧也要按那份文件判定（不再看默认两层）
+        with tempfile.TemporaryDirectory() as d:
+            explicit = Path(d) / "explicit.env"
+            explicit.write_text("SERVER_PORT=3111\n", encoding="utf-8")
+            self.assertEqual(
+                source_of("SERVER_PORT", [(SOURCE_DOTENV, explicit)]), "dotenv"
+            )
+            self.assertEqual(source_of("SERVER_PORT"), "default")
+
+    def test_env_lookup_is_case_insensitive(self) -> None:
+        with _env_without("SERVER_PORT"), patch.dict(os.environ, {"server_port": "3222"}):
+            self.assertEqual(source_of("SERVER_PORT"), "env")
+
+
+class FieldEnvKeyTest(unittest.TestCase):
+    """字段 → 环境变量键：alias 优先，否则 env_prefix + 字段名大写。"""
+
+    def test_alias_wins(self) -> None:
+        self.assertEqual(field_env_key(Settings, "db_path"), "DB_PATH")
+
+    def test_plugin_prefix_applied(self) -> None:
+        from briefdesk.plugins.benchmark.config import BenchmarkSettings
+
+        self.assertEqual(
+            field_env_key(BenchmarkSettings, "keep_runs"), "BENCHMARK_KEEP_RUNS"
+        )
+
+
+class TwoLayerPriorityTest(StagedFileTestCase):
+    """两个独立 dotenv 来源：项目 .env 高于暂存；wheel 模式只剩暂存。"""
+
+    def test_project_dotenv_beats_staged(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            project = Path(d) / ".env"
+            project.write_text("LOG_LEVEL=INFO\n", encoding="utf-8")
+            write_staged({"LOG_LEVEL": "DEBUG"})
+            with _env_without("LOG_LEVEL"), patch.object(
+                paths, "project_dotenv_path", return_value=project
+            ):
+                self.assertEqual(Settings().log_level, "INFO")
+                self.assertEqual(source_of("LOG_LEVEL"), "dotenv")
+
+    def test_wheel_mode_reads_staged_only(self) -> None:
+        write_staged({"LOG_LEVEL": "DEBUG"})
+        with _env_without("LOG_LEVEL"), patch.object(
+            paths, "project_dotenv_path", return_value=None
+        ):
+            self.assertEqual(Settings().log_level, "DEBUG")
+            self.assertEqual(source_of("LOG_LEVEL"), "override")
+
+
+class EnvFileContractTest(unittest.TestCase):
+    """显式 `_env_file`（含显式 None）完全取代两层；环境变量仍在其之上。"""
+
+    class _Probe(KeyringSettingsBase):
+        value: str = Field(default="default", alias="PROBE_VALUE")
+
+    def test_five_forms(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            project = root / ".env"
+            project.write_text("PROBE_VALUE=project\n", encoding="utf-8")
+            staged = root / "settings.env"
+            staged.write_text("PROBE_VALUE=staged\n", encoding="utf-8")
+            explicit = root / "explicit.env"
+            explicit.write_text("PROBE_VALUE=explicit\n", encoding="utf-8")
+            with (
+                _env_without("PROBE_VALUE"),
+                patch.dict(os.environ, {"BRIEFDESK_SETTINGS_FILE": str(staged)}),
+                patch.object(paths, "project_dotenv_path", return_value=project),
+            ):
+                self.assertEqual(self._Probe().value, "project")
+                self.assertEqual(self._Probe(_env_file=str(explicit)).value, "explicit")
+                self.assertEqual(self._Probe(_env_file=explicit).value, "explicit")
+                self.assertEqual(self._Probe(_env_file=[project, staged]).value, "staged")
+                self.assertEqual(self._Probe(_env_file=None).value, "default")
+                with patch.dict(os.environ, {"PROBE_VALUE": "env"}):
+                    self.assertEqual(self._Probe().value, "env")
+                    self.assertEqual(self._Probe(_env_file=str(explicit)).value, "env")
+
+
+class AllSettingsTwoLayerTest(StagedFileTestCase):
+    """六个 Settings 类同口径：项目 .env 高于暂存（env_prefix 各自生效）。"""
+
+    def _cases(self):
+        from briefdesk.plugins.benchmark.config import BenchmarkSettings
+        from briefdesk.plugins.qqflow.config import QqFlowSettings
+        from briefdesk.plugins.rag.config import RagSettings
+        from briefdesk.plugins.weflow.config import WeFlowSettings
+        from briefdesk.plugins.weflow_legacy.config import WeFlowLegacySettings
+
+        return [
+            (Settings, "LOG_LEVEL", "log_level", "WARNING"),
+            (WeFlowSettings, "WEFLOW_API_BASE", "api_base", "http://proj:1"),
+            (WeFlowLegacySettings, "WEFLOW_LEGACY_API_BASE", "api_base", "http://proj:2"),
+            (QqFlowSettings, "QQFLOW_API_BASE", "api_base", "http://proj:3"),
+            (RagSettings, "RAG_MODEL", "model", "model-proj"),
+            (BenchmarkSettings, "BENCHMARK_RUN_STALL_SECONDS", "run_stall_seconds", "1234"),
+        ]
+
+    def test_project_dotenv_beats_staged_for_every_class(self) -> None:
+        for model, key, attr, raw in self._cases():
+            with self.subTest(model=model.__name__):
+                self.assertEqual(field_env_key(model, attr), key)
+                with tempfile.TemporaryDirectory() as d:
+                    project = Path(d) / ".env"
+                    project.write_text(f"{key}={raw}\n", encoding="utf-8")
+                    # 暂存写一个必然不同的合法值：若优先级反了就会读到它
+                    write_staged({key: "0" if raw.isdigit() else "http://staged"})
+                    with (
+                        _env_without(key),
+                        patch.object(paths, "project_dotenv_path", return_value=project),
+                    ):
+                        parsed = getattr(model(), attr)
+                        expected = int(raw) if raw.isdigit() else raw
+                        self.assertEqual(parsed, expected, key)
+

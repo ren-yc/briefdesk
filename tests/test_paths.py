@@ -21,6 +21,10 @@ from platformdirs import (
 
 from briefdesk import paths
 
+#: 真身引用：conftest 的 autouse 夹具会把 paths.project_dotenv_path 换成
+#: 「wheel 模式」，而本文件要直测识别函数本身，必须在夹具生效前取一份原函数。
+_REAL_PROJECT_DOTENV_PATH = paths.project_dotenv_path
+
 
 def _fake_package_root(tmp_path: Path, pyproject: str | None) -> Path:
     """构造「包目录 + 父目录 pyproject.toml」的临时树，返回包目录。"""
@@ -141,19 +145,19 @@ def test_project_dotenv_path_detects_source_tree(tmp_path):
         tmp_path, '[project]\nname = "briefdesk"\nversion = "0.1.0"\n'
     )
     with patch.object(paths, "_package_root", return_value=pkg):
-        assert paths.project_dotenv_path() == tmp_path / ".env"
+        assert _REAL_PROJECT_DOTENV_PATH() == tmp_path / ".env"
 
 
 def test_project_dotenv_path_ignores_foreign_project(tmp_path):
     pkg = _fake_package_root(tmp_path, '[project]\nname = "other-app"\n')
     with patch.object(paths, "_package_root", return_value=pkg):
-        assert paths.project_dotenv_path() is None
+        assert _REAL_PROJECT_DOTENV_PATH() is None
 
 
 def test_project_dotenv_path_without_pyproject_is_wheel_mode(tmp_path):
     pkg = _fake_package_root(tmp_path, None)
     with patch.object(paths, "_package_root", return_value=pkg):
-        assert paths.project_dotenv_path() is None
+        assert _REAL_PROJECT_DOTENV_PATH() is None
 
 
 def test_project_dotenv_path_with_unreadable_pyproject_is_wheel_mode(tmp_path, caplog):
@@ -163,11 +167,11 @@ def test_project_dotenv_path_with_unreadable_pyproject_is_wheel_mode(tmp_path, c
         caplog.at_level("WARNING", logger="briefdesk.paths"),
         patch.object(paths, "_package_root", return_value=pkg),
     ):
-        assert paths.project_dotenv_path() is None
+        assert _REAL_PROJECT_DOTENV_PATH() is None
     assert "pyproject.toml" in caplog.text
 
 
 def test_project_dotenv_path_on_real_source_tree():
     """本仓库直跑测试时是源码模式：真实调用必须指向仓库根 .env。"""
     repo_root = Path(__file__).resolve().parent.parent
-    assert paths.project_dotenv_path() == repo_root / ".env"
+    assert _REAL_PROJECT_DOTENV_PATH() == repo_root / ".env"

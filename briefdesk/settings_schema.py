@@ -19,6 +19,8 @@ from pydantic import SecretStr
 from pydantic.fields import PydanticUndefined
 from pydantic_settings import BaseSettings
 
+from briefdesk.settings_env import field_env_key
+
 
 def _label_from_name(name: str) -> str:
     """把未声明展示名的字段转换成可读的英文标签。"""
@@ -26,11 +28,8 @@ def _label_from_name(name: str) -> str:
 
 
 def _field_key(model: type[BaseSettings], name: str) -> str:
-    field = model.model_fields[name]
-    if field.alias:
-        return str(field.alias)
-    prefix = str(model.model_config.get("env_prefix", ""))
-    return f"{prefix}{name}".upper()
+    """字段 → 环境变量键；规则与解析侧共用（见 settings_env.field_env_key）。"""
+    return field_env_key(model, name)
 
 
 def _unwrap_annotation(annotation: Any) -> Any:

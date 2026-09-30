@@ -8,12 +8,16 @@ Support/briefdesk/`，Linux `~/.config/briefdesk/`），也可经环境变量
 
 - 文件只存非密钥键值（`KEY=VALUE` 行，UTF-8、无注释、键序稳定）；
   密钥一律走系统密钥环（briefdesk/secrets_store.py），绝不落此文件。
-- 解析优先级：系统密钥环（仅密钥）> 环境变量 > **暂存文件** > `.env` > 默认值。
-  六个 Settings（app 级 + weflow/weflow-legacy/qqflow/rag/benchmark）的 `env_file` 均为
-  `[项目根 .env, 暂存文件]`，pydantic-settings 多文件后加载者优先。
+- 解析优先级：系统密钥环（仅密钥）> 环境变量 > **项目根 .env** > **用户暂存文件**
+  > 默认值。两个 dotenv 层是**独立来源**（不再是同一个 env_file 列表里的两项）：
+  `dotenv_layers()` 是唯一的有序层定义，解析（settings_base）与展示
+  （`source_of` / 启动快照）都消费它——各写一份判定链必然漂移（小写键就是
+  已复现的一例：解析采纳、判定漏看，设置页显示的来源与实际生效值矛盾）。
+- 项目根 .env 只在源码 / editable 模式存在（`paths.project_dotenv_path()`）；
+  wheel 安装不读任何隐式 .env（site-packages 与 cwd 都不读）。
 - 写入为原子操作（同目录临时文件 + os.replace），并发由调用方持锁。
 
-本模块不 import briefdesk.config（config 在 import 期构造环境文件列表，
+本模块不 import briefdesk.config（config 在 import 期构造配置实例，
 避免循环依赖）。
 """
 
@@ -22,15 +26,17 @@ import os
 from pathlib import Path
 
 from dotenv import dotenv_values
+from pydantic_settings import BaseSettings
 
 from briefdesk import paths
 
 logger = logging.getLogger(__name__)
 
-# 项目根目录（本文件上溯三级：briefdesk/settings_env.py → briefdesk/ → 根）。
-# 本模块不 import briefdesk.config（config 在 import 期构造环境文件列表，会循环），
-# 且 settings_base 的 env_file 列表在 import 期就要用它，故在此独立解析。
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
+# 来源层名：设置页 source / expected_source 的取值，前端按此措辞
+SOURCE_ENV = "env"
+SOURCE_DOTENV = "dotenv"  # 项目根 .env（仅源码 / editable 模式）
+SOURCE_OVERRIDE = "override"  # 用户暂存文件（settings.env）
+SOURCE_DEFAULT = "default"
 
 
 def get_settings_file() -> Path:
@@ -40,6 +46,101 @@ def get_settings_file() -> Path:
     只在 paths 一处定义，避免两个模块各自手写而漂移。
     """
     return paths.settings_file()
+
+
+def field_env_key(model: type[BaseSettings], name: str) -> str:
+    """字段对应的环境变量键：显式 `alias` 优先，否则 env_prefix + 字段名大写。
+
+    与 settings_schema 共用（它原来自己实现了一份）：键的推导若分两处，
+    设置页会按一个键展示、解析却按另一个键生效。
+    """
+    field = model.model_fields[name]
+    if field.alias:
+        return str(field.alias)
+    prefix = str(model.model_config.get("env_prefix", ""))
+    return f"{prefix}{name}".upper()
+
+
+def dotenv_layers() -> list[tuple[str, Path]]:
+    """按优先级从高到低返回 dotenv 层：(层名, 文件)。
+
+    唯一的有序层定义，解析与展示共用。文件不存在也照常返回（读取时静默跳过）；
+    项目根 .env 只在源码 / editable 模式出现，wheel 模式下这一层不存在。
+    """
+    layers: list[tuple[str, Path]] = []
+    project = paths.project_dotenv_path()
+    if project is not None:
+        layers.append((SOURCE_DOTENV, project))
+    layers.append((SOURCE_OVERRIDE, paths.settings_file()))
+    return layers
+
+
+def _env_value(alias: str) -> str | None:
+    """进程环境变量值（大小写不敏感，与 pydantic-settings 的默认口径一致）。"""
+    direct = os.environ.get(alias)
+    if direct is not None:
+        return direct
+    target = alias.upper()
+    for key, value in os.environ.items():
+        if key.upper() == target:
+            return value
+    return None
+
+
+def _file_has_key(path: Path, alias: str) -> bool:
+    """文件里是否有该键：大小写不敏感，且 `KEY=` 的空串算「有」。
+
+    为什么空串算有：`DotEnvSettingsSource` 会采纳空串（普通 str 字段得到 `''`、
+    int 字段直接 ValidationError），"留空即未设置" 不成立。
+    """
+    try:
+        values = dotenv_values(str(path), encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return False
+    target = alias.upper()
+    return any(key is not None and key.upper() == target for key in values)
+
+
+def source_of(alias: str, layers: list[tuple[str, Path]] | None = None) -> str:
+    """某配置键当前的生效来源：env / dotenv / override / default。
+
+    判定顺序取自 `dotenv_layers()`（与解析同一份定义，高优先级在前）；显式传入
+    `layers` 可判定自定义层序（例如显式 `_env_file` 构造时实际用的文件）。
+    """
+    if _env_value(alias) is not None:
+        return SOURCE_ENV
+    for name, path in dotenv_layers() if layers is None else layers:
+        if _file_has_key(path, alias):
+            return name
+    return SOURCE_DEFAULT
+
+
+# ── 启动快照（source 与 current 同时点）──
+
+_startup_sources: dict[str, str] | None = None
+
+
+def capture_startup_sources(model: type[BaseSettings]) -> dict[str, str]:
+    """按共享层序反推各字段**启动时**的来源并缓存，供设置页展示。
+
+    为什么不能实时判定：`config` 在启动时构造、无热应用——运行中改文件不会改变
+    本进程实际生效的值。"下次启动生效"另有 `expected_*` 表达，两者不可混用。
+    密钥字段也一并记录，但展示侧不消费（密钥走 configured/keyringConfigured）。
+    """
+    global _startup_sources
+    snapshot = {
+        key: source_of(key)
+        for key in (field_env_key(model, name) for name in model.model_fields)
+    }
+    _startup_sources = snapshot
+    return snapshot
+
+
+def startup_source(alias: str) -> str | None:
+    """启动快照里该键的来源；尚未捕获（如未 import config）时返回 None。"""
+    if _startup_sources is None:
+        return None
+    return _startup_sources.get(alias)
 
 
 def read_staged() -> dict[str, str]:
@@ -86,22 +187,3 @@ def write_staged(updates: dict[str, str | None]) -> None:
         # 写入/替换失败时清理残留 .tmp（原文件未被 os.replace 触碰，保持不变）
         tmp.unlink(missing_ok=True)
         raise
-
-
-def source_of(alias: str) -> str:
-    """某配置键当前的生效来源：env / override（暂存）/ dotenv / default。
-
-    判定顺序与解析优先级一致（环境变量 > 暂存文件 > .env > 默认）：
-    缺文件时静默跳过对应层。
-    """
-    if os.environ.get(alias) is not None:
-        return "env"
-    if alias in read_staged():
-        return "override"
-    try:
-        dotenv = dotenv_values(str(PROJECT_ROOT / ".env"), encoding="utf-8")
-    except (OSError, UnicodeDecodeError):
-        dotenv = {}
-    if dotenv.get(alias) is not None:
-        return "dotenv"
-    return "default"

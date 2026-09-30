@@ -86,8 +86,8 @@ weflow-server :5033        WeFlow(legacy) :5031        qqflow-server :5032
 | `briefdesk/sync.py` | 同步服务：`set_sync_callback` + `trigger_sync()`（fire-and-forget 全源轮询任务，syncing 互斥，结束后经 realtime 广播 `synced`）。main 启动与 `/api/sync` 共用。 |
 | `briefdesk/paths.py` | 路径计算（函数式，只算不建目录、每次调用求值）：`user_config_dir`/`user_data_dir`/`user_cache_dir`（platformdirs，**必须 `appauthor=False`**，否则 Windows 多一层 `briefdesk`）、`database_path`（用户数据目录 `data/briefdesk.sqlite`）、`benchmark_{cases,reports,runs}_dir`、`settings_file`、`project_dotenv_path`（源码/editable 判定）。`BRIEFDESK_DATA_DIR`/`BRIEFDESK_CACHE_DIR`/`BRIEFDESK_SETTINGS_FILE` **只读进程环境变量**，不读 `.env`。 |
 | `briefdesk/config.py` | `pydantic-settings` 配置（.env + UI 暂存文件；密钥 `SecretStr` 掩码；解析链见「配置」节）。[详见下文](#briefdeskconfigpy) |
-| `briefdesk/settings_env.py` | UI「启动配置」暂存层：`get_settings_file()`（委托 `paths.settings_file()`，可经 `BRIEFDESK_SETTINGS_FILE` 覆盖）、`read_staged`/`write_staged`（`KEY=VALUE` 行、原子写、空则删文件）、`source_of`（override/env/dotenv/default 判定）。不 import config（config 在 import 期构造 env_file 列表）。 |
-| `briefdesk/settings_base.py` | `KeyringSettingsBase`——app 级与各源插件 Settings 的公共基类（密钥环解析链挂载）。[详见下文](#briefdesksettings_basepy) |
+| `briefdesk/settings_env.py` | UI「启动配置」暂存层：`get_settings_file()`（委托 `paths.settings_file()`，可经 `BRIEFDESK_SETTINGS_FILE` 覆盖）、`read_staged`/`write_staged`（`KEY=VALUE` 行、原子写、空则删文件）、`dotenv_layers()`（**唯一的有序层定义**：项目 .env → 用户暂存，解析与展示共用）、`source_of`（env/dotenv/override/default；大小写不敏感、空串算已提供）、`field_env_key`（字段 → 环境变量键，与 settings_schema 共用）、启动快照（`capture_startup_sources`/`startup_source`）。不 import config。 |
+| `briefdesk/settings_base.py` | `KeyringSettingsBase`——app 级与各源插件 Settings 的公共基类：密钥环源挂载 + 两个独立 dotenv 来源（项目 .env 高于暂存）+ 显式 `_env_file` 契约（ContextVar 捕获显式性，`model_config["env_file"]` 恒为 None）。[详见下文](#briefdesksettings_basepy) |
 | `briefdesk/settings_schema.py` | 从核心或插件 `BaseSettings` 模型生成 JSON 安全的设置 schema（字段类型、默认值、当前值、约束与密钥配置状态）；统一规范化/校验前端暂存值，密钥不回传明文。 |
 | `briefdesk/plugins/weflow_legacy/normalize.py` | Two normalization paths: `normalize_sse` and `normalize_rest` both produce **lists** of `InternalMessage`。[详见下文](#briefdeskpluginsweflow_legacynormalizepy) |
 | `briefdesk/pipeline.py` | `process_all_batches()` — 管道**骨架**：入口过滤、raw 落库、批次编排与阶段调度（不 import 任何 AI/OCR 实现）。[详见下文](#briefdeskpipelinepy) |
@@ -332,7 +332,7 @@ else:
 
 #### briefdesk/config.py
 
-`pydantic-settings` from `[.env, UI 暂存文件]`（密钥型字段以 `SecretStr` 持有，repr/序列化自动掩码；密钥解析链见「配置解析链」小节）。含
+`pydantic-settings` 从两个独立来源读取（项目根 .env 高于 UI 暂存文件；密钥型字段以 `SecretStr` 持有，repr/序列化自动掩码；解析链见「配置解析链」小节）。含
 `plugins`（`PLUGINS`，默认 `[]`，JSON 数组，无通配语义，只过滤**可选插件**——不列出即禁用；核心插件恒装配，亦可在设置页
 「插件」面板逐个开关）、
 `plugins_required`/`plugin_path`、`db_path`（`DB_PATH`，默认 `paths.database_path()`——用户数据目录 `data/briefdesk.sqlite`；相对路径按 cwd 解析、`~` 不展开）、
@@ -345,9 +345,14 @@ AI 模型等。插件专属配置（`WEFLOW_*`/`WEFLOW_LEGACY_*`/`QQFLOW_*`/`RAG
 #### briefdesk/settings_base.py
 
 `KeyringSettingsBase`——六个 Settings（app 级与 weflow/weflow-legacy/qqflow/rag/benchmark）的公共基类：
-`settings_customise_sources` 单点实现（来源优先级 init > 密钥环 > 环境变量 > .env > 默认值）与统一 `env_file` 列表。子类以
+`settings_customise_sources` 单点实现（来源优先级 init > 密钥环 > 环境变量 > 项目根 .env > 用户暂存文件 > 默认值）。
+两个 dotenv 层是**独立来源**，顺序取自 `settings_env.dotenv_layers()`（解析、`source_of` 与启动快照共用同一份定义）；
+项目 .env 只在源码 / editable 模式存在，wheel 模式不读任何隐式 .env。显式传入 `_env_file`（含显式 `None`）时
+完全取代两层，其显式性由 `__init__` 的 ContextVar 捕获——`model_config["env_file"]` 恒为 `None`：pydantic-settings
+会**先**构造 DotEnvSettingsSource（构造即读文件）**再**调用来源钩子，「路径哨兵」写法会让文件在判定之前先被读一次
+（哨兵指向非法编码文件时直接抛错；wheel 模式下等于读 site-packages/.env）。子类以
 `ClassVar KEYRING_FIELDS`（字段名 → 环境变量名）声明密钥字段即自动挂 `KeyringSource`（非空才挂）；`model_config` 须注解
-`ClassVar[SettingsConfigDict]`（经中间基类继承时 ruff 对 pydantic 模型的 RUF012 豁免不再传导），其余键（env_file/extra 等）由
+`ClassVar[SettingsConfigDict]`（经中间基类继承时 ruff 对 pydantic 模型的 RUF012 豁免不再传导），其余键（env_file/encoding/extra）由
 pydantic 自动从基类合并、子类只需写 `env_prefix`。
 
 #### briefdesk/plugins/weflow_legacy/normalize.py
@@ -1082,12 +1087,20 @@ required field of `weflow`/`qqflow` → that plugin self-disables via `PluginDis
 
 ### 配置解析链（keyring + UI 暂存）
 
-配置按优先级解析：**系统密钥环（仅密钥）> 环境变量 > UI 暂存文件 > `.env` > 默认值**（实现：`briefdesk/secrets_store.py` +
-`briefdesk/settings_env.py` + `briefdesk/settings_base.py`；`KeyringSource` 由
+配置按优先级解析：**init 参数 > 系统密钥环（仅密钥）> 环境变量 > 项目根 `.env` > 用户暂存文件 > 默认值**（实现：
+`briefdesk/secrets_store.py` + `briefdesk/settings_env.py` + `briefdesk/settings_base.py`；`KeyringSource` 由
 `KeyringSettingsBase.settings_customise_sources` 单点挂载，六个 Settings（app 级与 weflow/weflow-legacy/qqflow/rag/benchmark）
-经 `ClassVar KEYRING_FIELDS` 声明密钥字段继承之，位于 env 源之前；六者的 `env_file` 均为
-`[项目根 .env, 暂存文件]`（基类统一声明、子类经 pydantic 自动合并继承），pydantic-settings 多文件**后加载优先**）。
+经 `ClassVar KEYRING_FIELDS` 声明密钥字段继承之，位于 env 源之前；两个 dotenv 层由 `settings_env.dotenv_layers()`
+统一给出顺序——解析、`source_of` 与启动快照**共用这一份定义**，避免「显示的来源」与「实际生效值」漂移：
+已复现的一例是小写键（解析按大小写不敏感采纳，判定若精确匹配就会误报 `default`）。
 
+- **来源的时点**：`source_of()` 是**实时**判定（按当前文件内容）；要展示与 `current` 同时点的来源时用启动快照
+  （`capture_startup_sources()` 在 `config` 构造后反推并缓存，读 `startup_source()`）——运行中改文件不会改变
+  本进程实际生效的值。
+
+- **项目根 `.env`**：仅源码 / editable 模式存在（`paths.project_dotenv_path()` 以文件系统判据识别；不用
+  `importlib.metadata`——源码树的 egg-info 会遮蔽 site-packages 的 dist-info，把 editable 误判成 wheel）；
+  wheel 安装不读用户目录、site-packages 或 cwd 的隐式 `.env`
 - **UI 暂存文件**：`briefdesk/paths.py` 的 `settings_file()`——platformdirs 用户配置目录下的
   `settings.env`（Windows `%LOCALAPPDATA%\briefdesk\settings.env`；macOS `~/Library/Application
   Support/briefdesk/`；Linux `~/.config/briefdesk/`）。⚠ Windows 必须传 `appauthor=False`：缺省
