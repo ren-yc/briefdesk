@@ -129,6 +129,24 @@ OCR 依赖为**可选**（`pip install -e ".[ocr]"`）：
 > 配置说明：`.env` 以项目根目录为基准解析，从任意目录启动（`python main.py` / `python -m briefdesk` / `briefdesk`）都会读到同一份配置；默认数据库落在平台用户数据目录（Windows `%LOCALAPPDATA%\briefdesk\data\briefdesk.sqlite`），可用 `DB_PATH` 覆盖（显式相对路径按当前工作目录解析，`~` 不展开）。
 > `PLUGINS` 未启用任何消息源插件时进入**降级启动**：应用照常运行（UI/设置/向导可用），状态栏明示「无消息源」，消息采集不可用——配置消息源后重启生效。
 
+### 数据与配置文件位置
+
+运行期可写的东西都在平台用户目录，安装目录只放代码与只读资源：
+
+| 内容 | 位置（Windows） | 覆盖入口 |
+|---|---|---|
+| SQLite 数据库 | `%LOCALAPPDATA%\briefdesk\data\briefdesk.sqlite` | `DB_PATH` |
+| UI 暂存配置 | `%LOCALAPPDATA%\briefdesk\settings.env` | `BRIEFDESK_SETTINGS_FILE` |
+| 基准用例与报告 | `%LOCALAPPDATA%\briefdesk\benchmark\{cases,reports}\` | `BRIEFDESK_DATA_DIR` |
+| 基准运行目录 | `%LOCALAPPDATA%\briefdesk\Cache\benchmark\runs\` | `BRIEFDESK_CACHE_DIR` |
+
+`BRIEFDESK_DATA_DIR` / `BRIEFDESK_CACHE_DIR` / `BRIEFDESK_SETTINGS_FILE` **只读进程环境变量**
+（写进 `.env` 无效）；macOS / Linux 走各自平台约定目录（platformdirs）。
+
+> **旧数据边界**：本版本默认路径与旧版不同，**不会自动发现、复制或迁移旧库**，也不提供旧库的迁移、
+> 导入或兼容转换指引；`DB_PATH` 只是通用的数据库文件覆盖入口，旧 schema、WAL 状态与兼容性不在支持范围。
+> 配置文件（`settings.env`）的位置同样变化：旧位置的文件不再被读取，其中的插件开关与暂存项回到默认值。
+
 ## 项目结构
 
 ```

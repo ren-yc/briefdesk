@@ -184,9 +184,13 @@ def _on_items_deleted(self, item_ids: list[str]) -> None:
 - **密钥写入**：`briefdesk secrets set <NAME>`（CLI）或 UI「设置 → 启动配置」面板底部的
   「密钥（系统钥匙串）」区；
   **禁止把真实密钥写进 .env 之外的任何仓库文件、日志或示例**。
-- **设置面板**：在插件 setup 里把 schema 注册给设置页（参考 rag 插件的
-  `build_settings_schema(RagSettings, plugin=...)`），字段类型/默认值/约束/密钥状态
-  由框架统一生成，密钥不回传明文。
+- **设置面板**：实现 `settings_schema(self, instance=None, *, running=True)` 并转调
+  `build_settings_schema(<你的 Settings>, instance, running=running, plugin=self.name, ...)`
+  （参考 rag 插件）——`instance`/`running` 由 `PluginManager` 下发：它在你的 setup 成功后
+  经可选的 `settings_instance()` 钩子取运行实例并登记来源快照，设置页展示的 `current`/`source`
+  才是「本进程正在用的值」；不实现这两个钩子的旧插件仍可用，只是字段不带运行快照
+  （框架按 `running=False` 展示「无运行值」）。字段类型/默认值/约束/密钥状态由框架统一生成，
+  密钥不回传明文。
 - **必填校验**：`briefdesk.plugin.config_helpers.validate_required_config(settings, {...})`
   统一检查必填项（缺失时一次性列出全部环境变量名），在 setup 抛 `PluginDisabledError`。
 

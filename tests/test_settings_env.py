@@ -1001,4 +1001,3 @@ class AllSettingsTwoLayerTest(StagedFileTestCase):
                         parsed = getattr(model(), attr)
                         expected = int(raw) if raw.isdigit() else raw
                         self.assertEqual(parsed, expected, key)
-

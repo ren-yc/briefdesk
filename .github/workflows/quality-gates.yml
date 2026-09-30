@@ -182,3 +182,36 @@ jobs:
       - name: Test (benchmark runner contract + isolation)
         run: |
           python -m pytest tests/test_benchmark_runner_contract.py tests/test_benchmark_isolation.py
+
+  # 独立 wheel 冒烟 job：构建 → wheel 资源清单断言 → 全新 venv 非 editable 安装 →
+  # 真进程启动（console script）+ HTTP 探活 + 真实写入（配置保存 / 用例导出 /
+  # 基准 runner / Web 基准运行与收尾）。形态对齐 isolation-smoke（单开 job、单版本、
+  # 直接跑入口），但 OS 与版本按需选择：主平台是 Windows，进程清理契约（terminate →
+  # 等待 → kill、文件占用导致删不掉）也是 Windows 特有的；Python 取 requires-python 下限。
+  wheel-smoke:
+    name: Wheel smoke (windows, py3.12)
+    runs-on: windows-latest
+    timeout-minutes: 30
+    env:
+      # headless runner 没有凭据管理器会话：密钥层走「未配置」分支
+      BRIEFDESK_KEYRING: "0"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+
+      # 只装锁文件：脚本需要的构建器（build）在锁里；被测应用装进脚本自建的
+      # 临时 venv，刻意不在本环境做 editable 安装——否则「装的是 wheel」会被掩盖。
+      - name: Install build tooling (lockfile)
+        run: pip install -r requirements-dev.txt
+
+      - name: Wheel smoke
+        run: python scripts/wheel_smoke.py
