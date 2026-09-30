@@ -46,8 +46,16 @@ def _without_project_dotenv(monkeypatch):
     用例自行 patch `paths.project_dotenv_path()` 到临时文件即可覆盖本夹具。
     """
     monkeypatch.setattr(paths, "project_dotenv_path", lambda: None)
-    # 核心启动快照在 import config 时就捕获了（早于任何夹具），这里按「无项目 .env」
-    # 重算一次——否则用例会读到开发机真实 .env 里的来源，CI 上又变成另一套结论。
+    # 宿主环境的第二个通道：shell 里可能预置 LOG_LEVEL / PLUGINS 这类同名变量，
+    # 不清掉时用例结论随宿主变化（典型「只在某台机器失败」）。需要它们的用例用
+    # monkeypatch.setenv / patch.dict 显式设置即可。
+    for field_name in Settings.model_fields:
+        key = settings_env.field_env_key(Settings, field_name)
+        monkeypatch.delenv(key, raising=False)
+        for existing in [k for k in os.environ if k.upper() == key.upper()]:
+            monkeypatch.delenv(existing, raising=False)
+    # 核心启动快照在 import config 时就捕获了（早于任何夹具），这里按「无项目 .env、
+    # 无宿主变量」重算一次——否则用例会读到开发机真实来源，CI 上又变成另一套结论。
     settings_env.capture_startup_sources(Settings)
 
 

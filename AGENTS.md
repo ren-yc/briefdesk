@@ -43,6 +43,9 @@ powershell -ExecutionPolicy Bypass -File scripts/install-hooks.ps1
 - 类型检查: `python -m mypy briefdesk/ tests/`（tests/ 为签名级检查；函数体深检因测试桩惯用法噪音大暂缓，配置理由见 pyproject `[tool.mypy]` 注释。CI 中 mypy 仅查 `briefdesk/` 包级——tests/ 的签名级检查由本地门禁覆盖，两处口径差异为有意为之）
 - 测试: `python -m pytest tests/`
 - 空白/冲突检查: `git diff --check`
+- 构建与元数据: `python -m build --wheel` + `python -m twine check dist/*`
+  （构建前先清空 `dist/`，避免校验到历史 artifact；完整 wheel 冒烟——临时 venv 安装、
+  真进程启动、写入隔离——在独立 CI job 跑，本地不跑）
 - 范围级空白检查（对齐 CI 的空树口径，覆盖全部跟踪文件；上一条只查工作区，
   对已入库的空白问题失明——rag/config.py 末尾空行曾因此逃逸到 CI 才拦下）:
   `git diff --check 4b825dc642cb6eb9a060e54bf8d69288fbee4904..HEAD`
@@ -119,6 +122,7 @@ powershell -ExecutionPolicy Bypass -File scripts/install-hooks.ps1
 - [ ] `python -m mypy briefdesk/ tests/` 通过
 - [ ] `python -m pytest tests/` 通过
 - [ ] `git diff --check` 通过
+- [ ] `python -m build --wheel` 与 `python -m twine check dist/*` 通过（先清空 `dist/`）
 - [ ] `git diff --check 4b825dc642cb6eb9a060e54bf8d69288fbee4904..HEAD` 通过（范围级，见质量门禁）
 - [ ] `git status --short` 中没有临时文件、缓存、数据库、本地 env 文件
 - [ ] `git diff --cached` 中没有真实密钥、Token、聊天记录、手机号等敏感信息

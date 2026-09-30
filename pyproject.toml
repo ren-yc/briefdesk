@@ -1,12 +1,17 @@
 [build-system]
-requires = ["setuptools>=68.0"]
+# PEP 639 的 project.license-files 自 setuptools 77.0.0 起可用：只改 [project]
+# 而不抬这个下限，干净构建环境取到 68–76 时会直接校验失败。
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "briefdesk"
 version = "0.1.0"
 description = "简报台 - BRIEFDESK"
+readme = "README.md"
 requires-python = ">=3.12"
+license = "MIT"
+license-files = ["LICENSE"]
 dependencies = [
     "fastapi>=0.115",
     "uvicorn[standard]>=0.34",
@@ -88,6 +93,10 @@ dev = [
     "ruff>=0.9",
     "mypy>=1.11",
     "pip-tools>=7.4",
+    # 构建与元数据校验：本地门禁跑 `python -m build --wheel` +
+    # `python -m twine check dist/*`（完整 wheel 冒烟在独立 CI job）
+    "build>=1.2",
+    "twine>=6",
 ]
 
 [tool.mypy]
