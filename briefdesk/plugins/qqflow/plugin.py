@@ -27,12 +27,22 @@ class QqFlowPlugin(SourcePlugin):
 
     def __init__(self) -> None:
         self._runtime: SourceRuntime | None = None
+        self._settings: Any = None  # 运行中的设置实例（manager 登记运行快照）
 
-    def settings_schema(self) -> list[dict[str, Any]]:
+    def settings_instance(self) -> Any:
+        """运行中的设置实例（未装配时为 None）；PluginManager 据此下发运行快照。"""
+        return self._settings
+
+    def settings_schema(
+        self, instance: Any = None, *, running: bool = True
+    ) -> list[dict[str, Any]]:
+        """字段描述；instance/running 由 PluginManager 下发（时点语义见 settings_schema.py）。"""
         from briefdesk.plugins.qqflow.config import QqFlowSettings
 
         return build_settings_schema(
             QqFlowSettings,
+            instance,
+            running=running,
             plugin=self.name,
             labels={
                 "api_base": "qqflow API 基址（根地址或反代子路径前缀）",
@@ -60,6 +70,7 @@ class QqFlowPlugin(SourcePlugin):
         from briefdesk.plugins.qqflow import runtime as qqflow_runtime
 
         settings = qqflow_config.QqFlowSettings()
+        self._settings = settings
         # QQFLOW_DB_PATH 允许为空：上游 qqflow-server 在 db_path 为空时
         # 自动回退到平台默认位置（Windows: Documents\Tencent Files 等）
         validate_required_config(settings, {

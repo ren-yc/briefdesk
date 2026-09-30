@@ -4448,21 +4448,56 @@ async function loadEnvConfig() {
   renderPluginToggles();
 }
 
+// 来源层名 → 界面措辞（与后端 settings_env.SOURCE_* 一一对应）
+function _envSourceLabel(source) {
+  const labels = { env: "环境变量", dotenv: "项目 .env", override: "暂存文件", default: "默认值" };
+  return labels[source] || String(source || "");
+}
+
+function _envValueText(value) {
+  if (value === null || value === undefined) return "—";
+  if (Array.isArray(value)) return value.length ? value.join("、") : "（空）";
+  if (typeof value === "boolean") return value ? "开" : "关";
+  return String(value);
+}
+
 function _envBadges(item, { skipPluginBadge = false } = {}) {
   const badges = [];
   if (item.staged !== null && item.staged !== undefined) {
     badges.push('<span class="env-badge env-badge-staged">已暂存 · 重启生效</span>');
   }
-  // 「环境变量优先」走默认灰徽章（.env-badge-env 不再有专属配色）：
-  // 它是底层技术细节，不应与「已暂存」这类必须关注的状态抢注意力
-  if (item.source === "env") {
-    badges.push('<span class="env-badge env-badge-env">环境变量优先</span>');
+  // 被更高优先层（环境变量 / 项目 .env）压住：按来源措辞提示，取代旧的「环境变量
+  // 优先」——两者是同一套覆盖规则，插件面板顶部警示也用这套措辞。
+  if (item.overridden) {
+    badges.push('<span class="env-badge env-badge-env">已被「' + esc(_envSourceLabel(item.override_source)) + "」覆盖</span>");
+  }
+  // 未装配 / 装配失败 / 无运行实例：显式「无运行值」，不拿下次启动值冒充运行值
+  if (item.running === false) {
+    badges.push('<span class="env-badge">无运行值</span>');
   }
   // 组级「未启用」已在分组标题上展示时，行内不再重复
   if (!skipPluginBadge && item.plugin && item.pluginStatus && item.pluginStatus !== "loaded") {
     badges.push('<span class="env-badge">插件' + esc(item.pluginStatus === "disabled" ? "未启用" : "不可用") + '</span>');
   }
   return badges.join("");
+}
+
+// 覆盖态 + 下次启动值：只在有草稿或确实被覆盖时出现，避免每行都堆提示
+function _envEffectiveHtml(item) {
+  const parts = [];
+  if (item.overridden) {
+    // 被覆盖：只报「谁在生效」，草稿本身已在输入框里，再报一遍会重复
+    parts.push("实际生效：" + esc(_envValueText(item.override_value))
+      + "（来源：" + esc(_envSourceLabel(item.override_source)) + "）");
+  } else if (item.staged !== null && item.staged !== undefined) {
+    if (item.expectedAvailable === false) {
+      parts.push("下次启动值不可用：" + esc(item.expectedError || "配置解析失败"));
+    } else if (item.expected_value !== undefined) {
+      parts.push("下次启动生效：" + esc(_envValueText(item.expected_value))
+        + "（来源：" + esc(_envSourceLabel(item.expected_source)) + "）");
+    }
+  }
+  return parts.length ? '<p class="text-muted settings-hint env-effective">' + parts.join("；") + "</p>" : "";
 }
 
 function _envControl(item) {
@@ -4543,6 +4578,7 @@ function _envRowHtml(item, groupDisabled) {
     + '<div class="env-row-head"><label class="env-label" title="' + escAttr(item.key) + '">' + esc(item.label) + "</label>"
     + _envBadges(item, { skipPluginBadge: groupDisabled }) + restore + "</div>"
     + _envControl(item)
+    + _envEffectiveHtml(item)
     + (item.hint ? '<p class="text-muted settings-hint">' + esc(item.hint) + "</p>" : "")
     + "</div>";
 }
@@ -5216,7 +5252,8 @@ function _pluginRowHtml(p) {
   if (p.reason) badges.push('<span class="plugin-reason text-muted">' + esc(p.reason) + "</span>");
   const control = p.core ? ""
     : '<label class="env-switch"><input type="checkbox" data-plugin-toggle="' + escAttr(p.name) + '"'
-      + (on ? " checked" : "") + '><span class="env-switch-text">启用</span></label>';
+      + (on ? " checked" : "") + (envData && envData.pluginsOverridden ? " disabled" : "")
+      + '><span class="env-switch-text">启用</span></label>';
   const deps = p.dependencies || [];
   const depsHint = deps.length
     ? '<p class="text-muted settings-hint">依赖：' + deps.map(esc).join("、") + "（核心插件恒满足）</p>"
@@ -5242,14 +5279,15 @@ function renderPluginToggles() {
     $pluginsList.innerHTML = '<p class="text-muted">未发现任何插件</p>';
     return;
   }
-  // 8a：pluginsSource==="env" → 顶部警示。来源链 env > 暂存 > .env > 默认，
-  // 面板开关写入的是暂存文件（优先级低于环境变量），env 覆盖时重启不生效。
-  // 只告知不禁用：用户可能想先暂存、将来移除环境变量后生效，或借此核对
-  // 当前生效值；与启动配置面板 env 行的「环境变量优先」徽章同口径。
-  const envSourced = envData.pluginsSource === "env";
-  const envNotice = envSourced
-    ? '<div class="plugins-env-notice">PLUGINS 由环境变量控制（优先于本机配置），'
-      + "此处的开关重启后不会生效——请修改系统环境变量或 .env 配置。</div>"
+  // 覆盖态：来源链 env > 项目 .env > 暂存 > 默认，面板开关写入的是暂存文件。
+  // 被 env 或项目 .env 压住时开关重启不生效：顶部警示 + 开关置灰（与启动配置
+  // 面板的「已被…覆盖」徽章同一套规则）。仅置灰不禁用数据：用户仍可借此核对
+  // 当前生效值，或在移除高层配置后再改。
+  const pluginsOverridden = !!envData.pluginsOverridden
+    || envData.pluginsSource === "env" || envData.pluginsSource === "dotenv";
+  const envNotice = pluginsOverridden
+    ? '<div class="plugins-env-notice">PLUGINS 当前由「' + esc(_envSourceLabel(envData.pluginsSource))
+      + "」控制（优先于本机配置），此处的开关重启后不会生效——请修改该来源后重启。</div>"
     : "";
   // 7b：无任何可选插件启用 → 面板顶部引导（覆盖零源降级最常见成因：新装
   // 复制 .env.example 默认 PLUGINS=[] / 旧版升级无 PLUGINS 行）。消息源等

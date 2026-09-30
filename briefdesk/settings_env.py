@@ -87,18 +87,21 @@ def _env_value(alias: str) -> str | None:
     return None
 
 
-def _file_has_key(path: Path, alias: str) -> bool:
-    """文件里是否有该键：大小写不敏感，且 `KEY=` 的空串算「有」。
+def _file_value(path: Path, alias: str) -> str | None:
+    """文件里该键的值：大小写不敏感，且 `KEY=` 的空串算「有值」。
 
-    为什么空串算有：`DotEnvSettingsSource` 会采纳空串（普通 str 字段得到 `''`、
+    为什么空串算有值：`DotEnvSettingsSource` 会采纳空串（普通 str 字段得到 `''`、
     int 字段直接 ValidationError），"留空即未设置" 不成立。
     """
     try:
         values = dotenv_values(str(path), encoding="utf-8")
     except (OSError, UnicodeDecodeError):
-        return False
+        return None
     target = alias.upper()
-    return any(key is not None and key.upper() == target for key in values)
+    for key, value in values.items():
+        if key is not None and key.upper() == target:
+            return value
+    return None
 
 
 def source_of(alias: str, layers: list[tuple[str, Path]] | None = None) -> str:
@@ -107,40 +110,74 @@ def source_of(alias: str, layers: list[tuple[str, Path]] | None = None) -> str:
     判定顺序取自 `dotenv_layers()`（与解析同一份定义，高优先级在前）；显式传入
     `layers` 可判定自定义层序（例如显式 `_env_file` 构造时实际用的文件）。
     """
-    if _env_value(alias) is not None:
-        return SOURCE_ENV
-    for name, path in dotenv_layers() if layers is None else layers:
-        if _file_has_key(path, alias):
-            return name
-    return SOURCE_DEFAULT
+    return composed_value(alias, layers=layers)[1]
+
+
+def composed_value(
+    alias: str,
+    *,
+    staged_override: dict[str, str] | None = None,
+    layers: list[tuple[str, Path]] | None = None,
+) -> tuple[str | None, str]:
+    """按共享层序返回该键**下次启动**生效的原始值与来源。
+
+    `staged_override` 传入「写入之后的暂存态」时，暂存层按它取值而不是读磁盘——
+    PUT 的组合校验要在落盘前判断下次启动的组合是否自洽。
+    """
+    env_value = _env_value(alias)
+    if env_value is not None:
+        return env_value, SOURCE_ENV
+    for name, file in dotenv_layers() if layers is None else layers:
+        if name == SOURCE_OVERRIDE and staged_override is not None:
+            value = staged_override.get(alias)
+        else:
+            value = _file_value(file, alias)
+        if value is not None:
+            return value, name
+    return None, SOURCE_DEFAULT
 
 
 # ── 启动快照（source 与 current 同时点）──
 
-_startup_sources: dict[str, str] | None = None
+#: 按模型登记的运行快照：核心 Settings 在 config 构造后登记，插件模型在插件
+#: setup 成功后由 PluginManager 登记——登记时刻即「运行实例取值的那一刻」。
+_model_sources: dict[type[BaseSettings], dict[str, str]] = {}
+_core_sources: dict[str, str] | None = None
 
 
-def capture_startup_sources(model: type[BaseSettings]) -> dict[str, str]:
-    """按共享层序反推各字段**启动时**的来源并缓存，供设置页展示。
+def capture_model_sources(model: type[BaseSettings]) -> dict[str, str]:
+    """按共享层序反推该模型各字段**此刻**的来源并登记，供设置页展示。
 
-    为什么不能实时判定：`config` 在启动时构造、无热应用——运行中改文件不会改变
-    本进程实际生效的值。"下次启动生效"另有 `expected_*` 表达，两者不可混用。
-    密钥字段也一并记录，但展示侧不消费（密钥走 configured/keyringConfigured）。
+    为什么不能每次渲染都实时判定：`config`/插件实例在启动时构造、无热应用——
+    运行中改文件不会改变本进程实际生效的值。"下次启动生效"另有 `expected_*`
+    表达，两者混用会出现「显示已生效、实际没生效」。密钥字段也一并登记，
+    但展示侧不消费（密钥走 configured/keyringConfigured）。
     """
-    global _startup_sources
     snapshot = {
         key: source_of(key)
         for key in (field_env_key(model, name) for name in model.model_fields)
     }
-    _startup_sources = snapshot
+    _model_sources[model] = snapshot
     return snapshot
 
 
+def model_sources(model: type[BaseSettings]) -> dict[str, str] | None:
+    """该模型已登记的快照；未登记返回 None（调用方决定何时登记）。"""
+    return _model_sources.get(model)
+
+
+def capture_startup_sources(model: type[BaseSettings]) -> dict[str, str]:
+    """核心 Settings 的启动快照入口（config.py 在构造 config 后调用）。"""
+    global _core_sources
+    _core_sources = capture_model_sources(model)
+    return _core_sources
+
+
 def startup_source(alias: str) -> str | None:
-    """启动快照里该键的来源；尚未捕获（如未 import config）时返回 None。"""
-    if _startup_sources is None:
+    """核心快照里该键的来源；尚未捕获（如未 import config）时返回 None。"""
+    if _core_sources is None:
         return None
-    return _startup_sources.get(alias)
+    return _core_sources.get(alias)
 
 
 def read_staged() -> dict[str, str]:

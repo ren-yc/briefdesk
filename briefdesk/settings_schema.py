@@ -19,7 +19,12 @@ from pydantic import SecretStr
 from pydantic.fields import PydanticUndefined
 from pydantic_settings import BaseSettings
 
-from briefdesk.settings_env import field_env_key
+from briefdesk.settings_env import (
+    capture_model_sources,
+    field_env_key,
+    model_sources,
+    source_of,
+)
 
 
 def _label_from_name(name: str) -> str:
@@ -99,10 +104,39 @@ def _render_default(value: Any) -> dict[str, Any]:
     return {}
 
 
+def render_value(value: Any) -> Any:
+    """把字段值转成可下发的 JSON 值；列表保序、标量原样、其余转字符串。"""
+    if isinstance(value, (list, tuple)):
+        return list(value)
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return str(value)
+
+
+def _sanitize_error(text: str) -> str:
+    """脱敏并截断校验错误：pydantic 会把出错的值回显在 input_value 里。"""
+    head = text.split(" [input_value=")[0]
+    lines = [line.strip() for line in head.splitlines() if line.strip()]
+    return (lines[-1][:200] if lines else "") or "配置解析失败"
+
+
+def _expected_instance(model: type[BaseSettings]) -> tuple[BaseSettings | None, str]:
+    """构造「下次启动生效值」用的全新实例；坏配置返回 (None, 脱敏摘要)。
+
+    为什么单独构造：`expected_*` 是「按当前文件重新解析」的语义，与运行实例
+    （`current`）无关；坏配置只影响这一路，字段元数据与运行值仍要照常下发。
+    """
+    try:
+        return model(), ""
+    except Exception as e:  # noqa: BLE001 — 坏配置不得让设置页 500
+        return None, _sanitize_error(str(e))
+
+
 def build_settings_schema(
     model: type[BaseSettings],
     instance: BaseSettings | None = None,
     *,
+    running: bool = True,
     plugin: str = "",
     labels: dict[str, str] | None = None,
     hints: dict[str, str] | None = None,
@@ -111,16 +145,27 @@ def build_settings_schema(
 ) -> list[dict[str, Any]]:
     """从 Settings 模型生成设置字段描述。
 
-    返回值只包含可 JSON 序列化内容，密钥字段不包含明文 ``current``。
-    ``instance`` 可由插件传入；为空时为展示配置创建一次模型实例。
+    三个时点必须分清（混用会让设置页显示「已生效」而实际没有）：
+
+    - `current` / `source`：**运行快照**——本进程正在用的值，以及它来自哪一层
+      （来源读按模型登记的快照，见 settings_env.capture_model_sources）。
+      `running=False`（插件未装配/装配失败/无运行实例）时不展示这两项，item 带
+      `running: False`，由前端显示「无运行值」，而不是拿下次启动值冒充。
+    - `expected_value` / `expected_source`：按**当前文件与环境**重新解析得到的
+      「下次启动生效值/来源」；解析失败时置 `expectedAvailable=False` + 脱敏摘要。
+    - 密钥字段：只下发 `configured`，不参与上述任何值时点。
+
+    返回值只包含可 JSON 序列化内容，密钥字段不包含明文。
     """
     settings: BaseSettings | None = instance
-    if settings is None:
+    if settings is None and running:
         try:
             settings = model()
         except Exception:  # noqa: BLE001 — schema 不应被无效配置阻断
             # 必填字段缺失或环境变量格式错误时，字段元数据仍可用于修复配置。
             settings = None
+    sources = model_sources(model) or capture_model_sources(model)
+    expected, expected_error = _expected_instance(model)
     labels = labels or {}
     hints = hints or {}
     warnings = warnings or {}
@@ -139,7 +184,10 @@ def build_settings_schema(
             "plugin": plugin,
             "secret": secret,
             "restart": True,
+            "running": running,
         }
+        if not running:
+            item.pop("current", None)
         if number_kind is not None:
             item["numberKind"] = number_kind
         if name in hints:
@@ -149,6 +197,8 @@ def build_settings_schema(
         if key in options:
             item["options"] = list(options[key])
         item.update(_constraints(field))
+        if running:
+            item["source"] = sources.get(key) or source_of(key)
         if field.default is not PydanticUndefined:
             if not secret and field.default is not None:
                 item.update(_render_default(field.default))
@@ -179,19 +229,19 @@ def build_settings_schema(
                     else secret_value
                 )
         else:
-            if settings is None:
-                item["current"] = None
+            if running:
+                item["current"] = (
+                    None if settings is None else render_value(getattr(settings, name))
+                )
+            if expected is None:
+                item["expectedAvailable"] = False
+                item["expectedError"] = expected_error or "配置解析失败"
             else:
-                value = getattr(settings, name)
-                if isinstance(value, (list, tuple)):
-                    item["current"] = list(value)
-                elif isinstance(value, (str, int, float, bool)) or value is None:
-                    item["current"] = value
-                else:
-                    item["current"] = str(value)
+                item["expectedAvailable"] = True
+                item["expected_source"] = source_of(key)
+                item["expected_value"] = render_value(getattr(expected, name))
         result.append(item)
     return result
-
 
 def staged_value(raw: str, setting_type: str) -> object:
     """把暂存文件中的字符串转换成前端控件可识别的值。"""

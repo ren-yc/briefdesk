@@ -86,9 +86,9 @@ weflow-server :5033        WeFlow(legacy) :5031        qqflow-server :5032
 | `briefdesk/sync.py` | 同步服务：`set_sync_callback` + `trigger_sync()`（fire-and-forget 全源轮询任务，syncing 互斥，结束后经 realtime 广播 `synced`）。main 启动与 `/api/sync` 共用。 |
 | `briefdesk/paths.py` | 路径计算（函数式，只算不建目录、每次调用求值）：`user_config_dir`/`user_data_dir`/`user_cache_dir`（platformdirs，**必须 `appauthor=False`**，否则 Windows 多一层 `briefdesk`）、`database_path`（用户数据目录 `data/briefdesk.sqlite`）、`benchmark_{cases,reports,runs}_dir`、`settings_file`、`project_dotenv_path`（源码/editable 判定）。`BRIEFDESK_DATA_DIR`/`BRIEFDESK_CACHE_DIR`/`BRIEFDESK_SETTINGS_FILE` **只读进程环境变量**，不读 `.env`。 |
 | `briefdesk/config.py` | `pydantic-settings` 配置（.env + UI 暂存文件；密钥 `SecretStr` 掩码；解析链见「配置」节）。[详见下文](#briefdeskconfigpy) |
-| `briefdesk/settings_env.py` | UI「启动配置」暂存层：`get_settings_file()`（委托 `paths.settings_file()`，可经 `BRIEFDESK_SETTINGS_FILE` 覆盖）、`read_staged`/`write_staged`（`KEY=VALUE` 行、原子写、空则删文件）、`dotenv_layers()`（**唯一的有序层定义**：项目 .env → 用户暂存，解析与展示共用）、`source_of`（env/dotenv/override/default；大小写不敏感、空串算已提供）、`field_env_key`（字段 → 环境变量键，与 settings_schema 共用）、启动快照（`capture_startup_sources`/`startup_source`）。不 import config。 |
+| `briefdesk/settings_env.py` | UI「启动配置」暂存层：`get_settings_file()`（委托 `paths.settings_file()`，可经 `BRIEFDESK_SETTINGS_FILE` 覆盖）、`read_staged`/`write_staged`（`KEY=VALUE` 行、原子写、空则删文件）、`dotenv_layers()`（**唯一的有序层定义**：项目 .env → 用户暂存，解析与展示共用）、`source_of`（env/dotenv/override/default；大小写不敏感、空串算已提供）、`field_env_key`（字段 → 环境变量键，与 settings_schema 共用）、值查询（`composed_value`：env > 项目 .env > 暂存，PUT 预检可按写后暂存态取值）、启动快照（按模型登记 `capture_model_sources`/`model_sources`，核心另有 `capture_startup_sources`/`startup_source`）。不 import config。 |
 | `briefdesk/settings_base.py` | `KeyringSettingsBase`——app 级与各源插件 Settings 的公共基类：密钥环源挂载 + 两个独立 dotenv 来源（项目 .env 高于暂存）+ 显式 `_env_file` 契约（ContextVar 捕获显式性，`model_config["env_file"]` 恒为 None）。[详见下文](#briefdesksettings_basepy) |
-| `briefdesk/settings_schema.py` | 从核心或插件 `BaseSettings` 模型生成 JSON 安全的设置 schema（字段类型、默认值、当前值、约束与密钥配置状态）；统一规范化/校验前端暂存值，密钥不回传明文。 |
+| `briefdesk/settings_schema.py` | 从核心或插件 `BaseSettings` 模型生成 JSON 安全的设置 schema（字段类型、默认值、约束、密钥配置状态，以及**三个时点**的取值：运行快照 `current`/`source`、下次启动 `expected_value`/`expected_source`）；统一规范化/校验前端暂存值，密钥不回传明文。 |
 | `briefdesk/plugins/weflow_legacy/normalize.py` | Two normalization paths: `normalize_sse` and `normalize_rest` both produce **lists** of `InternalMessage`。[详见下文](#briefdeskpluginsweflow_legacynormalizepy) |
 | `briefdesk/pipeline.py` | `process_all_batches()` — 管道**骨架**：入口过滤、raw 落库、批次编排与阶段调度（不 import 任何 AI/OCR 实现）。[详见下文](#briefdeskpipelinepy) |
 | `briefdesk/db.py` | All SQLite via `aiosqlite`（单连接单例、存储锁、schema 迁移与备份/恢复）。[详见下文](#briefdeskdbpy) |
@@ -827,7 +827,9 @@ WARNING）的日志噪音；`fmt_dur()` 统一耗时格式。
   classify/dedup/merge 声明依赖 ai_provider，被禁用时随依赖降级，pipeline 骨架对“阶段缺失”整批保留不标记防消息丢失）/ `WebPlugin`（router +
    asset_dir；核心提供 `GET /api/plugins` 元数据与 `GET /plugin-assets/{name}/{path}` 静态资源
   ，`include_plugin_router` 展开 APIRoute 插到 SPA mount 之前——新版 Starlette 的惰性 `_IncludedRouter` 会被 SPA 兜底截胡）
-  / 可选 `SettingsSchemaPlugin`（实现 `settings_schema()` 即可按插件当前配置动态暴露设置字段，旧插件无需实现）。
+  / 可选 `SettingsSchemaPlugin`（实现 `settings_schema()` 即可按插件当前配置动态暴露设置字段；`PluginManager` 在插件
+  setup 成功后经可选的 `settings_instance()` 钩子保存运行实例并下发 `settings_schema(instance, running=...)`，
+  `running=False` 表示没有运行值——旧插件不实现这两个钩子也能工作，只是字段不带运行快照）。
 - **双能力插件**：同一插件类可显式继承多个能力协议并同时注册（先例：rag = StagePlugin[post_insert] + WebPlugin，setup 内既
   register_stage 又 register_router/register_plugin_assets）。
 - **PluginContext 服务端口**：config、事件总线（`event_bus`，核心删除卡片发布 `EVENT_ITEMS_DELETED`，去重插件订阅清内存缓存）、
@@ -1094,9 +1096,13 @@ required field of `weflow`/`qqflow` → that plugin self-disables via `PluginDis
 统一给出顺序——解析、`source_of` 与启动快照**共用这一份定义**，避免「显示的来源」与「实际生效值」漂移：
 已复现的一例是小写键（解析按大小写不敏感采纳，判定若精确匹配就会误报 `default`）。
 
-- **来源的时点**：`source_of()` 是**实时**判定（按当前文件内容）；要展示与 `current` 同时点的来源时用启动快照
-  （`capture_startup_sources()` 在 `config` 构造后反推并缓存，读 `startup_source()`）——运行中改文件不会改变
-  本进程实际生效的值。
+- **三个时点必须分清**（设置页每行同时带这三组字段，混用会显示「已生效」而实际没有）：
+  `current`/`source` 是**运行快照**（本进程正在用的值；来源读按模型登记的 `capture_model_sources()`——核心 Settings
+  在 `config` 构造后登记，插件模型在插件 setup 成功后由 PluginManager 登记）；`staged` 是草稿；
+  `expected_value`/`expected_source` 是**按当前文件重新解析**的「下次启动生效值/来源」（`source_of()` 实时判定）。
+  覆盖态 `overridden`/`override_source`/`override_value` 属**预期**语义（与 `expected_*` 同源）：草稿存在且下次启动
+  会被 env / 项目 .env 压住时为真；`override_value` 给的是压住它的那一层的值。插件未装配/无运行实例时字段带
+  `running: false` 且不下发 `current`/`source`——显式表达「没有运行值」，不拿下次启动值冒充。
 
 - **项目根 `.env`**：仅源码 / editable 模式存在（`paths.project_dotenv_path()` 以文件系统判据识别；不用
   `importlib.metadata`——源码树的 egg-info 会遮蔽 site-packages 的 dist-info，把 editable 误判成 wheel）；
@@ -1108,10 +1114,13 @@ required field of `weflow`/`qqflow` → that plugin self-disables via `PluginDis
   `BRIEFDESK_SETTINGS_FILE` 显式指定（测试/便携）；只存非密钥键值，不存在时静默跳过；原子写（临时文件 +
   `os.replace`）+ 单写锁
 - **UI「设置 → 启动配置」面板**：GET/PUT `/api/settings/env`（核心字段从 `Settings.model_fields` 自动生成，并合并全部已发现
-  插件实现的 `settings_schema()`；支持 select/number/boolean/multi/text 与约束校验
-  ，`null`=恢复默认；PUT 对 PLUGINS 变更先经 `validate_selection` 依赖/互斥复检，不合法 409）、POST/DELETE `/api/settings/secrets`（keyring 写入/清除，明文永不下发；密钥状态同时区分有效配置 `configured` 与钥匙串
-  条目 `keyringConfigured`）；写入后**重启生效**（配置在启动时快照，无热应用）；来源徽标区分 override/env/dotenv/default（环境变量级优先时 UI 提示「
-  暂存不生效」）。可选插件禁用后仍显示其配置入口，便于启用前预配置；未实现可选 schema 的旧插件不受影响
+  插件实现的 `settings_schema()`；支持 select/number/boolean/multi/text 与约束校验，`null`=恢复默认）、POST/DELETE `/api/settings/secrets`
+  （keyring 写入/清除，明文永不下发；密钥状态同时区分有效配置 `configured` 与钥匙串条目 `keyringConfigured`）；写入后**重启生效**
+  （配置在启动时快照，无热应用）。GET 每行给三组值（见「三个时点」）：实际生效徽章按 `override_source` 措辞（「已被「项目 .env」覆盖」），
+  并在有草稿时显示「下次启动生效」；`expectedAvailable=false` 表示按当前文件解析失败（坏配置不 500，仍给脱敏摘要与全部字段元数据）。
+  PUT 对 PLUGINS 变更先经 `validate_selection` 依赖/互斥复检，不合法 409——复检用「写后暂存态 **按共享层序合成**」的组合，
+  只读暂存会漏掉被 .env/环境变量压住的情形（那种组合重启后按更高层生效）。可选插件禁用后仍显示其配置入口，便于启用前预配置；
+  未实现可选 schema 的旧插件不受影响
 - 系统密钥环经 `keyring` 库（Windows=凭据管理器/DPAPI，随用户账号加密；macOS=钥匙串；Linux=Secret Service），由 CLI
   `briefdesk secrets set|get|rm|list` 或 UI 密钥区管理（白名单 `SECRET_NAMES`）；
 - 密钥环不可用（无桌面会话 / 无 Secret Service / 未安装 keyring）或 `BRIEFDESK_KEYRING=0` 时**静默回退**环境变量 → `.env` → 默认值（读路

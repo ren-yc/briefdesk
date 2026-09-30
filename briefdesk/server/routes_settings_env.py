@@ -39,9 +39,13 @@ from briefdesk.server.web_plugins import (
     validate_plugin_selection,
 )
 from briefdesk.settings_env import (
+    SOURCE_DOTENV,
+    SOURCE_ENV,
+    composed_value,
     get_settings_file,
     read_staged,
     source_of,
+    startup_source,
     write_staged,
 )
 from briefdesk.settings_schema import (
@@ -104,29 +108,38 @@ _CORE_UI: dict[str, dict[str, Any]] = {
     "DEDUP_EMBED_FALLBACK_THRESHOLD": {"label": "低置信复核阈值"},
     "MERGE_WINDOW_MINUTES": {"label": "同话题合并窗口（分钟）", "hint": "0 = 禁用合并"},
     "MERGE_MAX_CANDIDATES": {"label": "合并候选上限"},
-    "DB_PATH": {"label": "数据库文件路径", "warn": "重启后数据库将使用新路径；旧库不会自动迁移，请备份后手动移动文件"},
+    "DB_PATH": {"label": "数据库文件路径", "warn": "重启后数据库将使用新路径；旧库不会被自动发现或迁移"},
     "SERVER_PORT": {"label": "服务端口", "warn": "重启后访问地址将变为新端口"},
     "LOG_LEVEL": {"label": "日志级别", "hint": "DEBUG 开启逐条细节；INFO 只保留阶段与汇总"},
 }
 
-_CORE_SCHEMA = build_settings_schema(
-    Settings,
-    config,
-    labels={key: value["label"] for key, value in _CORE_UI.items() if "label" in value},
-    hints={key: value["hint"] for key, value in _CORE_UI.items() if "hint" in value},
-    warnings={key: value["warn"] for key, value in _CORE_UI.items() if "warn" in value},
-    options={
-        "LOG_LEVEL": ["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
-        # 必须按环境键名登记：settings_schema 以 key 判 select，否则字段只会渲染成
-        # 文本框（见 _field_type 的兜底分支）
-        "AI_REASONING_EFFORT": list(REASONING_EFFORT_VALUES),
-    },
-)
-for _item in _CORE_SCHEMA:
-    _item.update(_CORE_UI.get(_item["key"], {}))
+def _core_schema() -> list[dict[str, Any]]:
+    """核心设置的字段描述（**按请求重建**）。
 
-ENV_SCHEMA: list[dict] = [item for item in _CORE_SCHEMA if not item.get("secret")]
-_CORE_SECRET_SCHEMA = [item for item in _CORE_SCHEMA if item.get("secret")]
+    必须重建而不是缓存：expected_* 是「按当前文件重新解析」的语义，缓存会把它
+    冻结在 import 时刻，用户改完文件后看到的下次启动值仍是旧的；current/source
+    来自运行快照，重建不改变其时点。
+    """
+    items = build_settings_schema(
+        Settings,
+        config,
+        labels={key: value["label"] for key, value in _CORE_UI.items() if "label" in value},
+        hints={key: value["hint"] for key, value in _CORE_UI.items() if "hint" in value},
+        warnings={key: value["warn"] for key, value in _CORE_UI.items() if "warn" in value},
+        options={
+            "LOG_LEVEL": ["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
+            # 必须按环境键名登记：settings_schema 以 key 判 select，否则字段只会渲染成
+            # 文本框（见 _field_type 的兜底分支）
+            "AI_REASONING_EFFORT": list(REASONING_EFFORT_VALUES),
+        },
+    )
+    for item in items:
+        item.update(_CORE_UI.get(item["key"], {}))
+    return items
+
+
+#: 核心密钥条目：密钥只下发 configured/掩码，不参与覆盖态（无值时点语义）
+_CORE_SECRET_SCHEMA = [item for item in _core_schema() if item.get("secret")]
 
 _SECRET_LABELS = {
     "AI_API_KEY": "AI API Key",
@@ -147,7 +160,7 @@ def _all_schema() -> list[dict[str, Any]]:
     预配置必填项），按 key 去重。"""
     result: list[dict[str, Any]] = []
     seen: set[str] = set()
-    for item in [*ENV_SCHEMA, *get_settings_schema()]:
+    for item in [*_core_schema(), *get_settings_schema()]:
         key = item.get("key")
         if not isinstance(key, str) or item.get("secret") or key in seen:
             continue
@@ -190,28 +203,54 @@ def _schema_of(key: str) -> dict:
     raise KeyError(key)
 
 
-def _fresh_item_state(key: str, staged_now: dict[str, str]) -> dict[str, Any]:
-    """写操作后该键的最终暂存态与来源（与 GET 同口径，供前端行级贴片）。
+def _item_state(meta: dict[str, Any], raw_staged: str | None) -> dict[str, Any]:
+    """单键展示状态：暂存态 + 运行值 + 覆盖态 + 下次启动值（GET/PUT 同口径）。
 
-    恢复默认（null）后键从暂存文件消失：staged 回 None、source 重新落
-    env/dotenv/default 层——source 依赖服务端解析链，客户端无法自行推算。
+    三个时点必须分清：current/source 是**运行快照**（本进程正在用），staged 是草稿，
+    expected_* 是**下次启动**。overridden 只在「草稿被更高优先层压住」时为真——
+    被覆盖时不提示「已生效」，也不改运行值；恢复默认（null）后草稿消失、覆盖态解除。
     """
-    meta = _schema_of(key)  # PUT 白名单已放行，必命中
-    raw = staged_now.get(key)
+    staged_val = (
+        staged_value(raw_staged, meta["type"]) if raw_staged is not None else None
+    )
+    # 覆盖态属**预期**语义（与 expected_* 同源）：判据是「下次启动时草稿会不会被
+    # 更高层压住」，不是启动快照——启动快照只描述本进程正在用的值（source/current）。
+    expected_source = meta.get("expected_source")
+    expected_available = bool(meta.get("expectedAvailable", True))
+    overridden = bool(
+        staged_val is not None
+        and expected_available
+        and expected_source in (SOURCE_ENV, SOURCE_DOTENV)
+    )
     return {
-        "staged": staged_value(raw, meta["type"]) if raw is not None else None,
-        "source": source_of(key),
+        "staged": staged_val,
+        "source": meta.get("source"),
+        "overridden": overridden,
+        "override_source": expected_source if overridden else None,
+        "override_value": meta.get("expected_value") if overridden else None,
+        "expected_value": meta.get("expected_value"),
+        "expected_source": meta.get("expected_source"),
+        "expectedAvailable": meta.get("expectedAvailable", True),
+        "expectedError": meta.get("expectedError", ""),
     }
 
 
-def _desired_plugins(staged: dict[str, str]) -> list[str]:
-    """下次启动的可选插件期望启用列表：暂存值优先，否则回落启动快照。
+def _fresh_item_state(key: str, staged_now: dict[str, str]) -> dict[str, Any]:
+    """写操作后该键的最终状态（与 GET 同口径，供前端行级贴片）。"""
+    meta = _schema_of(key)  # PUT 白名单已放行，必命中
+    return _item_state(meta, staged_now.get(key))
 
-    暂存值写入时已经 normalize_setting 校验，解析失败属防御分支（按快照
-    处理）。启动后修改过的 .env/环境变量不在此反映（快照语义，与设置
-    面板其余 current 字段一致）。
+
+def _desired_plugins(staged_override: dict[str, str] | None = None) -> list[str]:
+    """下次启动的可选插件启用列表：按**共享层序**合成（env > 项目 .env > 暂存）。
+
+    只看暂存会漏掉被 .env/环境变量压住的情形——那种组合重启后由更高层决定，
+    校验必须按实际生效的组合判，否则会放行「重启即中止」的配置。
+    staged_override 传「写入之后的暂存态」时按它取值（PUT 落盘前预检）。
+
+    解析失败属防御分支（暂存值写入时已过 normalize_setting 校验）。
     """
-    raw = staged.get("PLUGINS")
+    raw, _source = composed_value("PLUGINS", staged_override=staged_override)
     if raw is None:
         return list(config.plugins)
     try:
@@ -233,7 +272,7 @@ def _required_plugin_issues(staged: dict[str, str]) -> list[dict[str, str]]:
 
     核心插件恒装配，列入必选视为恒满足（面板也不提供它们的必选芯片）。
     """
-    raw = staged.get("PLUGINS_REQUIRED")
+    raw, _source = composed_value("PLUGINS_REQUIRED", staged_override=staged)
     if raw is None:
         return []
     try:
@@ -308,6 +347,11 @@ def _plugin_toggle_data(staged: dict[str, str]) -> list[dict[str, Any]]:
     return plugins
 
 
+def _plugins_source() -> str:
+    """PLUGINS 的运行来源：启动快照优先，未捕获时退回实时判定（测试场景）。"""
+    return startup_source("PLUGINS") or source_of("PLUGINS")
+
+
 def _normalize(key: str, raw: str) -> str:
     """动态 schema + 类型/约束校验，返回规范化的暂存字符串。"""
     try:
@@ -326,22 +370,10 @@ def _normalize(key: str, raw: str) -> str:
 async def api_settings_env():
     """启动配置面板数据：元数据 + 生效/暂存/来源 + 密钥状态 + 文件路径。"""
     staged = read_staged()
-    items = []
-    for meta in _all_schema():
-        key = meta["key"]
-        raw_staged = staged.get(key)
-        staged_val = (
-            staged_value(raw_staged, meta["type"])
-            if raw_staged is not None
-            else None
-        )
-        items.append(
-            {
-                **meta,
-                "staged": staged_val,
-                "source": source_of(key),
-            }
-        )
+    items = [
+        {**meta, **_item_state(meta, staged.get(meta["key"]))}
+        for meta in _all_schema()
+    ]
     # PLUGINS_REQUIRED 芯片选项：仅可选插件（核心插件恒装配，列入无意义）
     plugin_names = sorted(
         {p.get("name", "") for p in get_plugins_info() if not p.get("core")} - {""}
@@ -372,7 +404,10 @@ async def api_settings_env():
         "items": items,
         "pluginOptions": plugin_names,
         "plugins": _plugin_toggle_data(staged),
-        "pluginsSource": source_of("PLUGINS"),
+        # PLUGINS 的来源取启动快照（与「本进程开关是否生效」同一时点）；被 env 或
+        # 项目 .env 压住时前端禁用开关。
+        "pluginsSource": _plugins_source(),
+        "pluginsOverridden": _plugins_source() in (SOURCE_ENV, SOURCE_DOTENV),
         "secrets": secrets,
     }
 
@@ -407,14 +442,19 @@ async def api_settings_env_put(payload: EnvPutPayload):
         updates[key] = _normalize(key, raw)
     # 插件相关键的组合复检（暂存前失败快返回，409 携带 issue 明细）。
     # 单键合法 ≠ 组合合法：PLUGINS 的依赖/互斥复检，与 PLUGINS_REQUIRED ⊆ PLUGINS
-    # 的自洽检查，都必须按「本次写入之后的暂存态」成对看。
+    # 的自洽检查，都按「本次写入之后 **且按共享层序合成** 的组合」看——只读暂存会
+    # 漏掉被 .env/环境变量压住的情形（那种组合重启后按更高层生效，可能直接中止启动）。
     if {"PLUGINS", "PLUGINS_REQUIRED"} & set(updates):
+        merged = dict(read_staged())
+        for key, value in updates.items():
+            if value is None:
+                merged.pop(key, None)
+            else:
+                merged[key] = value
         issues: list[dict[str, str]] = []
         if "PLUGINS" in updates:
             raw = updates["PLUGINS"]
-            if raw is None:
-                desired: list[str] = list(config.plugins)
-            else:
+            if raw is not None:
                 try:
                     parsed = json.loads(raw)
                 except json.JSONDecodeError as exc:
@@ -423,17 +463,11 @@ async def api_settings_env_put(payload: EnvPutPayload):
                     isinstance(n, str) for n in parsed
                 ):
                     raise HTTPException(422, "PLUGINS: 值须为 JSON 字符串数组")
-                desired = parsed
             # 包装层约定：无管理器可校验时返回 None（测试/未装配），不是「无问题」
             # 的语义——这里统一成列表，避免下面的 += 变成 None + list
-            issues = list(validate_plugin_selection(desired) or [])
-        # 复检用「写后暂存态」：null 表示删键（回落启动快照）
-        merged = dict(read_staged())
-        for key, value in updates.items():
-            if value is None:
-                merged.pop(key, None)
-            else:
-                merged[key] = value
+            issues = list(
+                validate_plugin_selection(_desired_plugins(merged)) or []
+            )
         issues += _required_plugin_issues(merged)
         if issues:
             raise HTTPException(status_code=409, detail={"issues": issues})

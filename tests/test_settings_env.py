@@ -10,6 +10,7 @@
 
 import json
 import os
+import re
 import tempfile
 import unittest
 from contextlib import contextmanager
@@ -255,8 +256,15 @@ class EnvRoutesTest(StagedFileTestCase):
             },
         )
 
-    def test_put_stages_and_get_reports_override(self) -> None:
-        # 宿主环境若预置 LOG_LEVEL，会使 source 判定为 env 而非 override；测试内隔离该变量
+    def _env_items(self) -> dict[str, dict]:
+        """GET 一次并把 items 按 key 建索引（覆盖态断言共用）。"""
+        data = self.client.get("/api/settings/env").json()
+        return {item["key"]: item for item in data["items"]}
+
+    def test_put_stages_and_get_reports_draft_state(self) -> None:
+        # 暂存后 source 仍是**启动快照**（本进程还在用启动时的值），草稿与下次启动值
+        # 由 staged/expected_* 表达；只有被更高层压住时才置 overridden。
+        # 宿主环境若预置 LOG_LEVEL 会改变来源判定，测试内隔离该变量。
         with _env_without("LOG_LEVEL"):
             res = self.client.put(
                 "/api/settings/env", json={"items": {"LOG_LEVEL": "DEBUG"}}
@@ -266,7 +274,48 @@ class EnvRoutesTest(StagedFileTestCase):
             data = self.client.get("/api/settings/env").json()
             log_level = next(i for i in data["items"] if i["key"] == "LOG_LEVEL")
             self.assertEqual(log_level["staged"], "DEBUG")
-            self.assertEqual(log_level["source"], "override")
+            self.assertEqual(log_level["source"], "default")
+            self.assertFalse(log_level["overridden"])
+            self.assertEqual(log_level["expected_source"], "override")
+            self.assertEqual(log_level["expected_value"], "DEBUG")
+
+    def test_draft_blocked_by_project_dotenv_is_marked_overridden(self) -> None:
+        """覆盖态属预期语义：草稿会不会在下次启动被更高层压住。"""
+        write_staged({"LOG_LEVEL": "DEBUG"})
+        with tempfile.TemporaryDirectory() as d:
+            project = Path(d) / ".env"
+            project.write_text("LOG_LEVEL=INFO\n", encoding="utf-8")
+            with _env_without("LOG_LEVEL"), patch.object(
+                paths, "project_dotenv_path", return_value=project
+            ):
+                items = self._env_items()
+        item = items["LOG_LEVEL"]
+        self.assertEqual(item["staged"], "DEBUG")
+        self.assertTrue(item["overridden"])
+        self.assertEqual(item["override_source"], "dotenv")
+        self.assertEqual(item["override_value"], "INFO")
+        self.assertEqual(item["expected_source"], "dotenv")
+        self.assertEqual(item["expected_value"], "INFO")
+
+    def test_draft_applies_next_start_when_nothing_overrides(self) -> None:
+        write_staged({"LOG_LEVEL": "DEBUG"})
+        with _env_without("LOG_LEVEL"):
+            item = self._env_items()["LOG_LEVEL"]
+        self.assertFalse(item["overridden"])
+        self.assertIsNone(item["override_source"])
+        self.assertEqual(item["expected_source"], "override")
+        self.assertEqual(item["expected_value"], "DEBUG")
+
+    def test_invalid_expected_config_marks_unavailable_without_500(self) -> None:
+        """运行中把配置改坏：设置页不得 500，expected_* 标不可用并给脱敏摘要。"""
+        write_staged({"SERVER_PORT": "not-a-number"})
+        with _env_without("SERVER_PORT"):
+            items = self._env_items()
+        item = items["SERVER_PORT"]
+        self.assertFalse(item["expectedAvailable"])
+        self.assertNotIn("not-a-number", item["expectedError"], "摘要不得回显原始值")
+        self.assertIsNone(item["expected_value"])
+        self.assertIn("LOG_LEVEL", items, "其余字段仍须可展示")
 
     def test_put_multi_json_array(self) -> None:
         res = self.client.put(
@@ -505,10 +554,12 @@ class EnvRoutesTest(StagedFileTestCase):
                 "/api/settings/env", json={"items": {"LOG_LEVEL": "DEBUG"}}
             )
             self.assertEqual(res.status_code, 200)
-            self.assertEqual(
-                res.json()["items"],
-                {"LOG_LEVEL": {"staged": "DEBUG", "source": "override"}},
-            )
+            fresh = res.json()["items"]["LOG_LEVEL"]
+            self.assertEqual(fresh["staged"], "DEBUG")
+            self.assertEqual(fresh["source"], "default")  # 启动快照（本进程仍用默认值）
+            self.assertFalse(fresh["overridden"])
+            self.assertEqual(fresh["expected_source"], "override")
+            self.assertEqual(fresh["expected_value"], "DEBUG")
             # 恢复默认：staged 回 None、source 脱离 override
             # （本地有 .env 时为 dotenv，CI 无 .env 时为 default，均合法）
             res = self.client.put(
@@ -652,7 +703,7 @@ class PluginToggleRoutesTest(StagedFileTestCase):
                 plugins=[], plugins_required=[], plugin_path=""
             )
         ), patch.object(
-            settings_routes, "source_of", return_value="default"
+            settings_routes, "_plugins_source", return_value="default"
         ):
             data = self.client.get("/api/settings/env").json()
         plugins = {p["name"]: p for p in data["plugins"]}
@@ -672,7 +723,8 @@ class PluginToggleRoutesTest(StagedFileTestCase):
 
     def test_get_enabled_follows_staged_value(self) -> None:
         # 排除宿主环境 PLUGINS（env > .env > 暂存 > 默认）：来源判定若被宿主
-        # PLUGINS 抢占，pluginsSource 会返回 'env' 而非本用例期望的 'override'
+        # PLUGINS 抢占，pluginsSource 会返回 'env' 而非本用例期望的 'default'
+        # （本进程没有被更高层压住，开关重启后生效）
         with _env_without("PLUGINS"):
             write_staged({"PLUGINS": '["weflow"]'})
             with patch.object(
@@ -683,7 +735,8 @@ class PluginToggleRoutesTest(StagedFileTestCase):
             {p["name"]: p["enabled"] for p in data["plugins"]},
             {"weflow": True, "ai_provider": True},
         )
-        self.assertEqual(data["pluginsSource"], "override")
+        self.assertEqual(data["pluginsSource"], "default")
+        self.assertFalse(data["pluginsOverridden"])
 
     def test_put_plugins_conflict_rejected_409(self) -> None:
         issues = [
@@ -757,6 +810,54 @@ class FrontendGuardTest(unittest.TestCase):
         self.assertIn("_pluginChanges", js)
         # 多选控件不再注入通配符选项
         self.assertNotIn('opts.unshift("*")', js)
+
+
+#: `.env.example` 允许保持主动赋值的键：密钥 + 消息源必填项（新增须在此显式登记）
+_TEMPLATE_ALLOWED_ACTIVE = {
+    "AI_API_KEY",
+    "EMBED_API_KEY",
+    "RAG_API_KEY",
+    "WEFLOW_LEGACY_API_TOKEN",
+    "QQFLOW_API_TOKEN",
+    "QQFLOW_KEY",
+    "WEFLOW_WXID",
+    "QQFLOW_QQ",
+}
+
+
+class EnvExampleTemplateTest(unittest.TestCase):
+    """模板守卫：`.env.example` 的主动赋值键只允许显式登记的例外。
+
+    为什么：显式赋值的键高于 UI 暂存值，而 `cp .env.example .env` 是文档教的第一步——
+    钉死 UI 可编辑键会让「保存了却不生效」变成默认体验（纯假覆盖）。
+    """
+
+    def _template(self) -> str:
+        return (_REPO_ROOT / ".env.example").read_text(encoding="utf-8")
+
+    def test_active_keys_are_registered_exceptions(self) -> None:
+        actives = {
+            match.group(1)
+            for line in self._template().splitlines()
+            if (match := re.match(r"^([A-Z][A-Z0-9_]*)=", line))
+        }
+        self.assertEqual(
+            actives - _TEMPLATE_ALLOWED_ACTIVE,
+            set(),
+            "主动赋值键超出登记例外：会盖住 UI 暂存值（改成注释行或在例外清单登记）",
+        )
+        self.assertTrue(actives, "模板仍应保留密钥/消息源必填项作为主动赋值")
+
+    def test_header_describes_new_priority(self) -> None:
+        header = "\n".join(self._template().splitlines()[:24])
+        self.assertIn("项目 .env > UI 暂存文件", header)
+        self.assertIn("空串", header, "KEY= 空值会覆盖默认值，头部必须写明")
+
+    def test_no_legacy_database_usage_guidance(self) -> None:
+        text = self._template()
+        self.assertNotIn("手动移动", text, "不得给旧库操作指引")
+        self.assertNotIn("DB_PATH=C:", text, "不得出现旧库路径示例")
+        self.assertIn("旧库不会被自动发现", text, "只保留边界说明")
 
 
 if __name__ == "__main__":

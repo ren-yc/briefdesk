@@ -31,12 +31,22 @@ class WeFlowLegacyPlugin(SourcePlugin):
 
     def __init__(self) -> None:
         self._runtime: SourceRuntime | None = None
+        self._settings: Any = None  # 运行中的设置实例（manager 登记运行快照）
 
-    def settings_schema(self) -> list[dict[str, Any]]:
+    def settings_instance(self) -> Any:
+        """运行中的设置实例（未装配时为 None）；PluginManager 据此下发运行快照。"""
+        return self._settings
+
+    def settings_schema(
+        self, instance: Any = None, *, running: bool = True
+    ) -> list[dict[str, Any]]:
+        """字段描述；instance/running 由 PluginManager 下发（时点语义见 settings_schema.py）。"""
         from briefdesk.plugins.weflow_legacy.config import WeFlowLegacySettings
 
         return build_settings_schema(
             WeFlowLegacySettings,
+            instance,
+            running=running,
             plugin=self.name,
             labels={
                 "api_base": "WeFlow Legacy API 基址（根地址或反代子路径前缀）",
@@ -60,6 +70,7 @@ class WeFlowLegacyPlugin(SourcePlugin):
         from briefdesk.plugins.weflow_legacy import runtime as wfl_runtime
 
         settings = wfl_config.WeFlowLegacySettings()
+        self._settings = settings
         # 必填校验与 weflow/qqflow 统一（决策 ①=1B：零源降级启动后，自禁用
         # 不再引发「唯一源中止启动」；.env.example 标注本项必填）
         validate_required_config(settings, {

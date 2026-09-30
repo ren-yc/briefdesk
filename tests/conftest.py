@@ -32,7 +32,8 @@ import aiosqlite
 import pytest
 import pytest_asyncio  # noqa: F401
 
-from briefdesk import paths
+from briefdesk import paths, settings_env
+from briefdesk.config import Settings
 from briefdesk.db import init_schema
 
 
@@ -45,6 +46,9 @@ def _without_project_dotenv(monkeypatch):
     用例自行 patch `paths.project_dotenv_path()` 到临时文件即可覆盖本夹具。
     """
     monkeypatch.setattr(paths, "project_dotenv_path", lambda: None)
+    # 核心启动快照在 import config 时就捕获了（早于任何夹具），这里按「无项目 .env」
+    # 重算一次——否则用例会读到开发机真实 .env 里的来源，CI 上又变成另一套结论。
+    settings_env.capture_startup_sources(Settings)
 
 
 @pytest.fixture

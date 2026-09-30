@@ -205,9 +205,9 @@ class SettingsSchemaTest(unittest.TestCase):
     def test_core_settings_expose_vision_fields(self) -> None:
         # vision 路由：新配置项自动进入核心设置 schema（设置页白名单表单），
         # label/hint 经 _CORE_UI 覆盖层按 env key 合入（routes_settings_env.py:95-96）
-        from briefdesk.server.routes_settings_env import _CORE_SCHEMA
+        from briefdesk.server.routes_settings_env import _core_schema
 
-        by_key = {item["key"]: item for item in _CORE_SCHEMA}
+        by_key = {item["key"]: item for item in _core_schema()}
         vision = by_key["AI_VISION_ENABLED"]
         self.assertEqual(vision["type"], "boolean")
         self.assertEqual(vision["default"], False)
@@ -241,6 +241,39 @@ class DefaultFactorySchemaTest(unittest.TestCase):
             items = {item["key"]: item for item in build_settings_schema(Settings)}
         expected = str(Path(data_dir) / "data" / "briefdesk.sqlite")
         self.assertEqual(items["DB_PATH"]["default"], expected)
+
+class PluginRunningSnapshotTest(unittest.TestCase):
+    """插件运行快照：manager 保存运行实例并下发；未装配的插件显式「无运行值」。"""
+
+    def _items(self, loaded: bool) -> dict[str, dict]:
+        from briefdesk.plugin.manager import PluginManager
+        from briefdesk.plugins.benchmark.plugin import BenchmarkPlugin
+
+        plugin = BenchmarkPlugin()
+        manager = PluginManager()
+        manager.register(plugin)
+        if loaded:
+            manager._mark(plugin.name, "loaded")
+            manager._capture_settings(plugin.name, plugin)
+        fields = manager.settings_schema()
+        return {i["key"]: i for i in fields if i.get("plugin") == "benchmark"}
+
+    def test_loaded_plugin_exposes_running_values(self) -> None:
+        items = self._items(loaded=True)
+        item = items["BENCHMARK_KEEP_RUNS"]
+        self.assertTrue(item["running"])
+        self.assertIn("current", item)
+        self.assertIn("source", item)
+        self.assertIn("expected_value", item)
+
+    def test_unloaded_plugin_has_no_running_value(self) -> None:
+        items = self._items(loaded=False)
+        item = items["BENCHMARK_KEEP_RUNS"]
+        self.assertFalse(item["running"])
+        self.assertNotIn("current", item, "无运行值不得拿下次启动值冒充")
+        self.assertNotIn("source", item)
+        self.assertIn("expected_value", item, "下次启动值仍要能预配置")
+
 
 if __name__ == "__main__":
     unittest.main()

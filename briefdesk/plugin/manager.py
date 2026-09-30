@@ -6,6 +6,7 @@ setup/activate/teardown 的顺序约束（对齐 main 启动顺序）、PLUGINS 
 
 import importlib.metadata
 import importlib.util
+import inspect
 import logging
 import sys
 from collections.abc import Iterable
@@ -13,6 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, cast
 
+from briefdesk import settings_env
 from briefdesk.config import Settings, config
 from briefdesk.plugin.base import (
     PLUGIN_GROUP,
@@ -23,6 +25,14 @@ from briefdesk.plugin.base import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _accepts_instance(callback: Any) -> bool:
+    """插件 settings_schema 是否接受 instance 形参（旧版第三方插件可能不接受）。"""
+    try:
+        return "instance" in inspect.signature(callback).parameters
+    except (TypeError, ValueError):  # 内建/不可内省的可调用对象
+        return False
 
 
 @dataclass
@@ -73,6 +83,8 @@ class PluginManager:
         self._discovered = False
         self._load_order: list[str] = []  # setup 成功顺序，teardown 逆序
         self._initialized: set[str] = set()
+        #: 插件运行中的设置实例（运行快照来源）；由 _capture_settings 在 setup 后登记
+        self._plugin_settings: dict[str, Any] = {}
 
     # ── 发现 ──
 
@@ -231,6 +243,7 @@ class PluginManager:
                 self._fail_if_required(name)
                 continue
             self._mark(name, "loaded")
+            self._capture_settings(name, plugin)
             self._initialized.add(name)
             self._load_order.append(name)
             logger.info("插件已加载: %s %s", name, rec.version)
@@ -388,11 +401,34 @@ class PluginManager:
             for n in sorted(active - ordered)
         ]
 
+    def _capture_settings(self, name: str, plugin: Plugin) -> None:
+        """登记插件运行中的设置实例（运行快照来源）；失败不影响装配。
+
+        为什么由 manager 统一保存：设置页要展示「本进程正在用的值」，而插件每次
+        `settings_schema()` 现场构造实例展示的是「按当前文件解析的值」——运行中
+        改过文件后两者不一致（配置无热应用，后者其实是下次启动值）。
+        """
+        getter = getattr(plugin, "settings_instance", None)
+        if not callable(getter):
+            return
+        try:
+            instance = getter()
+        except Exception:
+            logger.exception("读取插件 %s 运行设置实例失败", name)
+            return
+        if instance is None:
+            return
+        self._plugin_settings[name] = instance
+        settings_env.capture_model_sources(type(instance))
+
     def settings_schema(self) -> list[dict[str, Any]]:
         """返回插件的设置描述（核心 + 全部已发现的可选插件）。
 
-        不按启用状态筛选：可选插件禁用时用户仍需能预配置（启用前先填
-        必填项），自禁用（缺必填配置）时亦然；UI 对未加载插件组折叠展示。
+        不按启用状态筛选：可选插件禁用时用户仍需能预配置（启用前先填必填项），
+        自禁用（缺必填配置）时亦然；UI 对未加载插件组折叠展示。
+        已装配且登记了运行实例的插件，字段带的是**运行快照**（`current`/`source`）；
+        未装配/无运行实例的插件显式置 `running=False` 并抹掉 `current`/`source`，
+        避免把「按当前文件解析的下次启动值」冒充成运行值。
         """
         self.discover()
         result: list[dict[str, Any]] = []
@@ -402,8 +438,15 @@ class PluginManager:
             callback = getattr(rec.plugin, "settings_schema", None)
             if not callable(callback):
                 continue
+            instance = self._plugin_settings.get(name)
+            running = rec.status == "loaded" and instance is not None
             try:
-                fields = callback()
+                if _accepts_instance(callback):
+                    fields = callback(instance=instance, running=running)
+                else:
+                    # 第三方插件可能仍是旧的无参签名：退回调用并声明无运行值
+                    fields = callback()
+                    running = False
             except Exception:
                 logger.exception("读取插件 %s 设置 schema 失败", name)
                 continue
@@ -416,6 +459,10 @@ class PluginManager:
                 item = dict(field)
                 item["plugin"] = name
                 item["pluginStatus"] = rec.status
+                if not running:
+                    item.pop("current", None)
+                    item.pop("source", None)
+                    item["running"] = False
                 result.append(item)
         return result
 

@@ -43,11 +43,24 @@ class BenchmarkPlugin(WebPlugin, StagePlugin):
     slot = "post_insert"  # 阶段槽位：合并判定之后（batch.merge_checks 已填充）
     priority = 1  # 同槽 priority 升序：在 merge 阶段（priority=0）之后运行
 
-    def settings_schema(self) -> list[dict[str, Any]]:
+
+    def settings_instance(self) -> Any:
+        """基准配置在每次运行时现场读取（supervisor 构造），因此「运行值」就是
+        按当前文件解析的值——这里给一个当前实例，保证设置页与运行口径一致。"""
+        from briefdesk.plugins.benchmark.config import BenchmarkSettings
+
+        return BenchmarkSettings()
+
+    def settings_schema(
+        self, instance: Any = None, *, running: bool = True
+    ) -> list[dict[str, Any]]:
+        """字段描述；instance/running 由 PluginManager 下发（时点语义见 settings_schema.py）。"""
         from briefdesk.plugins.benchmark.config import BenchmarkSettings
 
         return build_settings_schema(
             BenchmarkSettings,
+            instance,
+            running=running,
             plugin=self.name,
             labels={
                 "pause_pipeline": "运行期间暂停消息处理",

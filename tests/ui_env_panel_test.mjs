@@ -336,9 +336,9 @@ sandbox.renderPluginToggles();
   sandbox._pluginSets();
 }
 
-// ── 8a. pluginsSource==="env" → 顶部警示「重启不生效」（开关保持可用） ──
-// 来源链 env > 暂存 > .env > 默认；env 覆盖时面板开关写入暂存文件无效，
-// 须告知用户。env 之外的来源（override/dotenv/default）不显示警示。
+// ── 8a. PLUGINS 被更高层压住（env / 项目 .env）→ 顶部警示 + 开关置灰 ──
+// 来源链 env > 项目 .env > 暂存 > 默认；被压住时面板开关写入的是暂存文件，
+// 重启不生效。开关仍渲染（保留核对当前生效组合的入口），但置灰。
 {
   const savedEnv = vm.runInContext("envData", sandbox);
   const base = {
@@ -352,25 +352,28 @@ sandbox.renderPluginToggles();
     ],
   };
 
-  setEnvData({ ...base, pluginsSource: "env" });
+  setEnvData({ ...base, pluginsSource: "env", pluginsOverridden: true });
   sandbox._pluginSets();
   sandbox.renderPluginToggles();
   let html = getElement("plugins-list").innerHTML;
-  assert.ok(html.includes("PLUGINS 由环境变量控制"), "env 来源应显示优先警示");
+  assert.ok(html.includes("PLUGINS 当前由「环境变量」控制"), "env 来源应显示覆盖警示");
   assert.ok(html.includes("重启后不会生效"), "警示应说明开关不生效");
-  assert.ok(html.includes('data-plugin-toggle="weflow"'), "env 来源下开关仍渲染（不禁用）");
+  assert.ok(html.includes('data-plugin-toggle="weflow"'), "被覆盖时开关仍渲染（可核对生效组合）");
+  assert.ok(html.includes("disabled"), "被 env 覆盖时开关置灰");
+
+  setEnvData({ ...base, pluginsSource: "dotenv", pluginsOverridden: true });
+  sandbox._pluginSets();
+  sandbox.renderPluginToggles();
+  html = getElement("plugins-list").innerHTML;
+  assert.ok(html.includes("PLUGINS 当前由「项目 .env」控制"), "项目 .env 高于暂存：同样警示");
+  assert.ok(html.includes("disabled"), "被项目 .env 覆盖时开关置灰");
 
   setEnvData({ ...base, pluginsSource: "override" });
   sandbox._pluginSets();
   sandbox.renderPluginToggles();
   html = getElement("plugins-list").innerHTML;
-  assert.ok(!html.includes("PLUGINS 由环境变量控制"), "override（暂存）来源不应显示警示");
-
-  setEnvData({ ...base, pluginsSource: "dotenv" });
-  sandbox._pluginSets();
-  sandbox.renderPluginToggles();
-  html = getElement("plugins-list").innerHTML;
-  assert.ok(!html.includes("PLUGINS 由环境变量控制"), "dotenv 来源不应显示警示（暂存优先于 .env）");
+  assert.ok(!html.includes("PLUGINS 当前由"), "暂存来源不显示覆盖警示");
+  assert.ok(!html.includes("disabled"), "暂存来源下开关可用");
 
   vm.runInContext(`envData = ${JSON.stringify(savedEnv)};`, sandbox);
   sandbox._pluginSets();
@@ -693,6 +696,48 @@ sandbox.renderPluginToggles();
   assert.ok(confirmAsked, "含 warn 项的暂存应先弹确认");
   assert.ok(!calls.some(c => c.method === "PUT"), "确认取消后不应发 PUT");
   delete sandbox.confirm;
+}
+
+// ── 12. 覆盖态渲染：草稿被更高层压住时报覆盖来源，未装配插件报「无运行值」 ──
+setEnvData({
+  filePath: "C:/tmp/settings.env",
+  pluginOptions: [],
+  items: [
+    {
+      key: "LOG_LEVEL", type: "select", label: "日志级别", plugin: "", staged: "DEBUG",
+      current: "INFO", source: "default", overridden: true, override_source: "dotenv",
+      override_value: "INFO", expected_value: "INFO", expected_source: "dotenv",
+      expectedAvailable: true, expectedError: "", running: true,
+    },
+    {
+      key: "SERVER_PORT", type: "number", label: "服务端口", plugin: "", staged: null,
+      current: 3000, source: "default", overridden: false, override_source: null,
+      override_value: null, expected_value: 3000, expected_source: "default",
+      expectedAvailable: true, expectedError: "", running: true,
+    },
+    {
+      key: "WEFLOW_API_BASE", type: "text", label: "weflow API 基址", plugin: "weflow",
+      pluginStatus: "disabled", staged: null, source: null, overridden: false,
+      override_source: null, override_value: null, expected_value: "http://127.0.0.1:5033",
+      expected_source: "default", expectedAvailable: true, expectedError: "", running: false,
+    },
+  ],
+  secrets: [],
+});
+{
+  const [overridden, plain, notRunning] = vm.runInContext("envData.items", sandbox);
+  const overriddenHtml = sandbox._envRowHtml(overridden, false);
+  assert.ok(overriddenHtml.includes("已被「项目 .env」覆盖"), "被覆盖的草稿必须标注覆盖来源");
+  assert.ok(overriddenHtml.includes("实际生效：INFO"), "被覆盖时必须显示实际生效值");
+  assert.ok(!overriddenHtml.includes("下次启动生效"), "被覆盖时不再重复报下次启动值");
+
+  const plainHtml = sandbox._envRowHtml(plain, false);
+  assert.ok(!plainHtml.includes("已被"), "未被覆盖的行不得出现覆盖徽章");
+  assert.ok(!plainHtml.includes("实际生效"), "无草稿且未覆盖的行不得出现生效值提示");
+
+  const notRunningHtml = sandbox._envRowHtml(notRunning, false);
+  assert.ok(notRunningHtml.includes("无运行值"), "未装配插件必须显式标注「无运行值」");
+  assert.ok(!notRunningHtml.includes("实际生效"), "无运行值不得显示生效值");
 }
 
 console.log("ui_env_panel_test: all assertions passed");

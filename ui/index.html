@@ -264,7 +264,7 @@
 
           <section class="settings-panel hidden" data-panel="env">
             <h3 class="settings-section">启动配置（.env 暂存）</h3>
-            <p class="text-muted settings-hint">修改将暂存到本机配置文件，<strong>重启应用后生效</strong>；密钥走系统钥匙串（见下方），不写入文件。环境变量级配置优先于暂存值。</p>
+            <p class="text-muted settings-hint">修改将暂存到本机配置文件，<strong>重启应用后生效</strong>；密钥走系统钥匙串（见下方），不写入文件。优先级：环境变量 &gt; 项目 .env &gt; 本机暂存值——被覆盖的行会标注覆盖来源与实际生效值。</p>
             <p class="text-muted settings-hint" id="env-file-path"></p>
             <!-- sticky 工具条：搜索过滤跟随滚动；「保存」统一走弹窗底部全局操作栏 -->
             <div class="env-toolbar">

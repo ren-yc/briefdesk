@@ -62,12 +62,22 @@ class RagPlugin(StagePlugin, WebPlugin):
         # 维护循环的唤醒事件：reindex/降级自愈在循环休眠期踢一脚时立即
         # 执行回填，而不是干等一个维护间隔（默认 1h）后才生效
         self._kick_event = asyncio.Event()
+        self._settings: Any = None  # 运行中的设置实例（manager 登记运行快照）
 
-    def settings_schema(self) -> list[dict[str, Any]]:
+    def settings_instance(self) -> Any:
+        """运行中的设置实例（未装配时为 None）；PluginManager 据此下发运行快照。"""
+        return self._settings
+
+    def settings_schema(
+        self, instance: Any = None, *, running: bool = True
+    ) -> list[dict[str, Any]]:
+        """字段描述；instance/running 由 PluginManager 下发（时点语义见 settings_schema.py）。"""
         from briefdesk.plugins.rag.config import RagSettings
 
         return build_settings_schema(
             RagSettings,
+            instance,
+            running=running,
             plugin=self.name,
             labels={
                 "top_k": "向量召回条数",
@@ -107,7 +117,9 @@ class RagPlugin(StagePlugin, WebPlugin):
             )
         from briefdesk.plugins.rag.config import RagSettings
 
-        engine = RagEngine(RagSettings())
+        settings = RagSettings()
+        self._settings = settings
+        engine = RagEngine(settings)
         try:
             self._engine = engine
             set_engine(engine)

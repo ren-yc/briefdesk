@@ -30,12 +30,22 @@ class WeFlowPlugin(SourcePlugin):
 
     def __init__(self) -> None:
         self._runtime: SourceRuntime | None = None
+        self._settings: Any = None  # 运行中的设置实例（manager 登记运行快照）
 
-    def settings_schema(self) -> list[dict[str, Any]]:
+    def settings_instance(self) -> Any:
+        """运行中的设置实例（未装配时为 None）；PluginManager 据此下发运行快照。"""
+        return self._settings
+
+    def settings_schema(
+        self, instance: Any = None, *, running: bool = True
+    ) -> list[dict[str, Any]]:
+        """字段描述；instance/running 由 PluginManager 下发（时点语义见 settings_schema.py）。"""
         from briefdesk.plugins.weflow.config import WeFlowSettings
 
         return build_settings_schema(
             WeFlowSettings,
+            instance,
+            running=running,
             plugin=self.name,
             labels={
                 "api_base": "weflow API 基址（根地址或反代子路径前缀）",
@@ -67,6 +77,7 @@ class WeFlowPlugin(SourcePlugin):
         from briefdesk.plugins.weflow import runtime as wf_runtime
 
         settings = wf_config.WeFlowSettings()
+        self._settings = settings
         # db_keys_map 为 property（解析一份完整 WEFLOW_DB_KEYS），空 dict 视为
         # 缺失；与 api_token/wxid 聚合在同一条错误里一次报全
         validate_required_config(settings, {
