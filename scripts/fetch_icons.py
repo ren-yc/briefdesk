@@ -23,8 +23,8 @@ import urllib.request
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-ICONS_DIR = REPO_ROOT / "ui" / "icons"
-MANIFEST = REPO_ROOT / "ui" / "icon-manifest.txt"
+ICONS_DIR = REPO_ROOT / "briefdesk" / "ui" / "icons"
+MANIFEST = REPO_ROOT / "briefdesk" / "ui" / "icon-manifest.txt"
 
 # 钉定的 lucide-static 版本。升级流程：先 `python scripts/fetch_icons.py check`
 # 确认清单全部图标在新版本仍可拉取（未被改名/移除），再改本常量并同步更新

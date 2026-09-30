@@ -65,7 +65,7 @@ plugin = MyPlugin()  # 模块底部必须暴露名为 plugin 的实例（entry p
 ```
 
 前端约定：`asset_dir` 目录下的文件经 `/plugin-assets/myplug/<path>` 服务（浏览器直连，可引用
-`/ui/app.js` 导出的助手）；`app.js` 提供的公共助手清单见 `tests/test_web_plugins.py` 的对账表
+`briefdesk/ui/app.js` 导出的助手）；`app.js` 提供的公共助手清单见 `tests/test_web_plugins.py` 的对账表
 （`esc`/`escAttr`/`showToast`/`registerPluginView` 等）。
 
 ## 2. StagePlugin 槽位契约

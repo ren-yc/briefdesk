@@ -469,7 +469,7 @@ Content-Disposition attachment——扩展名不可信，封死伪装 SVG/HTML �
 日历/提醒路由位于 `plugins/{calendar,reminders}`。`/api/items` 接受 `sourceGroup`/`minMsgTime`/`hideExpired`/`filterNow`，
 并返回与完整过滤条件一致的 `totalCount`/`groupCount`/`sourceGroups`/`hasMore`/`nextOffset`/`filterNow`；启用隐藏截止时，客户
 端
-在同一分页链复用服务端首次返回的 `filterNow` 以固定时间边界。侧边栏计数仍为全局口径。Serves `ui/` with SPA fallback（三修：except 改捕
+在同一分页链复用服务端首次返回的 `filterNow` 以固定时间边界。侧边栏计数仍为全局口径。Serves `briefdesk/ui/` with SPA fallback（三修：except 改捕
 `starlette.exceptions.HTTPException` 基类——原 fastapi 子类 except 恒不匹配、fallback 从未生效；path 反斜杠归一化后再判 api/
 前
 缀（Windows starlette>=1.3 行为）；带扩展名的资源请求 404 即 404、不回退 index.html——避免 200 + text/html 应答脚本/样式触发严格 MIME
@@ -483,7 +483,7 @@ Content-Disposition attachment——扩展名不可信，封死伪装 SVG/HTML �
 `briefdesk/db.py`；`asset_dir()` 返回插件包内 `ui/`（**日历完整前端**：`ui/ui.js` 自建侧边栏入口（核心 `index.html` 的
 `#nav-top` 工具容器首位——搜索框正下方、过滤条与分类导航之上，横线分隔，恒排问一问之前；旧核心无容器时回退「订阅」前）/视图容器/浮层并注册核心视图钩子、`ui/ui.css` 日历样式，
 经
- `/plugin-assets/calendar/` 由核心加载器注入，核心 `ui/` 无任何日历前端残留——由 tests/test_web_plugins.py 的核心前端边界守卫测试覆盖）；区
+ `/plugin-assets/calendar/` 由核心加载器注入，核心 `briefdesk/ui/` 无任何日历前端残留——由 tests/test_web_plugins.py 的核心前端边界守卫测试覆盖）；区
 间查询 LIMIT 后置——SQL 不截断、内存过滤后应用 `_MAX_CALENDAR_ITEMS = 1000`（防 NULL 时间 extra_times 干扰行把真命中卡片挤出结果集），路由参
 数
 经 `date.fromisoformat` 真实日期校验；卡片行相对时间由前端计算（后端不再附加）。
@@ -494,7 +494,7 @@ Content-Disposition attachment——扩展名不可信，封死伪装 SVG/HTML �
 `GET /api/reminders/due`（到期提醒轮询）；`asset_dir()` 返回插件包内 `ui/`（**提醒完整前端**：`ui/ui.js` 自建卡片「提醒」按钮/菜单、设置弹窗
 「
 通知」面板自动提醒控件与到期轮询定时器，经核心 `registerItemRowExtension` 行内扩展钩子接入 `renderItemRow`/`renderCard` 动作区与
-`handleRowAction`，`ui/ui.css` 提醒菜单样式，经 `/plugin-assets/reminders/` 由核心加载器注入；核心 `ui/` 无任何提醒前端残留——由
+`handleRowAction`，`ui/ui.css` 提醒菜单样式，经 `/plugin-assets/reminders/` 由核心加载器注入；核心 `briefdesk/ui/` 无任何提醒前端残留——由
 tests/test_web_plugins.py 的核心前端边界守卫测试覆盖）。`GET /api/reminders/due` 返回项经 `db.get_items_verified_flags`
 批量补查合并 `is_verified`（核心查询契约不变、游标纪律收口在 db.py；前端据此决定「查看」跳转目标）；`POST .../reminder` 清除分支限定
 `remind_at IS NOT NULL`——对无提醒卡片清除返回 False（多标签页「先清后通知」互斥判据）；前端首次设提醒申请桌面通知权限，到期「查看」定位跳转（备忘录卡进备忘录视图，其余卡
@@ -885,7 +885,8 @@ SQLite file: `<user data dir>/data/briefdesk.sqlite` (configurable via `DB_PATH`
 
 ## 前端
 
-Vanilla JS SPA in `ui/` (`index.html`, `app.js`, `style.css`, `icons/`). No build step, no
+Vanilla JS SPA in `briefdesk/ui/` (`index.html`, `app.js`, `style.css`, `icons/`), shipped inside the package
+(`[tool.setuptools.package-data]`; `server/static.py` 以包内相对路径挂载). No build step, no
 framework.
 
 > **`app.js` 的形态约束**：插件前端以**同源 classic `<script>` 注入、与 `app.js` 共享全局作用域**（见下方「插件前端随插件包分发」）
@@ -928,7 +929,7 @@ Key behaviors:
 - Category sidebar with counts + 备忘录 (memo) / 已忽略 (ignored) views (from `/api/items`)
 - Item cards with three-state verification: 加入备忘录 (1) / 忽略 (-1) / 未处理 (0)
 - Expandable quote section (fetches context via `/api/context`)
-- Top bar: sync button (`/api/sync`, `ui/index.html` 的 `#sync-btn`); Settings modal: session enable/disable with select-all; 群聊列表支持类型筛选（全部/群聊/私
+- Top bar: sync button (`/api/sync`, `briefdesk/ui/index.html` 的 `#sync-btn`); Settings modal: session enable/disable with select-all; 群聊列表支持类型筛选（全部/群聊/私
   聊/公众号，多选）与消息源筛选（多选，芯片按 `/api/status` 的 `sources` 实际启用源动态渲染，单源部署整行隐藏），两者与名称搜索、按时间过滤叠加生效（仅显示层，不影响保存
   diff）；行标签「群/私/公」按 is_group/is_official 渲染。**会话筛选单源 `createSessionFilter`**：设置「群聊筛选」与首次使用向导 step2 是同一套
   筛选（`sessionRowMatches` 的四维 AND：类型多选 + 源多选 + 名称搜索 + `last_active` 时间窗口，各维空集/空值 = 不筛选），两侧均由该工厂产出实例
@@ -956,7 +957,7 @@ Key behaviors:
   件**（`has_frontend`，`asset_dir()` 非 None）注入 `/plugin-assets/<name>/ui.css`（样式）与
   `/plugin-assets/<name>/ui.js`（脚本；无前端资源的插件不请求，避免 404 触发浏览器严格 MIME 检查告警）→ 调用
   `window.briefdeskPlugins.<name>.init({isLoaded})`（异常仅 console.warn）。**插件的完整前端（DOM/样式/交互/入口）随插件包分发**：
-  calendar 的按钮、视图容器、两个浮层全部由其 `ui/ui.js` 自建，核心 `ui/` 不写死任何插件功能入口（由 tests/test_web_plugins.py 的核心前端边界守卫测试
+  calendar 的按钮、视图容器、两个浮层全部由其 `ui/ui.js` 自建，核心 `briefdesk/ui/` 不写死任何插件功能入口（由 tests/test_web_plugins.py 的核心前端边界守卫测试
   覆盖）；核心提供两类插件扩展钩子——**视图钩子** `registerPluginView`（hash 路由 / fetchData 委派 / Esc 消费 / 侧边栏数据就绪通知，calendar
   视图 `#calendar` 据此接入）与**行内扩展** `registerItemRowExtension`（renderItemRow/renderCard 动作区按钮与行末菜单渲染、
   handleRowAction 委派、文档点击关闭菜单、verifyItem 成功后 onVerify 通知——reminders 的提醒按钮/菜单/自动提醒据此接入），另设
@@ -1008,17 +1009,17 @@ Key behaviors:
   观察；`tests/ui_harness.mjs` 的 `loadAppJs` 支持可选注入 localStorage）
 - Real-time updates via `EventSource("/api/stream")` SSE channel (plus poll-based auto-refresh,
   settings persisted to `localStorage`)
-- **图标库**：使用 [Lucide](https://lucide.dev)（ISC 许可）的 vendored 子集，位于 `ui/icons/`（英文 kebab-case 扁平命名，经
+- **图标库**：使用 [Lucide](https://lucide.dev)（ISC 许可）的 vendored 子集，位于 `briefdesk/ui/icons/`（英文 kebab-case 扁平命名，经
   `/icons/<name>.svg` 引用；旧中文图标库 `ui/图标/` 已整体移除，历史版本在 git 中可回溯）。单一事实来源为
-  `ui/icon-manifest.txt`，`tests/test_icon_manifest.py` 双向守卫：代码引用 ⊆ 清单且文件存在、`ui/icons/` 文件集合 == 清单集合、旧路径
+  `briefdesk/ui/icon-manifest.txt`，`tests/test_icon_manifest.py` 双向守卫：代码引用 ⊆ 清单且文件存在、`briefdesk/ui/icons/` 文件集合 == 清单集合、旧路径
    `/图标/` 不得回流。**来源版本钉定**：`scripts/fetch_icons.py` 钉定 lucide-static 版本（`LUCIDE_STATIC_VERSION`，当前
   v1.34.0，现有文件头注释核对一致）；`add` 从钉定版本逐个拉取并自动登记清单、`check` 校验清单全部图标在钉定版本可拉取且格式可接受、`show` 显示版本；升级须先 `check` 再
-  改常量并更新 `ui/icons/README.md`「版本记录」。**插件图标通道**：插件前端不携带图标目录——复用核心 `/icons/` 路径（引用守卫自动覆盖插件文件），或在插件
+  改常量并更新 `briefdesk/ui/icons/README.md`「版本记录」。**插件图标通道**：插件前端不携带图标目录——复用核心 `/icons/` 路径（引用守卫自动覆盖插件文件），或在插件
   `ui.js` 内联 Lucide SVG（须 `currentColor` 跟随主题色、无 `on*` 事件属性、无 `<script>`，由
   `test_plugin_inline_svg_follows_theme_and_stays_safe` 覆盖）；新增图标一律走核心「新增图标流程」。**新增图标流程**：拷贝单个 Lucide
-  SVG 到 `ui/icons/`（或 `python scripts/fetch_icons.py add <name>`）→ manifest 登记 → 代码引用（动态渲染的图标须加入
+  SVG 到 `briefdesk/ui/icons/`（或 `python scripts/fetch_icons.py add <name>`）→ manifest 登记 → 代码引用（动态渲染的图标须加入
   `app.js` 的 `preloadSvgIcons` 预取集合或 `_CAT_ICONS`/`_CAT_PALETTE`/`_STATUS_ICONS` 映射）→ 守卫测试通过。禁止引入第二图标库或
-  整库拷贝；许可归属与流程见 `ui/icons/README.md`。图标由 JS fetch 后内联（`currentColor` 随 CSS color 着色），favicon 由
+  整库拷贝；许可归属与流程见 `briefdesk/ui/icons/README.md`。图标由 JS fetch 后内联（`currentColor` 随 CSS color 着色），favicon 由
   `layout-grid.svg` 加随机主题色动态生成
 
 ## 配置

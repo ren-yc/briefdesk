@@ -15,8 +15,8 @@
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
-INDEX = REPO / "ui" / "index.html"
-STYLE = REPO / "ui" / "style.css"
+INDEX = REPO / "briefdesk" / "ui" / "index.html"
+STYLE = REPO / "briefdesk" / "ui" / "style.css"
 CALENDAR_UI = REPO / "briefdesk" / "plugins" / "calendar" / "ui" / "ui.js"
 RAG_UI = REPO / "briefdesk" / "plugins" / "rag" / "ui" / "ui.js"
 

@@ -15,13 +15,13 @@ import re
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
-ICONS_DIR = REPO / "ui" / "icons"
-MANIFEST = REPO / "ui" / "icon-manifest.txt"
+ICONS_DIR = REPO / "briefdesk" / "ui" / "icons"
+MANIFEST = REPO / "briefdesk" / "ui" / "icon-manifest.txt"
 
 _SOURCES = [
-    REPO / "ui" / "index.html",
-    REPO / "ui" / "app.js",
-    REPO / "ui" / "style.css",
+    REPO / "briefdesk" / "ui" / "index.html",
+    REPO / "briefdesk" / "ui" / "app.js",
+    REPO / "briefdesk" / "ui" / "style.css",
     *sorted((REPO / "briefdesk" / "plugins").glob("*/ui/*.js")),
 ]
 
@@ -70,7 +70,7 @@ def test_referenced_icons_listed_and_exist() -> None:
     refs = _all_references()
     assert refs, "未扫描到任何 /icons/ 引用（扫描范围配置可能失效）"
     missing = {
-        r for r in refs if not (REPO / "ui" / r.lstrip("/")).exists()
+        r for r in refs if not (REPO / "briefdesk" / "ui" / r.lstrip("/")).exists()
     }
     assert not missing, f"引用的图标文件不存在: {sorted(missing)}"
     unlisted = refs - listed

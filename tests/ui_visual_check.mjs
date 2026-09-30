@@ -131,7 +131,7 @@ const sandbox = {
 sandbox.window = sandbox;
 sandbox.self = sandbox;
 vm.createContext(sandbox);
-vm.runInContext(fs.readFileSync(path.join(ROOT, "ui", "app.js"), "utf8"), sandbox, {
+vm.runInContext(fs.readFileSync(path.join(ROOT, "briefdesk", "ui", "app.js"), "utf8"), sandbox, {
   filename: "ui/app.js",
 });
 
@@ -178,7 +178,7 @@ const FIXTURES = [
 ];
 
 // ── 3. 组页面：真实 style.css + 固定视口 ──
-const css = fs.readFileSync(path.join(ROOT, "ui", "style.css"), "utf8");
+const css = fs.readFileSync(path.join(ROOT, "briefdesk", "ui", "style.css"), "utf8");
 
 function page(bodyHtml, theme) {
   return `<!DOCTYPE html>

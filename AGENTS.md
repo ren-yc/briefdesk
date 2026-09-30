@@ -90,7 +90,7 @@ powershell -ExecutionPolicy Bypass -File scripts/install-hooks.ps1
 - **例外**：确实需要在注释里保留某个编号时，在同一行写 `allow-plan-ref` 并说明理由。
 - **扫描面**（决定「漏写会不会被拦」，改动本节时须同步 `iter_segments`）：
   - **在面内**：`.py .js .mjs .md .yml .yaml .toml .ps1 .sh` 的注释与文档正文，以及提交信息（subject + body，`#` 注释行与 scissors 之后的 diff 不算）。JS 的行内尾注释与整行注释同口径。
-  - **不在面内**：无此类片段的文件（`.html .css .svg .json .example` 等，含 `ui/index.html` 的 HTML 注释与 `ui/style.css` 的 `/* */`）——扫描器对它们返回空片段。往这些文件写注释时不享受门禁兜底，需人工复核。
+  - **不在面内**：无此类片段的文件（`.html .css .svg .json .example` 等，含 `briefdesk/ui/index.html` 的 HTML 注释与 `briefdesk/ui/style.css` 的 `/* */`）——扫描器对它们返回空片段。往这些文件写注释时不享受门禁兜底，需人工复核。
   - `_EXEMPT` 白名单按**实际命中**增补（当前含少量仓库内暂未出现的防御项）；新增条目要写明它为什么与条目码同形却不是编号。
 - **工具与门禁**：
   - 本地提交：`scripts/install-hooks.ps1` 安装的 pre-commit（密钥 + 编号）与 commit-msg（提交信息）钩子；
@@ -149,7 +149,7 @@ powershell -ExecutionPolicy Bypass -File scripts/install-hooks.ps1
 消息源插件(weflow :5033 / weflow-legacy :5031 / qqflow :5032) → normalize 归一化
 → pipeline 入口统一过滤 → enrich(OCR) → classify(AI) → dedup(判重/入库)
 → post_insert(合并) → db(SQLite) → realtime(pub/sub) → server(FastAPI :3000)
-→ ui/ SPA（SSE 实时刷新）
+→ briefdesk/ui/ SPA（SSE 实时刷新）
 ```
 
 - **完整架构文档**：[docs/architecture.md](docs/architecture.md)——模块职责、插件框架、数据库 schema、server 路由清单、配置项表、设计要点与陷阱。涉及架构的任务先读它。

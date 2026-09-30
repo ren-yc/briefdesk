@@ -782,19 +782,19 @@ class FrontendGuardTest(unittest.TestCase):
     """前端面板与端点引用守卫（防漂移）。"""
 
     def test_index_html_has_env_panel(self) -> None:
-        html = (_REPO_ROOT / "ui" / "index.html").read_text(encoding="utf-8")
+        html = (_REPO_ROOT / "briefdesk" / "ui" / "index.html").read_text(encoding="utf-8")
         self.assertIn('data-panel="env"', html)
         self.assertIn('id="env-items"', html)
         self.assertIn('id="env-secrets"', html)
         self.assertIn('id="env-file-path"', html)
 
     def test_index_html_has_plugins_toggle_panel(self) -> None:
-        html = (_REPO_ROOT / "ui" / "index.html").read_text(encoding="utf-8")
+        html = (_REPO_ROOT / "briefdesk" / "ui" / "index.html").read_text(encoding="utf-8")
         self.assertIn('data-panel="plugins"', html)
         self.assertIn('id="plugins-list"', html)
 
     def test_app_js_references_env_endpoints(self) -> None:
-        js = (_REPO_ROOT / "ui" / "app.js").read_text(encoding="utf-8")
+        js = (_REPO_ROOT / "briefdesk" / "ui" / "app.js").read_text(encoding="utf-8")
         self.assertIn('"/api/settings/env"', js)
         self.assertIn('"/api/settings/secrets"', js)
         self.assertIn("data-env-restore", js)
@@ -803,7 +803,7 @@ class FrontendGuardTest(unittest.TestCase):
         self.assertIn('class="env-input"', js)
 
     def test_app_js_references_plugin_toggle_flow(self) -> None:
-        js = (_REPO_ROOT / "ui" / "app.js").read_text(encoding="utf-8")
+        js = (_REPO_ROOT / "briefdesk" / "ui" / "app.js").read_text(encoding="utf-8")
         self.assertIn("data-plugin-toggle", js)
         self.assertIn("_onPluginToggle", js)
         self.assertIn("renderPluginToggles", js)

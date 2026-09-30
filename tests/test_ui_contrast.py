@@ -18,7 +18,7 @@ import re
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
-STYLE = REPO / "ui" / "style.css"
+STYLE = REPO / "briefdesk" / "ui" / "style.css"
 
 AA_TEXT = 4.5
 AA_UI = 3.0
@@ -280,7 +280,7 @@ def test_category_foreground_chain_meets_aa() -> None:
     （.cat-link.active .cat-count）上的对比度。改派生比例或色板时必须保持
     ≥ 4.5:1。
     """
-    app = REPO / "ui" / "app.js"
+    app = REPO / "briefdesk" / "ui" / "app.js"
     palette = re.findall(r'color:\s*"(#[0-9A-Fa-f]{6})"',
                          app.read_text(encoding="utf-8"))
     assert palette, "未能从 app.js 解析到类别色板（--cat-fg 链路失去数据源）"

@@ -1163,8 +1163,8 @@ class CategoryPromptLimitTest(unittest.TestCase):
     def test_frontend_maxlength_matches_backend(self):
         from briefdesk.server.routes_categories import _PROMPT_MAX
 
-        index = (_ROOT / "ui" / "index.html").read_text(encoding="utf-8")
-        app = (_ROOT / "ui" / "app.js").read_text(encoding="utf-8")
+        index = (_ROOT / "briefdesk" / "ui" / "index.html").read_text(encoding="utf-8")
+        app = (_ROOT / "briefdesk" / "ui" / "app.js").read_text(encoding="utf-8")
         add = re.search(
             r'id="cat-add-prompt"[^>]*maxlength="(\d+)"', index
         )

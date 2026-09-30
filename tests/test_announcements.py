@@ -136,9 +136,9 @@ class UiWiringTest(unittest.TestCase):
     """前端接线静态守卫：容器、渲染函数、SSE 事件与状态轮询四个接点。"""
 
     def test_ui_wires_announcements(self) -> None:
-        html = (_ROOT / "ui" / "index.html").read_text(encoding="utf-8")
+        html = (_ROOT / "briefdesk" / "ui" / "index.html").read_text(encoding="utf-8")
         assert 'id="announcements"' in html
-        app = (_ROOT / "ui" / "app.js").read_text(encoding="utf-8")
+        app = (_ROOT / "briefdesk" / "ui" / "app.js").read_text(encoding="utf-8")
         assert "function renderAnnouncements" in app
         assert 'stream.addEventListener("announcements_updated"' in app
         assert "renderAnnouncements(data.status && data.status.announcements)" in app

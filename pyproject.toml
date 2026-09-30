@@ -48,6 +48,27 @@ rag = "briefdesk.plugins.rag.plugin:plugin"
 where = ["."]
 include = ["briefdesk", "briefdesk.*"]
 
+
+[tool.setuptools]
+# 只放行显式声明的 package-data；关掉 include-package-data，免得将来有人加
+# MANIFEST.in / setuptools_scm 后把脏树文件（reports/、*.fromweb.json、.tmp/）带进 wheel。
+include-package-data = false
+
+[tool.setuptools.package-data]
+# 键是包名；模式相对该包目录，`*` 不跨目录分隔符。
+# briefdesk/ui/ 与各插件 ui/ 都不是包（无 __init__.py），因此数据按所属包声明。
+"briefdesk" = [
+    "ui/*.html",
+    "ui/*.js",
+    "ui/*.css",
+    "ui/icons/*.svg",
+]
+# 插件前端：四个带前端的插件各 2 个文件（ui.js/ui.css）
+"briefdesk.plugins.calendar" = ["ui/*"]
+"briefdesk.plugins.reminders" = ["ui/*"]
+"briefdesk.plugins.rag" = ["ui/*"]
+"briefdesk.plugins.benchmark" = ["ui/*", "cases/*.example.json"]
+
 [project.optional-dependencies]
 # OCR 阶段插件（briefdesk.plugins.ocr）的运行时依赖：不安装时 OCR 插件
 # 自禁用（PluginDisabledError），其余功能不受影响

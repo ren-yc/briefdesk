@@ -15,7 +15,7 @@ class IconInlineParserGuardTest(unittest.TestCase):
     不得直接 span.innerHTML = svgText（未解析字符串赋值）。"""
 
     def test_svg_parsed_via_domparser(self):
-        app = (_ROOT / "ui" / "app.js").read_text(encoding="utf-8")
+        app = (_ROOT / "briefdesk" / "ui" / "app.js").read_text(encoding="utf-8")
         self.assertIn(
             'DOMParser().parseFromString(svgText, "image/svg+xml")',
             app,
@@ -40,7 +40,7 @@ class DynamicSelectorEscapeGuardTest(unittest.TestCase):
     破坏选择器或注入任意属性匹配）。"""
 
     def test_env_selector_values_escaped(self):
-        app = (_ROOT / "ui" / "app.js").read_text(encoding="utf-8")
+        app = (_ROOT / "briefdesk" / "ui" / "app.js").read_text(encoding="utf-8")
         self.assertIn(
             '\'#env-items .env-row[data-env-key="\' + CSS.escape(key) + \'"]\'',
             app,
@@ -63,7 +63,7 @@ class WriteErrorHelperGuardTest(unittest.TestCase):
     """
 
     def test_app_js_write_sites_use_shared_helper(self):
-        app = (_ROOT / "ui" / "app.js").read_text(encoding="utf-8")
+        app = (_ROOT / "briefdesk" / "ui" / "app.js").read_text(encoding="utf-8")
         self.assertIn(
             "function showWriteError(err, fallbackMsg, errorDuration = 4000)", app
         )

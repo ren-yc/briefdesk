@@ -16,7 +16,7 @@ from starlette.testclient import TestClient
 
 import briefdesk.server as srv
 
-_UI_DIR = Path(__file__).resolve().parents[1] / "ui"
+_UI_DIR = Path(__file__).resolve().parents[1] / "briefdesk" / "ui"
 
 
 def _inline_script_hashes() -> list[str]:

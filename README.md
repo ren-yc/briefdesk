@@ -27,8 +27,8 @@
 
 ```bash
 cd briefdesk
-# 必须以 editable 方式安装：ui/ 静态资源与 .env.example 在源码目录，
-# 非 editable 安装（pip install .）不会打包它们，页面会 404 无法使用。
+# 安装（editable 便于改代码；普通安装 pip install . 同样可用——核心 SPA 与
+# 插件前端随包分发，见 pyproject 的 [tool.setuptools.package-data]）。
 pip install -e .
 # 可选：启用图片 OCR 需额外安装 OCR 依赖（rapidocr/onnxruntime，
 # 体积较大；不安装时 OCR 插件自动禁用，其余功能不受影响）
@@ -169,11 +169,12 @@ briefdesk/
 │       ├── reminders/          # 提醒 Web 插件（plugin.py + router.py：提醒设置 + 到期轮询；ui/ 含完整前端）
 │       ├── rag/                # 检索问答 Web 插件（plugin.py + router.py + db.py + engine.py + prompts.py；ui/ 含完整前端）
 │       └── benchmark/           # 实验基准（case 样例 + runner + 报告生成，见 benchmark/README.md；可选插件，默认禁用，PLUGINS 显式列名启用）
-├── ui/
-│   ├── index.html          # 桌面端页面
-│   ├── app.js              # 前端逻辑
-│   ├── style.css           # 样式
-│   └── icons/              # 图标资源（Lucide SVG 子集，见 ui/icons/README.md）
+│   ├── ui/                 # 核心 SPA（随包分发；挂载见 server/static.py）
+│   │   ├── index.html      # 桌面端页面
+│   │   ├── app.js          # 前端逻辑
+│   │   ├── style.css       # 样式
+│   │   ├── icons/          # 图标资源（Lucide SVG 子集，见 icons/README.md）
+│   │   └── icon-manifest.txt  # 图标清单（源码维护资源，不进 wheel）
 └── tests/
 ```
 
@@ -215,7 +216,7 @@ briefdesk/
   路由与刷新联动，`ui.css` 随注入）；reminders 的提醒按钮/菜单、设置
   面板「自动提醒」控件与到期轮询全在 `reminders/ui/`（`ui.js` 注册核心
   `registerItemRowExtension` 行内扩展接入卡片动作区与 `handleRowAction`，
-  经 `data-plugin-slot` 注入设置面板）；核心 `ui/` 只留通用加载器与两类
+  经 `data-plugin-slot` 注入设置面板）；核心 `briefdesk/ui/` 只留通用加载器与两类
   扩展钩子（`TestCoreFrontendBoundary` 守卫），不写死任何插件功能入口
 
 当前阶段：消息源、管道四阶段、AI 供应商与 Web 插件全部插件化，

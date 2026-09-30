@@ -119,7 +119,7 @@ export function loadAppJs({ localStorage: localStorageStub } = {}) {
   sandbox.self = sandbox;
 
   vm.createContext(sandbox);
-  vm.runInContext(fs.readFileSync(path.join(ROOT, "ui", "app.js"), "utf8"), sandbox, {
+  vm.runInContext(fs.readFileSync(path.join(ROOT, "briefdesk", "ui", "app.js"), "utf8"), sandbox, {
     filename: "ui/app.js",
   });
   return { sandbox, document, getElement };
