@@ -15,6 +15,7 @@ from unittest.mock import AsyncMock, patch
 import aiosqlite
 import pytest
 
+from briefdesk import paths
 from briefdesk.config import config
 from briefdesk.db import (
     ItemInput,
@@ -24,6 +25,7 @@ from briefdesk.db import (
     SchemaMismatchError,
     SessionRow,
     _escape_like,
+    _init_connection,
     apply_pending_restore,
     are_messages_processed,
     atomic_transaction,
@@ -2499,6 +2501,40 @@ class TestDatabaseParentDir:
                 await live.close()
             db_module._db = saved_db
             config.db_path = saved_path
+
+
+class TestLegacyDatabaseUntouched:
+    """旧库（旧版本落在项目根的 briefdesk.sqlite）不被发现、复制、移动或重命名。
+
+    断言 mtime_ns + size：不碰 atime（读操作会改它，且它不是本用例关心的事实），
+    也不用 st_ino（非 NTFS / 网络盘上不稳）。
+    """
+
+    async def test_default_db_lands_in_user_dir_and_leaves_old_file_alone(
+        self, tmp_path, monkeypatch
+    ):
+        old_root = tmp_path / "old-project-root"
+        old_root.mkdir()
+        old_db = old_root / "briefdesk.sqlite"
+        old_db.write_text("legacy-bytes", encoding="utf-8")
+        before = (old_db.stat().st_mtime_ns, old_db.stat().st_size)
+
+        monkeypatch.setenv("BRIEFDESK_DATA_DIR", str(tmp_path / "user-data"))
+        new_db = paths.database_path()
+        assert new_db != old_db
+        assert "user-data" in str(new_db)
+
+        # 走真实入口建库：默认库必须落在用户数据目录，旧库文件一个字节都不动
+        ensure_database_parent_dir(str(new_db))
+        conn = await _init_connection(str(new_db), validate_schema_flag=False)
+        await conn.close()
+
+        after = (old_db.stat().st_mtime_ns, old_db.stat().st_size)
+        assert after == before, "旧库的 mtime/size 被改动（出现迁移副作用）"
+        assert old_db.read_text(encoding="utf-8") == "legacy-bytes"
+        assert sorted(p.name for p in old_root.iterdir()) == [
+            "briefdesk.sqlite"
+        ], "旧库目录被写入新文件（迁移标记/副本？）"
 
 
 if __name__ == "__main__":
