@@ -2,6 +2,7 @@
 
 import os
 import unittest
+from pathlib import Path
 from typing import Annotated
 from unittest.mock import patch
 
@@ -45,6 +46,19 @@ class MalformedSettings(BaseSettings):
     threshold: int = Field(default=4, ge=1)
 
     model_config = {"env_prefix": "MALFORMED_"}
+
+
+def _raise_factory_error() -> str:
+    raise RuntimeError("factory boom")
+
+
+class FactoryDefaultSettings(BaseSettings):
+    """default_factory 字段（DB_PATH 就是这种字段）的默认值展示。"""
+
+    db_path: str = Field(default_factory=lambda: "D:/data/briefdesk.sqlite", alias="DB_PATH")
+    broken: str = Field(default_factory=_raise_factory_error, alias="BROKEN")
+    none_value: str = Field(default_factory=lambda: None, alias="NONE_VALUE")  # type: ignore[assignment]
+    secret_value: SecretStr = Field(default_factory=lambda: SecretStr("s"), alias="SECRET_VALUE")
 
 
 class SettingsSchemaTest(unittest.TestCase):
@@ -205,6 +219,28 @@ class SettingsSchemaTest(unittest.TestCase):
         self.assertEqual(max_images["min"], 1)
         self.assertEqual(max_images["max"], 20)
 
+
+class DefaultFactorySchemaTest(unittest.TestCase):
+    """default_factory 字段的默认值：工厂是唯一取值来源（field.default 恒为
+    PydanticUndefined），漏读会让设置页丢掉该键的默认值展示。"""
+
+    def test_factory_value_is_exposed_and_failures_are_skipped(self) -> None:
+        items = {item["key"]: item for item in build_settings_schema(FactoryDefaultSettings)}
+        self.assertEqual(items["DB_PATH"]["default"], "D:/data/briefdesk.sqlite")
+        # 工厂抛错 / 返回 None / 密钥字段：省略 default，但不阻断整份 schema
+        self.assertNotIn("default", items["BROKEN"])
+        self.assertNotIn("default", items["NONE_VALUE"])
+        self.assertNotIn("default", items["SECRET_VALUE"])
+
+    def test_core_db_path_default_follows_data_dir(self) -> None:
+        """核心 Settings 的 DB_PATH 默认值随 BRIEFDESK_DATA_DIR 走（实例化时求值）。"""
+        from briefdesk.config import Settings
+
+        data_dir = os.path.join(os.sep, "tmp", "data-dir")
+        with patch.dict(os.environ, {"BRIEFDESK_DATA_DIR": data_dir}):
+            items = {item["key"]: item for item in build_settings_schema(Settings)}
+        expected = str(Path(data_dir) / "data" / "briefdesk.sqlite")
+        self.assertEqual(items["DB_PATH"]["default"], expected)
 
 if __name__ == "__main__":
     unittest.main()

@@ -7,6 +7,7 @@ import shutil
 import tempfile
 import unittest
 import uuid
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
 from unittest.mock import AsyncMock, patch
@@ -32,6 +33,7 @@ from briefdesk.db import (
     close_db,
     delete_category,
     delete_items,
+    ensure_database_parent_dir,
     get_all_item_texts,
     get_all_sessions,
     get_category_counts,
@@ -2451,6 +2453,52 @@ class TestDefaultCategoriesUpgrade(_InMemoryDbTest):
         await self.db.commit()
         await init_schema(self.db)
         assert await _notice_prompt() == _ACTIVITY_NOTICE_OLD_PROMPT
+
+
+class TestDatabaseParentDir:
+    """父目录创建契约：默认库迁到用户数据目录后，首启必须能自建目录。"""
+
+    def test_creates_missing_parent_dir(self, tmp_path):
+        target = tmp_path / "fresh" / "data" / "briefdesk.sqlite"
+        ensure_database_parent_dir(str(target))
+        assert target.parent.is_dir()
+        assert not target.exists(), '只建目录，不建库文件'
+
+    def test_existing_parent_dir_is_noop(self, tmp_path):
+        target = str(tmp_path / "briefdesk.sqlite")
+        ensure_database_parent_dir(target)
+        ensure_database_parent_dir(target)
+
+    def test_failure_raises_runtime_error_with_guidance(self, tmp_path, monkeypatch):
+        def boom(self, parents=False, exist_ok=False):
+            raise OSError("denied")
+
+        monkeypatch.setattr(Path, "mkdir", boom)
+        with pytest.raises(RuntimeError) as exc:
+            ensure_database_parent_dir(str(tmp_path / "blocked" / "briefdesk.sqlite"))
+        message = str(exc.value)
+        assert "blocked" in message
+        assert "DB_PATH" in message
+
+    async def test_get_db_creates_parent_dir_on_first_start(self, tmp_path):
+        """走真实入口：目录不存在时 get_db 自建目录并建库（首启唯一必炸点）。"""
+        import briefdesk.db as db_module
+
+        target = tmp_path / "fresh" / "data" / "briefdesk.sqlite"
+        saved_db = db_module._db
+        saved_path = config.db_path
+        db_module._db = None
+        config.db_path = str(target)
+        try:
+            conn = await get_db()
+            assert conn is db_module._db
+            assert target.exists()
+        finally:
+            live = db_module._db
+            if live is not None and live is not saved_db:
+                await live.close()
+            db_module._db = saved_db
+            config.db_path = saved_path
 
 
 if __name__ == "__main__":

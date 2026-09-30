@@ -10,6 +10,7 @@ import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any, Literal, NotRequired, TypedDict, cast, overload
 
 import aiosqlite
@@ -468,6 +469,26 @@ async def _init_connection(
     return conn
 
 
+def ensure_database_parent_dir(db_path: str) -> None:
+    """确保数据库文件的父目录存在；失败抛 RuntimeError（含路径与修复指引）。
+
+    为什么每个入口都要调：父目录不存在时 aiosqlite.connect 报
+    "unable to open database file"，而 main() 只捕 KeyboardInterrupt——栈里既看
+    不出该建哪个目录，也没有修复指引。备份/恢复的 mkstemp 也必须落在库同目录
+    （os.replace 跨盘在 Windows 报 WinError 17），同样不能假定目录已经在。
+
+    `~` 与 `%VAR%` 不展开：db_path 是裸 str，与 sqlite3 的解析口径保持一致
+    （相对路径按进程 cwd 解析）。
+    """
+    parent = Path(db_path).parent
+    try:
+        parent.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        raise RuntimeError(
+            f"无法创建数据库目录 {parent}（请检查 DB_PATH 或其父目录权限）: {e}"
+        ) from e
+
+
 async def get_db() -> aiosqlite.Connection:
     global _db
     if _db_closed:
@@ -476,6 +497,7 @@ async def get_db() -> aiosqlite.Connection:
     if _db is None:
         async with _lock:
             if _db is None:
+                ensure_database_parent_dir(config.db_path)
                 # 与向量连接对称：embed 连接持写锁落向量期间，
                 # 主连接的写操作短暂等待而非立即抛 "database is locked"
                 _db = await _init_connection(
@@ -509,6 +531,7 @@ async def get_embed_db() -> aiosqlite.Connection:
     if _embed_db is None:
         async with _lock:
             if _embed_db is None:
+                ensure_database_parent_dir(config.db_path)
                 # 与主连接同步语义一致（WAL + NORMAL）
                 _embed_db = await _init_connection(
                     config.db_path,
@@ -770,6 +793,8 @@ async def apply_pending_restore() -> bool:
     """
     import os
 
+    # 本函数在 get_db() 之前执行（main 的启动序），不能靠主连接兜底建目录
+    ensure_database_parent_dir(config.db_path)
     pending = f"{config.db_path}.restore-pending"
     if not os.path.exists(pending):
         return False

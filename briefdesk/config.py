@@ -1,17 +1,12 @@
 """应用配置 — pydantic-settings 从 .env 读取，含默认值。"""
 
-from pathlib import Path
 from typing import ClassVar
 
 from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import SettingsConfigDict
 
+from briefdesk import paths
 from briefdesk.settings_base import KeyringSettingsBase
-
-# 项目根目录（briefdesk/config.py 上溯两级）：.env 与默认 DB 路径均以此为基准，
-# 保证从任意工作目录启动（python main.py / python -m briefdesk / briefdesk）读到同一份配置，
-# 避免 console script 在其它目录运行时静默丢失 .env 或把数据库建到错误位置。
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 # 推理强度取值：CLI（--reasoning-effort 的 choices）与设置页下拉共用这一份清单，
 # 避免两处手抄漂移；新增取值只改这里。
@@ -159,8 +154,13 @@ class Settings(KeyringSettingsBase):
     的相邻卡片经 AI 判官判定合并；0 = 禁用合并。"""
     merge_max_candidates: int = Field(default=3, alias="MERGE_MAX_CANDIDATES", gt=0)
 
-    db_path: str = Field(default=str(PROJECT_ROOT / "briefdesk.sqlite"), alias="DB_PATH")
-    """SQLite 文件路径；默认落在项目根目录（用户显式配置的相对路径仍按 cwd 解析）。"""
+    db_path: str = Field(default_factory=lambda: str(paths.database_path()), alias="DB_PATH")
+    """SQLite 文件路径；默认在平台用户数据目录（`paths.database_path()`，Windows
+    `%LOCALAPPDATA%\\briefdesk\\data\\briefdesk.sqlite`）。必须是 `str(...)` 包装：
+    字段类型是 str 且 pydantic-settings 对默认值开启 validate_default，工厂直接返回
+    Path 会在实例化期抛 ValidationError；也不得写成 `default=str(...)`——那会在类定义
+    期冻结，令 `BRIEFDESK_DATA_DIR` 只能在 import 前生效。显式 `DB_PATH` 完全覆盖默认值
+    （相对路径按 cwd 解析、`~` 不展开）。"""
     server_port: int = Field(default=3000, alias="SERVER_PORT", ge=1, le=65535)
     log_level: str = Field(default="INFO", alias="LOG_LEVEL")
     """日志级别（DEBUG / INFO / WARNING / ERROR / CRITICAL），由 logger.py 读取。"""

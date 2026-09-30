@@ -1,12 +1,32 @@
 """briefdesk 测试套件共享配置。
 
+路径隔离（为什么在 import 期做，而不是 autouse 夹具）：`briefdesk/config.py` 在
+import 时构造全局 `config` 单例，其 `db_path` 默认值经 `paths.database_path()`
+求值——只有**在 import 之前**把三个 `BRIEFDESK_*` 覆盖变量指向临时目录，才能保证
+任何用例都不触碰真实用户数据目录。夹具跑得太晚：收集期已完成 import，那时
+config 早已冻结成真实路径。会话级临时目录在解释器退出时清理。
+
 存在性守卫：pytest-asyncio 是本套件的硬依赖（asyncio_mode = "auto"，
 见 pyproject [tool.pytest.ini_options]）。required_plugins 已能在插件
 未加载时报 "Missing required plugins"；本 import 提供第二道保险——
 包未安装时收集阶段即 ImportError，不依赖 ini 解析顺序。
 """
 
+import atexit
+import os
+import shutil
+import tempfile
+from pathlib import Path
 from unittest.mock import Mock
+
+_SESSION_TMP = Path(tempfile.mkdtemp(prefix="briefdesk-tests-"))
+atexit.register(shutil.rmtree, _SESSION_TMP, True)
+
+# 必须先于 briefdesk.* 的 import：config 单例与 settings_base 的 env_file 列表
+# 都在 import 期求值，之后再设环境变量不会改变它们。
+os.environ["BRIEFDESK_DATA_DIR"] = str(_SESSION_TMP / "data")
+os.environ["BRIEFDESK_CACHE_DIR"] = str(_SESSION_TMP / "cache")
+os.environ["BRIEFDESK_SETTINGS_FILE"] = str(_SESSION_TMP / "settings.env")
 
 import aiosqlite
 import pytest

@@ -1,9 +1,10 @@
 """启动配置暂存层 — UI「设置 → 启动配置」改动的持久化与来源判定。
 
-存储文件：`platformdirs.user_config_dir("briefdesk") / "settings.env"`
-（Windows: %LOCALAPPDATA%\\briefdesk\\settings.env；macOS: ~/Library/
-Application Support/briefdesk/；Linux: ~/.config/briefdesk/），也可经
-环境变量 `BRIEFDESK_SETTINGS_FILE` 显式指定（测试/便携场景）。
+存储文件：`briefdesk/paths.py` 的 `settings_file()`（platformdirs 用户配置目录，
+Windows 传 `appauthor=False` 以免多出一层 `briefdesk`：Windows
+`%LOCALAPPDATA%\\briefdesk\\settings.env`，macOS `~/Library/Application
+Support/briefdesk/`，Linux `~/.config/briefdesk/`），也可经环境变量
+`BRIEFDESK_SETTINGS_FILE` 显式指定（测试/便携场景）。
 
 - 文件只存非密钥键值（`KEY=VALUE` 行，UTF-8、无注释、键序稳定）；
   密钥一律走系统密钥环（briefdesk/secrets_store.py），绝不落此文件。
@@ -21,24 +22,24 @@ import os
 from pathlib import Path
 
 from dotenv import dotenv_values
-from platformdirs import user_config_dir
+
+from briefdesk import paths
 
 logger = logging.getLogger(__name__)
 
-# 显式指定暂存文件的环境变量（测试/便携场景；普通用户不感知）
-_SETTINGS_FILE_ENV = "BRIEFDESK_SETTINGS_FILE"
-
 # 项目根目录（本文件上溯三级：briefdesk/settings_env.py → briefdesk/ → 根）。
-# 与 config.PROJECT_ROOT 同值，但为规避循环导入在此独立解析。
+# 本模块不 import briefdesk.config（config 在 import 期构造环境文件列表，会循环），
+# 且 settings_base 的 env_file 列表在 import 期就要用它，故在此独立解析。
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 
 def get_settings_file() -> Path:
-    """暂存文件路径：BRIEFDESK_SETTINGS_FILE 优先，否则平台用户配置目录。"""
-    explicit = os.environ.get(_SETTINGS_FILE_ENV)
-    if explicit:
-        return Path(explicit)
-    return Path(user_config_dir("briefdesk")) / "settings.env"
+    """暂存文件路径：BRIEFDESK_SETTINGS_FILE 优先，否则平台用户配置目录。
+
+    委托 `paths.settings_file()`：平台目录口径（含 Windows 的 `appauthor=False`）
+    只在 paths 一处定义，避免两个模块各自手写而漂移。
+    """
+    return paths.settings_file()
 
 
 def read_staged() -> dict[str, str]:

@@ -11,8 +11,9 @@ import json
 import math
 import re
 import types
+from collections.abc import Callable
 from decimal import Decimal, InvalidOperation
-from typing import Annotated, Any, Union, get_args, get_origin
+from typing import Annotated, Any, Union, cast, get_args, get_origin
 
 from pydantic import SecretStr
 from pydantic.fields import PydanticUndefined
@@ -90,6 +91,15 @@ def _constraints(field: Any) -> dict[str, Any]:
     return result
 
 
+def _render_default(value: Any) -> dict[str, Any]:
+    """把字段默认值转成可下发的 JSON 值；不可下发（字典/Decimal 等）时返回空 dict。"""
+    if isinstance(value, (list, tuple)):
+        return {"default": list(value)}
+    if isinstance(value, (str, int, float, bool)):
+        return {"default": value}
+    return {}
+
+
 def build_settings_schema(
     model: type[BaseSettings],
     instance: BaseSettings | None = None,
@@ -141,12 +151,23 @@ def build_settings_schema(
             item["options"] = list(options[key])
         item.update(_constraints(field))
         if field.default is not PydanticUndefined:
-            default = field.default
-            if not secret and default is not None:
-                if isinstance(default, (list, tuple)):
-                    item["default"] = list(default)
-                elif isinstance(default, (str, int, float, bool)):
-                    item["default"] = default
+            if not secret and field.default is not None:
+                item.update(_render_default(field.default))
+        elif field.default_factory is not None and not secret:
+            # 工厂字段（如 DB_PATH）：field.default 是 PydanticUndefined，默认值只有
+            # 调用工厂才知道——漏读会让设置页丢掉这一个键的默认值展示。工厂抛错或
+            # 返回不可下发值时只省略该键，不阻断整份 schema（与上面实例化失败仍保留
+            # 字段元数据同口径）。
+            try:
+                # 工厂签名是 Callable[[], Any] | Callable[[dict], Any] 的联合，联合调用
+                # mypy 无法判定实参个数，这里显式取零参形态：需要 validated_data 的工厂
+                # 会走下面的异常分支省略该键（schema 期拿不到实例数据）。
+                factory = cast(Callable[[], Any], field.default_factory)
+                factory_default = factory()
+            except Exception:  # noqa: BLE001 — 默认值展示失败不应阻断 schema
+                factory_default = None
+            if factory_default is not None:
+                item.update(_render_default(factory_default))
         if secret:
             # 只下发是否配置，不下发密钥内容；模型会按完整解析链读取值。
             if settings is None:

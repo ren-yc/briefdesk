@@ -29,6 +29,7 @@ from briefdesk.db import (
     backup_db_to,
     category_exists,
     delete_items,
+    ensure_database_parent_dir,
     get_all_category_count,
     get_all_sessions,
     get_category_counts,
@@ -282,6 +283,18 @@ def _backup_tmp_dir() -> str:
     return os.path.dirname(os.path.abspath(str(config.db_path)))
 
 
+def _ensure_db_dir_or_500() -> None:
+    """备份/恢复前确保库目录存在；失败以 500 携带修复指引。
+
+    两条路由都要在 mkstemp(dir=库目录) 之前调用：目标目录不存在时 mkstemp 抛
+    FileNotFoundError，响应只剩通用 500，用户看不到「该建哪个目录」。
+    """
+    try:
+        ensure_database_parent_dir(str(config.db_path))
+    except RuntimeError as e:
+        raise HTTPException(500, str(e)) from e
+
+
 def _remove_backup_tmp(path: str) -> None:
     """删除备份临时文件并解除登记（后台任务/异常路径共用；OSError 静默）。"""
     try:
@@ -332,6 +345,7 @@ def cleanup_stale_backup_temps() -> int:
 @app.get("/api/backup")
 async def api_backup():
     """下载数据库在线备份（SQLite backup API，WAL 安全，可运行中执行）。"""
+    _ensure_db_dir_or_500()
     fd, tmp = tempfile.mkstemp(
         prefix=_BACKUP_TMP_PREFIX,
         suffix=_BACKUP_TMP_SUFFIX,
@@ -368,6 +382,7 @@ async def api_restore(file: Annotated[UploadFile, File()]):
     """
     # 临时文件必须落在库文件同目录：os.replace 不允许跨文件系统，系统临时目录
     # 与 DB_PATH 跨盘（Windows 上典型）时必然 WinError 17，恢复功能整体不可用
+    _ensure_db_dir_or_500()
     fd, tmp = tempfile.mkstemp(
         suffix=".sqlite", dir=os.path.dirname(os.path.abspath(str(config.db_path)))
     )

@@ -124,9 +124,9 @@ OCR 依赖为**可选**（`pip install -e ".[ocr]"`）：
 | `EMBED_API_BASE` / `EMBED_MODEL` / `EMBED_API_KEY` | 空（禁用） | 嵌入向量去重：填入嵌入服务地址后启用余弦预筛（留空回退字符重叠预过滤） |
 | `DEDUP_SIMILARITY_THRESHOLD` / `DEDUP_EMBED_THRESHOLD` / `DEDUP_EMBED_TOP_K` / `DEDUP_EMBED_FALLBACK_THRESHOLD` / `DEDUP_STRONG_THRESHOLD` | `0.3` / `0.80` / `3` / `0.65` / `0.99` | 去重预筛与 AI 判重门禁阈值 |
 | `LOG_LEVEL` | `INFO` | 日志级别（DEBUG 开逐条细节，并放出 uvicorn 的 HTTP 请求日志——默认静默以免逐请求刷屏） |
-| `DB_PATH` / `SERVER_PORT` | `briefdesk.sqlite` / `3000` | SQLite 路径 / Web 端口 |
+| `DB_PATH` / `SERVER_PORT` | 用户数据目录 `data/briefdesk.sqlite` / `3000` | SQLite 路径 / Web 端口 |
 
-> 配置说明：`.env` 与默认数据库路径均以项目根目录为基准解析，从任意目录启动（`python main.py` / `python -m briefdesk` / `briefdesk`）都会读取同一份配置（显式配置的相对 `DB_PATH` 仍按当前工作目录解析）。
+> 配置说明：`.env` 以项目根目录为基准解析，从任意目录启动（`python main.py` / `python -m briefdesk` / `briefdesk`）都会读到同一份配置；默认数据库落在平台用户数据目录（Windows `%LOCALAPPDATA%\briefdesk\data\briefdesk.sqlite`），可用 `DB_PATH` 覆盖（显式相对路径按当前工作目录解析，`~` 不展开）。
 > `PLUGINS` 未启用任何消息源插件时进入**降级启动**：应用照常运行（UI/设置/向导可用），状态栏明示「无消息源」，消息采集不可用——配置消息源后重启生效。
 
 ## 项目结构

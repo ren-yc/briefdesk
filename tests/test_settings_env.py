@@ -23,7 +23,7 @@ from pydantic import SecretStr
 from starlette.testclient import TestClient
 
 import briefdesk.server as srv
-from briefdesk import settings_env
+from briefdesk import paths, settings_env
 from briefdesk.config import Settings
 from briefdesk.server import routes_settings_env as settings_routes
 from briefdesk.settings_env import (
@@ -106,6 +106,12 @@ class StagedFileTestCase(unittest.TestCase):
 class SettingsFileTest(StagedFileTestCase):
     def test_explicit_env_override_file_path(self) -> None:
         self.assertEqual(get_settings_file(), self.staged_path)
+
+    def test_default_path_delegates_to_paths(self) -> None:
+        """无覆盖变量时与 paths.settings_file() 同源（平台目录口径只在 paths 一处）。"""
+        with _env_without("BRIEFDESK_SETTINGS_FILE"):
+            self.assertEqual(get_settings_file(), paths.settings_file())
+            self.assertEqual(get_settings_file(), paths.user_config_dir() / "settings.env")
 
     def test_write_read_roundtrip_and_delete_key(self) -> None:
         write_staged({"LOG_LEVEL": "DEBUG", "SERVER_PORT": "3001"})

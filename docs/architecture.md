@@ -84,8 +84,9 @@ weflow-server :5033        WeFlow(legacy) :5031        qqflow-server :5032
 | `briefdesk/realtime.py` | 进程内发布/订阅：`publish_items_updated()`（列表刷新）与 `publish_sync_progress()`（同步进度事件）把事件推给所有订阅队列（队列项为 `(事件名, data JSON)` 二元组），由 server 的 `/api/stream` SSE 按事件名转发给前端。订阅队列满丢弃事件累计 `_dropped_count`（`get_dropped_count()` 只读诊断口）。 |
 | `briefdesk/status.py` | 应用运行时状态 + 消息源注册表：`set_status`/`is_syncing`/同步进度计数与源客户端注册。[详见下文](#briefdeskstatuspy) |
 | `briefdesk/sync.py` | 同步服务：`set_sync_callback` + `trigger_sync()`（fire-and-forget 全源轮询任务，syncing 互斥，结束后经 realtime 广播 `synced`）。main 启动与 `/api/sync` 共用。 |
+| `briefdesk/paths.py` | 路径计算（函数式，只算不建目录、每次调用求值）：`user_config_dir`/`user_data_dir`/`user_cache_dir`（platformdirs，**必须 `appauthor=False`**，否则 Windows 多一层 `briefdesk`）、`database_path`（用户数据目录 `data/briefdesk.sqlite`）、`benchmark_{cases,reports,runs}_dir`、`settings_file`、`project_dotenv_path`（源码/editable 判定）。`BRIEFDESK_DATA_DIR`/`BRIEFDESK_CACHE_DIR`/`BRIEFDESK_SETTINGS_FILE` **只读进程环境变量**，不读 `.env`。 |
 | `briefdesk/config.py` | `pydantic-settings` 配置（.env + UI 暂存文件；密钥 `SecretStr` 掩码；解析链见「配置」节）。[详见下文](#briefdeskconfigpy) |
-| `briefdesk/settings_env.py` | UI「启动配置」暂存层：`get_settings_file()`（`platformdirs.user_config_dir("briefdesk")/settings.env`，可经 `BRIEFDESK_SETTINGS_FILE` 覆盖）、`read_staged`/`write_staged`（`KEY=VALUE` 行、原子写、空则删文件）、`source_of`（override/env/dotenv/default 判定）。不 import config（config 在 import 期构造 env_file 列表）。 |
+| `briefdesk/settings_env.py` | UI「启动配置」暂存层：`get_settings_file()`（委托 `paths.settings_file()`，可经 `BRIEFDESK_SETTINGS_FILE` 覆盖）、`read_staged`/`write_staged`（`KEY=VALUE` 行、原子写、空则删文件）、`source_of`（override/env/dotenv/default 判定）。不 import config（config 在 import 期构造 env_file 列表）。 |
 | `briefdesk/settings_base.py` | `KeyringSettingsBase`——app 级与各源插件 Settings 的公共基类（密钥环解析链挂载）。[详见下文](#briefdesksettings_basepy) |
 | `briefdesk/settings_schema.py` | 从核心或插件 `BaseSettings` 模型生成 JSON 安全的设置 schema（字段类型、默认值、当前值、约束与密钥配置状态）；统一规范化/校验前端暂存值，密钥不回传明文。 |
 | `briefdesk/plugins/weflow_legacy/normalize.py` | Two normalization paths: `normalize_sse` and `normalize_rest` both produce **lists** of `InternalMessage`。[详见下文](#briefdeskpluginsweflow_legacynormalizepy) |
@@ -334,7 +335,7 @@ else:
 `pydantic-settings` from `[.env, UI 暂存文件]`（密钥型字段以 `SecretStr` 持有，repr/序列化自动掩码；密钥解析链见「配置解析链」小节）。含
 `plugins`（`PLUGINS`，默认 `[]`，JSON 数组，无通配语义，只过滤**可选插件**——不列出即禁用；核心插件恒装配，亦可在设置页
 「插件」面板逐个开关）、
-`plugins_required`/`plugin_path`、`db_path`（默认 `briefdesk.sqlite`）、
+`plugins_required`/`plugin_path`、`db_path`（`DB_PATH`，默认 `paths.database_path()`——用户数据目录 `data/briefdesk.sqlite`；相对路径按 cwd 解析、`~` 不展开）、
 `server_port`（3000）、`backfill_hours`（24）、`log_level`（`LOG_LEVEL`，默认 `"INFO"`，logger.py 读取）、
 `realtime_batch_max_count`/`realtime_batch_timeout_ms`（实时批缓冲，跨源公共）、`backfill_batch_max_count`（回填切批）、
 AI 模型等。插件专属配置（`WEFLOW_*`/`WEFLOW_LEGACY_*`/`QQFLOW_*`/`RAG_*`）在各插件包的 `config.py`，不占 app 级配置——前缀归插件所有
@@ -841,7 +842,7 @@ WARNING）的日志噪音；`fmt_dur()` 统一耗时格式。
 
 ## 数据库
 
-SQLite file: `briefdesk.sqlite` (configurable via `DB_PATH` in `.env`). Key tables:
+SQLite file: `<user data dir>/data/briefdesk.sqlite` (configurable via `DB_PATH`; relative paths resolve against the process cwd). Key tables:
 - **`items`**: Classified/deduped information cards with category, title, structured fields, source
   tracking (`source` + `UNIQUE(source, source_msg_id)`), verification status (`is_verified`: 0
   unverified / 1 memo / -1 ignored), `image_urls` (JSON), `article_url`（文章卡片原文链接，前端渲染可点跳转）,
@@ -1048,7 +1049,9 @@ required field of `weflow`/`qqflow` → that plugin self-disables via `PluginDis
 | `AI_VISION_MAX_IMAGES` | `4` | 单条消息随分类请求附图上限（多图超出只发 OCR 文本）；单次请求另有总量预算兜底（classify 引擎内 `_MAX_IMAGES_PER_REQUEST=12`） |
 | `MAX_CLASSIFY_TOKENS` | `8192` | Max output tokens per classify call (DeepSeek cap 8192; truncation breaks JSON) |
 | `LOG_LEVEL` | `INFO` | 日志级别（DEBUG / INFO / WARNING / ERROR / CRITICAL，另接受 uvicorn 的 TRACE）。DEBUG 开启逐条细节（事件/请求/过滤决策），INFO 只保留阶段与汇总；同时驱动 uvicorn 自身 logger 的级别门，并决定 **uvicorn.access 请求日志是否输出（仅 DEBUG/TRACE）** |
-| `DB_PATH` | `briefdesk.sqlite` | SQLite file path |
+| `DB_PATH` | 用户数据目录 `data/briefdesk.sqlite`（Windows `%LOCALAPPDATA%\briefdesk\data\briefdesk.sqlite`） | SQLite file path；相对路径按进程 cwd 解析、`~` 不展开 |
+| `BRIEFDESK_DATA_DIR` / `BRIEFDESK_CACHE_DIR` | 平台用户数据/缓存目录（Windows `%LOCALAPPDATA%\briefdesk` 与 `%LOCALAPPDATA%\briefdesk\Cache`） | 数据/缓存目录覆盖（**只读进程环境变量**，写进 `.env` 无效）：数据库、Benchmark 用例与报告、运行目录都随之迁移 |
+| `BRIEFDESK_SETTINGS_FILE` | 用户配置目录下的 `settings.env` | UI 暂存配置文件覆盖（**只读进程环境变量**） |
 | `SERVER_PORT` | `3000` | FastAPI/uvicorn port |
 | `RAG_MODEL` / `RAG_API_BASE` / `RAG_API_KEY` | 全为空（分别回退 `AI_MODEL` / `AI_API_BASE` / `AI_API_KEY`） | rag 问答专用模型通道（read by `briefdesk/plugins/rag/config.py`）：主链路 `AI_MODEL` 常为分类/去重用的微调模型，引用式问答可单独指向另一模型（未微调通用版/云端）。三项留空 = 与主链路共用。**`RAG_API_KEY` 为 `SecretStr` 密钥项，建议只走系统钥匙串**（`briefdesk secrets set RAG_API_KEY` / UI 密钥区）。三项由插件配置域读取后经 `ai_ports.rag_chat` 的 override 参数下传，`ai_provider` 侧只提供机制、不认识 `RAG_` 前缀（否则供应商插件反向依赖 rag） |
 | `RAG_TOP_K` / `RAG_FTS_LIMIT` / `RAG_MAX_EVIDENCE` | `12` / `12` / `10` | rag 插件：向量召回条数 / 关键词召回条数 / 注入 prompt 的证据上限 |
@@ -1083,9 +1086,11 @@ required field of `weflow`/`qqflow` → that plugin self-disables via `PluginDis
 经 `ClassVar KEYRING_FIELDS` 声明密钥字段继承之，位于 env 源之前；六者的 `env_file` 均为
 `[项目根 .env, 暂存文件]`（基类统一声明、子类经 pydantic 自动合并继承），pydantic-settings 多文件**后加载优先**）。
 
-- **UI 暂存文件**：`platformdirs.user_config_dir("briefdesk")/settings.env`（Windows
-  `%LOCALAPPDATA%\briefdesk\settings.env`；macOS `~/Library/Application Support/briefdesk/`；Linux
-  `~/.config/briefdesk/`），也可经 `BRIEFDESK_SETTINGS_FILE` 显式指定（测试/便携）；只存非密钥键值，不存在时静默跳过；原子写（临时文件 +
+- **UI 暂存文件**：`briefdesk/paths.py` 的 `settings_file()`——platformdirs 用户配置目录下的
+  `settings.env`（Windows `%LOCALAPPDATA%\briefdesk\settings.env`；macOS `~/Library/Application
+  Support/briefdesk/`；Linux `~/.config/briefdesk/`）。⚠ Windows 必须传 `appauthor=False`：缺省
+  platformdirs 把 `appauthor` 回退为 appname，路径会多出一层 `briefdesk\briefdesk`。也可经
+  `BRIEFDESK_SETTINGS_FILE` 显式指定（测试/便携）；只存非密钥键值，不存在时静默跳过；原子写（临时文件 +
   `os.replace`）+ 单写锁
 - **UI「设置 → 启动配置」面板**：GET/PUT `/api/settings/env`（核心字段从 `Settings.model_fields` 自动生成，并合并全部已发现
   插件实现的 `settings_schema()`；支持 select/number/boolean/multi/text 与约束校验
