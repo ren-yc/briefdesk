@@ -2,12 +2,12 @@
 
 - 网页「导出当前列表为基准用例」把当前筛选的卡片构造成四类用例
   （classify/dedup/merge/title，推导口径见 store.CASE_BUILDERS）并逐功能
-  导出为 cases/<feature>.fromweb.json（覆盖式，见 store.py，不触碰数据库）；
+  导出到**用户用例目录**的 <feature>.fromweb.json（覆盖式，见 store.py，不触碰数据库）；
 - 网页「记录处理过程」打开 benchmark 阶段插件的采集（默认关闭）：管道真实
   处理时点的 dedup/merge 判定累积内存（recorder.py），经
-  POST /api/benchmark/export-recorded 导出为 cases/<feature>.fromweb.json
+  POST /api/benchmark/export-recorded 导出到用户用例目录的 <feature>.fromweb.json
   （覆盖式，含判重/合并命中的正向用例——按卡片最终状态导出观察不到）；
-- Web 运行从 cases/*.fromweb.json 加载；
+- Web 运行把包内示例与用户用例快照进运行目录（同名以用户文件为准）；
 - 运行生命周期交给 supervisor（见该模块）；本模块只做 HTTP 面：POST 启动、
   GET 轮询、DELETE 取消；
 - /report(.json) 一律读盘——只认最近一次 **completed** 的 run_dir（运行天然落盘）；

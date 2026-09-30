@@ -46,7 +46,7 @@ from briefdesk.plugins.benchmark.schema import (
 )
 from briefdesk.types import ClassifyOutcome, ClassifyResult
 
-CASES_DIR = (
+PACKAGE_CASES_DIR = (
     Path(__file__).resolve().parents[1] / "briefdesk" / "plugins" / "benchmark" / "cases"
 )
 
@@ -187,7 +187,7 @@ class ParseCasesTest(unittest.TestCase):
 class DatasetFileTest(unittest.TestCase):
     def test_example_datasets_load(self):
         for feature in FEATURES:
-            path = CASES_DIR / f"{feature}.example.json"
+            path = PACKAGE_CASES_DIR / f"{feature}.example.json"
             ds = load_dataset_file(path)
             assert ds.feature == feature
             cases = parse_cases(ds)
@@ -195,7 +195,7 @@ class DatasetFileTest(unittest.TestCase):
 
     def test_missing_file(self):
         with pytest.raises(FileNotFoundError):
-            load_dataset_file(CASES_DIR / "不存在.json")
+            load_dataset_file(PACKAGE_CASES_DIR / "不存在.json")
 
 
 class BinaryMetricsTest(unittest.TestCase):
@@ -399,9 +399,9 @@ class DryRunTest(unittest.TestCase):
             cases_dir = Path(tmp)
             for f in FEATURES:
                 shutil.copyfile(
-                    CASES_DIR / f"{f}.example.json", cases_dir / f"{f}.example.json"
+                    PACKAGE_CASES_DIR / f"{f}.example.json", cases_dir / f"{f}.example.json"
                 )
-            payload = cli.run_dry_run(list(FEATURES), cases_dir, None)
+            payload = cli.run_dry_run(list(FEATURES), [cases_dir], None)
             assert set(payload["features"]) == set(FEATURES)
             for f in FEATURES:
                 assert "cases" in payload["features"][f]
@@ -410,9 +410,9 @@ class DryRunTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             cases_dir = Path(tmp)
             shutil.copyfile(
-                CASES_DIR / "classify.example.json", cases_dir / "classify.example.json"
+                PACKAGE_CASES_DIR / "classify.example.json", cases_dir / "classify.example.json"
             )
-            path = cli._resolve_dataset("classify", cases_dir, None)
+            path = cli._resolve_dataset("classify", [cases_dir], None)
             assert path.name == "classify.example.json"
 
     def test_resolve_dataset_falls_back_to_fromweb(self):
@@ -421,13 +421,13 @@ class DryRunTest(unittest.TestCase):
             (cases_dir / "classify.fromweb.json").write_text(
                 json.dumps({"feature": "classify", "cases": []}), encoding="utf-8"
             )
-            path = cli._resolve_dataset("classify", cases_dir, None)
+            path = cli._resolve_dataset("classify", [cases_dir], None)
             assert path.name == "classify.fromweb.json"
             # fromweb 优先于示例数据集
             (cases_dir / "classify.example.json").write_text(
                 json.dumps({"feature": "classify", "cases": []}), encoding="utf-8"
             )
-            path = cli._resolve_dataset("classify", cases_dir, None)
+            path = cli._resolve_dataset("classify", [cases_dir], None)
             assert path.name == "classify.fromweb.json"
 
 
@@ -812,14 +812,10 @@ class ChartsTest(unittest.TestCase):
     def test_save_html_report(self):
         from briefdesk.plugins.benchmark.html_report import save_html_report
 
-        out_dir = Path(__file__).resolve().parents[1] / "briefdesk" / "plugins" / "benchmark" / ".tmp"
-        out_dir.mkdir(parents=True, exist_ok=True)
-        try:
-            path = save_html_report(out_dir, "test-run-1", "<html></html>")
+        with tempfile.TemporaryDirectory() as tmp:
+            path = save_html_report(Path(tmp), "test-run-1", "<html></html>")
             assert path.exists()
             assert path.read_text(encoding="utf-8") == "<html></html>"
-        finally:
-            path.unlink(missing_ok=True)
 
 
 if __name__ == "__main__":

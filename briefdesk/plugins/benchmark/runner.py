@@ -55,8 +55,6 @@ from briefdesk.plugins.benchmark.schema import (
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_CASES_DIR = Path(__file__).resolve().parent / "cases"
-
 # 退出码：只有 0（成功）与 2（用法错误）是契约承诺的粒度，其余一律非 0。
 EXIT_OK = 0
 EXIT_USAGE = 2
@@ -250,25 +248,31 @@ async def _load_cases(
 ) -> tuple[dict[str, list[BaseCase]], list[CategoryDef] | None, Any]:
     """返回 (cases_by_feature, category_defs, dataset_label)。
 
-    file 与 fromweb 走各自的装载路径：前者复用 CLI 的数据集解析（含示例回退），
-    后者读 cases/<feature>.fromweb.json。两条路径都受 --cases-dir 约束，否则
-    测试只能往包内真实用例目录里写夹具。
+    file 与 fromweb 走各自的装载路径；两条路径都受 --cases-dir 约束（显式即
+    全部世界；缺省 = 用户用例目录优先、包内示例兜底），否则测试只能往包内
+    真实用例目录里写夹具。
     """
+    from briefdesk.plugins.benchmark.cli import _cases_dirs_arg, _load_file_features
+
+    cases_dirs = _cases_dirs_arg(args.cases_dir)
     if args.source == "fromweb":
-        cases = {f: await _load_web(f, args.cases_dir) for f in features}
+        cases = {f: await _load_web(f, cases_dirs) for f in features}
         return cases, None, bench_engine.FROMWEB_SOURCE_LABEL
 
-    from briefdesk.plugins.benchmark.cli import _load_file_features
-
-    loaded = _load_file_features(features, Path(args.cases_dir), None)
+    loaded = _load_file_features(features, cases_dirs, None)
     cases_by_feature = {f: item[0] for f, item in loaded.items()}
     categories = loaded.get("classify", (None, None, None))[1]
     dataset_label = {f: str(item[2]) for f, item in loaded.items()}
     return cases_by_feature, categories, dataset_label
 
 
-async def _load_web(feature: str, cases_dir: str) -> list[BaseCase]:
-    return await bench_engine.load_web_cases(feature, cases_dir)
+async def _load_web(feature: str, cases_dirs: list[Path]) -> list[BaseCase]:
+    """按目录顺序取第一个非空的 fromweb 用例集（用户目录优先、包内兜底）。"""
+    for cases_dir in cases_dirs:
+        cases = await bench_engine.load_web_cases(feature, str(cases_dir))
+        if cases:
+            return cases
+    return []
 
 
 # ── 主流程 ──
@@ -367,8 +371,8 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--run-id", default=None, help="结果标识（缺省自动生成）")
     parser.add_argument(
         "--cases-dir",
-        default=str(DEFAULT_CASES_DIR),
-        help=f"用例目录（默认 {DEFAULT_CASES_DIR}）",
+        default=None,
+        help="用例目录（缺省：用户用例目录优先，回落包内示例）",
     )
     parser.add_argument(
         "--features",

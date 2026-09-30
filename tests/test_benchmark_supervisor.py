@@ -4,7 +4,7 @@
 （meta 先落盘、回收补终态记录、轮转保底）、gc_orphans 的 best-effort，以及「结果分类
 看三态、/report 只认 completed」这两条契约。
 
-子进程模式的用例把 CASES_SRC 指到临时夹具目录（快照就是这么来的），因此跑的是零重叠
+子进程模式的用例把 `_cases_sources` 指到临时夹具目录（快照就是这么来的），因此跑的是零重叠
 的离线用例：不发 chat 请求，也不碰用户导出的真实用例。
 """
 
@@ -117,8 +117,8 @@ class SupervisorTest(unittest.IsolatedAsyncioTestCase):
         )
         self.settings = _settings()
         self._patches: list[Any] = [
-            patch.object(supervisor, "RUN_ROOT", self.run_root),
-            patch.object(supervisor, "CASES_SRC", self.cases),
+            patch.object(supervisor, "_runs_root", return_value=self.run_root),
+            patch.object(supervisor, "_cases_sources", return_value=(self.cases,)),
             patch.object(supervisor, "_settings", lambda: self.settings),
         ]
         for p in self._patches:

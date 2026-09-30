@@ -26,7 +26,7 @@ import time
 from collections.abc import Callable
 from pathlib import Path
 
-from briefdesk import ai_ports
+from briefdesk import ai_ports, paths
 from briefdesk.config import REASONING_EFFORT_VALUES, config
 from briefdesk.db import close_db
 from briefdesk.logger import fmt_dur
@@ -41,20 +41,34 @@ from briefdesk.plugins.benchmark.schema import (
     CategoryDef,
     DatasetError,
 )
-from briefdesk.plugins.benchmark.store import FROMWEB_SUFFIX
+from briefdesk.plugins.benchmark.store import FROMWEB_SUFFIX, PACKAGE_CASES_DIR
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_CASES_DIR = Path(__file__).resolve().parent / "cases"
-DEFAULT_OUT_DIR = Path(__file__).resolve().parent / "reports"
+
+def default_cases_dirs() -> list[Path]:
+    """缺省用例目录搜索顺序：用户用例目录优先、包内示例兜底。
+
+    显式 `--cases-dir` 不走这里——显式即全部世界，不回落包内示例。
+    """
+    return [paths.benchmark_cases_dir(), PACKAGE_CASES_DIR]
+
+
+def _cases_dirs_arg(explicit: str | None) -> list[Path]:
+    """命令行 `--cases-dir` 语义：显式只查该目录；缺省走两层查找。"""
+    return [Path(explicit)] if explicit else default_cases_dirs()
+
+
+def _out_dir_arg(explicit: str | None) -> Path:
+    """命令行 `--out` 缺省：用户数据目录 benchmark/reports（每次调用求值）。"""
+    return Path(explicit) if explicit else paths.benchmark_reports_dir()
 
 
 # ── 数据集解析 ──
 
 
-def _resolve_dataset(feature: str, cases_dir: Path, dataset: str | None) -> Path:
-    if dataset:
-        return Path(dataset)
+def _resolve_in_dir(feature: str, cases_dir: Path) -> Path | None:
+    """单目录取名顺序：<feature>.json > <feature>.fromweb.json > <feature>.example.json。"""
     primary = cases_dir / f"{feature}.json"
     if primary.exists():
         return primary
@@ -66,19 +80,35 @@ def _resolve_dataset(feature: str, cases_dir: Path, dataset: str | None) -> Path
     if fallback.exists():
         print(f"  提示：未找到 {primary.name}，使用示例数据集 {fallback.name}")
         return fallback
+    return None
+
+
+def _resolve_dataset(feature: str, cases_dirs: list[Path], dataset: str | None) -> Path:
+    """按目录顺序解析数据集文件；目录内优先级由 _resolve_in_dir 决定。
+
+    缺省两层（用户用例目录 → 包内示例）只扩充「查哪个目录」，不改单目录内的
+    文件名优先级；显式 --cases-dir 只传一个目录，等价于旧行为。
+    """
+    if dataset:
+        return Path(dataset)
+    for cases_dir in cases_dirs:
+        path = _resolve_in_dir(feature, cases_dir)
+        if path is not None:
+            return path
+    candidates = " 或 ".join(str(d / f"{feature}.json") for d in cases_dirs)
     raise FileNotFoundError(
-        f"未找到测试集 {primary}（可从 {fallback.name} 复制后手动编辑添加数据，"
-        f"或在网页设置里「导出当前列表为基准用例」生成 {fromweb.name}）"
+        f"未找到测试集 {candidates}（可从 {feature}.example.json 复制后手动编辑添加数据，"
+        f"或在网页设置里「导出当前列表为基准用例」生成 {feature}{FROMWEB_SUFFIX}）"
     )
 
 
 def _load_file_features(
-    features: list[str], cases_dir: Path, dataset: str | None
+    features: list[str], cases_dirs: list[Path], dataset: str | None
 ) -> dict[str, tuple[list[BaseCase], list[CategoryDef] | None, Path]]:
     """返回 {feature: (cases, categories, path)}；categories 来自 classify 数据集声明。"""
     out: dict[str, tuple[list[BaseCase], list[CategoryDef] | None, Path]] = {}
     for f in features:
-        path = _resolve_dataset(f, cases_dir, dataset)
+        path = _resolve_dataset(f, cases_dirs, dataset)
         ds = bench_engine.load_file_dataset(path)
         out[f] = (bench_engine.load_file_cases(path), ds.categories, path)
     return out
@@ -129,13 +159,13 @@ def _dry_stats(feature: str, cases: list) -> dict:
 
 
 def run_dry_run(
-    features: list[str], cases_dir: Path, dataset: str | None
+    features: list[str], cases_dirs: list[Path], dataset: str | None
 ) -> dict:
     """校验测试集并打印统计（纯文件解析，不调用 AI / 不访问 DB）。"""
     payload: dict = {"features": {}}
 
     for f in features:
-        path = _resolve_dataset(f, cases_dir, dataset)
+        path = _resolve_dataset(f, cases_dirs, dataset)
         cases = bench_engine.load_file_cases(path)
         ds = bench_engine.load_file_dataset(path)
         stats = _dry_stats(f, cases)
@@ -259,7 +289,7 @@ async def run_benchmark(args: argparse.Namespace) -> dict:
         f"推理强度 {config.ai_reasoning_effort}）"
     )
 
-    loaded = _load_file_features(features, Path(args.cases_dir), args.dataset)
+    loaded = _load_file_features(features, _cases_dirs_arg(args.cases_dir), args.dataset)
     cases_by_feature = {f: item[0] for f, item in loaded.items()}
     categories = loaded.get("classify", (None, None, None))[1]
     dataset_label = {f: str(item[2]) for f, item in loaded.items()}
@@ -283,11 +313,12 @@ async def run_benchmark(args: argparse.Namespace) -> dict:
     if total_elapsed is not None:
         print(f"\n总用时: {fmt_dur(total_elapsed)}")
 
-    path = save_json_report(args.out, payload)
+    out_dir = str(_out_dir_arg(args.out))
+    path = save_json_report(out_dir, payload)
     print(f"\n结果已导出: {path}")
     if args.charts:
         html_path = save_html_report(
-            args.out, payload["run_id"], build_html_report(payload)
+            out_dir, payload["run_id"], build_html_report(payload)
         )
         print(f"图表报告已导出: {html_path}")
     return payload
@@ -311,8 +342,8 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--cases-dir",
-        default=str(DEFAULT_CASES_DIR),
-        help=f"文件数据集目录（默认 {DEFAULT_CASES_DIR}）",
+        default=None,
+        help="文件数据集目录（缺省：用户用例目录优先，回落包内示例）",
     )
     parser.add_argument(
         "--dataset",
@@ -338,8 +369,8 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--out",
-        default=str(DEFAULT_OUT_DIR),
-        help=f"结果 JSON 导出目录（默认 {DEFAULT_OUT_DIR}）",
+        default=None,
+        help="结果 JSON 导出目录（缺省：用户数据目录 benchmark/reports）",
     )
     parser.add_argument(
         "--charts",
@@ -372,7 +403,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.dry_run:
             if args.charts:
                 print("提示：dry-run 无运行结果，跳过图表报告", file=sys.stderr)
-            run_dry_run(features, Path(args.cases_dir), args.dataset)
+            run_dry_run(features, _cases_dirs_arg(args.cases_dir), args.dataset)
             print("\ndry-run 完成：测试集校验通过，未调用 AI。")
         else:
             asyncio.run(run_benchmark(args))

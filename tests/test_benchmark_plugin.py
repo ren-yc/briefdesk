@@ -1,7 +1,7 @@
 """benchmark 插件测试：装配、用例文件导出/列举/清空、四类用例推导、处理记录、运行编排（不调用 AI）。
 
-用例存储为插件包内 cases/*.fromweb.json（文件态，不触碰数据库）；文件测试经
-patch store.CASES_DIR 指向临时目录，导出读取 items 表经 patch("briefdesk.db.get_db")
+用例存储为**用户用例目录**下的 *.fromweb.json（文件态，不触碰数据库）；文件测试经
+patch paths.benchmark_cases_dir 指向临时目录，导出读取 items 表经 patch("briefdesk.db.get_db")
 指向内存连接（与基准环境补丁同机制）；运行测试用"零用例"路径（不触发任何 AI 调用）。
 """
 
@@ -17,6 +17,7 @@ import aiosqlite
 import pytest
 
 import briefdesk.db as briefdesk_db
+from briefdesk import paths
 from briefdesk.config import Settings, config
 from briefdesk.db import init_schema, insert_item
 from briefdesk.plugin.base import PluginContext
@@ -165,7 +166,7 @@ class TestStore:
     async def _autouse_setup(self):
         self._tmp = tempfile.TemporaryDirectory()
         self.cases_dir = Path(self._tmp.name)
-        patcher = patch.object(bench_store, "CASES_DIR", self.cases_dir)
+        patcher = patch.object(paths, "benchmark_cases_dir", return_value=self.cases_dir)
         patcher.start()
         yield
         patcher.stop()
@@ -276,7 +277,7 @@ class TestRecorder:
     async def _autouse_setup(self):
         bench_recorder.reset()
         self._tmp = tempfile.TemporaryDirectory()
-        store_patcher = patch.object(bench_store, "CASES_DIR", Path(self._tmp.name))
+        store_patcher = patch.object(paths, "benchmark_cases_dir", return_value=Path(self._tmp.name))
         store_patcher.start()
         yield
         bench_recorder.reset()
@@ -412,7 +413,7 @@ class TestRecordEndpoints:
     async def _autouse_setup(self):
         bench_recorder.reset()
         self._tmp = tempfile.TemporaryDirectory()
-        store_patcher = patch.object(bench_store, "CASES_DIR", Path(self._tmp.name))
+        store_patcher = patch.object(paths, "benchmark_cases_dir", return_value=Path(self._tmp.name))
         store_patcher.start()
         yield
         bench_recorder.reset()
@@ -702,7 +703,7 @@ class TestImportCurrent:
     async def _autouse_setup(self):
         self._tmp = tempfile.TemporaryDirectory()
         self.cases_dir = Path(self._tmp.name)
-        store_patcher = patch.object(bench_store, "CASES_DIR", self.cases_dir)
+        store_patcher = patch.object(paths, "benchmark_cases_dir", return_value=self.cases_dir)
         store_patcher.start()
         self.conn = await aiosqlite.connect(":memory:")
         self.conn.row_factory = aiosqlite.Row
@@ -804,12 +805,12 @@ class TestRunFlow:
         cases_dir.mkdir()
         run_root = Path(self._tmp.name) / "runs"
         run_root.mkdir()
-        store_patcher = patch.object(bench_store, "CASES_DIR", cases_dir)
+        store_patcher = patch.object(paths, "benchmark_cases_dir", return_value=cases_dir)
         store_patcher.start()
-        # 快照源与运行根都必须钉住：默认值分别指向插件目录里的 cases/ 与 .tmp/runs/，
-        # 前者会快照用户导出的真实用例（真发 AI 请求），后者会把产物写进仓库
-        cases_patcher = patch.object(supervisor, "CASES_SRC", cases_dir)
-        run_root_patcher = patch.object(supervisor, "RUN_ROOT", run_root)
+        # 快照源与运行根都必须钉住：默认值分别指向用户用例目录与用户缓存目录，
+        # 前者会快照用户导出的真实用例（真发 AI 请求），后者会把产物写进真实用户目录
+        cases_patcher = patch.object(supervisor, "_cases_sources", return_value=(cases_dir,))
+        run_root_patcher = patch.object(supervisor, "_runs_root", return_value=run_root)
         cases_patcher.start()
         run_root_patcher.start()
         settings_patcher = patch.object(
@@ -931,7 +932,7 @@ class TestTeardownStopsRun:
                     run_stall_seconds=600,
                 ),
             )
-            root = patch.object(supervisor, "RUN_ROOT", Path(tmp))
+            root = patch.object(supervisor, "_runs_root", return_value=Path(tmp))
             spawn = patch.object(supervisor, "_spawn", new=_spawn)
             with settings, root, spawn:
                 supervisor._current = None

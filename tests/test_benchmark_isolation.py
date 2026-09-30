@@ -255,7 +255,7 @@ class RunAvailabilityTest(unittest.TestCase):
             supervisor._current = None
             supervisor._last = None
             try:
-                with patch.object(supervisor, "RUN_ROOT", run_root), patch.object(
+                with patch.object(supervisor, "_runs_root", return_value=run_root), patch.object(
                     supervisor, "_settings", _subprocess_settings
                 ), patch.object(supervisor, "_spawn", new=_fake_spawn):
                     client = TestClient(

@@ -505,8 +505,8 @@ tests/test_web_plugins.py 的核心前端边界守卫测试覆盖）。`GET /api
 **基准运行的进程级隔离**（`supervisor.py` 父进程侧 + `runner.py` 子进程侧）：
 
 1. **启动**：`supervisor.start()` 在「判定 → 登记」之间不留 await，两个并发 POST 只会起一个运行；
-   随后建运行目录 `.tmp/runs/<时间戳>-<run_id 前 8 位>/`、把 `meta.json` **先落盘**（被杀/崩溃的运行
-   也要能被识别成「历史结果」而不是残目录）、把 `cases/` 快照进运行目录、关闭父进程侧的 `run.log` 句柄，
+   随后建运行目录 `paths.benchmark_runs_dir()/<时间戳>-<run_id 前 8 位>/`（用户缓存目录）、把 `meta.json` **先落盘**（被杀/崩溃的运行
+   也要能被识别成「历史结果」而不是残目录）、把用例快照进运行目录（包内示例在前、用户用例在后，同名以用户为准）、关闭父进程侧的 `run.log` 句柄，
    再 spawn 子进程（`python -m briefdesk.plugins.benchmark.runner`）。父进程**生效中**的
    benchmark 非密钥行为配置（模型、推理/JSON/视觉/分类输出、嵌入与去重参数）经环境变量下传：
    设置页改动是「暂存、重启后生效」，子进程若自己读 `.env` 会拿到尚未生效的值；密钥不下传，
@@ -524,7 +524,9 @@ tests/test_web_plugins.py 的核心前端边界守卫测试覆盖）。`GET /api
 界面侧：运行期间父进程**不重定向自己的连接**、也没有任何闸门，界面照常可用；只是把生产管道暂停
 （`benchmark_paused` 公告）——实时消息延后到下轮回填，结束后如未开启周期同步需点一次同步。手工 CLI
 （`python -m briefdesk.plugins.benchmark.cli`）与子进程同口径：自建临时目录作库、改指 `config.db_path`、
-建表并按数据集换类别、注入 AI 端口，退出先关连接再还原路径与删目录。
+建表并按数据集换类别、注入 AI 端口，退出先关连接再还原路径与删目录。用例与产物落用户目录：网页导出与
+「记录导出」写 `BRIEFDESK_DATA_DIR/benchmark/cases/`、CLI 报告默认写 `benchmark/reports/`、运行目录在
+缓存目录；缺省用例查找为「用户用例目录 → 包内示例」，显式 `--cases-dir` 只查该目录、不回落包内示例。
 
 #### briefdesk/sources_base.py
 

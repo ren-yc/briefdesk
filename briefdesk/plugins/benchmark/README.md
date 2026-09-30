@@ -7,7 +7,8 @@
 > ⚠️ 运行会**真实调用 AI**（读 `.env` 的 `AI_API_KEY` / `AI_API_BASE` / `AI_MODEL`），
 > 按用例数产生 API 费用。以**独立子进程**运行：父子只经文件交换，
 > **运行期间界面照常可用**（写操作、备份与导出都不受影响，列表区显示真实卡片），
-> 产物落在插件目录 `.tmp/runs/` 下并按 `BENCHMARK_KEEP_RUNS` 轮转。运行期间
+> 产物落在用户缓存目录 `benchmark/runs/`（Windows `%LOCALAPPDATA%\briefdesk\Cache\benchmark\runs`）下
+> 并按 `BENCHMARK_KEEP_RUNS` 轮转。运行期间
 > **消息处理会暂停**：实时消息延后到下一轮回填窗口处理（不丢失），结束后如未开启
 > 周期同步，请在界面上点一次同步补齐。
 > 测试数据请使用虚构/脱敏内容（AGENTS.md 隐私规范）。
@@ -30,7 +31,7 @@
 
 1. **导出当前列表为基准用例**：把当前筛选条件下的卡片导出为**四类**基准用例
    （期望 = 卡片当前状态；无类别卡片跳过；与「导出卡片 CSV」同口径），
-   逐功能**覆盖写入**插件目录 `cases/<feature>.fromweb.json`（文件存储，
+   逐功能**覆盖写入**用户用例目录 `cases/<feature>.fromweb.json`（文件存储，
    不写数据库；某功能无可导出用例时保留其原文件）。四类期望推导：
    - **classify**：期望 = 卡片当前分类/主体/时间字段（按批上限拆分多例）；
      **已忽略卡片（is_verified=-1）作为噪声样本进入 messages、不写期望**——
@@ -54,14 +55,14 @@
    - **merge**：合并判定命中/未命中的 (head, tail) 对 → merge=true/false；
    - **title**：合并后重拟标题事件（old_title + 合并后 key_info/quote →
      期望 = key_info 关键词包含，与网页导出同口径）。
-   **导出处理记录**把累积记录逐功能覆盖写入 `cases/<feature>.fromweb.json`
+   **导出处理记录**把累积记录逐功能覆盖写入用户用例目录的 `cases/<feature>.fromweb.json`
    （无记录的功能保留原文件），导出后清空累积器；**丢弃记录**不清文件。
    记录含真实聊天内容，导出文件已 gitignore，请勿长时间开启后忘记导出。
 3. **运行基准测试**：后台真实调用 AI（耗时数分钟），状态实时轮询；
    完成后显示各功能核心指标，可**打开图表报告**（自包含 HTML，可另存分享）。
-4. **清空基准用例**：删除全部 `cases/*.fromweb.json`（不影响卡片数据）。
+4. **清空基准用例**：删除用户用例目录下全部 `cases/*.fromweb.json`（不影响卡片数据与包内示例）。
 
-> `*.fromweb.json` 含真实聊天内容，已 gitignore，**禁止提交**（AGENTS.md 隐私规范）。
+> `*.fromweb.json` 含真实聊天内容，现落在用户数据目录（不再进仓库），样例仍**禁止提交**（AGENTS.md 隐私规范）。
 
 API：`GET/DELETE /api/benchmark/cases`（列出/删除导出用例）、
 `POST /api/benchmark/import-current`（导出当前列表）、
@@ -80,12 +81,14 @@ python -m briefdesk.plugins.benchmark.cli --charts            # 额外生成 HTM
 python -m briefdesk.plugins.benchmark.cli --model deepseek-v4-flash --concurrency 4
 ```
 
-- 文件数据集在 `cases/`（`<feature>.json`，示例为 `<feature>.example.json`，
-  复制后手动编辑；结构与 schema 校验见下）。查找顺序：`<feature>.json` →
-  网页导出的 `<feature>.fromweb.json` → `<feature>.example.json`；
+- 文件数据集缺省查两个目录：**用户用例目录优先**（手写 `<feature>.json` 与网页导出的
+  `<feature>.fromweb.json`），未命中再回落**包内示例目录**（`<feature>.example.json`，
+  复制后手动编辑；结构与 schema 校验见下）。单目录内查找顺序不变：`<feature>.json` →
+  `<feature>.fromweb.json` → `<feature>.example.json`；显式 `--cases-dir` 只查该目录、
+  不回落包内示例；
 - 运行中每完成 5 条用例输出一次进度（如 `  classify 5/20 · 42.3s`，失败用例
   带 `（失败 N）`；最后一条恒输出），`--dry-run` 不评估、无进度；
-- 结果导出到 `reports/`（gitignore）：`run-<时间戳>.json`（指标 + 逐用例明细）与
+- 结果导出到用户数据目录 `benchmark/reports/`：`run-<时间戳>.json`（指标 + 逐用例明细）与
   `run-<时间戳>.html`（`--charts` 时，自包含 SVG 图表报告）。
 
 ## 四个功能与评估口径
@@ -183,6 +186,6 @@ python -m briefdesk.plugins.benchmark.cli --model deepseek-v4-flash --concurrenc
 - **`DatasetError: 用例校验失败`**：`--dry-run` 会列出全部非法用例与字段错误，按提示修正。
 - **dedup 大量"预筛跳过"**：标题重叠不足，未走到 AI；参考上文候选预筛注意。
 - **想测不同模型**：`--model` 覆盖模型名；同一测试集多跑几次可观察判定稳定性。
-- **Web 导出的用例去哪了**：插件目录 `cases/*.fromweb.json`（classify/dedup/
+- **Web 导出的用例去哪了**：用户用例目录 `cases/*.fromweb.json`（classify/dedup/
   merge/title 四类，覆盖式文件，不写数据库；含真实聊天内容，已 gitignore，
   禁止提交）；CLI 未找到 `<feature>.json` 时会自动回退使用它们。

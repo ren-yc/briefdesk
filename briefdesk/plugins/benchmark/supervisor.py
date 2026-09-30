@@ -32,13 +32,30 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import IO, Any
 
-from briefdesk import announcements, pipeline
+from briefdesk import announcements, paths, pipeline
 from briefdesk.config import config
+from briefdesk.plugins.benchmark import store
 
 logger = logging.getLogger(__name__)
 
-RUN_ROOT = Path(__file__).resolve().parent / ".tmp" / "runs"
-CASES_SRC = Path(__file__).resolve().parent / "cases"
+
+def _runs_root() -> Path:
+    """运行目录根：用户缓存目录（可安全删除；Web 报告随各 run 目录落这里）。
+
+    每次调用求值：冻成模块常量后，测试与冒烟脚本就无法用 `BRIEFDESK_CACHE_DIR`
+    把产物重定向到临时目录，真跑一次就会写进真实用户目录。
+    """
+    return paths.benchmark_runs_dir()
+
+
+def _cases_sources() -> tuple[Path, ...]:
+    """快照来源，**顺序即覆盖顺序**：包内示例在前、用户用例在后。
+
+    只拷一个源会让 Web 驱动的基准读不到用户用例：
+    网页导出的 *.fromweb.json 落在用户目录，而快照只拷了包内示例。
+    """
+    return (store.PACKAGE_CASES_DIR, paths.benchmark_cases_dir())
+
 
 # 基准暂停公告码（前端据此提示「消息处理已暂停」）。
 ANNOUNCE_CODE = "benchmark_paused"
@@ -178,9 +195,10 @@ def latest_report_dir() -> Path | None:
 
 
 def _run_dirs() -> list[Path]:
-    if not RUN_ROOT.exists():
+    root = _runs_root()
+    if not root.exists():
         return []
-    return [p for p in RUN_ROOT.iterdir() if p.is_dir()]
+    return [p for p in root.iterdir() if p.is_dir()]
 
 # ── 工具 ──
 
@@ -307,7 +325,7 @@ async def start(features: list[str]) -> dict[str, Any]:
     run_id = _new_run_id()
     started_at = time.strftime("%Y-%m-%d %H:%M:%S")
     stamp = started_at.replace("-", "").replace(":", "").replace(" ", "-")
-    run_dir = RUN_ROOT / f"{stamp}-{run_id[:8]}"
+    run_dir = _runs_root() / f"{stamp}-{run_id[:8]}"
     run_dir.mkdir(parents=True, exist_ok=True)
     run = _Run(
         run_id=run_id,
@@ -342,11 +360,23 @@ async def start(features: list[str]) -> dict[str, Any]:
     return {"started": True, "features": list(features), "run_id": run_id}
 
 
+def _snapshot_cases(run_dir: Path) -> Path:
+    """把用例快照到 run_dir/cases：包内示例在前、用户用例在后（同名覆盖）。
+
+    独立成函数是为了让「两个来源 + 覆盖顺序」这条契约能被直接单测，
+    而不是只能靠拉起子进程间接验证。
+    """
+    cases_dir = run_dir / "cases"
+    cases_dir.mkdir(parents=True, exist_ok=True)
+    for source in _cases_sources():
+        if source.is_dir():
+            shutil.copytree(source, cases_dir, dirs_exist_ok=True)
+    return cases_dir
+
+
 async def _spawn(run: _Run) -> None:
     """快照用例 → spawn runner → 关闭父进程自己的日志句柄。"""
-    cases_dir = run.run_dir / "cases"
-    cases_dir.mkdir(parents=True, exist_ok=True)
-    shutil.copytree(CASES_SRC, cases_dir, dirs_exist_ok=True)
+    cases_dir = _snapshot_cases(run.run_dir)
     scratch = run.run_dir / "bench.sqlite"
     run.meta["db_path"] = str(scratch)
     _write_json(run.run_dir / "meta.json", run.meta)
@@ -490,7 +520,7 @@ _last_cache: tuple[tuple[str, int | None, int, int], dict[str, Any] | None] | No
 
 def _root_stamp() -> int | None:
     try:
-        return RUN_ROOT.stat().st_mtime_ns
+        return _runs_root().stat().st_mtime_ns
     except OSError:
         return None
 
