@@ -901,8 +901,8 @@ class _FakeProc:
 class TestTeardownStopsRun:
     """关闭期收口：插件 teardown 必须把运行先停下来（两种模式都要管）。
 
-    关闭序列是 teardown_all → close_db。进程内运行期间单例指向临时库，若任务
-    活到 close_db 之后才被取消，收尾会去动已经关闭的连接。
+    Web benchmark 由 supervisor 管理独立 runner 子进程；CLI benchmark 则在自身进程
+    内使用临时库。两条路径共享 benchmark engine，但隔离机制不同。
     """
 
     async def test_teardown_stops_running_benchmark(self):

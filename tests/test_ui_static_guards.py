@@ -78,8 +78,7 @@ class WriteErrorHelperGuardTest(unittest.TestCase):
             _ROOT / "briefdesk" / "plugins" / "benchmark" / "ui" / "ui.js"
         ).read_text(encoding="utf-8")
         self.assertIn("function detailText(", ui)
-        # detail 为对象（写闸门 / 备份防线 / 导出守卫的 409）时直接拼接会
-        # 渲染成 "[object Object]"
+        # detail 为错误对象时直接拼接会渲染成 "[object Object]"
         self.assertNotIn('(data.detail || ("HTTP " + res.status))', ui)
         self.assertEqual(ui.count("detailText(data, res.status)"), 3)
 

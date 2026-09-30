@@ -1,7 +1,7 @@
 """自包含 HTML 图表报告 — 内联 CSS + SVG 图表，无外部资源，浏览器直接打开。
 
 输入与 JSON 导出共用同一 payload（runner._build_payload 产物）：
-{"run_id", "generated_at", "model", "ai_api_base", "concurrency",
+{"run_id", "generated_at", "model", "concurrency", "config",
  "elapsed_sec", "features": {feature: {"dataset", "elapsed_sec", "summary": {...}, "cases": [逐用例 dict]}}}
 """
 
@@ -64,12 +64,28 @@ def _head() -> str:
 
 
 def _header(payload: dict[str, Any]) -> str:
+    config = payload.get("config") or {}
+    vision = "开启" if config.get("vision_enabled") else "关闭"
+    embedding = "开启" if config.get("embedding_enabled") else "关闭"
     meta = [
         ("运行时间", payload.get("generated_at", "")),
         ("模型", payload.get("model", "")),
-        ("API", payload.get("ai_api_base", "")),
         ("并发", str(payload.get("concurrency", ""))),
         ("推理强度", payload.get("reasoning_effort", "")),
+        ("JSON 模式", config.get("json_mode", "")),
+        ("分类最大输出", config.get("max_classify_tokens", "")),
+        ("视觉分类", vision),
+        ("视觉图片上限", config.get("vision_max_images", "")),
+        ("嵌入去重", embedding),
+        ("嵌入模型", config.get("embedding_model", "")),
+        ("嵌入批大小", config.get("embedding_batch_size", "")),
+        ("去重阈值", (
+            f"字符 {config.get('dedup_similarity_threshold', '')} / "
+            f"嵌入 {config.get('dedup_embed_threshold', '')} / "
+            f"回退 {config.get('dedup_embed_fallback_threshold', '')} / "
+            f"强匹配 {config.get('dedup_strong_threshold', '')} / "
+            f"Top-K {config.get('dedup_embed_top_k', '')}"
+        )),
         ("总用时", _dur(payload.get("elapsed_sec"))),
     ]
     parts = ['<h1>LLM 功能基准报告</h1><p class="meta">']

@@ -55,6 +55,26 @@ FEATURES: tuple[str, ...] = ("classify", "dedup", "merge", "title")
 FROMWEB_SOURCE_LABEL = "cases/*.fromweb.json"  # 网页导出用例的 dataset 标识（报告/JSON 溯源）
 
 
+def benchmark_config_snapshot() -> dict[str, Any]:
+    """返回不含密钥和 API 地址的实验配置快照。"""
+    return {
+        "max_concurrency": config.ai_max_concurrency,
+        "reasoning_effort": config.ai_reasoning_effort,
+        "json_mode": config.ai_json_mode,
+        "max_classify_tokens": config.max_classify_tokens,
+        "vision_enabled": config.ai_vision_enabled,
+        "vision_max_images": config.ai_vision_max_images,
+        "embedding_enabled": bool(config.embed_api_base),
+        "embedding_model": config.embed_model,
+        "embedding_batch_size": config.embed_batch_size,
+        "dedup_similarity_threshold": config.dedup_similarity_threshold,
+        "dedup_embed_threshold": config.dedup_embed_threshold,
+        "dedup_embed_top_k": config.dedup_embed_top_k,
+        "dedup_embed_fallback_threshold": config.dedup_embed_fallback_threshold,
+        "dedup_strong_threshold": config.dedup_strong_threshold,
+    }
+
+
 # ── 用例运行器 ──
 
 
@@ -311,7 +331,7 @@ def _build_payload(
     total_elapsed: float | None = None,
     run_id: str | None = None,
 ) -> dict[str, Any]:
-    """结果 payload（run_id/模型信息/逐功能 summary+逐用例明细/测试用时）。
+    """结果 payload（run_id/模型信息/配置快照/逐功能明细/测试用时）。
 
     elapsed_sec 为墙钟耗时（秒）：顶层 = 整轮总用时；features[f] 内 =
     该功能用例执行用时（不含聚合）。
@@ -328,10 +348,10 @@ def _build_payload(
         "run_id": run_id or time.strftime("%Y%m%d-%H%M%S"),
         "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         "model": config.ai_model,
-        "ai_api_base": config.ai_api_base,
         # 推理强度与模型、端点同级记录：同一模型在不同强度下的结果不可互比，
         # 报告必须自带这一项，否则事后无法判断某次运行到底发了什么参数
         "reasoning_effort": config.ai_reasoning_effort,
+        "config": benchmark_config_snapshot(),
         "concurrency": max(1, concurrency),
         "elapsed_sec": total_elapsed,
         "features": {

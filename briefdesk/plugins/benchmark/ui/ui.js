@@ -20,9 +20,8 @@
   let pollTimer = null;
   let runActive = false; // 最近一次状态轮询的运行中标记（驱动轮询保活）
 
-  // 错误体里的 detail 可能是对象（写闸门 / 备份防线 / 导出守卫的 409 都是
-  // {code, message}）；直接拼进提示会得到 "[object Object]"。对象取 message，
-  // 缺省退回 HTTP 状态码。
+  // 错误体里的 detail 可能是 {code, message} 对象；直接拼接对象会得到
+  // "[object Object]"，因此优先取 message，缺省回退到 HTTP 状态码。
   function detailText(data, status) {
     const d = data && data.detail;
     if (d && typeof d === "object") return d.message || ("HTTP " + status);

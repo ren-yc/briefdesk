@@ -228,22 +228,47 @@ class SupervisorTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(state["run_id"], info["run_id"])
         self.assertIn("summary", state)
 
-    def test_child_env_carries_effective_ai_config(self) -> None:
-        """子进程环境必须带生效的推理强度：_child_env 是唯一的配置下传通道。
+    def test_child_env_carries_effective_benchmark_config(self) -> None:
+        """子进程环境必须带生效的 benchmark 行为配置。
 
         直接调真实实现——既有的子进程用例会把 _child_env mock 掉，用它断言等于
         什么都没测（下传键名改错也不会红）。
         """
         from briefdesk.config import config
 
-        with patch.object(config, "ai_reasoning_effort", "off"), patch.object(
-            config, "ai_model", "m1"
+        with (
+            patch.object(config, "ai_reasoning_effort", "off"),
+            patch.object(config, "ai_model", "m1"),
+            patch.object(config, "ai_json_mode", "on"),
+            patch.object(config, "max_classify_tokens", 1234),
+            patch.object(config, "ai_vision_enabled", True),
+            patch.object(config, "ai_vision_max_images", 7),
+            patch.object(config, "embed_api_base", ""),
+            patch.object(config, "embed_model", ""),
+            patch.object(config, "embed_batch_size", 9),
+            patch.object(config, "dedup_similarity_threshold", 0.11),
+            patch.object(config, "dedup_embed_threshold", 0.77),
+            patch.object(config, "dedup_embed_top_k", 5),
+            patch.object(config, "dedup_embed_fallback_threshold", 0.44),
+            patch.object(config, "dedup_strong_threshold", 0.98),
         ):
             env = supervisor._child_env()
         self.assertEqual(env.get("AI_REASONING_EFFORT"), "off")
         self.assertEqual(env.get("AI_MODEL"), "m1")
-        # 刻意不断言旧键缺席：env 是父进程环境的拷贝，宿主若导出过该变量会照样带过去
-        # （子进程侧它是未知键，pydantic 直接忽略），断言它只会测到宿主环境
+        self.assertEqual(env.get("AI_JSON_MODE"), "on")
+        self.assertEqual(env.get("MAX_CLASSIFY_TOKENS"), "1234")
+        self.assertEqual(env.get("AI_VISION_ENABLED"), "true")
+        self.assertEqual(env.get("AI_VISION_MAX_IMAGES"), "7")
+        self.assertEqual(env.get("EMBED_API_BASE"), "")
+        self.assertEqual(env.get("EMBED_MODEL"), "")
+        self.assertEqual(env.get("EMBED_BATCH_SIZE"), "9")
+        self.assertEqual(env.get("DEDUP_SIMILARITY_THRESHOLD"), "0.11")
+        self.assertEqual(env.get("DEDUP_EMBED_THRESHOLD"), "0.77")
+        self.assertEqual(env.get("DEDUP_EMBED_TOP_K"), "5")
+        self.assertEqual(env.get("DEDUP_EMBED_FALLBACK_THRESHOLD"), "0.44")
+        self.assertEqual(env.get("DEDUP_STRONG_THRESHOLD"), "0.98")
+        for secret_name in ("AI_API_KEY", "EMBED_API_KEY", "RAG_API_KEY"):
+            self.assertNotIn(secret_name, env)
 
     async def test_state_does_not_scan_disk_while_running(self) -> None:
         """运行期间 state() 不扫盘：这是 3s 轮询的热路径，而扫盘是同步 I/O。

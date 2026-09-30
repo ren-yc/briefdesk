@@ -4358,8 +4358,8 @@ async function saveAllSettings() {
   if (saveBusy) return;
   saveBusy = true;
   $settingsSave.disabled = true;
-  // 暂存段的结果必须在 try 外声明：catch 需要知道它是否已提交
-  // （暂存走白名单路由，基准窗口内会成功；被拒的只有下面的类别/会话 ops）
+  // 暂存段的结果必须在 try 外声明：catch 需要知道它是否已提交。
+  // 暂存失败时保留接口返回的配置校验、依赖或互斥错误。
   let staged = "skipped";
   try {
     // 刷新间隔与同步数据无关，立即生效（先记是否变更，saveSettings 会更新基准）

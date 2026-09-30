@@ -506,8 +506,10 @@ tests/test_web_plugins.py 的核心前端边界守卫测试覆盖）。`GET /api
 1. **启动**：`supervisor.start()` 在「判定 → 登记」之间不留 await，两个并发 POST 只会起一个运行；
    随后建运行目录 `.tmp/runs/<时间戳>-<run_id 前 8 位>/`、把 `meta.json` **先落盘**（被杀/崩溃的运行
    也要能被识别成「历史结果」而不是残目录）、把 `cases/` 快照进运行目录、关闭父进程侧的 `run.log` 句柄，
-   再 spawn 子进程（`python -m briefdesk.plugins.benchmark.runner`）。父进程**生效中**的非密钥 AI 配置经环境变量下传：
-   设置页改动是「暂存、重启后生效」，子进程若自己读 `.env` 会拿到旧值；密钥不下传，子进程走自己的钥匙串。
+   再 spawn 子进程（`python -m briefdesk.plugins.benchmark.runner`）。父进程**生效中**的
+   benchmark 非密钥行为配置（模型、推理/JSON/视觉/分类输出、嵌入与去重参数）经环境变量下传：
+   设置页改动是「暂存、重启后生效」，子进程若自己读 `.env` 会拿到尚未生效的值；密钥不下传，
+   子进程走自己的钥匙串。报告记录这些配置的快照，但不记录 API 地址或密钥。
 2. **运行期**：父进程只做三件事——按 `progress.jsonl` 的**行数增长**判进展（阈值按
    `BENCHMARK_RUN_STALL_SECONDS × --progress-every` 放大，因为进度是节流写入的）、终态行落盘后的宽限 kill、
    可选的总时长上限；取消/超时/无进展一律经**本进程持有的句柄**终止。子进程在自己的库上跑
@@ -1040,7 +1042,7 @@ required field of `weflow`/`qqflow` → that plugin self-disables via `PluginDis
 | `AI_MAX_CONCURRENCY` | `4` | Max concurrent AI API requests, `0` = unlimited; set `1` for local models with concurrency limit 1 |
 | `POLL_OVERLAP_SECONDS` | `300` | 增量轮询窗口与上次水位间的重叠秒数：吸收边界秒/时钟偏差/翻页偏移，重叠部分由 processed_messages 去重 |
 | `POLL_INTERVAL_SECONDS` | `0` (disabled) | Periodic sync interval in seconds: fallback to backfill messages missed during SSE outages; >0 triggers the same sync path as `/api/sync` periodically (mutually exclusive) |
-| `AI_REASONING_EFFORT` | `auto` | 推理强度意图（取值见 `config.REASONING_EFFORT_VALUES`，必须全小写）：`auto` 不干预 / `off` 发送 `reasoning_effort="none"` 尽力关闭思考（端点明确拒收该参数时自动改为不发送并记忆）/ `omit` 永不发送 / `minimal`…`max` 固定强度；非法值启动期报错。⚠️ DeepSeek/思考系模型建议 `off`：思考输出计入 max_tokens 预算，会挤压时间提取/分类 JSON 造成 length 截断整批丢失（2026-08-28 问题报告 §4） |
+| `AI_REASONING_EFFORT` | `auto` | 推理强度意图（取值见 `config.REASONING_EFFORT_VALUES`，必须全小写）：`auto` 不干预 / `off` 发送 `reasoning_effort="none"` 尽力关闭思考（端点明确拒收该参数时自动改为不发送并记忆）/ `omit` 永不发送 / `minimal`…`max` 固定强度；非法值启动期报错。⚠️ DeepSeek/思考系模型建议 `off`：思考输出计入 max_tokens 预算，会挤压时间提取/分类 JSON 造成 length 截断整批丢失 |
 | `AI_JSON_MODE` | `auto` | JSON 严格输出开关（`response_format={"type": "json_object"}`）：`auto`（默认，启发式：ollama 端点或 deepseek-v4 系列模型）/ `on`（强制开启）/ `off`（强制关闭）。非默认 key 的 ollama 端点或其它支持 json_object 的模型经 `on` 强制开启 |
 | `AI_VISION_ENABLED` | `false` | **视觉路由开关**：主模型（`AI_MODEL`）支持图片输入时开启——含图消息将 OCR 文本连同图片一并送入 classify（多模态 content parts）；关闭时维持纯文本 OCR 路径（现状）。**需启用 ocr 插件**（图片字节由 enrich 下载归一化后随批暂存；缺失时纯占位符图片被入口过滤并常驻 `vision_without_ocr` 公告）。请求级失败（异常/空 choices）自动同批降级纯文本重试并置 `vision_fallback` 公告 |
 | `AI_VISION_MAX_IMAGES` | `4` | 单条消息随分类请求附图上限（多图超出只发 OCR 文本）；单次请求另有总量预算兜底（classify 引擎内 `_MAX_IMAGES_PER_REQUEST=12`） |
@@ -1060,7 +1062,7 @@ required field of `weflow`/`qqflow` → that plugin self-disables via `PluginDis
 | `IGNORED_EXPIRY_HOURS` | `0` (disabled) | On startup, purge ignored items older than this many hours (deletes from `items` + `raw_messages`, keeps `processed_messages`) |
 | `IGNORE_SELF` | `true` | 过滤本账号自己发送的消息（所有消息入口：SSE 实时 + REST 回填）。weflow-legacy REST 按 `isSend` 判定（SSE 上游已不推送自消息）；qqflow REST 按自身 UID（`u_<QQFLOW_QQ>`）判定，SSE 事件无发送者标识、开启后按消息回查 REST（每消息 +1 次本机 HTTP）。**注意 qqflow 的 `self_uid` 由配置推导而非取自上游**：服务端若绑着别的账号，自过滤会静默失效（把对方的消息当别人发的收进来，同时漏掉真正的自消息）——这是账号身份闸门在 qqflow 侧比 weflow 更要紧的原因（weflow 用数据自带的 `isSend`，不受影响） |
 | `REALTIME_BATCH_MAX_COUNT` / `REALTIME_BATCH_TIMEOUT_MS` | `1` / `180000` | Realtime batch buffer flush thresholds (跨源公共：监听器攒批 + 实时路径 pipeline 切批) |
-| `BACKFILL_BATCH_MAX_COUNT` | `10` | Backfill batch size per AI classify call (independent of SSE batching)。⚠️ 长批 + 多群易引发 AI 输出 index 漂移/漏回（2026-08-28 问题报告 §3），默认已由 20 调为 10 |
+| `BACKFILL_BATCH_MAX_COUNT` | `10` | Backfill batch size per AI classify call (independent of SSE batching)。⚠️ 长批 + 多群易引发 AI 输出 index 漂移/漏回，默认已由 20 调为 10 |
 | `DEDUP_SIMILARITY_THRESHOLD` | `0.3` | Dedup pre-filter: title character-overlap ratio that triggers AI semantic dedup（嵌入整体不可用时为主通道；嵌入模式下余弦零候选时作兜底通道） |
 | `EMBED_API_BASE` | `` (empty = disabled) | Embedding API base URL; non-empty enables embedding cosine pre-filter (falls back to `AI_API_BASE` if empty within enabled mode) |
 | `EMBED_MODEL` | `` (falls back to `AI_MODEL`) | Embedding model name |

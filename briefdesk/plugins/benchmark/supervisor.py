@@ -204,19 +204,36 @@ def _line_count(path: Path) -> int:
 
 
 def _child_env() -> dict[str, str]:
-    """把父进程**当前生效**的非密钥 AI 配置下传给子进程。
+    """把父进程**当前生效**的 benchmark 非密钥配置下传给子进程。
 
     设置页的非密钥改动是「暂存、重启后生效」，而子进程会重新读 .env 与暂存文件，
-    拿到的是尚未生效的值——两条路径可能不是同一个模型，报告里的 model 字段也会与
-    生产实际不符。环境变量优先级高于暂存文件，故在这里显式下传。密钥不下传，
-    子进程仍走自己的密钥来源。
+    拿到的是尚未生效的值——两条路径可能不是同一套实验配置。环境变量优先级高于
+    暂存文件，故在这里显式下传。密钥不下传，子进程仍走自己的密钥来源。
     """
     env = dict(os.environ)
     env["PYTHONIOENCODING"] = "utf-8"
-    env["AI_MODEL"] = str(config.ai_model)
-    env["AI_API_BASE"] = str(config.ai_api_base)
-    env["AI_MAX_CONCURRENCY"] = str(config.ai_max_concurrency)
-    env["AI_REASONING_EFFORT"] = config.ai_reasoning_effort
+    env.update(
+        {
+            "AI_MODEL": config.ai_model,
+            "AI_API_BASE": config.ai_api_base,
+            "AI_MAX_CONCURRENCY": str(config.ai_max_concurrency),
+            "AI_REASONING_EFFORT": config.ai_reasoning_effort,
+            "AI_JSON_MODE": config.ai_json_mode,
+            "MAX_CLASSIFY_TOKENS": str(config.max_classify_tokens),
+            "AI_VISION_ENABLED": str(config.ai_vision_enabled).lower(),
+            "AI_VISION_MAX_IMAGES": str(config.ai_vision_max_images),
+            "EMBED_API_BASE": config.embed_api_base,
+            "EMBED_MODEL": config.embed_model,
+            "EMBED_BATCH_SIZE": str(config.embed_batch_size),
+            "DEDUP_SIMILARITY_THRESHOLD": str(config.dedup_similarity_threshold),
+            "DEDUP_EMBED_THRESHOLD": str(config.dedup_embed_threshold),
+            "DEDUP_EMBED_TOP_K": str(config.dedup_embed_top_k),
+            "DEDUP_EMBED_FALLBACK_THRESHOLD": str(
+                config.dedup_embed_fallback_threshold
+            ),
+            "DEDUP_STRONG_THRESHOLD": str(config.dedup_strong_threshold),
+        }
+    )
     return env
 
 

@@ -508,6 +508,10 @@ class TestScratchPreparation:
         assert payload["elapsed_sec"] >= 0
         # 报告自描述：推理强度与模型同级落盘，便于对账同一模型的不同强度
         assert payload["reasoning_effort"] == config.ai_reasoning_effort
+        assert payload["config"]["reasoning_effort"] == config.ai_reasoning_effort
+        assert "ai_api_base" not in payload
+        assert "api_base" not in payload["config"]
+        assert "api_key" not in json.dumps(payload)
 
 
 class TestProgress:
@@ -647,8 +651,24 @@ class ChartsTest(unittest.TestCase):
             "run_id": "20260821-000000",
             "generated_at": "2026-08-21 00:00:00",
             "model": "test-model",
-            "ai_api_base": "http://localhost:11434/v1",
             "concurrency": 1,
+            "reasoning_effort": "auto",
+            "config": {
+                "max_concurrency": 1,
+                "reasoning_effort": "auto",
+                "json_mode": "auto",
+                "max_classify_tokens": 8192,
+                "vision_enabled": False,
+                "vision_max_images": 4,
+                "embedding_enabled": False,
+                "embedding_model": "",
+                "embedding_batch_size": 20,
+                "dedup_similarity_threshold": 0.3,
+                "dedup_embed_threshold": 0.8,
+                "dedup_embed_top_k": 3,
+                "dedup_embed_fallback_threshold": 0.65,
+                "dedup_strong_threshold": 0.99,
+            },
             "features": {
                 "classify": {
                     "dataset": "cases/classify.json",
@@ -693,6 +713,9 @@ class ChartsTest(unittest.TestCase):
         assert "混淆矩阵（行=预测，列=期望）" in html_text
         assert "100.0%" in html_text
         assert "dd-001" in html_text
+        assert "JSON 模式" in html_text
+        assert "分类最大输出" in html_text
+        assert "API" not in html_text
         assert "</html>" in html_text
         # 用例 id 注入应被转义
         payload = self._payload()
