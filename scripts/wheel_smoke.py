@@ -10,9 +10,12 @@
    足以让「默认库落在临时目录」「插件来自 wheel」这类断言失真；
 4. 启动、HTTP 断言与真实写入（配置保存 / 用例导出 / 基准 runner）分开断言，
    只发 GET 证明不了写入隔离；
-5. 结束校验 site-packages 无新增库/配置/报告，且临时 data/cache 目录确实被使用。
+5. 结束校验 site-packages 无新增库/配置/报告，且临时 data/cache 目录确实被使用；
+6. 真实用户缓存目录按**前后快照对比**（相对路径 → size + mtime_ns）判泄漏——存在性断言
+   在任何用过的机器上都会必然失败，只有干净 runner 才碰巧成立。
 """
 
+import argparse
 import json
 import os
 import shutil
@@ -26,7 +29,14 @@ import urllib.request
 import zipfile
 from pathlib import Path
 
+from packaging.markers import default_environment
+from packaging.requirements import Requirement
+
 REPO = Path(__file__).resolve().parent.parent
+
+#: 索引上的项目名：--install-from testpypi 时用它查元数据与安装
+PROJECT_NAME = "briefdesk"
+
 if str(REPO) not in sys.path:
     # 直跑时 sys.path[0] 是 scripts/：包路径需显式补，否则 scripts.runtime_manifest 导不到
     sys.path.insert(0, str(REPO))
@@ -57,7 +67,19 @@ def log(message: str) -> None:
     print(f"[wheel-smoke] {message}", flush=True)
 
 
-def run(cmd: list[str], *, env: dict[str, str] | None = None, timeout: int = 900) -> str:
+#: 装到 venv 之后跑辅助片段时，必须确保导入的是**安装的包**：`python -c` 与 `python -m`
+#: 都会把 cwd 放到 sys.path 首位，若 cwd 是仓库目录就会导入源码树——「wheel 里缺资源」
+#: 这类问题会被源码树掩盖（本冒烟就曾因此把源码树当成被测对象）。非仓库 cwd + 显式断言双保险。
+INSTALLED_GUARD = (
+    "import briefdesk, pathlib; "
+    "_p = pathlib.Path(briefdesk.__file__).resolve(); "
+    "assert 'site-packages' in _p.parts, f'导入到了非安装路径: {_p}'; "
+)
+
+
+def run(
+    cmd: list[str], *, env: dict[str, str] | None = None, timeout: int = 900, cwd: Path | None = None
+) -> str:
     """执行外部命令；非零退出即失败（输出附在异常里）。
 
     子进程与被读侧都钉死 UTF-8。仓库里的入口（benchmark runner/cli、本脚本等）按约定把
@@ -70,7 +92,7 @@ def run(cmd: list[str], *, env: dict[str, str] | None = None, timeout: int = 900
     child_env.setdefault("PYTHONIOENCODING", "utf-8")
     result = subprocess.run(
         cmd,
-        cwd=str(REPO),
+        cwd=str(cwd or REPO),
         env=child_env,
         capture_output=True,
         text=True,
@@ -201,6 +223,97 @@ def install_wheel(venv: Path, wheel: Path) -> None:
     run([str(python), "-m", "pip", "install", "--quiet", str(wheel)], timeout=900)
 
 
+def published_requirements(version: str) -> list[str]:
+    """从索引元数据取该版本的**运行时**依赖（按 marker 过滤掉 extra 行）。
+
+    依赖清单取自索引而不是本地 pyproject：装的就是发布物声明的依赖，本地文件改了而没
+    重新发布时，这里能立刻暴露差异。
+    """
+    url = f"https://test.pypi.org/pypi/{PROJECT_NAME}/{version}/json"
+    try:
+        with urllib.request.urlopen(url, timeout=60) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except (urllib.error.URLError, OSError, json.JSONDecodeError) as error:
+        raise SmokeFailure(f"读取 {url} 失败：{error}") from error
+    requires = payload.get("info", {}).get("requires_dist") or []
+    # extra == "ocr"/"dev" 这类 marker 在未请求 extra 时求值为假——不装可选重依赖
+    # packaging 把 default_environment() 标成 TypedDict(Environment)，展开成 dict[str, str]
+    # 会被 mypy 拒（值为 object）；显式复制并补上未请求 extra 时的空值
+    environment: dict[str, str] = {
+        key: str(value) for key, value in default_environment().items()
+    }
+    environment["extra"] = ""
+    runtime: list[str] = []
+    for raw in requires:
+        requirement = Requirement(raw)
+        if requirement.marker is not None and not requirement.marker.evaluate(environment):
+            continue
+        runtime.append(str(requirement))
+    return runtime
+
+
+def install_from_testpypi(python: Path, version: str) -> None:
+    """从 TestPyPI 装指定版本：**两段式，每段只对一个索引**。
+
+    为什么不用 --index-url testpypi + --extra-index-url pypi：pip 会把两个索引合并后取
+    最高版本，而 TestPyPI 上存在别人试传的同名依赖（实测 fastapi 1.0 稳定版 vs 正式 PyPI
+    的 0.142.x），依赖会被影子化成残缺 sdist，构建直接失败。两段式每段只有一个索引，
+    混淆不可能发生，且「包来自 test.pypi.org」的日志断言才有意义。
+    """
+    log(f"从 TestPyPI 安装 briefdesk=={version}（依赖走 PyPI，本包走 TestPyPI）")
+    requires = published_requirements(version)
+    if requires:
+        log(f"先装 {len(requires)} 条运行时依赖（--index-url https://pypi.org/simple/）")
+        run(
+            [str(python), "-m", "pip", "install", "--index-url", "https://pypi.org/simple/", *requires],
+            timeout=1800,
+        )
+    out = run(
+        [
+            str(python), "-m", "pip", "install", "--no-deps", "-v",
+            "--index-url", "https://test.pypi.org/simple/",
+            f"briefdesk=={version}",
+        ],
+        timeout=900,
+    )
+    if "test.pypi.org" not in out:
+        raise SmokeFailure("安装日志里没有 test.pypi.org——无法证明包来自 TestPyPI")
+    run([str(python), "-m", "pip", "check"], timeout=300)  # 依赖闭包自洽（缺依赖即失败）
+    installed = run(
+        [str(python), "-c", "import importlib.metadata as m; print(m.version('briefdesk'))"],
+        timeout=120,
+    ).strip()
+    if installed != version:
+        raise SmokeFailure(f"安装版本不符：期望 {version}，实际 {installed}")
+    log(f"来源、版本与依赖闭包断言通过：{installed} 来自 test.pypi.org")
+
+
+def assert_installed_resources(python: Path, cwd: Path) -> None:
+    """装完按与 wheel 冒烟同一份期望集合核对磁盘资源（多出与缺失都失败）。
+
+    cwd 必须是**非仓库目录**：`python -c` 把 cwd 放 sys.path 首位，仓库根会让导入落到
+    源码树，于是源码树里那些「不进包」的文件（plugins/benchmark/README.md、图标清单等）
+    会被算成「多出」——反过来也会掩盖 wheel 真正缺资源。
+    """
+    code = (
+        INSTALLED_GUARD
+        + "import json, pathlib, briefdesk\n"
+        "root = pathlib.Path(briefdesk.__file__).resolve().parent.parent\n"
+        "files = sorted(\n"
+        "    p.relative_to(root).as_posix()\n"
+        "    for p in root.glob('briefdesk/**/*')\n"
+        "    if p.is_file() and '__pycache__' not in p.parts and p.suffix != '.py'\n"
+        ")\n"
+        "print(json.dumps(files))\n"
+    )
+    installed = set(json.loads(run([str(python), "-c", code], timeout=120, cwd=cwd)))
+    expected = set(expected_manifest())
+    extra, missing = sorted(installed - expected), sorted(expected - installed)
+    if extra or missing:
+        raise SmokeFailure(f"安装后的资源与期望集合不一致：多出 {extra}，缺失 {missing}")
+    log(f"资源断言通过：{len(installed)} 个数据文件来自该 wheel")
+
+
 def wait_ready(base: str, log_path: Path, timeout: float = 60.0) -> None:
     deadline = time.time() + timeout
     last_error = ""
@@ -243,18 +356,27 @@ def assert_writes(base: str, port: int, python: Path, env: dict[str, str], data_
     log("写入步骤 1/5 通过：配置保存落在 BRIEFDESK_SETTINGS_FILE")
 
     export_code = (
-        "import asyncio\n"
+        INSTALLED_GUARD
+        + "import asyncio\n"
         "from briefdesk.plugins.benchmark import store\n"
         "case = {\"id\": \"smoke-1\", \"note\": \"smoke\", \"message\": {\"msg_id\": \"m1\", \"content\": \"smoke\"}, \"old_title\": \"t\", \"key_info\": \"\", \"expected\": {\"title\": \"smoke\"}}\n"
         "print(asyncio.run(store.export_fromweb(\"title\", [case])))\n"
     )
-    out = run([str(python), "-c", export_code], env=env, timeout=300)
+    out = run([str(python), "-c", export_code], env=env, timeout=300, cwd=tmp)
     exported = data_dir / "benchmark" / "cases" / "title.fromweb.json"
     if not exported.exists() or str(exported) not in out:
         raise SmokeFailure(f"用例导出未落在用户数据目录: {out.strip()}")
     log("写入步骤 2/5 通过：Web 导出写用户用例目录")
 
-    cases_dir = run([str(python), "-c", "from briefdesk.plugins.benchmark import store; print(store.PACKAGE_CASES_DIR)"], env=env, timeout=120).strip()
+    cases_dir = run(
+        [
+            str(python), "-c",
+            INSTALLED_GUARD + "from briefdesk.plugins.benchmark import store; print(store.PACKAGE_CASES_DIR)",
+        ],
+        env=env,
+        timeout=120,
+        cwd=tmp,
+    ).strip()
     run_dir = tmp / "runner-run"
     run_dir.mkdir(parents=True, exist_ok=True)
     run(
@@ -269,6 +391,8 @@ def assert_writes(base: str, port: int, python: Path, env: dict[str, str], data_
         ],
         env=env,
         timeout=600,
+        # python -m 会把 cwd 放 sys.path 首位：cwd 必须是仓库外，否则跑的是源码树
+        cwd=tmp,
     )
     if not (run_dir / "report.json").exists():
         raise SmokeFailure(f"基准 runner 未产出报告: {sorted(p.name for p in run_dir.iterdir())}")
@@ -277,10 +401,13 @@ def assert_writes(base: str, port: int, python: Path, env: dict[str, str], data_
     defaults = run(
         [
             str(python), "-c",
-            "from briefdesk.plugins.benchmark import cli, supervisor; print(cli._out_dir_arg(None)); print(supervisor._runs_root())",
+            INSTALLED_GUARD
+            + "from briefdesk.plugins.benchmark import cli, supervisor; "
+            "print(cli._out_dir_arg(None)); print(supervisor._runs_root())",
         ],
         env=env,
         timeout=120,
+        cwd=tmp,
     ).splitlines()
     if Path(defaults[0]) != data_dir / "benchmark" / "reports":
         raise SmokeFailure(f"CLI 默认报告目录异常: {defaults[0]}")
@@ -312,10 +439,52 @@ def assert_writes(base: str, port: int, python: Path, env: dict[str, str], data_
     log(f"写入步骤 5/5 通过：基准运行目录 {run_dirs[-1].name}（结局: {state.get('error') or state.get('summary') or '已收尾'}）")
 
 
+def snapshot_tree(root: Path) -> dict[str, tuple[int, int]]:
+    """递归指纹：相对路径 → (size, mtime_ns)。只 stat，不读内容，也不建目录。
+
+    为什么不只比顶层条目：泄漏可能表现为**往已存在的运行目录里写文件**（开发机上本来
+    就有历史运行记录），那时条目集合不变、只看名字会漏判。用 size + mtime_ns 与
+    tests/test_db.py 的「旧库不变」断言同源（刻意不碰 atime：读操作会改它）。
+    """
+    if not root.exists():
+        return {}
+    fingerprint: dict[str, tuple[int, int]] = {}
+    for path in root.rglob("*"):
+        try:
+            stat = path.stat()
+        except OSError:
+            continue  # 扫描期间被删除/不可访问：跳过而不是崩掉断言
+        fingerprint[path.relative_to(root).as_posix()] = (stat.st_size, stat.st_mtime_ns)
+    return fingerprint
+
+
+def assert_tree_unchanged(root: Path, before: dict[str, tuple[int, int]], *, why: str) -> None:
+    """断言目录内容与快照一致（新增 / 删除 / 改动都算失败）。"""
+    after = snapshot_tree(root)
+    added = sorted(set(after) - set(before))
+    removed = sorted(set(before) - set(after))
+    changed = sorted(key for key in set(before) & set(after) if before[key] != after[key])
+    if added or removed or changed:
+        raise SmokeFailure(
+            f"{why}: {root}（本次新增 {added[:5]}，删除 {removed[:5]}，改动 {changed[:5]}）"
+            "——若确有应用在同时运行基准，请关掉后重跑"
+        )
+
+
 def assert_no_leaks(
-    venv: Path, data_dir: Path, cache_dir: Path, settings_file: Path, real_runs_root: Path
+    venv: Path,
+    data_dir: Path,
+    cache_dir: Path,
+    settings_file: Path,
+    real_runs_root: Path,
+    real_runs_before: dict[str, tuple[int, int]],
 ) -> None:
-    """site-packages 不得新增库/配置/报告；真实用户缓存目录不得被触碰。"""
+    """site-packages 不得新增库/配置/报告；真实用户缓存目录不得被本次冒烟改动。
+
+    真实目录用**前后快照对比**而不是「必须不存在」：开发机上本来就有历史运行记录，
+    存在性断言会在任何用过的机器上必然失败（CI 的干净 runner 掩盖了这一点）。快照
+    对比在干净机器上等价于原断言，在已用过的机器上则能真正证明「本次没写进去」。
+    """
     site_packages = next(venv.glob("Lib/site-packages"), None) or next(venv.glob("lib/python*/site-packages"), None)
     if site_packages is None:
         raise SmokeFailure("找不到 venv 的 site-packages")
@@ -332,9 +501,12 @@ def assert_no_leaks(
         raise SmokeFailure("临时 settings 文件未被写入")
     if not cache_dir.exists():
         raise SmokeFailure("临时缓存目录未被使用（基准运行目录没落这里？）")
-    if real_runs_root.exists():
-        raise SmokeFailure(f"真实用户缓存目录被写入: {real_runs_root}（BRIEFDESK_CACHE_DIR 未生效？）")
-    log("隔离断言通过：site-packages 无产物、真实用户目录未被触碰")
+    assert_tree_unchanged(
+        real_runs_root,
+        real_runs_before,
+        why="真实用户缓存目录被本次冒烟写入（BRIEFDESK_CACHE_DIR 未生效？）",
+    )
+    log("隔离断言通过：site-packages 无产物、真实用户缓存目录与冒烟前一致")
 
 
 def main() -> int:
@@ -348,6 +520,12 @@ def main() -> int:
                 reconfigure(encoding="utf-8", errors="replace")
             except (OSError, ValueError):
                 pass  # 非可重配置流（测试捕获/已关闭）保持原样
+    parser = argparse.ArgumentParser(
+        description="wheel 冒烟：默认装本地构建的 wheel；--install-from testpypi 则从索引安装"
+    )
+    parser.add_argument("--install-from", choices=("local", "testpypi"), default="local")
+    parser.add_argument("--version", default="", help="--install-from testpypi 时必填：断言装到的版本")
+    args = parser.parse_args()
     tmp = Path(tempfile.mkdtemp(prefix="briefdesk-smoke-"))
     data_dir = tmp / "data"
     cache_dir = tmp / "cache"
@@ -355,11 +533,19 @@ def main() -> int:
     app_log = tmp / "app.log"
     process: subprocess.Popen | None = None
     try:
-        wheel = build_wheel(tmp)
-        assert_manifest(wheel)
-        venv = make_venv(tmp)
-        install_wheel(venv, wheel)
-        python = venv_python(venv)
+        if args.install_from == "testpypi":
+            if not args.version:
+                raise SmokeFailure("--install-from testpypi 需要 --version（例如 --version 0.1.0.dev1）")
+            venv = make_venv(tmp)
+            python = venv_python(venv)
+            install_from_testpypi(python, args.version)
+            assert_installed_resources(python, tmp)
+        else:
+            wheel = build_wheel(tmp)
+            assert_manifest(wheel)
+            venv = make_venv(tmp)
+            install_wheel(venv, wheel)
+            python = venv_python(venv)
         port = free_port()
         base = f"http://127.0.0.1:{port}"
         env = app_env(data_dir=data_dir, cache_dir=cache_dir, settings_file=settings_file, port=port)
@@ -369,13 +555,18 @@ def main() -> int:
             run(
                 [
                     str(python), "-c",
-                    "from briefdesk.plugins.benchmark import supervisor; print(supervisor._runs_root())",
+                    INSTALLED_GUARD
+                    + "from briefdesk.plugins.benchmark import supervisor; print(supervisor._runs_root())",
                 ],
                 env=probe_env,
                 timeout=120,
+                cwd=tmp,
             ).strip()
         )
-        log(f"真实用户缓存目录（应保持不存在）: {real_runs_root}")
+        # 快照点在此处：之前的构建/建 venv/装包都不导入本包（briefdesk/__init__.py 为空），
+        # 且本次探测只算路径、不建目录——从这里开始的写入都算泄漏
+        real_runs_before = snapshot_tree(real_runs_root)
+        log(f"真实用户缓存目录（本次不得改动，当前 {len(real_runs_before)} 个条目）: {real_runs_root}")
         workdir = tmp / "cwd"
         workdir.mkdir(parents=True, exist_ok=True)
         log(f"启动 console script（cwd={workdir}，端口 {port}）")
@@ -390,7 +581,7 @@ def main() -> int:
         wait_ready(base, app_log)
         assert_http_surface(base, port)
         assert_writes(base, port, python, env, data_dir, cache_dir, settings_file, tmp)
-        assert_no_leaks(venv, data_dir, cache_dir, settings_file, real_runs_root)
+        assert_no_leaks(venv, data_dir, cache_dir, settings_file, real_runs_root, real_runs_before)
         log("冒烟通过")
         return 0
     except SmokeFailure as error:
