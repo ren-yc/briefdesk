@@ -61,7 +61,15 @@ powershell -ExecutionPolicy Bypass -File scripts/install-hooks.ps1
   不进环境变量、不入仓库、不写 `.env`
 - **装 TestPyPI 的包不要用 `--extra-index-url pypi.org` 一把梭**：pip 跨索引取最高版本，
   实测被 TestPyPI 上别人试传的 `fastapi 1.0`（正式 PyPI 是 0.142.x）影子化、依赖构建失败。
-  冒烟因此改成「依赖走 PyPI、本包走 TestPyPI」两段式，文档与 README/USAGE 同口径
+  冒烟因此改成「依赖走 PyPI、本包走 TestPyPI」两段式，文档与 README/USAGE 同口径。
+  本机的 `release_check.py --upload` 只是试发便利入口；正式发布走下面的 CI workflow
+- **发布走 CI 的 `publish.yml`**（`workflow_dispatch` + environment 审批 + OIDC 可信发布，
+  本机不持有任何上传凭据）：job 先跑 `release_check.py` 做版本唯一性预检、构建与产物成员断言，
+  再用 `pypa/gh-action-pypi-publish` 上传（带 PEP 740 构建证明），最后两条安装路径各跑一次冒烟。
+  只允许从 `master` 的 HEAD 触发；正式索引的版本必须等于 `pyproject.toml` 的静态值（脚本强校验），
+  试发版本（`0.1.0.devN` / `0.1.0rc1`）只在构建期写入并逐字节还原，仓库里永不落地。
+  一次性配置：GitHub environments `testpypi` / `pypi`（后者配 Required reviewers），
+  两个索引各登记 trusted publisher（Owner `ren-yc`、Repository `briefdesk`、Workflow `publish.yml`）
 - **写入路径覆盖分工**（只发 GET 证明不了写入隔离，两侧都要看：冒烟在 CI 的
   `wheel-smoke` job，隔离回归在 `isolation-smoke` job）：
 

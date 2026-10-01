@@ -1,0 +1,116 @@
+# 发布 workflow：人工触发 + 环境审批 + OIDC 可信发布（无长期凭据）。
+#
+# 为什么不并进 quality-gates.yml：id-token 写权限只应出现在真正要发布的 workflow 里；门禁
+# 每次 push 都跑，也不需要任何写权限。
+#
+# 为什么不用 twine 上传：OIDC 的短期凭据只对 pypa/gh-action-pypi-publish 可见，本机与其它
+# 步骤都不持有上传凭据——「谁能发」由 GitHub 的 environment 审批决定，而不是谁的钥匙串里有 token。
+#
+# 一次性配置（仓库外）：
+# - GitHub environments：testpypi（可无保护）、pypi（建议配 Required reviewers）；
+# - TestPyPI / PyPI 各登记 trusted publisher：Owner ren-yc、Repository briefdesk、
+#   Workflow name publish.yml、Environment 与上面同名。
+name: Publish
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: "发布目标索引"
+        type: choice
+        options: [testpypi, pypi]
+        default: testpypi
+      version:
+        description: "要发布的版本（试发如 0.1.0rc1；正式必须等于 pyproject 的静态版本）"
+        type: string
+        required: true
+
+# 同一目标不允许并发发布：版本唯一性预检与上传之间被插队会撞上「同版本不可覆盖」
+concurrency:
+  group: publish-${{ inputs.target }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Publish (${{ inputs.target }})
+    # 主平台是 Windows，且发布后要跑 wheel 冒烟——它的进程清理契约是 Windows 特有的
+    runs-on: windows-latest
+    timeout-minutes: 45
+    # 人工闸门：pypi 环境配 Required reviewers 后，job 会停在审批上等人放行
+    environment: ${{ inputs.target }}
+    env:
+      # headless runner 没有凭据管理器会话：密钥层走「未配置」分支（与 wheel-smoke job 同口径）
+      BRIEFDESK_KEYRING: "0"
+    permissions:
+      contents: read
+      id-token: write      # OIDC 可信发布
+      attestations: write  # PEP 740 构建证明
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      # 只允许发布 master 的 HEAD：分支上的提交没走完门禁，而索引上的版本不可撤回
+      - name: Guard against non-master refs
+        shell: pwsh
+        run: |
+          if ("${{ github.ref }}" -ne "refs/heads/master") {
+            throw "只能从 master 发布，当前 ref 是 ${{ github.ref }}"
+          }
+          git fetch --no-tags origin master
+          if ((git rev-parse HEAD) -ne (git rev-parse origin/master)) {
+            throw "HEAD 与 origin/master 不一致：先把 master 推平再发布"
+          }
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+
+      # 只装锁文件：构建器（build）与 twine 都在锁里；被测应用由冒烟装进它自建的临时 venv
+      - name: Install build tooling (lockfile)
+        run: pip install -r requirements-dev.txt
+
+      # 版本唯一性预检 + 构建 + 产物成员断言 + twine check；正式索引下版本必须等于仓库静态值
+      - name: Build and verify artifacts
+        run: python scripts/release_check.py --target ${{ inputs.target }} --version ${{ inputs.version }}
+
+      - name: Publish to TestPyPI
+        if: inputs.target == 'testpypi'
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist/
+          repository-url: https://test.pypi.org/legacy/
+
+      - name: Publish to PyPI
+        if: inputs.target == 'pypi'
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist/
+
+      # 上传成功到索引可见之间有秒级延迟：先等 JSON 元数据可用，再跑安装验证，
+      # 否则失败信息会指向「版本不存在」，掩盖真正的发布结果
+      - name: Wait for the index to serve the version
+        shell: pwsh
+        run: |
+          $host = if ("${{ inputs.target }}" -eq "pypi") { "pypi.org" } else { "test.pypi.org" }
+          $url = "https://$host/pypi/briefdesk/${{ inputs.version }}/json"
+          for ($i = 1; $i -le 30; $i++) {
+            try {
+              $response = Invoke-WebRequest -Uri $url -UseBasicParsing -TimeoutSec 15
+              if ($response.StatusCode -eq 200) { Write-Host "索引已提供该版本（第 $i 次探测）"; exit 0 }
+            } catch {
+              Start-Sleep -Seconds 10
+            }
+          }
+          throw "索引在 300s 内没有提供该版本：$url"
+
+      # 装完才算验完：两条安装路径 + 启动 + 资源 + 写入隔离，与 CI 的 wheel 冒烟同一条脚本
+      - name: Verify wheel install path
+        run: python scripts/wheel_smoke.py --install-from ${{ inputs.target }} --version ${{ inputs.version }}
+
+      - name: Verify sdist install path
+        run: python scripts/wheel_smoke.py --install-from ${{ inputs.target }} --version ${{ inputs.version }} --from-sdist
