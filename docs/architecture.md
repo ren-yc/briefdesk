@@ -1313,3 +1313,19 @@ required field of `weflow`/`qqflow` → that plugin self-disables via `PluginDis
 - 两源错钥的**可知时机**不同，别误以为是实现不一致：weflow 的 WCDB 有逐页 HMAC，`start_account` 内 `verify_page1` 能同步判错 → HTTP 400；
   SQLCipher 无等价的轻量页校验，qqflow 只能校验密钥**格式**（16 字节可打印 ASCII），真解密推迟到后台建索引 → 数分钟后异步转 `error`。各自都是在「能真正知道」的最早
   时刻报错。故格式合法但错的密钥在 qqflow 侧会先返回 `accepted`。
+
+### Windows 控制台编码与 CI 门禁基线
+
+两个只在 CI 上暴露、本地全绿的坑（都属「验收自己出错」而不是代码出错）：
+
+- **入口必须把 stdout/stderr 重配为 UTF-8**：GitHub 的 Windows runner 控制台是 ANSI 代码页
+  （cp1252），入口脚本第一行 `print` 中文就抛 `UnicodeEncodeError`，验收会在第一步失败。
+  `benchmark/cli.py`、`benchmark/runner.py`、`scripts/wheel_smoke.py`、`scripts/fetch_icons.py` 都在入口
+  用 `stream.reconfigure(encoding="utf-8", errors="replace")` 兜底（`errors=replace` 保证即使流
+  不可重配也不会因日志字符崩掉验收）；**新增任何会打印非 ASCII 的入口都要照做**。
+- **强推后差异扫描的基线会不可达**：CI 的密钥扫描与编号引用扫描以推送事件的 `before` 为基线，
+  重写历史（rebase 重签、amend、squash）后该提交在全新克隆里不存在，两个脚本按设计以退出码 2
+  拒绝放行（「扫描未执行 ≠ 干净」），于是 quality-gates 的每个版本一起假红。workflow 的
+  `Resolve push base` 步骤在零 SHA 或基线不可达时，改用推送载荷回推 `HEAD~N`——本次推送的 N 个
+  提交正是 HEAD 起往前 N 个，即推送前的位置，扫描范围与正常推送一致；门禁强度不变
+  （脚本对真正不可达的基线仍拒绝放行）。
