@@ -50,9 +50,15 @@ powershell -ExecutionPolicy Bypass -File scripts/install-hooks.ps1
   （构建到唯一临时目录，断言 sdist 成员集合与 wheel 的运行时资源一一对应、从 sdist
   重建的 wheel 与直接构建的 wheel 数据成员相同、twine check 通过；不进 pytest——断言
   依赖真实构建。脚本自带构建与 twine check，不要再单独跑 `python -m build --sdist`）
-- 版本号: `pyproject.toml` 的 `version` 是静态值。TestPyPI 试发用 `0.1.0.devN` 递增
-  （索引不允许覆盖同版本），正式发布才用 `0.1.0`；上传流程与 twine 凭据（只走进程环境
-  变量，不入仓库、不写 .env）留待解禁后再补
+- 版本号与试发: `pyproject.toml` 的 `version` 是静态值，索引不允许覆盖同版本——试发用
+  `python scripts/release_check.py`（查 TestPyPI 算下一个空闲 `0.1.0.devN` → 构建期间瞬态写入
+  版本 → 逐字节还原 → `twine check`），加 `--upload` 才真的上传；正式发布才用 `0.1.0`。
+  端到端验证：`python scripts/wheel_smoke.py --install-from testpypi --version 0.1.0.devN`。
+  凭据由 twine 从系统钥匙串取（`python -m keyring set https://test.pypi.org/legacy/ __token__`），
+  不进环境变量、不入仓库、不写 `.env`
+- **装 TestPyPI 的包不要用 `--extra-index-url pypi.org` 一把梭**：pip 跨索引取最高版本，
+  实测被 TestPyPI 上别人试传的 `fastapi 1.0`（正式 PyPI 是 0.142.x）影子化、依赖构建失败。
+  冒烟因此改成「依赖走 PyPI、本包走 TestPyPI」两段式，文档与 README/USAGE 同口径
 - **写入路径覆盖分工**（只发 GET 证明不了写入隔离，两侧都要看：冒烟在 CI 的
   `wheel-smoke` job，隔离回归在 `isolation-smoke` job）：
 

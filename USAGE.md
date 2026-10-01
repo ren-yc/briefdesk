@@ -22,6 +22,11 @@ python main.py                   # 或 python -m briefdesk / briefdesk
 
 浏览器打开 `http://localhost:3000`。
 
+**试用预发布版（TestPyPI）**：试发版本（`0.1.0.devN`）必须两段式装，每段只对一个索引——
+先 `pip install --no-deps --index-url https://test.pypi.org/simple/ briefdesk==0.1.0.devN`，
+再把依赖从正式 PyPI 装上（清单见 `pip show briefdesk` 的 Requires）。不要用
+`--extra-index-url` 一步装：pip 跨索引取最高版本，会被 TestPyPI 上别人试传的同名依赖影子化。
+
 ## 2. 首次使用（3 步向导）
 
 首次打开页面会弹出向导（仅当从未完成且未启用任何群聊时）：

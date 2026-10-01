@@ -50,6 +50,23 @@ python main.py
 
 浏览器打开 `http://localhost:3000`
 
+#### 试用预发布版（TestPyPI）
+
+试发版本发在 TestPyPI（形如 `0.1.0.dev1`），装法与正式包**不同**——两段式，每段只对一个索引：
+
+```bash
+# 1) 本包：只对 TestPyPI，且先不解析依赖
+pip install --no-deps --index-url https://test.pypi.org/simple/ briefdesk==0.1.0.dev1
+# 2) 依赖：只对正式 PyPI（清单以包元数据为准：pip show briefdesk 的 Requires，
+#    或 https://test.pypi.org/pypi/briefdesk/json）
+pip install fastapi "uvicorn[standard]" httpx aiosqlite pydantic pydantic-settings \
+    openai python-dotenv Pillow numpy json-repair python-multipart keyring platformdirs
+```
+
+**不要**改成 `--index-url https://test.pypi.org/simple/ --extra-index-url https://pypi.org/simple/` 一步装：
+pip 会把两个索引合并后取最高版本，而 TestPyPI 上存在别人试传的同名依赖（实测 `fastapi 1.0` 稳定版
+vs 正式 PyPI 的 `0.142.x`），依赖会被影子化成残缺包、构建直接失败。
+
 ### 首次使用（关键步骤）
 
 首次打开页面会弹出**首次使用向导**（仅当浏览器从未完成过向导且尚未启用任何群聊时出现；后端不可用时不弹），分三步：
