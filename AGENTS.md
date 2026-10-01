@@ -46,6 +46,19 @@ powershell -ExecutionPolicy Bypass -File scripts/install-hooks.ps1
 - 构建与元数据: `python -m build --wheel` + `python -m twine check dist/*`
   （构建前先清空 `dist/`，避免校验到历史 artifact；完整 wheel 冒烟——临时 venv 安装、
   真进程启动、写入隔离——在独立 CI job 跑，本地不跑）
+- **写入路径覆盖分工**（只发 GET 证明不了写入隔离，两侧都要看：冒烟在 CI 的
+  `wheel-smoke` job，隔离回归在 `isolation-smoke` job）：
+
+  | 写入路径 | 覆盖位置 |
+  |---|---|
+  | 配置保存（`PUT /api/settings/env`，带与端口一致的同源 `Origin`） | `scripts/wheel_smoke.py` |
+  | Benchmark 用例导出（`store.export_fromweb`，辅助进程直调 + 虚构用例） | 同上 |
+  | 基准执行与报告（`runner --ai-provider stub --source file`） | 同上 |
+  | supervisor 运行目录 / CLI `--out` 默认目录 | 同上（各自单独断言） |
+  | 运行中失败也能收尾（Web 基准故意用不可达端点 + 缓存 run 目录） | 同上 |
+  | 子进程对生产库的隔离（真 spawn + 逐表内容摘要不变） | `tests/test_benchmark_isolation.py` |
+
+  冒烟跑在全新 venv 与空库上；**本机真实数据下的写入行为不在 CI 覆盖内**。
 - 范围级空白检查（对齐 CI 的空树口径，覆盖全部跟踪文件；上一条只查工作区，
   对已入库的空白问题失明——rag/config.py 末尾空行曾因此逃逸到 CI 才拦下）:
   `git diff --check 4b825dc642cb6eb9a060e54bf8d69288fbee4904..HEAD`
