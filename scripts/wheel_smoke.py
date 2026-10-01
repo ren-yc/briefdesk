@@ -27,25 +27,11 @@ import zipfile
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
+if str(REPO) not in sys.path:
+    # 直跑时 sys.path[0] 是 scripts/：包路径需显式补，否则 scripts.runtime_manifest 导不到
+    sys.path.insert(0, str(REPO))
 
-#: 运行时资源期望集合（核心 3 + 插件 8 + 示例用例 4；图标由清单动态追加）
-EXPECTED_DATA = [
-    "briefdesk/ui/index.html",
-    "briefdesk/ui/app.js",
-    "briefdesk/ui/style.css",
-    "briefdesk/plugins/calendar/ui/ui.js",
-    "briefdesk/plugins/calendar/ui/ui.css",
-    "briefdesk/plugins/reminders/ui/ui.js",
-    "briefdesk/plugins/reminders/ui/ui.css",
-    "briefdesk/plugins/rag/ui/ui.js",
-    "briefdesk/plugins/rag/ui/ui.css",
-    "briefdesk/plugins/benchmark/ui/ui.js",
-    "briefdesk/plugins/benchmark/ui/ui.css",
-    "briefdesk/plugins/benchmark/cases/classify.example.json",
-    "briefdesk/plugins/benchmark/cases/dedup.example.json",
-    "briefdesk/plugins/benchmark/cases/merge.example.json",
-    "briefdesk/plugins/benchmark/cases/title.example.json",
-]
+from scripts.runtime_manifest import expected_data_members  # noqa: E402
 
 #: 非数据成员：dist-info 与包内模块（.py 另由「必须落在真实包目录内」约束兜底）
 ALLOWED_NON_DATA = (
@@ -139,15 +125,8 @@ def build_wheel(out_dir: Path) -> Path:
 
 
 def expected_manifest() -> list[str]:
-    """期望集合：登记清单 + 图标清单（单一事实来源）。"""
-    expected = list(EXPECTED_DATA)
-    manifest = (REPO / "briefdesk" / "ui" / "icon-manifest.txt").read_text(encoding="utf-8")
-    expected += sorted(
-        f"briefdesk/ui/icons/{Path(line.strip()).stem}.svg"
-        for line in manifest.splitlines()
-        if line.strip() and not line.strip().startswith("#")
-    )
-    return sorted(expected)
+    """期望集合：scripts/runtime_manifest.py（与 sdist 检查共用同一份登记）。"""
+    return expected_data_members()
 
 
 def assert_manifest(wheel: Path) -> None:

@@ -215,3 +215,9 @@ jobs:
 
       - name: Wheel smoke
         run: python scripts/wheel_smoke.py
+
+      # sdist 与 wheel 的运行时资源必须同源：断言 sdist 成员集合、从 sdist 重建的 wheel
+      # 与直接构建的 wheel 数据成员一致，并对两件产物跑 twine check。构建全在脚本自建的
+      # 临时目录里，不碰 dist/，因此与本 job 的 wheel 构建互不干扰。
+      - name: sdist check
+        run: python scripts/sdist_check.py

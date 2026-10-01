@@ -8,40 +8,19 @@
   示例用例、图标）；
 - 明确排除的资源不得被任何模式命中——图标清单/说明是源码维护资源，上游镜像文档
   运行期不读，用户导出的 *.fromweb.json 含真实聊天内容，都不能进包。
+
+期望集合来自 `scripts/runtime_manifest.py`（sdist 检查与 wheel 冒烟共用同一份，
+新增资源只登记一处）。
 """
 
 import tomllib
 from pathlib import Path
 
+from scripts.runtime_manifest import EXCLUDED, REQUIRED, icon_manifest_entries
+
 REPO = Path(__file__).resolve().parent.parent
 _PYPROJECT = tomllib.loads((REPO / "pyproject.toml").read_text(encoding="utf-8"))
 PACKAGE_DATA: dict[str, list[str]] = _PYPROJECT["tool"]["setuptools"]["package-data"]
-
-#: 必须随 wheel 分发的运行时资源（相对仓库根；图标由清单动态校验，见下方用例）
-REQUIRED = [
-    "briefdesk/ui/index.html",
-    "briefdesk/ui/app.js",
-    "briefdesk/ui/style.css",
-    "briefdesk/plugins/calendar/ui/ui.js",
-    "briefdesk/plugins/calendar/ui/ui.css",
-    "briefdesk/plugins/reminders/ui/ui.js",
-    "briefdesk/plugins/reminders/ui/ui.css",
-    "briefdesk/plugins/rag/ui/ui.js",
-    "briefdesk/plugins/rag/ui/ui.css",
-    "briefdesk/plugins/benchmark/ui/ui.js",
-    "briefdesk/plugins/benchmark/ui/ui.css",
-    "briefdesk/plugins/benchmark/cases/classify.example.json",
-    "briefdesk/plugins/benchmark/cases/dedup.example.json",
-    "briefdesk/plugins/benchmark/cases/merge.example.json",
-    "briefdesk/plugins/benchmark/cases/title.example.json",
-]
-
-#: 明确不进 wheel 的资源（源码维护文件 / 上游镜像文档 / 用户数据）
-EXCLUDED = [
-    "briefdesk/ui/icon-manifest.txt",
-    "briefdesk/ui/icons/README.md",
-    "briefdesk/plugins/weflow_legacy/weflow-legacy-api.md",
-]
 
 
 def _expand(package: str, pattern: str) -> list[Path]:
@@ -81,13 +60,7 @@ def test_icon_set_matches_manifest() -> None:
     """图标以清单为单一事实来源：声明覆盖的文件集合必须与清单一一对应。"""
     matched = _declared_files()
     icons = sorted(name for name in matched if name.startswith("briefdesk/ui/icons/"))
-    manifest = (REPO / "briefdesk" / "ui" / "icon-manifest.txt").read_text(encoding="utf-8")
-    expected = sorted(
-        f"briefdesk/ui/icons/{Path(line.strip()).stem}.svg"
-        for line in manifest.splitlines()
-        if line.strip() and not line.strip().startswith("#")
-    )
-    assert icons == expected
+    assert icons == icon_manifest_entries()
     assert icons, "图标集合不应为空"
 
 

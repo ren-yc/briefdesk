@@ -18,6 +18,7 @@
 - [ ] `git diff --check`（无空白错误 / 冲突标记）
 - [ ] `git diff --check 4b825dc642cb6eb9a060e54bf8d69288fbee4904..HEAD`（空树口径：覆盖全部跟踪文件）
 - [ ] `python -m build --wheel` 与 `python -m twine check dist/*`（构建前清空 `dist/`）
+- [ ] `python scripts/sdist_check.py`（sdist 成员与 wheel 运行时资源一一对应）
 - [ ] 敏感信息自查：不含真实密钥、Token、聊天记录、手机号等 PII
 - [ ] 注释 / 文档 / 提交信息中没有编号引用（`python scripts/forbidden_refs.py --tree` 无新增命中）
 

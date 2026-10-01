@@ -46,6 +46,13 @@ powershell -ExecutionPolicy Bypass -File scripts/install-hooks.ps1
 - 构建与元数据: `python -m build --wheel` + `python -m twine check dist/*`
   （构建前先清空 `dist/`，避免校验到历史 artifact；完整 wheel 冒烟——临时 venv 安装、
   真进程启动、写入隔离——在独立 CI job 跑，本地不跑）
+- sdist 产出与断言: `python scripts/sdist_check.py`
+  （构建到唯一临时目录，断言 sdist 成员集合与 wheel 的运行时资源一一对应、从 sdist
+  重建的 wheel 与直接构建的 wheel 数据成员相同、twine check 通过；不进 pytest——断言
+  依赖真实构建。脚本自带构建与 twine check，不要再单独跑 `python -m build --sdist`）
+- 版本号: `pyproject.toml` 的 `version` 是静态值。TestPyPI 试发用 `0.1.0.devN` 递增
+  （索引不允许覆盖同版本），正式发布才用 `0.1.0`；上传流程与 twine 凭据（只走进程环境
+  变量，不入仓库、不写 .env）留待解禁后再补
 - **写入路径覆盖分工**（只发 GET 证明不了写入隔离，两侧都要看：冒烟在 CI 的
   `wheel-smoke` job，隔离回归在 `isolation-smoke` job）：
 
@@ -136,6 +143,7 @@ powershell -ExecutionPolicy Bypass -File scripts/install-hooks.ps1
 - [ ] `python -m pytest tests/` 通过
 - [ ] `git diff --check` 通过
 - [ ] `python -m build --wheel` 与 `python -m twine check dist/*` 通过（先清空 `dist/`）
+- [ ] `python scripts/sdist_check.py` 通过（sdist 成员与 wheel 运行时资源一一对应）
 - [ ] `git diff --check 4b825dc642cb6eb9a060e54bf8d69288fbee4904..HEAD` 通过（范围级，见质量门禁）
 - [ ] `git status --short` 中没有临时文件、缓存、数据库、本地 env 文件
 - [ ] `git diff --cached` 中没有真实密钥、Token、聊天记录、手机号等敏感信息

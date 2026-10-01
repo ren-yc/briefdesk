@@ -1,0 +1,8 @@
+# sdist 内容与 wheel 的运行时资源保持一致：源码与包内前端资源由 setuptools 规则收集。
+# 这里只剪掉 distutils 默认会入列的 tests/ 顶层 test*.py（装包者用不到，且随仓库演进
+# 会持续变大），并显式钉住三件标准文件——其余成员由 scripts/sdist_check.py 的
+# 「成员集合双向相等」断言兜底，不靠这份文件的完整性。
+prune tests
+include pyproject.toml
+include README.md
+include LICENSE
