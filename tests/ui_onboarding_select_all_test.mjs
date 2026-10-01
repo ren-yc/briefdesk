@@ -1,4 +1,4 @@
-// 前端首次使用向导“全选”回归测试（Node vm 加载真实 ui/app.js）。
+// 前端首次使用向导“全选”回归测试（Node vm 加载真实 briefdesk/ui/app.js）。
 // 验证 step2 渲染时会生成全选行，且全选行不会混入保存逻辑所需的会话复选框选择器。
 
 import assert from "node:assert/strict";

@@ -1,4 +1,4 @@
-// 前端 localStorage 单源助手回归测试（Node vm 直接加载真实的 ui/app.js）。
+// 前端 localStorage 单源助手回归测试（Node vm 直接加载真实的 briefdesk/ui/app.js）。
 //
 // 守的缺陷：隐私模式/配额耗尽/站点存储被策略禁用时，localStorage 的读写都会抛异常。
 // 助手化之前有一半调用点没包 try，异常会中断整个事件处理函数，把"持久化失败"升级成

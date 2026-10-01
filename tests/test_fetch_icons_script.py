@@ -1,7 +1,7 @@
 """scripts/fetch_icons.py 的纯函数级单元测试（不触网，注入假拉取器）。
 
-约定（ui/icons/README.md）：图标只允许从钉定的 lucide-static 版本逐个拉取，
-自动登记 ui/icon-manifest.txt；内容必须能被前端内联管线接受（可选注释 + <svg>）。
+约定（briefdesk/ui/icons/README.md）：图标只允许从钉定的 lucide-static 版本逐个拉取，
+自动登记 briefdesk/ui/icon-manifest.txt；内容必须能被前端内联管线接受（可选注释 + <svg>）。
 """
 
 from pathlib import Path

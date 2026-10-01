@@ -2482,6 +2482,34 @@ class TestDatabaseParentDir:
         assert "blocked" in message
         assert "DB_PATH" in message
 
+    def test_relative_db_path_resolves_against_cwd(self, tmp_path, monkeypatch):
+        """相对 DB_PATH 不被归一化，父目录按进程 cwd 解析（config 不加绝对化）。"""
+        from briefdesk.config import Settings
+
+        monkeypatch.chdir(tmp_path)
+        relative = str(Path("rel") / "briefdesk.sqlite")
+        settings = Settings(_env_file=None, DB_PATH=relative)
+        assert settings.db_path == relative, "config 把相对路径绝对化了"
+        ensure_database_parent_dir(settings.db_path)
+        assert (tmp_path / "rel").is_dir(), "相对路径未按 cwd 解析"
+
+    def test_tilde_db_path_is_not_expanded(self, tmp_path, monkeypatch):
+        """`~` 与 `%VAR%` 都不展开：原样交给 sqlite3，与文档口径一致。
+
+        展开会静默换库位——`~` 落到用户主目录、`%VAR%` 落到环境变量
+        指向处，而设置页显示的仍是字面值。
+        """
+        from briefdesk.config import Settings
+
+        monkeypatch.chdir(tmp_path)
+        paths = (str(Path("~") / "briefdesk.sqlite"), r"%TEMP%\briefdesk.sqlite")
+        for literal in paths:
+            settings = Settings(_env_file=None, DB_PATH=literal)
+            assert settings.db_path == literal, f"config 展开了 {literal}"
+            ensure_database_parent_dir(settings.db_path)
+        assert (tmp_path / "~").is_dir(), "`~` 被展开成用户主目录了"
+        assert (tmp_path / "%TEMP%").is_dir(), "`%VAR%` 被展开成环境变量值了"
+
     async def test_get_db_creates_parent_dir_on_first_start(self, tmp_path):
         """走真实入口：目录不存在时 get_db 自建目录并建库（首启唯一必炸点）。"""
         import briefdesk.db as db_module

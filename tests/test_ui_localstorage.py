@@ -4,7 +4,7 @@
 存储被策略禁用时 getItem/setItem 都会抛异常，未包的调用点一旦抛出会中断整个事件
 处理函数，把“持久化失败”升级成“功能不响应”——主题芯片不再调 applyTheme()、折叠
 开关不重渲染、隐藏已截止开关连按钮态都不更新。现读写统一经 lsGet/lsSet/lsGetJson/
-lsSetJson，异常在助手内吞掉并退回 fallback；本测试用 vm 加载真实 ui/app.js，注入
+lsSetJson，异常在助手内吞掉并退回 fallback；本测试用 vm 加载真实 briefdesk/ui/app.js，注入
 “必抛的 localStorage”守卫该行为。
 """
 

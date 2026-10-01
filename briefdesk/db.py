@@ -44,7 +44,7 @@ storage_lock = asyncio.Lock()
 logger = logging.getLogger(__name__)
 
 # 默认分类类别（名称, 描述, 颜色, 出厂启用态），共 13 类。描述即各类别的默认 prompt；
-# 颜色与前端类别色板一致（ui/app.js _CAT_PALETTE 含同名色块+图标组合）。
+# 颜色与前端类别色板一致（briefdesk/ui/app.js _CAT_PALETTE 含同名色块+图标组合）。
 # 出厂启用态：仅原五类 enabled=1；新增八类入库即停用（enabled=0），在设置页开启后参与分类。
 # 存量库经 _backfill_default_categories 一次性补齐缺失的默认类（user_version 门控）。
 # 注意：描述为「自包含」写法——排除句只描述本类不收的消息特征，

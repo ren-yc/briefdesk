@@ -1,4 +1,4 @@
-// 前端测试共用的最小 DOM/BOM 桩：把真实的 ui/app.js 加载进 Node vm。
+// 前端测试共用的最小 DOM/BOM 桩：把真实的 briefdesk/ui/app.js 加载进 Node vm。
 //
 // app.js 是同源 classic script（不能 ESM 化、不能 IIFE 包裹，见 docs/architecture.md），
 // 顶层就会 document.getElementById(...) 一大批常量，因此桩只需"任何 id 都返回一个
@@ -58,7 +58,7 @@ export function makeElement(selectorMap = null) {
   };
 }
 
-// 建立 sandbox 并执行 ui/app.js；返回的 sandbox 即 window，其上是 app.js 的全局符号。
+// 建立 sandbox 并执行 briefdesk/ui/app.js；返回的 sandbox 即 window，其上是 app.js 的全局符号。
 // localStorage 可选注入：需要测试「localStorage 初始态 → 模块级初始化」（如 listMode
 // 迁移读取）时传入受控实现；默认桩恒返回 null（首次使用）。
 export function loadAppJs({ localStorage: localStorageStub } = {}) {
@@ -120,7 +120,7 @@ export function loadAppJs({ localStorage: localStorageStub } = {}) {
 
   vm.createContext(sandbox);
   vm.runInContext(fs.readFileSync(path.join(ROOT, "briefdesk", "ui", "app.js"), "utf8"), sandbox, {
-    filename: "ui/app.js",
+    filename: "briefdesk/ui/app.js",
   });
   return { sandbox, document, getElement };
 }

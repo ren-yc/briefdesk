@@ -3,7 +3,7 @@
 修复背景：fetchContext 曾把“已带 ctx-target 高亮的 HTML”按
 source|session|msg_time 缓存，同会话同秒的多张卡会命中同一份 HTML，
 导致 A 卡的原文在 B 卡的上下文中被标绿。现在缓存原始消息列表、按卡片
-source_msg_id 现渲染；本测试用 vm 加载真实 ui/app.js 守卫该行为。
+source_msg_id 现渲染；本测试用 vm 加载真实 briefdesk/ui/app.js 守卫该行为。
 """
 
 import shutil

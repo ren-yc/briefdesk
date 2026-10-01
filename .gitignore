@@ -30,6 +30,8 @@ venv/
 # Dependencies
 *.egg-info/
 dist/
+# setuptools 就地重建的构建暂存目录（python -m build 的中间产物，不是 dist/）
+build/
 
 # Database
 *.sqlite

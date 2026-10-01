@@ -1,4 +1,4 @@
-// 搜索态与侧栏分类导航禁用开关的同步回归测试（Node vm 加载真实 ui/app.js）。
+// 搜索态与侧栏分类导航禁用开关的同步回归测试（Node vm 加载真实 briefdesk/ui/app.js）。
 //
 // 历史缺陷：`body.searching`（style.css 里 `body.searching #category-nav` 的
 // pointer-events:none + 「搜索中 · 分类导航已停用」说明）只在 applySearch 里切换，

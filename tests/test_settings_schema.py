@@ -242,6 +242,23 @@ class DefaultFactorySchemaTest(unittest.TestCase):
         expected = str(Path(data_dir) / "data" / "briefdesk.sqlite")
         self.assertEqual(items["DB_PATH"]["default"], expected)
 
+    def test_explicit_db_path_overrides_data_dir_default(self) -> None:
+        """显式 DB_PATH 完全覆盖默认路径：默认值只在该键缺省时参与。
+
+        环境变量与构造参数是两条独立的显式通道，任一存在都不应再回落到
+        「用户数据目录/data/briefdesk.sqlite」。
+        """
+        from briefdesk.config import Settings
+
+        data_dir = os.path.join(os.sep, "tmp", "data-dir")
+        explicit = os.path.join(os.sep, "custom", "briefdesk.sqlite")
+        with patch.dict(
+            os.environ, {"BRIEFDESK_DATA_DIR": data_dir, "DB_PATH": explicit}
+        ):
+            self.assertEqual(Settings(_env_file=None).db_path, explicit)
+        self.assertEqual(Settings(_env_file=None, DB_PATH=explicit).db_path, explicit)
+
+
 class PluginRunningSnapshotTest(unittest.TestCase):
     """插件运行快照：manager 保存运行实例并下发；未装配的插件显式「无运行值」。"""
 

@@ -1,4 +1,4 @@
-// 视觉回归对比工具（Playwright + 真实 ui/style.css + 真实 renderCard）。
+// 视觉回归对比工具（Playwright + 真实 briefdesk/ui/style.css + 真实 renderCard）。
 //
 // 为什么需要它：字号/间距/圆角的令牌化收敛是纯几何改写，ruff / mypy /
 // pytest / tests/test_ui_contrast.py 全都查不出"某处宽了 2 像素"。
@@ -132,12 +132,12 @@ sandbox.window = sandbox;
 sandbox.self = sandbox;
 vm.createContext(sandbox);
 vm.runInContext(fs.readFileSync(path.join(ROOT, "briefdesk", "ui", "app.js"), "utf8"), sandbox, {
-  filename: "ui/app.js",
+  filename: "briefdesk/ui/app.js",
 });
 
 for (const fn of ["renderCard", "renderItemRow"]) {
   if (typeof sandbox[fn] !== "function") {
-    console.error(`无法从 ui/app.js 取到 ${fn}()——渲染函数可能已改名`);
+    console.error(`无法从 briefdesk/ui/app.js 取到 ${fn}()——渲染函数可能已改名`);
     process.exit(1);
   }
 }

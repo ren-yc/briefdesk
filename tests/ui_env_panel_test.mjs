@@ -1,4 +1,4 @@
-// 启动配置（设置 → 启动配置/插件）面板逻辑回归（Node vm 加载真实 ui/app.js）。
+// 启动配置（设置 → 启动配置/插件）面板逻辑回归（Node vm 加载真实 briefdesk/ui/app.js）。
 //
 // 守七件事：
 // 1. _collectEnvChanges 的布尔分支必须跳过未变化项——此前缺失相等性检查，

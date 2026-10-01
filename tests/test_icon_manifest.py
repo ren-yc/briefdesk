@@ -1,7 +1,7 @@
 """图标清单守卫测试。
 
-约定（见 ui/icons/README.md 与 ui/icon-manifest.txt）：
-- ``ui/icons/*.svg`` 文件集合必须与清单完全一致（多、少都算失败）；
+约定（见 briefdesk/ui/icons/README.md 与 briefdesk/ui/icon-manifest.txt）：
+- ``briefdesk/ui/icons/*.svg`` 文件集合必须与清单完全一致（多、少都算失败）；
 - 代码中引用的 ``/icons/<name>.svg`` 必须已登记且文件真实存在；
 - 旧中文图标库路径 ``/图标/`` 不得回流；
 - 插件前端内联 ``<svg>`` 形态：必须跟随主题色（``currentColor``）、
@@ -27,7 +27,7 @@ _SOURCES = [
 
 _ICON_REF = re.compile(r"/icons/[\w.-]+\.svg")
 
-# 与 ui/app.js 的 _SVG_CONTENT_RE 保持一致：可选前置 XML 注释 + <svg> 根标签。
+# 与 briefdesk/ui/app.js 的 _SVG_CONTENT_RE 保持一致：可选前置 XML 注释 + <svg> 根标签。
 # 不满足该格式的文件会被内联管线静默拒绝（退回 <img> 形态，深色模式恒黑）
 _SVG_CONTENT = re.compile(r"^\s*(?:<!--[\s\S]*?-->\s*)*<svg[\s>]")
 
@@ -55,11 +55,11 @@ def _all_references() -> set[str]:
 
 
 def test_manifest_matches_disk() -> None:
-    """清单与 ui/icons/ 磁盘文件集合双向一致。"""
+    """清单与 briefdesk/ui/icons/ 磁盘文件集合双向一致。"""
     listed = _manifest_paths()
     on_disk = {f"/icons/{p.name}" for p in ICONS_DIR.glob("*.svg")}
     assert listed == on_disk, (
-        f"清单与 ui/icons/ 不一致："
+        f"清单与 briefdesk/ui/icons/ 不一致："
         f"仅清单有={sorted(listed - on_disk)} 仅磁盘有={sorted(on_disk - listed)}"
     )
 
@@ -74,7 +74,7 @@ def test_referenced_icons_listed_and_exist() -> None:
     }
     assert not missing, f"引用的图标文件不存在: {sorted(missing)}"
     unlisted = refs - listed
-    assert not unlisted, f"引用未登记进 ui/icon-manifest.txt: {sorted(unlisted)}"
+    assert not unlisted, f"引用未登记进 briefdesk/ui/icon-manifest.txt: {sorted(unlisted)}"
 
 
 def test_svg_files_acceptable_by_inline_pipeline() -> None:
@@ -97,7 +97,7 @@ def test_no_legacy_icon_path_references() -> None:
 def test_plugin_inline_svg_follows_theme_and_stays_safe() -> None:
     """插件前端的厂商内联 <svg> 必须跟随主题色且不带事件处理器/脚本。
 
-    约定（ui/icons/README.md「插件图标通道」）：插件图标二选一——复用核心
+    约定（briefdesk/ui/icons/README.md「插件图标通道」）：插件图标二选一——复用核心
     ``/icons/<name>.svg``（引用由上面的守卫自动覆盖），或在插件 ui.js 内联
     Lucide SVG（``stroke``/``fill="currentColor"``，颜色随 CSS 继承）。
     内联形态不得硬编码颜色（深色模式恒黑），不得携带 ``on*`` 事件属性或

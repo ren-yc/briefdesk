@@ -77,7 +77,7 @@ async def _local_security_guard(request: Request, call_next):
     response = await call_next(request)
     response.headers.setdefault(
         "Content-Security-Policy",
-        # script-src 的 sha256 白名单放行 ui/index.html 的 <head> 内联主题脚本
+        # script-src 的 sha256 白名单放行 briefdesk/ui/index.html 的 <head> 内联主题脚本
         # （防首绘闪烁：深色用户必须在首次绘制前落定 data-theme）。
         # 该 hash 与 tests/test_csp_inline_theme.py 的守卫测试对齐——未来若改动
         # 内联脚本内容，守卫测试会失败并提示重算。

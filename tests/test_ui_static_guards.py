@@ -1,4 +1,4 @@
-"""ui/app.js 静态守卫：图标内联解析安全与动态选择器转义。
+"""briefdesk/ui/app.js 静态守卫：图标内联解析安全与动态选择器转义。
 
 按 tests/test_announcements.py::UiWiringTest 的静态检查风格：读 app.js
 源码断言关键写法存在/不存在。

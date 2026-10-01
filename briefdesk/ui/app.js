@@ -3988,7 +3988,7 @@ async function loadEnabledSources() {
 // ── Categories ──
 
 // 预设色板（颜色 + 图标组合）：默认五类沿用原颜色与图标（视觉不变）；
-// 补充色块从 ui/icons/ 目录挑选语义合理的通用图标；默认灰配通用"文件"图标
+// 补充色块从 briefdesk/ui/icons/ 目录挑选语义合理的通用图标；默认灰配通用"文件"图标
 const _CAT_PALETTE = [
   { color: "#2563EB", icon: "/icons/calendar.svg" },
   { color: "#7C3AED", icon: "/icons/users.svg" },
@@ -5437,7 +5437,7 @@ function initTheme() {
 }
 
 // ── 网页图标（favicon）：素材库图标 + 随机主题色 ──
-// 直接使用 ui/icons/ 的 Lucide SVG（stroke="currentColor"），加载后把颜色
+// 直接使用 briefdesk/ui/icons/ 的 Lucide SVG（stroke="currentColor"），加载后把颜色
 // 替换为随机主题色并以内联 data URI 呈现；加载失败保留默认 favicon。
 const _FAVICON_ICON = "/icons/layout-grid.svg";
 const _FAVICON_COLORS = [

@@ -2,7 +2,7 @@
 
 设置「群聊筛选」与首次使用向导 step2 是同一套筛选规则（类型多选 + 消息源多选 +
 名称搜索 + 时间窗口，四者 AND 叠加），历史上两侧各抄了一份实现，改一处漏一处。
-现两侧都由 createSessionFilter 产出实例；本测试用 vm 加载真实 ui/app.js，
+现两侧都由 createSessionFilter 产出实例；本测试用 vm 加载真实 briefdesk/ui/app.js，
 守卫 sessionRowMatches 的四维语义与工厂实例的过滤/三态/档位规范化行为。
 """
 
