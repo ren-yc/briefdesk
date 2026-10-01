@@ -46,18 +46,17 @@ PROJECT_NAME = "briefdesk"
 #: 依赖始终走正式 PyPI；本包按 --install-from 指定的索引取（两段式，每段只对一个索引）
 PYPI_INDEX = "https://pypi.org/simple/"
 
-#: 索引端点与**下载来源标记**。标记刻意区分开："pypi.org" 是 "test.pypi.org" 的子串，
-#: 拿它判来源会把试发索引的下载误判成正式索引的，等于没验发布物。
+#: 索引端点。来源判定用 `simple` 拼出的 pip 索引行（见 assert_index_install_log），
+#: 不靠下载主机名：pip 对 sdist 只打印文件名（`Downloading briefdesk-0.1.0.tar.gz`），
+#: CDN 主机名只在一部分产物上出现——正式发布时实测会假红。
 INDEXES = {
     "testpypi": {
         "simple": "https://test.pypi.org/simple/",
         "json": "https://test.pypi.org/pypi",
-        "marker": "test.pypi.org",
     },
     "pypi": {
         "simple": "https://pypi.org/simple/",
         "json": "https://pypi.org/pypi",
-        "marker": "files.pythonhosted.org",
     },
 }
 
@@ -361,8 +360,9 @@ def assert_index_install_log(output: str, version: str, *, index: str, from_sdis
     两类静默失败只能靠日志抓：
     - 纯 Python 包 pip 默认选 wheel：不比对产物名，`--from-sdist` 被跳过后冒烟依旧全绿，
       「sdist 少带运行时资源」这类问题永远看不到；
-    - 来源标记必须与目标索引一致：正式索引的验证若混进试发索引的下载，等于没验发布物。
-      `pypi.org` 是 `test.pypi.org` 的子串，所以正式索引的标记取 `files.pythonhosted.org`。
+    - 来源必须与目标索引一致：正式索引的验证若混进试发索引的下载，等于没验发布物。
+      判据取 pip 必然打印的 `Looking in indexes: <url>` 行，且**带前缀整体比对**——
+      `test.pypi.org/simple/` 以 `pypi.org/simple/` 结尾，裸子串判定会互相包含。
     """
     if from_sdist:
         artifact_lines = [
@@ -386,10 +386,10 @@ def assert_index_install_log(output: str, version: str, *, index: str, from_sdis
             "安装日志里没有本地构建记录——源码包可能被换成了现成 wheel"
             f"（日志片段：{_package_log_excerpt(output)}）"
         )
-    marker = INDEXES[index]["marker"]
-    if marker not in output:
+    index_line = f"Looking in indexes: {INDEXES[index]['simple']}"
+    if index_line not in output:
         raise SmokeFailure(
-            f"安装日志里没有 {marker}——无法证明包来自 {index}"
+            f"安装日志里没有「{index_line}」——无法证明包来自 {index}"
             f"（日志片段：{_package_log_excerpt(output)}）"
         )
     if index == "pypi" and "test.pypi.org" in output:

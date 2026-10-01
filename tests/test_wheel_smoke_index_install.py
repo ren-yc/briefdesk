@@ -161,17 +161,19 @@ def test_index_metadata_does_not_retry_other_http_errors(monkeypatch: pytest.Mon
 
 def test_sdist_log_with_download_and_build_passes() -> None:
     output = (
-        f"Downloading {INDEXES['testpypi']['simple']}briefdesk-{VERSION}.tar.gz (548 kB)\n"
+        f"Looking in indexes: {INDEXES['testpypi']['simple']}\n"
+        f"Downloading {PROJECT_NAME}-{VERSION}.tar.gz (548 kB)\n"
         "Building wheel for briefdesk (pyproject.toml): finished with status 'done'\n"
     )
 
     assert_index_install_log(output, VERSION, index="testpypi", from_sdist=True)  # 不抛即通过
 
 
-def test_wheel_log_with_pypi_marker_passes() -> None:
+def test_wheel_log_with_the_pypi_index_line_passes() -> None:
+    """来源判据是 pip 必然打印的索引行：下载行可能只有文件名（sdist 实测如此）。"""
     output = (
-        f"Downloading {INDEXES['pypi']['marker']}/packages/ab/cd/"
-        f"briefdesk-{VERSION}-py3-none-any.whl (622 kB)\n"
+        f"Looking in indexes: {INDEXES['pypi']['simple']}\n"
+        f"Downloading {PROJECT_NAME}-{VERSION}-py3-none-any.whl (622 kB)\n"
     )
 
     assert_index_install_log(output, VERSION, index="pypi", from_sdist=False)
@@ -198,20 +200,23 @@ def test_sdist_without_local_build_is_rejected() -> None:
         assert_index_install_log(output, VERSION, index="testpypi", from_sdist=True)
 
 
-def test_pypi_log_without_its_marker_is_rejected() -> None:
-    """正式索引的标记取 files.pythonhosted.org：test.pypi.org 是它的子串反例，不能当判据。"""
-    output = f"Downloading {INDEXES['testpypi']['simple']}{PROJECT_NAME}-{VERSION}-py3-none-any.whl\n"
+def test_pypi_log_without_its_index_line_is_rejected() -> None:
+    """试发索引的索引行以 `pypi.org/simple/` 结尾：裸子串判定会漏，必须带前缀整体比对。"""
+    output = (
+        f"Looking in indexes: {INDEXES['testpypi']['simple']}\n"
+        f"Downloading {PROJECT_NAME}-{VERSION}-py3-none-any.whl (622 kB)\n"
+    )
 
-    with pytest.raises(SmokeFailure, match="files.pythonhosted.org"):
+    with pytest.raises(SmokeFailure, match="Looking in indexes"):
         assert_index_install_log(output, VERSION, index="pypi", from_sdist=False)
 
 
 def test_pypi_log_mixing_testpypi_is_rejected() -> None:
-    """依赖从 PyPI 下、本包却来自试发索引：两个标记同时出现时必须失败。"""
+    """本包确实从 PyPI 来，但日志里混进了试发索引（例如有人加回 --extra-index-url）：必须失败。"""
     output = (
-        f"Downloading {INDEXES['pypi']['marker']}/packages/ab/cd/fastapi-0.142.0-py3-none-any.whl\n"
-        f"Downloading {PROJECT_NAME}-{VERSION}-py3-none-any.whl\n"
-        f"Looking in indexes: {INDEXES['testpypi']['simple']}\n"
+        f"Looking in indexes: {INDEXES['pypi']['simple']}\n"
+        f"Downloading {PROJECT_NAME}-{VERSION}-py3-none-any.whl (622 kB)\n"
+        f"  Link requires https://test.pypi.org/simple/\n"
     )
 
     with pytest.raises(SmokeFailure, match="混进了试发索引"):
