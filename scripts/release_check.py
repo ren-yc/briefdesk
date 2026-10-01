@@ -162,7 +162,11 @@ def main() -> int:
         artifacts = build_artifacts(version, dist_dir)
         if args.upload:
             upload(artifacts)
-            log(f"已发布 {version}；端到端验证：python scripts/wheel_smoke.py --install-from testpypi --version {version}")
+            log(
+                f"已发布 {version}；端到端验证（两条安装路径都要跑）："
+                f"python scripts/wheel_smoke.py --install-from testpypi --version {version}；"
+                f"--install-from testpypi-sdist --version {version}（源码分发 + 本地构建）"
+            )
         else:
             log("未上传。确认无误后加 --upload，或手工："
                 f"python -m twine upload --repository testpypi --non-interactive {' '.join(a.name for a in artifacts)}")

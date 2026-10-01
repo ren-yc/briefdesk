@@ -3,6 +3,10 @@
 为什么单独成脚本、只在 CI 的独立 job 跑：它要建临时 venv、装 wheel、起真服务并触发写入，
 分钟级且与构建强耦合；放进 pytest 会给「跑测试」引入「先能构建」的隐式前置。
 
+两个索引安装模式（--install-from testpypi / testpypi-sdist）跳过构建、直接验发布物：前者装索引上的
+wheel，后者用 --no-binary 强制走 sdist 并在本地构建——纯 Python 包 pip 默认只选 wheel，不强制就永远
+测不到源码分发那条路（sdist 少带运行时资源、从 sdist 重建的 wheel 与直接构建的不一致，都只在它上面暴露）。
+
 验收要点（每步都对应一种「装完 wheel 才发现」的失败）：
 1. 只构建到临时目录并锁定唯一 wheel——复用 dist/ 会累积旧包，装到上一个版本也能通过；
 2. wheel 内数据成员与期望集合双向相等（多出即失败：reports/、*.fromweb.json、.tmp/ 混入）；
@@ -24,6 +28,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import tomllib
 import urllib.error
 import urllib.request
 import zipfile
@@ -34,8 +39,12 @@ from packaging.requirements import Requirement
 
 REPO = Path(__file__).resolve().parent.parent
 
-#: 索引上的项目名：--install-from testpypi 时用它查元数据与安装
+#: 索引上的项目名：--install-from testpypi / testpypi-sdist 时用它查元数据与安装
 PROJECT_NAME = "briefdesk"
+
+#: 两个索引各自独立使用，任何一步都不得同时指向两者（依赖混淆见 install_from_testpypi）
+PYPI_INDEX = "https://pypi.org/simple/"
+TESTPYPI_INDEX = "https://test.pypi.org/simple/"
 
 if str(REPO) not in sys.path:
     # 直跑时 sys.path[0] 是 scripts/：包路径需显式补，否则 scripts.runtime_manifest 导不到
@@ -75,6 +84,11 @@ INSTALLED_GUARD = (
     "_p = pathlib.Path(briefdesk.__file__).resolve(); "
     "assert 'site-packages' in _p.parts, f'导入到了非安装路径: {_p}'; "
 )
+
+#: 版本探测片段：必须**带 INSTALLED_GUARD 且在非仓库 cwd 下执行**——仓库里 `python -m build`
+#: 留下的 briefdesk.egg-info 会被 importlib.metadata 当成同名分发包，把发布版本读成仓库的静态
+#: 版本号（实测把 0.1.0.dev1 读成 0.1.0），断言结果于是随构建残留漂移。
+VERSION_PROBE = INSTALLED_GUARD + "import importlib.metadata as m; print(m.version('briefdesk'))"
 
 
 def run(
@@ -252,44 +266,125 @@ def published_requirements(version: str) -> list[str]:
     return runtime
 
 
-def install_from_testpypi(python: Path, version: str) -> None:
+def build_requirements() -> list[str]:
+    """构建后端下限取自 pyproject 的 `build-system.requires`，不写死常量。
+
+    为什么必须同源：关掉构建隔离后 pip **不校验** `build-system.requires`，装到偏旧的后端
+    照样构建成功——例如 PEP 639 所需的 `setuptools>=77` 被漏掉时，从 sdist 重建的 wheel
+    元数据与直接构建的不同，而资源集合断言恰好看不出来（成员名一致）。空列表说明读取路径
+    失效，此时必须显式失败，不能让构建悄悄用默认后端。
+    """
+    payload = tomllib.loads((REPO / "pyproject.toml").read_text(encoding="utf-8"))
+    requires = payload.get("build-system", {}).get("requires") or []
+    return [str(item) for item in requires]
+
+
+def index_install_command(python: Path, version: str, *, from_sdist: bool) -> list[str]:
+    """装**本包**的命令（依赖已由调用方从 PyPI 装好，所以 --no-deps）。
+
+    from_sdist 的三个开关各有理由，缺一个都会静默失效：
+    - `--no-binary` **只限定本包**：`:all:` 会把运行时依赖也拖去源码构建，既慢又会把依赖的
+      构建失败算到本包头上；
+    - `--no-cache-dir`：**实测**（pip 26.1.2）HTTP 缓存里有同名 wheel 时，pip 会直接
+      `Using cached briefdesk-…-py3-none-any.whl`，`--no-binary` 形同虚设——源码路径被静默
+      跳过，而资源断言照样全绿。缓存只对本包这一步关掉，依赖那步仍走缓存。
+    - `--no-build-isolation`：隔离环境解析 `build-system.requires` 用的仍是当前索引，等于
+      把 TestPyPI 上的同名包拉进构建环境——构建后端改由调用方先从 PyPI 预装。
+    """
+    command = [
+        str(python), "-m", "pip", "install", "--no-deps", "-v",
+        "--index-url", TESTPYPI_INDEX,
+    ]
+    if from_sdist:
+        command += ["--no-binary", PROJECT_NAME, "--no-cache-dir", "--no-build-isolation"]
+    command.append(f"{PROJECT_NAME}=={version}")
+    return command
+
+
+def _package_log_excerpt(output: str, limit: int = 4) -> str:
+    """失败时给出能直接定位的行：pip 的 `Using cached …whl` 就藏在这些行里。"""
+    interesting = [
+        line.strip()
+        for line in output.splitlines()
+        if "briefdesk" in line or "Downloading" in line or "Using cached" in line
+    ]
+    return " | ".join(interesting[:limit]) or output.strip()[-200:]
+
+
+def assert_sdist_install_log(output: str, version: str) -> None:
+    """日志必须证明走的是 sdist，而不只是「装成功了」。
+
+    纯 Python 包 pip 默认选 wheel：sdist 被静默跳过时，冒烟依旧全绿，而「sdist 少带运行时
+    资源」「从 sdist 重建的 wheel 与直接构建的不一致」这两类问题永远看不到——所以断言看
+    日志证据（下载到 .tar.gz + 本地构建），不看安装结果。
+    """
+    sdist_name = f"{PROJECT_NAME}-{version}.tar.gz"
+    if sdist_name not in output:
+        raise SmokeFailure(
+            f"安装日志里没有 {sdist_name}——pip 没有走源码分发包"
+            f"（日志片段：{_package_log_excerpt(output)}）"
+        )
+    if "Building wheel for" not in output:
+        raise SmokeFailure(
+            "安装日志里没有本地构建记录——源码包可能被换成了现成 wheel"
+            f"（日志片段：{_package_log_excerpt(output)}）"
+        )
+
+
+def install_from_testpypi(
+    python: Path, version: str, *, from_sdist: bool = False, cwd: Path | None = None
+) -> None:
     """从 TestPyPI 装指定版本：**两段式，每段只对一个索引**。
 
     为什么不用 --index-url testpypi + --extra-index-url pypi：pip 会把两个索引合并后取
     最高版本，而 TestPyPI 上存在别人试传的同名依赖（实测 fastapi 1.0 稳定版 vs 正式 PyPI
     的 0.142.x），依赖会被影子化成残缺 sdist，构建直接失败。两段式每段只有一个索引，
     混淆不可能发生，且「包来自 test.pypi.org」的日志断言才有意义。
+
+    from_sdist=True 走源码分发包：装的是 sdist、构建在本地发生（理由见 index_install_command
+    与 assert_sdist_install_log）。
+
+    cwd 是**探测版本时的工作目录**，必须由调用方给一个非仓库目录：`python -c` 把 cwd 放进
+    sys.path 首位，仓库根的 briefdesk.egg-info 会让 importlib.metadata 读到那个版本（见 VERSION_PROBE）。
     """
-    log(f"从 TestPyPI 安装 briefdesk=={version}（依赖走 PyPI，本包走 TestPyPI）")
+    source = "源码分发" if from_sdist else "wheel"
+    log(f"从 TestPyPI 安装 {PROJECT_NAME}=={version}（依赖走 PyPI，本包走 TestPyPI，{source}路径）")
     requires = published_requirements(version)
     if requires:
-        log(f"先装 {len(requires)} 条运行时依赖（--index-url https://pypi.org/simple/）")
+        log(f"先装 {len(requires)} 条运行时依赖（--index-url {PYPI_INDEX}）")
         run(
-            [str(python), "-m", "pip", "install", "--index-url", "https://pypi.org/simple/", *requires],
+            [str(python), "-m", "pip", "install", "--index-url", PYPI_INDEX, *requires],
             timeout=1800,
         )
-    out = run(
-        [
-            str(python), "-m", "pip", "install", "--no-deps", "-v",
-            "--index-url", "https://test.pypi.org/simple/",
-            f"briefdesk=={version}",
-        ],
-        timeout=900,
-    )
+    if from_sdist:
+        backend = build_requirements()
+        if not backend:
+            raise SmokeFailure("pyproject.toml 的 build-system.requires 为空——无法预装构建后端")
+        log(f"预装构建后端：{' '.join(backend)}（--index-url {PYPI_INDEX}）")
+        run(
+            [str(python), "-m", "pip", "install", "--index-url", PYPI_INDEX, *backend],
+            timeout=600,
+        )
+    out = run(index_install_command(python, version, from_sdist=from_sdist), timeout=900)
     if "test.pypi.org" not in out:
         raise SmokeFailure("安装日志里没有 test.pypi.org——无法证明包来自 TestPyPI")
+    if from_sdist:
+        assert_sdist_install_log(out, version)
     run([str(python), "-m", "pip", "check"], timeout=300)  # 依赖闭包自洽（缺依赖即失败）
     installed = run(
-        [str(python), "-c", "import importlib.metadata as m; print(m.version('briefdesk'))"],
+        [str(python), "-c", VERSION_PROBE],
         timeout=120,
+        cwd=cwd or Path(tempfile.gettempdir()),
     ).strip()
     if installed != version:
         raise SmokeFailure(f"安装版本不符：期望 {version}，实际 {installed}")
-    log(f"来源、版本与依赖闭包断言通过：{installed} 来自 test.pypi.org")
+    log(f"来源、版本与依赖闭包断言通过：{installed} 来自 test.pypi.org（{source}路径）")
 
 
 def assert_installed_resources(python: Path, cwd: Path) -> None:
     """装完按与 wheel 冒烟同一份期望集合核对磁盘资源（多出与缺失都失败）。
+
+    源码安装与 wheel 安装共用这一份断言：sdist 少了运行时资源时，缺项就在这里暴露。
 
     cwd 必须是**非仓库目录**：`python -c` 把 cwd 放 sys.path 首位，仓库根会让导入落到
     源码树，于是源码树里那些「不进包」的文件（plugins/benchmark/README.md、图标清单等）
@@ -311,7 +406,7 @@ def assert_installed_resources(python: Path, cwd: Path) -> None:
     extra, missing = sorted(installed - expected), sorted(expected - installed)
     if extra or missing:
         raise SmokeFailure(f"安装后的资源与期望集合不一致：多出 {extra}，缺失 {missing}")
-    log(f"资源断言通过：{len(installed)} 个数据文件来自该 wheel")
+    log(f"资源断言通过：{len(installed)} 个数据文件来自安装的包")
 
 
 def wait_ready(base: str, log_path: Path, timeout: float = 60.0) -> None:
@@ -521,10 +616,13 @@ def main() -> int:
             except (OSError, ValueError):
                 pass  # 非可重配置流（测试捕获/已关闭）保持原样
     parser = argparse.ArgumentParser(
-        description="wheel 冒烟：默认装本地构建的 wheel；--install-from testpypi 则从索引安装"
+        description="wheel 冒烟：默认装本地构建的 wheel；--install-from testpypi 装索引上的 wheel，"
+        "testpypi-sdist 装索引上的源码分发包（强制本地构建）"
     )
-    parser.add_argument("--install-from", choices=("local", "testpypi"), default="local")
-    parser.add_argument("--version", default="", help="--install-from testpypi 时必填：断言装到的版本")
+    parser.add_argument("--install-from", choices=("local", "testpypi", "testpypi-sdist"), default="local")
+    parser.add_argument(
+        "--version", default="", help="--install-from testpypi / testpypi-sdist 时必填：断言装到的版本"
+    )
     args = parser.parse_args()
     tmp = Path(tempfile.mkdtemp(prefix="briefdesk-smoke-"))
     data_dir = tmp / "data"
@@ -532,13 +630,18 @@ def main() -> int:
     settings_file = tmp / "settings.env"
     app_log = tmp / "app.log"
     process: subprocess.Popen | None = None
+    failed = False
     try:
-        if args.install_from == "testpypi":
+        if args.install_from in ("testpypi", "testpypi-sdist"):
             if not args.version:
-                raise SmokeFailure("--install-from testpypi 需要 --version（例如 --version 0.1.0.dev1）")
+                raise SmokeFailure(
+                    f"--install-from {args.install_from} 需要 --version（例如 --version 0.1.0.dev1）"
+                )
             venv = make_venv(tmp)
             python = venv_python(venv)
-            install_from_testpypi(python, args.version)
+            install_from_testpypi(
+                python, args.version, from_sdist=args.install_from == "testpypi-sdist", cwd=tmp
+            )
             assert_installed_resources(python, tmp)
         else:
             wheel = build_wheel(tmp)
@@ -585,8 +688,9 @@ def main() -> int:
         log("冒烟通过")
         return 0
     except SmokeFailure as error:
+        failed = True
         print(f"[wheel-smoke] 失败: {error}", file=sys.stderr, flush=True)
-        print(f"[wheel-smoke] 现场保留在 {tmp}（含 app.log）", file=sys.stderr, flush=True)
+        print(f"[wheel-smoke] 现场保留在 {tmp}（含 venv 与日志，便于定位）", file=sys.stderr, flush=True)
         return 1
     finally:
         if process is not None and process.poll() is None:
@@ -596,8 +700,10 @@ def main() -> int:
             except subprocess.TimeoutExpired:
                 process.kill()
                 process.wait(timeout=10)
-        if process is None or process.poll() is not None:
-            # 只有确认应用进程已退出才清理目录（Windows 上被占用的文件删不掉）
+        # 失败时保留现场：原先只要应用进程没起来就删目录，而报错信息同时声称"现场保留"，
+        # 拿到的路径其实已经不存在（诊断价值归零）；成功路径与"进程未退出就不删"的 Windows
+        # 约束都不变。
+        if not failed and (process is None or process.poll() is not None):
             shutil.rmtree(tmp, ignore_errors=True)
 
 
