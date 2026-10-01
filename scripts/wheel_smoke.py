@@ -3,9 +3,10 @@
 为什么单独成脚本、只在 CI 的独立 job 跑：它要建临时 venv、装 wheel、起真服务并触发写入，
 分钟级且与构建强耦合；放进 pytest 会给「跑测试」引入「先能构建」的隐式前置。
 
-两个索引安装模式（--install-from testpypi / testpypi-sdist）跳过构建、直接验发布物：前者装索引上的
-wheel，后者用 --no-binary 强制走 sdist 并在本地构建——纯 Python 包 pip 默认只选 wheel，不强制就永远
-测不到源码分发那条路（sdist 少带运行时资源、从 sdist 重建的 wheel 与直接构建的不一致，都只在它上面暴露）。
+索引安装模式（--install-from testpypi / pypi，可加 --from-sdist）跳过构建、直接验发布物：默认装索引
+上的 wheel，加 --from-sdist 则用 --no-binary 强制走 sdist 并在本地构建——纯 Python 包 pip 默认只选
+wheel，不强制就永远测不到源码分发那条路（sdist 少带运行时资源、从 sdist 重建的 wheel 与直接构建的
+不一致，都只在它上面暴露）。
 
 验收要点（每步都对应一种「装完 wheel 才发现」的失败）：
 1. 只构建到临时目录并锁定唯一 wheel——复用 dist/ 会累积旧包，装到上一个版本也能通过；
@@ -39,12 +40,26 @@ from packaging.requirements import Requirement
 
 REPO = Path(__file__).resolve().parent.parent
 
-#: 索引上的项目名：--install-from testpypi / testpypi-sdist 时用它查元数据与安装
+#: 索引上的项目名：--install-from testpypi / pypi 时用它查元数据与安装
 PROJECT_NAME = "briefdesk"
 
-#: 两个索引各自独立使用，任何一步都不得同时指向两者（依赖混淆见 install_from_testpypi）
+#: 依赖始终走正式 PyPI；本包按 --install-from 指定的索引取（两段式，每段只对一个索引）
 PYPI_INDEX = "https://pypi.org/simple/"
-TESTPYPI_INDEX = "https://test.pypi.org/simple/"
+
+#: 索引端点与**下载来源标记**。标记刻意区分开："pypi.org" 是 "test.pypi.org" 的子串，
+#: 拿它判来源会把试发索引的下载误判成正式索引的，等于没验发布物。
+INDEXES = {
+    "testpypi": {
+        "simple": "https://test.pypi.org/simple/",
+        "json": "https://test.pypi.org/pypi",
+        "marker": "test.pypi.org",
+    },
+    "pypi": {
+        "simple": "https://pypi.org/simple/",
+        "json": "https://pypi.org/pypi",
+        "marker": "files.pythonhosted.org",
+    },
+}
 
 if str(REPO) not in sys.path:
     # 直跑时 sys.path[0] 是 scripts/：包路径需显式补，否则 scripts.runtime_manifest 导不到
@@ -237,13 +252,13 @@ def install_wheel(venv: Path, wheel: Path) -> None:
     run([str(python), "-m", "pip", "install", "--quiet", str(wheel)], timeout=900)
 
 
-def published_requirements(version: str) -> list[str]:
-    """从索引元数据取该版本的**运行时**依赖（按 marker 过滤掉 extra 行）。
+def published_requirements(version: str, *, index: str) -> list[str]:
+    """从**目标索引**的元数据取该版本的运行时依赖（按 marker 过滤掉 extra 行）。
 
     依赖清单取自索引而不是本地 pyproject：装的就是发布物声明的依赖，本地文件改了而没
     重新发布时，这里能立刻暴露差异。
     """
-    url = f"https://test.pypi.org/pypi/{PROJECT_NAME}/{version}/json"
+    url = f"{INDEXES[index]['json']}/{PROJECT_NAME}/{version}/json"
     try:
         with urllib.request.urlopen(url, timeout=60) as response:
             payload = json.loads(response.read().decode("utf-8"))
@@ -279,7 +294,7 @@ def build_requirements() -> list[str]:
     return [str(item) for item in requires]
 
 
-def index_install_command(python: Path, version: str, *, from_sdist: bool) -> list[str]:
+def index_install_command(python: Path, version: str, *, index: str, from_sdist: bool) -> list[str]:
     """装**本包**的命令（依赖已由调用方从 PyPI 装好，所以 --no-deps）。
 
     from_sdist 的三个开关各有理由，缺一个都会静默失效：
@@ -287,13 +302,13 @@ def index_install_command(python: Path, version: str, *, from_sdist: bool) -> li
       构建失败算到本包头上；
     - `--no-cache-dir`：**实测**（pip 26.1.2）HTTP 缓存里有同名 wheel 时，pip 会直接
       `Using cached briefdesk-…-py3-none-any.whl`，`--no-binary` 形同虚设——源码路径被静默
-      跳过，而资源断言照样全绿。缓存只对本包这一步关掉，依赖那步仍走缓存。
+      跳过，而资源断言照样全绿。缓存只对本包这一步关掉，依赖那步仍走缓存；
     - `--no-build-isolation`：隔离环境解析 `build-system.requires` 用的仍是当前索引，等于
-      把 TestPyPI 上的同名包拉进构建环境——构建后端改由调用方先从 PyPI 预装。
+      把该索引上的同名包拉进构建环境——构建后端改由调用方先从 PyPI 预装。
     """
     command = [
         str(python), "-m", "pip", "install", "--no-deps", "-v",
-        "--index-url", TESTPYPI_INDEX,
+        "--index-url", INDEXES[index]["simple"],
     ]
     if from_sdist:
         command += ["--no-binary", PROJECT_NAME, "--no-cache-dir", "--no-build-isolation"]
@@ -311,45 +326,66 @@ def _package_log_excerpt(output: str, limit: int = 4) -> str:
     return " | ".join(interesting[:limit]) or output.strip()[-200:]
 
 
-def assert_sdist_install_log(output: str, version: str) -> None:
-    """日志必须证明走的是 sdist，而不只是「装成功了」。
+def assert_index_install_log(output: str, version: str, *, index: str, from_sdist: bool) -> None:
+    """日志必须证明「从哪个索引、拿了哪件产物」，而不只是「装成功了」。
 
-    纯 Python 包 pip 默认选 wheel：sdist 被静默跳过时，冒烟依旧全绿，而「sdist 少带运行时
-    资源」「从 sdist 重建的 wheel 与直接构建的不一致」这两类问题永远看不到——所以断言看
-    日志证据（下载到 .tar.gz + 本地构建），不看安装结果。
+    两类静默失败只能靠日志抓：
+    - 纯 Python 包 pip 默认选 wheel：不比对产物名，`--from-sdist` 被跳过后冒烟依旧全绿，
+      「sdist 少带运行时资源」这类问题永远看不到；
+    - 来源标记必须与目标索引一致：正式索引的验证若混进试发索引的下载，等于没验发布物。
+      `pypi.org` 是 `test.pypi.org` 的子串，所以正式索引的标记取 `files.pythonhosted.org`。
     """
-    sdist_name = f"{PROJECT_NAME}-{version}.tar.gz"
-    if sdist_name not in output:
+    if from_sdist:
+        artifact_lines = [
+            line for line in output.splitlines() if f"{PROJECT_NAME}-{version}.tar.gz" in line
+        ]
+        artifact = "源码分发包"
+    else:
+        artifact_lines = [
+            line
+            for line in output.splitlines()
+            if f"{PROJECT_NAME}-{version}-" in line and ".whl" in line
+        ]
+        artifact = "wheel"
+    if not artifact_lines:
         raise SmokeFailure(
-            f"安装日志里没有 {sdist_name}——pip 没有走源码分发包"
+            f"安装日志里没有 {PROJECT_NAME}-{version} 的{artifact}记录——pip 可能选了另一件产物"
             f"（日志片段：{_package_log_excerpt(output)}）"
         )
-    if "Building wheel for" not in output:
+    if from_sdist and "Building wheel for" not in output:
         raise SmokeFailure(
             "安装日志里没有本地构建记录——源码包可能被换成了现成 wheel"
             f"（日志片段：{_package_log_excerpt(output)}）"
         )
+    marker = INDEXES[index]["marker"]
+    if marker not in output:
+        raise SmokeFailure(
+            f"安装日志里没有 {marker}——无法证明包来自 {index}"
+            f"（日志片段：{_package_log_excerpt(output)}）"
+        )
+    if index == "pypi" and "test.pypi.org" in output:
+        raise SmokeFailure("安装日志里出现 test.pypi.org——正式索引的验证混进了试发索引")
 
 
-def install_from_testpypi(
-    python: Path, version: str, *, from_sdist: bool = False, cwd: Path | None = None
+def install_from_index(
+    python: Path, version: str, *, index: str, from_sdist: bool = False, cwd: Path | None = None
 ) -> None:
-    """从 TestPyPI 装指定版本：**两段式，每段只对一个索引**。
+    """从指定索引装该索引上的发布物：**两段式，每段只对一个索引**（依赖始终走正式 PyPI）。
 
-    为什么不用 --index-url testpypi + --extra-index-url pypi：pip 会把两个索引合并后取
+    为什么不用「目标索引 + --extra-index-url pypi」一步装：pip 会把两个索引合并后取
     最高版本，而 TestPyPI 上存在别人试传的同名依赖（实测 fastapi 1.0 稳定版 vs 正式 PyPI
     的 0.142.x），依赖会被影子化成残缺 sdist，构建直接失败。两段式每段只有一个索引，
-    混淆不可能发生，且「包来自 test.pypi.org」的日志断言才有意义。
+    混淆不可能发生，且「包来自哪个索引」的日志断言才有意义。
 
     from_sdist=True 走源码分发包：装的是 sdist、构建在本地发生（理由见 index_install_command
-    与 assert_sdist_install_log）。
+    与 assert_index_install_log）。
 
     cwd 是**探测版本时的工作目录**，必须由调用方给一个非仓库目录：`python -c` 把 cwd 放进
     sys.path 首位，仓库根的 briefdesk.egg-info 会让 importlib.metadata 读到那个版本（见 VERSION_PROBE）。
     """
     source = "源码分发" if from_sdist else "wheel"
-    log(f"从 TestPyPI 安装 {PROJECT_NAME}=={version}（依赖走 PyPI，本包走 TestPyPI，{source}路径）")
-    requires = published_requirements(version)
+    log(f"从 {index} 安装 {PROJECT_NAME}=={version}（依赖走 PyPI，本包走 {index}，{source}路径）")
+    requires = published_requirements(version, index=index)
     if requires:
         log(f"先装 {len(requires)} 条运行时依赖（--index-url {PYPI_INDEX}）")
         run(
@@ -365,11 +401,10 @@ def install_from_testpypi(
             [str(python), "-m", "pip", "install", "--index-url", PYPI_INDEX, *backend],
             timeout=600,
         )
-    out = run(index_install_command(python, version, from_sdist=from_sdist), timeout=900)
-    if "test.pypi.org" not in out:
-        raise SmokeFailure("安装日志里没有 test.pypi.org——无法证明包来自 TestPyPI")
-    if from_sdist:
-        assert_sdist_install_log(out, version)
+    out = run(
+        index_install_command(python, version, index=index, from_sdist=from_sdist), timeout=900
+    )
+    assert_index_install_log(out, version, index=index, from_sdist=from_sdist)
     run([str(python), "-m", "pip", "check"], timeout=300)  # 依赖闭包自洽（缺依赖即失败）
     installed = run(
         [str(python), "-c", VERSION_PROBE],
@@ -378,7 +413,7 @@ def install_from_testpypi(
     ).strip()
     if installed != version:
         raise SmokeFailure(f"安装版本不符：期望 {version}，实际 {installed}")
-    log(f"来源、版本与依赖闭包断言通过：{installed} 来自 test.pypi.org（{source}路径）")
+    log(f"来源、版本与依赖闭包断言通过：{installed} 来自 {index}（{source}路径）")
 
 
 def assert_installed_resources(python: Path, cwd: Path) -> None:
@@ -616,12 +651,15 @@ def main() -> int:
             except (OSError, ValueError):
                 pass  # 非可重配置流（测试捕获/已关闭）保持原样
     parser = argparse.ArgumentParser(
-        description="wheel 冒烟：默认装本地构建的 wheel；--install-from testpypi 装索引上的 wheel，"
-        "testpypi-sdist 装索引上的源码分发包（强制本地构建）"
+        description="wheel 冒烟：默认装本地构建的 wheel；--install-from testpypi / pypi 装索引上的"
+        "发布物，配 --from-sdist 则强制源码分发包并在本地构建"
     )
-    parser.add_argument("--install-from", choices=("local", "testpypi", "testpypi-sdist"), default="local")
+    parser.add_argument("--install-from", choices=("local", "testpypi", "pypi"), default="local")
     parser.add_argument(
-        "--version", default="", help="--install-from testpypi / testpypi-sdist 时必填：断言装到的版本"
+        "--from-sdist", action="store_true", help="从索引装源码分发包并本地构建（需 --install-from testpypi/pypi）"
+    )
+    parser.add_argument(
+        "--version", default="", help="--install-from testpypi / pypi 时必填：断言装到的版本"
     )
     args = parser.parse_args()
     tmp = Path(tempfile.mkdtemp(prefix="briefdesk-smoke-"))
@@ -632,18 +670,20 @@ def main() -> int:
     process: subprocess.Popen | None = None
     failed = False
     try:
-        if args.install_from in ("testpypi", "testpypi-sdist"):
+        if args.install_from in INDEXES:
             if not args.version:
                 raise SmokeFailure(
                     f"--install-from {args.install_from} 需要 --version（例如 --version 0.1.0.dev1）"
                 )
             venv = make_venv(tmp)
             python = venv_python(venv)
-            install_from_testpypi(
-                python, args.version, from_sdist=args.install_from == "testpypi-sdist", cwd=tmp
+            install_from_index(
+                python, args.version, index=args.install_from, from_sdist=args.from_sdist, cwd=tmp
             )
             assert_installed_resources(python, tmp)
         else:
+            if args.from_sdist:
+                raise SmokeFailure("--from-sdist 需要 --install-from testpypi 或 pypi：本地模式构建的就是 wheel")
             wheel = build_wheel(tmp)
             assert_manifest(wheel)
             venv = make_venv(tmp)

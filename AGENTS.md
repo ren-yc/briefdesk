@@ -54,9 +54,9 @@ powershell -ExecutionPolicy Bypass -File scripts/install-hooks.ps1
   `python scripts/release_check.py`（查 TestPyPI 算下一个空闲 `0.1.0.devN` → 构建期间瞬态写入
   版本 → 逐字节还原 → `twine check`），加 `--upload` 才真的上传；正式发布才用 `0.1.0`。
   端到端验证两条安装路径都要跑：`python scripts/wheel_smoke.py --install-from testpypi --version 0.1.0.devN`
-  （索引上的 wheel）与 `--install-from testpypi-sdist --version 0.1.0.devN`（`--no-binary` 强制 sdist +
-  本地构建，构建后端先从 PyPI 预装）——pip 对纯 Python 包默认只选 wheel，不强制就永远测不到源码
-  分发那条路，而「sdist 少带运行时资源」只在它上面暴露。
+  （索引上的 wheel）与同一条命令加 `--from-sdist`（`--no-binary` 强制 sdist + 本地构建，构建后端
+  先从 PyPI 预装）——pip 对纯 Python 包默认只选 wheel，不强制就永远测不到源码分发那条路，而
+  「sdist 少带运行时资源」只在它上面暴露。正式索引把 `testpypi` 换成 `pypi` 即可。
   凭据由 twine 从系统钥匙串取（`python -m keyring set https://test.pypi.org/legacy/ __token__`），
   不进环境变量、不入仓库、不写 `.env`
 - **装 TestPyPI 的包不要用 `--extra-index-url pypi.org` 一把梭**：pip 跨索引取最高版本，
