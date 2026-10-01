@@ -58,10 +58,29 @@ def log(message: str) -> None:
 
 
 def run(cmd: list[str], *, env: dict[str, str] | None = None, timeout: int = 900) -> str:
-    """执行外部命令；非零退出即失败（输出附在异常里）。"""
+    """执行外部命令；非零退出即失败（输出附在异常里）。
+
+    子进程与被读侧都钉死 UTF-8。仓库里的入口（benchmark runner/cli、本脚本等）按约定把
+    stdout/stderr 重配成 UTF-8 输出中文，而 text=True 缺省按 locale 解码——CI 的
+    Windows runner 是 cp1252，UTF-8 续字节（0x8D/0x8F）在 cp1252 里未定义，解码会在
+    subprocess 的读取线程里抛 UnicodeDecodeError：异常只被 threading.excepthook 打印、
+    不冒泡，run() 照常返回而 stdout 静默变成 None（解析输出的调用点随后 AttributeError）。
+    """
+    child_env = dict(os.environ if env is None else env)
+    child_env.setdefault("PYTHONIOENCODING", "utf-8")
     result = subprocess.run(
-        cmd, cwd=str(REPO), env=env, capture_output=True, text=True, timeout=timeout, check=False
+        cmd,
+        cwd=str(REPO),
+        env=child_env,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=timeout,
+        check=False,
     )
+    if result.stdout is None or result.stderr is None:
+        raise SmokeFailure(f"子进程输出读取失败（编码不一致？）: {' '.join(cmd)}")
     if result.returncode != 0:
         raise SmokeFailure(f"命令失败({result.returncode}): {' '.join(cmd)}\n{result.stdout[-2000:]}\n{result.stderr[-2000:]}")
     return result.stdout
@@ -110,6 +129,9 @@ def app_env(*, data_dir: Path, cache_dir: Path, settings_file: Path, port: int) 
             "AI_API_BASE": "http://127.0.0.1:9/v1",  # 不可达：任何真实调用都立刻失败
             "EMBED_API_BASE": "",  # 显式禁用嵌入，避免预热访问外部服务
             "PLUGINS": '["benchmark"]',  # benchmark 可选：不显式启用就跑不了基准步骤
+            # 应用入口没像 benchmark 入口那样重配 stdout，CI 的 cp1252 控制台上打中文
+            # 日志会在编码处炸；这里钉死 UTF-8，与 wait_ready 读 app.log 的口径一致
+            "PYTHONIOENCODING": "utf-8",
         }
     )
     return env

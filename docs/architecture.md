@@ -1330,6 +1330,12 @@ required field of `weflow`/`qqflow` → that plugin self-disables via `PluginDis
   `benchmark/cli.py`、`benchmark/runner.py`、`scripts/wheel_smoke.py`、`scripts/fetch_icons.py` 都在入口
   用 `stream.reconfigure(encoding="utf-8", errors="replace")` 兜底（`errors=replace` 保证即使流
   不可重配也不会因日志字符崩掉验收）；**新增任何会打印非 ASCII 的入口都要照做**。
+  **读取侧是同一件事的另一半**：`subprocess` 的 `text=True` 缺省按 **locale** 解码，而子进程按上面的
+  约定输出 UTF-8——CI（cp1252）上解 UTF-8 续字节会在**读取线程**里抛 `UnicodeDecodeError`，该异常只被
+  `threading.excepthook` 打印、不冒泡：`subprocess.run` 照常返回、`stdout` 静默变成 `None`（解析输出的
+  调用点随后 `AttributeError`，宽松判断则直接漏判）。捕获型调用一律写
+  `encoding="utf-8", errors="replace"`，并让子进程也按 UTF-8 输出（注入 `PYTHONIOENCODING=utf-8`）；
+  守卫见 `tests/test_subprocess_encoding.py`。
 - **强推后差异扫描的基线会不可达**：CI 的密钥扫描与编号引用扫描以推送事件的 `before` 为基线，
   重写历史（rebase 重签、amend、squash）后该提交在全新克隆里不存在，两个脚本按设计以退出码 2
   拒绝放行（「扫描未执行 ≠ 干净」），于是 quality-gates 的每个版本一起假红。workflow 的

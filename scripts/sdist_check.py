@@ -12,6 +12,7 @@ CI：在 wheel-smoke job 内跑同一入口。
 """
 
 import fnmatch
+import os
 import shutil
 import subprocess
 import sys
@@ -74,7 +75,27 @@ def log(message: str) -> None:
 
 
 def run(cmd: list[str], *, cwd: Path = REPO, timeout: int = 900) -> str:
-    result = subprocess.run(cmd, cwd=str(cwd), capture_output=True, text=True, timeout=timeout)
+    """执行外部命令；非零退出即失败（输出附在异常里）。
+
+    子进程输出统一按 UTF-8 读、并让子进程也按 UTF-8 写：text=True 缺省按 locale
+    （CI 的 Windows runner = cp1252）解码，而仓库入口按约定输出 UTF-8，UTF-8 续字节
+    在 cp1252 里未定义——解码异常发生在 subprocess 的读取线程里，只被
+    threading.excepthook 打印、不冒泡，run() 会照常返回且 stdout 静默变成 None。
+    """
+    child_env = dict(os.environ)
+    child_env.setdefault("PYTHONIOENCODING", "utf-8")
+    result = subprocess.run(
+        cmd,
+        cwd=str(cwd),
+        env=child_env,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=timeout,
+    )
+    if result.stdout is None or result.stderr is None:
+        raise CheckFailure(f"子进程输出读取失败（编码不一致？）: {' '.join(cmd)}")
     if result.returncode != 0:
         tail = (result.stdout + result.stderr).strip()[-1500:]
         raise CheckFailure(f"命令失败（exit {result.returncode}）: {' '.join(cmd)}\n{tail}")
