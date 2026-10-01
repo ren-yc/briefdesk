@@ -1104,7 +1104,14 @@ required field of `weflow`/`qqflow` → that plugin self-disables via `PluginDis
   覆盖态 `overridden`/`override_source`/`override_value` 属**预期**语义（与 `expected_*` 同源）：草稿存在且下次启动
   会被 env / 项目 .env 压住时为真；`override_value` 给的是压住它的那一层的值。插件未装配/无运行实例时字段带
   `running: false` 且不下发 `current`/`source`——显式表达「没有运行值」，不拿下次启动值冒充。
+  **没有 `current` 的行仍可预配置**：前端 `_envControl` 把它渲染成空控件，`_collectEnvChanges` 必须用
+  同一套归一（`null/undefined → ""`）算基准——两侧不一致时「没动过」会被判成改动并提交空串，数字项必被
+  `normalize_setting` 以「须为数字（留空不等于恢复默认）」422 拦下，整次保存失败（界面只显示笼统的
+  「暂存失败，请检查输入后重试」）。清掉已暂存的值走行内「恢复默认」，不要靠清空输入框。
 
+- **环境变量会压住项目 `.env`**：同名键只要在进程环境里存在，`.env` 的改动就不生效（设置页会标
+  「已被环境变量覆盖」，但排查「改了没反应」时要先看 `Get-ChildItem env:<KEY>` / `printenv <KEY>`）。
+  已踩过的一例：shell 或启动脚本导出过旧的 `PLUGINS`，往 `.env` 里补插件后插件始终不启用。
 - **项目根 `.env`**：仅源码 / editable 模式存在（`paths.project_dotenv_path()` 以文件系统判据识别；不用
   `importlib.metadata`——源码树的 egg-info 会遮蔽 site-packages 的 dist-info，把 editable 误判成 wheel）；
   wheel 安装不读用户目录、site-packages 或 cwd 的隐式 `.env`
