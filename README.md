@@ -50,6 +50,17 @@ python main.py
 
 浏览器打开 `http://localhost:3000`
 
+#### 从索引安装（发布版）
+
+不改代码时直接装发布版：
+
+```bash
+pip install briefdesk               # 可选图片 OCR：pip install "briefdesk[ocr]"
+briefdesk                           # 或 python -m briefdesk
+```
+
+配置与数据目录口径同上（只有源码/editable 模式才读项目根 `.env`）。
+
 #### 试用预发布版（TestPyPI）
 
 试发版本发在 TestPyPI（形如 `0.1.0.dev1`），装法与正式包**不同**——两段式，每段只对一个索引：

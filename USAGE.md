@@ -22,6 +22,9 @@ python main.py                   # 或 python -m briefdesk / briefdesk
 
 浏览器打开 `http://localhost:3000`。
 
+**从索引安装（发布版）**：`pip install briefdesk`（可选图片 OCR：`pip install "briefdesk[ocr]"`），
+用 `briefdesk` 启动；配置与数据目录位置同源码安装（只有源码/editable 模式才读项目根 `.env`）。
+
 **试用预发布版（TestPyPI）**：试发版本（`0.1.0.devN`）必须两段式装，每段只对一个索引——
 先 `pip install --no-deps --index-url https://test.pypi.org/simple/ briefdesk==0.1.0.devN`，
 再把依赖从正式 PyPI 装上（清单见 `pip show briefdesk` 的 Requires）。不要用

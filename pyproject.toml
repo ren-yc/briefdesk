@@ -12,6 +12,8 @@ readme = "README.md"
 requires-python = ">=3.12"
 license = "MIT"
 license-files = ["LICENSE"]
+# PyPI 页面上的作者署名；不写 classifiers（许可已由 PEP 639 的 SPDX 字段表达）
+authors = [{ name = "ren-yc" }]
 dependencies = [
     "fastapi>=0.115",
     "uvicorn[standard]>=0.34",
@@ -31,6 +33,13 @@ dependencies = [
     # 用户配置目录：UI「启动配置」暂存文件位置（settings_env.py）
     "platformdirs>=4",
 ]
+
+# 索引页面的 Homepage / Repository / Issues 三个入口都靠这里；必须放在 dependencies 之后——
+# TOML 的子表头会终止 [project] 表，之后再写的键会落进 [project.urls]
+[project.urls]
+Homepage = "https://github.com/ren-yc/briefdesk"
+Repository = "https://github.com/ren-yc/briefdesk"
+Issues = "https://github.com/ren-yc/briefdesk/issues"
 
 [project.scripts]
 briefdesk = "briefdesk.main:main"
