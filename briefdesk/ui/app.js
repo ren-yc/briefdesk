@@ -4760,7 +4760,7 @@ function _collectEnvChanges() {
       newVal = el.value;
       // 与 _envControl 同一套归一：未装配插件的条目不下发 current（running:false），
       // 输入框渲染成空串，而 String(undefined) 是 "undefined"——不归一就会把
-      // 「没动过」判成改动：数字项提交空串被服务端按「须为数字」422 拦下，
+      // 「没动过」判成改动：数字项提交空串被服务端按「须为数字（留空不等于恢复默认）」422 拦下，
       // 整次保存失败（界面只显示笼统的「暂存失败，请检查输入后重试」）。
       const raw = _envInputValue(item);
       oldVal = raw === null || raw === undefined ? "" : String(raw);

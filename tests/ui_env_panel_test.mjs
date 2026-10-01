@@ -744,7 +744,7 @@ setEnvData({
 
 // ── 13. 无运行值条目：服务端不下发 current（running:false），渲染成空输入 ──
 // 收集侧若拿 String(undefined) 当基准，就会把「没动过」判成改动并提交空串：
-// 数字项被服务端按「须为数字」422 拦下，整次保存失败。
+// 数字项被服务端按「须为数字（留空不等于恢复默认）」422 拦下，整次保存失败。
 setEnvData({
   filePath: "C:/tmp/settings.env",
   pluginOptions: [],

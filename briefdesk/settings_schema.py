@@ -279,7 +279,9 @@ def normalize_setting(meta: dict[str, Any], raw: str) -> str:
             else:
                 number_value = float(raw)
         except (TypeError, ValueError) as exc:
-            raise ValueError("须为数字") from exc
+            # 空串也走这条：前端可能把「没有运行值」的空输入框当成改动提交，报错要
+            # 直接点明正确路径（行内「恢复默认」），否则用户只会看到笼统的保存失败
+            raise ValueError("须为数字（留空不等于恢复默认；清空请用「恢复默认」）") from exc
         if not math.isfinite(float(number_value)):
             raise ValueError("须为有限数字")
         if "min" in meta and number_value < meta["min"]:

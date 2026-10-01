@@ -88,6 +88,17 @@ class SettingsSchemaTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             normalize_setting(by_key["EXAMPLE_ENABLED"], "maybe")
 
+    def test_empty_number_value_error_names_the_reset_path(self) -> None:
+        """数字项收到空串的报错必须点明「留空不等于恢复默认」。
+
+        前端对「没有运行值」的条目渲染空控件，归一写错时会把空串当改动提交上来；
+        报错若只说「须为数字」，用户看到的只是笼统的保存失败，无从知道该走哪里。
+        """
+        by_key = {item["key"]: item for item in build_settings_schema(ExampleSettings)}
+        with self.assertRaises(ValueError) as ctx:
+            normalize_setting(by_key["EXAMPLE_LIMIT"], "")
+        self.assertIn("留空不等于恢复默认", str(ctx.exception))
+
     def test_rejects_newline_and_inline_comment_in_string_value(self) -> None:
         """字符串值含换行 / ' #' 时拒绝：暂存文件是 KEY=VALUE
         行格式，换行可注入任意配置行（含密钥名——路由白名单只过滤键名），
