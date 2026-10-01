@@ -14,8 +14,12 @@ from pathlib import Path
 
 from scripts.runtime_manifest import REPO
 
-#: 扫描面：生产代码与仓库脚本（tests/ 尚未收敛，见 docs/architecture.md 的入口编码约定）
-_SCANNED_DIRS = ("briefdesk", "scripts")
+#: 扫描面：生产代码、仓库脚本与测试（三处都已收敛，新增违规会被本文件的用例拦下）
+_SCANNED_DIRS = ("briefdesk", "scripts", "tests")
+
+#: 已知边界（刻意不加，需要更复杂的分析而收益不成比例）：
+#: - 只认字面 `text=True`：值来自变量时不拦；
+#: - 只查 `encoding`/`errors` 是否存在、不校验取值：写 `encoding="gbk"` 照过。
 
 #: 会返回「文本模式」结果的子进程入口
 _SUBPROCESS_FUNCS = {"run", "Popen", "check_output", "call", "check_call"}

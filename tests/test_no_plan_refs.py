@@ -231,6 +231,8 @@ def test_local_commit_messages_are_clean() -> None:
         cwd=_ROOT,
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         check=False,
     )
     if probe.returncode != 0:
