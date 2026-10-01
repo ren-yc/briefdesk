@@ -87,6 +87,15 @@ def _env_value(alias: str) -> str | None:
     return None
 
 
+def _lookup_value(values: dict[str, str | None], alias: str) -> str | None:
+    """大小写不敏感查表（与 pydantic-settings 的默认口径一致）。"""
+    target = alias.upper()
+    for key, value in values.items():
+        if key is not None and key.upper() == target:
+            return value
+    return None
+
+
 def _file_value(path: Path, alias: str) -> str | None:
     """文件里该键的值：大小写不敏感，且 `KEY=` 的空串算「有值」。
 
@@ -97,11 +106,42 @@ def _file_value(path: Path, alias: str) -> str | None:
         values = dotenv_values(str(path), encoding="utf-8")
     except (OSError, UnicodeDecodeError):
         return None
-    target = alias.upper()
-    for key, value in values.items():
-        if key is not None and key.upper() == target:
-            return value
-    return None
+    return _lookup_value(values, alias)
+
+
+def env_shadowed_dotenv_keys(model: type[BaseSettings]) -> list[str]:
+    """项目 .env 里定义了、却被进程环境变量压住且**取值不同**的键名。
+
+    为什么只在「取值不同」时报：同值覆盖虽然同样由环境变量胜出，但取值没变，报出来
+    只是噪音——用户需要的是「改了 .env 为什么不生效」。
+
+    为什么跳过密钥字段：密钥还有 keyring 层，而这里的判据只看 env 与 dotenv——keyring
+    已配置时解除环境变量也不会让 .env 生效，报「被环境变量压住」会把人引向错方向。
+
+    wheel 模式（`project_dotenv_path()` 为 None）恒为空；坏 .env 只漏报不误报。
+    返回键名列表，**绝不返回值**。
+    """
+    project = paths.project_dotenv_path()
+    if project is None:
+        return []
+    try:
+        file_values = dotenv_values(str(project), encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return []
+    secret_keys = set(getattr(model, "KEYRING_FIELDS", {}).values())
+    shadowed: list[str] = []
+    for name in model.model_fields:
+        alias = field_env_key(model, name)
+        if alias in secret_keys:
+            continue
+        env_value = _env_value(alias)
+        if env_value is None:
+            continue  # 不是环境变量压着（含「只有 .env」的情形）
+        file_value = _lookup_value(file_values, alias)
+        if file_value is None or file_value == env_value:
+            continue
+        shadowed.append(alias)
+    return shadowed
 
 
 def source_of(alias: str, layers: list[tuple[str, Path]] | None = None) -> str:
@@ -171,6 +211,15 @@ def capture_startup_sources(model: type[BaseSettings]) -> dict[str, str]:
     global _core_sources
     _core_sources = capture_model_sources(model)
     return _core_sources
+
+
+def registered_models() -> list[type[BaseSettings]]:
+    """已登记来源快照的模型：核心 Settings + 装配成功的插件模型。
+
+    启动期聚合提示（哪些键被环境变量压住）需要的是「本进程在用的模型集合」，
+    直接读登记表而不是让调用方各自维护一份名单——登记时刻即模型真正生效的时刻。
+    """
+    return list(_model_sources)
 
 
 def startup_source(alias: str) -> str | None:

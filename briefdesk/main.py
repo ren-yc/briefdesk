@@ -17,8 +17,8 @@ from collections.abc import Callable
 import uvicorn
 from fastapi import APIRouter
 
-from briefdesk import stages
-from briefdesk.config import config
+from briefdesk import settings_env, stages
+from briefdesk.config import Settings, config
 from briefdesk.db import (
     apply_pending_restore,
     close_db,
@@ -246,6 +246,8 @@ async def _run() -> None:
         )
         stages.set_context(ctx)  # 管道骨架（pipeline）经此读取阶段与服务端口
         await manager.setup_all(ctx)
+        # 装配完成即报「.env 被环境变量压住」——插件模型的来源快照此刻才登记齐全
+        _warn_shadowed_env_keys()
         # 2.1 Web 插件挂载（HTTP 服务启动前）：路由 + 静态资源 + 插件元数据
         for r in routers:
             include_plugin_router(r)
@@ -405,6 +407,37 @@ async def _periodic_sync_loop() -> None:
         task = trigger_sync(reason="periodic")
         if task is not None:
             await task
+
+
+def _warn_shadowed_env_keys() -> list[str]:
+    """启动期提示：项目 .env 里被进程环境变量压住、且取值不同的键（只列键名）。
+
+    为什么在插件装配之后调用：插件模型的字段要等各自 setup 成功后才登记来源，之前聚合
+    不到它们；这里对「核心 + 已登记模型」一次报完。
+
+    为什么惰性计算而不是 import 期暂存：import 期取值会随宿主环境（开发机 / CI）分叉，
+    测试也无法归一；放在这里则取值与「本进程正在用的配置」同一时点。
+    """
+    models = settings_env.registered_models() or [Settings]
+    seen: set[str] = set()
+    shadowed: list[str] = []
+    for model in models:
+        for key in settings_env.env_shadowed_dotenv_keys(model):
+            if key not in seen:
+                seen.add(key)
+                shadowed.append(key)
+    if not shadowed:
+        return []
+    head = "、".join(shadowed[:8])
+    suffix = f" 等 {len(shadowed)} 项" if len(shadowed) > 8 else ""
+    logger.warning(
+        "检测到 %d 个配置项被进程环境变量覆盖（项目 .env 中的同名行不生效）：%s%s；"
+        "排查：Get-ChildItem env:<KEY>（Windows）或 printenv <KEY>",
+        len(shadowed),
+        head,
+        suffix,
+    )
+    return shadowed
 
 
 def main() -> None:

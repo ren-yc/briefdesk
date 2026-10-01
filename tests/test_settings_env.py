@@ -1001,3 +1001,123 @@ class AllSettingsTwoLayerTest(StagedFileTestCase):
                         parsed = getattr(model(), attr)
                         expected = int(raw) if raw.isdigit() else raw
                         self.assertEqual(parsed, expected, key)
+
+
+class ShadowedEnvKeysTest(unittest.TestCase):
+    """启动期「.env 被环境变量压住」的判据：只在同名且取值不同时才报。
+
+    判据直接比较进程环境变量与项目 .env，不依赖启动快照——因此不需要重捕获；
+    与宿主预置变量的解耦由 conftest 的清变量夹具负责。
+    """
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.project = Path(self._tmp.name) / ".env"
+
+    def _shadowed(self, text: str) -> list[str]:
+        self.project.write_text(text, encoding="utf-8")
+        with patch.object(paths, "project_dotenv_path", return_value=self.project):
+            return settings_env.env_shadowed_dotenv_keys(Settings)
+
+    def test_reports_key_whose_env_value_differs(self) -> None:
+        with patch.dict(os.environ, {"LOG_LEVEL": "DEBUG"}):
+            self.assertEqual(self._shadowed("LOG_LEVEL=INFO\n"), ["LOG_LEVEL"])
+
+    def test_same_value_is_not_reported(self) -> None:
+        """同值覆盖取值没变，报出来只是噪音。"""
+        with patch.dict(os.environ, {"LOG_LEVEL": "INFO"}):
+            self.assertEqual(self._shadowed("LOG_LEVEL=INFO\n"), [])
+
+    def test_only_dotenv_is_not_reported(self) -> None:
+        with _env_without("LOG_LEVEL"):
+            self.assertEqual(self._shadowed("LOG_LEVEL=INFO\n"), [])
+
+    def test_only_env_is_not_reported(self) -> None:
+        with patch.dict(os.environ, {"LOG_LEVEL": "DEBUG"}):
+            self.assertEqual(self._shadowed("SERVER_PORT=3001\n"), [])
+
+    def test_lowercase_dotenv_key_still_matches(self) -> None:
+        """大小写口径与解析一致：.env 里写小写键同样能认出来。"""
+        with patch.dict(os.environ, {"LOG_LEVEL": "DEBUG"}):
+            self.assertEqual(self._shadowed("log_level=INFO\n"), ["LOG_LEVEL"])
+
+    def test_secret_keys_are_skipped(self) -> None:
+        """密钥还有 keyring 层：解除环境变量也不会让 .env 生效，报它只会误导。"""
+        with patch.dict(os.environ, {"AI_API_KEY": "sk-from-env"}):
+            self.assertEqual(self._shadowed("AI_API_KEY=sk-from-dotenv\n"), [])
+
+    def test_wheel_mode_reports_nothing(self) -> None:
+        with (
+            patch.object(paths, "project_dotenv_path", return_value=None),
+            patch.dict(os.environ, {"LOG_LEVEL": "DEBUG"}),
+        ):
+            self.assertEqual(settings_env.env_shadowed_dotenv_keys(Settings), [])
+
+    def test_unreadable_dotenv_only_underreports(self) -> None:
+        """坏 .env 只漏报：读不了文件既不该抛错，也不该把键全报出来。"""
+        self.project.write_bytes(b"LOG_LEVEL=\xff\xfe\n")
+        with (
+            patch.object(paths, "project_dotenv_path", return_value=self.project),
+            patch.dict(os.environ, {"LOG_LEVEL": "DEBUG"}),
+        ):
+            self.assertEqual(settings_env.env_shadowed_dotenv_keys(Settings), [])
+
+
+class ShadowedEnvWarningTest(unittest.TestCase):
+    """main 侧聚合：装配后打一条 WARNING，只列键名，超长截断。"""
+
+    _KEYS = (
+        "LOG_LEVEL",
+        "SERVER_PORT",
+        "BACKFILL_HOURS",
+        "IGNORE_SELF",
+        "AI_MODEL",
+        "AI_API_BASE",
+        "MERGE_WINDOW_MINUTES",
+        "POLL_INTERVAL_SECONDS",
+        "DEDUP_EMBED_TOP_K",
+    )
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.project = Path(self._tmp.name) / ".env"
+
+    def _run(self, env: dict[str, str], dotenv_text: str) -> tuple[list[str], str]:
+        from briefdesk import main as main_mod
+
+        self.project.write_text(dotenv_text, encoding="utf-8")
+        with (
+            patch.object(paths, "project_dotenv_path", return_value=self.project),
+            patch.dict(os.environ, env),
+            self.assertLogs("briefdesk.main", level="WARNING") as logs,
+        ):
+            keys = main_mod._warn_shadowed_env_keys()
+        self.assertEqual(len(logs.output), 1, "应当只打一条聚合日志")
+        return keys, logs.output[0]
+
+    def test_single_warning_lists_key_names_and_hint(self) -> None:
+        keys, message = self._run({"LOG_LEVEL": "DEBUG"}, "LOG_LEVEL=INFO\n")
+        self.assertEqual(keys, ["LOG_LEVEL"])
+        self.assertIn("LOG_LEVEL", message)
+        self.assertIn("Get-ChildItem", message)
+        self.assertNotIn("DEBUG", message, "只列键名，不得回显取值")
+
+    def test_long_lists_are_truncated(self) -> None:
+        env = {key: f"env-{index}" for index, key in enumerate(self._KEYS)}
+        dotenv = "".join(f"{key}=file-{index}\n" for index, key in enumerate(self._KEYS))
+        keys, message = self._run(env, dotenv)
+        self.assertEqual(len(keys), len(self._KEYS))
+        self.assertIn(f"等 {len(self._KEYS)} 项", message)
+
+    def test_silent_when_nothing_is_shadowed(self) -> None:
+        from briefdesk import main as main_mod
+
+        self.project.write_text("LOG_LEVEL=INFO\n", encoding="utf-8")
+        with (
+            patch.object(paths, "project_dotenv_path", return_value=self.project),
+            patch.dict(os.environ, {"LOG_LEVEL": "INFO"}),
+            self.assertNoLogs("briefdesk.main", level="WARNING"),
+        ):
+            self.assertEqual(main_mod._warn_shadowed_env_keys(), [])

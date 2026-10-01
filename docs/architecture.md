@@ -1112,6 +1112,9 @@ required field of `weflow`/`qqflow` → that plugin self-disables via `PluginDis
 - **环境变量会压住项目 `.env`**：同名键只要在进程环境里存在，`.env` 的改动就不生效（设置页会标
   「已被环境变量覆盖」，但排查「改了没反应」时要先看 `Get-ChildItem env:<KEY>` / `printenv <KEY>`）。
   已踩过的一例：shell 或启动脚本导出过旧的 `PLUGINS`，往 `.env` 里补插件后插件始终不启用。
+  插件装配完成后，启动期还会对「被环境变量压住**且取值不同**」的键打一条 WARNING（只列键名、
+  不回显取值；同值覆盖不报，避免噪音；密钥键跳过——它们还有 keyring 层，判据看不到。回归见
+  `tests/test_settings_env.py` 的 ShadowedEnv 用例）。
 - **项目根 `.env`**：仅源码 / editable 模式存在（`paths.project_dotenv_path()` 以文件系统判据识别；不用
   `importlib.metadata`——源码树的 egg-info 会遮蔽 site-packages 的 dist-info，把 editable 误判成 wheel）；
   wheel 安装不读用户目录、site-packages 或 cwd 的隐式 `.env`
