@@ -1,5 +1,13 @@
 # 发布 workflow：人工触发 + 环境审批 + OIDC 可信发布（无长期凭据）。
 #
+# 为什么分两个 job：两条约束指向不同平台——
+# - 上传用的 pypa/gh-action-pypi-publish 是 Docker 容器动作，只在 Linux runner 上能跑
+#   （放 Windows 上会在跑任何逻辑之前直接以 "This action is only able to run under
+#   GNU/Linux environments" 失败）；
+# - 装完之后的 wheel 冒烟要验的是用户实际运行的平台（主平台 Windows），它的进程清理契约
+#   （terminate → 等 → kill、文件占用导致删不掉）也只在 Windows 上成立。
+# 拆开之后审批闸门仍只在上传那一步：environment 挂在 publish job 上，verify 只读。
+#
 # 为什么不并进 quality-gates.yml：id-token 写权限只应出现在真正要发布的 workflow 里；门禁
 # 每次 push 都跑，也不需要任何写权限。
 #
@@ -32,15 +40,11 @@ concurrency:
 
 jobs:
   publish:
-    name: Publish (${{ inputs.target }})
-    # 主平台是 Windows，且发布后要跑 wheel 冒烟——它的进程清理契约是 Windows 特有的
-    runs-on: windows-latest
-    timeout-minutes: 45
+    name: Build & publish (${{ inputs.target }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
     # 人工闸门：pypi 环境配 Required reviewers 后，job 会停在审批上等人放行
     environment: ${{ inputs.target }}
-    env:
-      # headless runner 没有凭据管理器会话：密钥层走「未配置」分支（与 wheel-smoke job 同口径）
-      BRIEFDESK_KEYRING: "0"
     permissions:
       contents: read
       id-token: write      # OIDC 可信发布
@@ -48,18 +52,17 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v7
-        with:
-          fetch-depth: 0
 
       # 只允许从 master 发布：分支上的提交没走完门禁，而索引上的版本不可撤回。
       # workflow_dispatch 允许选分支/标签，这个判据把它挡在门外；这里不需要再比对
       # origin/master——在 Actions 里被检出的提交本来就来自远端。
       - name: Guard against non-master refs
-        shell: pwsh
+        shell: bash
         run: |
-          if ("${{ github.ref }}" -ne "refs/heads/master") {
-            throw "只能从 master 发布，当前 ref 是 ${{ github.ref }}"
-          }
+          if [ "${{ github.ref }}" != "refs/heads/master" ]; then
+            echo "只能从 master 发布，当前 ref 是 ${{ github.ref }}" >&2
+            exit 1
+          fi
 
       - name: Set up Python 3.12
         uses: actions/setup-python@v7
@@ -68,7 +71,7 @@ jobs:
           cache: pip
           cache-dependency-path: requirements-dev.txt
 
-      # 只装锁文件：构建器（build）与 twine 都在锁里；被测应用由冒烟装进它自建的临时 venv
+      # 只装锁文件：构建器（build）与 twine 都在锁里
       - name: Install build tooling (lockfile)
         run: pip install -r requirements-dev.txt
 
@@ -89,10 +92,36 @@ jobs:
         with:
           packages-dir: dist/
 
-      # 装完才算验完：两条安装路径 + 启动 + 资源 + 写入隔离，与 CI 的 wheel 冒烟同一条脚本。
-      # 上传成功到索引可见之间有秒级延迟，冒烟在取索引元数据时会等该版本挂出来（见
-      # scripts/wheel_smoke.py 的 INDEX_WAIT_SECONDS）——放进 shell 里做会多一份环境相关的
-      # 失败面（本机演练时 $host 撞上 PowerShell 自动变量，步骤就一直在重试）
+  # 装完才算验完：与 CI 的 wheel 冒烟同一条脚本（两条安装路径 + 启动 + 资源 + 写入隔离）。
+  # 它按「索引 + 版本」安装，装到的就是上面刚上传的那两件产物，因此 job 之间不必传文件。
+  # 上传成功到索引可见之间有秒级延迟，冒烟取元数据时会等该版本挂出来（见 wheel_smoke.py 的
+  # INDEX_WAIT_SECONDS）——放进 shell 里做会多一份环境相关的失败面（本机演练时 $host 撞上
+  # PowerShell 自动变量，步骤就一直在重试）。
+  verify:
+    name: Verify installs (windows, ${{ inputs.target }})
+    needs: publish
+    runs-on: windows-latest
+    timeout-minutes: 45
+    env:
+      # headless runner 没有凭据管理器会话：密钥层走「未配置」分支（与 wheel-smoke job 同口径）
+      BRIEFDESK_KEYRING: "0"
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+
+      # 冒烟自己 import packaging，并用它解析依赖 marker：锁文件里就有
+      - name: Install build tooling (lockfile)
+        run: pip install -r requirements-dev.txt
+
       - name: Verify wheel install path
         run: python scripts/wheel_smoke.py --install-from ${{ inputs.target }} --version ${{ inputs.version }}
 

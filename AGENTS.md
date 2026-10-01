@@ -64,10 +64,12 @@ powershell -ExecutionPolicy Bypass -File scripts/install-hooks.ps1
   冒烟因此改成「依赖走 PyPI、本包走 TestPyPI」两段式，文档与 README/USAGE 同口径。
   本机的 `release_check.py --upload` 只是试发便利入口；正式发布走下面的 CI workflow
 - **发布走 CI 的 `publish.yml`**（`workflow_dispatch` + environment 审批 + OIDC 可信发布，
-  本机不持有任何上传凭据）：job 先跑 `release_check.py` 做版本唯一性预检、构建与产物成员断言，
-  再用 `pypa/gh-action-pypi-publish` 上传（带 PEP 740 构建证明），最后两条安装路径各跑一次冒烟
-  ——冒烟取索引元数据时会先等该版本挂出来（上传到可见有秒级延迟，立刻失败会把「索引延迟」
-  报成「版本不存在」）。
+  本机不持有任何上传凭据）：`publish` job 在 **ubuntu** 上跑 `release_check.py`（版本唯一性预检、
+  构建、产物成员断言）再用 `pypa/gh-action-pypi-publish` 上传（带 PEP 740 构建证明）——上传
+  action 是 Docker 容器动作，只在 Linux runner 上能跑；`verify` job 在 **windows** 上按
+  「索引 + 版本」跑两条安装路径的冒烟（主平台 + 进程清理契约），因此不需要在 job 之间传产物。
+  冒烟取索引元数据时会先等该版本挂出来（上传到可见有秒级延迟，立刻失败会把「索引延迟」报成
+  「版本不存在」）。
   只允许从 `master` 触发；正式索引的版本必须等于 `pyproject.toml` 的静态值（脚本强校验），
   试发版本（`0.1.0.devN` / `0.1.0rc1`）只在构建期写入并逐字节还原，仓库里永不落地。
   一次性配置：GitHub environments `testpypi` / `pypi`（后者配 Required reviewers），
