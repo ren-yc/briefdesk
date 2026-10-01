@@ -61,6 +61,10 @@ INDEXES = {
     },
 }
 
+#: 上传成功到索引可见之间有秒级延迟：取元数据时等待而不是立刻失败——否则失败信息指向
+#: 「版本不存在」，掩盖真正的发布结果。等待上限同时也是「版本根本没上传」的暴露时间。
+INDEX_WAIT_SECONDS = 300.0
+
 if str(REPO) not in sys.path:
     # 直跑时 sys.path[0] 是 scripts/：包路径需显式补，否则 scripts.runtime_manifest 导不到
     sys.path.insert(0, str(REPO))
@@ -252,18 +256,43 @@ def install_wheel(venv: Path, wheel: Path) -> None:
     run([str(python), "-m", "pip", "install", "--quiet", str(wheel)], timeout=900)
 
 
+def index_metadata(url: str, *, timeout: float | None = None, interval: float = 10.0) -> dict:
+    """取索引元数据；404 视为「还没挂出来」并重试到超时。
+
+    为什么必须重试：验证通常紧跟着上传执行，而索引从上传到可见有秒级延迟。立刻就失败时
+    报的是「版本不存在」，读的人会去查发布是否成功——真正的失败点（索引延迟）被掩盖了。
+    只有 404 重试：其它错误（网络、5xx）立刻抛出，重试只会拖长定位时间。
+    """
+    # 上限在调用时求值：写成默认参数会在 import 期冻结，测试与环境变量都改不动它
+    limit = INDEX_WAIT_SECONDS if timeout is None else timeout
+    deadline = time.monotonic() + limit
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            with urllib.request.urlopen(url, timeout=60) as response:
+                return json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as error:
+            if error.code != 404:
+                raise SmokeFailure(f"读取 {url} 失败：HTTP {error.code}") from error
+            last_error = "HTTP 404（该索引上还没有这个版本？）"
+        except (urllib.error.URLError, OSError, json.JSONDecodeError) as error:
+            raise SmokeFailure(f"读取 {url} 失败：{error}") from error
+        if time.monotonic() >= deadline:
+            raise SmokeFailure(
+                f"读取 {url} 失败：等待 {limit:.0f}s（{attempt} 次探测）后仍不可用——{last_error}"
+            )
+        time.sleep(interval)
+
+
 def published_requirements(version: str, *, index: str) -> list[str]:
     """从**目标索引**的元数据取该版本的运行时依赖（按 marker 过滤掉 extra 行）。
 
     依赖清单取自索引而不是本地 pyproject：装的就是发布物声明的依赖，本地文件改了而没
-    重新发布时，这里能立刻暴露差异。
+    重新发布时，这里能立刻暴露差异。索引延迟由 index_metadata 兜住（上传后紧接着验证的场景）。
     """
     url = f"{INDEXES[index]['json']}/{PROJECT_NAME}/{version}/json"
-    try:
-        with urllib.request.urlopen(url, timeout=60) as response:
-            payload = json.loads(response.read().decode("utf-8"))
-    except (urllib.error.URLError, OSError, json.JSONDecodeError) as error:
-        raise SmokeFailure(f"读取 {url} 失败：{error}") from error
+    payload = index_metadata(url, timeout=INDEX_WAIT_SECONDS)
     requires = payload.get("info", {}).get("requires_dist") or []
     # extra == "ocr"/"dev" 这类 marker 在未请求 extra 时求值为假——不装可选重依赖
     # packaging 把 default_environment() 标成 TypedDict(Environment)，展开成 dict[str, str]

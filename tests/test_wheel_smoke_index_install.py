@@ -8,10 +8,14 @@
 
 import subprocess
 import sys
+import urllib.error
+from email.message import Message
 from pathlib import Path
+from typing import Self
 
 import pytest
 
+from scripts import wheel_smoke
 from scripts.wheel_smoke import (
     INDEXES,
     INSTALLED_GUARD,
@@ -94,6 +98,65 @@ def test_repo_egg_info_fools_cwd_version_lookup(tmp_path: Path) -> None:
     )
 
     assert result.stdout.strip() == "9.9.9"
+
+
+class _Response:
+    """urlopen 的替身：只需要 read() 与上下文管理器协议。"""
+
+    status = 200
+
+    def read(self) -> bytes:
+        return b'{"info": {"requires_dist": []}}'
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        return None
+
+
+def test_index_metadata_retries_until_the_version_appears(monkeypatch: pytest.MonkeyPatch) -> None:
+    """上传到索引可见有秒级延迟：404 必须重试，不能立刻判「版本不存在」。"""
+    calls = {"count": 0}
+
+    def fake_urlopen(url: str, timeout: float | None = None) -> _Response:
+        calls["count"] += 1
+        if calls["count"] == 1:
+            raise urllib.error.HTTPError(url, 404, "not found", Message(), None)
+        return _Response()
+
+    monkeypatch.setattr(wheel_smoke.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(wheel_smoke.time, "sleep", lambda _seconds: None)
+
+    assert wheel_smoke.published_requirements("0.1.0.dev1", index="testpypi") == []
+    assert calls["count"] == 2
+
+
+def test_index_metadata_gives_up_with_a_locating_message(monkeypatch: pytest.MonkeyPatch) -> None:
+    """一直 404 时要给出可定位的失败：URL + 探测次数，而不是一句「版本不存在」。"""
+
+    def always_404(url: str, timeout: float | None = None) -> _Response:
+        raise urllib.error.HTTPError(url, 404, "not found", Message(), None)
+
+    monkeypatch.setattr(wheel_smoke.urllib.request, "urlopen", always_404)
+    monkeypatch.setattr(wheel_smoke.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(wheel_smoke, "INDEX_WAIT_SECONDS", 0.0)
+
+    with pytest.raises(SmokeFailure, match="test.pypi.org"):
+        wheel_smoke.published_requirements("0.1.0.dev1", index="testpypi")
+
+
+def test_index_metadata_does_not_retry_other_http_errors(monkeypatch: pytest.MonkeyPatch) -> None:
+    """5xx 之类立刻失败：重试只会把定位时间拖长。"""
+
+    def server_error(url: str, timeout: float | None = None) -> _Response:
+        raise urllib.error.HTTPError(url, 503, "unavailable", Message(), None)
+
+    monkeypatch.setattr(wheel_smoke.urllib.request, "urlopen", server_error)
+    monkeypatch.setattr(wheel_smoke.time, "sleep", lambda _seconds: None)
+
+    with pytest.raises(SmokeFailure, match="503"):
+        wheel_smoke.published_requirements("0.1.0.dev1", index="testpypi")
 
 
 def test_sdist_log_with_download_and_build_passes() -> None:

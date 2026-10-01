@@ -51,16 +51,14 @@ jobs:
         with:
           fetch-depth: 0
 
-      # 只允许发布 master 的 HEAD：分支上的提交没走完门禁，而索引上的版本不可撤回
+      # 只允许从 master 发布：分支上的提交没走完门禁，而索引上的版本不可撤回。
+      # workflow_dispatch 允许选分支/标签，这个判据把它挡在门外；这里不需要再比对
+      # origin/master——在 Actions 里被检出的提交本来就来自远端。
       - name: Guard against non-master refs
         shell: pwsh
         run: |
           if ("${{ github.ref }}" -ne "refs/heads/master") {
             throw "只能从 master 发布，当前 ref 是 ${{ github.ref }}"
-          }
-          git fetch --no-tags origin master
-          if ((git rev-parse HEAD) -ne (git rev-parse origin/master)) {
-            throw "HEAD 与 origin/master 不一致：先把 master 推平再发布"
           }
 
       - name: Set up Python 3.12
@@ -91,24 +89,10 @@ jobs:
         with:
           packages-dir: dist/
 
-      # 上传成功到索引可见之间有秒级延迟：先等 JSON 元数据可用，再跑安装验证，
-      # 否则失败信息会指向「版本不存在」，掩盖真正的发布结果
-      - name: Wait for the index to serve the version
-        shell: pwsh
-        run: |
-          $host = if ("${{ inputs.target }}" -eq "pypi") { "pypi.org" } else { "test.pypi.org" }
-          $url = "https://$host/pypi/briefdesk/${{ inputs.version }}/json"
-          for ($i = 1; $i -le 30; $i++) {
-            try {
-              $response = Invoke-WebRequest -Uri $url -UseBasicParsing -TimeoutSec 15
-              if ($response.StatusCode -eq 200) { Write-Host "索引已提供该版本（第 $i 次探测）"; exit 0 }
-            } catch {
-              Start-Sleep -Seconds 10
-            }
-          }
-          throw "索引在 300s 内没有提供该版本：$url"
-
-      # 装完才算验完：两条安装路径 + 启动 + 资源 + 写入隔离，与 CI 的 wheel 冒烟同一条脚本
+      # 装完才算验完：两条安装路径 + 启动 + 资源 + 写入隔离，与 CI 的 wheel 冒烟同一条脚本。
+      # 上传成功到索引可见之间有秒级延迟，冒烟在取索引元数据时会等该版本挂出来（见
+      # scripts/wheel_smoke.py 的 INDEX_WAIT_SECONDS）——放进 shell 里做会多一份环境相关的
+      # 失败面（本机演练时 $host 撞上 PowerShell 自动变量，步骤就一直在重试）
       - name: Verify wheel install path
         run: python scripts/wheel_smoke.py --install-from ${{ inputs.target }} --version ${{ inputs.version }}
 
