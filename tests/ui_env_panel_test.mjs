@@ -1,6 +1,6 @@
 // 启动配置（设置 → 启动配置/插件）面板逻辑回归（Node vm 加载真实 briefdesk/ui/app.js）。
 //
-// 守七件事：
+// 守八件事：
 // 1. _collectEnvChanges 的布尔分支必须跳过未变化项——此前缺失相等性检查，
 //    每次「暂存更改」都会把所有布尔项重写进暂存文件，「没有需要暂存的更改」
 //    永不触发，差异计数常驻虚高；
@@ -16,6 +16,8 @@
 //    本插件草稿态；_pluginChanges 把草稿 diff 成单个 PLUGINS JSON 值。
 // 7. 行内动作（恢复默认/密钥写清）行级贴片：不整面重载 loadEnvConfig——
 //    整面重载会丢其它行的未暂存编辑、「插件」面板开关草稿与搜索过滤态。
+// 8. 无运行值条目（未装配插件不下发 current）不得产生假差异，且仍可预配置；
+//    select 的当前值不在选项内时必须渲染为选中项。
 //
 // 数据一律虚构（见 AGENTS.md）。
 
@@ -738,6 +740,67 @@ setEnvData({
   const notRunningHtml = sandbox._envRowHtml(notRunning, false);
   assert.ok(notRunningHtml.includes("无运行值"), "未装配插件必须显式标注「无运行值」");
   assert.ok(!notRunningHtml.includes("实际生效"), "无运行值不得显示生效值");
+}
+
+// ── 13. 无运行值条目：服务端不下发 current（running:false），渲染成空输入 ──
+// 收集侧若拿 String(undefined) 当基准，就会把「没动过」判成改动并提交空串：
+// 数字项被服务端按「须为数字」422 拦下，整次保存失败。
+setEnvData({
+  filePath: "C:/tmp/settings.env",
+  pluginOptions: [],
+  items: [
+    { key: "OFF_NUM", type: "number", label: "未启用插件的数字项", plugin: "off", staged: null, running: false, numberKind: "integer", min: 1 },
+    { key: "OFF_TEXT", type: "text", label: "未启用插件的文本项", plugin: "off", staged: null, running: false },
+    { key: "OFF_FLAG", type: "boolean", label: "未启用插件的开关", plugin: "off", staged: null, running: false },
+    { key: "OFF_MULTI", type: "multi", label: "未启用插件的多选", plugin: "off", staged: null, running: false },
+  ],
+  secrets: [],
+});
+{
+  const multiRow = makeRow("OFF_MULTI", {});
+  multiRow.querySelectorAll = () => [];
+  const rows = [
+    makeRow("OFF_NUM", { control: { value: "" } }),
+    makeRow("OFF_TEXT", { control: { value: "" } }),
+    makeRow("OFF_FLAG", { checkbox: { checked: false } }),
+    multiRow,
+  ];
+  getElement("env-items").querySelectorAll = () => rows;
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(sandbox._collectEnvChanges())),
+    {},
+    "无运行值且未改动时必须无差异（否则每次保存都提交空串 → 422）",
+  );
+
+  // 无运行值不等于不可配置：用户填了值仍要提交（下次启动生效）
+  rows[0].querySelector("[data-env-key]").value = "3";
+  rows[1].querySelector("[data-env-key]").value = "http://127.0.0.1:5031";
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(sandbox._collectEnvChanges())),
+    { OFF_NUM: "3", OFF_TEXT: "http://127.0.0.1:5031" },
+    "无运行值条目填了值必须进入差异集",
+  );
+
+  // 清空数字项不入 payload（空串必 422）；恢复默认走行内按钮
+  rows[0].querySelector("[data-env-key]").value = "";
+  assert.deepEqual(
+    Object.keys(sandbox._collectEnvChanges()),
+    ["OFF_TEXT"],
+    "空数字项不得进入差异集",
+  );
+
+  // select 兜底：当前值不在选项内时补同值 option，否则浏览器回落到第一项，
+  // 收集侧比对 el.value 会把「显示的那一项」当成用户改动写回
+  assert.match(
+    sandbox._envControl({ key: "LOG_LEVEL", type: "select", options: ["DEBUG", "INFO"], current: "info" }),
+    /value="info" selected/,
+    "不在选项内的当前值必须渲染为选中项",
+  );
+  assert.match(
+    sandbox._envControl({ key: "LOG_LEVEL", type: "select", options: ["DEBUG", "INFO"], current: "INFO" }),
+    /value="INFO" selected/,
+    "在选项内的当前值照常选中",
+  );
 }
 
 console.log("ui_env_panel_test: all assertions passed");

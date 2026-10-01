@@ -4511,7 +4511,12 @@ function _envControl(item) {
       + (cur ? " checked" : "") + '><span class="env-switch-text">启用</span></label>';
   }
   if (item.type === "select") {
-    const options = Array.isArray(item.options) ? item.options : [];
+    const options = Array.isArray(item.options) ? item.options.slice() : [];
+    // 当前值不在选项内（手改 .env 写了小写 log_level 等）时补一条同值 option：
+    // 否则浏览器回落到第一项，而收集侧比对的是 el.value——保存会把「显示的那
+    // 一项」当成用户改动写回，静默改写配置。
+    const shown = String(displayValue);
+    if (shown !== "" && !options.includes(shown)) options.unshift(shown);
     return '<select class="settings-select" data-env-key="' + keyAttr + '">'
       + options.map(o => '<option value="' + escAttr(o) + '"'
         + (String(displayValue) === o ? " selected" : "") + ">" + esc(o) + "</option>").join("")
@@ -4753,7 +4758,15 @@ function _collectEnvChanges() {
       const el = row.querySelector("[data-env-key]");
       if (!el) continue;
       newVal = el.value;
-      oldVal = String(_envInputValue(item));
+      // 与 _envControl 同一套归一：未装配插件的条目不下发 current（running:false），
+      // 输入框渲染成空串，而 String(undefined) 是 "undefined"——不归一就会把
+      // 「没动过」判成改动：数字项提交空串被服务端按「须为数字」422 拦下，
+      // 整次保存失败（界面只显示笼统的「暂存失败，请检查输入后重试」）。
+      const raw = _envInputValue(item);
+      oldVal = raw === null || raw === undefined ? "" : String(raw);
+      // 空数字不入 payload：<input type=number> 对非法输入返回空串，提交必 422；
+      // 要清掉已暂存的值请走行内「恢复默认」按钮。
+      if (item.type === "number" && newVal.trim() === "") continue;
       if (newVal === oldVal) continue;
     }
     if (item.type === "boolean") changes[key] = newVal ? "true" : "false";
