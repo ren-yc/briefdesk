@@ -117,6 +117,15 @@ def check_icons(
 
 
 def _main(argv: list[str] | None = None) -> int:
+    # 输出统一 UTF-8：Windows 控制台默认 ANSI 代码页，直接打印中文（可用/错误）
+    # 会抛 UnicodeEncodeError，把一条可读的失败信息变成栈回溯（与 benchmark CLI 同约定）。
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            try:
+                reconfigure(encoding="utf-8", errors="replace")
+            except (OSError, ValueError):
+                pass
     parser = argparse.ArgumentParser(
         description="从钉定版本的 lucide-static 拉取单个图标并登记清单。"
     )

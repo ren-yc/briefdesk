@@ -337,6 +337,16 @@ def assert_no_leaks(
 
 
 def main() -> int:
+    # 输出统一 UTF-8：Windows runner 的控制台默认是 ANSI 代码页（cp1252），
+    # 直接 print 中文会抛 UnicodeEncodeError 让冒烟在第一步就失败；
+    # errors=replace 保证即使流不可重配也不会因日志字符崩掉验收。
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            try:
+                reconfigure(encoding="utf-8", errors="replace")
+            except (OSError, ValueError):
+                pass  # 非可重配置流（测试捕获/已关闭）保持原样
     tmp = Path(tempfile.mkdtemp(prefix="briefdesk-smoke-"))
     data_dir = tmp / "data"
     cache_dir = tmp / "cache"
