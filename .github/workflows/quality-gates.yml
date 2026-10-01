@@ -64,24 +64,33 @@ jobs:
           pip install -r requirements-dev.txt
           pip install -e . --no-deps
 
+      # 推送事件的差异基线：正常推送用 event.before；首次推送（零 SHA）或强推
+      # （重写历史后旧 tip 在全新克隆里不可达）时改用推送载荷回推的等价基线——
+      # 本次推送的 N 个提交正是 HEAD 起往前 N 个，HEAD~N 即「推送前的位置」，
+      # 扫描范围与正常推送一致。基线不可达时若直接拒绝放行，强推后的门禁会假红。
+      - name: Resolve push base
+        if: github.event_name == 'push'
+        shell: bash
+        run: |
+          before="${{ github.event.before }}"
+          if [ -z "$before" ] || [ "$before" = "0000000000000000000000000000000000000000" ] \
+             || ! git cat-file -e "${before}^{commit}" 2>/dev/null; then
+            set -- ${{ join(github.event.commits.*.id, ' ') }}
+            before="HEAD~$#"
+          fi
+          echo "PUSH_BASE=$before" >> "$GITHUB_ENV"
+          echo "push base: $before"
       - name: Secret scan (PR diff)
         if: github.event_name == 'pull_request'
         run: |
           git fetch origin master
           python scripts/secret_scan.py --ref origin/master
 
-      # github.event.before is the all-zeros SHA on a branch's first push;
-      # fall back to origin/master there rather than scanning an empty diff.
       - name: Secret scan (push diff)
         if: github.event_name == 'push'
         shell: bash
         run: |
-          before="${{ github.event.before }}"
-          if [ -z "$before" ] || [ "$before" = "0000000000000000000000000000000000000000" ]; then
-            git fetch origin master
-            before="origin/master"
-          fi
-          python scripts/secret_scan.py --ref "$before"
+          python scripts/secret_scan.py --ref "$PUSH_BASE"
 
       # AGENTS.md「注释、文档与提交信息规范」：本地钩子覆盖提交前，但可被 --no-verify
       # 绕过，CI 是共享兜底。ref 口径与上方密钥扫描一致；与钩子不同，这里只看差异，
@@ -96,12 +105,7 @@ jobs:
         if: github.event_name == 'push'
         shell: bash
         run: |
-          before="${{ github.event.before }}"
-          if [ -z "$before" ] || [ "$before" = "0000000000000000000000000000000000000000" ]; then
-            git fetch origin master
-            before="origin/master"
-          fi
-          python scripts/forbidden_refs.py --ref "$before"
+          python scripts/forbidden_refs.py --ref "$PUSH_BASE"
 
       # AGENTS.md「注释、文档与提交信息规范」：提交信息只能靠 rebase 事后修订，
       # 本地 commit-msg 钩子可被 --no-verify 绕过；直接推 master 的路径也没有 PR
@@ -114,11 +118,7 @@ jobs:
             git fetch origin master
             base="origin/master"
           else
-            base="${{ github.event.before }}"
-            if [ -z "$base" ] || [ "$base" = "0000000000000000000000000000000000000000" ]; then
-              git fetch origin master
-              base="origin/master"
-            fi
+            base="$PUSH_BASE"
           fi
           for sha in $(git log --format=%H "$base"..HEAD); do
             git show -s --format=%B "$sha" > "$RUNNER_TEMP/commit-msg.txt"
