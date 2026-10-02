@@ -5167,8 +5167,13 @@ async function loadAboutSources() {
 let pluginBaseSet = null;   // 服务端期望启用的可选插件名集合（加载时快照）
 let pluginDraftSet = null;  // 草稿启用集合；null = 尚未改动
 
+let pluginExpectedUnknown = false;
+
 function _pluginSets() {
   const plugins = (envData && envData.plugins) || [];
+  // enabled===null 是服务端显式「预期未知」（名单解析失败），不是关闭：
+  // 不能把未知折进空集合并自动提交 PLUGINS=[] 清空名单。
+  pluginExpectedUnknown = plugins.some(p => !p.core && p.enabled === null);
   pluginBaseSet = new Set(plugins.filter(p => !p.core && p.enabled).map(p => p.name));
   pluginDraftSet = null;
 }
@@ -5187,6 +5192,8 @@ function _pluginEnabledInDraft(name) {
 function _pluginChanges() {
   // 草稿 → PLUGINS 期望列表（仅可选插件名，按名排序稳定序列化）
   if (!pluginDraftSet) return {};
+  // 预期未知时开关整体禁用，不应有草稿；防御：不产生清空名单的假更改
+  if (pluginExpectedUnknown) return {};
   const draft = [...pluginDraftSet].sort();
   const base = [...pluginBaseSet].sort();
   if (JSON.stringify(draft) === JSON.stringify(base)) return {};
@@ -5253,7 +5260,9 @@ function _pluginStatusBadge(p) {
 }
 
 function _pluginRowHtml(p) {
-  const on = pluginDraftSet ? pluginDraftSet.has(p.name) : pluginBaseSet.has(p.name);
+  // enabled===null（预期未知）不参与集合运算：开关禁用，显示不可信而非「关」
+  const unknownExpected = p.enabled === null;
+  const on = unknownExpected ? false : (pluginDraftSet ? pluginDraftSet.has(p.name) : pluginBaseSet.has(p.name));
   const badges = [];
   if (p.core) {
     badges.push('<span class="env-badge">核心 · 始终启用</span>');
@@ -5263,7 +5272,7 @@ function _pluginRowHtml(p) {
   }
   badges.push(_pluginStatusBadge(p));
   if (p.reason) badges.push('<span class="plugin-reason text-muted">' + esc(p.reason) + "</span>");
-  const control = p.core ? ""
+  const control = p.core || unknownExpected ? ""
     : '<label class="env-switch"><input type="checkbox" data-plugin-toggle="' + escAttr(p.name) + '"'
       + (on ? " checked" : "") + (envData && envData.pluginsOverridden ? " disabled" : "")
       + '><span class="env-switch-text">启用</span></label>';
@@ -5298,14 +5307,19 @@ function renderPluginToggles() {
   // 当前生效值，或在移除高层配置后再改。
   const pluginsOverridden = !!envData.pluginsOverridden
     || envData.pluginsSource === "env" || envData.pluginsSource === "dotenv";
+  // 预期名单不可用：顶部错误说明（不是「全部关闭」的推断）
+  const expectedErrorNotice = envData.pluginsExpectedError
+    ? '<div class="plugins-env-notice">插件预期名单无法解析：' + esc(envData.pluginsExpectedError)
+      + "——请修正该来源（环境变量 / 项目 .env / 本机配置）后刷新。开关已停用。</div>"
+    : "";
   const envNotice = pluginsOverridden
     ? '<div class="plugins-env-notice">PLUGINS 当前由「' + esc(_envSourceLabel(envData.pluginsSource))
       + "」控制（优先于本机配置），此处的开关重启后不会生效——请修改该来源后重启。</div>"
     : "";
   // 7b：无任何可选插件启用 → 面板顶部引导（覆盖零源降级最常见成因：新装
   // 复制 .env.example 默认 PLUGINS=[] / 旧版升级无 PLUGINS 行）。消息源等
-  // 可选插件默认禁用，须逐个启用并重启生效。
-  const optionalAllOff = !plugins.some(p => !p.core && p.enabled);
+  // 可选插件默认禁用，须逐个启用并重启生效。预期未知时不做「全关」推断。
+  const optionalAllOff = !pluginExpectedUnknown && !plugins.some(p => !p.core && p.enabled);
   const optionalHint = optionalAllOff
     ? '<p class="text-muted settings-hint plugins-empty-hint">当前未启用任何可选插件'
       + "（消息源等默认禁用）。消息采集不可用——请在上方启用至少一个消息源，"
@@ -5316,7 +5330,7 @@ function renderPluginToggles() {
     ? '<div class="plugin-section"><div class="plugin-section-title">' + title + "</div>"
       + rows.map(_pluginRowHtml).join("") + "</div>"
     : "";
-  $pluginsList.innerHTML = envNotice
+  $pluginsList.innerHTML = expectedErrorNotice + envNotice
     + (optionalHint ? '<div class="plugin-section">' + optionalHint + "</div>" : "")
     + section("核心插件（始终启用）", plugins.filter(p => p.core))
     + section("可选插件", plugins.filter(p => !p.core));

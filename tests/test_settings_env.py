@@ -30,6 +30,7 @@ from briefdesk.server import routes_settings_env as settings_routes
 from briefdesk.settings_base import KeyringSettingsBase
 from briefdesk.settings_env import (
     SOURCE_DOTENV,
+    StagedReadError,
     field_env_key,
     get_settings_file,
     read_staged,
@@ -735,7 +736,9 @@ class PluginToggleRoutesTest(StagedFileTestCase):
             {p["name"]: p["enabled"] for p in data["plugins"]},
             {"weflow": True, "ai_provider": True},
         )
-        self.assertEqual(data["pluginsSource"], "default")
+        # 实时来源语义：暂存层提供 PLUGINS 时 pluginsSource=override（开关仍可编辑，
+        # 只有 env/.env 压住才 overridden）——旧断言按启动快照写 default，按新语义改写
+        self.assertEqual(data["pluginsSource"], "override")
         self.assertFalse(data["pluginsOverridden"])
 
     def test_put_plugins_conflict_rejected_409(self) -> None:
@@ -776,6 +779,158 @@ class PluginToggleRoutesTest(StagedFileTestCase):
         )
         self.assertEqual(res.status_code, 422)
         self.assertEqual(read_staged(), {})
+
+
+class DeletePluginsFallbackTest(StagedFileTestCase):
+    """删除暂存名单不得回落启动 config.plugins，解析失败不等同无冲突。
+
+    旧行为：删除最后一个 PLUGINS 暂存后 _desired_plugins 回落 config.plugins，
+    「暂存含 benchmark + REQUIRED 含 benchmark」的组合在运行中删除 PLUGINS 会
+    被放行——保存成功、重启必失败（required_not_enabled）。
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.client = TestClient(
+            srv.app,
+            base_url="http://localhost",
+            headers={"Origin": "http://localhost"},
+        )
+
+    def test_delete_only_staged_plugins_conflicts_with_required(self) -> None:
+        """暂存 PLUGINS+REQUIRED 后删除 PLUGINS：预期启用名单 []，409 拒绝且文件不变。"""
+        ok = self.client.put(
+            "/api/settings/env",
+            json={
+                "items": {
+                    "PLUGINS": json.dumps(["benchmark"]),
+                    "PLUGINS_REQUIRED": json.dumps(["benchmark"]),
+                }
+            },
+        )
+        self.assertEqual(ok.status_code, 200)
+        before = read_staged()
+        res = self.client.put(
+            "/api/settings/env", json={"items": {"PLUGINS": None}}
+        )
+        self.assertEqual(res.status_code, 409)
+        issues = res.json()["detail"]["issues"]
+        self.assertTrue(
+            any(
+                i["type"] == "required_not_enabled" and i["plugin"] == "benchmark"
+                for i in issues
+            ),
+            issues,
+        )
+        self.assertEqual(read_staged(), before, "拒绝时暂存必须原样保留")
+
+    def test_delete_last_plugins_without_required_resets_to_default(self) -> None:
+        """无必选约束时删除 PLUGINS：合法，预期名单为默认空——不是启动旧值。"""
+        ok = self.client.put(
+            "/api/settings/env", json={"items": {"PLUGINS": json.dumps(["benchmark"])}}
+        )
+        self.assertEqual(ok.status_code, 200)
+        res = self.client.put(
+            "/api/settings/env", json={"items": {"PLUGINS": None}}
+        )
+        self.assertEqual(res.status_code, 200)
+        self.assertNotIn("PLUGINS", read_staged())
+
+    def test_clear_both_plugin_keys_at_once(self) -> None:
+        """同请求清两键：按剩余层校验，合法时成功（恢复出厂默认）。"""
+        ok = self.client.put(
+            "/api/settings/env",
+            json={
+                "items": {
+                    "PLUGINS": json.dumps(["benchmark"]),
+                    "PLUGINS_REQUIRED": json.dumps(["benchmark"]),
+                }
+            },
+        )
+        self.assertEqual(ok.status_code, 200)
+        res = self.client.put(
+            "/api/settings/env",
+            json={"items": {"PLUGINS": None, "PLUGINS_REQUIRED": None}},
+        )
+        self.assertEqual(res.status_code, 200)
+        self.assertEqual(read_staged(), {})
+
+    def test_broken_staged_plugins_required_reports_unavailable(self) -> None:
+        """暂存 REQUIRED 是坏 JSON（经直写绕过 normalize）：PUT 任何插件键都 409 点名，不放行。"""
+        write_staged({"PLUGINS_REQUIRED": "[17]"})
+        res = self.client.put(
+            "/api/settings/env", json={"items": {"PLUGINS": json.dumps(["benchmark"])}}
+        )
+        self.assertEqual(res.status_code, 409)
+        issues = res.json()["detail"]["issues"]
+        self.assertTrue(any(i["type"] == "unavailable" for i in issues), issues)
+        # 不落盘
+        self.assertEqual(read_staged()["PLUGINS_REQUIRED"], "[17]")
+        self.assertNotIn("PLUGINS", read_staged())
+
+
+class PluginsExpectedUnavailableTest(StagedFileTestCase):
+    """名单不可用时 GET 显式说明、enabled 显式未知；预检与回读同源（含变量展开）。"""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.client = TestClient(
+            srv.app,
+            base_url="http://localhost",
+            headers={"Origin": "http://localhost"},
+        )
+
+    def test_get_reports_expected_error_and_unknown_enabled(self) -> None:
+        """暂存 PLUGINS 坏 JSON：GET 不 500，pluginsExpectedError 非空，enabled 显式未知。"""
+        write_staged({"PLUGINS": "not-json"})
+        with patch.object(settings_routes, "get_plugin_meta", return_value=[]):
+            data = self.client.get("/api/settings/env").json()
+        self.assertIn("PLUGINS 不是合法 JSON", data["pluginsExpectedError"])
+        self.assertTrue(
+            all(p["enabled"] is None for p in data["plugins"]),
+            data["plugins"],
+        )
+
+    def test_project_env_plugins_surface_in_expected_error(self) -> None:
+        """高层 .env 提供坏名单：同样显式不可用（预检按共享层序，不只看暂存）。"""
+        with tempfile.TemporaryDirectory() as d:
+            project = Path(d) / ".env"
+            project.write_text("PLUGINS=not-json\n", encoding="utf-8")
+            with _env_without("PLUGINS"), patch.object(
+                paths, "project_dotenv_path", return_value=project
+            ), patch.object(settings_routes, "get_plugin_meta", return_value=[]):
+                data = self.client.get("/api/settings/env").json()
+        self.assertIn("PLUGINS 不是合法 JSON", data["pluginsExpectedError"])
+
+    def test_candidate_bytes_interpolation_seen_by_precheck(self) -> None:
+        """暂存值含 ${VAR} 时预检看到展开后的值，与提交后重新解析同源。
+
+        内存 dict 合并直接 json.loads 看到的是展开前的原文：PLUGINS=["${X:-weflow}"]
+        是合法 JSON（字符串内容而已），但它不是提交后真正生效的名单。
+        """
+        res = self.client.put(
+            "/api/settings/env",
+            json={"items": {"PLUGINS": '["${BD_TEST_PLUGIN:-weflow}"]'}},
+        )
+        # weflow 在测试进程没有元数据登记：预检按**展开后的** ["weflow"] 校验，
+        # 无人可校验（validate 返回 None → []）所以放行落盘
+        self.assertEqual(res.status_code, 200)
+        # 落盘的是原文；read_staged() 会按 dotenv 规则展开，因此这里断言文件字节
+        self.assertIn("${BD_TEST_PLUGIN:-weflow}", self.staged_path.read_text(encoding="utf-8"))
+        self.assertEqual(read_staged()["PLUGINS"], '["weflow"]')
+
+    def test_put_rejects_write_when_staged_unreadable(self) -> None:
+        """暂存读不出来时拒绝写入（409），不把读失败当「无暂存」覆盖成空文件。"""
+        write_staged({"LOG_LEVEL": "DEBUG"})
+        before = self.staged_path.read_bytes()
+        with patch.object(
+            settings_routes, "prepare_staged_write", side_effect=StagedReadError("boom")
+        ):
+            res = self.client.put(
+                "/api/settings/env", json={"items": {"LOG_LEVEL": "INFO"}}
+            )
+        self.assertEqual(res.status_code, 409)
+        self.assertEqual(self.staged_path.read_bytes(), before)
 
 
 class FrontendGuardTest(unittest.TestCase):

@@ -23,6 +23,7 @@ Support/briefdesk/`，Linux `~/.config/briefdesk/`），也可经环境变量
 
 import logging
 import os
+from io import StringIO
 from pathlib import Path
 
 from dotenv import dotenv_values
@@ -229,8 +230,36 @@ def startup_source(alias: str) -> str | None:
     return _core_sources.get(alias)
 
 
+class StagedReadError(RuntimeError):
+    """暂存文件存在但无法可靠读取（权限/编码等）：调用方不得当成空文件覆盖。
+
+    读取失败被当成空 dict 时，下一次写入会把整个暂存态抹掉——那不是「恢复默认」，
+    是静默数据丢失。展示路径（GET）可以降级为空并提示，写入路径必须显式失败。
+    """
+
+
+def read_staged_strict() -> dict[str, str]:
+    """写入路径用的严格读取：文件存在但读不了/解不了码时抛 StagedReadError。
+
+    只有 FileNotFoundError 等价于「无暂存」。返回值口径与 read_staged 一致
+    （丢弃 dotenv 解析出 None 值的行）。
+    """
+    path = get_settings_file()
+    try:
+        raw = dotenv_values(str(path), encoding="utf-8")
+    except FileNotFoundError:
+        return {}
+    except (OSError, UnicodeDecodeError) as error:
+        raise StagedReadError(f"暂存文件无法读取: {path}（{error}）") from error
+    return {k: v for k, v in raw.items() if v is not None}
+
+
 def read_staged() -> dict[str, str]:
-    """读取暂存文件内容（不存在/解析异常 → 空 dict，调用方不回滚）。"""
+    """读取暂存文件内容（展示路径：不存在/解析异常 → 空 dict，不回滚）。
+
+    写入路径必须用 read_staged_strict()：读失败当空会让下一次写入把暂存态整文件
+    抹掉。文件确实不存在时两者等价于空。
+    """
     path = get_settings_file()
     try:
         raw = dotenv_values(str(path), encoding="utf-8")
@@ -240,24 +269,52 @@ def read_staged() -> dict[str, str]:
     return {k: v for k, v in raw.items() if v is not None}
 
 
-def write_staged(updates: dict[str, str | None]) -> None:
-    """按更新项改写暂存文件：None = 删除该键；全部删除后移除整个文件。
+def prepare_staged_write(updates: dict[str, str | None]) -> tuple[dict[str, str], bytes | None]:
+    """按更新项合成写后暂存态并产出最终 bytes；None = 删除该键。
 
-    原子性：先写同目录临时文件再 os.replace；失败时原文件保持不变。
+    返回 (写后暂存字典, 候选 bytes)；候选为 None 表示「全部删除，移除文件」。
+    只准备不落盘：PUT 的组合预检要看到与提交后**完全相同的解析结果**——值里
+    带 ${VAR} 展开时，内存 dict 合并后直接 json.loads 看到的是展开前的原文，
+    与真实回读不一致。换行值在此拒绝（normalize_setting 之外的纵深防御）。
     """
-    path = get_settings_file()
-    current = read_staged()
+    current = read_staged_strict()
     bad = [k for k, v in updates.items() if v is not None and ("\n" in v or "\r" in v)]
     if bad:
         # 纵深防御：normalize_setting 已拒绝换行值，此处防其他调用路径回归——
         # 换行会把 KEY=VALUE 行格式拆出伪键（可注入任意配置行，含密钥名）
         raise ValueError(f"暂存值不能包含换行: {bad}")
+    merged = dict(current)
     for key, value in updates.items():
         if value is None:
-            current.pop(key, None)
+            merged.pop(key, None)
         else:
-            current[key] = value
-    if not current:
+            merged[key] = value
+    if not merged:
+        return merged, None
+    payload = "".join(f"{k}={v}" + "\n" for k, v in merged.items()).encode("utf-8")
+    return merged, payload
+
+
+def read_staged_from_bytes(candidate: bytes | None) -> dict[str, str]:
+    """按暂存文件同一套 dotenv 规则解析候选字节（PUT 预检用）。
+
+    candidate 为 None（全部删除）等价于空暂存。解析口径必须与真实回读一致
+    （同一 parser、同一插值规则），预检看到的才是提交后会生效的值。坏编码
+    抛 UnicodeDecodeError，由调用方显式拒绝写入。
+    """
+    if candidate is None:
+        return {}
+    raw = dotenv_values(stream=StringIO(candidate.decode("utf-8")))
+    return {k: v for k, v in raw.items() if v is not None}
+
+
+def commit_staged_write(candidate: bytes | None) -> None:
+    """提交 prepare 产出的候选 bytes（或删除文件）；失败时原文件保持不变。
+
+    只写已校验的字节，不重新读取/合并/序列化——预检与落盘必须是同一份内容。
+    """
+    path = get_settings_file()
+    if candidate is None:
         try:
             path.unlink(missing_ok=True)
         except OSError:
@@ -265,11 +322,20 @@ def write_staged(updates: dict[str, str | None]) -> None:
         return
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
-    lines = "".join(f"{k}={v}\n" for k, v in current.items())
     try:
-        tmp.write_text(lines, encoding="utf-8")
+        tmp.write_bytes(candidate)
         os.replace(tmp, path)
     except OSError:
         # 写入/替换失败时清理残留 .tmp（原文件未被 os.replace 触碰，保持不变）
         tmp.unlink(missing_ok=True)
         raise
+
+
+def write_staged(updates: dict[str, str | None]) -> None:
+    """按更新项改写暂存文件（兼容入口）：prepare + commit，不留旧写入通道。
+
+    原子性：先写同目录临时文件再 os.replace；失败时原文件保持不变。
+    调用方持锁（服务端 PUT 用 _write_lock 串行化）。
+    """
+    _, candidate = prepare_staged_write(updates)
+    commit_staged_write(candidate)

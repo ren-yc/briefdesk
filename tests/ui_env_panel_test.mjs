@@ -804,3 +804,30 @@ setEnvData({
 }
 
 console.log("ui_env_panel_test: all assertions passed");
+
+// ── 9. 插件预期未知（enabled===null）：开关禁用、不产生 PLUGINS 假更改 ──
+// 名单解析失败时服务端把可选插件 enabled 置 null（显式未知，不是关闭）：
+// UI 若把未知折进空集合，会把「未知」自动提交成 PLUGINS=[] 清空名单。
+setEnvData({
+  filePath: "C:/tmp/settings.env",
+  pluginOptions: [],
+  pluginsExpectedError: "PLUGINS 不是合法 JSON",
+  pluginsSource: "default",
+  pluginsOverridden: false,
+  items: [],
+  secrets: [],
+  plugins: [
+    { name: "alpha", core: false, enabled: null, dependencies: [], conflicts: [], status: "disabled", reason: "" },
+    { name: "core-a", core: true, enabled: true, dependencies: [], conflicts: [], status: "loaded", reason: "" },
+  ],
+});
+sandbox._pluginSets(); // 与 loadEnvConfig 同序：先算期望集再渲染
+sandbox.renderPluginToggles();
+{
+  const html = getElement("plugins-list").innerHTML;
+  assert.match(html, /无法解析/, "预期未知必须显示错误说明，不能显示「全关」引导");
+  assert.doesNotMatch(html, /当前未启用任何可选插件/, "不得做「全部关闭」的推断");
+  // 防御断言：未知时 _pluginChanges 不得产出 PLUGINS 假更改
+  vm.runInContext("pluginDraftSet = new Set();", sandbox);
+  assert.deepEqual(JSON.parse(JSON.stringify(sandbox._pluginChanges())), {}, "预期未知不得提交清空名单的假更改");
+}
