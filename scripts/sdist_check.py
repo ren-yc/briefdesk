@@ -205,19 +205,38 @@ def main() -> int:
             except (OSError, ValueError):
                 pass  # 非可重配置流（测试捕获/已关闭）保持原样：Windows 控制台默认 ANSI 代码页
     workdir = Path(tempfile.mkdtemp(prefix="briefdesk-sdist-"))
+    # 显式状态机而不用 sys.exc_info() 判断流程结果：except 分支里 return 时，
+    # finally 已不在「异常正在处理」状态，sys.exc_info() 返回 None——检查失败的
+    # 现场照样被删，「现场保留在 …」的提示指向不存在的目录。任何未完成成功加清理
+    # 成功的路径（含 KeyboardInterrupt 等意外中断）都判定为失败并保留现场。
+    checks_passed = False
+    failed: BaseException | None = None
     try:
         sdist = build_sdist(workdir / "dist")
         data = assert_sdist_contents(sdist)
         assert_wheel_consistency(sdist, workdir)
         log(f"sdist 检查通过：{sdist.name}，数据成员 {len(data)} 个")
-        return 0
+        checks_passed = True
     except CheckFailure as error:
+        failed = error
         print(f"[sdist-check] 失败: {error}", file=sys.stderr, flush=True)
-        print(f"[sdist-check] 现场保留在 {workdir}", file=sys.stderr, flush=True)
+    except BaseException as error:  # noqa: BLE001 — 意外异常/中断同样保留现场后再传播
+        failed = error
+        print(f"[sdist-check] 意外终止（{type(error).__name__}），现场保留: {workdir}", file=sys.stderr, flush=True)
+    if not checks_passed:
+        if isinstance(failed, CheckFailure):
+            print(f"[sdist-check] 现场保留在 {workdir}", file=sys.stderr, flush=True)
         return 1
-    finally:
-        if sys.exc_info()[0] is None:
-            shutil.rmtree(workdir, ignore_errors=True)
+    # 清理成功是「通过」的一部分：删除失败（Windows 文件占用常见）不得静默放过，
+    # 否则退出码 0 声称的检查结果附带一个半删的现场。只忽略目录已不存在。
+    try:
+        shutil.rmtree(workdir)
+    except FileNotFoundError:
+        pass
+    except OSError as error:
+        print(f"[sdist-check] 检查通过，但清理现场失败（残余目录）: {workdir}（{error}）", file=sys.stderr, flush=True)
+        return 1
+    return 0
 
 
 if __name__ == "__main__":
