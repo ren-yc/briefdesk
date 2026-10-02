@@ -845,6 +845,12 @@ WARNING）的日志噪音；`fmt_dur()` 统一耗时格式。
   （`_ATTACHMENT_RE`）与图片 `mediaType == "image"` 校验与 SSE 路径同口径——同一消息不因到达路径（实时 SSE/回填 REST）不同而入库结果不同。
   **URL 拼接契约**：`*_API_BASE`（base_url）必须是**服务根地址或反代
   子路径前缀**，不得携带查询串、不得填完整端点路径；三源 SSE/媒体经共享助手 `sources_base.build_endpoint_url` 按 base 的路径前缀拼接
+- **消息源共享就绪门控与 vendor SDK**：weflow/qqflow 两客户端的「身份状态机」（健康检查驱动的记忆化、绑定账号身份闸门、
+  良性/被拒态注册分诊）收敛为 `briefdesk/plugins/_sdk_base.ReadinessGate`——HTTP 细节以**属性名**注入（调用时解析，
+  测试的实例级打桩对门控可见）；每次 SSE 实际建连交付消息前强制重检（周期轮询默认关闭，身份闸门不可移交 poller）；
+  绑定账号不符抛 Mismatch 并置 offline，禁止继续读流。`vendor/weflow_sdk` 与 `vendor/qqflow_sdk` 是两个上游 SDK 的 
+  git subtree 纯镜像（`--squash`，供应分支 `sdk-dist`），随包分发；**vendor 内禁改**——补丁一律上游先行再经 
+  `scripts/sync_vendor.ps1` 同步，违反即 modify/delete 冲突响亮失败。
   （保留 base 自带查询串），与 REST 的相对路径合并三路一致——反代子路径部署下不再 404。**刻意保留的上游契约差异**：SSE 心跳/读超时（weflow/qqflow 上游 25s
   ping→60s；legacy 上游无心跳→300s）、自消息检测（weflow/legacy 信任上游不推自消息；qqflow 每消息 REST 回查）、`retry_on_empty`（仅
   legacy 上游存在「刚入库查不到」竞态）、`WEFLOW_DB_KEYS` 存储层自动分片（Windows 凭据管理器单条上限，配置语义恒为一份完整 JSON）。
