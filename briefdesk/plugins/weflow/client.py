@@ -24,6 +24,7 @@ import httpx
 
 from briefdesk.logger import fmt_dur
 from briefdesk.masking import clean_display_name
+from briefdesk.plugins._sdk_base import ReadinessGate
 from briefdesk.plugins.weflow.config import WeFlowSettings
 from briefdesk.sources_base import (
     ConnectionStatus,
@@ -227,9 +228,19 @@ class WeFlowClient(SourceClient):
             sse_read_timeout_ms = WeFlowSettings().sse_read_timeout_ms
         self._sse_read_timeout_s = sse_read_timeout_ms / 1000
         self._client: httpx.AsyncClient | None = None
-        self._ready_checked = False
-        # 串行化健康检查 + 引导注册（SSE 强制重检与轮询检查并发竞争时避免重复注册）
-        self._ready_lock = asyncio.Lock()
+        # 共享就绪门控：状态机本体（健康分诊/身份闸门/注册分诊）在
+        # _sdk_base.ReadinessGate；HTTP 细节以回调注入（方法见下）。
+        self._gate = ReadinessGate(
+            owner=self,
+            health_attr="fetch_health",
+            accounts_attr="fetch_accounts",
+            register_attr="_register_via_gate",
+            log_errors_attr="_log_account_errors",
+            identity_attr="_check_bound_identity",
+            version_label="weflow-server",
+            log=logger,
+        )
+
         # 上游版本号（/health 的 version）：首次就绪时记一条日志，便于排查
         # 「下游按新契约调用、上游还是旧二进制」的错配
         self._logged_version: str | None = None
@@ -292,7 +303,11 @@ class WeFlowClient(SourceClient):
             # 会看到 indexing 良性态而直接返回，且上游注册已幂等（v0.3.0 起
             # 重复注册 ready/indexing 账号不重建索引）。
             logger.debug("GET %s → 503（服务端索引期，瞬态）", path)
-            self._ready_checked = False
+            # 503 自愈：同时复位本地镜像与共享门控的标志
+            # 503 自愈：同时复位本地镜像与共享门控的标志
+            # 503 自愈：同时复位本地镜像与共享门控的标志
+            # 503 self-heal: the gate owns the flag
+            self._gate.reset()
             raise WeFlowNotReadyError(
                 f"weflow-server 尚未就绪（503）: {resp.text[:200]}"
             )
@@ -409,100 +424,46 @@ class WeFlowClient(SourceClient):
             f"请修正 WEFLOW_WXID，或注销占用方后重启服务端"
         )
 
+    @property
+    def _logged_version(self) -> str | None:
+        """白盒兼容面：已记录版本的真身在共享门控上。"""
+        return self._gate.logged_version
+    @_logged_version.setter
+    def _logged_version(self, value: str | None) -> None:
+        """poller 等处会写入版本号；真身在门控上，写入保持一致。"""
+        self._gate._logged_version = value
+
+    @property
+    def _ready_checked(self) -> bool:
+        """白盒兼容面：记忆化标志的真身在共享门控上。
+        """
+        return self._gate.checked
+
+    @_ready_checked.setter
+    def _ready_checked(self, value: bool) -> None:
+        self._gate.checked = value
+
     async def ensure_ready(self, force: bool = False) -> None:
         """确保服务端有就绪账号（健康检查驱动，记忆化，可强制重检）。
 
-        先查 /health 的标量 account 阶段（上游 v0.5.0 起）：ready 与 indexing
-        即记忆化返回，**不重复注册**；unregistered / error 才注册。注册后进入
-        索引期，业务接口的 503 由 WeFlowNotReadyError 瞬态处理兜底，不在此
-        阻塞等待。
-
-        force=True 时忽略记忆化标志重新健康检查（SSE 重连后服务端可能已重启，
-        内存态账号注册表丢失，需重新注册）。良性态（_BENIGN_REGISTER_STATES /
-        _BOOTSTRAPPING_PHASES）记忆；被拒态与网络失败不记忆，下轮重试（自愈）。
-
-        单账号（上游 v0.5.0 起为强制）意味着服务端同时只绑定一个账号，但**不
-        意味着那个账号一定是我们的**：`/health` 的标量阶段刻意不含身份（免鉴权
-        端点列账号 = 允许枚举本机账号），绑着别人的账号时阶段照样报 ready。
-        所以短路前必须先确认身份 —— 双层判定：
-        1. 快路：从鉴权明细端点比对绑定账号（`_check_bound_identity`）；
-        2. 兜底：明细取不到（401/抖动）时不硬失败，照常走注册，由上游的
-           `account_conflict` 定夺（该守卫在密钥校验**之前**，是可靠的身份预言机）。
-        确认不符即抛 WeFlowAccountMismatchError，不记忆化。
+        状态机本体在共享基座：健康阶段分诊、绑定账号身份闸门、良性/被拒
+        态的注册分诊两平台同构（_sdk_base.ReadinessGate），本类构造时把
+        HTTP 细节（健康检查、明细、自持注册、根因诊断、身份比对）注入。
         """
-        if self._ready_checked and not force:
-            return
-        async with self._ready_lock:
-            # 锁内双检：并发调用（SSE 强制检查 vs 轮询检查）先到者注册并置位，
-            # 后到者在此短路，避免重复注册
-            if self._ready_checked and not force:
-                return
-            try:
-                health = await self.fetch_health()
-            except Exception:
-                self._ready_checked = False
-                raise
-            version = health.get("version")
-            if version and version != self._logged_version:
-                logger.info("weflow-server 版本: %s", version)
-                self._logged_version = str(version)
-            phase = health.get("account", "unregistered")
-            logger.debug("健康检查: 账号阶段 %s", phase)
+        await self._gate.ensure_ready(force=force)
+    async def _register_via_gate(self) -> tuple[str, str | None]:
+        """自持注册：返回 (state, status) 供门控分诊。
 
-            # 身份闸门：阶段说「有绑定」时，先确认绑的是不是自己的账号。
-            accounts: list[dict] = []
-            identity_ok = False
-            if phase in _BOUND_PHASES:
-                try:
-                    accounts = await self.fetch_accounts()
-                except Exception as e:  # noqa: BLE001 —— 取不到身份不硬失败
-                    logger.warning("账号明细不可用（%s），改由注册结果判定身份", e)
-                else:
-                    # 比对必须留在 else：else 不受上面 except 保护，
-                    # _check_bound_identity 的不符错误才能原样冒泡。挪进 try
-                    # 就会被那条宽 except 吞成一行 warning —— 正是本次要修的病。
-                    identity_ok = self._check_bound_identity(accounts)
+        account_conflict 由 register_account 就地抛 Mismatch（它持有
+        occupied_by，消息更有诊断价值）；网络失败原样冒泡（不记忆化）。
+        """
+        state, status = await self.register_account()
+        return state, status
 
-            if identity_ok and phase == "ready":
-                self._ready_checked = True
-                logger.debug("已确认自有账号就绪，跳过注册")
-                return
-            if identity_ok and phase in _BOOTSTRAPPING_PHASES:
-                self._ready_checked = True
-                logger.debug("自有账号建索引中（%s），不再重复注册", phase)
-                return
-            if phase == "error":
-                # /health 只给标量，根因（密钥/路径填错的 error 字符串）只在需
-                # 鉴权的明细接口里。仍显式告警——否则用户只能看到业务接口持续
-                # 503，看不到原因。诊断失败不能挡住下面的注册重试。
-                # 明细已在上面取过就复用，避免对同一个 GET 打两次。
-                await self._log_account_errors(accounts)
-            # `error` 落到注册分支是有意的：服务端的 error 状态不释放绑定，但同一
-            # 账号可以直接重试注册来恢复（密钥修正后即生效）。
-            logger.info(
-                "无就绪账号（阶段 %s），注册账号 wxid=%s "
-                "(db_path=%s, keys=%d 个库)",
-                phase,
-                self._wxid,
-                self._db_path or "<默认>",
-                len(self._db_keys),
-            )
-            # account_conflict 由 register_account 就地抛 WeFlowAccountMismatchError
-            # （与 qqflow 同形），不在此处分支。
-            state, status = await self.register_account()
-            if state in _BENIGN_REGISTER_STATES or status in _BOOTSTRAPPING_PHASES:
-                self._ready_checked = True
-                logger.info("账号注册: state=%s, status=%s", state, status)
-            else:
-                # 被拒态（error / awaiting_key 等）不记忆化：保持未检查标志让
-                # 下一轮重试；否则零账号部署下没有业务 503 兜底复位标志，
-                # 注册失败后永不自愈
-                logger.warning(
-                    "账号注册被拒: state=%s, status=%s（下轮重试）",
-                    state,
-                    status,
-                )
-
+    def _identity_matches(self, accounts: list[dict]) -> bool:
+        """绑定账号身份比对；不符抛 Mismatch（原样冒泡）。
+        """
+        return self._check_bound_identity(accounts)
     async def _log_account_errors(self, accounts: list[dict] | None = None) -> None:
         """把 error 根因打出来（诊断专用，失败仅降级为 debug）。
 

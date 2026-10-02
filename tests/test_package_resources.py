@@ -23,13 +23,22 @@ _PYPROJECT = tomllib.loads((REPO / "pyproject.toml").read_text(encoding="utf-8")
 PACKAGE_DATA: dict[str, list[str]] = _PYPROJECT["tool"]["setuptools"]["package-data"]
 
 
+# packages.find 的 where 根（包名 → 目录的解析根，与 pyproject 保持一致）
+_PACKAGE_ROOTS = (REPO, REPO / "vendor")
+
+
 def _expand(package: str, pattern: str) -> list[Path]:
     """按 setuptools 的口径展开某个包的数据模式（* 不跨目录分隔符）。
 
-    包名到目录：本仓库的目录布局与包名一一对应（a.b → a/b）。
+    包名到目录：本仓库的目录布局与包名一一对应（a.b → a/b）；vendor 的
+    两个 subtree 包（weflow_sdk/qqflow_sdk）位于 vendor/ 根下，逐一尝试
+    packages.find 声明的 where 根。
     """
-    base = REPO.joinpath(*package.split("."))
-    return sorted(p for p in base.glob(pattern) if p.is_file())
+    for root in _PACKAGE_ROOTS:
+        base = root.joinpath(*package.split("."))
+        if base.is_dir():
+            return sorted(p for p in base.glob(pattern) if p.is_file())
+    return []
 
 
 def _declared_files() -> dict[str, Path]:
@@ -44,8 +53,9 @@ def _declared_files() -> dict[str, Path]:
 
 def test_declared_patterns_match_real_files() -> None:
     for package, patterns in PACKAGE_DATA.items():
-        base = REPO.joinpath(*package.split("."))
-        assert base.is_dir(), f"声明的包目录不存在（目录搬走了？）: {package}"
+        assert any(
+            root.joinpath(*package.split(".")).is_dir() for root in _PACKAGE_ROOTS
+        ), f"声明的包目录不存在（目录搬走了？）: {package}"
         for pattern in patterns:
             assert _expand(package, pattern), f"{package} 的 {pattern!r} 未命中任何文件"
 

@@ -20,6 +20,7 @@ import httpx
 
 from briefdesk.logger import fmt_dur
 from briefdesk.masking import clean_display_name
+from briefdesk.plugins._sdk_base import ReadinessGate
 from briefdesk.plugins.qqflow.config import QqFlowSettings
 from briefdesk.sources_base import (
     ConnectionStatus,
@@ -123,21 +124,6 @@ logger = logging.getLogger(__name__)
 # 媒体下载大小上限：防止异常/恶意上游返回超大文件造成内存放大
 _MAX_MEDIA_BYTES = 20 * 1024 * 1024
 
-# 注册接口（POST /api/v1/accounts）返回的良性 state：已受理/引导中，视为可
-# 记忆，索引期内不重复注册。这是**注册结果**的词表，与 /health 的 account
-# 阶段值（unregistered/indexing/ready/error）是两套不相交的枚举 —— 曾经把它
-# 拿去比对健康状态，那个分支恒为假，"索引中不重复注册"的优化从未生效。
-_BENIGN_STATES = ("accepted", "in_progress", "already_ready")
-
-# /health 的 account 阶段值中，代表"服务端已在引导、无需再注册"的那些。
-_BOOTSTRAPPING_PHASES = ("indexing",)
-
-# /health 的 account 阶段值中，代表"服务端已被某个账号占用"的那些。上游
-# AccountPhase 恰好四值（unregistered/indexing/ready/error，snake_case 序列化），
-# 且刻意没有 awaiting_key 变体 —— 启动扫描发现但无人注册的账号一律折叠成
-# unregistered，所以这三个就是"有绑定"的全部取值。
-_BOUND_PHASES = ("indexing", "ready", "error")
-
 # 按消息回查 REST（IGNORE_SELF 方向判定）的单页条数：倒序响应下目标消息
 # 之后 120s 窗口内的新消息会把它挤出首页，50 条在刷屏场景不够，
 # 放宽到 200：50 条在刷屏场景下不够用
@@ -188,13 +174,19 @@ class QqFlowClient(SourceClient):
             sse_read_timeout_ms = QqFlowSettings().sse_read_timeout_ms
         self._sse_read_timeout_s = sse_read_timeout_ms / 1000
         self._client: httpx.AsyncClient | None = None
-        self._ready_checked = False
-        # 首次见到的上游版本号（/health 的 version 字段）：仅用于版本日志与
-        # 「上游可能不支持 offset」告警的文案（sources_base 的 upstream_version），
-        # 不参与任何行为判定
-        self._logged_version: str | None = None
-        # 串行化健康检查 + 引导注册（SSE 强制重检与轮询检查并发竞争时避免重复注册）
-        self._ready_lock = asyncio.Lock()
+        # 共享就绪门控：状态机本体（健康分诊/身份闸门/注册分诊）在
+        # _sdk_base.ReadinessGate；HTTP 细节以属性名注入（调用时解析，
+        # 测试的实例级打桩可见）。
+        self._gate = ReadinessGate(
+            owner=self,
+            health_attr="fetch_health",
+            accounts_attr="fetch_accounts",
+            register_attr="_register_via_gate",
+            log_errors_attr="_log_account_errors",
+            identity_attr="_check_bound_identity",
+            version_label="qqflow-server",
+            log=logger,
+        )
         self.connection_status = "offline"
 
     def sse_timeout(self) -> httpx.Timeout:
@@ -260,7 +252,8 @@ class QqFlowClient(SourceClient):
             # 就绪门控（瞬态）：失效记忆化标志——服务端重启（内存态注册表丢失）
             # 后，下一轮 ensure_ready 会重新健康检查 + 引导注册（自愈）
             logger.debug("GET %s → 503（服务端索引期，瞬态）", path)
-            self._ready_checked = False
+            # 503 自愈：复位共享门控的记忆化标志（下轮重检）
+            self._gate.reset()
             raise QqFlowNotReadyError(
                 f"qqflow-server 尚未就绪（503）: {resp.text[:200]}"
             )
@@ -352,96 +345,40 @@ class QqFlowClient(SourceClient):
             f"请修正 QQFLOW_QQ，或注销占用方后重启服务端"
         )
 
+    @property
+    def _logged_version(self) -> str | None:
+        """白盒兼容面：已记录版本的真身在共享门控上。"""
+        return self._gate.logged_version
+    @_logged_version.setter
+    def _logged_version(self, value: str | None) -> None:
+        """poller 等处会写入版本号；真身在门控上，写入保持一致。"""
+        self._gate._logged_version = value
+
+    @property
+    def _ready_checked(self) -> bool:
+        """白盒兼容面：记忆化标志的真身在共享门控上。"""
+        return self._gate.checked
+
+    @_ready_checked.setter
+    def _ready_checked(self, value: bool) -> None:
+        self._gate.checked = value
+
     async def ensure_ready(self, force: bool = False) -> None:
-        """确保服务端有就绪账号（记忆化，可强制重检）。
+        """确保服务端有就绪账号（健康检查驱动，记忆化，可强制重检）。
 
-        force=True 时忽略记忆化标志重新健康检查（SSE 重连后服务端可能已重启，
-        内存态账号注册表丢失，需重新引导注册）。
-        无 ready/引导中账号时用配置的 qq/key/db_path 自动注册；注册后进入
-        索引期，业务接口的 503 由 QqFlowNotReadyError 瞬态处理兜底，不在此
-        阻塞等待。引导中（_BENIGN_STATES）视为良性状态并记忆，索引期内不
-        重复注册；网络失败不记忆，下轮重试。
-
-        `/health` 只给一个标量 `account` 阶段（`unregistered` / `indexing` /
-        `ready` / `error`），不再列出账号 —— 该接口免鉴权，账号清单会向任何
-        调用方泄露本机存在哪些账号。明细在需鉴权的 `GET /api/v1/accounts`
-        （见 fetch_accounts）。
-
-        **正因为标量阶段不含身份，「服务端 ready」≠「我的账号 ready」**：上游
-        强制单账号绑定，若绑的是别人的账号，阶段一样报 ready。所以短路前必须
-        先确认身份 —— 双层判定：
-        1. 快路：从鉴权明细端点比对绑定账号（`_check_bound_identity`）；
-        2. 兜底：明细取不到（401/抖动）时不硬失败，照常走注册，由上游的
-           `account_conflict` 定夺（该守卫在密钥校验**之前**，是可靠的身份预言机）。
-        确认不符即抛 QqFlowAccountMismatchError，不记忆化。
+        状态机本体在共享基座（_sdk_base.ReadinessGate）：健康阶段分诊、绑定
+        账号身份闸门、良性/被拒态的注册分诊两平台同构；本类构造时把 HTTP
+        细节以属性名注入（fetch_health / fetch_accounts / _register_via_gate
+        / _log_account_errors / _check_bound_identity），调用时解析，测试的
+        实例级打桩对门控可见。
         """
-        if self._ready_checked and not force:
-            return
-        async with self._ready_lock:
-            # 锁内双检：并发调用（SSE 强制检查 vs 轮询检查）先到者注册并置位，
-            # 后到者在此短路，避免重复注册
-            if self._ready_checked and not force:
-                return
-            try:
-                health = await self.fetch_health()
-            except Exception:
-                self._ready_checked = False
-                raise
-            version = health.get("version")
-            if version and version != self._logged_version:
-                logger.info("qqflow-server 版本: %s", version)
-                self._logged_version = str(version)
-            phase = health.get("account", "unregistered")
-            logger.debug("健康检查: 账号阶段 %s", phase)
-
-            # 身份闸门：阶段说"有绑定"时，先确认绑的是不是自己的账号。
-            accounts: list[dict] = []
-            identity_ok = False
-            if phase in _BOUND_PHASES:
-                try:
-                    accounts = await self.fetch_accounts()
-                except Exception as e:  # noqa: BLE001 —— 取不到身份不硬失败
-                    logger.warning("账号明细不可用（%s），改由注册结果判定身份", e)
-                else:
-                    # 比对必须留在 else：else 不受上面 except 保护，
-                    # _check_bound_identity 的不符错误才能原样冒泡。挪进 try
-                    # 就会被那条宽 except 吞成一行 warning —— 正是本次要修的病。
-                    identity_ok = self._check_bound_identity(accounts)
-
-            if identity_ok and phase == "ready":
-                self._ready_checked = True
-                logger.debug("已确认自有账号就绪，跳过注册")
-                return
-            if identity_ok and phase in _BOOTSTRAPPING_PHASES:
-                self._ready_checked = True
-                logger.debug("自有账号建索引中（%s），不再重复注册", phase)
-                return
-            if phase == "error":
-                # /health 只给标量，根因（密钥/路径填错的 error 字符串）只在需
-                # 鉴权的明细接口里。仍显式告警——否则用户只能看到业务接口持续
-                # 503，看不到原因。诊断失败不能挡住下面的注册重试。
-                # 明细已在上面取过就复用，避免对同一个 GET 打两次。
-                await self._log_account_errors(accounts)
-            # `error` 落到这里是有意的：服务端的 error 状态不释放绑定，但同一
-            # 账号可以直接重试注册来恢复（密钥修正后即生效）。
-            logger.info(
-                "无就绪账号（阶段 %s），注册账号 qq=%s (db_path=%s)",
-                phase,
-                self._qq,
-                self._db_path or "<默认>",
-            )
-            # account_conflict 由 register_account 就地抛 QqFlowAccountMismatchError
-            # 只加抛出、不改签名），不在此处分支。
-            state = await self.register_account(self._qq, self._key, self._db_path)
-            if state in _BENIGN_STATES:
-                self._ready_checked = True
-                logger.info("账号注册: state=%s", state)
-            else:
-                # 被拒态（invalid_key/invalid_db_path/unknown_qq 等）不记忆化：
-                # 保持未检查标志让下一轮 poll 的 ensure_ready 再次尝试注册；
-                # 否则零账号部署下没有业务 503 兜底复位标志，引导失败后永不自愈
-                logger.warning("账号注册被拒: state=%s（下轮重试）", state)
-
+        await self._gate.ensure_ready(force=force)
+    async def _register_via_gate(self) -> tuple[str, str | None]:
+        """自持注册：register_account 返回 state；conflict 就地抛 Mismatch。
+        门控只要 (state, status) 元组分诊，这里把 str 适配成元组。
+        """
+        state = await self.register_account(self._qq, self._key, self._db_path)
+        return state, None
     async def _log_account_errors(self, accounts: list[dict] | None = None) -> None:
         """把 error 根因打出来（诊断专用，失败仅降级为 debug）。
 

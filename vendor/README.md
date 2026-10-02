@@ -26,9 +26,9 @@ powershell -File scripts/sync_vendor.ps1
 ```
 
 同步脚本会：pull 两个 subtree → 解析 squash 提交里的 `changes from X..Y` 标记
-（解析不到即响亮报错退出，不静默跳过）→ 更新本文件的同步记录段 → import 冒烟。
+（解析不到即响亮报错退出，不静默跳过）→ 提示更新本文件的同步记录段 → import 冒烟。
 
 ## 同步记录
 
-- 初始挂载：weflow `sdk-dist`（源自 weflow-server `55cb066`）、
-  qqflow `sdk-dist`（源自 qqflow-server `fdc3f0c`）。
+- 初始挂载：weflow `sdk-dist`（55cb066，源自 weflow-server master `d8d191b`）、
+  qqflow `sdk-dist`（fdc3f0c，源自 qqflow-server master `a4f0d0e`）。

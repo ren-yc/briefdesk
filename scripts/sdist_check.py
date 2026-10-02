@@ -39,6 +39,11 @@ ALLOWED_NON_DATA = (
     "README.md",
     "LICENSE",
     "briefdesk/*.py",
+    # vendor 的两个 subtree SDK：随包分发的镜像源码（路径按工作区拼写）
+    "vendor/weflow_sdk/*.py",
+    "vendor/weflow_sdk/generated/**/*.py",
+    "vendor/qqflow_sdk/*.py",
+    "vendor/qqflow_sdk/generated/**/*.py",
 )
 
 #: wheel 侧非数据成员（与 scripts/wheel_smoke.py 同口径；fnmatch 的 * 跨 /）

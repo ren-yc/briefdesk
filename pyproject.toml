@@ -86,8 +86,8 @@ include-package-data = false
 "briefdesk.plugins.rag" = ["ui/*"]
 "briefdesk.plugins.benchmark" = ["ui/*", "cases/*.example.json"]
 # vendor 的两个 SDK：生成层的 spec 快照与 py.typed 标记随包分发
-"weflow_sdk" = ["generated/**/spec.json", "py.typed"]
-"qqflow_sdk" = ["generated/**/spec.json", "py.typed"]
+"weflow_sdk" = ["generated/**/spec.json", "generated/**/py.typed"]
+"qqflow_sdk" = ["generated/**/spec.json", "generated/**/py.typed"]
 
 [project.optional-dependencies]
 # OCR 阶段插件（briefdesk.plugins.ocr）的运行时依赖：不安装时 OCR 插件

@@ -49,6 +49,21 @@ def icon_manifest_entries() -> list[str]:
     )
 
 
+def vendor_sdk_data_members() -> list[str]:
+    """vendor 两个 SDK 的生成层数据资源（spec 快照与 py.typed）。
+
+    sdist 与 wheel 的路径拼写不同：sdist 按工作区相对路径（vendor/ 前缀），
+    wheel 按 site-packages 顶层包路径。返回两种拼写的并集，供两道断言各自
+    命中自己那一侧。"""
+    resources: list[str] = []
+    for pkg in ("weflow_sdk", "qqflow_sdk"):
+        for rel in ("generated/spec.json", f"generated/{pkg}/py.typed"):
+            # sdist 按工作区相对路径归档；wheel 侧同名资源在顶层包下，
+            # 由 sdist↔wheel 重建一致性断言覆盖（不进本清单）
+            resources.append(f"vendor/{pkg}/{rel}")
+    return resources
+
+
 def expected_data_members() -> list[str]:
-    """期望的数据成员集合（显式登记 + 图标清单），已排序去重。"""
-    return sorted({*REQUIRED, *icon_manifest_entries()})
+    """期望的数据成员集合（显式登记 + 图标清单 + vendor 数据），已排序去重。"""
+    return sorted({*REQUIRED, *icon_manifest_entries(), *vendor_sdk_data_members()})
