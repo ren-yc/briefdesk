@@ -32,6 +32,9 @@ dependencies = [
     "keyring>=24",
     # 用户配置目录：UI「启动配置」暂存文件位置（settings_env.py）
     "platformdirs>=4",
+    # vendor 的两个 Python SDK（weflow_sdk/qqflow_sdk，git subtree 随包分发）
+    # 唯一新增传递依赖：生成层模型用到 dateutil
+    "python-dateutil>=2.8",
 ]
 
 # 索引页面的 Homepage / Repository / Issues 三个入口都靠这里；必须放在 dependencies 之后——
@@ -59,8 +62,8 @@ benchmark = "briefdesk.plugins.benchmark.plugin:plugin"
 rag = "briefdesk.plugins.rag.plugin:plugin"
 
 [tool.setuptools.packages.find]
-where = ["."]
-include = ["briefdesk", "briefdesk.*"]
+where = [".", "vendor"]
+include = ["briefdesk", "briefdesk.*", "weflow_sdk", "weflow_sdk.*", "qqflow_sdk", "qqflow_sdk.*"]
 
 
 [tool.setuptools]
@@ -82,6 +85,9 @@ include-package-data = false
 "briefdesk.plugins.reminders" = ["ui/*"]
 "briefdesk.plugins.rag" = ["ui/*"]
 "briefdesk.plugins.benchmark" = ["ui/*", "cases/*.example.json"]
+# vendor 的两个 SDK：生成层的 spec 快照与 py.typed 标记随包分发
+"weflow_sdk" = ["generated/**/spec.json", "py.typed"]
+"qqflow_sdk" = ["generated/**/spec.json", "py.typed"]
 
 [project.optional-dependencies]
 # OCR 阶段插件（briefdesk.plugins.ocr）的运行时依赖：不安装时 OCR 插件
@@ -112,6 +118,8 @@ dev = [
 # pydantic 插件：参与模型构造签名的生成（注意：对带 alias 的字段按别名
 # 生成 kwargs，populate_by_name 不被插件识别——测试里以别名构造 Settings）
 plugins = ["pydantic.mypy"]
+# vendor/ 是 git subtree 的上游镜像（禁改）：不参加本仓类型检查
+exclude = ["vendor"]
 
 # tests/ 纳入门禁的范围是「签名级」检查（函数注解、import、模块级语句）：
 # 实测开启 check_untyped_defs 后全量函数体检查会在测试套件上产生约 200 个
@@ -119,6 +127,10 @@ plugins = ["pydantic.mypy"]
 # fetchone() 可空值直接索引等），修齐需先给测试引入共享夹具与 Protocol 桩，
 # 属独立重构；briefdesk/ 维持默认严格度不变。
 # 若后续要深化，从此处放开并按错误码逐类收敛。
+
+[tool.ruff]
+# vendor/ 是 git subtree 的上游镜像（禁改）：不参加本仓 lint
+exclude = ["vendor"]
 
 [tool.ruff.lint]
 # 在 ruff 默认规则（E/F）之上追加日志相关两组：
