@@ -1,0 +1,1777 @@
+{
+  "components": {
+    "schemas": {
+      "AccountConflict": {
+        "description": "注册**被别的账号占位**（互锁）。\n\n`occupied_by` / `occupied_status` 让客户端能记下「实际在跟哪个账号说话」，\n而不是无限重试。",
+        "properties": {
+          "occupied_by": {
+            "type": "string"
+          },
+          "occupied_status": {
+            "$ref": "#/components/schemas/AccountStatus"
+          },
+          "state": {
+            "type": "string"
+          },
+          "success": {
+            "type": "boolean"
+          },
+          "wxid": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "occupied_by",
+          "occupied_status",
+          "state",
+          "success",
+          "wxid"
+        ],
+        "type": "object"
+      },
+      "AccountDeregistered": {
+        "description": "注销：**已成功解绑**。",
+        "properties": {
+          "index_cleared": {
+            "type": "boolean"
+          },
+          "previous_status": {
+            "$ref": "#/components/schemas/AccountStatus",
+            "description": "请求落地时账号处于什么状态 —— 让客户端能区分「我取消了正在进行的构建」与\n「我解绑了一个就绪账号」。"
+          },
+          "purged_dirs": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "purged_media": {
+            "type": "boolean"
+          },
+          "state": {
+            "type": "string"
+          },
+          "success": {
+            "type": "boolean"
+          },
+          "wxid": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "index_cleared",
+          "previous_status",
+          "purged_dirs",
+          "purged_media",
+          "state",
+          "success",
+          "wxid"
+        ],
+        "type": "object"
+      },
+      "AccountNotRegistered": {
+        "description": "注销：**本来就没有绑定**。刻意幂等 —— 重试已完成的注销得到 200 而不是错误。",
+        "properties": {
+          "index_cleared": {
+            "type": "boolean"
+          },
+          "purged_dirs": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "purged_media": {
+            "type": "boolean"
+          },
+          "state": {
+            "type": "string"
+          },
+          "success": {
+            "type": "boolean"
+          },
+          "wxid": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "index_cleared",
+          "purged_dirs",
+          "purged_media",
+          "state",
+          "success",
+          "wxid"
+        ],
+        "type": "object"
+      },
+      "AccountPhase": {
+        "description": "Coarse account phase for the unauthenticated `/health`.\n\n`/health` needs no token, so it must not reveal which accounts exist on\nthis machine, how many there are, where their databases live, or why one\nfailed. The startup scan seeds one discovery entry per `xwechat_files`\nprofile directory, which makes even the *count* a disclosure. This enum has\nno `AwaitingKey` variant at all, so leaking discovery results through\n`/health` is a type error rather than a review item; the detail lives\nbehind the token-protected `GET /api/v1/accounts`.",
+        "enum": [
+          "unregistered",
+          "indexing",
+          "ready",
+          "error"
+        ],
+        "type": "string"
+      },
+      "AccountRegistered": {
+        "description": "注册**受理**（或幂等命中：`already_ready` / `in_progress`）。",
+        "properties": {
+          "db_storage": {
+            "type": "string"
+          },
+          "state": {
+            "type": "string"
+          },
+          "status": {
+            "$ref": "#/components/schemas/AccountStatus"
+          },
+          "success": {
+            "type": "boolean"
+          },
+          "wxid": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "db_storage",
+          "state",
+          "status",
+          "success",
+          "wxid"
+        ],
+        "type": "object"
+      },
+      "AccountStateView": {
+        "properties": {
+          "db_storage": {
+            "description": "字段**按字母序声明**：此前它是经 `json!` 序列化的（走 BTreeMap，键被排序），\n而 struct 用声明序 —— 「换 DTO」时若不同步调整，响应里的键序会变。\n快照的 `keys` 字段就是为抓这个而加的。\n\nResolved live-database directory (`<account>/db_storage`). Same field\nname the registration endpoint echoes back.",
+            "type": "string"
+          },
+          "error": {
+            "nullable": true,
+            "type": "string"
+          },
+          "message_count": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "state": {
+            "$ref": "#/components/schemas/AccountStatus"
+          },
+          "wxid": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "db_storage",
+          "message_count",
+          "state",
+          "wxid"
+        ],
+        "type": "object"
+      },
+      "AccountStatus": {
+        "description": "One account's state-machine value, exposed via the token-protected\n`GET /api/v1/accounts` and echoed by the registration endpoint.\n\nNOT what `/health` reports: that endpoint is unauthenticated and carries the\ncoarser [`AccountPhase`] instead, which has no `AwaitingKey` variant.",
+        "enum": [
+          "awaiting_key",
+          "indexing",
+          "ready",
+          "error"
+        ],
+        "type": "string"
+      },
+      "AccountWxidMismatch": {
+        "description": "注销：**互锁触发**（另一个账号持有绑定，它被完全不动地留下）。",
+        "properties": {
+          "index_cleared": {
+            "type": "boolean"
+          },
+          "occupied_by": {
+            "type": "string"
+          },
+          "occupied_status": {
+            "$ref": "#/components/schemas/AccountStatus"
+          },
+          "purged_dirs": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "purged_media": {
+            "type": "boolean"
+          },
+          "state": {
+            "type": "string"
+          },
+          "success": {
+            "type": "boolean"
+          },
+          "wxid": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "index_cleared",
+          "occupied_by",
+          "occupied_status",
+          "purged_dirs",
+          "purged_media",
+          "state",
+          "success",
+          "wxid"
+        ],
+        "type": "object"
+      },
+      "AccountsList": {
+        "description": "`GET /api/v1/accounts`。",
+        "properties": {
+          "accounts": {
+            "items": {
+              "$ref": "#/components/schemas/AccountStateView"
+            },
+            "type": "array"
+          },
+          "success": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "accounts",
+          "success"
+        ],
+        "type": "object"
+      },
+      "ChatlabHeader": {
+        "description": "ChatLab 信封头。`exportedAt` 是**墙钟**（每次请求都不同）——快照里靠时钟哨兵掩码。",
+        "properties": {
+          "exportedAt": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "generator": {
+            "type": "string"
+          },
+          "version": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "exportedAt",
+          "generator",
+          "version"
+        ],
+        "type": "object"
+      },
+      "ChatlabMember": {
+        "description": "本页出现过的发送者（去重）。`avatar` 无来源时是**空串**。",
+        "properties": {
+          "accountName": {
+            "type": "string"
+          },
+          "avatar": {
+            "type": "string"
+          },
+          "groupNickname": {
+            "type": "string"
+          },
+          "platformId": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "accountName",
+          "avatar",
+          "groupNickname",
+          "platformId"
+        ],
+        "type": "object"
+      },
+      "ChatlabMessage": {
+        "description": "ChatLab 面的消息项。",
+        "properties": {
+          "accountName": {
+            "type": "string"
+          },
+          "content": {
+            "type": "string"
+          },
+          "groupNickname": {
+            "type": "string"
+          },
+          "media": {
+            "$ref": "#/components/schemas/MediaBrief",
+            "description": "媒体元数据；无媒体时**整个键省略**（见 `MediaBrief`）。"
+          },
+          "platformMessageId": {
+            "type": "string"
+          },
+          "replyToMessageId": {
+            "description": "**无引用时省略该键**（不是给 `null`）：规范把它列为可选 *string*，`null` 会让信任\n类型的读者拿到解析不了的值。三个面（原生面、消息面、拉取面）在这一键上同规。",
+            "nullable": true,
+            "type": "string"
+          },
+          "sender": {
+            "type": "string"
+          },
+          "timestamp": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "type": {
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "accountName",
+          "content",
+          "groupNickname",
+          "platformMessageId",
+          "sender",
+          "timestamp",
+          "type"
+        ],
+        "type": "object"
+      },
+      "ChatlabMessages": {
+        "description": "`GET /chatlab/messages`（消息面）。\n\n**不带 `success`**：它输出的是数据信封，而 `success` 是「操作结果」的语言 —— 两者同时\n出现时，读者无法判断 `count`/`page` 是否可信。翻页信息一律走 `page`，与发现面同规。",
+        "properties": {
+          "chatlab": {
+            "$ref": "#/components/schemas/ChatlabHeader"
+          },
+          "count": {
+            "description": "**本页条数**（不是总数）—— 总数不在这个面上表达，分页语义由 `page` 承担。",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "members": {
+            "items": {
+              "$ref": "#/components/schemas/ChatlabMember"
+            },
+            "type": "array"
+          },
+          "messages": {
+            "items": {
+              "$ref": "#/components/schemas/ChatlabMessage"
+            },
+            "type": "array"
+          },
+          "meta": {
+            "$ref": "#/components/schemas/ChatlabMeta"
+          },
+          "page": {
+            "$ref": "#/components/schemas/Page"
+          },
+          "talker": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "chatlab",
+          "count",
+          "members",
+          "messages",
+          "meta",
+          "page",
+          "talker"
+        ],
+        "type": "object"
+      },
+      "ChatlabMeta": {
+        "description": "会话元信息。`type` 是字符串；`ownerId` 未绑定时是空串（现状如此）。",
+        "properties": {
+          "groupId": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "ownerId": {
+            "type": "string"
+          },
+          "platform": {
+            "type": "string"
+          },
+          "type": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "groupId",
+          "name",
+          "ownerId",
+          "platform",
+          "type"
+        ],
+        "type": "object"
+      },
+      "Contact": {
+        "description": "联系人项。\n\n**缺字段一律是空串，绝不是 `null`**。`store::Contact` 内部用 `Option<String>`（因为\n`display_name()` 要区分「没有备注」与「备注是空串」），但**只有 JSON 边界**把它压平成\n空串 —— 这个压平是契约的一部分，已在别处钉死。改回去会静默改变每个下游的判空逻辑。",
+        "properties": {
+          "alias": {
+            "type": "string"
+          },
+          "avatarUrl": {
+            "type": "string"
+          },
+          "displayName": {
+            "type": "string"
+          },
+          "nickname": {
+            "type": "string"
+          },
+          "remark": {
+            "type": "string"
+          },
+          "type": {
+            "type": "string"
+          },
+          "username": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "alias",
+          "avatarUrl",
+          "displayName",
+          "nickname",
+          "remark",
+          "type",
+          "username"
+        ],
+        "type": "object"
+      },
+      "Contacts": {
+        "description": "`GET|POST /api/v1/contacts`。",
+        "properties": {
+          "contacts": {
+            "items": {
+              "$ref": "#/components/schemas/Contact"
+            },
+            "type": "array"
+          },
+          "count": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "hasMore": {
+            "type": "boolean"
+          },
+          "success": {
+            "type": "boolean"
+          },
+          "total": {
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "contacts",
+          "count",
+          "hasMore",
+          "success",
+          "total"
+        ],
+        "type": "object"
+      },
+      "EventMedia": {
+        "description": "推送里的媒体元数据（**第三种形状**：无 `url` / `localPath` / `exported`）。",
+        "properties": {
+          "fileName": {
+            "description": "建议文件名（含扩展名）。",
+            "type": "string"
+          },
+          "md5": {
+            "description": "原文件的 md5；取不到时为 `null`（键保留）。",
+            "nullable": true,
+            "type": "string"
+          },
+          "mediaId": {
+            "description": "**可直接取字节的 id** —— 单段路由 `GET /api/v1/media/{id}`。\n\n**只在导出根下确有这个文件、且名字由内容摘要派生时才出现**（键随之消失，不是给\n`null`）：承诺是「出现即可取」，不是尽力而为 —— 按名取字节是跨会话解析的，平台给的\n名字（语音的 svr_id、视频的 DB 名）在别的会话里可能有同名异内容的文件。通告一个取不到\n的 id，调用方会拿到 404 并以为是服务坏了。",
+            "nullable": true,
+            "type": "string"
+          },
+          "type": {
+            "description": "媒体大类。",
+            "type": "string"
+          }
+        },
+        "required": [
+          "fileName",
+          "type"
+        ],
+        "type": "object"
+      },
+      "EventNew": {
+        "description": "`message.new` 事件载荷。\n\n**`media` 是第三种媒体形状**：只有 `type` / `fileName` / `md5` —— 推送里不含任何路径\n与取字节用的键（字节走 REST 的 `media=1` 导出），也**永远不含**解密密钥。推一个取不到\n的地址只会让客户端误以为有东西可拿。",
+        "properties": {
+          "content": {
+            "type": "string"
+          },
+          "event": {
+            "description": "事件名。帧头（`event:` 行）与载荷里各有一份，**不是**重复：客户端只解析\n`data:` 行时也要能分辨类型。",
+            "type": "string"
+          },
+          "groupName": {
+            "nullable": true,
+            "type": "string"
+          },
+          "media": {
+            "$ref": "#/components/schemas/EventMedia",
+            "description": "无媒体时为 `null`（键保留）。"
+          },
+          "rawid": {
+            "type": "string"
+          },
+          "sessionId": {
+            "type": "string"
+          },
+          "sessionType": {
+            "type": "string"
+          },
+          "sourceName": {
+            "type": "string"
+          },
+          "timestamp": {
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "content",
+          "event",
+          "rawid",
+          "sessionId",
+          "sessionType",
+          "sourceName",
+          "timestamp"
+        ],
+        "type": "object"
+      },
+      "EventRevoke": {
+        "description": "撤销事件。形状与 `message.new` 相同但**没有 `media`** —— 撤销的是消息，不是媒体。",
+        "properties": {
+          "content": {
+            "type": "string"
+          },
+          "event": {
+            "type": "string"
+          },
+          "groupName": {
+            "nullable": true,
+            "type": "string"
+          },
+          "rawid": {
+            "type": "string"
+          },
+          "sessionId": {
+            "type": "string"
+          },
+          "sessionType": {
+            "type": "string"
+          },
+          "sourceName": {
+            "type": "string"
+          },
+          "timestamp": {
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "content",
+          "event",
+          "rawid",
+          "sessionId",
+          "sessionType",
+          "sourceName",
+          "timestamp"
+        ],
+        "type": "object"
+      },
+      "EventSync": {
+        "description": "水位基线/重基事件。客户端据此得知「从哪里继续拉」。\n\n**什么时候发**：连接建立（基线）、订阅端落后（重基线）、索引重建、注销（水位归零）。\n\n`generation` 在**注销**时递增：带着旧 `Last-Event-ID` 重连的客户端据此区分「注销后新账号\n刚开始」（该丢弃本地状态重新拉）与「自己漏收了」（该补拉）。少了它这两种情况在协议上是同一\n件事。它与新的通知面发的是**同一个**计数器。",
+        "properties": {
+          "event": {
+            "description": "事件名（`sync`）。",
+            "type": "string"
+          },
+          "generation": {
+            "description": "事件基线代号，注销时递增。",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "watermarks": {
+            "description": "各表的水位线 —— 客户端从这里开始增量拉。",
+            "items": {
+              "$ref": "#/components/schemas/WatermarkEntry"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "event",
+          "generation",
+          "watermarks"
+        ],
+        "type": "object"
+      },
+      "GroupMember": {
+        "description": "群成员项。字段缺失同样压平成**空串**（与 `contacts` 同规）。\n\n`isOwner` 由 `chat_room.owner` 解析得出：**本页成员中恰为群主者为 `true`**；群主不在\n本页、或缺 `chat_room`/owner 时全为 `false`（键恒保留）。`messageCount` 仅在\n`includeMessageCounts=1` 时为真实值。删掉这些键会让下游的字段存在性判断失效。",
+        "properties": {
+          "alias": {
+            "type": "string"
+          },
+          "avatarUrl": {
+            "type": "string"
+          },
+          "displayName": {
+            "type": "string"
+          },
+          "groupNickname": {
+            "type": "string"
+          },
+          "isFriend": {
+            "type": "boolean"
+          },
+          "isOwner": {
+            "type": "boolean"
+          },
+          "messageCount": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "nickname": {
+            "type": "string"
+          },
+          "remark": {
+            "type": "string"
+          },
+          "wxid": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "alias",
+          "avatarUrl",
+          "displayName",
+          "groupNickname",
+          "isFriend",
+          "isOwner",
+          "messageCount",
+          "nickname",
+          "remark",
+          "wxid"
+        ],
+        "type": "object"
+      },
+      "GroupMembers": {
+        "description": "`GET /api/v1/group-members`。\n\n成员集合是**名册 ∪ 发言人**：从未发过言的名册成员（潜水成员）也会出现，其 `messageCount`\n为 0。这是有意的 —— 只列发言人会让「群里有谁」这个问题的答案取决于谁最近说过话。",
+        "properties": {
+          "chatroomId": {
+            "type": "string"
+          },
+          "count": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "fromCache": {
+            "description": "名册与消息都在内存索引里，本请求不读盘、也不触发同步 ⇒ 恒为 `false`。",
+            "type": "boolean"
+          },
+          "members": {
+            "items": {
+              "$ref": "#/components/schemas/GroupMember"
+            },
+            "type": "array"
+          },
+          "success": {
+            "type": "boolean"
+          },
+          "updatedAt": {
+            "description": "索引构建完成时刻（**毫秒**）：客户端据此判断这份成员表有多旧。秒级会让同一秒内的\n两次构建无法区分，而成员表的更新恰恰可能落在同一秒里。",
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "chatroomId",
+          "count",
+          "fromCache",
+          "members",
+          "success",
+          "updatedAt"
+        ],
+        "type": "object"
+      },
+      "Health": {
+        "description": "`GET|POST /health` 与 `/api/v1/health`（**免鉴权**）。\n\n刻意是标量：未鉴权方可访问，因此**不能**列出账号 —— 连数组长度都会泄露\n「本机有几个账号、各自到哪一步」。账号身份与消息数走鉴权的 `/api/v1/accounts`。",
+        "properties": {
+          "account": {
+            "$ref": "#/components/schemas/AccountPhase",
+            "description": "账号阶段枚举（**不是字符串**：它的取值集合是封闭的，用类型表达比用字符串稳）。\n刻意**没有**「已配置但缺密钥」这一档 —— 否则未鉴权方就能数出本机配了几个账号。"
+          },
+          "status": {
+            "type": "string"
+          },
+          "version": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "account",
+          "status",
+          "version"
+        ],
+        "type": "object"
+      },
+      "MediaBrief": {
+        "description": "一条消息的媒体**元数据**（拉取面与消息面同形）。\n\n它**不是**「字节可取」的承诺：无媒体时整个键省略；`fileName` 只有在导出确实写出了本地\n副本之后才是可取句柄（那时它是**实际导出文件名**），否则它只是这条消息自带的文件名。\n`md5` 取不到时省略该键 —— 未导出不等于没有摘要。",
+        "properties": {
+          "fileName": {
+            "type": "string"
+          },
+          "md5": {
+            "nullable": true,
+            "type": "string"
+          },
+          "type": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "fileName",
+          "type"
+        ],
+        "type": "object"
+      },
+      "MediaEnvelope": {
+        "description": "本页的导出状态。`exportPath` 是绝对路径（客户端用它找导出的文件），\n`count` 是**成功导出**的条数 —— 不是本页消息数。",
+        "properties": {
+          "count": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "enabled": {
+            "type": "boolean"
+          },
+          "exportPath": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "count",
+          "enabled",
+          "exportPath"
+        ],
+        "type": "object"
+      },
+      "MediaObject": {
+        "description": "消息的媒体元数据 —— **原生面专用**（拉取面与消息面用 `MediaBrief`，SSE 用 `EventMedia`）。\n\n- 未导出：`url` / `localPath` / `mediaId` **都不出现**，`exported` 也不出现；\n- 导出成功：`url` 是根相对路径、`localPath` 是绝对路径，且多出 `exported: true`；\n  其中**名字由内容摘要派生**的那些再多一个 `mediaId`（可直接喂给按名取字节的路由）；\n  名字来自平台（视频的 DB 名回落）的那些**不给** `mediaId` —— 按名取字节是跨会话解析的，\n  同名可能是别的会话的另一个文件。\n\n`exported` 是**条件键**：不导出时它**不出现**而不是 `false`。客户端靠「键在不在」\n判断字节可不可取 —— 改成恒出现会让这个判据失效。",
+        "properties": {
+          "exported": {
+            "description": "字母序使然：`exported` 排在 `fileName` 之前，这样输出与 `json!` 的现状一致。",
+            "nullable": true,
+            "type": "boolean"
+          },
+          "fileName": {
+            "description": "文件名**始终是字符串**；没有名字时是空串（不是 `null`）。",
+            "type": "string"
+          },
+          "localPath": {
+            "description": "未导出时**省略**（不是空串）：空串会被读成「有路径、只是空的」。",
+            "nullable": true,
+            "type": "string"
+          },
+          "md5": {
+            "description": "**取不到摘要时才省略**（不是给 `null`）：未导出不等于没有摘要。",
+            "nullable": true,
+            "type": "string"
+          },
+          "mediaId": {
+            "description": "可直接取字节的 id；只在**本次请求的导出批次**确实写出了摘要派生的本地文件时出现。",
+            "nullable": true,
+            "type": "string"
+          },
+          "type": {
+            "type": "string"
+          },
+          "url": {
+            "description": "根相对路径；未导出时**省略**。",
+            "nullable": true,
+            "type": "string"
+          }
+        },
+        "required": [
+          "fileName",
+          "type"
+        ],
+        "type": "object"
+      },
+      "MessageNative": {
+        "description": "原生面的消息项。",
+        "properties": {
+          "appmsgSubtype": {
+            "description": "`localType` 的高 32 位（appmsg 子类型）；无子类型时为 `null`。",
+            "format": "int64",
+            "nullable": true,
+            "type": "integer"
+          },
+          "baseType": {
+            "description": "`localType` 的低位（基础类型）。两个半边分开给，免得每个消费方自己去拆\n`(子类型 << 32) | 基础类型` 这种打包常量。",
+            "format": "int64",
+            "type": "integer"
+          },
+          "content": {
+            "type": "string"
+          },
+          "createTime": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "isSend": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "localId": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "localType": {
+            "description": "平台原始打包值 —— 下游已依赖它，保留。",
+            "format": "int64",
+            "type": "integer"
+          },
+          "media": {
+            "$ref": "#/components/schemas/MediaObject",
+            "description": "**始终出现**（无媒体时为 `null`），不要加 `skip_serializing_if`。"
+          },
+          "parsedContent": {
+            "type": "string"
+          },
+          "quote": {
+            "$ref": "#/components/schemas/Quote",
+            "description": "**始终出现**（无引用时为 `null`）。"
+          },
+          "rawContent": {
+            "type": "string"
+          },
+          "replyToMessageId": {
+            "description": "**无引用时省略该键**（不是给 `null`）：下游若按「键在不在」判断引用关系，\n应改为「键在且非空」—— 这条与拉取面、消息面同规，三个面不再有形状差异。",
+            "nullable": true,
+            "type": "string"
+          },
+          "senderName": {
+            "type": "string"
+          },
+          "senderUsername": {
+            "type": "string"
+          },
+          "serverId": {
+            "type": "string"
+          },
+          "sortSeq": {
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "baseType",
+          "content",
+          "createTime",
+          "isSend",
+          "localId",
+          "localType",
+          "parsedContent",
+          "rawContent",
+          "senderName",
+          "senderUsername",
+          "serverId",
+          "sortSeq"
+        ],
+        "type": "object"
+      },
+      "MessagesNative": {
+        "description": "`GET|POST /api/v1/messages`（原生面）。\n\n`media=1` 触发媒体导出，**单请求上限 200 项**——超出的部分保持未导出，再次请求续传。\n这个闸门必须留在描述里：下游只能靠它规划分批策略，而它此前只存在于散文文档。",
+        "properties": {
+          "count": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "hasMore": {
+            "type": "boolean"
+          },
+          "media": {
+            "$ref": "#/components/schemas/MediaEnvelope"
+          },
+          "messages": {
+            "items": {
+              "$ref": "#/components/schemas/MessageNative"
+            },
+            "type": "array"
+          },
+          "success": {
+            "type": "boolean"
+          },
+          "talker": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "count",
+          "hasMore",
+          "media",
+          "messages",
+          "success",
+          "talker"
+        ],
+        "type": "object"
+      },
+      "NotificationFrame": {
+        "description": "`/chatlab/push/messages` 的通知帧：**只带元信息，不带正文**。\n\n规范对这条通道的定位是「仅通知：不假设事件可靠送达」—— 客户端收到后**去拉**那一页。\n带正文会诱导调用方把它当数据源，而它并不保证送达；不带，语义就没有歧义。\n\n`eventId` 与 `platformMessageId` 是**两个不同的号**：前者是事件通道自己的标识，后者是那条\n消息在平台上的 id（拉取时用它定位）。\n\n**`platformMessageId` 按事件类型给**：撤回帧带上（本仓事件里的 rawid 就是平台消息号），\n`message.new` 仍为 `null` —— 新消息要把事件里的编号翻成平台消息号，得在**推送热路径**上\n逐事件查一次索引，而规范里这个字段是**可选**的；定位它请用**拉取面**返回的同名字段，\n「收到通知后去拉那一页」本来就是这条通道的用法。",
+        "properties": {
+          "event": {
+            "description": "事件名。帧头（`event:` 行）与载荷里各有一份，**不是**重复：只解析 `data:` 行的客户端\n也要能分辨类型。",
+            "type": "string"
+          },
+          "eventId": {
+            "description": "事件通道自己的标识。",
+            "type": "string"
+          },
+          "platformMessageId": {
+            "description": "平台消息 id；取不到时为 `null`（键保留）。",
+            "nullable": true,
+            "type": "string"
+          },
+          "sessionId": {
+            "description": "所属会话。",
+            "type": "string"
+          },
+          "timestamp": {
+            "description": "事件时刻（秒）。",
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "event",
+          "eventId",
+          "sessionId",
+          "timestamp"
+        ],
+        "type": "object"
+      },
+      "Page": {
+        "description": "翻页信息。**`nextCursor` 始终出现**（排空时为 `null`），不要给它加\n`skip_serializing_if`：客户端按「键在不在」判断「还有没有下一页」会读错。",
+        "properties": {
+          "hasMore": {
+            "type": "boolean"
+          },
+          "nextCursor": {
+            "nullable": true,
+            "type": "string"
+          }
+        },
+        "required": [
+          "hasMore"
+        ],
+        "type": "object"
+      },
+      "PullEnvelope": {
+        "description": "ChatLab Pull 信封：**顶层就是那五块**，没有 `success` / `count`。",
+        "properties": {
+          "chatlab": {
+            "$ref": "#/components/schemas/ChatlabHeader"
+          },
+          "members": {
+            "items": {
+              "$ref": "#/components/schemas/ChatlabMember"
+            },
+            "type": "array"
+          },
+          "messages": {
+            "items": {
+              "$ref": "#/components/schemas/PullMessage"
+            },
+            "type": "array"
+          },
+          "meta": {
+            "$ref": "#/components/schemas/ChatlabMeta"
+          },
+          "sync": {
+            "$ref": "#/components/schemas/PullSync"
+          }
+        },
+        "required": [
+          "chatlab",
+          "members",
+          "messages",
+          "meta",
+          "sync"
+        ],
+        "type": "object"
+      },
+      "PullMessage": {
+        "description": "Pull 面的消息项。\n\n**与消息面（`ChatlabMessage`）是两个 struct**，尽管字段目前一致：它们属于两个面 —— 一个\n由 Pull 协议定义、一个由本服务的消息面定义，规范面加字段时不该顺带改到另一个面。\n复用同一个 struct 会把两份契约绑在一起（这一批之前它们正是靠两个 struct 承载\n`replyToMessageId` 的形状差异，现在差异消失了，分建的理由仍在）。",
+        "properties": {
+          "accountName": {
+            "type": "string"
+          },
+          "content": {
+            "type": "string"
+          },
+          "groupNickname": {
+            "type": "string"
+          },
+          "media": {
+            "$ref": "#/components/schemas/MediaBrief",
+            "description": "媒体元数据；无媒体时**整个键省略**（见 `MediaBrief`）。"
+          },
+          "platformMessageId": {
+            "type": "string"
+          },
+          "replyToMessageId": {
+            "description": "**省略**（不是 `null`）：规范把它列为可选 *string*，`null` 会让信任类型的读者\n拿到解析不了的值。",
+            "nullable": true,
+            "type": "string"
+          },
+          "sender": {
+            "type": "string"
+          },
+          "timestamp": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "type": {
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "accountName",
+          "content",
+          "groupNickname",
+          "platformMessageId",
+          "sender",
+          "timestamp",
+          "type"
+        ],
+        "type": "object"
+      },
+      "PullSync": {
+        "description": "翻页与水位。**两个游标都要原样回传**：`nextSince` 是排他下界、`nextOffset` 只用于\n时间戳没能前进的退化情形，客户端自行推导会跳行。",
+        "properties": {
+          "hasMore": {
+            "type": "boolean"
+          },
+          "nextOffset": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "nextSince": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "watermark": {
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "hasMore",
+          "nextOffset",
+          "nextSince",
+          "watermark"
+        ],
+        "type": "object"
+      },
+      "Quote": {
+        "description": "引用（回复）的渲染信息。",
+        "properties": {
+          "accountName": {
+            "type": "string"
+          },
+          "content": {
+            "type": "string"
+          },
+          "platformMessageId": {
+            "type": "string"
+          },
+          "sender": {
+            "type": "string"
+          },
+          "type": {
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "accountName",
+          "content",
+          "platformMessageId",
+          "sender",
+          "type"
+        ],
+        "type": "object"
+      },
+      "SessionChatlab": {
+        "description": "ChatLab 面的会话项。`type` 是字符串（`group` / `private`）。\n\n`type` 只有两个取值（规范的枚举就这么大）—— 公众号与「其它」都归到 `private`：它们都是**一对\n一的对话**，而规范没有第三个格子可放。",
+        "properties": {
+          "id": {
+            "description": "会话在数据源里的唯一标识，可直接用作拉取路径。",
+            "type": "string"
+          },
+          "lastMessageAt": {
+            "description": "最新消息时间戳（秒）。",
+            "format": "int64",
+            "type": "integer"
+          },
+          "memberCount": {
+            "description": "成员数 —— **可选**：群名册的加载器拿得到才给（私聊、或名册缺失时**不出现这个键**）。\n\n规范把它列为可选，而「没有名册」与「名册是空的」在下游是两件事：前者不该被读成 0。",
+            "minimum": 0,
+            "nullable": true,
+            "type": "integer"
+          },
+          "messageCount": {
+            "description": "消息总数（用于 ChatLab 展示预估量）。",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "name": {
+            "description": "会话名称（群名/联系人名）。",
+            "type": "string"
+          },
+          "platform": {
+            "description": "平台标识。",
+            "type": "string"
+          },
+          "type": {
+            "description": "`group` / `private`。",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "lastMessageAt",
+          "messageCount",
+          "name",
+          "platform",
+          "type"
+        ],
+        "type": "object"
+      },
+      "SessionNative": {
+        "description": "原生面的会话项。`type` 是**平台数值枚举**（weflow：0 私聊 / 1 群 / 2 公众号 / 3 其他；\nqqflow 的取值含义不同），`sessionType` 是同一枚举的字符串形式 —— 下游应当用后者。",
+        "properties": {
+          "displayName": {
+            "type": "string"
+          },
+          "lastTimestamp": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "messageCount": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "sessionType": {
+            "type": "string"
+          },
+          "summary": {
+            "description": "**始终出现，无摘要时为 `null`** —— `Option` 且**不加** `skip_serializing_if`。\n这种「有键但值为空」与「没有这个键」的区别是契约的一部分，不要顺手统一。",
+            "nullable": true,
+            "type": "string"
+          },
+          "type": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "unreadCount": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "username": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "displayName",
+          "lastTimestamp",
+          "messageCount",
+          "sessionType",
+          "type",
+          "unreadCount",
+          "username"
+        ],
+        "type": "object"
+      },
+      "SessionsChatlab": {
+        "description": "`GET /chatlab/sessions`（Pull 形状的发现面）。\n\n**与原生面的键集不同**，且 `type` 在这里是字符串 —— 两个面不可能共用一个 struct。",
+        "properties": {
+          "count": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "page": {
+            "$ref": "#/components/schemas/Page"
+          },
+          "sessions": {
+            "items": {
+              "$ref": "#/components/schemas/SessionChatlab"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "count",
+          "page",
+          "sessions"
+        ],
+        "type": "object"
+      },
+      "SessionsNative": {
+        "description": "`GET /api/v1/sessions`（原生面）。",
+        "properties": {
+          "count": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "sessions": {
+            "items": {
+              "$ref": "#/components/schemas/SessionNative"
+            },
+            "type": "array"
+          },
+          "success": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "count",
+          "sessions",
+          "success"
+        ],
+        "type": "object"
+      },
+      "SyncFrame": {
+        "description": "`/chatlab/push/messages` 的基线帧。\n\n`generation` 在注销时递增（见 `server::GENERATION`）：带着旧 `Last-Event-ID` 重连的客户端\n据此区分「注销后新账号刚开始」与「自己漏收了」—— 前者该丢弃本地状态重新拉，后者该补拉。\n少了它，这两种情况在协议上是同一件事。",
+        "properties": {
+          "event": {
+            "description": "事件名（`sync`）。",
+            "type": "string"
+          },
+          "generation": {
+            "description": "基线代号。",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "watermarks": {
+            "description": "各表的水位线 —— 客户端从这里开始增量拉。",
+            "items": {
+              "$ref": "#/components/schemas/WatermarkEntry"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "event",
+          "generation",
+          "watermarks"
+        ],
+        "type": "object"
+      },
+      "SyncResult": {
+        "description": "`POST /api/v1/sync`。",
+        "properties": {
+          "newMessages": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "revokeMessages": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "success": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "newMessages",
+          "revokeMessages",
+          "success"
+        ],
+        "type": "object"
+      },
+      "WatermarkEntry": {
+        "description": "一张表的水位。",
+        "properties": {
+          "table": {
+            "type": "string"
+          },
+          "watermark": {
+            "$ref": "#/components/schemas/WatermarkValue"
+          }
+        },
+        "required": [
+          "table",
+          "watermark"
+        ],
+        "type": "object"
+      },
+      "WatermarkValue": {
+        "description": "水位三元组。三个都要：`local_id` 单独不够（同一秒可能有多条），`create_time` 单独\n也不够（同秒内要靠 `sort_seq` 与 `local_id` 定序）。",
+        "properties": {
+          "create_time": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "local_id": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "sort_seq": {
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "create_time",
+          "local_id",
+          "sort_seq"
+        ],
+        "type": "object"
+      }
+    }
+  },
+  "info": {
+    "title": "weflow-server",
+    "version": "0.7.0"
+  },
+  "openapi": "3.0.3",
+  "paths": {
+    "/api/v1/accounts": {
+      "get": {
+        "operationId": "get__api_v1_accounts",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AccountsList"
+                }
+              }
+            },
+            "description": "成功"
+          }
+        }
+      },
+      "post": {
+        "operationId": "post__api_v1_accounts",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/AccountRegistered"
+                    },
+                    {
+                      "$ref": "#/components/schemas/AccountConflict"
+                    }
+                  ]
+                }
+              }
+            },
+            "description": "成功"
+          }
+        }
+      }
+    },
+    "/api/v1/accounts/{wxid}": {
+      "delete": {
+        "description": "注销账号。",
+        "operationId": "delete__api_v1_accounts__wxid",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "wxid",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "style": "simple"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/AccountDeregistered"
+                    },
+                    {
+                      "$ref": "#/components/schemas/AccountNotRegistered"
+                    },
+                    {
+                      "$ref": "#/components/schemas/AccountWxidMismatch"
+                    }
+                  ]
+                }
+              }
+            },
+            "description": "成功"
+          }
+        }
+      }
+    },
+    "/api/v1/contacts": {
+      "get": {
+        "operationId": "get__api_v1_contacts",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Contacts"
+                }
+              }
+            },
+            "description": "成功"
+          }
+        }
+      }
+    },
+    "/api/v1/group-members": {
+      "get": {
+        "description": "成员集合是**名册 ∪ 发言人**：从未发过言的成员也会出现（`messageCount` 为 0）。",
+        "operationId": "get__api_v1_group-members",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GroupMembers"
+                }
+              }
+            },
+            "description": "成功"
+          }
+        }
+      }
+    },
+    "/api/v1/health": {
+      "get": {
+        "operationId": "get__api_v1_health",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Health"
+                }
+              }
+            },
+            "description": "成功"
+          }
+        }
+      },
+      "post": {
+        "operationId": "post__api_v1_health",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Health"
+                }
+              }
+            },
+            "description": "成功"
+          }
+        }
+      }
+    },
+    "/api/v1/media/{id}": {
+      "get": {
+        "description": "字节面（唯一入口）：只服务导出根下**摘要派生**的文件名；未导出的先经 `media=1`（每请求上限 200 项）导出。同名多命中时内容一致才服务、不一致给 404。",
+        "operationId": "get__api_v1_media__id",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "style": "simple"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/octet-stream": {
+                "schema": {
+                  "format": "binary",
+                  "type": "string"
+                }
+              }
+            },
+            "description": "成功"
+          }
+        }
+      }
+    },
+    "/api/v1/messages": {
+      "get": {
+        "description": "原生/富数据形状：`limit` 默认 100、上限 10000；`media=1` 触发导出，**每请求最多导出 200 项**（超出的保持未导出，再请求续传）。ChatLab 形状走 `/chatlab/messages`。",
+        "operationId": "get__api_v1_messages",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MessagesNative"
+                }
+              }
+            },
+            "description": "成功"
+          }
+        }
+      }
+    },
+    "/api/v1/push/messages": {
+      "get": {
+        "description": "SSE：重放缓冲 1000 条 / 600 秒；广播缓冲 1024；保活 25 秒（注释帧）。载荷为完整事件（老面形状）。",
+        "operationId": "get__api_v1_push_messages",
+        "responses": {
+          "200": {
+            "content": {
+              "text/event-stream": {
+                "schema": {
+                  "description": "SSE 帧流（event: + data: 行）。帧结构：老面见 EventNew/EventRevoke/EventSync，通知面见 NotificationFrame/SyncFrame。",
+                  "type": "string"
+                }
+              }
+            },
+            "description": "成功"
+          }
+        }
+      }
+    },
+    "/api/v1/sessions": {
+      "get": {
+        "description": "会话列表（原生形状）：`limit` 默认 100、上限 10000；`offset` 翻页。ChatLab 形状走 `/chatlab/sessions`。",
+        "operationId": "get__api_v1_sessions",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionsNative"
+                }
+              }
+            },
+            "description": "成功"
+          }
+        }
+      }
+    },
+    "/api/v1/sessions/{id}/messages": {
+      "get": {
+        "description": "游标拉取：`limit` 单页上限 5000。",
+        "operationId": "get__api_v1_sessions__id__messages",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "style": "simple"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PullEnvelope"
+                }
+              }
+            },
+            "description": "成功"
+          }
+        }
+      }
+    },
+    "/api/v1/sync": {
+      "get": {
+        "operationId": "get__api_v1_sync",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SyncResult"
+                }
+              }
+            },
+            "description": "成功"
+          }
+        }
+      },
+      "post": {
+        "operationId": "post__api_v1_sync",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SyncResult"
+                }
+              }
+            },
+            "description": "成功"
+          }
+        }
+      }
+    },
+    "/chatlab/messages": {
+      "get": {
+        "description": "ChatLab 形状的消息面：`talker` 必填，`limit`/`offset`/`cursor`/`start`/`end`/`media`/`keyword`；`count` 是**本页条数**、消息**升序**、`page` 报告截断；`media=1` 真正执行导出（每请求上限 200 项）。",
+        "operationId": "get__chatlab_messages",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChatlabMessages"
+                }
+              }
+            },
+            "description": "成功"
+          }
+        }
+      }
+    },
+    "/chatlab/push/messages": {
+      "get": {
+        "description": "SSE 通知面：只发元信息、不发正文；缓冲与保活同老面；基线帧带 `generation`。",
+        "operationId": "get__chatlab_push_messages",
+        "responses": {
+          "200": {
+            "content": {
+              "text/event-stream": {
+                "schema": {
+                  "description": "SSE 帧流（event: + data: 行）。帧结构：老面见 EventNew/EventRevoke/EventSync，通知面见 NotificationFrame/SyncFrame。",
+                  "type": "string"
+                }
+              }
+            },
+            "description": "成功"
+          }
+        }
+      }
+    },
+    "/chatlab/sessions": {
+      "get": {
+        "description": "Pull 形状的发现面：`keyword`/`limit`/`cursor` 分页；`count`/`page` 报告截断。",
+        "operationId": "get__chatlab_sessions",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionsChatlab"
+                }
+              }
+            },
+            "description": "成功"
+          }
+        }
+      }
+    },
+    "/chatlab/sessions/{id}/messages": {
+      "get": {
+        "description": "Pull 面（与 `/api/v1/sessions/{id}/messages` 同一实现）：`limit` 单页上限 5000。",
+        "operationId": "get__chatlab_sessions__id__messages",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "style": "simple"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PullEnvelope"
+                }
+              }
+            },
+            "description": "成功"
+          }
+        }
+      }
+    },
+    "/health": {
+      "get": {
+        "operationId": "get__health",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Health"
+                }
+              }
+            },
+            "description": "成功"
+          }
+        }
+      },
+      "post": {
+        "operationId": "post__health",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Health"
+                }
+              }
+            },
+            "description": "成功"
+          }
+        }
+      }
+    },
+    "/openapi.json": {
+      "get": {
+        "description": "免鉴权：只描述形状，不含账号、路径与密钥。",
+        "operationId": "get__openapi.json",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "OpenAPI 描述文档自身",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "成功"
+          }
+        }
+      }
+    }
+  }
+}
