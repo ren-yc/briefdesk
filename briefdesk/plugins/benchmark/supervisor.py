@@ -87,6 +87,12 @@ class _Run:
     pause: bool = True
     finished: bool = False
     terminal: str | None = None  # completed | failed-recorded | aborted
+    # 本次运行**采用**的运行参数快照（start 解析成功后立即捕获）：设置页改动
+    # 不影响已发布的运行——「下次运行采用」由 expected_* 表达，current 冻结在
+    # 这里，直到 _finish 撤销。
+    pause_pipeline: bool = True
+    run_timeout_seconds: int = 0
+    run_stall_seconds: int = 600
     meta: dict[str, Any] = field(default_factory=dict)
 
 
@@ -99,6 +105,22 @@ _last: dict[str, Any] | None = None
 
 def is_running() -> bool:
     return _current is not None and not _current.finished
+
+
+def runtime_settings_snapshot() -> dict[str, Any]:
+    """活动运行采用的运行参数副本（无活动运行返回 {}）。
+
+    供设置页展示「本次基准运行采用」：只读 _Run 内存字段并返回副本——调用方
+    不得持有对 _Run 的引用（并发收尾时会撤销）。
+    """
+    run = _current
+    if run is None or run.finished:
+        return {}
+    return {
+        "pause_pipeline": run.pause_pipeline,
+        "run_timeout_seconds": run.run_timeout_seconds,
+        "run_stall_seconds": run.run_stall_seconds,
+    }
 
 
 def current_run_id() -> str | None:
@@ -334,7 +356,11 @@ async def start(features: list[str]) -> dict[str, Any]:
         started_at=started_at,
         t0=time.monotonic(),
     )
-    run.pause = bool(settings.pause_pipeline)
+    # 三个运行参数在此刻冻结进 _Run：start 解析成功即「本次运行采用」——
+    # 运行中改配置只改变 expected（下次运行），不得影响已发布的运行。
+    run.pause = run.pause_pipeline = bool(settings.pause_pipeline)
+    run.run_timeout_seconds = int(settings.run_timeout_seconds)
+    run.run_stall_seconds = int(settings.run_stall_seconds)
     run.meta = {
         "run_id": run_id,
         "features": list(features),
@@ -351,7 +377,7 @@ async def start(features: list[str]) -> dict[str, Any]:
             pipeline.set_processing_paused(True)
         await _announce()
         await _spawn(run)
-        run.monitor = asyncio.create_task(_monitor(run, settings))
+        run.monitor = asyncio.create_task(_monitor(run))
     except Exception as e:
         run.error = f"{type(e).__name__}: {e}"
         run.aborted_reason = "启动失败"
@@ -423,14 +449,14 @@ async def _spawn(run: _Run) -> None:
     run.fh.close()
     run.fh = None
 
-async def _monitor(run: _Run, settings: Any) -> None:
+async def _monitor(run: _Run) -> None:
     """三条出口：终态行落盘后的宽限 kill、无进展看门狗、总时长兜底。
 
     看门狗只用 progress.jsonl 的**行数增长**判进展（不探活、也不拿最后一行判存活），
     阈值按 --progress-every 线性放大——进度节流后相邻两行之间最坏隔着 N 条用例。
     """
-    stall = max(1, int(settings.run_stall_seconds)) * max(1, run.progress_every)
-    timeout = int(settings.run_timeout_seconds)
+    stall = max(1, run.run_stall_seconds) * max(1, run.progress_every)
+    timeout = run.run_timeout_seconds
     last_lines = 0
     last_change = time.monotonic()
     grace_from: float | None = None
@@ -508,6 +534,8 @@ async def _finish(run: _Run) -> None:
     }
     if _current is run:
         _current = None
+    # 运行快照随 _current 撤销在轮转**之前**：_rotate 抛错时也不能让已结束
+    # 的运行继续以 current 身份露出（旧的 current/expected 时序缺陷）。
     await _rotate()
 
 
@@ -586,6 +614,12 @@ def state() -> dict[str, Any]:
         out["run_id"] = run.run_id
         out["started_at"] = run.started_at
         out["elapsed_sec"] = round(time.monotonic() - run.t0, 3)
+        # 本次运行采用的运行参数（current 时点）：设置页展示「本次基准运行采用」
+        out["runtime_settings"] = {
+            "pause_pipeline": run.pause_pipeline,
+            "run_timeout_seconds": run.run_timeout_seconds,
+            "run_stall_seconds": run.run_stall_seconds,
+        }
         progress = _progress(run.run_dir / "progress.jsonl")
         if progress is not None:
             out["progress"] = progress
@@ -653,7 +687,11 @@ async def stop_all() -> None:
 
 
 async def _rotate() -> None:
-    """保留最近 keep_runs 个运行目录；最新一个 completed 永不删除（/report 依赖它）。"""
+    """保留最近 keep_runs 个运行目录；最新一个 completed 永不删除（/report 依赖它）。
+
+    keep_runs **每次清理时重新读取**（不是运行快照的一部分）：它作用于「下一次
+    清理」，与「本次运行采用」的三个参数采用时点不同。
+    """
     settings = _settings()
     keep = max(1, int(settings.keep_runs))
     dirs = sorted(

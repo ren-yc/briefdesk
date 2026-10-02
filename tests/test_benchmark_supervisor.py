@@ -340,3 +340,62 @@ class SupervisorTest(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RuntimeSettingsSnapshotTest(SupervisorTest):
+    """运行参数采用时点：start 冻结进 _Run，运行中改配置不影响活动运行。
+
+    旧实现把 settings 对象直接交给监控协程，每次读的是解析时的命名空间——
+    运行中换掉 _settings 的返回值就会改变活动运行的阈值（页面值与真实运行
+    各说各话）。快照必须冻结在 _Run 上。
+    """
+
+    async def test_start_freezes_runtime_settings_into_run(self) -> None:
+        self.settings = _settings(run_timeout_seconds=999, run_stall_seconds=888)
+        patchers = self._pin_spawn()
+        for p in patchers:
+            p.start()
+        try:
+            await supervisor.start(["dedup"])
+            run = supervisor._current
+            assert run is not None
+            self.assertEqual(run.run_timeout_seconds, 999)
+            self.assertEqual(run.run_stall_seconds, 888)
+            self.assertEqual(run.pause_pipeline, False)
+            # 运行中改配置：活动快照不变（「下次运行采用」才是 expected 的事）
+            self.settings = _settings(run_timeout_seconds=1, run_stall_seconds=1)
+            self.assertEqual(run.run_timeout_seconds, 999)
+            self.assertEqual(supervisor.runtime_settings_snapshot()["run_timeout_seconds"], 999)
+        finally:
+            for p in patchers:
+                p.stop()
+        await supervisor.stop_all()
+
+    async def test_snapshot_revoked_after_finish(self) -> None:
+        patchers = self._pin_spawn()
+        for p in patchers:
+            p.start()
+        try:
+            await supervisor.start(["dedup"])
+            self.assertNotEqual(supervisor.runtime_settings_snapshot(), {})
+        finally:
+            for p in patchers:
+                p.stop()
+        await supervisor.stop_all()
+        self.assertEqual(
+            supervisor.runtime_settings_snapshot(),
+            {},
+            "运行收尾后不得继续露出旧 current 的快照"
+        )
+
+    async def test_keep_runs_read_fresh_at_each_rotate(self) -> None:
+        """keep_runs 每次清理重读：start 之后的改动要影响下一次轮转。"""
+        _make_completed(self.run_root / "a", "2026-01-01 00:00:00", "a")
+        _make_completed(self.run_root / "b", "2026-01-02 00:00:00", "b")
+        self.settings = _settings(keep_runs=5)
+        await supervisor._rotate()
+        self.assertEqual(len(list(self.run_root.iterdir())), 2)
+        self.settings = _settings(keep_runs=1)
+        await supervisor._rotate()
+        names = {p.name for p in self.run_root.iterdir()}
+        self.assertEqual(names, {"b"}, "keep_runs=1 只留最新的 completed")

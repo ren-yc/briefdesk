@@ -44,12 +44,28 @@ class BenchmarkPlugin(WebPlugin, StagePlugin):
     priority = 1  # 同槽 priority 升序：在 merge 阶段（priority=0）之后运行
 
 
-    def settings_instance(self) -> Any:
-        """基准配置在每次运行时现场读取（supervisor 构造），因此「运行值」就是
-        按当前文件解析的值——这里给一个当前实例，保证设置页与运行口径一致。"""
+    def settings_model(self) -> type[Any]:
+        """动态运行配置：manager 只登记模型，不再缓存 setup 期实例。
+
+        基准的三个运行参数在**每次 start** 由 supervisor 现场解析（采用时点=运行
+        开始），setup 期捕获的实例到运行时早已过期——设置页若拿它当「运行值」
+        就会与真实运行各说各话。运行值经 settings_snapshot() 从 supervisor 内存
+        读取，不触发文件重读。
+        """
         from briefdesk.plugins.benchmark.config import BenchmarkSettings
 
-        return BenchmarkSettings()
+        return BenchmarkSettings
+
+    def settings_snapshot(self) -> dict[str, Any]:
+        """当前活动运行的采用值快照（current/source 时点）；无活动运行返回 {}。
+
+        只读 supervisor 内存（_Run 的字段副本），不调 _settings()、不读文件、
+        不导入新的 supervisor——热路径（前端 3s 轮询）与设置页共用这一份。
+        """
+        from briefdesk.plugins.benchmark import supervisor
+
+        snapshot = supervisor.runtime_settings_snapshot()
+        return {k: v for k, v in snapshot.items()}
 
     def settings_schema(
         self, instance: Any = None, *, running: bool = True

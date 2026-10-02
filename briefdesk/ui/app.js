@@ -4450,7 +4450,7 @@ async function loadEnvConfig() {
 
 // 来源层名 → 界面措辞（与后端 settings_env.SOURCE_* 一一对应）
 function _envSourceLabel(source) {
-  const labels = { env: "环境变量", dotenv: "项目 .env", override: "暂存文件", default: "默认值" };
+  const labels = { env: "环境变量", dotenv: "项目 .env", override: "暂存文件", default: "默认值", run: "本次基准运行采用" };
   return labels[source] || String(source || "");
 }
 

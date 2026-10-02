@@ -16,7 +16,13 @@ from briefdesk.settings_base import KeyringSettingsBase
 
 
 class BenchmarkSettings(KeyringSettingsBase):
-    """基准插件配置（每次进入基准环境时重新实例化，设置页改动即时生效）。
+    """基准插件配置（每次实例化时现场解析）。
+
+    采用时点契约：pause_pipeline / run_timeout_seconds / run_stall_seconds 在
+    **每次基准运行开始**解析并冻结（「本次运行采用」，运行中改动不影响已发布
+    的运行，只改变下次运行）；keep_runs 在**每次运行目录清理**时重新读取。
+    设置页的 current=本次运行采用（无活动运行则无运行值）、expected=下次运行/
+    清理采用。
 
     run_stall_seconds 是**运行期**的无进展阈值：进展信号是 progress.jsonl 的行数
     增长（**用例粒度**），阈值必须 ≥ 单个用例的最坏耗时 × 进度节流间隔。默认
