@@ -851,8 +851,16 @@ WARNING）的日志噪音；`fmt_dur()` 统一耗时格式。
 - **消息源共享就绪门控与 vendor SDK**：weflow/qqflow 两客户端的「身份状态机」（健康检查驱动的记忆化、绑定账号身份闸门、
   良性/被拒态注册分诊）收敛为 `briefdesk/plugins/_sdk_base.ReadinessGate`——HTTP 细节以**属性名**注入（调用时解析，
   测试的实例级打桩对门控可见）；每次 SSE 实际建连交付消息前强制重检（周期轮询默认关闭，身份闸门不可移交 poller）；
-  绑定账号不符抛 Mismatch 并置 offline，禁止继续读流。`vendor/weflow_sdk` 与 `vendor/qqflow_sdk` 是两个上游 SDK 的
-  git subtree 纯镜像（`--squash`，供应分支 `sdk-dist`），随包分发；**vendor 内禁改**——补丁一律上游先行再经
+  绑定账号不符抛 Mismatch 并置 offline，禁止继续读流。force 重检在第一次 await 前就失效成功标志：任何一条
+  force 失败路径（被拒 / 网络错 / Mismatch / 取消）都不留过期记忆，否则「force 意为重新验证」恰好反转。
+  注册前的平台化 INFO（含 wxid/qq、db_path、keys 数）经 `register_desc_attr` 回调由 owner 供词——门控跨
+  平台拿不到这些身份上下文，丢了这行日志排查面即回退；结果日志按「有无 status」两种文案（qqflow 面的
+  回调不带 status，恒打会多一个 None）。`vendor/weflow_sdk` 与 `vendor/qqflow_sdk` 是两个上游 SDK 的
+  git subtree 纯镜像（`--squash`，供应分支 `sdk-dist`），随包分发——**目前仅到「装完可导入且形状对」**
+  （`scripts/wheel_smoke.py` 的 `assert_vendor_importable` 是第一个消费者），插件运行期仍走自己的
+  httpx 直连、只复用 vendor 的语义口径；运行期消费 vendor 是后续批次。SSE 分帧两处与 SDK 的刻意口径
+  差异（多 `data:` 行的拼接、上限是否约束单个完整帧）见 `sources_base.iter_sse_events` 文档串与
+  两仓 SDK 的 `watch` 文档串，两边各自成立、只记录不统一。**vendor 内禁改**——补丁一律上游先行再经
   `scripts/sync_vendor.ps1` 同步；本地修改的失败模式是下次同步产生冲突、需人工解决（不是自动丢弃）。
 
 ## 数据库
