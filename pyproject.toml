@@ -37,6 +37,10 @@ dependencies = [
     # （Annotated / Self / NotRequired 等）用 typing_extensions。两者此前都
     # 只靠别的包传递带入（dateutil 靠 pandas 系、typing_extensions 靠
     # pydantic）——一旦上游不再传递依赖就静默 ImportError，所以在此显式声明。
+    # 版本下限关系登记：vendor 两包自声明 requires-python >= 3.10，本仓声明
+    # >= 3.12 ——实际下限由本仓决定，「vendor 支持 3.10」不等于本仓在 3.10 上
+    # 可用；且 vendor 树不在本仓 CI 矩阵内（矩阵测的是 briefdesk 本体与依赖
+    # 闭包，vendor 只经 wheel 冒烟的导入与形状断言消费）。
     "python-dateutil>=2.8",
     "typing-extensions>=4.7",
 ]
