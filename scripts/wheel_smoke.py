@@ -488,6 +488,47 @@ def assert_installed_resources(python: Path, cwd: Path) -> None:
     log(f"资源断言通过：{len(installed)} 个数据文件来自安装的包")
 
 
+def assert_vendor_importable(python: Path, cwd: Path) -> None:
+    """vendor SDK 的「第一个真实消费者」断言：装完能导入、公共形状对。
+
+    这是随包分发从「文件在包里」到「可用」的最短验证——不做任何运行期
+    数据通路（插件仍走自己的 httpx 直连），也不碰上游公共面口径。断言走
+    **模块路径**（weflow_sdk.client._REFUSAL_STATES 只在模块层可达，包顶层
+    刻意不再导出——为这条断言去上游加再导出会改动已登记的公共面并触发
+    重新 split/re-vendor，得不偿失）。
+
+    辅助进程里构造 Client 会创建 httpx.AsyncClient：必须显式 aclose()，
+    且**不把 stderr 当失败信号**（一次性 -c 进程退出时可能打
+    ResourceWarning: unclosed 一类噪音，判据只有退出码与 stdout 标记）。
+    """
+    code = (
+        INSTALLED_GUARD
+        + "import json\n"
+        "import asyncio\n"
+        "import weflow_sdk, qqflow_sdk\n"
+        "import weflow_sdk.client as wf_client\n"
+        "assert 'account_conflict' in wf_client._REFUSAL_STATES\n"
+        "assert hasattr(qqflow_sdk, 'StatusError') or hasattr(qqflow_sdk, 'Client')\n"
+        "assert 'event' in qqflow_sdk.MessageEvent.model_fields\n"
+        "import weflow_sdk.generated.weflow_sdk as wf_gen\n"
+        "async def _ctor_check():\n"
+        "    c = weflow_sdk.Client('http://127.0.0.1:1', 'x')\n"
+        "    await c.aclose()\n"
+        "asyncio.run(_ctor_check())\n"
+        "for pkg in ('weflow_sdk', 'qqflow_sdk'):\n"
+        "    spec_path = __import__(pkg).__file__\n"
+        "    import pathlib\n"
+        "    p = pathlib.Path(spec_path).parent / 'generated' / 'spec.json'\n"
+        "    doc = json.loads(p.read_text(encoding='utf-8'))\n"
+        "    assert doc.get('components', {}).get('schemas'), f'{pkg}: spec.json 无 schemas'\n"
+        "print('VENDOR-OK')\n"
+    )
+    out = run([str(python), "-c", code], timeout=180, cwd=cwd)
+    if "VENDOR-OK" not in out:
+        raise SmokeFailure(f"vendor SDK 导入/形状断言未通过（输出缺标记）: {out[-300:]}")
+    log("vendor 消费者断言通过：两包可导入、拒绝词表/事件形状/spec 齐全")
+
+
 def wait_ready(base: str, log_path: Path, timeout: float = 60.0) -> None:
     deadline = time.time() + timeout
     last_error = ""
@@ -733,6 +774,7 @@ def main() -> int:
             venv = make_venv(tmp)
             install_wheel(venv, wheel)
             python = venv_python(venv)
+        assert_vendor_importable(python, tmp)
         port = free_port()
         base = f"http://127.0.0.1:{port}"
         env = app_env(data_dir=data_dir, cache_dir=cache_dir, settings_file=settings_file, port=port)

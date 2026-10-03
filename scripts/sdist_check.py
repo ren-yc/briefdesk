@@ -6,11 +6,18 @@ pytest 会给「跑测试」引入「先能构建」的隐式前置——与 scr
 本地门禁：`python scripts/sdist_check.py`（构建到唯一临时目录，不碰 dist/）
 CI：在 wheel-smoke job 内跑同一入口。
 
+`--keep-artifacts`：断言全过之后，把 sdist 与直接构建的 wheel 保留到
+`dist/`（先清空旧产物——复用 dist/ 会校验到历史 artifact）。存在的理由：
+`release_check.assert_artifact_members(wheel, sdist)` 需要两件真产物才能
+直调，而 AGENTS 规定 sdist 构建的唯一入口是本脚本——单独 `python -m
+build --sdist` 会造出第二入口。默认行为不变（临时目录、跑完即删）。
+
 为什么期望集合从 scripts/runtime_manifest.py 取：sdist 与 wheel 的运行时资源必须是
 同一份事实。任何一处多打/少打都由「双向相等」拦下（多出即失败——图标清单、维护
 脚本、*.fromweb.json 这类只要漏进一个就会命中）。
 """
 
+import argparse
 import fnmatch
 import os
 import shutil
@@ -195,7 +202,7 @@ def wheel_data_members(wheel: Path) -> list[str]:
     return [n for n in wheel_members(wheel) if not any(fnmatch.fnmatch(n, p) for p in WHEEL_ALLOWED_NON_DATA)]
 
 
-def assert_wheel_consistency(sdist: Path, workdir: Path) -> None:
+def assert_wheel_consistency(sdist: Path, workdir: Path) -> tuple[Path, Path]:
     """从 sdist 重建的 wheel 必须与直接构建的 wheel 数据成员一致。
 
     这条同时抓两类失败：sdist 少带了资源（重建的 wheel 缺文件），以及本地 wheel
@@ -226,9 +233,33 @@ def assert_wheel_consistency(sdist: Path, workdir: Path) -> None:
     log(f"vendor 成员齐全：{len(expected_vendor)} 项（两个 wheel 各断言一次）")
     run([sys.executable, "-m", "twine", "check", str(sdist), str(from_sdist), str(direct)])
     log("twine check 通过（sdist + 两个 wheel）")
+    return from_sdist, direct
 
 
-def main() -> int:
+DIST_DIR = REPO / "dist"
+
+
+def _keep_artifacts(sdist: Path, direct_wheel: Path) -> None:
+    """断言全过后把产物保留到 dist/（--keep-artifacts）。
+
+    先清空 dist/ 里的 *.whl / *.tar.gz：AGENTS 把「构建前先清空 dist/」写成
+    所有产物类门禁的公共前置，通配命中历史产物会假绿或假红。"""
+    DIST_DIR.mkdir(parents=True, exist_ok=True)
+    for stale in list(DIST_DIR.glob("*.whl")) + list(DIST_DIR.glob("*.tar.gz")):
+        stale.unlink()
+    shutil.copy2(sdist, DIST_DIR / sdist.name)
+    shutil.copy2(direct_wheel, DIST_DIR / direct_wheel.name)
+    log(f"产物已保留：{DIST_DIR / sdist.name}、{DIST_DIR / direct_wheel.name}")
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = argparse.ArgumentParser(description=__doc__)
+    args.add_argument(
+        "--keep-artifacts",
+        action="store_true",
+        help="断言通过后把 wheel 与 sdist 保留到 dist/（供产物级门禁直调）",
+    )
+    parsed = args.parse_args(argv)
     for stream in (sys.stdout, sys.stderr):
         reconfigure = getattr(stream, "reconfigure", None)
         if reconfigure is not None:
@@ -240,8 +271,10 @@ def main() -> int:
     try:
         sdist = build_sdist(workdir / "dist")
         data = assert_sdist_contents(sdist)
-        assert_wheel_consistency(sdist, workdir)
+        _from_sdist, direct = assert_wheel_consistency(sdist, workdir)
         log(f"sdist 检查通过：{sdist.name}，数据成员 {len(data)} 个")
+        if parsed.keep_artifacts:
+            _keep_artifacts(sdist, direct)
         return 0
     except CheckFailure as error:
         print(f"[sdist-check] 失败: {error}", file=sys.stderr, flush=True)
