@@ -34,6 +34,7 @@ import urllib.error
 import urllib.request
 import zipfile
 from pathlib import Path
+from typing import Any
 
 from packaging.markers import default_environment
 from packaging.requirements import Requirement
@@ -68,7 +69,8 @@ if str(REPO) not in sys.path:
     # 直跑时 sys.path[0] 是 scripts/：包路径需显式补，否则 scripts.runtime_manifest 导不到
     sys.path.insert(0, str(REPO))
 
-from scripts.runtime_manifest import expected_data_members  # noqa: E402
+from scripts.runtime_manifest import expected_data_members
+from scripts.smoke_process import SmokeCommandError, SmokeCommands
 
 #: 非数据成员：dist-info 与包内模块（.py 另由「必须落在真实包目录内」约束兜底）
 ALLOWED_NON_DATA = (
@@ -114,30 +116,37 @@ def run(
 ) -> str:
     """执行外部命令；非零退出即失败（输出附在异常里）。
 
-    子进程与被读侧都钉死 UTF-8。仓库里的入口（benchmark runner/cli、本脚本等）按约定把
-    stdout/stderr 重配成 UTF-8 输出中文，而 text=True 缺省按 locale 解码——CI 的
-    Windows runner 是 cp1252，UTF-8 续字节（0x8D/0x8F）在 cp1252 里未定义，解码会在
-    subprocess 的读取线程里抛 UnicodeDecodeError：异常只被 threading.excepthook 打印、
-    不冒泡，run() 照常返回而 stdout 静默变成 None（解析输出的调用点随后 AttributeError）。
+    命令在 SmokeCommands 的所有权管理下执行（许可包装 + 文件日志 + 原子状态），
+    输出统一按 UTF-8 读。不用管道捕获：孙进程继承管道写端会让超时后的读取
+    一直挂到孙进程退出（冒烟进程树层层嵌套，一处挂住拖死整个 job）。
+    命令根目录在 main 里创建并注入；直接调用本函数（测试）时退化为一次性的
+    模块级容器。
     """
+    commands = _commands_for_run()
     child_env = dict(os.environ if env is None else env)
     child_env.setdefault("PYTHONIOENCODING", "utf-8")
-    result = subprocess.run(
-        cmd,
-        cwd=str(cwd or REPO),
-        env=child_env,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        timeout=timeout,
-        check=False,
+    output = commands.run(
+        cmd, env=child_env, timeout=timeout, cwd=cwd if cwd is not None else REPO
     )
-    if result.stdout is None or result.stderr is None:
-        raise SmokeFailure(f"子进程输出读取失败（编码不一致？）: {' '.join(cmd)}")
-    if result.returncode != 0:
-        raise SmokeFailure(f"命令失败({result.returncode}): {' '.join(cmd)}\n{result.stdout[-2000:]}\n{result.stderr[-2000:]}")
-    return result.stdout
+    return output
+
+
+# main 里创建的命令容器（run/start_app 共用）；测试可用 _active_commands 注入。
+# 直接调用 run()（脚本外/测试）时惰性建一次性容器，全部命令仍被所有权管理。
+_default_commands: SmokeCommands | None = None
+_active_commands: SmokeCommands | None = None
+
+
+def _commands_for_run() -> SmokeCommands:
+    global _default_commands
+    if _active_commands is not None:
+        return _active_commands
+    if _default_commands is None:
+        # 进程内一次性容器：目录带 PID，避免同机多次运行共享同一命令根
+        _default_commands = SmokeCommands(
+            Path(tempfile.gettempdir()) / f"briefdesk-smoke-commands-{os.getpid()}"
+        )
+    return _default_commands
 
 
 def free_port() -> int:
@@ -473,15 +482,17 @@ def assert_installed_resources(python: Path, cwd: Path) -> None:
     log(f"资源断言通过：{len(installed)} 个数据文件来自安装的包")
 
 
-def wait_ready(base: str, log_path: Path, timeout: float = 60.0) -> None:
+def wait_ready(base: str, log_path: Path, timeout: float = 60.0, *, app: Any = None) -> None:
     deadline = time.time() + timeout
-    last_error = ""
     while time.time() < deadline:
         if http(f"{base}/", timeout=3)[0] == 200:
             return
+        # 应用进程已死就没有再等的意义：立即失败并带上日志尾部
+        if app is not None and app.proc is not None and app.proc.poll() is not None:
+            break
         time.sleep(0.5)
     tail = log_path.read_text(encoding="utf-8", errors="replace")[-2000:] if log_path.exists() else "(无日志)"
-    raise SmokeFailure(f"应用未在 {timeout:.0f}s 内就绪（{last_error}）\n日志尾部:\n{tail}")
+    raise SmokeFailure(f"应用未在 {timeout:.0f}s 内就绪\n日志尾部:\n{tail}")
 
 
 def assert_http_surface(base: str, port: int) -> None:
@@ -576,26 +587,91 @@ def assert_writes(base: str, port: int, python: Path, env: dict[str, str], data_
 
     # 5) Web 基准运行（**故意失败**）：证明 supervisor 运行目录落缓存目录，且
     #    运行中失败也能收尾——清理契约里最容易被忽略的就是异常路径。
+    #    终态必须按 **run_id + 终态记录** 判定，不用「running 字段缺席」：请求失败
+    #    （非 200/连接拒绝）被当成「已收尾」时，应用中途崩掉也能通过本步骤。
     status, body = http(
         f"{base}/api/benchmark/run", method="POST", payload={"features": ["title"]}, origin=origin
     )
     if status != 200:
         raise SmokeFailure(f"启动基准失败: {status} {body[:300]}")
-    deadline = time.time() + 180
-    state: dict = {}
-    while time.time() < deadline:
+    try:
+        started = json.loads(body)
+    except json.JSONDecodeError as exc:
+        raise SmokeFailure(f"启动响应不是 JSON: {exc}") from exc
+    if not isinstance(started, dict) or started.get("started") is not True:
+        raise SmokeFailure(f"启动响应异常: {body[:300]}")
+    run_id = started.get("run_id")
+    if not isinstance(run_id, str) or not run_id:
+        raise SmokeFailure(f"启动响应缺 run_id: {body[:300]}")
+    run_dir = wait_benchmark_terminal(base, run_id, cache_dir / "benchmark" / "runs", timeout=180)
+    log(f"写入步骤 5/5 通过：基准运行目录 {run_dir.name}（终态已按 run_id 核对）")
+
+
+def wait_benchmark_terminal(base: str, run_id: str, runs_root: Path, *, timeout: float) -> Path:
+    """按 run_id 轮询到运行终态；协议错误立即失败，临时故障在期限内重试。
+
+    判据（与 supervisor 的三态契约同源）：meta.json 存在、meta.run_id 一致、
+    terminal.state ∈ {completed, failed-recorded, aborted}、terminal.exit_code 是
+    实际整数（bool/None 不算）。exit_code 允许非零——本步骤验证的是「失败也能
+    收尾」，不要求业务成功。meta 由 supervisor 在 spawn 前先写、终态后补写，
+    中间态（缺文件/半写 JSON）按期限重试；只有期限耗尽才失败。
+    """
+    deadline = time.monotonic() + timeout
+    while True:
         status, body = http(f"{base}/api/benchmark/run", timeout=5)
-        state = json.loads(body) if status == 200 else {}
-        if not state.get("running"):
-            break
+        if status == 200:
+            try:
+                state = json.loads(body)
+            except json.JSONDecodeError:
+                state = None
+            if not isinstance(state, dict):
+                raise SmokeFailure(f"基准状态响应不是 JSON 对象: {body[:200]}")
+            if state.get("running") is False and state.get("run_id") == run_id:
+                run_dir = _locate_run_dir(runs_root, run_id, deadline)
+                if run_dir is not None:
+                    return run_dir
+        elif status in (502, 503, 504):
+            pass  # 应用临时不可达（收尾中的重启窗口）：期限内重试
+        elif status != 0 and status < 500:
+            raise SmokeFailure(f"基准状态请求失败: HTTP {status} {body[:200]}")
+        if time.monotonic() >= deadline:
+            raise SmokeFailure(
+                f"基准运行 {run_id} 未在 {timeout:.0f}s 内出现按 run_id 核对的终态（清理契约失效？）"
+            )
         time.sleep(1)
-    if state.get("running"):
-        raise SmokeFailure("基准运行未在 180s 内收尾（清理契约失效？）")
-    runs_root = cache_dir / "benchmark" / "runs"
-    run_dirs = sorted(runs_root.glob("*")) if runs_root.exists() else []
-    if not run_dirs:
-        raise SmokeFailure(f"Web 基准未在缓存目录创建运行目录: {runs_root}")
-    log(f"写入步骤 5/5 通过：基准运行目录 {run_dirs[-1].name}（结局: {state.get('error') or state.get('summary') or '已收尾'}）")
+
+
+def _locate_run_dir(runs_root: Path, run_id: str, deadline: float) -> Path | None:
+    """在 runs_root 里按 meta.run_id 找本次运行目录；未出现/未终态返回 None 继续等。
+
+    不用「名字排序后的最新目录」：并发/重试产生的其他运行目录会被误认成本次。
+    """
+    if not runs_root.exists():
+        return None
+    for child in runs_root.iterdir():
+        if not child.is_dir():
+            continue
+        meta_path = child / "meta.json"
+        if not meta_path.exists():
+            continue
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue  # 半写/正在写：按期限重试
+        if not isinstance(meta, dict) or meta.get("run_id") != run_id:
+            continue
+        terminal = meta.get("terminal")
+        if not isinstance(terminal, dict):
+            continue
+        if terminal.get("state") not in ("completed", "failed-recorded", "aborted"):
+            continue
+        exit_code = terminal.get("exit_code")
+        if isinstance(exit_code, bool) or not isinstance(exit_code, int):
+            continue  # 终态行有了但退出码没落盘：等下一次
+        return child
+    if time.monotonic() >= deadline:
+        raise SmokeFailure(f"运行目录里找不到 {run_id} 的带终态记录（runs_root={runs_root}）")
+    return None
 
 
 def snapshot_tree(root: Path) -> dict[str, tuple[int, int]]:
@@ -679,6 +755,7 @@ def main() -> int:
                 reconfigure(encoding="utf-8", errors="replace")
             except (OSError, ValueError):
                 pass  # 非可重配置流（测试捕获/已关闭）保持原样
+    global _active_commands
     parser = argparse.ArgumentParser(
         description="wheel 冒烟：默认装本地构建的 wheel；--install-from testpypi / pypi 装索引上的"
         "发布物，配 --from-sdist 则强制源码分发包并在本地构建"
@@ -695,9 +772,14 @@ def main() -> int:
     data_dir = tmp / "data"
     cache_dir = tmp / "cache"
     settings_file = tmp / "settings.env"
-    app_log = tmp / "app.log"
-    process: subprocess.Popen | None = None
-    failed = False
+    # 全部命令（构建/pip/应用/辅助探测）都在同一个所有权容器里：close_all 之后再做
+    # 最终检查——进程没退干净时写的产物不算数，也没法宣称「无泄漏」。
+    commands = SmokeCommands(tmp)
+    _active_commands = commands
+    # 最初异常为主错误：清理/泄漏错误用 add_note 追加诊断，不在 finally 里 return 吞掉
+    primary_error: BaseException | None = None
+    real_runs_before: dict[str, tuple[int, int]] | None = None
+    cleanup_error: Exception | None = None
     try:
         if args.install_from in INDEXES:
             if not args.version:
@@ -721,14 +803,16 @@ def main() -> int:
         port = free_port()
         base = f"http://127.0.0.1:{port}"
         env = app_env(data_dir=data_dir, cache_dir=cache_dir, settings_file=settings_file, port=port)
-        # 真实用户缓存目录：不注入 BRIEFDESK_* 时应用会去那里——冒烟全程必须不碰它
+        # 真实用户缓存目录：不注入 BRIEFDESK_* 时应用会去那里——冒烟全程必须不碰它。
+        # 探针只导入 briefdesk.paths（纯路径计算）：导入 supervisor 会连带构造 config、
+        # 访问真实钥匙串与真实 .env。
         probe_env = {key: value for key, value in os.environ.items() if key in ENV_ALLOWLIST}
         real_runs_root = Path(
             run(
                 [
                     str(python), "-c",
                     INSTALLED_GUARD
-                    + "from briefdesk.plugins.benchmark import supervisor; print(supervisor._runs_root())",
+                    + "import briefdesk.paths as _p; print(_p.benchmark_runs_dir())",
                 ],
                 env=probe_env,
                 timeout=120,
@@ -742,38 +826,64 @@ def main() -> int:
         workdir = tmp / "cwd"
         workdir.mkdir(parents=True, exist_ok=True)
         log(f"启动 console script（cwd={workdir}，端口 {port}）")
-        with app_log.open("wb") as log_file:
-            process = subprocess.Popen(
-                [str(console_script(venv))],
-                cwd=str(workdir),
-                env=env,
-                stdout=log_file,
-                stderr=subprocess.STDOUT,
-            )
-        wait_ready(base, app_log)
+        app = commands.start_app([str(console_script(venv))], env=env, cwd=workdir)
+        app_log = app.log_path  # 包装进程把应用输出写进命令目录的 output.log
+        wait_ready(base, app_log, app=app)
         assert_http_surface(base, port)
         assert_writes(base, port, python, env, data_dir, cache_dir, settings_file, tmp)
-        assert_no_leaks(venv, data_dir, cache_dir, settings_file, real_runs_root, real_runs_before)
+        # 先确认全部所属进程退出，再做最终检查——进程没退干净时写的产物不算数，
+        # 也没法宣称「真实目录与冒烟前一致」。
+        try:
+            commands.close_all(timeout=15)
+        except SmokeCommandError as error:
+            cleanup_error = error
+        if real_runs_before is not None and cleanup_error is None:
+            assert_no_leaks(venv, data_dir, cache_dir, settings_file, real_runs_root, real_runs_before)
+        elif cleanup_error is not None:
+            raise SmokeFailure(f"所属进程未全部确认退出，跳过最终检查并保留现场: {cleanup_error}")
         log("冒烟通过")
         return 0
     except SmokeFailure as error:
-        failed = True
-        print(f"[wheel-smoke] 失败: {error}", file=sys.stderr, flush=True)
-        print(f"[wheel-smoke] 现场保留在 {tmp}（含 venv 与日志，便于定位）", file=sys.stderr, flush=True)
-        return 1
+        primary_error = error
+    except SmokeCommandError as error:
+        primary_error = SmokeFailure(f"命令管理失败: {error}")
+    except (TimeoutError, OSError, subprocess.SubprocessError) as error:
+        # 意外异常（含子进程超时）：与 SmokeFailure 同样保留现场——旧实现只在
+        # SmokeFailure 分支置 failed 标志，TimeoutExpired 等仍走删除现场路径。
+        primary_error = SmokeFailure(f"意外终止（{type(error).__name__}）: {error}")
     finally:
-        if process is not None and process.poll() is None:
-            process.terminate()
+        try:
+            commands.close_all(timeout=15)
+        except Exception as close_error:  # noqa: BLE001 — 清理失败追加诊断，不吞主异常
+            if primary_error is not None:
+                primary_error.add_note(f"收尾清理也失败: {close_error}")
+            else:
+                # 成功路径上清理失败 = 不通过：转为失败并保留现场
+                primary_error = SmokeFailure(f"冒烟收尾清理失败，不视为通过: {close_error}")
+        _active_commands = None
+        # 现场处置在 try/finally 结束后统一进行：finally 里不 return（会吞异常）
+        if primary_error is not None:
+            assert primary_error is not None
+            print(f"[wheel-smoke] 失败: {primary_error}", file=sys.stderr, flush=True)
+            for note in getattr(primary_error, "__notes__", []) or []:
+                print(f"[wheel-smoke]   {note}", file=sys.stderr, flush=True)
+            print(f"[wheel-smoke] 现场保留在 {tmp}（含 venv 与日志，便于定位）", file=sys.stderr, flush=True)
+        else:
             try:
-                process.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait(timeout=10)
-        # 失败时保留现场：原先只要应用进程没起来就删目录，而报错信息同时声称"现场保留"，
-        # 拿到的路径其实已经不存在（诊断价值归零）；成功路径与"进程未退出就不删"的 Windows
-        # 约束都不变。
-        if not failed and (process is None or process.poll() is not None):
-            shutil.rmtree(tmp, ignore_errors=True)
+                shutil.rmtree(tmp)
+            except OSError as remove_error:
+                # 成功路径的现场清理也属于验收：删除失败视为不通过并说明残余目录
+                print(
+                    f"[wheel-smoke] 检查通过，但清理现场失败（残余目录）: {tmp}（{remove_error}）",
+                    file=sys.stderr, flush=True,
+                )
+                primary_error = SmokeFailure(f"现场清理失败: {remove_error}")
+            else:
+                print(f"[wheel-smoke] 冒烟通过，现场已清理: {tmp}")
+    # 结果在 try/finally 完整结束后统一返回：finally 里不 return（会吞异常）
+    if primary_error is not None:
+        return 1
+    return 0
 
 
 if __name__ == "__main__":

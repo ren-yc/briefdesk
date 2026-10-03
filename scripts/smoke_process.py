@@ -1,0 +1,511 @@
+"""wheel 冒烟的命令所有权管理：许可包装进程 + 文件日志 + 原子完成状态。
+
+为什么不用 subprocess.run 的管道捕获：Windows 上 run(timeout) 杀掉直接子进程后再读管道，
+孙进程若继承了管道写端，读取会一直挂到孙进程退出——冒烟进程树（venv/pip/console script/
+基准 runner）层层嵌套，一处挂住就拖死整个 job。这里全部输出走**文件日志**，完成信号走
+**原子状态文件**，等待侧没有任何管道可被孙进程握住。
+
+所有权模型：
+- Windows：每个命令包进一个「许可包装进程」，实际命令加入 Job 对象（KILL_ON_JOB_CLOSE）。
+  父进程把 Popen 持有的进程句柄（_handle）指给 Job——不按 PID 重新 OpenProcess，避免
+  句柄已退出、PID 被复用时把别的进程指进 Job。
+- POSIX：包装进程以独立会话组长启动（start_new_session），实际命令及其后代继承进程组；
+  终止先对组发 SIGTERM、宽限后最后一次 SIGKILL，之后才 wait 回收包装进程。
+- 父进程硬死时：Windows 由 KILL_ON_JOB_CLOSE 内核兜底；POSIX 不承诺（这是脚本级
+  所有权，不是内核容器——不要把它当 Job 的等价物）。
+
+状态文件协议（status.json，写临时文件后 os.replace 原子发布，只发布一次）：
+    {"kind": "exit", "returncode": <int>}      实际命令的退出码
+    {"kind": "error", "error_type": "...", "message": "..."}  包装层失败（启动失败等）
+状态存在但 JSON/schema 非法 → 立即失败（不是继续等）；缺失才按总期限等待。
+"""
+
+from __future__ import annotations
+
+import ctypes
+import json
+import os
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+from typing import Any
+
+_IS_WINDOWS = os.name == "nt"
+
+_STATUS_NAME = "status.json"
+
+
+class SmokeCommandError(RuntimeError):
+    """冒烟命令管理失败（协议/清理/超时）：携带可直接定位的说明。"""
+
+
+def parse_status(payload: bytes) -> dict[str, Any]:
+    """解析并校验状态载荷；非法即抛 SmokeCommandError（立即失败，不等待）。"""
+    try:
+        data = json.loads(payload.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise SmokeCommandError(f"状态文件不是合法 JSON: {error}") from error
+    if not isinstance(data, dict):
+        raise SmokeCommandError("状态文件必须是 JSON 对象")
+    kind = data.get("kind")
+    if kind == "exit":
+        code = data.get("returncode")
+        if isinstance(code, bool) or not isinstance(code, int):
+            raise SmokeCommandError("exit 状态的 returncode 必须是整数")
+        return data
+    if kind == "error":
+        if not isinstance(data.get("error_type"), str) or not isinstance(data.get("message"), str):
+            raise SmokeCommandError("error 状态必须有 error_type 与 message 字符串")
+        return data
+    raise SmokeCommandError(f"未知状态 kind: {kind!r}")
+
+
+# ── 许可包装进程 ──
+# 独立脚本体（不是 -c 内联）：引号嵌套与转义在 Windows 命令行里不可靠，写成模块常量
+# 经 stdin 传给解释器最稳。wrapper 只用标准库。
+_WRAPPER_SOURCE = """
+import os
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+
+def _publish(path, payload):
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(payload, encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def _status_json(payload):
+    import json
+
+    return json.dumps(payload)
+
+
+def main() -> int:
+    log_path = Path(sys.argv[1])
+    status_path = Path(sys.argv[2])
+    gate_path = Path(sys.argv[3])
+    # 读到准确许可字节前不创建任何东西：轮询许可文件，直到内容恰为 GO——
+    # 父进程死在许可前时无人写 GO，wrapper 会一直等；因此许可由父进程显式写入，
+    # 并在写前先写 PENDING（父进程启动失败时由 close_all 终止 wrapper）。
+    import time as _time
+
+    while True:
+        try:
+            if gate_path.read_bytes() == b"GO":
+                break
+        except OSError:
+            pass
+        _time.sleep(0.02)
+    cmd = sys.argv[4:]
+    log = log_path.open("ab")
+    try:
+        kwargs = {}
+        if os.name == "nt":
+            kwargs["creationflags"] = 0x08000000  # CREATE_NO_WINDOW：实际命令也要，不只 wrapper
+        proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT, **kwargs)
+    except Exception as error:
+        _publish(status_path, _status_json({
+            "kind": "error",
+            "error_type": type(error).__name__,
+            "message": str(error)[:300],
+        }))
+        return 2
+    code = proc.wait()
+    _publish(status_path, _status_json({"kind": "exit", "returncode": code}))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+""".lstrip()
+
+
+# ── 父进程侧管理 ──
+
+
+class _OwnedCommand:
+    """一条已登记命令：命令目录、包装进程句柄与平台侧的清理手段。
+
+    对象先登记再启动：启动中途抛错时 close_all 仍能看到并回收它（部分启动失败
+    不得漏对象）。清理失败的对象留在登记表里，close_all 继续处理其余命令。
+    """
+
+    def __init__(self, name: str, directory: Path) -> None:
+        self.name = name
+        self.directory = directory
+        self.proc: subprocess.Popen[bytes] | None = None
+        self.status_path = directory / _STATUS_NAME
+        self.log_path = directory / "output.log"
+        self.gate_path = directory / "gate"
+        self._job_handle: Any = None  # Windows：Job 句柄（int）
+        self._cleaned = False
+
+    def started(self, proc: subprocess.Popen[bytes], job_handle: Any = None) -> None:
+        self.proc = proc
+        self._job_handle = job_handle
+
+
+class SmokeCommands:
+    """冒烟命令的所有权容器：run() 同步命令与 start_app() 长驻应用共用。
+
+    根目录下每条命令一个独占子目录（commands/<seq>-<name>/），日志与状态文件
+    都在里面——不能从 cwd 推导日志根，也不能用模块级临时路径（冒烟可能有多个
+    实例，测试也需要隔离）。
+    """
+
+    def __init__(self, root: Path) -> None:
+        self._root = root
+        self._commands_dir = root / "commands"
+        self._commands_dir.mkdir(parents=True, exist_ok=True)
+        self._owned: list[_OwnedCommand] = []
+        self._seq = 0
+        self._close_errors: list[str] = []
+
+    # ── 登记 ──
+
+    def _new_command(self, name: str) -> _OwnedCommand:
+        self._seq += 1
+        directory = self._commands_dir / f"{self._seq:03d}-{name}"
+        directory.mkdir(parents=True, exist_ok=False)
+        owned = _OwnedCommand(name, directory)
+        self._owned.append(owned)
+        return owned
+
+    # ── 平台细节：Windows Job / POSIX 组 ──
+
+    def _assign_to_job(self, owned: _OwnedCommand, proc: subprocess.Popen[bytes]) -> None:
+        """把 wrapper 进程（及其后代）指进 Kill-on-Close 的 Job。
+
+        句柄来源是 **Popen 持有的进程句柄**：只在适配函数内借用 int(proc._handle)，
+        强引用 Popen 保证句柄生命周期，不手动 CloseHandle，不按 PID 重新
+        OpenProcess（PID 复用会把无关进程指进 Job）。私有接口不可用时显式失败，
+        不静默退化为无 Job 启动。
+        """
+        if not _IS_WINDOWS:
+            return
+        job = _create_kill_on_close_job()
+        assigned = False
+        try:
+            handle = getattr(proc, "_handle", None)
+            if handle is None:
+                raise SmokeCommandError("CPython 未暴露 Popen._handle——无法把命令指进 Job")
+            assigned = _assign_process_to_job(job, int(handle))
+        except SmokeCommandError:
+            _close_handle(job)
+            raise
+        if not assigned:
+            _close_handle(job)
+            raise SmokeCommandError(
+                f"AssignProcessToJobObject 失败（WinError {_last_error()}）——"
+                "runner 环境可能不允许嵌套 Job，不绕开其管理"
+            )
+        owned.started(proc, job_handle=job)
+
+    def _start_wrapper(self, owned: _OwnedCommand, cmd: list[str], *, env: dict[str, str], cwd: Path | None) -> subprocess.Popen[bytes]:
+        owned.gate_path.write_bytes(b"PENDING")  # 许可文件：GO 才放行
+        popen_kwargs: dict[str, Any] = {
+            "stdin": subprocess.DEVNULL,
+            "stdout": subprocess.DEVNULL,
+            "stderr": subprocess.DEVNULL,
+            "env": env,
+        }
+        if cwd is not None:
+            popen_kwargs["cwd"] = str(cwd)
+        if _IS_WINDOWS:
+            popen_kwargs["creationflags"] = 0x08000000  # CREATE_NO_WINDOW
+        else:
+            # 独立会话组长：实际命令及后代继承进程组，组信号一次覆盖
+            popen_kwargs["start_new_session"] = True
+        proc = subprocess.Popen(
+            [sys.executable, "-I", "-S", "-c", _WRAPPER_SOURCE,
+             str(owned.log_path), str(owned.status_path), str(owned.gate_path), *cmd],
+            **popen_kwargs,
+        )
+        owned.started(proc)
+        # 许可：wrapper 轮询许可文件，读到 GO 才创建实际命令。文件比管道稳——
+        # 管道写端句柄会被子进程继承链纠缠，文件没有这个问题。
+        owned.gate_path.write_bytes(b"GO")
+        return proc
+
+    # ── 对外接口 ──
+
+    def run(self, cmd: list[str], *, env: dict[str, str] | None = None, timeout: float = 900, cwd: Path | None = None) -> str:
+        """同步执行一条命令并返回其日志文本（失败由调用方按状态判定）。"""
+        owned = self._new_command(_safe_name(cmd))
+        try:
+            child_env = dict(os.environ if env is None else env)
+            child_env.setdefault("PYTHONIOENCODING", "utf-8")
+            self._start_wrapper(owned, cmd, env=child_env, cwd=cwd)
+            if _IS_WINDOWS:
+                self._assign_to_job(owned, owned.proc)  # type: ignore[arg-type]
+        except Exception:
+            self._cleanup(owned, grace_seconds=0.0)
+            raise
+        status = self._wait_status(owned, timeout=timeout)
+        exit_code = self._cleanup(owned, grace_seconds=0.0)
+        if status["kind"] == "error":
+            raise SmokeCommandError(
+                f"命令包装层失败: {status['error_type']}: {status['message']}"
+            )
+        if status["returncode"] != 0:
+            tail = self._log_tail(owned)
+            raise SmokeCommandError(
+                f"命令失败({status['returncode']}): {' '.join(cmd)}\n{tail}"
+            )
+        if exit_code not in (0, None) and owned.proc is not None and owned.proc.returncode != 0:
+            raise SmokeCommandError(f"包装进程退出码异常({owned.proc.returncode}): {' '.join(cmd)}")
+        return self._log_tail(owned, limit=None)
+
+    def start_app(self, cmd: list[str], *, env: dict[str, str], cwd: Path) -> _OwnedCommand:
+        """启动长驻应用：不等它退出，由 close_all 统一回收。"""
+        owned = self._new_command("app")
+        try:
+            child_env = dict(env)
+            child_env.setdefault("PYTHONIOENCODING", "utf-8")
+            self._start_wrapper(owned, cmd, env=child_env, cwd=cwd)
+            if _IS_WINDOWS:
+                self._assign_to_job(owned, owned.proc)  # type: ignore[arg-type]
+        except Exception:
+            self._cleanup(owned, grace_seconds=0.0)
+            raise
+        return owned
+
+    def close_all(self, timeout: float = 10.0) -> None:
+        """回收全部已登记命令；聚合错误但逐条处理（第一个失败不得漏掉其余）。"""
+        for owned in self._owned:
+            try:
+                self._cleanup(owned, grace_seconds=timeout)
+            except Exception as error:  # noqa: BLE001 — 聚合清理错误，最后统一抛
+                self._close_errors.append(f"{owned.name}: {error}")
+        self._owned.clear()
+        if self._close_errors:
+            raise SmokeCommandError("命令清理失败: " + "; ".join(self._close_errors))
+
+    # ── 等待与清理 ──
+
+    def _wait_status(self, owned: _OwnedCommand, *, timeout: float) -> dict[str, Any]:
+        deadline = time.monotonic() + timeout
+        while True:
+            if owned.status_path.exists():
+                return parse_status(owned.status_path.read_bytes())
+            if owned.proc is not None and owned.proc.poll() is not None and owned.proc.returncode not in (0, None):
+                # wrapper 在许可前/读许可失败时退出：不会有状态文件
+                raise SmokeCommandError(
+                    f"包装进程提前退出（{owned.proc.returncode}），命令未执行: {owned.name}"
+                )
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise SmokeCommandError(f"命令在 {timeout:.0f}s 内未完成: {owned.name}")
+            time.sleep(min(0.2, max(remaining, 0.01)))
+
+    def _log_tail(self, owned: _OwnedCommand, *, limit: int | None = 2000) -> str:
+        try:
+            text = owned.log_path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return "(无日志)"
+        return text if limit is None else text[-limit:]
+
+    def _cleanup(self, owned: _OwnedCommand, *, grace_seconds: float) -> int | None:
+        """终止并回收一条命令的所属进程；返回 wrapper 退出码（已回收时）。
+
+        顺序（Windows）：先 TerminateJobObject 再等 ActiveProcesses 归零，最后关
+        Job 句柄并 wait wrapper——确认计数之前不关句柄（关了就失去内核兜底的
+        计数依据）。POSIX：组 SIGTERM → 宽限 → 组 SIGKILL → wait wrapper。
+        """
+        if owned._cleaned:
+            return owned.proc.returncode if owned.proc is not None else None
+        owned._cleaned = True
+        if owned.proc is None:
+            return None
+        try:
+            if _IS_WINDOWS and owned._job_handle is not None:
+                _terminate_job(owned._job_handle, grace_seconds=grace_seconds)
+            elif not _IS_WINDOWS and owned.proc.poll() is None:
+                _terminate_group(owned, grace_seconds=grace_seconds)
+            else:
+                # 无平台句柄（启动中途失败）：直接按进程终止
+                if owned.proc.poll() is None:
+                    owned.proc.kill()
+            try:
+                owned.proc.wait(timeout=grace_seconds + 5)
+            except subprocess.TimeoutExpired:
+                owned.proc.kill()
+                owned.proc.wait(timeout=5)
+        finally:
+            if owned._job_handle is not None:
+                # finally 里关 Job：终止/查询失败也要触发 KILL_ON_JOB_CLOSE 内核兜底
+                _close_handle(owned._job_handle)
+                owned._job_handle = None
+        return owned.proc.returncode
+
+
+def _safe_name(cmd: list[str]) -> str:
+    """从命令首参推导目录名：只留安全字符，避免长路径/怪字符进目录名。"""
+    head = Path(cmd[0]).stem if cmd else "cmd"
+    keep = "".join(ch if ch.isalnum() or ch in "-_" else "-" for ch in head)
+    return (keep or "cmd")[:40]
+
+
+# ── Windows Job 对象（ctypes，显式签名）──
+
+if _IS_WINDOWS:
+    _HANDLE = ctypes.c_void_p
+    _DWORD = ctypes.c_uint32
+    _BOOL = ctypes.c_long
+    _LPVOID = ctypes.c_void_p
+
+    _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined]
+    _kernel32.CreateJobObjectW.argtypes = (_LPVOID, ctypes.c_wchar_p)
+    _kernel32.CreateJobObjectW.restype = _HANDLE
+    _kernel32.SetInformationJobObject.argtypes = (_HANDLE, _DWORD, _LPVOID, _DWORD)
+    _kernel32.SetInformationJobObject.restype = _BOOL
+    _kernel32.AssignProcessToJobObject.argtypes = (_HANDLE, _HANDLE)
+    _kernel32.AssignProcessToJobObject.restype = _BOOL
+    _kernel32.TerminateJobObject.argtypes = (_HANDLE, ctypes.c_uint32)
+    _kernel32.TerminateJobObject.restype = _BOOL
+    _kernel32.QueryInformationJobObject.argtypes = (_HANDLE, _DWORD, _LPVOID, _DWORD, _LPVOID)
+    _kernel32.QueryInformationJobObject.restype = _BOOL
+    _kernel32.CloseHandle.argtypes = (_HANDLE,)
+    _kernel32.CloseHandle.restype = _BOOL
+
+    _JOB_OBJECT_EXTENDED_LIMIT_INFORMATION_CLASS = 9  # JobObjectExtendedLimitInformation
+    _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x2000
+
+    import ctypes as _ctypes
+
+    class _IO_COUNTERS(_ctypes.Structure):
+        _fields_ = [
+            ("ReadOperationCount", _ctypes.c_ulonglong),
+            ("WriteOperationCount", _ctypes.c_ulonglong),
+            ("OtherOperationCount", _ctypes.c_ulonglong),
+            ("ReadTransferCount", _ctypes.c_ulonglong),
+            ("WriteTransferCount", _ctypes.c_ulonglong),
+            ("OtherTransferCount", _ctypes.c_ulonglong),
+        ]
+
+    class _JOBOBJECT_BASIC_LIMIT_INFORMATION(_ctypes.Structure):
+        _fields_ = [
+            ("PerProcessUserTimeLimit", _ctypes.c_longlong),
+            ("PerJobUserTimeLimit", _ctypes.c_longlong),
+            ("LimitFlags", _DWORD),
+            ("MinimumWorkingSetSize", ctypes.c_size_t),
+            ("MaximumWorkingSetSize", ctypes.c_size_t),
+            ("ActiveProcessLimit", _DWORD),
+            ("Affinity", _LPVOID),
+            ("PriorityClass", _DWORD),
+            ("SchedulingClass", _DWORD),
+        ]
+
+    class _JOBOBJECT_EXTENDED_LIMIT_INFORMATION(_ctypes.Structure):
+        _fields_ = [
+            ("BasicLimitInformation", _JOBOBJECT_BASIC_LIMIT_INFORMATION),
+            ("IoInfo", _IO_COUNTERS),
+            ("ProcessMemoryLimit", ctypes.c_size_t),
+            ("JobMemoryLimit", ctypes.c_size_t),
+            ("PeakProcessMemoryUsed", ctypes.c_size_t),
+            ("PeakJobMemoryUsed", ctypes.c_size_t),
+        ]
+
+
+def _last_error() -> int:
+    return ctypes.get_last_error() if _IS_WINDOWS else 0
+
+
+def _create_kill_on_close_job() -> Any:
+    """创建未命名、不可继承、KILL_ON_JOB_CLOSE 的 Job；失败抛 SmokeCommandError。"""
+    if not _IS_WINDOWS:
+        raise SmokeCommandError("Job 对象只在 Windows 上可用")
+    job = _kernel32.CreateJobObjectW(None, None)
+    if not job:
+        raise SmokeCommandError(f"CreateJobObjectW 失败（WinError {_last_error()}）")
+    info = _JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
+    info.BasicLimitInformation.LimitFlags = _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+    ok = _kernel32.SetInformationJobObject(
+        job, _JOB_OBJECT_EXTENDED_LIMIT_INFORMATION_CLASS,
+        ctypes.byref(info), ctypes.sizeof(info),
+    )
+    if not ok:
+        error = _last_error()
+        _close_handle(job)
+        raise SmokeCommandError(f"SetInformationJobObject 失败（WinError {error}）")
+    return job
+
+
+def _assign_process_to_job(job: Any, process_handle: int) -> bool:
+    """把（Popen 持有的）进程句柄指进 Job；返回内核原始布尔。"""
+    return bool(_kernel32.AssignProcessToJobObject(_HANDLE(job), _HANDLE(process_handle)))
+
+
+def _terminate_job(job: Any, *, grace_seconds: float) -> None:
+    """终止 Job 内全部进程并等 ActiveProcesses 归零；失败保留句柄交 finally 关闭兜底。"""
+    if not _kernel32.TerminateJobObject(job, 1):
+        raise SmokeCommandError(f"TerminateJobObject 失败（WinError {_last_error()}）")
+    deadline = time.monotonic() + max(grace_seconds, 1.0)
+    accounting = _JOBOBJECT_BASIC_ACCOUNTING()
+    while time.monotonic() < deadline:
+        queried = _kernel32.QueryInformationJobObject(
+            job, 8,  # JobObjectBasicAccountingInformation
+            ctypes.byref(accounting), ctypes.sizeof(accounting), None,
+        )
+        if queried and accounting.ActiveProcesses == 0:
+            return
+        time.sleep(0.05)
+    # 超时不抛：CloseHandle 的 KILL_ON_JOB_CLOSE 仍会内核兜底；调用方据此记失败
+
+
+if _IS_WINDOWS:
+    class _JOBOBJECT_BASIC_ACCOUNTING(_ctypes.Structure):
+        _fields_ = [
+            ("TotalUserTime", _ctypes.c_longlong),
+            ("TotalKernelTime", _ctypes.c_longlong),
+            ("ThisPeriodTotalUserTime", _ctypes.c_longlong),
+            ("ThisPeriodTotalKernelTime", _ctypes.c_longlong),
+            ("TotalPageFaultCount", _DWORD),
+            ("TotalProcesses", _DWORD),
+            ("ActiveProcesses", _DWORD),
+            ("TotalTerminatedProcesses", _DWORD),
+        ]
+
+
+def _close_handle(handle: Any) -> None:
+    if handle:
+        _kernel32.CloseHandle(_HANDLE(handle))
+
+
+# ── POSIX 进程组 ──
+
+
+def _terminate_group(owned: _OwnedCommand, *, grace_seconds: float) -> None:
+    """对进程组发 SIGTERM → 宽限 → 最后一次 SIGKILL；之后才由调用方 wait 回收。
+
+    向「最后一次组信号」之前保持组长身份：owned.proc 未回收，PGID 不会复用。
+    重复清理（reap 后再调）不再向旧 PGID 发信号——组号可能已被复用，宁可保守失败。
+    """
+    if owned.proc is None or owned._cleaned:
+        return
+    # 运行在 POSIX 才有进程组 API；Windows 类型检查下这些属性不存在，运行时判定
+    if not hasattr(os, "getpgid") or not hasattr(os, "killpg"):
+        return
+    try:
+        pgid = os.getpgid(owned.proc.pid)  # type: ignore[attr-defined]
+    except ProcessLookupError:
+        return
+    try:
+        os.killpg(pgid, signal.SIGTERM)  # type: ignore[attr-defined]
+    except ProcessLookupError:
+        return
+    deadline = time.monotonic() + max(grace_seconds, 0.0)
+    while time.monotonic() < deadline:
+        if owned.proc.poll() is not None:
+            break
+        time.sleep(0.05)
+    if owned.proc.poll() is None:
+        try:
+            os.killpg(pgid, signal.SIGKILL)  # type: ignore[attr-defined]
+        except ProcessLookupError:
+            pass
