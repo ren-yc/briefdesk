@@ -104,5 +104,3 @@ class AccountView(BaseModel):
             "state": obj.get("state")
         })
         return _obj
-
-

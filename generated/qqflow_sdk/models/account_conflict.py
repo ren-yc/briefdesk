@@ -93,5 +93,3 @@ class AccountConflict(BaseModel):
             "success": obj.get("success")
         })
         return _obj
-
-

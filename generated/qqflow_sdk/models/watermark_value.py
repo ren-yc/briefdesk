@@ -84,5 +84,3 @@ class WatermarkValue(BaseModel):
             "rowid": obj.get("rowid")
         })
         return _obj
-
-

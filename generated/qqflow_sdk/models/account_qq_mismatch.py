@@ -100,5 +100,3 @@ class AccountQqMismatch(BaseModel):
             "success": obj.get("success")
         })
         return _obj
-
-

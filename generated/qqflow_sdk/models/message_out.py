@@ -150,5 +150,3 @@ class MessageOut(BaseModel):
             "type": obj.get("type")
         })
         return _obj
-
-

@@ -88,5 +88,3 @@ class ChatlabHeader(BaseModel):
             "version": obj.get("version")
         })
         return _obj
-
-
