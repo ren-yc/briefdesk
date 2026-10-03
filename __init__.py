@@ -13,10 +13,10 @@ Two layers with different ownership:
 from .client import BadDate, Client, ClientError, NotReady, ShapeError, StatusError
 
 __all__ = [
+    "BadDate",
     "Client",
     "ClientError",
-    "StatusError",
-    "ShapeError",
     "NotReady",
-    "BadDate",
+    "ShapeError",
+    "StatusError",
 ]
