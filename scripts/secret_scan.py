@@ -112,9 +112,24 @@ def main(argv: list[str] | None = None) -> int:
         help="扫描相对该基线的差异（如 origin/master…HEAD，供 CI 使用）；"
         "缺省扫描 staged 新增内容（pre-commit 钩子路径）",
     )
+    parser.add_argument("--base", default=None, help="双端模式基线（emit 的固定 SHA 或空树对象）")
+    parser.add_argument("--head", default=None, help="双端模式新端（emit 的固定 SHA）")
     args = parser.parse_args(argv)
+    if (args.base is None) != (args.head is None):
+        print(
+            "[secret-scan] --base 与 --head 必须成对给出；拒绝放行",
+            file=sys.stderr,
+        )
+        return 2
 
-    diff = _git_diff([f"{args.ref}...HEAD"]) if args.ref else _staged_added_diff()
+    if args.base and args.head:
+        # 双端模式：直接比较两个端点树（不构造 base...head——三点语义会引入
+        # merge-base 这一隐藏基线，事件边界必须是调用方给定的那两个对象）。
+        diff = _git_diff([args.base, args.head])
+    elif args.ref:
+        diff = _git_diff([f"{args.ref}...HEAD"])
+    else:
+        diff = _staged_added_diff()
     if diff is None:
         print(
             "[secret-scan] 扫描未执行，拒绝放行；请检查 git 环境/基线引用后重试",
@@ -123,7 +138,12 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     hits = scan_text(diff)
     if hits:
-        target = f"相对 {args.ref} 的差异" if args.ref else "staged 新增内容"
+        if args.base and args.head:
+            target = f"{args.base[:12]}..{args.head[:12]} 的新增行"
+        elif args.ref:
+            target = f"相对 {args.ref} 的差异"
+        else:
+            target = "staged 新增内容"
         print(f"检测到疑似密钥/敏感信息（{target}），请先移除或脱敏后再提交：")
         for line, label, snippet in hits:
             # 只回显脱敏片段：命中值原样打到 stdout 会让 CI 日志成为密钥泄露面

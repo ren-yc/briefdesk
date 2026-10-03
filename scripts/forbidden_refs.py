@@ -304,7 +304,7 @@ def scan_text(path: str, text: str) -> list[Hit]:
 def _git(args: list[str], *, cwd: Path | None = None) -> str:
     proc = subprocess.run(
         ["git", *args],
-        cwd=cwd,
+        cwd=str(cwd) if cwd is not None else None,
         capture_output=True,
         text=True,
         encoding="utf-8",
@@ -390,23 +390,26 @@ def scan_lines(path: str, source: str, lines: set[int]) -> list[Hit]:
     return [hit for hit in scan_source(path, source) if hit.line in lines]
 
 
-def scan_diff(diff_text: str, *, rev: str | None, staged: bool) -> list[Hit]:
+def scan_diff(
+    diff_text: str, *, rev: str | None, staged: bool, new_side: str | None = None
+) -> list[Hit]:
     """扫描增量变更：只报新增行上的命中。
 
     定位方式：先解析新增行行号，再取该文件的**完整版本**做语法分段，
     只保留落在新增行上的命中——这样 docstring 内的行号依然精确，
     且规则 4 仍能按「注释 / 文档语境」判定。
 
-    版本选择：行号是**新文件**（HEAD / 工作区）的行号，因此内容必须取
-    「新增侧」的版本——staged 取索引（:0），CI 比较基线...HEAD 时取 HEAD。
-    取基线 ref 会把新行号套到旧内容上，报出一堆「本轮已删除」的假命中。
-    取不到（文件为新增或删除）时跳过该文件。
+    版本选择：行号是**新文件**（新端 / 工作区）的行号，因此内容必须取
+    「新增侧」的版本——staged 取索引（:0），双端模式取调用方给定的新端 OID，
+    旧 --ref 模式取 HEAD。取基线 ref 会把新行号套到旧内容上，报出一堆
+    「本轮已删除」的假命中。取不到（文件为新增或删除）时跳过该文件。
     """
     hits: list[Hit] = []
+    new_rev = ":0" if staged else (new_side or "HEAD")
     for path, lines in _added_lines(diff_text).items():
         if not lines:
             continue
-        source = _file_at_rev(":0" if staged else "HEAD", path)
+        source = _file_at_rev(new_rev, path)
         if source is None:
             continue
         hits.extend(scan_lines(path, source, lines))
@@ -438,6 +441,29 @@ def scan_commit_message(message: str) -> list[Hit]:
     return scan_text("<commit-message>", strip_git_commentary(message))
 
 
+def _commits_between(base: str | None, head: str, *, cwd: Path | None = None) -> list[str]:
+    """提交集合：base 为 None 时取 head 的全部祖先（首次推送的已知空边界）。"""
+    args = ["rev-list", "--reverse", head] if base is None else ["rev-list", "--reverse", head, "--not", base]
+    out = _git(args, cwd=cwd)
+    return [line.strip() for line in out.splitlines() if line.strip()]
+
+
+def _commit_message(sha: str, *, cwd: Path | None = None) -> str:
+    """单条提交信息（subject + body）；读取失败抛错由调用方转 2。"""
+    return _git(["show", "-s", "--format=%B", sha], cwd=cwd)
+
+
+def scan_commit_range(
+    base: str | None, head: str, *, cwd: Path | None = None
+) -> tuple[list[Hit], int]:
+    """扫描一段提交的全部信息；返回 (命中, 提交数)。合法空集合返回 ([], 0)。"""
+    hits: list[Hit] = []
+    shas = _commits_between(base, head, cwd=cwd)
+    for sha in shas:
+        hits.extend(scan_commit_message(_commit_message(sha, cwd=cwd)))
+    return hits, len(shas)
+
+
 def _format(hits: Iterable[Hit]) -> str:
     return "\n".join(
         f"  {hit.path}:{hit.line} [{hit.rule}] {hit.text[:120]}" for hit in hits
@@ -457,19 +483,44 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--ref", default=None, help="扫描相对该基线的差异（CI 用）")
     parser.add_argument("--tree", action="store_true", help="全量扫描跟踪文件")
     parser.add_argument("--message-file", default=None, help="扫描提交信息文件")
+    parser.add_argument("--base", default=None, help="双端模式基线（事件固定 SHA 或空树对象）")
+    parser.add_argument("--head", default=None, help="双端模式新端（事件固定 SHA）")
+    parser.add_argument(
+        "--commits",
+        action="store_true",
+        help="扫描提交信息集合（配合 --base/--head；无 --base 时取 head 全部祖先）",
+    )
     args = parser.parse_args(argv)
 
     # git 取不到差异时必须拒绝放行：当作空 diff 会「扫描没跑却通过」，
     # 与 scripts/secret_scan.py 同口径（退出码 2）。CI 里 fetch 失败或基线
     # 引用无效都会走到这里，静默通过等于门禁失守。
+    if (args.base is None) != (args.head is None) and not args.commits:
+        print("[forbidden-refs] --base 与 --head 必须成对给出；拒绝放行", file=sys.stderr)
+        return 2
     try:
         if args.message_file:
             text = Path(args.message_file).read_text(encoding="utf-8", errors="replace")
             hits = scan_commit_message(text)
             target = f"提交信息 {args.message_file}"
+        elif args.commits:
+            if not args.head:
+                print("[forbidden-refs] --commits 需要 --head；拒绝放行", file=sys.stderr)
+                return 2
+            hits, count = scan_commit_range(args.base, args.head)
+            scope = "全部祖先" if args.base is None else f"{args.base[:12]}..{args.head[:12]}"
+            target = f"提交信息集合（{scope}，{count} 条）"
         elif args.tree:
             hits = scan_tree()
             target = "全量跟踪文件"
+        elif args.base and args.head:
+            hits = scan_diff(
+                _git(["diff", "--unified=0", args.base, args.head]),
+                rev=None,
+                staged=False,
+                new_side=args.head,
+            )
+            target = f"{args.base[:12]}..{args.head[:12]} 的新增行"
         elif args.ref:
             hits = scan_diff(_range_diff(args.ref), rev=args.ref, staged=False)
             target = f"相对 {args.ref} 的差异"

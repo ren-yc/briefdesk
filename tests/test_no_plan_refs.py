@@ -20,6 +20,7 @@ import pytest
 from scripts.forbidden_refs import (
     _added_lines,
     scan_commit_message,
+    scan_commit_range,
     scan_lines,
     scan_source,
     scan_tree,
@@ -264,3 +265,65 @@ def test_tracked_files_independent_of_cwd(monkeypatch: pytest.MonkeyPatch) -> No
     files = tracked_files(_ROOT)
     assert "scripts/forbidden_refs.py" in files
     assert all((_ROOT / f).exists() for f in files)
+
+def _dual_endpoint_repo(tmp_path: Path) -> tuple[Path, str, str]:
+    """两提交临时仓库：返回 (repo, first, second)。自行构造，不动工作区。"""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    def git(*args: str) -> str:
+        proc = subprocess.run(
+            ["git", *args], cwd=repo, capture_output=True, text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=True,
+        )
+        return proc.stdout.strip()
+    git("init", "-q", "-b", "master")
+    git("config", "user.email", "test@example.invalid")
+    git("config", "user.name", "Test")
+    (repo / "a.txt").write_text("one" + chr(10), encoding="utf-8")
+    git("add", ".")
+    git("commit", "-qm", "first")
+    first = git("rev-parse", "HEAD")
+    (repo / "a.txt").write_text("one" + chr(10) + "two" + chr(10), encoding="utf-8")
+    git("add", ".")
+    git("commit", "-qm", "second")
+    return repo, first, git("rev-parse", "HEAD")
+
+
+def test_commit_range_counts_only_new_commits(tmp_path: Path) -> None:
+    """提交信息集合 = reachable(head) − reachable(base)；空集合是合法结果。"""
+    repo, first, second = _dual_endpoint_repo(tmp_path)
+    hits, count = scan_commit_range(first, second, cwd=repo)
+    assert (hits, count) == ([], 1)
+    _, all_count = scan_commit_range(None, second, cwd=repo)
+    assert all_count == 2, "首次推送要覆盖 head 的全部祖先（含根提交）"
+    _, empty = scan_commit_range(second, second, cwd=repo)
+    assert empty == 0, "before == after 的合法空集合不算失败"
+
+
+def test_commit_range_reports_hits(tmp_path: Path) -> None:
+    """命中提交信息要能被枚举出来（而不是静默跳过）。"""
+    repo, _first, second = _dual_endpoint_repo(tmp_path)
+    def git(*args: str) -> str:
+        proc = subprocess.run(
+            ["git", *args], cwd=repo, capture_output=True, text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=True,
+        )
+        return proc.stdout.strip()
+    (repo / "b.txt").write_text("b" + chr(10), encoding="utf-8")
+    git("add", ".")
+    git("commit", "-qm", f"bad {_ref('P', 3)}-1 reference")
+    third = git("rev-parse", "HEAD")
+    hits, count = scan_commit_range(second, third, cwd=repo)
+    assert count == 1
+    assert hits and hits[0].path == "<commit-message>"
+
+
+def test_commit_range_fails_loudly_on_bad_revision(tmp_path: Path) -> None:
+    """枚举失败必须抛错（调用方转退出码 2），不得当作空集合通过。"""
+    repo, _first, _second = _dual_endpoint_repo(tmp_path)
+    with pytest.raises(RuntimeError):
+        scan_commit_range("no-such-rev", "HEAD", cwd=repo)
