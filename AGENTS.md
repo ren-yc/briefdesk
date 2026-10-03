@@ -44,8 +44,10 @@ powershell -ExecutionPolicy Bypass -File scripts/install-hooks.ps1
 - 测试: `python -m pytest tests/`
 - 空白/冲突检查: `git diff --check`
 - 构建与元数据: `python -m build --wheel` + `python -m twine check dist/*`
-  （构建前先清空 `dist/`，避免校验到历史 artifact；完整 wheel 冒烟——临时 venv 安装、
-  真进程启动、写入隔离——在独立 CI job 跑，本地不跑）
+  （构建前先清空 `dist/` **与 `build/`**，避免校验到历史 artifact；`build/lib` 是 setuptools
+  的增量暂存目录，只清 `dist/` 时它会用**上一次构建的文件副本**填新 wheel——实测把
+  `vendor/qqflow_sdk/__init__.py` 改名后门禁仍绿，清掉 `build/` 才按预期变红；完整 wheel
+  冒烟——临时 venv 安装、真进程启动、写入隔离——在独立 CI job 跑，本地不跑）
 - sdist 产出与断言: `python scripts/sdist_check.py`
   （构建到唯一临时目录，断言 sdist 成员集合与 wheel 的运行时资源一一对应、从 sdist
   重建的 wheel 与直接构建的 wheel 数据成员相同、twine check 通过；不进 pytest——断言
