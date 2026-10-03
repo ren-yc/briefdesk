@@ -84,6 +84,8 @@ powershell -ExecutionPolicy Bypass -File scripts/install-hooks.ps1
   | 基准执行与报告（`runner --ai-provider stub --source file`） | 同上 |
   | supervisor 运行目录 / CLI `--out` 默认目录 | 同上（各自单独断言） |
   | 运行中失败也能收尾（Web 基准故意用不可达端点 + 缓存 run 目录） | 同上 |
+  | 命令与所属进程全部回收（Job / 进程组所有权，含孙进程） | 同上（`scripts/smoke_process.py`；协议单测在 `tests/test_smoke_process.py`） |
+  | 基准终态按 `run_id` 核对（HTTP 失败不得当作「已收尾」） | 同上 |
   | 子进程对生产库的隔离（真 spawn + 逐表内容摘要不变） | `tests/test_benchmark_isolation.py` |
 
   冒烟跑在全新 venv 与空库上；**本机真实数据下的写入行为不在 CI 覆盖内**。
@@ -139,7 +141,9 @@ powershell -ExecutionPolicy Bypass -File scripts/install-hooks.ps1
 - **工具与门禁**：
   - 本地提交：`scripts/install-hooks.ps1` 安装的 pre-commit（密钥 + 编号）与 commit-msg（提交信息）钩子；
   - 命令行：`python scripts/forbidden_refs.py`（扫描 staged）、`--ref origin/master`（扫描差异）、`--tree`（全量）、`--message-file <路径>`（提交信息）。退出码：0 = 无命中、1 = 命中、**2 = 扫描未执行（git 取差异失败，拒绝放行——空 diff 不等于干净）**；
-  - 门禁：`tests/test_no_plan_refs.py` 随 pytest 一起跑，对全库注释 / 文档 **0 容忍**（存量已清理完毕），并覆盖本地领先 `origin/master` 的提交信息（无基线时 skip）；CI 另有独立的提交信息扫描 step，覆盖直接推 master 的路径。
+  - CI 侧统一入口：`python scripts/ci_scan.py`（读 `GITHUB_EVENT_NAME` / `GITHUB_EVENT_PATH`，范围只认事件载荷里的固定 SHA：PR 用 `base.sha`/`head.sha` 的 merge-base 到事件 head，push 用 `before`/`after`）。非零 `before` 本地缺失时先精确 fetch 该 SHA，仍取不到返回 2 阻断；全零 `before` 是首次推送的已知空边界（空树 → after，提交集合取全部祖先）；`before == after` 是合法空范围；删除分支事件明确无操作。
+  - 两个扫描器另有成对的双端参数：`python scripts/secret_scan.py --base <commit|空树> --head <commit>`、`python scripts/forbidden_refs.py --base ... --head ...`（直接比较两端树，不构造三点范围）、`python scripts/forbidden_refs.py --commits [--base ...] --head ...`（提交信息集合 = reachable 差集；无 `--base` 时取 head 全部祖先）。任一环节读取失败一律退出 2。
+  - 门禁：`tests/test_no_plan_refs.py` 随 pytest 一起跑，对全库注释 / 文档 **0 容忍**（存量已清理完毕），并覆盖本地领先 `origin/master` 的提交信息（无基线时 skip）；`tests/test_ci_scan.py` 用临时仓库构造真实 DAG 覆盖事件范围与退出码承诺；CI 的扫描步骤已合并为一次 `ci_scan` 调用，覆盖直接推 master 的路径。
 
 ### 隐私与敏感数据扫描
 

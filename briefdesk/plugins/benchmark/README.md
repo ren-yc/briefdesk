@@ -15,12 +15,16 @@
 
 ## 配置（`.env`，全部可选）
 
-| 键 | 默认 | 说明 |
-|---|---|---|
-| `BENCHMARK_PAUSE_PIPELINE` | `true` | 运行期间暂停消息处理（结束后点一次同步补齐） |
-| `BENCHMARK_KEEP_RUNS` | `5` | 保留多少次运行的产物；最新一次**已完成**的永不删除 |
-| `BENCHMARK_RUN_TIMEOUT_SECONDS` | `0` | 单次运行总时长上限（0 = 不限） |
-| `BENCHMARK_RUN_STALL_SECONDS` | `600` | 运行期的「无进展」阈值（按进度行数增长判定） |
+| 键 | 默认 | 采用时点 | 说明 |
+|---|---|---|---|
+| `BENCHMARK_PAUSE_PIPELINE` | `true` | 每次运行开始 | 运行期间暂停消息处理（结束后点一次同步补齐） |
+| `BENCHMARK_RUN_TIMEOUT_SECONDS` | `0` | 每次运行开始 | 单次运行总时长上限（0 = 不限） |
+| `BENCHMARK_RUN_STALL_SECONDS` | `600` | 每次运行开始 | 运行期的「无进展」阈值（按进度行数增长判定） |
+| `BENCHMARK_KEEP_RUNS` | `5` | 每次运行目录轮转 | 保留多少次运行的产物；最新一次**已完成**的永不删除 |
+
+「采用时点」的含义：**运行开始**的那三个参数在 start 时冻结，运行中改它们不影响已发布的运行，只改变
+下一次运行（设置页 `current` 显示本次采用值、`expected` 显示下次运行值）；**每次轮转**的 `BENCHMARK_KEEP_RUNS`
+在下一次清理运行目录时生效。
 
 ## 用法一：Web（插件）
 

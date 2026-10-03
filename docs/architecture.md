@@ -518,7 +518,12 @@ tests/test_web_plugins.py 的核心前端边界守卫测试覆盖）。`GET /api
    子进程走自己的钥匙串。报告记录这些配置的快照，但不记录 API 地址或密钥。
 2. **运行期**：父进程只做三件事——按 `progress.jsonl` 的**行数增长**判进展（阈值按
    `BENCHMARK_RUN_STALL_SECONDS × --progress-every` 放大，因为进度是节流写入的）、终态行落盘后的宽限 kill、
-   可选的总时长上限；取消/超时/无进展一律经**本进程持有的句柄**终止。子进程在自己的库上跑
+   可选的总时长上限；取消/超时/无进展一律经**本进程持有的句柄**终止。
+   **采用时点**：`start` 解析成功时把 `pause_pipeline` / `run_timeout_seconds` / `run_stall_seconds` 冻结进 `_Run`，
+   监控协程只消费这份快照——运行中改配置不影响已发布的运行（改的是「下次运行采用」，由 `expected_*` 表达，
+   设置页 `current` 显示「本次基准运行采用」）。`BENCHMARK_KEEP_RUNS` 不同：它在**每次运行目录轮转**时重新读取，
+   作用于下一次清理，不进运行快照。`_finish` 先撤销 `_current` 再轮转——轮转抛错也不让已结束的运行继续以
+   `current` 身份露出。子进程在自己的库上跑
    （`--db` 就是它自己的路径，起进程时单例为空，不可能碰到生产库），产物写进运行目录：
    `progress.jsonl` / `report.json` / `report.html` / `run.log`。
 3. **收尾**：判定三态——`completed`（终态行 + 两份报告齐全）/ `failed-recorded`（有 error 终态行，
@@ -1104,6 +1109,10 @@ required field of `weflow`/`qqflow` → that plugin self-disables via `PluginDis
   覆盖态 `overridden`/`override_source`/`override_value` 属**预期**语义（与 `expected_*` 同源）：草稿存在且下次启动
   会被 env / 项目 .env 压住时为真；`override_value` 给的是压住它的那一层的值。插件未装配/无运行实例时字段带
   `running: false` 且不下发 `current`/`source`——显式表达「没有运行值」，不拿下次启动值冒充。
+  **采用时点在运行期的插件**（benchmark）不走「setup 快照」：它声明 `settings_model()` 与 `settings_snapshot()`，
+  manager 只登记模型类型，三个运行参数由 supervisor 在**每次 start** 解析并冻结进 `_Run`，schema 组装时从内存现读
+  （`source` 下发 `run`，前端显示「本次基准运行采用」）；空闲时不给 `current`——空闲没有运行值，`expected_*` 表达的
+  才是「下次运行 / 下次清理采用」。旧插件的 `settings_instance()` 契约保留不变（见 docs/plugin-dev.md）。
   **没有 `current` 的行仍可预配置**：前端 `_envControl` 把它渲染成空控件，`_collectEnvChanges` 必须用
   同一套归一（`null/undefined → ""`）算基准——两侧不一致时「没动过」会被判成改动并提交空串，数字项必被
   `normalize_setting` 以「须为数字（留空不等于恢复默认）」422 拦下，整次保存失败（界面只显示笼统的
@@ -1129,9 +1138,15 @@ required field of `weflow`/`qqflow` → that plugin self-disables via `PluginDis
   （keyring 写入/清除，明文永不下发；密钥状态同时区分有效配置 `configured` 与钥匙串条目 `keyringConfigured`）；写入后**重启生效**
   （配置在启动时快照，无热应用）。GET 每行给三组值（见「三个时点」）：实际生效徽章按 `override_source` 措辞（「已被「项目 .env」覆盖」），
   并在有草稿时显示「下次启动生效」；`expectedAvailable=false` 表示按当前文件解析失败（坏配置不 500，仍给脱敏摘要与全部字段元数据）。
-  PUT 对 PLUGINS 变更先经 `validate_selection` 依赖/互斥复检，不合法 409——复检用「写后暂存态 **按共享层序合成**」的组合，
-  只读暂存会漏掉被 .env/环境变量压住的情形（那种组合重启后按更高层生效）。可选插件禁用后仍显示其配置入口，便于启用前预配置；
-  未实现可选 schema 的旧插件不受影响
+  PUT 的插件组合复检（`PLUGINS` / `PLUGINS_REQUIRED` 任一被写都要跑）按**候选字节**判定：先在写锁内严格读取现有暂存并合成
+  「提交后会落盘的那份字节」，再用与真实回读同一套 dotenv 规则解析（含 `${VAR}` 展开）——内存 dict 合并直接 `json.loads` 看到的是
+  展开前的原文，预检结论会与提交后的实际组合不一致。名单解析失败 / 元素非字符串**不是**「无冲突」：显式返回 409 + `unavailable` issue，
+  不写盘（旧实现回落 `config.plugins` 或过滤坏元素，会放行「保存成功、重启必失败」的组合）；所有层都未提供时按模型默认 `[]`，
+  不回落启动快照。`validate_selection` 未接入（无 manager）时同样以 409 报「无法完成组合校验」，不当作无问题放行。
+  暂存文件读不出来（权限/编码）时 PUT 直接拒绝写入（旧行为把读失败当空文件，下一次写入会抹掉整个暂存态）；GET 不 500，
+  改为把预期标为不可用：`pluginsExpectedError` 下发脱敏说明，插件项 `enabled` 置 `null`（显式未知，不是「关闭」），
+  前端停用开关并禁用「全关」推断——把未知折进空集合会凭空生成 `PLUGINS=[]` 的假更改。可选插件禁用后仍显示其配置入口，
+  便于启用前预配置；未实现可选 schema 的旧插件不受影响
 - 系统密钥环经 `keyring` 库（Windows=凭据管理器/DPAPI，随用户账号加密；macOS=钥匙串；Linux=Secret Service），由 CLI
   `briefdesk secrets set|get|rm|list` 或 UI 密钥区管理（白名单 `SECRET_NAMES`）；
 - 密钥环不可用（无桌面会话 / 无 Secret Service / 未安装 keyring）或 `BRIEFDESK_KEYRING=0` 时**静默回退**环境变量 → `.env` → 默认值（读路
@@ -1324,6 +1339,35 @@ required field of `weflow`/`qqflow` → that plugin self-disables via `PluginDis
   SQLCipher 无等价的轻量页校验，qqflow 只能校验密钥**格式**（16 字节可打印 ASCII），真解密推迟到后台建索引 → 数分钟后异步转 `error`。各自都是在「能真正知道」的最早
   时刻报错。故格式合法但错的密钥在 qqflow 侧会先返回 `accepted`。
 
+### 冒烟命令的进程所有权（scripts/smoke_process.py）
+
+`wheel_smoke.py` 的全部外部命令（构建、建 venv、pip、探测、runner）与长驻应用都经 `SmokeCommands` 执行：
+许可包装进程 + **文件日志** + **原子状态文件**（`exit` / `error` 两态；文件存在但 JSON/schema 非法立即失败，
+缺失才按总期限等待）。为什么不用管道捕获：Windows 上 `subprocess.run(timeout)` 杀掉直接子进程后再读管道，
+孙进程若继承了管道写端，读取会挂到孙进程退出——冒烟进程树（console script → 应用 → 基准 runner）层层嵌套，
+一处挂住就拖死整个 job。
+
+- **Windows**：包装进程被指进 `KILL_ON_JOB_CLOSE` 的 Job，句柄取自 `Popen` **持有的**进程句柄（不按 PID 重新
+  `OpenProcess`——句柄已退出、PID 被复用时会把无关进程指进 Job）；清理先 `TerminateJobObject` 再等
+  `ActiveProcesses` 归零，最后关句柄并回收包装进程，确认计数之前不关句柄（关了就没有内核兜底的依据）。
+  嵌套 Job 被 runner 拒绝时显式失败，不绕开其管理。父进程硬死时由内核兜底。
+- **POSIX**：包装进程以 `start_new_session` 成为组长，实际命令与正常后代继承进程组；先对组发 SIGTERM、
+  宽限后最后一次 SIGKILL，之后才回收。这是**脚本级**所有权，不承诺父进程被 SIGKILL 后仍能执行清理——
+  不要当作 Windows Job 的等价物。
+- **收尾顺序**：全部所属进程确认退出 → 才做最终检查（真实用户目录前后快照、site-packages 无产物）→ 成功才删
+  临时目录。任何失败（含意外异常与超时）都保留现场并打印路径；成功路径的目录清理失败也算不通过。
+
+### 发行脚本的两条硬契约
+
+- **版本改写按原始字节**（`scripts/release_check.py`）：`[project].version` 的瞬态改写与还原全程 `read_bytes` /
+  `write_bytes`，替换目标用 tomllib 定位静态值本身（不是「第一行 version」），替换后再做双断言——TOML 仍可解析、
+  且除该值外语义树逐项相等。为什么不能走文本模式：`read_text`/`write_text` 的 universal newlines 会把 LF 规范化成
+  CRLF，还原后 bytes 已变而文本比较相等，自校验检不出文件被动过；首次写入也在 `try` 内，部分写入同样走恢复。
+- **sdist 检查的现场留存**（`scripts/sdist_check.py`）：用显式成功状态而不是 `finally` 里的 `sys.exc_info()`——
+  `except` 分支 `return` 时该值已回到 `None`，用它判断会把检查失败的现场照常删掉，而提示同时声称「现场保留在 …」。
+  任何失败（含 `KeyboardInterrupt` 等意外中断）都保留现场；清理取消 `ignore_errors`，清理失败计入退出码——
+  「检查通过」包含「清理成功」。
+
 ### Windows 控制台编码与 CI 门禁基线
 
 两个只在 CI 上暴露、本地全绿的坑（都属「验收自己出错」而不是代码出错）：
@@ -1339,9 +1383,14 @@ required field of `weflow`/`qqflow` → that plugin self-disables via `PluginDis
   调用点随后 `AttributeError`，宽松判断则直接漏判）。捕获型调用一律写
   `encoding="utf-8", errors="replace"`，并让子进程也按 UTF-8 输出（注入 `PYTHONIOENCODING=utf-8`）；
   守卫见 `tests/test_subprocess_encoding.py`。
-- **强推后差异扫描的基线会不可达**：CI 的密钥扫描与编号引用扫描以推送事件的 `before` 为基线，
-  重写历史（rebase 重签、amend、squash）后该提交在全新克隆里不存在，两个脚本按设计以退出码 2
-  拒绝放行（「扫描未执行 ≠ 干净」），于是 quality-gates 的每个版本一起假红。workflow 的
-  `Resolve push base` 步骤在零 SHA 或基线不可达时，改用推送载荷回推 `HEAD~N`——本次推送的 N 个
-  提交正是 HEAD 起往前 N 个，即推送前的位置，扫描范围与正常推送一致；门禁强度不变
-  （脚本对真正不可达的基线仍拒绝放行）。
+- **CI 扫描范围只认事件载荷里的固定 SHA**，由 `scripts/ci_scan.py` 单点解析与编排（workflow 里只有
+  一次 `python scripts/ci_scan.py`）。三个扫描器共用同一范围：**内容扫描比较两端树的差异**（双端
+  `--base/--head`，直接 `git diff base head`，不构造三点范围——三点会引入 merge-base 这个隐藏基线），
+  **提交信息扫描**比较 reachable 差集（`--commits`，逐条 `git show` 读取，不写临时文件）。
+  范围契约：PR 用 `pull_request.base.sha` / `head.sha` 的 merge-base 到事件 head（没有共同祖先或有多个
+  merge-base 即拒绝，不擅自选一个）；push 用 `before` / `after`；非零 `before` 本地缺失时先**精确 fetch
+  该 SHA**，仍取不到就返回 2 阻断（不做全历史兜底、不静默换范围）；全零 `before` 是首次推送的**已知空边界**
+  （空树 → after，提交集合取 head 全部祖先，含根提交）；`before == after` 是合法空范围；删除分支事件明确
+  无操作。旧实现用推送载荷 `commits` 数组的长度推算 `HEAD~N`——数组长度不等于第一父链步数（含合并会错位、
+  载荷截断会漏扫），首次推送的根提交会越界，数组为空时 HEAD~0 扫了个空 diff 还报成功。回归：
+  `tests/test_ci_scan.py` 用临时仓库构造真实 DAG 覆盖上述各分支与退出码承诺。
