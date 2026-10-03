@@ -12,6 +12,7 @@ from scripts.runtime_manifest import (
     REQUIRED,
     expected_data_members,
     icon_manifest_entries,
+    vendor_sdk_data_members,
 )
 
 _MANIFEST = REPO / "MANIFEST.in"
@@ -74,6 +75,10 @@ def test_registry_is_consistent() -> None:
     icons = icon_manifest_entries()
     assert icons, "图标清单为空"
     assert not set(icons) & set(REQUIRED), "图标应由清单派生，不重复登记"
+    # 第三类来源：vendor 的两个 subtree SDK（生成层 spec 快照与 py.typed）
+    vendor = vendor_sdk_data_members()
+    assert vendor, "vendor SDK 数据资源登记为空（镜像资源会缺在 sdist 里）"
+    assert not set(vendor) & set(REQUIRED), "vendor 资源不应混入显式登记表"
     expected = expected_data_members()
     assert expected == sorted(set(expected)), "期望集合必须排序去重"
-    assert set(expected) == {*REQUIRED, *icons}
+    assert set(expected) == {*REQUIRED, *icons, *vendor}
