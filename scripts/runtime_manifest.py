@@ -77,6 +77,11 @@ def vendor_expected_members(prefix: str = "") -> list[str]:
             cwd=REPO,
             capture_output=True,
             text=True,
+            # 文本模式必须显式编码：缺省按 locale 解码，UTF-8 续字节在 cp1252 下未定义，
+            # 解码异常发生在读取线程里、只被 excepthook 打印，调用方会静默拿到 None
+            # （回归见 tests/test_subprocess_encoding.py::test_captured_subprocess_calls_pin_utf8）。
+            encoding="utf-8",
+            errors="replace",
             check=True,
         )
         rel = [line.strip() for line in completed.stdout.splitlines() if line.strip()]
