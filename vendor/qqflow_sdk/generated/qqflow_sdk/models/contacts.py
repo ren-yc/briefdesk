@@ -100,5 +100,3 @@ class Contacts(BaseModel):
             "total": obj.get("total")
         })
         return _obj
-
-

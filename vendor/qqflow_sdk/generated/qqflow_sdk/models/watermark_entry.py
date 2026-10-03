@@ -90,5 +90,3 @@ class WatermarkEntry(BaseModel):
             "watermark": WatermarkValue.from_dict(obj["watermark"]) if obj.get("watermark") is not None else None
         })
         return _obj
-
-

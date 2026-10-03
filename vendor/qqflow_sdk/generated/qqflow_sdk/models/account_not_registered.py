@@ -95,5 +95,3 @@ class AccountNotRegistered(BaseModel):
             "success": obj.get("success")
         })
         return _obj
-
-

@@ -133,5 +133,3 @@ class MediaInfo(BaseModel):
             "width": obj.get("width")
         })
         return _obj
-
-

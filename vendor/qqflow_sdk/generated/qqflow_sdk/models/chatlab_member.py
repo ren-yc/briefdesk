@@ -90,5 +90,3 @@ class ChatlabMember(BaseModel):
             "platformId": obj.get("platformId")
         })
         return _obj
-
-

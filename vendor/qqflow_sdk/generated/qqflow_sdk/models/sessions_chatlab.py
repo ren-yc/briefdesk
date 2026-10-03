@@ -100,5 +100,3 @@ class SessionsChatlab(BaseModel):
             "sessions": [SessionChatlab.from_dict(_item) for _item in obj["sessions"]] if obj.get("sessions") is not None else None
         })
         return _obj
-
-
