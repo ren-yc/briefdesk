@@ -184,6 +184,7 @@ class QqFlowClient(SourceClient):
             register_attr="_register_via_gate",
             log_errors_attr="_log_account_errors",
             identity_attr="_check_bound_identity",
+            register_desc_attr="_register_desc",
             version_label="qqflow-server",
             log=logger,
         )
@@ -351,7 +352,8 @@ class QqFlowClient(SourceClient):
         return self._gate.logged_version
     @_logged_version.setter
     def _logged_version(self, value: str | None) -> None:
-        """poller 等处会写入版本号；真身在门控上，写入保持一致。"""
+        """白盒兼容面：版本号的真身在门控上（当前无生产写入路径，写入只
+        为测试复位观测面；门控自身在首次记录时赋值）。"""
         self._gate._logged_version = value
 
     @property
@@ -369,16 +371,26 @@ class QqFlowClient(SourceClient):
         状态机本体在共享基座（_sdk_base.ReadinessGate）：健康阶段分诊、绑定
         账号身份闸门、良性/被拒态的注册分诊两平台同构；本类构造时把 HTTP
         细节以属性名注入（fetch_health / fetch_accounts / _register_via_gate
-        / _log_account_errors / _check_bound_identity），调用时解析，测试的
-        实例级打桩对门控可见。
+        / _log_account_errors / _check_bound_identity / _register_desc），
+        调用时解析，测试的实例级打桩对门控可见。
         """
         await self._gate.ensure_ready(force=force)
+
     async def _register_via_gate(self) -> tuple[str, str | None]:
         """自持注册：register_account 返回 state；conflict 就地抛 Mismatch。
         门控只要 (state, status) 元组分诊，这里把 str 适配成元组。
         """
         state = await self.register_account(self._qq, self._key, self._db_path)
         return state, None
+
+    def _register_desc(self) -> str:
+        """门控「注册前 INFO」的平台描述（迁移前本插件自己打的原文案）。
+
+        身份上下文只有插件有（门控跨平台），以回调供词；纯字符串拼接，
+        不做 IO，不可能失败。
+        """
+        return f"注册账号 qq={self._qq} (db_path={self._db_path or '<默认>'})"
+
     async def _log_account_errors(self, accounts: list[dict] | None = None) -> None:
         """把 error 根因打出来（诊断专用，失败仅降级为 debug）。
 

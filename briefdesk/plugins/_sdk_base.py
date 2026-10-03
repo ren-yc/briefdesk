@@ -1,12 +1,15 @@
-"""两个消息源插件共享的 SDK 适配基座（vendor 之上的薄层）。
+"""两个消息源插件共享的身份状态机（就绪门控）。
 
-vendor 侧（`weflow_sdk` / `qqflow_sdk`）提供的是**语义正确的行为原语**：
-`wait_ready`（wait-only 就绪轮询，不做任何注册动作）、`ensure_ready`
-（注册 + 就绪轮询，200 拒绝态映射为 StatusError）、`watch`（单连接连续
-多帧 + 字节级 LF 分帧 + 1 MiB 缓冲上限）。本模块把两个插件各自的「身份
-状态机」收敛为一份实现：健康检查驱动的记忆化、绑定账号身份闸门、良性
-态/被拒态的注册分诊，全部逻辑两个平台同构，只有「怎么调 HTTP」不同——
-那部分以协作回调注入，本模块不持有 HTTP 客户端。
+**与 vendor SDK 的关系**：`weflow_sdk` / `qqflow_sdk` 目前**仅随包分发**
+（wheel/sdist 内含、装完可导入、形状有门禁断言），插件运行期**尚未消费**
+它们——本模块自己用 httpx 直连上游，只复用 vendor 定下的**语义口径**
+（wait-only 就绪轮询、200 拒绝态快速失败、SSE 单连接多帧等）。运行期
+切换到 vendor SDK 是下一批的事，别把「随包分发」读成「在跑它的代码」。
+
+本模块把两个插件各自的「身份状态机」收敛为一份实现：健康检查驱动的
+记忆化、绑定账号身份闸门、良性态/被拒态的注册分诊，全部逻辑两个平台
+同构，只有「怎么调 HTTP」不同——那部分以协作回调注入，本模块不持有
+HTTP 客户端。
 
 身份闸门的时点约定（两平台一致，**不可弱化**）：每次 SSE 实际建连成功、
 交付消息之前必须强制重检（`force=True`）；周期轮询默认关闭
@@ -67,6 +70,12 @@ class ReadinessGate:
     register_attr: str
     log_errors_attr: str
     identity_attr: str
+    # 注册分诊日志的平台描述（owner.<attr> 指向无参 callable，返回
+    # 一行描述文本，例如 weflow 的「注册账号 wxid=… (db_path=…, keys=N 个库)」
+    # 与 qqflow 的「注册账号 qq=… (db_path=…)」）。迁移到本门控时这条
+    # 「注册前 INFO」曾被整体丢失：它带的是平台各自的身份上下文，门控拿不到，
+    # 只能由 owner 以回调供词——缺省 None 时回落到通用文案（测试桩可用）。
+    register_desc_attr: str | None = None
     # 版本日志的平台前缀（weflow-server / qqflow-server），与既有日志口径一致
     version_label: str = "服务端"
     log: logging.Logger = field(default_factory=lambda: logger)
@@ -119,6 +128,15 @@ class ReadinessGate:
         async with self._lock:
             if self._ready_checked and not force:
                 return
+            # force=True must invalidate the memoized success *before* the
+            # first await: otherwise a force call that fails (registration
+            # refusal, network error, Mismatch, cancellation) leaves the
+            # stale success flag set and every later non-force call short-
+            # circuits without ever re-checking - the exact opposite of
+            # 'force means re-verify'. Successful force re-checks re-set
+            # the flag below on the normal paths.
+            if force:
+                self._ready_checked = False
             try:
                 health = await self._coll(self.health_attr)()
             except Exception:
@@ -157,15 +175,33 @@ class ReadinessGate:
                 await self._coll(self.log_errors_attr)(accounts)
             # error 落到注册分支是有意的：error 不释放绑定，同一账号可直接
             # 重试注册恢复（密钥修正后即生效）。
+            # 注册前 INFO（平台化描述）：两个插件迁移到本门控前各打一行
+            # 「无就绪账号（阶段 X），注册账号 …」——账号身份上下文（wxid/qq/
+            # db_path/keys 数）只有插件自己有，门控只能要回调供词。丢了这行，
+            # 「服务端拒绝引导」在日志里就只剩一行阶段 debug，排查面回退。
+            desc = None
+            if self.register_desc_attr is not None:
+                try:
+                    desc = self._coll(self.register_desc_attr)()
+                except Exception:  # noqa: BLE001 —— 供词失败绝不阻断注册
+                    desc = None
+            if desc:
+                self.log.info("无就绪账号（阶段 %s），%s", phase, desc)
+            else:
+                self.log.info("无就绪账号（阶段 %s），注册账号", phase)
             state, status = await self._coll(self.register_attr)()
+            # status 只在「有」时打：qqflow 面的 register 回调不带 status
+            # （其健康分诊由 phase 承担），此前恒打 status 会让那侧的日志
+            # 永远多一个 None——按有无 status 两种文案，恢复各平台迁移前
+            # 的口径（weflow: state+status；qqflow: 仅 state）。
+            detail = (f"state={state}, status={status}" if status is not None
+                      else f"state={state}")
             if state in BENIGN_REGISTER_STATES or (
                 status is not None and status in BOOTSTRAPPING_PHASES
             ):
                 self._ready_checked = True
-                self.log.info("账号注册: state=%s, status=%s", state, status)
+                self.log.info("账号注册: %s", detail)
             else:
                 # 被拒态不记忆化：保持未检查标志让下一轮重试；否则零账号
                 # 部署下没有业务 503 兜底复位标志，引导失败后永不自愈。
-                self.log.warning(
-                    "账号注册被拒: state=%s, status=%s（下轮重试）", state, status
-                )
+                self.log.warning("账号注册被拒: %s（下轮重试）", detail)

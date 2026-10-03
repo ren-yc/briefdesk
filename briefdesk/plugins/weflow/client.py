@@ -218,6 +218,7 @@ class WeFlowClient(SourceClient):
             register_attr="_register_via_gate",
             log_errors_attr="_log_account_errors",
             identity_attr="_check_bound_identity",
+            register_desc_attr="_register_desc",
             version_label="weflow-server",
             log=logger,
         )
@@ -284,10 +285,7 @@ class WeFlowClient(SourceClient):
             # 会看到 indexing 良性态而直接返回，且上游注册已幂等（v0.3.0 起
             # 重复注册 ready/indexing 账号不重建索引）。
             logger.debug("GET %s → 503（服务端索引期，瞬态）", path)
-            # 503 自愈：同时复位本地镜像与共享门控的标志
-            # 503 自愈：同时复位本地镜像与共享门控的标志
-            # 503 自愈：同时复位本地镜像与共享门控的标志
-            # 503 self-heal: the gate owns the flag
+            # 503 自愈：门控持有记忆化标志，复位只此一处
             self._gate.reset()
             raise WeFlowNotReadyError(
                 f"weflow-server 尚未就绪（503）: {resp.text[:200]}"
@@ -411,13 +409,13 @@ class WeFlowClient(SourceClient):
         return self._gate.logged_version
     @_logged_version.setter
     def _logged_version(self, value: str | None) -> None:
-        """poller 等处会写入版本号；真身在门控上，写入保持一致。"""
+        """白盒兼容面：版本号的真身在门控上（当前无生产写入路径，写入只
+        为测试复位观测面；门控自身在首次记录时赋值）。"""
         self._gate._logged_version = value
 
     @property
     def _ready_checked(self) -> bool:
-        """白盒兼容面：记忆化标志的真身在共享门控上。
-        """
+        """白盒兼容面：记忆化标志的真身在共享门控上。"""
         return self._gate.checked
 
     @_ready_checked.setter
@@ -429,9 +427,11 @@ class WeFlowClient(SourceClient):
 
         状态机本体在共享基座：健康阶段分诊、绑定账号身份闸门、良性/被拒
         态的注册分诊两平台同构（_sdk_base.ReadinessGate），本类构造时把
-        HTTP 细节（健康检查、明细、自持注册、根因诊断、身份比对）注入。
+        HTTP 细节（健康检查、明细、自持注册、根因诊断、身份比对）与注册前
+        日志的平台描述（_register_desc）注入。
         """
         await self._gate.ensure_ready(force=force)
+
     async def _register_via_gate(self) -> tuple[str, str | None]:
         """自持注册：返回 (state, status) 供门控分诊。
 
@@ -441,10 +441,18 @@ class WeFlowClient(SourceClient):
         state, status = await self.register_account()
         return state, status
 
-    def _identity_matches(self, accounts: list[dict]) -> bool:
-        """绑定账号身份比对；不符抛 Mismatch（原样冒泡）。
+    def _register_desc(self) -> str:
+        """门控「注册前 INFO」的平台描述（迁移前本插件自己打的原文案）。
+
+        身份上下文只有插件有（门控跨平台），以回调供词；纯字符串拼接，
+        不做 IO，不可能失败。
         """
-        return self._check_bound_identity(accounts)
+        return (
+            f"注册账号 wxid={self._wxid}"
+            f" (db_path={self._db_path or '<默认>'},"
+            f" keys={len(self._db_keys)} 个库)"
+        )
+
     async def _log_account_errors(self, accounts: list[dict] | None = None) -> None:
         """把 error 根因打出来（诊断专用，失败仅降级为 debug）。
 
