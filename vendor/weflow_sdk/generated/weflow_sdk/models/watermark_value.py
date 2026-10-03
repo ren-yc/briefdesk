@@ -88,5 +88,3 @@ class WatermarkValue(BaseModel):
             "sort_seq": obj.get("sort_seq")
         })
         return _obj
-
-

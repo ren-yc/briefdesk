@@ -118,5 +118,3 @@ class PullEnvelope(BaseModel):
             "sync": PullSync.from_dict(obj["sync"]) if obj.get("sync") is not None else None
         })
         return _obj
-
-

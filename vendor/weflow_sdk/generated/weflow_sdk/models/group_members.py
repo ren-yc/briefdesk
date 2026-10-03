@@ -102,5 +102,3 @@ class GroupMembers(BaseModel):
             "updatedAt": obj.get("updatedAt")
         })
         return _obj
-
-

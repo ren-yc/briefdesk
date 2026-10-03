@@ -89,5 +89,3 @@ class MediaEnvelope(BaseModel):
             "exportPath": obj.get("exportPath")
         })
         return _obj
-
-

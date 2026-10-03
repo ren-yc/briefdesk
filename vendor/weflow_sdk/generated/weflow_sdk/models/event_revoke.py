@@ -103,5 +103,3 @@ class EventRevoke(BaseModel):
             "timestamp": obj.get("timestamp")
         })
         return _obj
-
-

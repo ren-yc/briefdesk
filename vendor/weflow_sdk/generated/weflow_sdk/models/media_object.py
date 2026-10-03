@@ -121,5 +121,3 @@ class MediaObject(BaseModel):
             "url": obj.get("url")
         })
         return _obj
-
-

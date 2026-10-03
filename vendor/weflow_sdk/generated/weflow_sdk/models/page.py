@@ -91,5 +91,3 @@ class Page(BaseModel):
             "nextCursor": obj.get("nextCursor")
         })
         return _obj
-
-
