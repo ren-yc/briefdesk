@@ -26,7 +26,7 @@ if str(REPO) not in sys.path:
     # 直跑时 sys.path[0] 是 scripts/：包路径需显式补，否则 scripts.runtime_manifest 导不到
     sys.path.insert(0, str(REPO))
 
-from scripts.runtime_manifest import expected_data_members
+from scripts.runtime_manifest import expected_data_members, vendor_expected_members
 
 #: sdist 里的非数据成员：标准元数据与构建产物。刻意**按模式**而不是锁文件名——
 #: setuptools 升级可能增删 egg-info 内的文件，锁死会让门禁因工具升级假红。
@@ -39,17 +39,20 @@ ALLOWED_NON_DATA = (
     "README.md",
     "LICENSE",
     "briefdesk/*.py",
-    # vendor 的两个 subtree SDK：随包分发的镜像源码（路径按工作区拼写）
-    "vendor/weflow_sdk/*.py",
-    "vendor/weflow_sdk/generated/**/*.py",
-    "vendor/qqflow_sdk/*.py",
-    "vendor/qqflow_sdk/generated/**/*.py",
+    # vendor 的两个 subtree SDK：随包分发的镜像源码。整棵树按非数据成员处理，
+    # 存在性由下面 assert_sdist_contents / assert_wheel_consistency 里的清单断言
+    # 负责——把 105 个模块文件登记进期望集合才能参与集合比对，而那会让清单
+    # 与「本仓资源登记表」的职责混淆（见 runtime_manifest.vendor_expected_members）。
+    "vendor/weflow_sdk/**",
+    "vendor/qqflow_sdk/**",
 )
 
 #: wheel 侧非数据成员（与 scripts/wheel_smoke.py 同口径；fnmatch 的 * 跨 /）
 WHEEL_ALLOWED_NON_DATA = (
     "briefdesk-*.dist-info/*",
     "briefdesk/*.py",
+    "weflow_sdk/**",
+    "qqflow_sdk/**",
 )
 
 #: 绝不允许进 sdist 的内容。构建时它们就躺在工作区里（.env、库文件、用户导出的用例），
@@ -154,7 +157,14 @@ def assert_sdist_contents(sdist: Path) -> list[str]:
     if stray:
         raise CheckFailure(f".py 出现在非包目录（调试脚本误入？）: {stray}")
 
-    log(f"sdist 成员断言通过：{len(names)} 个成员，其中数据成员 {len(data)} 个")
+    # 集合比对只覆盖本仓资源（vendor 整棵树按非数据成员处理），镜像的存在性
+    # 必须单独断言：只做集合互比时，两侧一起漏就抓不到。
+    vendor_missing = sorted(set(vendor_expected_members("vendor/")) - set(names))
+    if vendor_missing:
+        raise CheckFailure(
+            f"sdist 缺少随包分发的 vendor 成员 {len(vendor_missing)} 项：{vendor_missing[:5]}"
+        )
+    log(f"sdist 成员断言通过：{len(names)} 个成员，其中数据成员 {len(data)} 个；vendor 成员 {len(vendor_expected_members("vendor/"))} 项齐全")
     return data
 
 
@@ -176,9 +186,13 @@ def build_wheel(srcdir: Path, out_dir: Path) -> Path:
     return wheels[0]
 
 
+def wheel_members(wheel: Path) -> list[str]:
+    """wheel 的全部成员路径（未过滤）。镜像存在性断言要拿它比对。"""
+    return sorted(n.replace("\\", "/") for n in zipfile.ZipFile(wheel).namelist())
+
+
 def wheel_data_members(wheel: Path) -> list[str]:
-    names = [n.replace("\\", "/") for n in zipfile.ZipFile(wheel).namelist()]
-    return sorted(n for n in names if not any(fnmatch.fnmatch(n, p) for p in WHEEL_ALLOWED_NON_DATA))
+    return [n for n in wheel_members(wheel) if not any(fnmatch.fnmatch(n, p) for p in WHEEL_ALLOWED_NON_DATA)]
 
 
 def assert_wheel_consistency(sdist: Path, workdir: Path) -> None:
@@ -198,21 +212,18 @@ def assert_wheel_consistency(sdist: Path, workdir: Path) -> None:
         )
     log(f"wheel 一致性通过：两侧数据成员均为 {len(a)} 个")
 
-    # 声明对了不等于打进去了：两侧互比抓不到「两边一起漏」。这里对直接构建的
-    # wheel 逐个点名 vendor 的两个 SDK——它们靠 packages.find 的第二 where 根
-    # 进包，是「随包分发」这一供应方式的唯一保证。
-    required_vendor = (
-        "weflow_sdk/client.py",
-        "weflow_sdk/generated/spec.json",
-        "weflow_sdk/generated/weflow_sdk/py.typed",
-        "qqflow_sdk/client.py",
-        "qqflow_sdk/generated/spec.json",
-        "qqflow_sdk/generated/qqflow_sdk/py.typed",
-    )
-    vendor_missing = [name for name in required_vendor if name not in b]
-    if vendor_missing:
-        raise CheckFailure(f"wheel 缺少 vendor SDK 成员（随包分发失效）: {vendor_missing}")
-    log(f"vendor SDK 成员齐全：{len(required_vendor)} 项")
+    # 声明对了不等于打进去了：两侧互比抓不到「两边一起漏」。这里对**两个** wheel
+    # 各做一次 vendor 全量清单断言——镜像靠 packages.find 的第二个 where 根进包，
+    # 是「随包分发」这一供应方式的唯一保证。只点名少量文件时，漏掉 models/ 之类
+    # 仍会全绿；清单由工作区现算，新增镜像文件自动纳入。
+    expected_vendor = vendor_expected_members()
+    for label, wheel in (("从 sdist 重建", from_sdist), ("直接构建", direct)):
+        missing_vendor = sorted(set(expected_vendor) - set(wheel_members(wheel)))
+        if missing_vendor:
+            raise CheckFailure(
+                f"{label}的 wheel 缺少 vendor 成员 {len(missing_vendor)} 项：{missing_vendor[:5]}"
+            )
+    log(f"vendor 成员齐全：{len(expected_vendor)} 项（两个 wheel 各断言一次）")
     run([sys.executable, "-m", "twine", "check", str(sdist), str(from_sdist), str(direct)])
     log("twine check 通过（sdist + 两个 wheel）")
 

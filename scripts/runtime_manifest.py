@@ -8,6 +8,7 @@ wheel 冒烟、sdist 检查与 pytest 静态断言都从这里取期望集合：
 （新增图标只需跑 `scripts/fetch_icons.py add`，登记自动完成）。
 """
 
+import subprocess
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
@@ -49,21 +50,51 @@ def icon_manifest_entries() -> list[str]:
     )
 
 
-def vendor_sdk_data_members() -> list[str]:
-    """vendor 两个 SDK 的生成层数据资源（spec 快照与 py.typed）。
+#: 随包分发的两个上游 SDK（git subtree 镜像，经 packages.find 的第二个 where 根进包）
+VENDOR_PACKAGES = ("weflow_sdk", "qqflow_sdk")
 
-    sdist 与 wheel 的路径拼写不同：sdist 按工作区相对路径（vendor/ 前缀），
-    wheel 按 site-packages 顶层包路径。返回两种拼写的并集，供两道断言各自
-    命中自己那一侧。"""
-    resources: list[str] = []
-    for pkg in ("weflow_sdk", "qqflow_sdk"):
-        for rel in ("generated/spec.json", f"generated/{pkg}/py.typed"):
-            # sdist 按工作区相对路径归档；wheel 侧同名资源在顶层包下，
-            # 由 sdist↔wheel 重建一致性断言覆盖（不进本清单）
-            resources.append(f"vendor/{pkg}/{rel}")
-    return resources
+
+def vendor_expected_members(prefix: str = "") -> list[str]:
+    """vendor 两个 SDK 的**全部**文件：随包分发的存在性判据。
+
+    为什么整棵树都不进数据成员清单：wheel 门禁把顶层 ``weflow_sdk/**`` 与
+    ``qqflow_sdk/**`` 一律当作数据成员参与集合比对，只登记 spec 快照与 py.typed
+    会让 105 个模块文件全部落进「多出」；而若不单独断言存在性，「声明了却没打进
+    包」又没人管——两边一起漏正是互比型断言抓不到的形态。故此处只负责存在性，
+    集合比对里 vendor 整棵树按非数据成员处理。
+
+    路径来源是 ``git ls-files``：镜像以「git 跟踪的文件」为准，磁盘上的编辑器
+    备份与调试残留不该被要求打进包。取不到 git 时退回遍历包目录（排除
+    ``__pycache__``）。``vendor/README.md`` 是本仓的镜像说明，不属于上游 SDK，
+    不在此列。
+
+    ``prefix`` 切换两类拼写：空串＝wheel 顶层包路径，``vendor/``＝sdist 工作区路径。
+    """
+    rel: list[str] = []
+    try:
+        completed = subprocess.run(
+            ["git", "ls-files", *[f"vendor/{pkg}" for pkg in VENDOR_PACKAGES]],
+            cwd=REPO,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        rel = [line.strip() for line in completed.stdout.splitlines() if line.strip()]
+    except (OSError, subprocess.CalledProcessError):
+        rel = [
+            path.relative_to(REPO).as_posix()
+            for pkg in VENDOR_PACKAGES
+            for path in sorted((REPO / "vendor" / pkg).rglob("*"))
+            if path.is_file() and "__pycache__" not in path.parts
+        ]
+    members = [path.removeprefix("vendor/") for path in rel]
+    return sorted(prefix + member for member in members)
 
 
 def expected_data_members() -> list[str]:
-    """期望的数据成员集合（显式登记 + 图标清单 + vendor 数据），已排序去重。"""
-    return sorted({*REQUIRED, *icon_manifest_entries(), *vendor_sdk_data_members()})
+    """期望的数据成员集合（显式登记 + 图标清单），已排序去重。
+
+    vendor 的镜像文件**不在**此列：它们由 :func:`vendor_expected_members` 单独做
+    存在性断言——整棵树进集合比对会与 wheel 门禁的口径冲突（详见该函数说明）。
+    """
+    return sorted({*REQUIRED, *icon_manifest_entries()})

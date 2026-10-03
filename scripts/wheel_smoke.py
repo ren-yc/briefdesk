@@ -68,12 +68,19 @@ if str(REPO) not in sys.path:
     # 直跑时 sys.path[0] 是 scripts/：包路径需显式补，否则 scripts.runtime_manifest 导不到
     sys.path.insert(0, str(REPO))
 
-from scripts.runtime_manifest import expected_data_members  # noqa: E402
+from scripts.runtime_manifest import (
+    expected_data_members,
+    vendor_expected_members,
+)
 
-#: 非数据成员：dist-info 与包内模块（.py 另由「必须落在真实包目录内」约束兜底）
+#: 非数据成员：dist-info、包内模块（.py 另由「必须落在真实包目录内」约束兜底），
+#: 以及随包分发的上游镜像——镜像整棵树的存在性由 assert_manifest 里的清单断言负责，
+#: 不参与「数据成员集合」比对（整棵树进比对会要求把 105 个模块文件也登记成数据资源）。
 ALLOWED_NON_DATA = (
     "briefdesk-*.dist-info/*",
     "briefdesk/*.py",
+    "weflow_sdk/**",
+    "qqflow_sdk/**",
 )
 
 #: 应用进程只继承这些宿主变量：黑名单会随新配置项失效，白名单把「继承来的外部配置」
@@ -215,6 +222,14 @@ def assert_manifest(wheel: Path) -> None:
     missing = sorted(set(expected) - set(data))
     if extra or missing:
         raise SmokeFailure(f"wheel 资源与期望集合不一致：多出 {extra}，缺失 {missing}")
+    # 集合比对只覆盖本仓资源：vendor 整棵树按非数据成员处理（见 ALLOWED_NON_DATA
+    # 的说明）。镜像的存在性必须单独断言——只做集合互比时，两侧一起漏就抓不到，
+    # 而「随包分发」正是 vendor 的唯一目的。
+    vendor_missing = sorted(set(vendor_expected_members()) - set(names))
+    if vendor_missing:
+        raise SmokeFailure(
+            f"wheel 缺少随包分发的 vendor 成员 {len(vendor_missing)} 项：{vendor_missing[:5]}"
+        )
     for member in ("METADATA", "RECORD", "WHEEL"):
         if not any(name.endswith(f".dist-info/{member}") for name in names):
             raise SmokeFailure(f"dist-info 缺 {member}")
@@ -224,7 +239,7 @@ def assert_manifest(wheel: Path) -> None:
     ]
     if stray:
         raise SmokeFailure(f".py 出现在非包目录: {stray}")
-    log(f"资源清单通过：{len(data)} 个数据成员")
+    log(f"资源清单通过：{len(data)} 个数据成员；vendor 成员 {len(vendor_expected_members())} 项齐全")
 
 
 def make_venv(tmp: Path) -> Path:

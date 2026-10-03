@@ -12,7 +12,7 @@ from scripts.runtime_manifest import (
     REQUIRED,
     expected_data_members,
     icon_manifest_entries,
-    vendor_sdk_data_members,
+    vendor_expected_members,
 )
 
 _MANIFEST = REPO / "MANIFEST.in"
@@ -75,10 +75,26 @@ def test_registry_is_consistent() -> None:
     icons = icon_manifest_entries()
     assert icons, "图标清单为空"
     assert not set(icons) & set(REQUIRED), "图标应由清单派生，不重复登记"
-    # 第三类来源：vendor 的两个 subtree SDK（生成层 spec 快照与 py.typed）
-    vendor = vendor_sdk_data_members()
-    assert vendor, "vendor SDK 数据资源登记为空（镜像资源会缺在 sdist 里）"
-    assert not set(vendor) & set(REQUIRED), "vendor 资源不应混入显式登记表"
     expected = expected_data_members()
     assert expected == sorted(set(expected)), "期望集合必须排序去重"
-    assert set(expected) == {*REQUIRED, *icons, *vendor}
+    assert set(expected) == {*REQUIRED, *icons}
+
+
+def test_vendor_inventory_spellings_agree() -> None:
+    """vendor 存在性清单：镜像按 git 跟踪定义，两类拼写必须一一对应。
+
+    为什么存在性单独断言而不并进数据成员集合：wheel 门禁把顶层 `weflow_sdk/**`
+    与 `qqflow_sdk/**` 整棵树当数据成员参与集合比对（要相等就得登记 105 个模块
+    文件），因此集合清单只放本仓资源；镜像的存在性在这里与 scripts/sdist_check.py、
+    scripts/wheel_smoke.py 的清单断言里各查一次。
+    """
+    wheel_spelling = vendor_expected_members()
+    sdist_spelling = vendor_expected_members("vendor/")
+    assert wheel_spelling, "vendor 存在性清单为空：镜像整棵缺失时不会被任何断言拦下"
+    assert sdist_spelling == [f"vendor/{name}" for name in wheel_spelling], (
+        "两类拼写不是一一对应：两侧的存在性断言会各自漏掉不同的文件"
+    )
+    assert not any(name.startswith("vendor/") for name in wheel_spelling)
+    assert not any(name.endswith("README.md") for name in wheel_spelling), (
+        "vendor/README.md 是本仓的镜像说明，不属于上游 SDK"
+    )
