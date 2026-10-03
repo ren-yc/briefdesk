@@ -165,7 +165,7 @@ powershell -ExecutionPolicy Bypass -File scripts/install-hooks.ps1
 - [ ] `python -m mypy briefdesk/ tests/` 通过
 - [ ] `python -m pytest tests/` 通过
 - [ ] `git diff --check` 通过
-- [ ] `python -m build --wheel` 与 `python -m twine check dist/*` 通过（先清空 `dist/`）
+- [ ] `python -m build --wheel` 与 `python -m twine check dist/*` 通过（先清空 `dist/` 与 `build/`，见质量门禁）
 - [ ] `python scripts/sdist_check.py` 通过（sdist 成员与 wheel 运行时资源一一对应）
 - [ ] `git diff --check 4b825dc642cb6eb9a060e54bf8d69288fbee4904..HEAD` 通过（范围级，见质量门禁）
 - [ ] `git status --short` 中没有临时文件、缓存、数据库、本地 env 文件
