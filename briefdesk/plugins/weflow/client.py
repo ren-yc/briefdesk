@@ -160,25 +160,6 @@ _MAX_MEDIA_BYTES = 20 * 1024 * 1024
 # 120s 窗口内的新消息会把它挤出首页，50 条在刷屏场景不够，放宽到 200
 _LOOKUP_LIMIT = 200
 
-# 注册响应的两套词表（weflow-server v0.3.0 起分离，勿混用）：
-# - state：本次注册的结果语义（qqflow-server 风格）
-# - status：账号状态机当前值（awaiting_key / indexing / ready / error）
-# 良性 = 已受理或已就绪，可记忆化，索引期内不重复注册。
-_BENIGN_REGISTER_STATES = ("accepted", "already_ready", "in_progress")
-
-# 「引导中」的取值 indexing：同时存在于两套词表，一个常量服务两处比对——
-# /health 的标量 account 阶段（v0.5.0 起）identity_ok 且 phase == indexing
-# 即服务端已在引导；注册响应的 status（awaiting_key / indexing / ready /
-# error）为 indexing 时同样良性可记忆。ready 单独判定，unregistered /
-# error 落到注册分支。两套词表不是一回事：awaiting_key 只出现在注册
-# status 里（/health 未注册即 unregistered）。
-_BOOTSTRAPPING_PHASES = ("indexing",)
-
-# /health 的标量 account 阶段中，代表「服务端已被某个账号占用」的取值。上游
-# account_phase() 走 bound_account()，而注册表里只放已绑定账号，扫描发现的
-# 账号不在其中 —— 所以这三个就是「有绑定」的全部取值。
-_BOUND_PHASES = ("indexing", "ready", "error")
-
 
 class WeFlowNotReadyError(SourceError):
     """weflow-server 尚未就绪（503 就绪门控：无账号或正在建索引），瞬态。

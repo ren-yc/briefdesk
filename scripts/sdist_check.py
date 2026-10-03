@@ -26,7 +26,7 @@ if str(REPO) not in sys.path:
     # 直跑时 sys.path[0] 是 scripts/：包路径需显式补，否则 scripts.runtime_manifest 导不到
     sys.path.insert(0, str(REPO))
 
-from scripts.runtime_manifest import expected_data_members  # noqa: E402
+from scripts.runtime_manifest import expected_data_members
 
 #: sdist 里的非数据成员：标准元数据与构建产物。刻意**按模式**而不是锁文件名——
 #: setuptools 升级可能增删 egg-info 内的文件，锁死会让门禁因工具升级假红。
@@ -197,6 +197,22 @@ def assert_wheel_consistency(sdist: Path, workdir: Path) -> None:
             f"只在 sdist 侧 {sorted(set(a) - set(b))}，只在直接构建侧 {sorted(set(b) - set(a))}"
         )
     log(f"wheel 一致性通过：两侧数据成员均为 {len(a)} 个")
+
+    # 声明对了不等于打进去了：两侧互比抓不到「两边一起漏」。这里对直接构建的
+    # wheel 逐个点名 vendor 的两个 SDK——它们靠 packages.find 的第二 where 根
+    # 进包，是「随包分发」这一供应方式的唯一保证。
+    required_vendor = (
+        "weflow_sdk/client.py",
+        "weflow_sdk/generated/spec.json",
+        "weflow_sdk/generated/weflow_sdk/py.typed",
+        "qqflow_sdk/client.py",
+        "qqflow_sdk/generated/spec.json",
+        "qqflow_sdk/generated/qqflow_sdk/py.typed",
+    )
+    vendor_missing = [name for name in required_vendor if name not in b]
+    if vendor_missing:
+        raise CheckFailure(f"wheel 缺少 vendor SDK 成员（随包分发失效）: {vendor_missing}")
+    log(f"vendor SDK 成员齐全：{len(required_vendor)} 项")
     run([sys.executable, "-m", "twine", "check", str(sdist), str(from_sdist), str(direct)])
     log("twine check 通过（sdist + 两个 wheel）")
 
