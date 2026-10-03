@@ -89,9 +89,11 @@ include-package-data = false
 "briefdesk.plugins.reminders" = ["ui/*"]
 "briefdesk.plugins.rag" = ["ui/*"]
 "briefdesk.plugins.benchmark" = ["ui/*", "cases/*.example.json"]
-# vendor 的两个 SDK：生成层的 spec 快照与 py.typed 标记随包分发
-"weflow_sdk" = ["generated/**/spec.json", "generated/**/py.typed"]
-"qqflow_sdk" = ["generated/**/spec.json", "generated/**/py.typed"]
+# vendor 的两个 SDK：生成层的 spec 快照与 py.typed 标记随包分发；
+# LICENSE 由上游包目录带来（include-package-data=false 下不声明就不进 wheel，
+# 而 vendor 全量清单断言会要求它在——两侧必须同源）。
+"weflow_sdk" = ["generated/**/spec.json", "generated/**/py.typed", "LICENSE"]
+"qqflow_sdk" = ["generated/**/spec.json", "generated/**/py.typed", "LICENSE"]
 
 [project.optional-dependencies]
 # OCR 阶段插件（briefdesk.plugins.ocr）的运行时依赖：不安装时 OCR 插件

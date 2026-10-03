@@ -41,3 +41,9 @@ powershell -File scripts/sync_vendor.ps1
   qqflow `sdk-dist`（`b6f1f06`，源自 qqflow-server master `c840db5`）。上游生成管线新增确定性
   规范化（逐行去行尾空白、折叠结尾空行、保证单个结尾换行），镜像随之更新；此次同步后
   vendor 内不再有条目级空白问题，范围级空白门禁对镜像部分归零。
+- 行为层修复与包内许可证同步：weflow `sdk-dist`（`8456773`，源自 weflow-server master `c8c7392`）、
+  qqflow `sdk-dist`（`d6d7550`，源自 qqflow-server master `58856b9`）。上游改动：`watch` 的退避只在
+  干净结束时复位、1 MiB 上限同时约束单个完整帧与未成帧累计、一帧多条 `data:` 行按规范以 LF 拼接、
+  撤销从未生效的 `poll_interval` 形参；包目录新增 `LICENSE`（本仓 `package-data` 同步声明，
+  vendor 全量清单随之 109 → 111 项）。同步经 `scripts/sync_vendor.ps1` 完成，脚本打印的
+  记录行即本节两行的来源（squash 标记取自 merge 提交的第二父）。
