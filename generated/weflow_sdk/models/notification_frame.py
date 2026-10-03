@@ -97,5 +97,3 @@ class NotificationFrame(BaseModel):
             "timestamp": obj.get("timestamp")
         })
         return _obj
-
-

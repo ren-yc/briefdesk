@@ -91,5 +91,3 @@ class PullSync(BaseModel):
             "watermark": obj.get("watermark")
         })
         return _obj
-
-

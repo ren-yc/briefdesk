@@ -123,5 +123,3 @@ class ChatlabMessages(BaseModel):
             "talker": obj.get("talker")
         })
         return _obj
-
-

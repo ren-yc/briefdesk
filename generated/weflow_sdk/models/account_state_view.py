@@ -99,5 +99,3 @@ class AccountStateView(BaseModel):
             "wxid": obj.get("wxid")
         })
         return _obj
-
-

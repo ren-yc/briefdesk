@@ -109,5 +109,3 @@ class EventNew(BaseModel):
             "timestamp": obj.get("timestamp")
         })
         return _obj
-
-

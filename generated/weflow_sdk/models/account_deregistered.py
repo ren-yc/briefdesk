@@ -98,5 +98,3 @@ class AccountDeregistered(BaseModel):
             "wxid": obj.get("wxid")
         })
         return _obj
-
-

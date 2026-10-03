@@ -100,5 +100,3 @@ class AccountWxidMismatch(BaseModel):
             "wxid": obj.get("wxid")
         })
         return _obj
-
-

@@ -96,5 +96,3 @@ class Contact(BaseModel):
             "username": obj.get("username")
         })
         return _obj
-
-

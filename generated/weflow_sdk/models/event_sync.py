@@ -96,5 +96,3 @@ class EventSync(BaseModel):
             "watermarks": [WatermarkEntry.from_dict(_item) for _item in obj["watermarks"]] if obj.get("watermarks") is not None else None
         })
         return _obj
-
-

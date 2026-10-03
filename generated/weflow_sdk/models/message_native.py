@@ -132,5 +132,3 @@ class MessageNative(BaseModel):
             "sortSeq": obj.get("sortSeq")
         })
         return _obj
-
-

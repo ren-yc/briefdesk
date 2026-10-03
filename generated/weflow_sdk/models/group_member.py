@@ -102,5 +102,3 @@ class GroupMember(BaseModel):
             "wxid": obj.get("wxid")
         })
         return _obj
-
-
