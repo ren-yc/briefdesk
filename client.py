@@ -29,8 +29,9 @@ import asyncio
 import json as _json
 import logging
 import re
+from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
-from typing import Any, AsyncIterator, Callable, Optional
+from typing import Any
 
 import httpx
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field, ValidationError
@@ -54,9 +55,12 @@ _REFUSAL_STATES = frozenset({
 # SSE framing is byte-level: U+0085/U+2028/U+2029 are legal *inside* JSON
 # bodies, and str.splitlines (what ``aiter_lines`` uses) would split the
 # body there and corrupt the frame. Only LF terminates a line; a lone CR is
-# stripped for CRLF servers. The cap bounds a malformed stream that never
-# emits a blank line - without it, one such stream grows the buffer without
-# bound.
+# stripped for CRLF servers. The cap bounds BOTH the unconsumed
+# accumulation of a malformed stream that never emits a blank line AND a
+# single complete frame: without the accumulation bound one such stream
+# grows without limit, and without the frame-bound check an over-cap frame
+# would be delivered before any check could stop it - the cap would have
+# no defined semantics for frames.
 _SSE_BUFFER_CAP = 1 << 20
 
 
@@ -117,25 +121,26 @@ class MessageEvent(BaseModel):
     event: str
     session_id: str = Field(validation_alias=AliasChoices("sessionId", "session_id"))
     session_type: str = Field(validation_alias=AliasChoices("sessionType", "session_type"))
-    group_name: Optional[str] = Field(default=None, validation_alias=AliasChoices("groupName", "group_name"))
+    group_name: str | None = Field(default=None, validation_alias=AliasChoices("groupName", "group_name"))
     rawid: str
-    avatar_url: Optional[str] = Field(default=None, validation_alias=AliasChoices("avatarUrl", "avatar_url"))
-    source_name: Optional[str] = Field(default=None, validation_alias=AliasChoices("sourceName", "source_name"))
+    avatar_url: str | None = Field(default=None, validation_alias=AliasChoices("avatarUrl", "avatar_url"))
+    source_name: str | None = Field(default=None, validation_alias=AliasChoices("sourceName", "source_name"))
     content: str
     timestamp: int
-    media: Optional[dict] = None
-    media_id: Optional[str] = Field(default=None, validation_alias=AliasChoices("mediaId", "media_id"))
+    media: dict | None = None
+    media_id: str | None = Field(default=None, validation_alias=AliasChoices("mediaId", "media_id"))
 
 
 @dataclass(frozen=True)
 class _SseFrame:
-    event: Optional[str]
-    data: Optional[str]
-    id_: Optional[str]
+    event: str | None
+    data: str | None
+    id_: str | None
 
 
-def _parse_sse_block(block: bytes) -> Optional[_SseFrame]:
-    event = data = id_ = None
+def _parse_sse_block(block: bytes) -> _SseFrame | None:
+    event = id_ = None
+    data_lines: list[bytes] = []
     for raw in block.split(b"\n"):
         raw = raw.rstrip(b"\r")
         if raw.startswith(b":"):
@@ -145,9 +150,16 @@ def _parse_sse_block(block: bytes) -> Optional[_SseFrame]:
         elif raw.startswith(b"event:"):
             event = raw[6:].strip().decode("utf-8", "replace")
         elif raw.startswith(b"data:"):
-            data = raw[5:].strip().decode("utf-8", "replace")
-    if data is None:
+            data_lines.append(raw[5:])
+    if not data_lines:
         return None
+    # SSE spec: several data lines in one frame join with LF into the
+    # dispatched payload. The old per-line overwrite kept only the last
+    # line - a today-unreachable shape (the server emits exactly one data
+    # line per frame) that would silently drop a multi-line payload. The
+    # single-line path strips exactly like before, so committed frames
+    # decode byte-identically.
+    data = b"\n".join(data_lines).strip().decode("utf-8", "replace")
     return _SseFrame(event, data, id_)
 
 
@@ -167,7 +179,7 @@ class Client:
     async def aclose(self) -> None:
         await self._http.aclose()
 
-    async def __aenter__(self) -> "Client":
+    async def __aenter__(self) -> Client:
         return self
 
     async def __aexit__(self, *exc: Any) -> None:
@@ -265,7 +277,7 @@ class Client:
     async def drain_session(
         self,
         talker: str,
-        since: Optional[int],
+        since: int | None,
         on_page: Callable[[list[gen.PullMessage]], None],
     ) -> int:
         """Drain one session through the Pull cursor loop.
@@ -276,7 +288,7 @@ class Client:
         get silently skipped or replayed.
         """
         next_since = since
-        next_offset: Optional[int] = None
+        next_offset: int | None = None
         total = 0
         while True:
             query: dict[str, str] = {}
@@ -330,8 +342,8 @@ class Client:
         self,
         talker: str,
         keyword: str,
-        start: Optional[str] = None,
-        end: Optional[str] = None,
+        start: str | None = None,
+        end: str | None = None,
     ) -> gen.MessagesNative:
         """Keyword + time-window search; YYYYMMDD validated client-side.
 
@@ -388,8 +400,9 @@ class Client:
 
         Framing is byte-level LF - never ``aiter_lines``, whose splitlines
         semantics split JSON bodies at U+0085/U+2028/U+2029 - with a 1 MiB
-        cap on unconsumed bytes: a malformed stream that never emits a
-        blank line grows a naive buffer without bound.
+        cap that bounds both the unconsumed accumulation and any single
+        complete frame: an over-cap frame (well-formed or not) is not
+        delivered and the stream ends for a backing-off reconnect.
 
         Decoding failures on a single frame (bad JSON, shape mismatch,
         non-object payload) are logged and skipped, never fatal: one bad
@@ -404,9 +417,12 @@ class Client:
         watched session *from scratch* (a full re-drain, not a cursor
         resume).
         """
-        last_event_id: Optional[str] = None
+        last_event_id: str | None = None
         backoff = 0.5
         while True:
+            # Only a *clean* stream end (EOF, no overflow, no transport
+            # error) resets backoff - see the flag below.
+            clean_exit = False
             try:
                 headers = {
                     "Authorization": f"Bearer {self._token}",
@@ -420,7 +436,11 @@ class Client:
                 ) as resp:
                     if resp.status_code >= 400:
                         raise StatusError(resp.status_code, self._url("/api/v1/push/messages"))
-                    backoff = 0.5
+                    # The old shape reset backoff right here, on every
+                    # 200: a server that connects fine and then emits
+                    # over-cap frames reconnected forever at a flat 0.5s
+                    # (measured: 6 connects in 3s) - which is not a backoff
+                    # at all. Only the clean-exit path below may reset it.
                     buffer = bytearray()
                     pending: list[bytes] = []
                     pending_bytes = 0
@@ -437,6 +457,14 @@ class Client:
                                 pending_bytes += len(line) + 1
                                 continue
                             # blank line = end of frame
+                            if pending_bytes > _SSE_BUFFER_CAP:
+                                log.warning(
+                                    "SSE frame over %d bytes (malformed stream?), "
+                                    "ending this stream for reconnect",
+                                    _SSE_BUFFER_CAP,
+                                )
+                                overflow = True
+                                break
                             frame = _parse_sse_block(b"\n".join(pending))
                             pending = []
                             pending_bytes = 0
@@ -459,33 +487,49 @@ class Client:
                             )
                             overflow = True
                             break
-                    residual = bytes(buffer).rstrip(b"\r")
-                    buffer.clear()
-                    if residual:
-                        pending.append(residual)
-                    if not overflow and pending:
-                        # EOF: fold the unterminated final line (still in the buffer) into the
-                        # pending frame - a server may close without
-                        # the trailing blank line, and the last event would
-                        # silently vanish with the buffer.
-                        frame = _parse_sse_block(b"\n".join(pending))
-                        if frame is not None:
-                            if frame.id_ is not None and frame.id_.isdigit():
-                                last_event_id = frame.id_
-                            try:
-                                decoded = self._decode_event(frame)
-                            except Exception as exc:
-                                log.warning("undecodable final SSE frame: %s", exc)
-                            else:
-                                if decoded is not None:
-                                    yield decoded
+                    if not overflow:
+                        residual = bytes(buffer).rstrip(b"\r")
+                        buffer.clear()
+                        if residual:
+                            pending.append(residual)
+                        # (No separate EOF frame-cap check: the accumulation
+                        # check above already fires once pending_bytes passes
+                        # the cap, so an over-cap unterminated frame never
+                        # reaches this flush - a branch here would be dead.
+                        # Pinned by
+                        # test_watch_drops_oversized_final_frame_at_eof_without_blank.)
+                        if pending:
+                            # EOF: fold the unterminated final line (still in
+                            # the buffer) into the pending frame - a server
+                            # may close without the trailing blank line, and
+                            # the last event would silently vanish with it.
+                            frame = _parse_sse_block(b"\n".join(pending))
+                            if frame is not None:
+                                if frame.id_ is not None and frame.id_.isdigit():
+                                    last_event_id = frame.id_
+                                try:
+                                    decoded = self._decode_event(frame)
+                                except (ShapeError, ValidationError, AttributeError) as exc:
+                                    log.warning("undecodable final SSE frame: %s", exc)
+                                else:
+                                    if decoded is not None:
+                                        yield decoded
+                        if not overflow:
+                            # Every guard passed: the next reconnect starts
+                            # from the floor instead of carrying a stale
+                            # doubled delay over.
+                            clean_exit = True
+                    # Overflow: skip the EOF flush entirely (an un-trusted
+                    # stream must not deliver its tail) and keep escalating.
             except httpx.HTTPError as exc:
                 log.warning("SSE stream error, reconnecting: %s", exc)
+            if clean_exit:
+                backoff = 0.5
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 30.0)
 
     @staticmethod
-    def _decode_event(frame: _SseFrame) -> Optional[Any]:
+    def _decode_event(frame: _SseFrame) -> Any | None:
         assert frame.data is not None
         try:
             payload = _json.loads(frame.data)

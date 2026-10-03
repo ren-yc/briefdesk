@@ -10,14 +10,22 @@ Two layers with different ownership:
   most downstreams should use.
 """
 
-from .client import BadDate, Client, ClientError, MessageEvent, NotReady, ShapeError, StatusError
+from .client import (
+    BadDate,
+    Client,
+    ClientError,
+    MessageEvent,
+    NotReady,
+    ShapeError,
+    StatusError,
+)
 
 __all__ = [
+    "BadDate",
     "Client",
     "ClientError",
-    "StatusError",
-    "ShapeError",
-    "NotReady",
-    "BadDate",
     "MessageEvent",
+    "NotReady",
+    "ShapeError",
+    "StatusError",
 ]
