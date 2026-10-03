@@ -33,8 +33,12 @@ dependencies = [
     # 用户配置目录：UI「启动配置」暂存文件位置（settings_env.py）
     "platformdirs>=4",
     # vendor 的两个 Python SDK（weflow_sdk/qqflow_sdk，git subtree 随包分发）
-    # 唯一新增传递依赖：生成层模型用到 dateutil
+    # 生成层的直接 import（不是传递依赖）：日期解析用 dateutil，类型注解
+    # （Annotated / Self / NotRequired 等）用 typing_extensions。两者此前都
+    # 只靠别的包传递带入（dateutil 靠 pandas 系、typing_extensions 靠
+    # pydantic）——一旦上游不再传递依赖就静默 ImportError，所以在此显式声明。
     "python-dateutil>=2.8",
+    "typing-extensions>=4.7",
 ]
 
 # 索引页面的 Homepage / Repository / Issues 三个入口都靠这里；必须放在 dependencies 之后——
