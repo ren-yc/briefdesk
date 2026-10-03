@@ -116,13 +116,22 @@ def _fetch_missing(sha: str, *, cwd: Path | None = None) -> bool:
 
 
 def _merge_base(base: str, head: str, *, cwd: Path | None = None) -> str:
-    proc = _git(["merge-base", base, head], cwd=cwd)
+    """唯一 merge-base；没有或不止一个都拒绝（不擅自选一个）。
+
+    `--all` 是必需的：criss-cross 合流（两边互相合过）会有多个 merge-base，
+    单值调用会静默挑一个，扫描范围随之变成「其中一个基线」，与契约不符。
+    """
+    proc = _git(["merge-base", "--all", base, head], cwd=cwd)
     if proc.returncode != 0:
         raise ScanUnavailable(f"找不到 {base} 与 {head} 的共同祖先（不擅自选一个）")
-    value = proc.stdout.strip()
-    if not value:
+    bases = [line.strip() for line in proc.stdout.splitlines() if line.strip()]
+    if not bases:
         raise ScanUnavailable(f"{base} 与 {head} 没有 merge-base")
-    return value
+    if len(bases) > 1:
+        raise ScanUnavailable(
+            f"{base} 与 {head} 有多个 merge-base（{[b[:12] for b in bases]}）——范围不唯一，拒绝放行"
+        )
+    return bases[0]
 
 
 def resolve_plan(

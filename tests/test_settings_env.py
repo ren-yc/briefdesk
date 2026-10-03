@@ -919,6 +919,27 @@ class PluginsExpectedUnavailableTest(StagedFileTestCase):
         self.assertIn("${BD_TEST_PLUGIN:-weflow}", self.staged_path.read_text(encoding="utf-8"))
         self.assertEqual(read_staged()["PLUGINS"], '["weflow"]')
 
+    def test_put_with_broken_higher_layer_plugins_and_valid_required_is_409(self) -> None:
+        """高层坏 PLUGINS + 有效必选名单时 PUT 必须 409，不能把异常冒成 500。
+
+        必选复检内部要读启用名单；那条路径若不受保护，坏名单会以未捕获异常的形式
+        穿出路由（生产即 500，用户只看到「服务器错误」，也没有可据此修复的 issue 明细）。
+        """
+        write_staged({"PLUGINS_REQUIRED": json.dumps(["benchmark"])})
+        with patch.dict(os.environ, {"PLUGINS": "not-json"}):
+            res = self.client.put(
+                "/api/settings/env",
+                json={"items": {"PLUGINS_REQUIRED": json.dumps(["benchmark"])}},
+            )
+        self.assertEqual(res.status_code, 409)
+        issues = res.json()["detail"]["issues"]
+        self.assertTrue(
+            any(i["type"] == "unavailable" and i.get("key") == "PLUGINS" for i in issues),
+            issues,
+        )
+        # 拒绝时不落盘：暂存保持调用前原样
+        self.assertEqual(read_staged(), {"PLUGINS_REQUIRED": json.dumps(["benchmark"])})
+
     def test_put_rejects_write_when_staged_unreadable(self) -> None:
         """暂存读不出来时拒绝写入（409），不把读失败当「无暂存」覆盖成空文件。"""
         write_staged({"LOG_LEVEL": "DEBUG"})

@@ -9,11 +9,13 @@ Windows，本地能跑；POSIX 分支只做导入级冒烟（CI 的 isolation-sm
 """
 
 import json
+import os
 import sys
 from pathlib import Path
 
 import pytest
 
+from scripts import smoke_process
 from scripts.smoke_process import (
     SmokeCommandError,
     SmokeCommands,
@@ -97,6 +99,28 @@ class TestSmokeCommands:
             assert owned._cleaned
         finally:
             cmds.close_all()
+
+    @pytest.mark.skipif(sys.platform != "win32", reason="Windows Job 路径")
+    def test_process_is_actually_inside_the_job(self, root: Path) -> None:
+        """句柄存在还不够：进程必须真的在 Job 里（否则 KILL_ON_JOB_CLOSE 只是摆设）。
+
+        用长驻子进程做探针：启动后查询 Job 的 ActiveProcesses，应当 ≥ 1；
+        close_all 之后再查计数归零（说明清理确实按 Job 走的）。
+        """
+        cmds = SmokeCommands(root)
+        owned = cmds.start_app(
+            [sys.executable, "-c", "import time; time.sleep(30)"],
+            env=dict(os.environ),
+            cwd=root,
+        )
+        try:
+            assert owned._job_handle is not None, "Windows 上必须已指进 Job"
+            active = smoke_process._active_processes(owned._job_handle)
+            assert active is not None, "应能查询 Job 的 ActiveProcesses"
+            assert active >= 1, f"命令进程不在 Job 内（ActiveProcesses={active}）"
+        finally:
+            cmds.close_all()
+        assert owned.reaped, "清理后必须已回收包装进程"
 
     def test_close_all_is_idempotent_and_aggregates(self, root: Path) -> None:
         """close_all 处理全部已登记对象：单个失败不漏其余（聚合报错）。"""

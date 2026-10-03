@@ -144,6 +144,10 @@ class _OwnedCommand:
         self.gate_path = directory / "gate"
         self._job_handle: Any = None  # Windows：Job 句柄（int）
         self._cleaned = False
+        # POSIX：**启动时**记下进程组号。退出后 os.getpgid(pid) 会失败，
+        # 而组号在回收前不会复用——启动时取一次是后续组信号的唯一可靠依据。
+        self.pgid: int | None = None
+        self.reaped = False  # 是否已 wait 回收（回收后不得再向旧 PGID 发信号）
 
     def started(self, proc: subprocess.Popen[bytes], job_handle: Any = None) -> None:
         self.proc = proc
@@ -227,6 +231,10 @@ class SmokeCommands:
             **popen_kwargs,
         )
         owned.started(proc)
+        if not _IS_WINDOWS:
+            # start_new_session 已让 wrapper 成为组长：组号就是它的 pid，
+            # 在此刻取一次（进程退出后 getpgid 会失败）
+            owned.pgid = proc.pid
         # 许可：wrapper 轮询许可文件，读到 GO 才创建实际命令。文件比管道稳——
         # 管道写端句柄会被子进程继承链纠缠，文件没有这个问题。
         owned.gate_path.write_bytes(b"GO")
@@ -293,7 +301,15 @@ class SmokeCommands:
         while True:
             if owned.status_path.exists():
                 return parse_status(owned.status_path.read_bytes())
-            if owned.proc is not None and owned.proc.poll() is not None and owned.proc.returncode not in (0, None):
+            # 只在 Windows 上用 poll() 判「包装进程提前退出」：POSIX 的 poll 会**回收**
+            # 子进程，一旦回收就无法再向它所在的进程组发信号（组号可能被复用）——
+            # POSIX 侧按契约只用状态文件与总期限判断命令是否完成。
+            if (
+                _IS_WINDOWS
+                and owned.proc is not None
+                and owned.proc.poll() is not None
+                and owned.proc.returncode not in (0, None)
+            ):
                 # wrapper 在许可前/读许可失败时退出：不会有状态文件
                 raise SmokeCommandError(
                     f"包装进程提前退出（{owned.proc.returncode}），命令未执行: {owned.name}"
@@ -325,7 +341,10 @@ class SmokeCommands:
         try:
             if _IS_WINDOWS and owned._job_handle is not None:
                 _terminate_job(owned._job_handle, grace_seconds=grace_seconds)
-            elif not _IS_WINDOWS and owned.proc.poll() is None:
+            elif not _IS_WINDOWS:
+                # 组信号在回收**之前**发：wrapper 自己先退出不代表组里没有后代
+                # （命令 detach 出的孙进程仍在组内）。等 wrapper 退出后再发就晚了——
+                # 组号可能随回收被复用，那时只能保守放弃，孤儿无人收。
                 _terminate_group(owned, grace_seconds=grace_seconds)
             else:
                 # 无平台句柄（启动中途失败）：直接按进程终止
@@ -336,6 +355,7 @@ class SmokeCommands:
             except subprocess.TimeoutExpired:
                 owned.proc.kill()
                 owned.proc.wait(timeout=5)
+            owned.reaped = True
         finally:
             if owned._job_handle is not None:
                 # finally 里关 Job：终止/查询失败也要触发 KILL_ON_JOB_CLOSE 内核兜底
@@ -441,18 +461,26 @@ def _assign_process_to_job(job: Any, process_handle: int) -> bool:
     return bool(_kernel32.AssignProcessToJobObject(_HANDLE(job), _HANDLE(process_handle)))
 
 
+def _active_processes(job: Any) -> int | None:
+    """Job 内当前活动进程数；查询失败返回 None（调用方保守处理）。"""
+    if not _IS_WINDOWS or not job:
+        return None
+    accounting = _JOBOBJECT_BASIC_ACCOUNTING()
+    queried = _kernel32.QueryInformationJobObject(
+        job, 1,  # JobObjectBasicAccountingInformation（类号 1，不是 8——8 是 Basic+IO，结构不同）
+        ctypes.byref(accounting), ctypes.sizeof(accounting), None,
+    )
+    return int(accounting.ActiveProcesses) if queried else None
+
+
 def _terminate_job(job: Any, *, grace_seconds: float) -> None:
     """终止 Job 内全部进程并等 ActiveProcesses 归零；失败保留句柄交 finally 关闭兜底。"""
     if not _kernel32.TerminateJobObject(job, 1):
         raise SmokeCommandError(f"TerminateJobObject 失败（WinError {_last_error()}）")
     deadline = time.monotonic() + max(grace_seconds, 1.0)
-    accounting = _JOBOBJECT_BASIC_ACCOUNTING()
     while time.monotonic() < deadline:
-        queried = _kernel32.QueryInformationJobObject(
-            job, 8,  # JobObjectBasicAccountingInformation
-            ctypes.byref(accounting), ctypes.sizeof(accounting), None,
-        )
-        if queried and accounting.ActiveProcesses == 0:
+        active = _active_processes(job)
+        if active == 0:
             return
         time.sleep(0.05)
     # 超时不抛：CloseHandle 的 KILL_ON_JOB_CLOSE 仍会内核兜底；调用方据此记失败
@@ -483,29 +511,26 @@ def _close_handle(handle: Any) -> None:
 def _terminate_group(owned: _OwnedCommand, *, grace_seconds: float) -> None:
     """对进程组发 SIGTERM → 宽限 → 最后一次 SIGKILL；之后才由调用方 wait 回收。
 
-    向「最后一次组信号」之前保持组长身份：owned.proc 未回收，PGID 不会复用。
-    重复清理（reap 后再调）不再向旧 PGID 发信号——组号可能已被复用，宁可保守失败。
+    组号取自**启动时**记下的 owned.pgid（进程退出后 getpgid 会失败，且那时若已
+    wait 回收，组号可能被复用——向复用的组号发信号就是杀别的进程）。已经回收过
+    的命令不再发信号：此时无法区分「组已空」与「组号被复用」，保守报告而非误杀。
     """
-    if owned.proc is None or owned._cleaned:
+    if owned.proc is None or owned.reaped or owned.pgid is None:
         return
     # 运行在 POSIX 才有进程组 API；Windows 类型检查下这些属性不存在，运行时判定
-    if not hasattr(os, "getpgid") or not hasattr(os, "killpg"):
+    if not hasattr(os, "killpg"):
         return
-    try:
-        pgid = os.getpgid(owned.proc.pid)  # type: ignore[attr-defined]
-    except ProcessLookupError:
-        return
+    pgid = owned.pgid
     try:
         os.killpg(pgid, signal.SIGTERM)  # type: ignore[attr-defined]
     except ProcessLookupError:
         return
+    # 宽限期按墙钟走，不用 proc.poll() 判结束：poll 会**回收**子进程，
+    # 一旦回收就失去向该组发信号的安全窗口（组号可能被复用）。
     deadline = time.monotonic() + max(grace_seconds, 0.0)
     while time.monotonic() < deadline:
-        if owned.proc.poll() is not None:
-            break
         time.sleep(0.05)
-    if owned.proc.poll() is None:
-        try:
-            os.killpg(pgid, signal.SIGKILL)  # type: ignore[attr-defined]
-        except ProcessLookupError:
-            pass
+    try:
+        os.killpg(pgid, signal.SIGKILL)  # type: ignore[attr-defined]
+    except ProcessLookupError:
+        pass

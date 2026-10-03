@@ -141,6 +141,40 @@ class TestPullRequestPlans:
         assert plan.content_base == base, "内容基线是 merge-base，不是 base 本身之外的东西"
         assert plan.message_base == base
 
+    def test_pr_with_multiple_merge_bases_blocks(self, repo: Path) -> None:
+        """criss-cross 合流会产生多个 merge-base：范围不唯一，必须拒绝而不是挑一个。
+
+        构图（经典 criss-cross）：共同祖先上分别出「主线一次提交」与「侧分支一次提交」，
+        然后主线合侧分支、侧分支合主线——两边互不包含对方的合并提交，共同祖先因此有两个。
+        『对方的最新 tip』，其中一侧就会包含另一侧，退化成唯一 merge-base。
+        """
+        base = _rev(repo)
+        _git(repo, "checkout", "-qb", "side", base)
+        (repo / "side.txt").write_text("s" + chr(10), encoding="utf-8")
+        _git(repo, "add", ".")
+        _git(repo, "commit", "-qm", "side change")
+        s1 = _rev(repo)
+        _git(repo, "checkout", "-q", "master")
+        (repo / "main.txt").write_text("m" + chr(10), encoding="utf-8")
+        _git(repo, "add", ".")
+        _git(repo, "commit", "-qm", "main change")
+        m1 = _rev(repo)
+        # 主线先合侧分支那次提交；侧分支再合**主线那一次提交**（不是主线最新 tip，
+        # 否则一侧包含另一侧，退化成唯一 merge-base）
+        _git(repo, "merge", "-q", "--no-ff", "-m", "merge side", s1)
+        _git(repo, "checkout", "-q", "side")
+        _git(repo, "merge", "-q", "--no-ff", "-m", "merge main", m1)
+        side_tip = _rev(repo)
+        _git(repo, "checkout", "-q", "master")
+        bases = _git(repo, "merge-base", "--all", "master", "side").splitlines()
+        assert len(bases) >= 2, f"构图未产生多个 merge-base: {bases}"
+        with pytest.raises(ci_scan.ScanUnavailable, match="多个 merge-base"):
+            ci_scan.resolve_plan(
+                "pull_request",
+                {"pull_request": {"base": {"sha": _rev(repo)}, "head": {"sha": side_tip}}},
+                cwd=repo,
+            )
+
     def test_pr_without_common_ancestor_blocks(self, repo: Path) -> None:
         """孤立历史：merge-base 取不到即阻断，不擅自选一个基线。"""
         orphan = _rev(repo)

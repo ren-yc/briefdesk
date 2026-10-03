@@ -258,6 +258,22 @@ class _PluginsUnresolvable(Exception):
         self.detail = detail
 
 
+def _dedupe_issues(issues: list[dict[str, str]]) -> list[dict[str, str]]:
+    """同名 issue 去重：启用名单不可解析时，候选解析与必选复检会各报一条。
+
+    两条内容相同，重复下发只会让 409 的明细看起来像两个独立问题。
+    """
+    seen: set[tuple[tuple[str, str], ...]] = set()
+    unique: list[dict[str, str]] = []
+    for issue in issues:
+        key = tuple(sorted((k, str(v)) for k, v in issue.items()))
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(issue)
+    return unique
+
+
 def _resolve_plugin_list(key: str, staged_override: dict[str, str] | None = None) -> list[str] | None:
     """按共享层序解析 PLUGINS / PLUGINS_REQUIRED 为字符串数组。
 
@@ -310,7 +326,12 @@ def _required_plugin_issues(staged: dict[str, str]) -> list[dict[str, str]]:
         return []
     known = {p.get("name") for p in get_plugins_info() if p.get("name")}
     core = {p.get("name") for p in get_plugins_info() if p.get("core")}
-    desired = set(_desired_plugins(staged))
+    # 启用名单本身不可解析时同样按不可用报：这里若让 _PluginsUnresolvable 冒出去，
+    # 路由会变成 500——坏名单（高层 env/项目 .env 或暂存）配有效必选名单时必然触发。
+    try:
+        desired = set(_desired_plugins(staged))
+    except _PluginsUnresolvable as exc:
+        return [{"type": "unavailable", "key": exc.key, "detail": exc.detail}]
     issues: list[dict[str, str]] = []
     for name in required:
         if known and name not in known:
@@ -518,7 +539,7 @@ async def api_settings_env_put(payload: EnvPutPayload):
                 issues = list(validate_plugin_selection(desired) or [])
             issues += _required_plugin_issues(_candidate_staged)
             if issues:
-                raise HTTPException(status_code=409, detail={"issues": issues})
+                raise HTTPException(status_code=409, detail={"issues": _dedupe_issues(issues)})
         commit_staged_write(candidate)
     # 写后重读暂存，回传受影响键的最终态：前端据此做行级贴片，不必整面
     # 重拉（整面重载会丢其它行的未暂存编辑与「插件」面板的开关草稿）
