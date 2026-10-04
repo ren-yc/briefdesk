@@ -11,6 +11,7 @@ Windows，本地能跑；POSIX 分支只做导入级冒烟（CI 的 isolation-sm
 import json
 import os
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -131,3 +132,118 @@ class TestSmokeCommands:
         assert cmds._owned == []
         # 重复调用不抛（幂等）
         cmds.close_all()
+
+class TestSpawnReleaseOrdering:
+    """纳管后才放行的规范时序与 run() 的状态文件事实原则。
+
+    旧实现的两个失败模式：先写 GO 再纳管，实际命令在 AssignProcessToJobObject
+    前启动、整体落在 Job 外（KILL_ON_JOB_CLOSE 兜底旁路）；放行后用 wrapper
+    退出码反推命令失败，把「发布状态后 wrapper 被终止收尾」误报成命令失败，
+    负载下连 run() 都会因「句柄已回收」误报成 runner 不允许嵌套 Job。
+    """
+
+    @pytest.fixture()
+    def root(self, tmp_path: Path) -> Path:
+        return tmp_path
+
+    @pytest.mark.skipif(sys.platform != "win32", reason="Windows Job 路径")
+    def test_real_command_pid_is_inside_the_job(self, root: Path) -> None:
+        """真实命令的 PID 必须在 Job 内（ActiveProcesses 计数抓不到「只有 wrapper
+        在内」的错序，必须按 PID 查）。同步手法：命令先写哨兵文件再阻塞，测试轮询
+        哨兵出现后按其中记录的 PID 查归属——start_app 立即返回，恰好提供断言窗口。
+        """
+        sentinel = root / "sentinel.pid"
+        script = (
+            "from pathlib import Path; import os, time;"
+            + " Path(r'" + str(sentinel).replace("'", "''") + "').write_text(str(os.getpid()));"
+            + " time.sleep(30)"
+        )
+        cmds = SmokeCommands(root)
+        owned = cmds.start_app(
+            [sys.executable, "-c", script],
+            env=dict(os.environ),
+            cwd=root,
+        )
+        try:
+            deadline = 10.0
+            while not sentinel.exists() and deadline > 0:
+                time.sleep(0.05)
+                deadline -= 0.05
+            assert sentinel.exists(), "实际命令未在期限内启动"
+            pid = int(sentinel.read_text(encoding="utf-8"))
+            assert owned._job_handle is not None, "Windows 上必须已指进 Job"
+            assert smoke_process._process_in_job(
+                owned._job_handle, pid
+            ), "实际命令不在 Job 内——放行早于纳管，Job 兜底旁路"
+        finally:
+            cmds.close_all()
+
+    def test_wrapper_linger_after_status_does_not_fail_run(self, root: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """发布完成状态后 wrapper 逗留：run() 仍正常返回（防 TerminateJobObject
+        误杀 + 退出码反推误报）。构造缝隙：wrapper 源码在发布状态后 sleep 数秒——
+        插入点必须在 main() 的 publish 与 return 之间，脚本体以 sys.exit(main())
+        结尾，追加到末尾不可达，会造出假 linger 让用例照绿。"""
+        old_line = '    _publish(status_path, _status_json({"kind": "exit", "returncode": code}))'
+        new_line = old_line + "\n    import time as _linger\n    _linger.sleep(3.0)"
+        linger_source = smoke_process._WRAPPER_SOURCE.replace(old_line, new_line)
+        assert linger_source != smoke_process._WRAPPER_SOURCE, "变体构造失败"
+        monkeypatch.setattr(smoke_process, "_WRAPPER_SOURCE", linger_source)
+        cmds = SmokeCommands(root)
+        try:
+            out = cmds.run([sys.executable, "-c", "print('linger-ok')"], timeout=60)
+            assert "linger-ok" in out
+        finally:
+            cmds.close_all()
+
+    def test_wrapper_early_exit_before_release_reported_as_early_exit(self, root: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """wrapper 在放行前自行退出：报「包装进程提前退出」，不误报嵌套 Job 被拒。
+
+        新时序下 poll 紧邻 spawn，真实 wrapper 不可能确定性地在此之前退出——
+        把 _WRAPPER_SOURCE 换成立即退出的变体，并把 spawn 包装成「等它退出后
+        再返回」，poll 必然看到已退出。"""
+        exit_source = smoke_process._WRAPPER_SOURCE.replace(
+            "    while True:",
+            "    import sys as _s\n    _s.exit(9)\n    while True:",
+        )
+        assert exit_source != smoke_process._WRAPPER_SOURCE, "变体构造失败"
+        monkeypatch.setattr(smoke_process, "_WRAPPER_SOURCE", exit_source)
+        real_spawn = SmokeCommands._spawn_wrapper
+
+        def _spawn_then_wait(self, owned, cmd, *, env, cwd):
+            proc = real_spawn(self, owned, cmd, env=env, cwd=cwd)
+            proc.wait(timeout=10)
+            return proc
+
+        monkeypatch.setattr(SmokeCommands, "_spawn_wrapper", _spawn_then_wait)
+        cmds = SmokeCommands(root)
+        released: list[bool] = []
+
+        real_release = SmokeCommands._release
+
+        def _tracking_release(owned):
+            released.append(True)
+            real_release(owned)
+
+        monkeypatch.setattr(SmokeCommands, "_release", _tracking_release)
+        try:
+            with pytest.raises(SmokeCommandError, match="提前退出") as exc_info:
+                cmds.run([sys.executable, "-c", "print('never')"], timeout=30)
+            assert "嵌套 Job" not in str(exc_info.value)
+            assert released == [], "提前退出路径不得写放行"
+        finally:
+            cmds.close_all()
+
+    @pytest.mark.skipif(sys.platform != "win32", reason="Windows Job 路径")
+    def test_assign_failure_keeps_gate_pending_and_cleans(self, root: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """纳管失败（伪造内核拒绝）：保持 PENDING、真实命令未启动、清理后显式报错。"""
+        monkeypatch.setattr(
+            smoke_process, "_assign_process_to_job", lambda job, handle: False
+        )
+        cmds = SmokeCommands(root)
+        try:
+            with pytest.raises(SmokeCommandError, match="AssignProcessToJobObject 失败"):
+                cmds.run([sys.executable, "-c", "print('never')"], timeout=30)
+            owned = cmds._owned[0]
+            assert owned.gate_path.read_bytes() == b"PENDING", "纳管失败不得写放行"
+        finally:
+            cmds.close_all()

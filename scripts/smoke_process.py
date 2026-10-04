@@ -36,6 +36,12 @@ _IS_WINDOWS = os.name == "nt"
 
 _STATUS_NAME = "status.json"
 
+#: 已发布完成状态后等 wrapper 自然退出的宽限。发布状态意味着实际命令已结束，
+#: wrapper 只剩收尾——正常毫秒级退出；超时才升级 TerminateJobObject，避免把
+#: 刚写完状态文件的 wrapper 误杀（其退出码不参与命令成败判定，误杀也不影响
+#: 结果，但会留下难排查的清理噪音）。
+_WRAPPER_EXIT_GRACE = 2.0
+
 
 class SmokeCommandError(RuntimeError):
     """冒烟命令管理失败（协议/清理/超时）：携带可直接定位的说明。"""
@@ -210,7 +216,13 @@ class SmokeCommands:
             )
         owned.started(proc, job_handle=job)
 
-    def _start_wrapper(self, owned: _OwnedCommand, cmd: list[str], *, env: dict[str, str], cwd: Path | None) -> subprocess.Popen[bytes]:
+    def _spawn_wrapper(self, owned: _OwnedCommand, cmd: list[str], *, env: dict[str, str], cwd: Path | None) -> subprocess.Popen[bytes]:
+        """启动包装进程但不放行：实际命令要等纳管成功后才允许创建。
+
+        许可与启动拆开是 Windows 所有权的关键时序——先写 GO 再纳管时，实际命令
+        在 AssignProcessToJobObject 之前就可能已启动（慢启动命令更必然），它和
+        它的后代全部落在 Job 外，KILL_ON_JOB_CLOSE 兜底整体旁路。
+        """
         owned.gate_path.write_bytes(b"PENDING")  # 许可文件：GO 才放行
         popen_kwargs: dict[str, Any] = {
             "stdin": subprocess.DEVNULL,
@@ -235,27 +247,47 @@ class SmokeCommands:
             # start_new_session 已让 wrapper 成为组长：组号就是它的 pid，
             # 在此刻取一次（进程退出后 getpgid 会失败）
             owned.pgid = proc.pid
-        # 许可：wrapper 轮询许可文件，读到 GO 才创建实际命令。文件比管道稳——
-        # 管道写端句柄会被子进程继承链纠缠，文件没有这个问题。
-        owned.gate_path.write_bytes(b"GO")
         return proc
+
+    @staticmethod
+    def _release(owned: _OwnedCommand) -> None:
+        """写许可放行实际命令；只能由 run/start_app 在纳管（或 POSIX 无纳管）后调用。
+
+        许可用文件不用管道：管道写端句柄会被子进程继承链纠缠，文件没有这个问题。
+        """
+        owned.gate_path.write_bytes(b"GO")
 
     # ── 对外接口 ──
 
     def run(self, cmd: list[str], *, env: dict[str, str] | None = None, timeout: float = 900, cwd: Path | None = None) -> str:
-        """同步执行一条命令并返回其日志文本（失败由调用方按状态判定）。"""
+        """同步执行一条命令并返回其日志文本（失败由调用方按状态判定）。
+
+        Windows 规范顺序：spawn → 立即 poll（未放行时退出只可能是 wrapper 自身
+        启动失败）→ 纳管 → 放行。放行后命令成败只以状态文件为事实，wrapper 的
+        退出码不作判据——发布完成状态后 wrapper 被 TerminateJobObject 收尾是
+        正常路径，按其 returncode 反推会把成功命令误报成失败，还把「进程已退出、
+        句柄回收」误报成「runner 不允许嵌套 Job」。
+        """
         owned = self._new_command(_safe_name(cmd))
         try:
             child_env = dict(os.environ if env is None else env)
             child_env.setdefault("PYTHONIOENCODING", "utf-8")
-            self._start_wrapper(owned, cmd, env=child_env, cwd=cwd)
+            self._spawn_wrapper(owned, cmd, env=child_env, cwd=cwd)
             if _IS_WINDOWS:
-                self._assign_to_job(owned, owned.proc)  # type: ignore[arg-type]
+                proc = owned.proc
+                if proc is None or proc.poll() is not None:
+                    # 尚未放行，退出只可能是 wrapper 自身启动失败
+                    code = proc.returncode if proc is not None else None
+                    raise SmokeCommandError(
+                        f"包装进程提前退出（{code}），命令未执行: {owned.name}"
+                    )
+                self._assign_to_job(owned, proc)
         except Exception:
             self._cleanup(owned, grace_seconds=0.0)
             raise
+        self._release(owned)
         status = self._wait_status(owned, timeout=timeout)
-        exit_code = self._cleanup(owned, grace_seconds=0.0)
+        self._cleanup(owned, grace_seconds=0.0)
         if status["kind"] == "error":
             raise SmokeCommandError(
                 f"命令包装层失败: {status['error_type']}: {status['message']}"
@@ -265,8 +297,6 @@ class SmokeCommands:
             raise SmokeCommandError(
                 f"命令失败({status['returncode']}): {' '.join(cmd)}\n{tail}"
             )
-        if exit_code not in (0, None) and owned.proc is not None and owned.proc.returncode != 0:
-            raise SmokeCommandError(f"包装进程退出码异常({owned.proc.returncode}): {' '.join(cmd)}")
         return self._log_tail(owned, limit=None)
 
     def start_app(self, cmd: list[str], *, env: dict[str, str], cwd: Path) -> _OwnedCommand:
@@ -275,12 +305,19 @@ class SmokeCommands:
         try:
             child_env = dict(env)
             child_env.setdefault("PYTHONIOENCODING", "utf-8")
-            self._start_wrapper(owned, cmd, env=child_env, cwd=cwd)
+            self._spawn_wrapper(owned, cmd, env=child_env, cwd=cwd)
             if _IS_WINDOWS:
-                self._assign_to_job(owned, owned.proc)  # type: ignore[arg-type]
+                proc = owned.proc
+                if proc is None or proc.poll() is not None:
+                    code = proc.returncode if proc is not None else None
+                    raise SmokeCommandError(
+                        f"包装进程提前退出（{code}），命令未执行: {owned.name}"
+                    )
+                self._assign_to_job(owned, proc)
         except Exception:
             self._cleanup(owned, grace_seconds=0.0)
             raise
+        self._release(owned)
         return owned
 
     def close_all(self, timeout: float = 10.0) -> None:
@@ -340,6 +377,15 @@ class SmokeCommands:
             return None
         try:
             if _IS_WINDOWS and owned._job_handle is not None:
+                if owned.status_path.exists():
+                    # 已发布完成状态：实际命令已结束，先等 wrapper 自然退出，
+                    # 不立即 TerminateJobObject（会把它连同状态一起粗暴收尾）
+                    try:
+                        owned.proc.wait(timeout=_WRAPPER_EXIT_GRACE)
+                        owned.reaped = True
+                        return owned.proc.returncode
+                    except subprocess.TimeoutExpired:
+                        pass
                 _terminate_job(owned._job_handle, grace_seconds=grace_seconds)
             elif not _IS_WINDOWS:
                 # 组信号在回收**之前**发：wrapper 自己先退出不代表组里没有后代
@@ -390,6 +436,10 @@ if _IS_WINDOWS:
     _kernel32.TerminateJobObject.restype = _BOOL
     _kernel32.QueryInformationJobObject.argtypes = (_HANDLE, _DWORD, _LPVOID, _DWORD, _LPVOID)
     _kernel32.QueryInformationJobObject.restype = _BOOL
+    _kernel32.IsProcessInJob.argtypes = (_HANDLE, _HANDLE, ctypes.POINTER(_BOOL))
+    _kernel32.IsProcessInJob.restype = _BOOL
+    _kernel32.OpenProcess.argtypes = (_DWORD, _BOOL, _DWORD)
+    _kernel32.OpenProcess.restype = _HANDLE
     _kernel32.CloseHandle.argtypes = (_HANDLE,)
     _kernel32.CloseHandle.restype = _BOOL
 
@@ -459,6 +509,25 @@ def _create_kill_on_close_job() -> Any:
 def _assign_process_to_job(job: Any, process_handle: int) -> bool:
     """把（Popen 持有的）进程句柄指进 Job；返回内核原始布尔。"""
     return bool(_kernel32.AssignProcessToJobObject(_HANDLE(job), _HANDLE(process_handle)))
+
+
+def _process_in_job(job: Any, pid: int) -> bool:
+    """按 PID 查询进程是否在指定 Job 内（测试断言真实归属用）。
+
+    句柄取不到（进程已退出/权限不足）返回 False：测试侧把它当作「不在 Job 内」
+    的保守结论，不伪造归属证据。只读查询，不改变进程或 Job 状态。
+    """
+    if not _IS_WINDOWS or not job:
+        return False
+    handle = _kernel32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+    if not handle:
+        return False
+    try:
+        in_job = _BOOL()
+        ok = _kernel32.IsProcessInJob(handle, _HANDLE(job), ctypes.byref(in_job))
+        return bool(ok and in_job.value)
+    finally:
+        _close_handle(handle)
 
 
 def _active_processes(job: Any) -> int | None:
