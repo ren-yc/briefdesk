@@ -374,19 +374,36 @@ class Client:
 
     # ---- list_all_sessions ----------------------------------------------
 
-    async def list_all_sessions(self) -> list[gen.SessionNative]:
+    async def list_all_sessions(
+        self,
+        *,
+        page_size: int | None = None,
+        keyword: str | None = None,
+    ) -> list[gen.SessionNative]:
         """Fetch the complete session list via offset paging.
 
         The list is a live view; duplicates across pages are collapsed with a
         warning (losing data silently is the failure mode this loop must not
         have).
+
+        ``page_size`` is the server-side page size (the server caps it at
+        10000). Leave it ``None`` for the server default; a polling consumer
+        that re-reads the list every cycle should ask for the maximum instead,
+        because the request count is ``sessions / page_size`` and the server's
+        default page is two orders of magnitude smaller than the cap.
+        ``keyword`` filters server-side, so pagination walks the filtered list.
         """
         out: list[gen.SessionNative] = []
         seen: set[str] = set()
         offset = 0
         while True:
+            query: dict[str, str] = {"offset": str(offset)}
+            if page_size is not None:
+                query["limit"] = str(page_size)
+            if keyword is not None:
+                query["keyword"] = keyword
             page = gen.SessionsNative.model_validate(
-                await self._get_json("/api/v1/sessions", {"offset": str(offset)})
+                await self._get_json("/api/v1/sessions", query)
             )
             count = len(page.sessions)
             for session in page.sessions:
