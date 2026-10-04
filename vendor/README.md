@@ -41,6 +41,14 @@ powershell -File scripts/sync_vendor.ps1
   qqflow `sdk-dist`（`b6f1f06`，源自 qqflow-server master `c840db5`）。上游生成管线新增确定性
   规范化（逐行去行尾空白、折叠结尾空行、保证单个结尾换行），镜像随之更新；此次同步后
   vendor 内不再有条目级空白问题，范围级空白门禁对镜像部分归零。
+- SDK 0.8.0 公共面扩展同步：weflow `sdk-dist`（`682fee7`，源自 weflow-server master `9d26033`）、
+  qqflow `sdk-dist`（`4ca7666`，源自 qqflow-server master `dbd090f`）。上游改动：**新增七项公共面**
+  （`health` / `accounts` / `register`（非阻塞，原始 `state`/`status`）/ `wait_ready` /
+  `list_messages`（原生消息面，含 `offset` 翻页与 `media=1`）/ `contacts` / `media_bytes_by_id`）、
+  **删除 `search`**（`list_messages` 是其严格超集）、`ensure_ready` 对 200 拒绝态**立即失败**
+  （Rust 侧新增 `ClientError::Refused`，Python 侧维持 `StatusError`）、时间界校验放宽为
+  「`YYYYMMDD` 或 unix 秒」。同步经 `scripts/sync_vendor.ps1` 完成，本行两个 commit 取自
+  merge 提交的第二父。
 - 行为层修复与包内许可证同步：weflow `sdk-dist`（`8456773`，源自 weflow-server master `c8c7392`）、
   qqflow `sdk-dist`（`d6d7550`，源自 qqflow-server master `58856b9`）。上游改动：`watch` 的退避只在
   干净结束时复位、1 MiB 上限同时约束单个完整帧与未成帧累计、一帧多条 `data:` 行按规范以 LF 拼接、
