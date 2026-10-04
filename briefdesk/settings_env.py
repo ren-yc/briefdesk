@@ -23,6 +23,7 @@ Support/briefdesk/`，Linux `~/.config/briefdesk/`），也可经环境变量
 
 import logging
 import os
+from collections.abc import Mapping
 from io import StringIO
 from pathlib import Path
 
@@ -88,7 +89,7 @@ def _env_value(alias: str) -> str | None:
     return None
 
 
-def _lookup_value(values: dict[str, str | None], alias: str) -> str | None:
+def _lookup_value(values: Mapping[str, str | None], alias: str) -> str | None:
     """大小写不敏感查表（与 pydantic-settings 的默认口径一致）。"""
     target = alias.upper()
     for key, value in values.items():
@@ -154,6 +155,39 @@ def source_of(alias: str, layers: list[tuple[str, Path]] | None = None) -> str:
     return composed_value(alias, layers=layers)[1]
 
 
+def resolve_alias_layers(
+    alias: str,
+    *,
+    staged_override: dict[str, str] | None = None,
+    layers: list[tuple[str, Path]] | None = None,
+) -> list[tuple[str, str]]:
+    """按共享层序返回**每一层**为该键提供的原始值（高→低）。
+
+    胜出值判定与逐层可用性判定必须共用本函数：名单键是否可用要看每一层——
+    高层合法、低层坏 JSON 时真实 Settings() 构造会在低层解码失败，只看胜出值
+    会放行「保存成功、下次启动失败」的配置。文件层取值经与 composed_value 同一
+    dotenv 解析（含 ${VAR} 插值）：整值草稿落盘的是未展开原文，解析后可能是
+    合法数组，用未插值的原始行文本判 JSON 会把它误判成坏值。
+
+    env 命中也作为最高一层参与；`staged_override` 存在时替换 override 层的取值
+    （调用方传入「写入之后的暂存态」，文件不再参与该层）。层遍历中某文件层读盘
+    遇 OSError/编码错误时按「该层未提供该键」处理（与 _file_value 同口径）：
+    GET 降级展示、写入路径由 StagedReadError 显式拦截，各自入口负责。
+    """
+    resolved: list[tuple[str, str]] = []
+    env_value = _env_value(alias)
+    if env_value is not None:
+        resolved.append((SOURCE_ENV, env_value))
+    for name, file in dotenv_layers() if layers is None else layers:
+        if name == SOURCE_OVERRIDE and staged_override is not None:
+            value = _lookup_value(staged_override, alias)
+        else:
+            value = _file_value(file, alias)
+        if value is not None:
+            resolved.append((name, value))
+    return resolved
+
+
 def composed_value(
     alias: str,
     *,
@@ -163,19 +197,16 @@ def composed_value(
     """按共享层序返回该键**下次启动**生效的原始值与来源。
 
     `staged_override` 传入「写入之后的暂存态」时，暂存层按它取值而不是读磁盘——
-    PUT 的组合校验要在落盘前判断下次启动的组合是否自洽。
+    PUT 的组合校验要在落盘前判断下次启动的组合是否自洽。胜出值即
+    resolve_alias_layers 结果中的最高层。
     """
-    env_value = _env_value(alias)
-    if env_value is not None:
-        return env_value, SOURCE_ENV
-    for name, file in dotenv_layers() if layers is None else layers:
-        if name == SOURCE_OVERRIDE and staged_override is not None:
-            value = staged_override.get(alias)
-        else:
-            value = _file_value(file, alias)
-        if value is not None:
-            return value, name
-    return None, SOURCE_DEFAULT
+    resolved = resolve_alias_layers(
+        alias, staged_override=staged_override, layers=layers
+    )
+    if not resolved:
+        return None, SOURCE_DEFAULT
+    source, value = resolved[0]
+    return value, source
 
 
 # ── 启动快照（source 与 current 同时点）──
@@ -236,6 +267,20 @@ class StagedReadError(RuntimeError):
     读取失败被当成空 dict 时，下一次写入会把整个暂存态抹掉——那不是「恢复默认」，
     是静默数据丢失。展示路径（GET）可以降级为空并提示，写入路径必须显式失败。
     """
+
+
+class StagedCommitError(OSError):
+    """暂存文件的写入/替换/删除失败：显式失败，不得谎报「保存成功」。
+
+    删除失败被吞成 ok:true 是静默丢写入（文件仍在磁盘、内容原样）；写/替换失败
+    若不接错误面，OSError 会穿出路由变成无 detail 的 500。继承 OSError 以兼容
+    既有「写入失败抛 OSError」的调用方契约。stage 指出失败阶段（write/replace/
+    delete），供路由映射结构化明细；「文件本就不存在」不算失败（删除幂等）。
+    """
+
+    def __init__(self, stage: str, message: str) -> None:
+        super().__init__(message)
+        self.stage = stage
 
 
 def read_staged_strict() -> dict[str, str]:
@@ -312,23 +357,38 @@ def commit_staged_write(candidate: bytes | None) -> None:
     """提交 prepare 产出的候选 bytes（或删除文件）；失败时原文件保持不变。
 
     只写已校验的字节，不重新读取/合并/序列化——预检与落盘必须是同一份内容。
+    失败显式抛 StagedCommitError（按阶段）：删除失败被吞成成功是静默丢写入，
+    读路径已有 StagedReadError 拦截、写路径不能自成例外。
     """
     path = get_settings_file()
     if candidate is None:
         try:
             path.unlink(missing_ok=True)
-        except OSError:
-            logger.debug("暂存文件删除失败: %s", path, exc_info=True)
+        except FileNotFoundError:
+            # missing_ok 已覆盖「不存在」；这里再显式接一层以表明删除幂等语义
+            return
+        except OSError as error:
+            raise StagedCommitError(
+                "delete", f"暂存文件删除失败: {path}（{error}）"
+            ) from error
         return
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
     try:
         tmp.write_bytes(candidate)
+    except OSError as error:
+        tmp.unlink(missing_ok=True)
+        raise StagedCommitError(
+            "write", f"暂存状态写入失败: {path}（{error}）"
+        ) from error
+    try:
         os.replace(tmp, path)
-    except OSError:
+    except OSError as error:
         # 写入/替换失败时清理残留 .tmp（原文件未被 os.replace 触碰，保持不变）
         tmp.unlink(missing_ok=True)
-        raise
+        raise StagedCommitError(
+            "replace", f"暂存状态替换失败: {path}（{error}）"
+        ) from error
 
 
 def write_staged(updates: dict[str, str | None]) -> None:

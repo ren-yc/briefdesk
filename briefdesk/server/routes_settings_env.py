@@ -14,6 +14,7 @@
 
 import asyncio
 import json
+import logging
 from typing import Any
 
 from fastapi import APIRouter, HTTPException
@@ -41,13 +42,15 @@ from briefdesk.server.web_plugins import (
 from briefdesk.settings_env import (
     SOURCE_DOTENV,
     SOURCE_ENV,
+    StagedCommitError,
     StagedReadError,
     commit_staged_write,
-    composed_value,
     get_settings_file,
     prepare_staged_write,
     read_staged,
     read_staged_from_bytes,
+    read_staged_strict,
+    resolve_alias_layers,
     source_of,
     startup_source,
 )
@@ -58,6 +61,8 @@ from briefdesk.settings_schema import (
 )
 
 router = APIRouter()
+
+logger = logging.getLogger(__name__)
 
 # 单进程写锁 + 原子写：并发 PUT 串行化
 _write_lock = asyncio.Lock()
@@ -280,14 +285,30 @@ def _resolve_plugin_list(key: str, staged_override: dict[str, str] | None = None
     返回 None 表示所有层都未提供（真实默认 []）；解析失败/元素非字符串抛
     _PluginsUnresolvable——不回落 config.plugins、不过滤坏元素。空串是「已提供
     的坏值」（数组字段会解码失败），按不可用处理，不等同未设置。
+
+    逐层解码判可用性、胜出值判类型，两者与真实构造语义一一对应：任一层提供了
+    该键但 JSON 解码失败即不可用（真实 Settings() 会在那一层解码失败，只看胜出
+    值会放行「保存成功、下次启动失败」的配置）；元素类型只对胜出值判——低层
+    合法 JSON 但被高层覆盖的错类型（如 [17]）按 pydantic 合并语义是可启动的。
+    层序与胜出值共用 resolve_alias_layers 一份定义（来源展示取自同一结果）。
     """
-    raw, _source = composed_value(key, staged_override=staged_override)
-    if raw is None:
+    layers = resolve_alias_layers(key, staged_override=staged_override)
+    if not layers:
         return None
+    winning_source, raw = layers[0]
     try:
         parsed = json.loads(raw)
     except json.JSONDecodeError as exc:
-        raise _PluginsUnresolvable(key, f"{key} 不是合法 JSON（{exc.msg}）") from exc
+        raise _PluginsUnresolvable(
+            key, f"{key} 不是合法 JSON（{exc.msg}，来源 {winning_source}）"
+        ) from exc
+    for source, value in layers[1:]:
+        try:
+            json.loads(value)
+        except json.JSONDecodeError as exc:
+            raise _PluginsUnresolvable(
+                key, f"{key} 不是合法 JSON（{exc.msg}，来源 {source}）"
+            ) from exc
     if not isinstance(parsed, list) or not all(isinstance(n, str) for n in parsed):
         raise _PluginsUnresolvable(key, f"{key} 须为 JSON 字符串数组")
     return parsed
@@ -401,18 +422,20 @@ def _plugin_toggle_data(staged: dict[str, str]) -> tuple[list[dict[str, Any]], s
 
 
 def _plugins_source() -> str:
-    """PLUGINS 的运行来源：启动快照优先，未捕获时退回实时判定（测试场景）。
+    """PLUGINS 的运行来源：返回**真正压住该键的那一层**。
 
     显示与开关禁用判据必须是同一个答案：enabled 按实时层序合成（_desired_plugins），
-    这里若只看启动快照，运行中改过 .env 后「开关是否可编辑」与「enabled 是什么」
-    会各说各话。实时层序被 env/项目 .env 占据时，暂存层的开关草稿重启不生效，
-    与启动快照的结论必须一致才不误导。
+    开关可编辑性必须与它一致。方向不能写反：启动快照回落 default 是「无快照」的
+    占位值（真值字符串）——运行中往项目 .env 新增 PLUGINS 时若先取启动侧，实时
+    的 dotenv 永远被 default 挡住，开关显示可编辑、草稿重启却不生效。
     """
     startup = startup_source("PLUGINS")
     realtime = source_of("PLUGINS")
-    # 任一侧显示被更高层压住，开关就不可编辑：两边都指向同一层才一致。
-    if startup in (SOURCE_ENV, SOURCE_DOTENV) or realtime in (SOURCE_ENV, SOURCE_DOTENV):
-        return startup or realtime
+    # 优先取「压住它的层」（实时侧在前：草稿的生效与否由当前文件状态决定）；
+    # 两侧都没被压住时才是运行值/快照/默认。
+    for value in (realtime, startup):
+        if value in (SOURCE_ENV, SOURCE_DOTENV):
+            return value
     return realtime or startup or "default"
 
 
@@ -464,15 +487,17 @@ async def api_settings_env():
             }
         )
     plugins_data, plugins_expected_error = _plugin_toggle_data(staged)
+    # 来源判定一次求值后复用：函数内读盘（source_of 走文件层），两次独立调用在
+    # 文件刚好被外部改动的间隙会给出互相矛盾的来源与覆盖态。
+    plugins_source = _plugins_source()
     return {
         "filePath": str(get_settings_file()),
         "items": items,
         "pluginOptions": plugin_names,
         "plugins": plugins_data,
-        # PLUGINS 的来源取启动快照（与「本进程开关是否生效」同一时点）；被 env 或
-        # 项目 .env 压住时前端禁用开关。
-        "pluginsSource": _plugins_source(),
-        "pluginsOverridden": _plugins_source() in (SOURCE_ENV, SOURCE_DOTENV),
+        # PLUGINS 的来源 = 真正压住该键的那一层（env/dotenv 时前端禁用开关）。
+        "pluginsSource": plugins_source,
+        "pluginsOverridden": plugins_source in (SOURCE_ENV, SOURCE_DOTENV),
         # 预期名单不可用（坏 JSON/非字符串数组）时显式说明：开关与启停展示不能
         # 把未知当「全关」，也不能假装一切正常。
         "pluginsExpectedError": plugins_expected_error or "",
@@ -540,10 +565,38 @@ async def api_settings_env_put(payload: EnvPutPayload):
             issues += _required_plugin_issues(_candidate_staged)
             if issues:
                 raise HTTPException(status_code=409, detail={"issues": _dedupe_issues(issues)})
-        commit_staged_write(candidate)
-    # 写后重读暂存，回传受影响键的最终态：前端据此做行级贴片，不必整面
-    # 重拉（整面重载会丢其它行的未暂存编辑与「插件」面板的开关草稿）
-    staged_now = read_staged()
+        try:
+            commit_staged_write(candidate)
+        except StagedCommitError as exc:
+            # 写入/替换/删除失败必须显式失败：静默 ok:true 是丢写入。不用 409——
+            # 那是「客户端可调整后重试」的语义，OS 层失败改多少次都一样；也不回显
+            # 暂存值（可能含敏感内容）。日志脱敏：只记阶段与异常类别。
+            logger.error(
+                "暂存提交失败（%s）: %s", exc.stage, type(exc).__name__
+            )
+            raise HTTPException(
+                500,
+                {
+                    "type": "staged_commit_failed",
+                    "stage": exc.stage,
+                    "message": f"暂存状态提交失败（{exc.stage}），请稍后重试",
+                },
+            ) from exc
+    # 写后重读暂存（严格口径：吞 OSError 的展示读取会把「已写入但读不出」变成
+    # ok:true + 空状态，比报错更坏），回传受影响键的最终态：前端据此做行级贴片，
+    # 不必整面重拉（整面重载会丢其它行的未暂存编辑与「插件」面板的开关草稿）。
+    # 重读失败时写入已发生：明确「已写入、状态未知」，不得谎报未保存。
+    try:
+        staged_now = read_staged_strict()
+    except StagedReadError as exc:
+        logger.error("暂存写入后重读失败: %s", type(exc).__name__)
+        raise HTTPException(
+            500,
+            {
+                "type": "staged_state_unknown",
+                "message": "配置已写入，但当前状态未知（读取失败），请刷新确认",
+            },
+        ) from exc
     return {
         "ok": True,
         "filePath": str(get_settings_file()),
