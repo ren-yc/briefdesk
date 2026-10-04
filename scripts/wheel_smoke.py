@@ -32,6 +32,7 @@ import tomllib
 import urllib.error
 import urllib.request
 import zipfile
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -108,6 +109,14 @@ INSTALLED_GUARD = (
 #: 留下的 briefdesk.egg-info 会被 importlib.metadata 当成同名分发包，把发布版本读成仓库的静态
 #: 版本号（实测把 0.1.0.dev1 读成 0.1.0），断言结果于是随构建残留漂移。
 VERSION_PROBE = INSTALLED_GUARD + "import importlib.metadata as m; print(m.version('briefdesk'))"
+
+#: 真实默认缓存目录探针：只导入 briefdesk.paths（纯路径计算，不建目录）。
+#: 不得触碰 supervisor/config——那会连带构造 Settings、访问真实钥匙串与 .env，
+#: 探针本身就成了它要防的泄漏源。形态守卫见 tests/test_wheel_smoke_lifecycle.py
+#: （文本守卫：钉住「只 import paths」这一形态，行为由冒烟主链路覆盖）。
+RUNTIME_DIR_PROBE = (
+    INSTALLED_GUARD + "import briefdesk.paths as _p; print(_p.benchmark_runs_dir())"
+)
 
 
 def run(
@@ -606,7 +615,14 @@ def assert_writes(base: str, port: int, python: Path, env: dict[str, str], data_
     log(f"写入步骤 5/5 通过：基准运行目录 {run_dir.name}（终态已按 run_id 核对）")
 
 
-def wait_benchmark_terminal(base: str, run_id: str, runs_root: Path, *, timeout: float) -> Path:
+def wait_benchmark_terminal(
+    base: str,
+    run_id: str,
+    runs_root: Path,
+    *,
+    timeout: float,
+    fetcher: Callable[..., tuple[int, str]] | None = None,
+) -> Path:
     """按 run_id 轮询到运行终态；协议错误立即失败，临时故障在期限内重试。
 
     判据（与 supervisor 的三态契约同源）：meta.json 存在、meta.run_id 一致、
@@ -614,10 +630,15 @@ def wait_benchmark_terminal(base: str, run_id: str, runs_root: Path, *, timeout:
     实际整数（bool/None 不算）。exit_code 允许非零——本步骤验证的是「失败也能
     收尾」，不要求业务成功。meta 由 supervisor 在 spawn 前先写、终态后补写，
     中间态（缺文件/半写 JSON）按期限重试；只有期限耗尽才失败。
+
+    fetcher 缺省为 http（生产形态不变）；注入是为了让终态状态机的协议分支
+    在 pytest 内可判定（回归见 tests/test_wheel_smoke_lifecycle.py）——真跑
+    仍由 CI 的 wheel-smoke 覆盖，两者不可互替。
     """
+    fetch = fetcher if fetcher is not None else http
     deadline = time.monotonic() + timeout
     while True:
-        status, body = http(f"{base}/api/benchmark/run", timeout=5)
+        status, body = fetch(f"{base}/api/benchmark/run", timeout=5)
         if status == 200:
             try:
                 state = json.loads(body)
@@ -805,16 +826,11 @@ def main() -> int:
         base = f"http://127.0.0.1:{port}"
         env = app_env(data_dir=data_dir, cache_dir=cache_dir, settings_file=settings_file, port=port)
         # 真实用户缓存目录：不注入 BRIEFDESK_* 时应用会去那里——冒烟全程必须不碰它。
-        # 探针只导入 briefdesk.paths（纯路径计算）：导入 supervisor 会连带构造 config、
-        # 访问真实钥匙串与真实 .env。
+        # 探针形态见 RUNTIME_DIR_PROBE（只导入 briefdesk.paths，纯路径计算）。
         probe_env = {key: value for key, value in os.environ.items() if key in ENV_ALLOWLIST}
         real_runs_root = Path(
             run(
-                [
-                    str(python), "-c",
-                    INSTALLED_GUARD
-                    + "import briefdesk.paths as _p; print(_p.benchmark_runs_dir())",
-                ],
+                [str(python), "-c", RUNTIME_DIR_PROBE],
                 env=probe_env,
                 timeout=120,
                 cwd=tmp,
@@ -849,7 +865,7 @@ def main() -> int:
         primary_error = error
     except SmokeCommandError as error:
         primary_error = SmokeFailure(f"命令管理失败: {error}")
-    except BaseException as error:  # noqa: BLE001 — 意外异常与中断按原类型继续传播
+    except BaseException as error:  # 意外异常与中断按原类型继续传播
         # 脚本自身的 bug（ValueError/AttributeError/KeyError…）和 Ctrl-C 恰恰最
         # 需要现场的场合：置传播标记后原样 re-raise 保留 traceback 语义，现场路径
         # 在 finally 里、传播前打印。旧白名单只接三类异常并转写返回 1，其余类型
