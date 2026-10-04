@@ -41,6 +41,10 @@ powershell -File scripts/sync_vendor.ps1
   qqflow `sdk-dist`（`b6f1f06`，源自 qqflow-server master `c840db5`）。上游生成管线新增确定性
   规范化（逐行去行尾空白、折叠结尾空行、保证单个结尾换行），镜像随之更新；此次同步后
   vendor 内不再有条目级空白问题，范围级空白门禁对镜像部分归零。
+- 顶层包类型标记同步：weflow `sdk-dist`（`c7d9b3a`，源自 weflow-server master `8b5c009`）、
+  qqflow `sdk-dist`（`81ad924`，源自 qqflow-server master `10991a1`）。上游给顶层手写包补了
+  `py.typed`（此前只有生成层内部有）：缺它时消费方 mypy 报 `import-untyped`、SDK 的注解
+  全部失效——本仓引入 SDK 后正是这样被拦下的。
 - `list_all_sessions` 页大小参数同步：weflow `sdk-dist`（`5345d6d`，源自 weflow-server master
   `12d68f2`）、qqflow `sdk-dist`（`819690b`，源自 qqflow-server master `cdf7418`）。上游改动：
   该方法新增 `page_size`（服务端上限 10000 条/页）与 `keyword`，供**每轮都重读列表**的轮询
