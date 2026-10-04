@@ -21,6 +21,7 @@ from unittest.mock import AsyncMock, Mock, patch
 
 import httpx
 import pytest
+import qqflow_sdk
 
 from briefdesk.config import config
 from briefdesk.plugins.qqflow.client import (
@@ -84,18 +85,24 @@ class TestQqFlowFetchSessionsLimit:
     """
 
     async def test_fetch_sessions_pages_with_max_page_size(self):
-        client = QqFlowClient("http://127.0.0.1:5032", "tok")
-        captured: dict = {}
+        """断言落在真实请求上：首页带 limit=10000 与 offset=0。
 
-        async def fake_get(path, *, params=None, not_found_ok=False):
-            captured["path"] = path
-            captured["params"] = params
-            return {"sessions": []}
+        翻页与终止条件由 SDK 负责（该面没有 hasMore，以空页终止），因此这里
+        只钉「请求形状」——它正是「被上游默认 100 截断」那个坑的入口。
+        """
+        seen: list[httpx.Request] = []
 
-        client._get = fake_get  # type: ignore[method-assign]
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen.append(request)
+            return httpx.Response(
+                200, json={"success": True, "count": 0, "sessions": []}
+            )
+
+        client = TestRegisterConflictHttp._client_with(handler)
         await client.fetch_sessions()
-        assert captured["path"] == "/api/v1/sessions"
-        assert captured["params"] == {"limit": 10000, "offset": 0}
+        assert str(seen[0].url).split("?")[0].endswith("/api/v1/sessions")
+        assert seen[0].url.params["limit"] == "10000"
+        assert seen[0].url.params["offset"] == "0"
 
 
 class SseReadTimeoutTest(unittest.TestCase):
@@ -435,13 +442,20 @@ class TestRegisterConflictHttp:
 
     @staticmethod
     def _client_with(handler) -> QqFlowClient:
+        """把插件的 vendor SDK 客户端接到 MockTransport 上。
+
+        HTTP 现在由 SDK 承载（插件不再自持 REST 客户端），注入点是 SDK 内部的
+        httpx 客户端——那正是发出真实请求的一层；断言因此落在真实请求形状上。
+        """
         client = QqFlowClient(
             "http://127.0.0.1:5032", "tok", qq="123", key="k" * 16
         )
-        client._client = httpx.AsyncClient(
+        sdk = qqflow_sdk.Client("http://127.0.0.1:5032", "tok", timeout=30.0)
+        sdk._http = httpx.AsyncClient(
             base_url="http://127.0.0.1:5032",
             transport=httpx.MockTransport(handler),
         )
+        client._sdk = sdk
         return client
 
     async def test_register_conflict_raises_with_occupied_by(self):

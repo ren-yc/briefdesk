@@ -13,10 +13,12 @@
 import asyncio
 import logging
 import time as time_module
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Any, Literal, TypedDict, cast
 
 import httpx
+import qqflow_sdk
+from qqflow_sdk import Client as QqFlowSdkClient
 
 from briefdesk.logger import fmt_dur
 from briefdesk.masking import clean_display_name
@@ -173,7 +175,13 @@ class QqFlowClient(SourceClient):
         if sse_read_timeout_ms is None:
             sse_read_timeout_ms = QqFlowSettings().sse_read_timeout_ms
         self._sse_read_timeout_s = sse_read_timeout_ms / 1000
-        self._client: httpx.AsyncClient | None = None
+        # 运行期消费 vendor SDK（随包分发的镜像，见 vendor/README.md）：
+        # REST / 分页 / 媒体 / 错误分类都由 SDK 负责，插件只保留业务逻辑
+        # （身份闸门、去重、归一化）。**SSE 是个例外**：SDK 的 watch() 自带
+        # 重连循环，没有「每次建连成功」的接缝，而本插件的身份闸门要求每次
+        # 建连强制重检（POLL_INTERVAL_SECONDS=0 时那是唯一一道闸门）——
+        # 换掉它只会弱化安全属性，因此 SSE 仍由本类自持。
+        self._sdk: QqFlowSdkClient | None = None
         # 共享就绪门控：状态机本体（健康分诊/身份闸门/注册分诊）在
         # _sdk_base.ReadinessGate；HTTP 细节以属性名注入（调用时解析，
         # 测试的实例级打桩可见）。
@@ -203,80 +211,57 @@ class QqFlowClient(SourceClient):
 
     # ── 内部 ──
 
-    def _get_client(self) -> httpx.AsyncClient:
-        """获取共享的 httpx 客户端（懒初始化）。"""
-        if self._client is None:
-            self._client = httpx.AsyncClient(
-                base_url=self._base_url,
-                timeout=httpx.Timeout(30.0),
-            )
-        return self._client
+    def _api(self) -> QqFlowSdkClient:
+        """共享的 vendor SDK 客户端（懒初始化）。"""
+        if self._sdk is None:
+            self._sdk = QqFlowSdkClient(self._base_url, self._api_token, timeout=30.0)
+        return self._sdk
 
     def _auth_headers(self) -> dict[str, str]:
         return {"Authorization": f"Bearer {self._api_token}"}
 
-    async def _get(
+    async def _sdk_call(
         self,
-        path: str,
+        fn: Callable[[], Awaitable[Any]],
         *,
-        params: dict[str, Any] | None = None,
+        what: str,
         not_found_ok: bool = False,
     ) -> Any:
-        """通用 GET 请求，带错误处理。
+        """调 SDK，并把它抛出的错误翻译回本插件既有的分类。
 
-        Args:
-            path: API 路径，如 "/api/v1/sessions"
-            params: 查询参数
-            not_found_ok: 为 True 时，404 返回 None（由调用方降级处理）
+        SDK 的错误面是 (status, url)，插件的调用方（poller/runtime）按
+        「503 = 瞬态、静默跳过本轮」与「其余 = 错误」两档处理：503 → 复位
+        共享门控 + QqFlowNotReadyError；404 且 not_found_ok → None；其余
+        非成功状态 → RuntimeError。
 
-        Returns:
-            JSON 响应；not_found_ok 且上游返回 404 时为 None
-
-        Raises:
-            QqFlowNotReadyError: 服务端正在建索引（503 就绪门控，瞬态）
-            RuntimeError: 其他非成功状态
+        ``with_connect_retry`` 仍包一层：连接级重试是三源共享的 briefdesk
+        策略，不属于 SDK 的协议语义。
         """
-        client = self._get_client()
         start = time_module.perf_counter()
-        resp = await with_connect_retry(
-            lambda: client.get(path, params=params, headers=self._auth_headers())
-        )
-        logger.debug(
-            "GET %s%s → %s (%s)",
-            path,
-            f"?{resp.url.query.decode()}" if resp.url.query else "",
-            resp.status_code,
-            fmt_dur(time_module.perf_counter() - start),
-        )
-        # 先判状态码再解析 JSON：503 信封是合法 JSON，但需走瞬态语义
-        if resp.status_code == 503:
-            # 就绪门控（瞬态）：失效记忆化标志——服务端重启（内存态注册表丢失）
-            # 后，下一轮 ensure_ready 会重新健康检查 + 引导注册（自愈）
-            logger.debug("GET %s → 503（服务端索引期，瞬态）", path)
-            # 503 自愈：复位共享门控的记忆化标志（下轮重检）
-            self._gate.reset()
-            raise QqFlowNotReadyError(
-                f"qqflow-server 尚未就绪（503）: {resp.text[:200]}"
-            )
-        if not resp.is_success:
-            if not_found_ok and resp.status_code == 404:
+        try:
+            result = await with_connect_retry(fn)
+        except qqflow_sdk.StatusError as exc:
+            if exc.status == 503:
+                # 就绪门控（瞬态）：复位共享门控的记忆化标志（下轮重检）。
+                logger.debug("%s → 503（服务端索引期，瞬态）", what)
+                self._gate.reset()
+                raise QqFlowNotReadyError(
+                    f"qqflow-server 尚未就绪（503）: {exc}"
+                ) from exc
+            if not_found_ok and exc.status == 404:
                 return None
-            raise RuntimeError(
-                f"QqFlow API error: {resp.status_code} on {path} — {resp.text[:200]}"
-            )
-        return resp.json()
+            raise RuntimeError(f"QqFlow API error: {exc.status} on {what}") from exc
+        logger.debug(
+            "%s → ok (%s)", what, fmt_dur(time_module.perf_counter() - start)
+        )
+        return result
 
     # ── 账号引导 ──
 
     async def fetch_health(self) -> dict[str, Any]:
         """健康检查（免鉴权）。"""
-        client = self._get_client()
-        resp = await with_connect_retry(lambda: client.get("/health"))
-        if not resp.is_success:
-            raise RuntimeError(
-                f"QqFlow API error: {resp.status_code} on /health — {resp.text[:200]}"
-            )
-        return resp.json()
+        health = await self._sdk_call(self._api().health, what="/health")
+        return health.model_dump(by_alias=True)
 
     async def register_account(self, qq: str, key: str, db_path: str) -> str:
         """POST /api/v1/accounts 注册账号，返回 state。
@@ -288,22 +273,13 @@ class QqFlowClient(SourceClient):
         QqFlowAccountMismatchError —— 这里本来就持有整个响应 JSON，能把
         occupied_by 一并带进错误消息；返回值形状保持不变。
         """
-        client = self._get_client()
-        resp = await with_connect_retry(
-            lambda: client.post(
-                "/api/v1/accounts",
-                json={"qq": qq, "key": key, "db_path": db_path},
-                headers=self._auth_headers(),
-            )
+        outcome = await self._sdk_call(
+            lambda: self._api().register({"qq": qq, "key": key, "db_path": db_path}),
+            what="/api/v1/accounts",
         )
-        if not resp.is_success:
-            raise RuntimeError(
-                f"QqFlow API error: {resp.status_code} on /api/v1/accounts — "
-                f"{resp.text[:200]}"
-            )
-        data = resp.json()
-        state = data.get("state", "unknown")
+        state = outcome.state or "unknown"
         if state == "account_conflict":
+            data = outcome.body
             # 上游内存索引没有账号维度，同时只能绑定一个账号；重试不会自愈，
             # 得由人去注销占用方或改配置。
             raise QqFlowAccountMismatchError(
@@ -421,16 +397,12 @@ class QqFlowClient(SourceClient):
         不是本地配置的账号，只能靠这里的 `qq` 字段（见 ensure_ready 的身份闸门）。
         取不到时不阻断，退化为由注册结果判定。
         """
-        client = self._get_client()
-        resp = await with_connect_retry(
-            lambda: client.get("/api/v1/accounts", headers=self._auth_headers())
+        accounts = await self._sdk_call(
+            self._api().accounts, what="/api/v1/accounts"
         )
-        if not resp.is_success:
-            raise RuntimeError(
-                f"QqFlow API error: {resp.status_code} on /api/v1/accounts — "
-                f"{resp.text[:200]}"
-            )
-        return resp.json().get("accounts", [])
+        # 转回 dict：门控与下游（_bound_account / _check_bound_identity /
+        # _log_account_errors）按 .get(...) 取值，且这是插件的既有契约。
+        return [a.model_dump(by_alias=True) for a in accounts]
 
     # ── REST API ──
 
@@ -446,8 +418,22 @@ class QqFlowClient(SourceClient):
         退化成 UID。传大 limit 只是把天花板抬到上游硬上限 10000，仍是猜值；
         翻页才是取尽。
         """
+        async def _page(_path: str, params: dict[str, Any]) -> dict[str, Any]:
+            """一页联系人（SDK 只做单页；翻页策略与「本页无新增」防御留在
+            briefdesk 共享层 fetch_all_pages，三源同规）。"""
+            limit = params.get("limit")
+            offset = params.get("offset")
+            page = await self._sdk_call(
+                lambda: self._api().contacts(
+                    limit=int(limit) if limit is not None else None,
+                    offset=int(offset) if offset is not None else None,
+                ),
+                what="/api/v1/contacts",
+            )
+            return page.model_dump(by_alias=True)
+
         rows = await fetch_all_pages(
-            lambda path, params: self._get(path, params=params),
+            _page,
             "/api/v1/contacts",
             key="contacts",
             dedup_key="username",
@@ -477,14 +463,13 @@ class QqFlowClient(SourceClient):
         请求即取尽（与旧「显式大 limit」实现请求数相同）；旧上游若忽略
         offset，共享「本页无新增」防御立即告警终止，停在 10000 条——零回退。
         """
-        return await fetch_all_pages(
-            lambda path, params: self._get(path, params=params),
-            "/api/v1/sessions",
-            key="sessions",
-            dedup_key="username",
-            page_size=10000,
-            upstream_version=self._logged_version,
+        # 翻页与跨页重复折叠都由 SDK 负责（list_all_sessions 取尽到空页）；
+        # page_size=10000 = 上游 limit 硬上限，典型规模一个请求取尽。
+        sessions = await self._sdk_call(
+            lambda: self._api().list_all_sessions(page_size=10000),
+            what="/api/v1/sessions",
         )
+        return [s.model_dump(by_alias=True) for s in sessions]
 
     async def fetch_messages(
         self,
@@ -511,12 +496,17 @@ class QqFlowClient(SourceClient):
         Returns:
             QqFlowMessagesResponse: 含 messages 与 hasMore，翻页由调用方驱动
         """
-        params: dict[str, Any] = {"talker": talker, "limit": limit, "offset": offset}
-        if start is not None:
-            params["start"] = start
-        data = await self._get(
-            "/api/v1/messages", params=params, not_found_ok=not_found_ok
+        page = await self._sdk_call(
+            lambda: self._api().list_messages(
+                talker,
+                start=str(start) if start is not None else None,
+                limit=limit,
+                offset=offset,
+            ),
+            what="/api/v1/messages",
+            not_found_ok=not_found_ok,
         )
+        data = None if page is None else page.model_dump(by_alias=True)
         if data is None:
             return {
                 "success": True,
@@ -657,35 +647,30 @@ class QqFlowClient(SourceClient):
         Raises:
             MediaError: 网络错误或 qqflow-server 返回非成功状态（cause 保留原异常）
         """
-        client = self._get_client()
         start = time_module.perf_counter()
         try:
-            async with client.stream(
-                "GET", self._build_media_url(path), headers=self._auth_headers()
-            ) as resp:
-                if not resp.is_success:
-                    raise MediaError(
-                        f"QqFlow media error: {resp.status_code} on {path}"
-                    )
-                chunks: list[bytes] = []
-                total = 0
-                async for chunk in resp.aiter_bytes():
-                    total += len(chunk)
-                    if total > _MAX_MEDIA_BYTES:
-                        raise MediaError(f"QqFlow media too large: {path}")
-                    chunks.append(chunk)
-                logger.debug(
-                    "媒体下载完成: %s (%d bytes, %s)",
-                    path,
-                    total,
-                    fmt_dur(time_module.perf_counter() - start),
-                )
-                return b"".join(chunks)
-        except httpx.RequestError as e:
+            data = await with_connect_retry(
+                lambda: self._api().media_bytes_by_id(path)
+            )
+        except (qqflow_sdk.ClientError, httpx.HTTPError) as e:
+            # 非成功状态（缓存被清理 404 / 就绪门控 503）与传输错误统一映射为
+            # MediaError：pipeline 跳过 OCR，server 代理映射为 404 兜底。
             raise MediaError(f"media fetch failed: {path}") from e
+        if len(data) > _MAX_MEDIA_BYTES:
+            # 上限语义保留（防异常/恶意上游造成内存放大）。SDK 目前不接收上限
+            # 参数，因此这是**事后**判定而不是边读边停；真正的提前中止需要在
+            # SDK 上加 max_bytes（与 weflow 侧同一处待补能力）。
+            raise MediaError(f"QqFlow media too large: {path}")
+        logger.debug(
+            "媒体下载完成: %s (%d bytes, %s)",
+            path,
+            len(data),
+            fmt_dur(time_module.perf_counter() - start),
+        )
+        return data
 
     async def close(self) -> None:
         """关闭 HTTP 客户端。"""
-        if self._client is not None:
-            await self._client.aclose()
-            self._client = None
+        if self._sdk is not None:
+            await self._sdk.aclose()
+            self._sdk = None

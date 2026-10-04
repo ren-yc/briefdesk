@@ -15,6 +15,7 @@ from unittest.mock import AsyncMock
 
 import httpx
 import pytest
+import qqflow_sdk
 
 from briefdesk.plugins.qqflow.client import QqFlowClient, QqFlowNotReadyError
 from briefdesk.plugins.weflow_legacy.client import WeFlowLegacyClient
@@ -95,13 +96,39 @@ class TestWithConnectRetry:
 
 class TestQqFlowClientRetry:
     def _client_with_get(self, side_effect):
+        """注入点从插件自持的 httpx 客户端移到了 SDK 内部的 httpx 客户端。
+
+        HTTP 现在由 SDK 承载，而 `with_connect_retry` 仍包在插件这一层——本组
+        用例要证明的正是「连接层重试照旧生效、503 语义不被它改写」。
+        """
         client = QqFlowClient(base_url="http://127.0.0.1:5032", api_token="t")
         fake = SimpleNamespace(get=AsyncMock(side_effect=side_effect), post=AsyncMock())
-        client._client = fake
+        sdk = qqflow_sdk.Client("http://127.0.0.1:5032", "t", timeout=30.0)
+        sdk._http = fake
+        client._sdk = sdk
         return client, fake
 
     async def test_fetch_contacts_retries_connect_errors(self):
-        resp = _FakeResp(200, {"contacts": [{"username": "u_1", "displayName": "A"}]})
+        resp = _FakeResp(
+            200,
+            {
+                "success": True,
+                "count": 1,
+                "total": 1,
+                "hasMore": False,
+                "contacts": [
+                    {
+                        "username": "u_1",
+                        "displayName": "A",
+                        "nickname": "",
+                        "remark": "",
+                        "alias": "",
+                        "avatarUrl": "",
+                        "type": "friend",
+                    }
+                ],
+            },
+        )
         client, fake = self._client_with_get(
             [httpx.ConnectError("refused"), httpx.ConnectError("refused"), resp]
         )
