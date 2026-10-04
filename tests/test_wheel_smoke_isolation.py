@@ -90,9 +90,42 @@ class TestScenePreservation:
         wheel_smoke, scene = self._stub_main(
             monkeypatch, tmp_path, TimeoutError("构建超时（模拟意外异常）")
         )
-        assert wheel_smoke.main() == 1, "意外异常必须返回非零"
+        # 新语义：非 SmokeFailure/SmokeCommandError 一律按原类型传播（traceback 留给
+        # 调用方），不再转写成返回 1——旧断言 == 1 会把「吞掉异常」当成正确行为。
+        with pytest.raises(TimeoutError):
+            wheel_smoke.main()
         assert scene.exists(), "意外异常同样要保留现场（旧实现会删掉）"
-        assert "现场保留" in capsys.readouterr().err
+        captured = capsys.readouterr()
+        assert "现场保留" in captured.err
+        assert "冒烟通过" not in captured.out + captured.err, "失败路径不得出现通过文案"
+
+    @pytest.mark.parametrize(
+        "boom",
+        [
+            ValueError("意外值错误"),
+            TypeError("意外类型错误"),
+            AttributeError("意外属性错误"),
+            KeyError("意外键缺失"),
+            RuntimeError("意外运行时错误"),
+            KeyboardInterrupt(),
+        ],
+        ids=["value", "type", "attribute", "key", "runtime", "interrupt"],
+    )
+    def test_any_unexpected_exception_propagates_and_keeps_scene(
+        self,
+        boom: BaseException,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture,
+    ) -> None:
+        """白名单外类型（含脚本自身 bug 与 Ctrl-C）：传播 + 保留现场 + 无通过文案。"""
+        wheel_smoke, scene = self._stub_main(monkeypatch, tmp_path, boom)
+        with pytest.raises(type(boom)):
+            wheel_smoke.main()
+        assert scene.exists(), f"{type(boom).__name__} 传播时现场必须保留"
+        captured = capsys.readouterr()
+        assert "现场保留" in captured.err
+        assert "冒烟通过" not in captured.out + captured.err
 
     def test_smoke_failure_keeps_scene(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture

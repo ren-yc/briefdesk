@@ -25,7 +25,6 @@ import json
 import os
 import shutil
 import socket
-import subprocess
 import sys
 import tempfile
 import time
@@ -778,6 +777,8 @@ def main() -> int:
     _active_commands = commands
     # 最初异常为主错误：清理/泄漏错误用 add_note 追加诊断，不在 finally 里 return 吞掉
     primary_error: BaseException | None = None
+    #: 正在向调用方传播的意外异常：没有转写成主错误，但同样属于失败路径（现场必须保留）
+    unexpected_error: BaseException | None = None
     real_runs_before: dict[str, tuple[int, int]] | None = None
     cleanup_error: Exception | None = None
     try:
@@ -841,32 +842,40 @@ def main() -> int:
             assert_no_leaks(venv, data_dir, cache_dir, settings_file, real_runs_root, real_runs_before)
         elif cleanup_error is not None:
             raise SmokeFailure(f"所属进程未全部确认退出，跳过最终检查并保留现场: {cleanup_error}")
-        log("冒烟通过")
+        # 「冒烟通过」只在 finally 的完整收尾（现场删除成功）后打印：
+        # 收尾清理或现场删除失败都属于非成功路径，提前打印会让失败输出混进成功文案。
         return 0
     except SmokeFailure as error:
         primary_error = error
     except SmokeCommandError as error:
         primary_error = SmokeFailure(f"命令管理失败: {error}")
-    except (TimeoutError, OSError, subprocess.SubprocessError) as error:
-        # 意外异常（含子进程超时）：与 SmokeFailure 同样保留现场——旧实现只在
-        # SmokeFailure 分支置 failed 标志，TimeoutExpired 等仍走删除现场路径。
-        primary_error = SmokeFailure(f"意外终止（{type(error).__name__}）: {error}")
+    except BaseException as error:  # noqa: BLE001 — 意外异常与中断按原类型继续传播
+        # 脚本自身的 bug（ValueError/AttributeError/KeyError…）和 Ctrl-C 恰恰最
+        # 需要现场的场合：置传播标记后原样 re-raise 保留 traceback 语义，现场路径
+        # 在 finally 里、传播前打印。旧白名单只接三类异常并转写返回 1，其余类型
+        # 照样走删除分支——报错让人查现场而现场已经没了。
+        unexpected_error = error
+        raise
     finally:
         try:
             commands.close_all(timeout=15)
         except Exception as close_error:  # noqa: BLE001 — 清理失败追加诊断，不吞主异常
             if primary_error is not None:
                 primary_error.add_note(f"收尾清理也失败: {close_error}")
+            elif unexpected_error is not None:
+                unexpected_error.add_note(f"收尾清理也失败: {close_error}")
             else:
                 # 成功路径上清理失败 = 不通过：转为失败并保留现场
                 primary_error = SmokeFailure(f"冒烟收尾清理失败，不视为通过: {close_error}")
         _active_commands = None
-        # 现场处置在 try/finally 结束后统一进行：finally 里不 return（会吞异常）
+        # 现场处置只看「是否有任何异常被记录或在传播」；删除现场要求两者皆无。
         if primary_error is not None:
-            assert primary_error is not None
             print(f"[wheel-smoke] 失败: {primary_error}", file=sys.stderr, flush=True)
             for note in getattr(primary_error, "__notes__", []) or []:
                 print(f"[wheel-smoke]   {note}", file=sys.stderr, flush=True)
+            print(f"[wheel-smoke] 现场保留在 {tmp}（含 venv 与日志，便于定位）", file=sys.stderr, flush=True)
+        elif unexpected_error is not None:
+            # 意外异常/中断：只补现场路径一行，失败详情交给随后打印的 traceback
             print(f"[wheel-smoke] 现场保留在 {tmp}（含 venv 与日志，便于定位）", file=sys.stderr, flush=True)
         else:
             try:
