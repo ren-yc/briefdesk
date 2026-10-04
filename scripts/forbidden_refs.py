@@ -316,6 +316,24 @@ def _git(args: list[str], *, cwd: Path | None = None) -> str:
     return proc.stdout
 
 
+def _git_result(args: list[str], *, cwd: Path | None = None) -> tuple[int, str]:
+    """不抛错的 git 调用：返回 (退出码, stderr 摘要)。
+
+    与 _git 共用参数口径（cwd、UTF-8 显式解码）——两处各写一份 subprocess 参数
+    必然漂移，编码不一致时 stderr 摘要会变成 None 或乱码，判定跟着失真。
+    """
+    proc = subprocess.run(
+        ["git", *args],
+        cwd=str(cwd) if cwd is not None else None,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+    )
+    return proc.returncode, proc.stderr.strip()
+
+
 def tracked_files(root: Path | None = None) -> list[str]:
     """列出纳入扫描的跟踪文件（排除未跟踪的本地计划产物）。
 
@@ -374,11 +392,31 @@ def _added_lines(diff_text: str) -> dict[str, set[int]]:
 
 
 def _file_at_rev(rev: str, path: str) -> str | None:
-    """取某版本下的文件内容；失败（新增/删除文件）返回 None。"""
+    """取某版本下的文件内容；读不到（新增/删除文件、git 异常）返回 None。
+
+    None 只表示「这次没读到」，不表示文件不存在——是否真不存在由
+    _file_exists_at 区分，调用方不得把两者混为一谈（见 scan_diff）。
+    """
     try:
         return _git(["show", f"{rev}:{path}"])
     except RuntimeError:
         return None
+
+
+def _file_exists_at(rev: str, path: str) -> bool:
+    """判断该版本下是否**存在**这个路径；git 无法判定时抛 RuntimeError。
+
+    cat-file -e 的退出码不够用：rev 本身非法（如基线引用失效）与「rev 有效
+    但路径不在」都返回 128——前者必须按扫描失败拦下，后者才是合法的跳过。
+    用 stderr 文案区分「does not exist」与其余错误：前者是 git 明确回答了
+    「不在」，后者没有回答，不能当作「不在」。
+    """
+    code, err = _git_result(["cat-file", "-e", f"{rev}:{path}"])
+    if code == 0:
+        return True
+    if code == 128 and "does not exist" in err:
+        return False
+    raise RuntimeError(f"git cat-file -e {rev}:{path} 无法判定：{err or code}")
 
 
 def scan_lines(path: str, source: str, lines: set[int]) -> list[Hit]:
@@ -402,7 +440,12 @@ def scan_diff(
     版本选择：行号是**新文件**（新端 / 工作区）的行号，因此内容必须取
     「新增侧」的版本——staged 取索引（:0），双端模式取调用方给定的新端 OID，
     旧 --ref 模式取 HEAD。取基线 ref 会把新行号套到旧内容上，报出一堆
-    「本轮已删除」的假命中。取不到（文件为新增或删除）时跳过该文件。
+    「本轮已删除」的假命中。
+
+    读不到新端文件时按两种情况分流：新端确实没有该路径（纯删除）没有新增行，
+    合法跳过；该有而读不到（git 异常、对象损坏、索引被改写）必须抛错——静默
+    跳过等于漏扫，还会照样打印「未发现编号引用」，让门禁看起来跑过。抛错由
+    main 的既有异常路径转成退出码 2（扫描未执行，拒绝放行）。
     """
     hits: list[Hit] = []
     new_rev = ":0" if staged else (new_side or "HEAD")
@@ -411,6 +454,8 @@ def scan_diff(
             continue
         source = _file_at_rev(new_rev, path)
         if source is None:
+            if _file_exists_at(new_rev, path):
+                raise RuntimeError(f"新增行所在文件读不到：{new_rev}:{path}")
             continue
         hits.extend(scan_lines(path, source, lines))
     return hits

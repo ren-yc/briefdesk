@@ -56,24 +56,40 @@ def test_main_check_failure_keeps_workdir(fixed_workdir: Path) -> None:
     assert fixed_workdir.exists(), "失败必须保留现场"
 
 
-def test_main_unexpected_exception_keeps_workdir(fixed_workdir: Path) -> None:
-    """意外异常（非 CheckFailure）同样保留现场并返回 1。"""
-    def _boom(*_args, **_kwargs):
-        raise RuntimeError("构建器炸了")
+@pytest.mark.parametrize("boom", [RuntimeError("构建器炸了"), KeyboardInterrupt()], ids=["error", "interrupt"])
+def test_main_unexpected_exception_propagates_and_keeps_workdir(
+    fixed_workdir: Path, boom: BaseException, capsys: pytest.CaptureFixture
+) -> None:
+    """意外异常/中断：打印现场路径后按原类型传播，现场保留。
+
+    旧实现打印完就落回 return 1——吞掉异常后排查者按堆栈找线索却找不到堆栈，
+    也分不清是「检查失败」还是「脚本自身的 bug」，Ctrl-C 同样失去中断语义。
+    """
+    def _raise(*_args, **_kwargs):
+        raise boom
 
     with (
-        patch.object(sdist_check, "build_sdist", _boom),
+        patch.object(sdist_check, "build_sdist", _raise),
         patch.object(sdist_check, "assert_sdist_contents", _stub_pass),
         patch.object(sdist_check, "assert_wheel_consistency", _stub_pass),
+        pytest.raises(type(boom)),
     ):
-        assert sdist_check.main() == 1
-    assert fixed_workdir.exists()
+        sdist_check.main()
+    assert fixed_workdir.exists(), "传播前必须保留现场"
+    captured = capsys.readouterr()
+    assert "现场保留" in captured.err
+    assert str(fixed_workdir) in captured.err, "提示必须指向实际现场路径"
 
 
 def test_main_cleanup_failure_returns_nonzero(fixed_workdir: Path) -> None:
-    """检查通过但清理失败（Windows 文件占用）：不得静默放过，返回非零并提示残余目录。"""
+    """检查通过但清理失败（Windows 文件占用）：不得静默放过，返回非零并提示残余目录。
+
+    build_sdist 必须返回 Path（不是 _stub_pass 的空列表）：log() 会取 .name，
+    桩给错类型会让「检查」阶段就先炸——意外异常被吞掉的旧实现会把这条错误
+    伪装成本用例预期的 return 1，于是清理分支从未被真正执行过。
+    """
     with (
-        patch.object(sdist_check, "build_sdist", _stub_pass),
+        patch.object(sdist_check, "build_sdist", _stub_sdist),
         patch.object(sdist_check, "assert_sdist_contents", _stub_pass),
         patch.object(sdist_check, "assert_wheel_consistency", _stub_pass),
         patch.object(sdist_check.shutil, "rmtree", side_effect=OSError("文件被占用")),

@@ -327,3 +327,126 @@ def test_commit_range_fails_loudly_on_bad_revision(tmp_path: Path) -> None:
     repo, _first, _second = _dual_endpoint_repo(tmp_path)
     with pytest.raises(RuntimeError):
         scan_commit_range("no-such-rev", "HEAD", cwd=repo)
+
+
+# ── 新端源码读取失败的分流（扫描未执行 ≠ 文件不存在）──
+
+
+def _repo_with_added_lines(tmp_path: Path) -> tuple[Path, str, str]:
+    """双提交仓库：第二次提交新增一行，返回 (repo, first, second)。"""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+
+    def git(*args: str) -> str:
+        proc = subprocess.run(
+            ["git", *args], cwd=repo, capture_output=True, text=True,
+            encoding="utf-8", errors="replace", check=True,
+        )
+        return proc.stdout.strip()
+
+    git("init", "-q")
+    git("config", "user.email", "probe@example.invalid")
+    git("config", "user.name", "probe")
+    (repo / "a.txt").write_text("one" + chr(10), encoding="utf-8")
+    git("add", ".")
+    git("commit", "-qm", "first")
+    first = git("rev-parse", "HEAD")
+    (repo / "a.txt").write_text("one" + chr(10) + "two" + chr(10), encoding="utf-8")
+    git("add", ".")
+    git("commit", "-qm", "second")
+    return repo, first, git("rev-parse", "HEAD")
+
+
+def _patch_git_cwd(monkeypatch: pytest.MonkeyPatch, repo: Path) -> None:
+    """把模块内的 git 调用绑到临时仓库，并同步 _file_at_rev 的内部实现。"""
+    from scripts import forbidden_refs
+
+    def _git(args: list[str], *, cwd: Path | None = None) -> str:
+        proc = subprocess.run(
+            ["git", *args], cwd=str(cwd or repo), capture_output=True, text=True,
+            encoding="utf-8", errors="replace", check=False,
+        )
+        if proc.returncode != 0:
+            raise RuntimeError(f"git {' '.join(args)} 失败：{proc.stderr.strip()}")
+        return proc.stdout
+
+    def _git_result(args: list[str], *, cwd: Path | None = None) -> tuple[int, str]:
+        proc = subprocess.run(
+            ["git", *args], cwd=str(cwd or repo), capture_output=True, text=True,
+            encoding="utf-8", errors="replace", check=False,
+        )
+        return proc.returncode, proc.stderr.strip()
+
+    monkeypatch.setattr(forbidden_refs, "_git", _git)
+    monkeypatch.setattr(forbidden_refs, "_git_result", _git_result)
+
+
+def test_scan_diff_raises_when_present_file_cannot_be_read(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """新端确实有该文件却读不到：必须抛错，不得静默跳过当作「没内容可扫」。
+
+    桩返回 None（不是抛错）——抛错在「None 即跳过」的旧实现下同样会经 main
+    的异常路径得到退出码 2，用例照样绿，等于零判别力。这里模拟的是读取本身
+    失败（对象损坏 / 索引被改写）而 cat-file 明确回答「文件在」的分歧场景。
+    """
+    from scripts import forbidden_refs
+
+    repo, first, second = _repo_with_added_lines(tmp_path)
+    _patch_git_cwd(monkeypatch, repo)
+    diff_text = subprocess.run(
+        ["git", "diff", "--unified=0", first, second], cwd=repo, capture_output=True,
+        text=True, encoding="utf-8", errors="replace", check=True,
+    ).stdout
+    assert "+two" in diff_text, "夹具必须产生新增行"
+    monkeypatch.setattr(forbidden_refs, "_file_at_rev", lambda rev, path: None)
+    # 前提确认：新端真的有这个路径（否则跳过是合法的，用例失去意义）
+    assert forbidden_refs._file_exists_at(second, "a.txt") is True
+    with pytest.raises(RuntimeError, match="读不到"):
+        forbidden_refs.scan_diff(diff_text, rev=None, staged=False, new_side=second)
+
+
+def test_scan_diff_skips_pure_deletion(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """纯删除：新端没有该文件，也没有新增行——合法跳过，不是扫描失败。"""
+    from scripts import forbidden_refs
+
+    repo, _first, second = _repo_with_added_lines(tmp_path)
+    subprocess.run(["git", "rm", "-q", "a.txt"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-qm", "delete"], cwd=repo, check=True)
+    deleted = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True,
+        encoding="utf-8", errors="replace", check=True,
+    ).stdout.strip()
+    diff_text = subprocess.run(
+        ["git", "diff", "--unified=0", second, deleted], cwd=repo, capture_output=True,
+        text=True, encoding="utf-8", errors="replace", check=True,
+    ).stdout
+    assert forbidden_refs.scan_diff(diff_text, rev=None, staged=False, new_side=deleted) == []
+
+
+def test_scan_diff_raises_when_existence_check_itself_fails(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """存在性判定本身失败（rev 非法 / git 环境坏）：按扫描未执行抛错，不判「不存在」。"""
+    from scripts import forbidden_refs
+
+    repo, first, second = _repo_with_added_lines(tmp_path)
+    _patch_git_cwd(monkeypatch, repo)
+    diff_text = subprocess.run(
+        ["git", "diff", "--unified=0", first, second], cwd=repo, capture_output=True,
+        text=True, encoding="utf-8", errors="replace", check=True,
+    ).stdout
+    monkeypatch.setattr(forbidden_refs, "_file_at_rev", lambda rev, path: None)
+    with pytest.raises(RuntimeError, match="无法判定"):
+        forbidden_refs.scan_diff(diff_text, rev=None, staged=False, new_side="no-such-rev")
+
+
+def test_main_maps_unreadable_new_side_to_exit_2(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture) -> None:
+    """真实入口收口：新端读不到时退出码 2，且不得打印「未发现编号引用」。
+
+    静默跳过会让 CI 显示扫描通过——门禁失守比扫不出来更糟。
+    """
+    from scripts import forbidden_refs
+
+    repo, first, second = _repo_with_added_lines(tmp_path)
+    _patch_git_cwd(monkeypatch, repo)
+    monkeypatch.setattr(forbidden_refs, "_file_at_rev", lambda rev, path: None)
+    assert forbidden_refs.main(["--base", first, "--head", second]) == 2
+    captured = capsys.readouterr()
+    assert "未发现编号引用" not in captured.out, "漏扫不得伪装成通过"

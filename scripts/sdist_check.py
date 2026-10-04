@@ -26,7 +26,7 @@ if str(REPO) not in sys.path:
     # 直跑时 sys.path[0] 是 scripts/：包路径需显式补，否则 scripts.runtime_manifest 导不到
     sys.path.insert(0, str(REPO))
 
-from scripts.runtime_manifest import expected_data_members  # noqa: E402
+from scripts.runtime_manifest import expected_data_members
 
 #: sdist 里的非数据成员：标准元数据与构建产物。刻意**按模式**而不是锁文件名——
 #: setuptools 升级可能增删 egg-info 内的文件，锁死会让门禁因工具升级假红。
@@ -86,6 +86,7 @@ def run(cmd: list[str], *, cwd: Path = REPO, timeout: int = 900) -> str:
     child_env.setdefault("PYTHONIOENCODING", "utf-8")
     result = subprocess.run(
         cmd,
+        check=False,  # 返回码由下方手工判定（非零转 CheckFailure，附输出尾部）
         cwd=str(cwd),
         env=child_env,
         capture_output=True,
@@ -207,10 +208,11 @@ def main() -> int:
     workdir = Path(tempfile.mkdtemp(prefix="briefdesk-sdist-"))
     # 显式状态机而不用 sys.exc_info() 判断流程结果：except 分支里 return 时，
     # finally 已不在「异常正在处理」状态，sys.exc_info() 返回 None——检查失败的
-    # 现场照样被删，「现场保留在 …」的提示指向不存在的目录。任何未完成成功加清理
-    # 成功的路径（含 KeyboardInterrupt 等意外中断）都判定为失败并保留现场。
+    # 现场照样被删，「现场保留在 …」的提示指向不存在的目录。凡未走到「全部检查
+    # 成功 + 清理成功」的路径都不得返回 0：检查类失败返回 1 并保留现场，
+    # 意外异常/中断打印现场路径后按原类型传播（见下方 except BaseException）。
     checks_passed = False
-    failed: BaseException | None = None
+    failed: CheckFailure | None = None
     try:
         sdist = build_sdist(workdir / "dist")
         data = assert_sdist_contents(sdist)
@@ -220,9 +222,13 @@ def main() -> int:
     except CheckFailure as error:
         failed = error
         print(f"[sdist-check] 失败: {error}", file=sys.stderr, flush=True)
-    except BaseException as error:  # noqa: BLE001 — 意外异常/中断同样保留现场后再传播
-        failed = error
+    except BaseException as error:
+        # 意外异常/中断：先打印现场路径再按原类型继续传播。吞掉它（落回
+        # return 1）会让注释声称的「保留现场后再传播」与实现相反——排查者
+        # 按提示去找现场、按堆栈找线索，结果既没有 traceback 也分不清是检查
+        # 失败还是脚本自身的 bug；KeyboardInterrupt 被吞掉时 Ctrl-C 也失去语义。
         print(f"[sdist-check] 意外终止（{type(error).__name__}），现场保留: {workdir}", file=sys.stderr, flush=True)
+        raise
     if not checks_passed:
         if isinstance(failed, CheckFailure):
             print(f"[sdist-check] 现场保留在 {workdir}", file=sys.stderr, flush=True)
