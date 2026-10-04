@@ -16,11 +16,13 @@
 import asyncio
 import logging
 import time as time_module
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from datetime import UTC, datetime, timedelta
 from typing import Any, Literal, NotRequired, TypedDict, cast
 
 import httpx
+import weflow_sdk
+from weflow_sdk import Client as WeFlowSdkClient
 
 from briefdesk.logger import fmt_dur
 from briefdesk.masking import clean_display_name
@@ -208,7 +210,13 @@ class WeFlowClient(SourceClient):
         if sse_read_timeout_ms is None:
             sse_read_timeout_ms = WeFlowSettings().sse_read_timeout_ms
         self._sse_read_timeout_s = sse_read_timeout_ms / 1000
-        self._client: httpx.AsyncClient | None = None
+        # 运行期消费 vendor SDK（随包分发的镜像，见 vendor/README.md）：
+        # REST / 分页 / 媒体 / 错误分类都由 SDK 负责，插件只保留业务逻辑
+        # （身份闸门、去重、归一化）。**SSE 是个例外**：SDK 的 watch() 自带
+        # 重连循环，没有「每次建连成功」的接缝，而本插件的身份闸门要求每次
+        # 建连强制重检（POLL_INTERVAL_SECONDS=0 时那是唯一一道闸门）——
+        # 换掉它只会弱化安全属性，因此 SSE 仍由本类自持。
+        self._sdk: WeFlowSdkClient | None = None
         # 共享就绪门控：状态机本体（健康分诊/身份闸门/注册分诊）在
         # _sdk_base.ReadinessGate；HTTP 细节以回调注入（方法见下）。
         self._gate = ReadinessGate(
@@ -233,70 +241,55 @@ class WeFlowClient(SourceClient):
 
     # ── 内部 ──
 
-    def _get_client(self) -> httpx.AsyncClient:
-        """获取共享的 httpx 客户端（懒初始化）。"""
-        if self._client is None:
-            self._client = httpx.AsyncClient(
-                base_url=self._base_url,
-                timeout=httpx.Timeout(30.0),
+    def _api(self) -> WeFlowSdkClient:
+        """共享的 vendor SDK 客户端（懒初始化）。"""
+        if self._sdk is None:
+            self._sdk = WeFlowSdkClient(
+                self._base_url, self._api_token, timeout=30.0
             )
-        return self._client
+        return self._sdk
 
     def _auth_headers(self) -> dict[str, str]:
         return {"Authorization": f"Bearer {self._api_token}"}
 
-    async def _get(
+    async def _sdk_call(
         self,
-        path: str,
+        fn: Callable[[], Awaitable[Any]],
         *,
-        params: dict[str, Any] | None = None,
+        what: str,
         not_found_ok: bool = False,
     ) -> Any:
-        """通用 GET 请求，带错误处理。
+        """调 SDK，并把它抛出的错误翻译回本插件既有的分类。
 
-        Args:
-            path: API 路径，如 "/api/v1/sessions"
-            params: 查询参数
-            not_found_ok: 为 True 时，404 返回 None（由调用方降级处理）
+        SDK 的错误面是 (status, url)，而插件的调用方（poller/runtime）按
+        「503 = 瞬态、静默跳过本轮」与「其余 = 错误」两档处理，这里保持那个
+        契约：503 → 复位共享门控 + WeFlowNotReadyError；404 且 not_found_ok
+        → None；其余非成功状态 → RuntimeError。
 
-        Returns:
-            JSON 响应；not_found_ok 且上游返回 404 时为 None
-
-        Raises:
-            WeFlowNotReadyError: 服务端未就绪（503 就绪门控，瞬态）
-            RuntimeError: 其他非成功状态
+        ``with_connect_retry`` 仍包一层：连接级重试是三源共享的 briefdesk
+        策略，不属于 SDK 的协议语义。
         """
-        client = self._get_client()
         start = time_module.perf_counter()
-        resp = await with_connect_retry(
-            lambda: client.get(path, params=params, headers=self._auth_headers())
-        )
-        logger.debug(
-            "GET %s%s → %s (%s)",
-            path,
-            f"?{resp.url.query.decode()}" if resp.url.query else "",
-            resp.status_code,
-            fmt_dur(time_module.perf_counter() - start),
-        )
-        if resp.status_code == 503:
-            # 就绪门控（瞬态）：失效记忆化标志——服务端重启（内存态注册表丢失）
-            # 后，下一轮 ensure_ready 会重新健康检查 + 引导注册（自愈）。
-            # 复位不会引发注册风暴：下一轮 ensure_ready 先查 /health，索引期
-            # 会看到 indexing 良性态而直接返回，且上游注册已幂等（v0.3.0 起
-            # 重复注册 ready/indexing 账号不重建索引）。
-            logger.debug("GET %s → 503（服务端索引期，瞬态）", path)
-            # 503 自愈：门控持有记忆化标志，复位只此一处
-            self._gate.reset()
-            raise WeFlowNotReadyError(
-                f"weflow-server 尚未就绪（503）: {resp.text[:200]}"
-            )
-        if not resp.is_success:
-            if not_found_ok and resp.status_code == 404:
+        try:
+            result = await with_connect_retry(fn)
+        except weflow_sdk.StatusError as exc:
+            if exc.status == 503:
+                # 就绪门控（瞬态）：失效记忆化标志——服务端重启（内存态注册表
+                # 丢失）后，下一轮 ensure_ready 会重新健康检查 + 引导注册。
+                # 复位不会引发注册风暴：下一轮先查 /health，索引期看到
+                # indexing 良性态即返回，且上游注册已幂等。
+                logger.debug("%s → 503（服务端索引期，瞬态）", what)
+                self._gate.reset()
+                raise WeFlowNotReadyError(
+                    f"weflow-server 尚未就绪（503）: {exc}"
+                ) from exc
+            if not_found_ok and exc.status == 404:
                 return None
-            raise RuntimeError(
-                f"WeFlow API error: {resp.status_code} on {path} — {resp.text[:200]}"
-            )
-        return resp.json()
+            raise RuntimeError(f"WeFlow API error: {exc.status} on {what}") from exc
+        logger.debug(
+            "%s → ok (%s)", what, fmt_dur(time_module.perf_counter() - start)
+        )
+        return result
 
     # ── 账号引导 ──
 
@@ -311,13 +304,8 @@ class WeFlowClient(SourceClient):
         本接口**不列出账号**（v0.5.0 起）：它免鉴权，账号清单会向任意调用方泄露
         本机存在哪些账号。明细在需鉴权的 GET /api/v1/accounts（见 fetch_accounts）。
         """
-        client = self._get_client()
-        resp = await with_connect_retry(lambda: client.get("/health"))
-        if not resp.is_success:
-            raise RuntimeError(
-                f"WeFlow API error: {resp.status_code} on /health — {resp.text[:200]}"
-            )
-        return resp.json()
+        health = await self._sdk_call(self._api().health, what="/health")
+        return health.model_dump(by_alias=True)
 
     async def register_account(self) -> tuple[str, str]:
         """POST /api/v1/accounts 注册账号（客户端驱动启动），返回 (state, status)。
@@ -336,7 +324,6 @@ class WeFlowClient(SourceClient):
         `account_conflict` 在此就地抛 WeFlowAccountMismatchError —— 这里本来就
         持有整个响应 JSON，能把 occupied_by 一并带进错误消息；返回值形状不变。
         """
-        client = self._get_client()
         payload: dict[str, Any] = {"wxid": self._wxid}
         if self._db_path:
             payload["db_path"] = self._db_path
@@ -346,21 +333,12 @@ class WeFlowClient(SourceClient):
             payload["img_aes_key"] = self._img_aes_key
         if self._img_xor_key:
             payload["img_xor_key"] = self._img_xor_key
-        resp = await with_connect_retry(
-            lambda: client.post(
-                "/api/v1/accounts",
-                json=payload,
-                headers=self._auth_headers(),
-            )
+        outcome = await self._sdk_call(
+            lambda: self._api().register(payload), what="/api/v1/accounts"
         )
-        if not resp.is_success:
-            raise RuntimeError(
-                f"WeFlow API error: {resp.status_code} on /api/v1/accounts — "
-                f"{resp.text[:200]}"
-            )
-        data = resp.json()
-        state = data.get("state", "unknown")
+        state = outcome.state or "unknown"
         if state == "account_conflict":
+            data = outcome.body
             # 上游强制单账号绑定；重试不会自愈，得由人去注销占用方或改配置。
             raise WeFlowAccountMismatchError(
                 f"注册被拒：weflow-server 已绑定 "
@@ -369,7 +347,9 @@ class WeFlowClient(SourceClient):
                 f"本地配置为 {self._wxid}；"
                 f"请修正 WEFLOW_WXID，或 DELETE /api/v1/accounts/{{占用方wxid}} 后重试"
             )
-        return state, data.get("status", "unknown")
+        # 注册响应是**多形状**的（accepted/in_progress/already_ready 带 status，
+        # 冲突与 mismatch 不带）：SDK 把共同字段类型化，其余留在 outcome.body。
+        return state, outcome.status or "unknown"
 
     def _bound_account(self, accounts: list[dict]) -> dict | None:
         """取持有绑定的那条账号明细；上游强制单账号，最多一条。
@@ -484,16 +464,12 @@ class WeFlowClient(SourceClient):
         本地配置的账号，只能靠这里的 wxid 字段（见 ensure_ready 的身份闸门）。
         取不到时不阻断，退化为由注册结果判定。
         """
-        client = self._get_client()
-        resp = await with_connect_retry(
-            lambda: client.get("/api/v1/accounts", headers=self._auth_headers())
+        accounts = await self._sdk_call(
+            self._api().accounts, what="/api/v1/accounts"
         )
-        if not resp.is_success:
-            raise RuntimeError(
-                f"WeFlow API error: {resp.status_code} on /api/v1/accounts — "
-                f"{resp.text[:200]}"
-            )
-        return resp.json().get("accounts", [])
+        # 转回 dict：门控与下游（_bound_account / _check_bound_identity /
+        # _log_account_errors）按 .get(...) 取值，且这是插件的既有契约。
+        return [a.model_dump(by_alias=True) for a in accounts]
 
     # ── REST API ──
 
@@ -509,8 +485,22 @@ class WeFlowClient(SourceClient):
         截断外的发送者显示名会退化成 wxid。传大 limit 只是把天花板抬到上游
         硬上限 10000，仍是猜值；翻页才是取尽。
         """
+        async def _page(_path: str, params: dict[str, Any]) -> dict[str, Any]:
+            """一页联系人（SDK 只做单页；翻页策略与「本页无新增」防御留在
+            briefdesk 共享层 fetch_all_pages，三源同规）。"""
+            limit = params.get("limit")
+            offset = params.get("offset")
+            page = await self._sdk_call(
+                lambda: self._api().contacts(
+                    limit=int(limit) if limit is not None else None,
+                    offset=int(offset) if offset is not None else None,
+                ),
+                what="/api/v1/contacts",
+            )
+            return page.model_dump(by_alias=True)
+
         rows = await fetch_all_pages(
-            lambda path, params: self._get(path, params=params),
+            _page,
             "/api/v1/contacts",
             key="contacts",
             dedup_key="username",
@@ -546,14 +536,13 @@ class WeFlowClient(SourceClient):
         chatlab 格式的 type 实测不可靠（official 会话也返回 private），
         故用原生格式的 sessionType 判定会话类型。
         """
-        return await fetch_all_pages(
-            lambda path, params: self._get(path, params=params),
-            "/api/v1/sessions",
-            key="sessions",
-            dedup_key="username",
-            page_size=10000,
-            upstream_version=self._logged_version,
+        # 翻页与跨页重复折叠都由 SDK 负责（list_all_sessions 取尽到空页）；
+        # page_size=10000 = 上游 limit 硬上限，典型规模一个请求取尽。
+        sessions = await self._sdk_call(
+            lambda: self._api().list_all_sessions(page_size=10000),
+            what="/api/v1/sessions",
         )
+        return [s.model_dump(by_alias=True) for s in sessions]
 
     async def fetch_messages(
         self,
@@ -582,15 +571,18 @@ class WeFlowClient(SourceClient):
         无空结果重试：weflow-server 0.5.x 无「刚入库查不到」竞态（该兜底是
         legacy 上游的历史行为，其 client 保留实现）。
         """
-        params: dict[str, Any] = {"talker": talker, "limit": limit, "offset": offset}
-        if start_ts is not None:
-            params["start"] = start_ts
-        if media:
-            params["media"] = 1
-            params["image"] = 1
-        data = await self._get(
-            "/api/v1/messages", params=params, not_found_ok=not_found_ok
+        page = await self._sdk_call(
+            lambda: self._api().list_messages(
+                talker,
+                start=str(start_ts) if start_ts is not None else None,
+                limit=limit,
+                offset=offset,
+                media=media,
+            ),
+            what="/api/v1/messages",
+            not_found_ok=not_found_ok,
         )
+        data = None if page is None else page.model_dump(by_alias=True)
         if data is None:
             return {
                 "success": True,
@@ -696,32 +688,27 @@ class WeFlowClient(SourceClient):
         Raises:
             MediaError: 网络错误或 weflow-server 返回非成功状态（cause 保留原异常）
         """
-        client = self._get_client()
         start = time_module.perf_counter()
         try:
-            async with client.stream(
-                "GET", self._build_media_url(path), headers=self._auth_headers()
-            ) as resp:
-                if not resp.is_success:
-                    raise MediaError(
-                        f"WeFlow media error: {resp.status_code} on {path}"
-                    )
-                chunks: list[bytes] = []
-                total = 0
-                async for chunk in resp.aiter_bytes():
-                    total += len(chunk)
-                    if total > _MAX_MEDIA_BYTES:
-                        raise MediaError(f"WeFlow media too large: {path}")
-                    chunks.append(chunk)
-                logger.debug(
-                    "媒体下载完成: %s (%d bytes, %s)",
-                    path,
-                    total,
-                    fmt_dur(time_module.perf_counter() - start),
-                )
-                return b"".join(chunks)
-        except httpx.RequestError as e:
+            data = await with_connect_retry(
+                lambda: self._api().media_bytes_by_id(path)
+            )
+        except (weflow_sdk.ClientError, httpx.HTTPError) as e:
+            # 非成功状态（未导出 404 / 就绪门控 503）与传输错误统一映射为
+            # MediaError：pipeline 跳过 OCR，server 代理映射为 404 兜底。
             raise MediaError(f"media fetch failed: {path}") from e
+        if len(data) > _MAX_MEDIA_BYTES:
+            # 上限语义保留（防异常/恶意上游造成内存放大）。SDK 目前不接收
+            # 上限参数，因此这是**事后**判定而不是边读边停——真正的提前
+            # 中止需要在 SDK 上加 max_bytes（已登记，见 vendor 同步记录）。
+            raise MediaError(f"WeFlow media too large: {path}")
+        logger.debug(
+            "媒体下载完成: %s (%d bytes, %s)",
+            path,
+            len(data),
+            fmt_dur(time_module.perf_counter() - start),
+        )
+        return data
 
     # ── SSE 流 ──
 
@@ -802,6 +789,6 @@ class WeFlowClient(SourceClient):
 
     async def close(self) -> None:
         """关闭 HTTP 客户端。"""
-        if self._client is not None:
-            await self._client.aclose()
-            self._client = None
+        if self._sdk is not None:
+            await self._sdk.aclose()
+            self._sdk = None

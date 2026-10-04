@@ -15,6 +15,7 @@ from unittest.mock import AsyncMock, patch
 
 import httpx
 import pytest
+import weflow_sdk
 
 from briefdesk.plugins.weflow.client import (
     WeFlowAccountMismatchError,
@@ -36,6 +37,23 @@ def _client() -> WeFlowClient:
         db_keys={"session/session.db": "00" * 32},
         sse_read_timeout_ms=1000,
     )
+
+
+def _client_with_transport(handler) -> WeFlowClient:
+    """把插件的 vendor SDK 客户端接到 MockTransport 上。
+
+    HTTP 现在由 SDK 承载（插件不再自持 REST 客户端），所以注入点是 SDK 内部
+    的 httpx 客户端——那正是发出真实请求的一层。走 HTTP 层的用例用这个助手，
+    断言的是真实请求形状（URL / 查询串 / 鉴权头），而不是插件调了哪个私有方法。
+    """
+    client = _client()
+    sdk = weflow_sdk.Client(client._base_url, client._api_token, timeout=30.0)
+    sdk._http = httpx.AsyncClient(
+        base_url="http://127.0.0.1:5033",
+        transport=httpx.MockTransport(handler),
+    )
+    client._sdk = sdk
+    return client
 
 
 def _health(phase: str = "unregistered", version: str = "0.5.0") -> dict:
@@ -380,17 +398,13 @@ class TestAccountDetail:
 
     async def test_fetch_accounts_sends_token_and_unwraps_list(self):
         """走 /api/v1/accounts、带鉴权头、返回 accounts 数组本身。"""
-        client = _client()
-        captured: dict = {}
+        seen: list[httpx.Request] = []
 
-        class _Resp:
-            status_code = 200
-            is_success = True
-            text = ""
-            url = httpx.URL("http://127.0.0.1:5033/api/v1/accounts")
-
-            def json(self) -> dict:
-                return {
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen.append(request)
+            return httpx.Response(
+                200,
+                json={
                     "success": True,
                     "accounts": [
                         {
@@ -400,42 +414,22 @@ class TestAccountDetail:
                             "db_storage": "C:\\x\\db_storage",
                         }
                     ],
-                }
+                },
+            )
 
-        real_client = client._get_client()
-
-        async def fake_get(path, **kwargs):
-            captured["path"] = path
-            captured["headers"] = kwargs.get("headers")
-            return _Resp()
-
-        with patch.object(real_client, "get", fake_get):
-            accounts = await client.fetch_accounts()
-        assert captured["path"] == "/api/v1/accounts"
-        assert "Authorization" in captured["headers"]
+        client = _client_with_transport(handler)
+        accounts = await client.fetch_accounts()
+        assert str(seen[0].url).endswith("/api/v1/accounts")
+        assert seen[0].headers["authorization"] == "Bearer test-token"
         assert len(accounts) == 1
         assert accounts[0]["message_count"] == 42
 
     async def test_fetch_accounts_raises_on_http_error(self):
         """非 2xx（如 401）上抛 RuntimeError，由调用方决定是否降级。"""
-        client = _client()
-
-        class _Resp:
-            status_code = 401
-            is_success = False
-            text = '{"success":false,"code":401,"message":"unauthorized"}'
-            url = httpx.URL("http://127.0.0.1:5033/api/v1/accounts")
-
-            def json(self) -> dict:
-                return {}
-
-        with (
-            patch(
-                "briefdesk.plugins.weflow.client.with_connect_retry",
-                AsyncMock(return_value=_Resp()),
-            ),
-            pytest.raises(RuntimeError),
-        ):
+        client = _client_with_transport(
+            lambda _r: httpx.Response(401, json={"success": False, "code": 401})
+        )
+        with pytest.raises(RuntimeError):
             await client.fetch_accounts()
 
 
@@ -448,11 +442,19 @@ class TestRegisterConflictHttp:
 
     @staticmethod
     def _client_with(handler) -> WeFlowClient:
+        """把插件的 vendor SDK 客户端接到 MockTransport 上。
+
+        HTTP 已经由 SDK 承载（插件不再自持 REST 客户端），因此这里注入的是
+        SDK 内部的 httpx 客户端——它正是发出真实请求的那一层；插件的 SSE
+        客户端另有接线（见 patch httpx.AsyncClient 的那条用例）。
+        """
         client = _client()
-        client._client = httpx.AsyncClient(
+        sdk = weflow_sdk.Client(client._base_url, client._api_token, timeout=30.0)
+        sdk._http = httpx.AsyncClient(
             base_url="http://127.0.0.1:5033",
             transport=httpx.MockTransport(handler),
         )
+        client._sdk = sdk
         return client
 
     async def test_register_conflict_raises_with_occupied_by(self):
@@ -513,26 +515,12 @@ class TestReadyGate:
 
     async def test_503_resets_memoized_flag(self):
         """503 → WeFlowNotReadyError 且复位 _ready_checked（服务端重启自愈）。"""
-        client = _client()
+        client = _client_with_transport(
+            lambda _r: httpx.Response(503, json={"success": False, "code": 503})
+        )
         client._ready_checked = True
-
-        class _Resp:
-            status_code = 503
-            is_success = False
-            text = '{"success":false,"code":503,"message":"account not ready"}'
-            url = httpx.URL("http://127.0.0.1:5033/api/v1/sessions")
-
-            def json(self) -> dict:
-                return {}
-
-        with (
-            patch(
-                "briefdesk.plugins.weflow.client.with_connect_retry",
-                AsyncMock(return_value=_Resp()),
-            ),
-            pytest.raises(WeFlowNotReadyError),
-        ):
-            await client._get("/api/v1/sessions")
+        with pytest.raises(WeFlowNotReadyError):
+            await client.fetch_accounts()
         assert not client._ready_checked
 
     async def test_404_with_not_found_ok_returns_none(self):
@@ -541,24 +529,12 @@ class TestReadyGate:
         上游 sessions 端点仍会列出无消息表的聚合会话，messages 查询对其
         返回 404（见 bug.md 问题 2，未修），故该兜底必须保留。
         """
-        client = _client()
-
-        class _Resp:
-            status_code = 404
-            is_success = False
-            text = '{"success":false,"code":404,"message":"conversation not found"}'
-            url = httpx.URL("http://127.0.0.1:5033/api/v1/messages")
-
-            def json(self) -> dict:
-                return {}
-
-        with patch(
-            "briefdesk.plugins.weflow.client.with_connect_retry",
-            AsyncMock(return_value=_Resp()),
-        ):
-            resp = await client.fetch_messages(
-                "brandsessionholder", None, not_found_ok=True
-            )
+        client = _client_with_transport(
+            lambda _r: httpx.Response(404, json={"success": False, "code": 404})
+        )
+        resp = await client.fetch_messages(
+            "brandsessionholder", None, not_found_ok=True
+        )
         assert resp["messages"] == []
         assert not resp["hasMore"]
 
@@ -572,30 +548,40 @@ class TestListPagination:
         上游 limit 默认 100，不翻页只能拿到前 100 条且无错误提示——截断外的
         发送者显示名会退化成 wxid。
         """
-        client = _client()
-        page1 = {
-            "contacts": [
-                {"username": f"wxid_{i:04d}", "displayName": f"联系人{i}"}
-                for i in range(1000)
-            ],
-            "total": 1500,
-            "hasMore": True,
-        }
-        page2 = {
-            "contacts": [
-                {"username": f"wxid_{i:04d}", "displayName": f"联系人{i}"}
-                for i in range(1000, 1500)
-            ],
-            "total": 1500,
-            "hasMore": False,
-        }
-        with patch.object(
-            client, "_get", AsyncMock(side_effect=[page1, page2])
-        ) as get:
-            contacts = await client.fetch_contacts()
+        seen: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen.append(request)
+            offset = int(request.url.params.get("offset", "0"))
+            rows = [
+                {
+                    "username": f"wxid_{i:04d}",
+                    "displayName": f"联系人{i}",
+                    "nickname": "",
+                    "remark": "",
+                    "alias": "",
+                    "avatarUrl": "",
+                    "type": "friend",
+                }
+                for i in range(offset, min(offset + 1000, 1500))
+            ]
+            return httpx.Response(
+                200,
+                json={
+                    "success": True,
+                    "count": len(rows),
+                    "contacts": rows,
+                    "total": 1500,
+                    "hasMore": offset + len(rows) < 1500,
+                },
+            )
+
+        client = _client_with_transport(handler)
+        contacts = await client.fetch_contacts()
         assert len(contacts) == 1500
-        offsets = [c.kwargs["params"]["offset"] for c in get.await_args_list]
-        assert offsets == [0, 1000]
+        # 翻页策略仍在 briefdesk 共享层（fetch_all_pages）：一页一请求，offset
+        # 按已返回行数推进。
+        assert [int(r.url.params["offset"]) for r in seen] == [0, 1000]
         assert contacts["wxid_1499"] == "联系人1499"
 
     async def test_sessions_first_page_uses_max_page_size(self):
@@ -604,21 +590,36 @@ class TestListPagination:
         上游 sessions 实际信封不含 hasMore：短页（无 hasMore 且条数 <
         page_size）即末页终止——典型规模一个请求取尽。
         """
-        client = _client()
-        page = {
-            "sessions": [
-                {"username": f"wxid_{i:04d}", "displayName": f"会话{i}"}
-                for i in range(3)
+        seen: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen.append(request)
+            offset = int(request.url.params.get("offset", "0"))
+            rows = [
+                {
+                    "username": f"wxid_{i:04d}",
+                    "displayName": f"会话{i}",
+                    "lastTimestamp": 1,
+                    "messageCount": 0,
+                    "sessionType": "private",
+                    "type": 0,
+                    "unreadCount": 0,
+                }
+                for i in range(offset, min(offset + 10000, 3))
             ]
-        }
-        with patch.object(
-            client, "_get", AsyncMock(return_value=page)
-        ) as get:
-            sessions = await client.fetch_sessions()
+            return httpx.Response(
+                200,
+                json={"success": True, "count": len(rows), "sessions": rows},
+            )
+
+        client = _client_with_transport(handler)
+        sessions = await client.fetch_sessions()
         assert len(sessions) == 3
-        assert get.await_count == 1
-        assert get.await_args.args[0] == "/api/v1/sessions"
-        assert get.await_args.kwargs["params"] == {"limit": 10000, "offset": 0}
+        # 第一页请求带上游 limit 硬上限（10000）；该面没有 hasMore，SDK 以
+        # 「空页」终止，因此短页之后还有一次探测请求。
+        assert seen[0].url.params["limit"] == "10000"
+        assert seen[0].url.params["offset"] == "0"
+        assert len(seen) == 2, "短页不是终止信号，空页才是"
 
     async def test_sessions_paginate_until_exhausted(self):
         """sessions 按 offset 翻页取尽：多页合并、username 去重、hasMore=false 终止。
@@ -626,28 +627,33 @@ class TestListPagination:
         实际 sessions 信封虽不含 hasMore，fetch_all_pages 在 hasMore 存在时
         优先以它为准（共享分页契约，与 contacts 一致）。
         """
-        client = _client()
-        page1 = {
-            "sessions": [
-                {"username": f"wxid_{i:04d}", "displayName": f"会话{i}"}
-                for i in range(1000)
-            ],
-            "hasMore": True,
-        }
-        page2 = {
-            "sessions": [
-                {"username": f"wxid_{i:04d}", "displayName": f"会话{i}"}
-                for i in range(1000, 1200)
-            ],
-            "hasMore": False,
-        }
-        with patch.object(
-            client, "_get", AsyncMock(side_effect=[page1, page2])
-        ) as get:
-            sessions = await client.fetch_sessions()
+        seen: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen.append(request)
+            offset = int(request.url.params.get("offset", "0"))
+            rows = [
+                {
+                    "username": f"wxid_{i:04d}",
+                    "displayName": f"会话{i}",
+                    "lastTimestamp": 1,
+                    "messageCount": 0,
+                    "sessionType": "private",
+                    "type": 0,
+                    "unreadCount": 0,
+                }
+                for i in range(offset, min(offset + 1000, 1200))
+            ]
+            return httpx.Response(
+                200,
+                json={"success": True, "count": len(rows), "sessions": rows},
+            )
+
+        client = _client_with_transport(handler)
+        sessions = await client.fetch_sessions()
         assert len(sessions) == 1200
-        offsets = [c.kwargs["params"]["offset"] for c in get.await_args_list]
-        assert offsets == [0, 1000]
+        # offset 按实际返回行数推进，空页终止（该面没有 hasMore 字段）。
+        assert [int(r.url.params["offset"]) for r in seen] == [0, 1000, 1200]
         assert sessions[1199]["username"] == "wxid_1199"
 
 
