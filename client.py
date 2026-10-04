@@ -28,7 +28,6 @@ from __future__ import annotations
 import asyncio
 import json as _json
 import logging
-import re
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
 from typing import Any
@@ -93,7 +92,36 @@ class NotReady(ClientError):
 
 
 class BadDate(ClientError):
-    """``search`` was given a malformed YYYYMMDD bound."""
+    """A time bound was neither ``YYYYMMDD`` nor unix seconds."""
+
+
+@dataclass(frozen=True)
+class RegisterOutcome:
+    """Raw ``POST /api/v1/accounts`` outcome.
+
+    HTTP 200 covers several business states with **different shapes**
+    (``accepted`` / ``in_progress`` / ``already_ready`` carry a status; a
+    conflict carries who holds the binding; the invalid-* refusals carry
+    neither), so only the two fields every state has are typed here and the
+    decoded body stays available for the caller's own classification.
+
+    A refusal is a **value**, not an error: what to do about it is the
+    caller's decision - the caller is the one holding the configuration that
+    identity is compared against.
+    """
+
+    state: str
+    status: str | None
+    body: dict[str, Any]
+
+
+def _validate_time_bound(field: str, value: str) -> None:
+    """Accept a bare ``YYYYMMDD`` date or unix seconds - the server parses
+    both, so rejecting either here would block a legal request."""
+    if not value.isdigit():
+        raise BadDate(
+            f"invalid time bound {field}={value!r}: expected YYYYMMDD or unix seconds"
+        )
 
 
 class MessageEvent(BaseModel):
@@ -255,22 +283,60 @@ class Client:
         Intermediate states (``indexing``) are waiting, not errors; errors
         are reserved for the deadline or the account landing in ``error``.
         """
+        outcome = await self.register(body)
+        if outcome.state in _REFUSAL_STATES:
+            url = self._url("/api/v1/accounts")
+            raise StatusError(200, f"{url} (state={outcome.state})")
+        await self.wait_ready(account, timeout)
+
+    # ---- health / accounts / register -----------------------------------
+
+    async def health(self) -> gen.Health:
+        """``GET /health`` - liveness and account phase. **Unauthenticated.**
+
+        Deliberately carries no account identity: confirming *which* account
+        is bound requires :meth:`accounts`. The SDK sends no credentials
+        here, and a test pins that.
+        """
+        url = self._url("/health")
+        resp = await self._http.get(url)
+        return gen.Health.model_validate(await self._decode(resp, url))
+
+    async def accounts(self) -> list[gen.AccountView]:
+        """``GET /api/v1/accounts`` - one entry per bound account.
+
+        The failure reason (``error``) and the message count live only here;
+        ``/health`` collapses everything to a scalar phase.
+        """
+        listing = gen.AccountsList.model_validate(
+            await self._get_json("/api/v1/accounts", {})
+        )
+        return listing.accounts
+
+    async def register(self, body: dict) -> RegisterOutcome:
+        """``POST /api/v1/accounts`` - register, returning the raw outcome
+        **without waiting**.
+
+        The waiting half is :meth:`wait_ready`; :meth:`ensure_ready` is the
+        two composed with the refusal vocabulary applied. Callers that must
+        classify the answer themselves (a refusal is a business state, not an
+        HTTP error) use this pair instead.
+        """
         url = self._url("/api/v1/accounts")
         resp = await self._http.post(
             url,
             headers={"Authorization": f"Bearer {self._token}"},
             json=body,
         )
-        if resp.status_code >= 400:
-            raise StatusError(resp.status_code, url)
-        try:
-            payload = resp.json()
-        except ValueError:
-            payload = None
-        state = payload.get("state") if isinstance(payload, dict) else None
-        if isinstance(state, str) and state in _REFUSAL_STATES:
-            raise StatusError(200, f"{url} (state={state})")
-        await self.wait_ready(account, timeout)
+        payload = await self._decode(resp, url)
+        if not isinstance(payload, dict) or not isinstance(payload.get("state"), str):
+            raise ShapeError(f"{url}: no string `state` in the body: {payload!r}")
+        status = payload.get("status")
+        return RegisterOutcome(
+            state=payload["state"],
+            status=status if isinstance(status, str) else None,
+            body=payload,
+        )
 
     # ---- drain_session --------------------------------------------------
 
@@ -336,31 +402,6 @@ class Client:
                 return out
             offset += count
 
-    # ---- search ---------------------------------------------------------
-
-    async def search(
-        self,
-        talker: str,
-        keyword: str,
-        start: str | None = None,
-        end: str | None = None,
-    ) -> gen.MessagesNative:
-        """Keyword + time-window search; YYYYMMDD validated client-side.
-
-        ``end`` covers the whole day, same as the server.
-        """
-        for field, value in (("start", start), ("end", end)):
-            if value is not None and not re.fullmatch(r"\d{8}", value):
-                raise BadDate(f"invalid date bound {field}={value!r}: expected YYYYMMDD")
-        query = {"talker": talker, "keyword": keyword}
-        if start is not None:
-            query["start"] = start
-        if end is not None:
-            query["end"] = end
-        return gen.MessagesNative.model_validate(
-            await self._get_json("/api/v1/messages", query)
-        )
-
     # ---- media_bytes ----------------------------------------------------
 
     async def media_bytes(self, message: gen.ChatlabMessage) -> bytes:
@@ -382,6 +423,88 @@ class Client:
                 {"talker": message.account_name, "media": "1"},
             )
             resp = await self._http.get(url, headers={"Authorization": f"Bearer {self._token}"})
+        if resp.status_code >= 400:
+            raise StatusError(resp.status_code, url)
+        return resp.content
+
+    # ---- list_messages / contacts / media_bytes_by_id ---------------------
+
+    async def list_messages(
+        self,
+        talker: str,
+        *,
+        keyword: str | None = None,
+        start: str | None = None,
+        end: str | None = None,
+        limit: int | None = None,
+        offset: int | None = None,
+        media: bool = False,
+    ) -> gen.MessagesNative:
+        """``GET /api/v1/messages`` - the **native** messages face.
+
+        Descending by time, offset-paged: advance ``offset`` by the page size
+        until ``has_more`` is false. This is the face that carries what the
+        ChatLab shape drops - ``raw_content``, ``is_send``, ``local_type`` - and
+        the only one that can export media (``media=True``).
+
+        Prefer :meth:`drain_session` when both faces would do: the Pull cursor
+        is stable across a live database, while offset paging over a growing
+        table can shift.
+        """
+        if not talker:
+            raise ShapeError("talker must not be empty")
+        query: dict[str, str] = {"talker": talker}
+        if keyword is not None:
+            query["keyword"] = keyword
+        for field, value in (("start", start), ("end", end)):
+            if value is not None:
+                _validate_time_bound(field, value)
+                query[field] = value
+        if limit is not None:
+            query["limit"] = str(limit)
+        if offset is not None:
+            query["offset"] = str(offset)
+        if media:
+            query["media"] = "1"
+        return gen.MessagesNative.model_validate(
+            await self._get_json("/api/v1/messages", query)
+        )
+
+    async def contacts(
+        self,
+        *,
+        limit: int | None = None,
+        offset: int | None = None,
+        keyword: str | None = None,
+    ) -> gen.Contacts:
+        """``GET /api/v1/contacts`` - one page of the contact list.
+
+        Contact detail is not part of the ChatLab shape at all; this is the
+        only source for display names, remarks and aliases.
+        """
+        query: dict[str, str] = {}
+        if limit is not None:
+            query["limit"] = str(limit)
+        if offset is not None:
+            query["offset"] = str(offset)
+        if keyword is not None:
+            query["keyword"] = keyword
+        return gen.Contacts.model_validate(
+            await self._get_json("/api/v1/contacts", query)
+        )
+
+    async def media_bytes_by_id(self, media_id: str) -> bytes:
+        """``GET /api/v1/media/{id}`` - bytes for a handle the server advertised.
+
+        ``media_id`` is a **single path segment**: the native face's
+        ``media_id``, or the last segment of ``media_url``. Prefer
+        :meth:`media_bytes` when a ChatLab message is at hand - that one also
+        triggers an export and retries once on a 404.
+        """
+        url = self._url(f"/api/v1/media/{media_id}")
+        resp = await self._http.get(
+            url, headers={"Authorization": f"Bearer {self._token}"}
+        )
         if resp.status_code >= 400:
             raise StatusError(resp.status_code, url)
         return resp.content
