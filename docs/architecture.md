@@ -1143,7 +1143,27 @@ required field of `weflow`/`qqflow` → that plugin self-disables via `PluginDis
   展开前的原文，预检结论会与提交后的实际组合不一致。名单解析失败 / 元素非字符串**不是**「无冲突」：显式返回 409 + `unavailable` issue，
   不写盘（旧实现回落 `config.plugins` 或过滤坏元素，会放行「保存成功、重启必失败」的组合）；所有层都未提供时按模型默认 `[]`，
   不回落启动快照。`validate_selection` 未接入（无 manager）时同样以 409 报「无法完成组合校验」，不当作无问题放行。
-  暂存文件读不出来（权限/编码）时 PUT 直接拒绝写入（旧行为把读失败当空文件，下一次写入会抹掉整个暂存态）；GET 不 500，
+- **逐层解码判可用性、胜出值判类型**（`settings_env.resolve_alias_layers` 是层序的唯一定义，展示用的 `composed_value`
+  就是它的首层视图——两处各写一份判定必然漂移）：任一层提供了该键但 JSON 解码失败（含空串）就判不可用，因为真实
+  `Settings()` 构造时**每一层**都会解码，高层合法压不住低层的坏 JSON（实测：env 合法 + 项目 `.env` 写 `not-json`，
+  PUT 旧实现回 200 而下次启动必失败）；元素是否全为字符串**只对胜出值**判——低层是合法 JSON 但类型错（如 `[17]`）
+  且被高层覆盖时，pydantic 的最终合并结果不受影响，不得新增「每层类型都必须合法」的过严规则。回归见
+  `tests/test_settings_env_round2.py` 的 `PerLayerDecodeTest`。
+- **预检的键匹配与真实解析同口径**：dotenv 解析按大小写不敏感采纳键，暂存文件被外部编辑器写成小写
+  `plugins_required=` 时读盘命中；预检若用大小写敏感的精确查表就查不到该层，会放行「必选含 benchmark、启用列表不含」
+  的矛盾组合（写锁只串行化本进程 API，锁不住外部编辑器，所以这是常态路径）。因此 `staged_override` 分支走
+  `_lookup_value`；不要在 `read_staged_from_bytes` 里另做键归一化（那会引入第二份口径）。回归：`PrecheckCaseSensitivityTest`。
+- **整值模板草稿**：multi 字段允许「原文非 JSON、但 dotenv 展开后为合法字符串数组」的草稿进入预检（`normalize_setting`
+  只在 `json.loads` 失败且原文含 `${` 时放行**落盘原文**，不经 `json.dumps` 规范化，否则模板被改写、与回读口径不一致；
+  `json.loads` 成功但元素非全字符串不放宽）。放宽处必须自带通用 text 尾巴的两道拒绝（multi 分支走不到那里）：换行会把
+  `KEY=VALUE` 拆成伪键行，「 #」是 dotenv 行内注释起点（回读截断会写出与用户所见不同的名单）。回归：`WholeValueTemplateTest`。
+  暂存文件读不出来（权限/编码）时 PUT 直接拒绝写入（`StagedReadError` → 409；旧行为把读失败当空文件，下一次写入会抹掉整个
+  暂存态）。**写方向同样不得静默**：`commit_staged_write` 的写入/替换/删除失败抛 `StagedCommitError`（继承 `OSError`，
+  只忽略「文件本就不存在」），路由统一映射为 500 + `{type: "staged_commit_failed", stage: write|replace|delete}`——
+  删除失败被吞成 `ok:true` 是静默丢写入（文件仍在磁盘、内容原样），而裸 `OSError` 穿出路由只会留下无 detail 的 500；
+  不用 409（那是「客户端可调整后重试」，OS 占用改多少次都一样）。写后回传状态用严格读取 `read_staged_strict()`：
+  吞异常的展示口径会把「已写入但读不出」变成 `ok:true` + 空明细（比报错更坏），此时返回 500 +
+  `{type: "staged_state_unknown"}` 并明确「已写入、状态未知」，不得谎报未保存。回归：`StagedCommitFailureTest`。GET 不 500，
   改为把预期标为不可用：`pluginsExpectedError` 下发脱敏说明，插件项 `enabled` 置 `null`（显式未知，不是「关闭」），
   前端停用开关并禁用「全关」推断——把未知折进空集合会凭空生成 `PLUGINS=[]` 的假更改。可选插件禁用后仍显示其配置入口，
   便于启用前预配置；未实现可选 schema 的旧插件不受影响
@@ -1351,11 +1371,33 @@ required field of `weflow`/`qqflow` → that plugin self-disables via `PluginDis
   `OpenProcess`——句柄已退出、PID 被复用时会把无关进程指进 Job）；清理先 `TerminateJobObject` 再等
   `ActiveProcesses` 归零，最后关句柄并回收包装进程，确认计数之前不关句柄（关了就没有内核兜底的依据）。
   嵌套 Job 被 runner 拒绝时显式失败，不绕开其管理。父进程硬死时由内核兜底。
+- **唯一规范顺序**（`run()` 与 `start_app()` 共用）：`_spawn_wrapper`（写 PENDING → Popen → 记组号，**不放行**）
+  → 立即 `proc.poll()`（此时还没放行，已退出只可能是 wrapper 自身启动失败 → 报「包装进程提前退出」并清理，
+  不得当成命令完成，也不得报成嵌套 Job 被拒）→ `_assign_to_job` → `_release`（写 GO）。**纳管成功后才释放许可**：
+  反过来写会让慢启动的实际命令（pip / venv / runner）在 `AssignProcessToJobObject` 之前就创建，它和它的后代全部
+  落在 Job 外，内核兜底整体旁路——`ActiveProcesses` 计数抓不到这种错序（只有 wrapper 在内也满足 ≥1），断言必须
+  **按实际命令的 PID** 查（`_process_in_job`，测试用哨兵文件取 PID）。纳管失败路径保持 PENDING，实际命令永不启动。
+- **命令成败只以状态文件为事实**：放行后不得用 wrapper 的退出码反推命令失败——发布完成状态后 wrapper 被
+  `TerminateJobObject` 收尾是正常路径（`_cleanup` 对此先等 `_WRAPPER_EXIT_GRACE` 让它自然退出，超时才升级），
+  而「句柄已回收」导致的纳管失败也与 runner 是否允许嵌套 Job 无关。误用反推会让 CI 随机假红并把排查引向错误方向。
+  回归：`tests/test_smoke_process.py` 的 `TestSpawnReleaseOrdering`。
 - **POSIX**：包装进程以 `start_new_session` 成为组长，实际命令与正常后代继承进程组；先对组发 SIGTERM、
   宽限后最后一次 SIGKILL，之后才回收。这是**脚本级**所有权，不承诺父进程被 SIGKILL 后仍能执行清理——
   不要当作 Windows Job 的等价物。
 - **收尾顺序**：全部所属进程确认退出 → 才做最终检查（真实用户目录前后快照、site-packages 无产物）→ 成功才删
   临时目录。任何失败（含意外异常与超时）都保留现场并打印路径；成功路径的目录清理失败也算不通过。
+  现场保留覆盖**任意 `BaseException`**（脚本自身的 `ValueError`/`AttributeError`、`KeyboardInterrupt` 与
+  `TimeoutError`/`OSError`/`SubprocessError` 同等对待），并按原类型继续传播以保留 traceback 与中断语义；
+  「冒烟通过」只在 finally 的现场删除成功后打印——非成功路径绝不出现通过文案。回归：
+  `tests/test_wheel_smoke_isolation.py` 的异常参数化用例。
+- **路径探针只导入 `briefdesk.paths`**（模块常量 `RUNTIME_DIR_PROBE`）：算真实默认缓存目录时若导入
+  `supervisor`/`config`，会连带构造 `Settings`、访问真实钥匙串与 `.env`——探针本身就成了它要防的泄漏源。
+  形态守卫是文本断言（`tests/test_wheel_smoke_lifecycle.py::TestRuntimeDirProbeGuard`），行为面由前后快照对比覆盖。
+- **基准终态按 `run_id` 核对**（`wait_benchmark_terminal`）：状态获取为非 200 时**不得**当成「已收尾」——
+  连接失败与临时 5xx 在同一 monotonic 期限内重试，4xx 等确定错误立即失败，200 但 JSON 损坏 / 非 dict /
+  `running` 非 bool 属协议失败；只有 `running is False` 且 `run_id` 与 POST 一致、且按 `run_id`（不是名字最新的
+  目录）定位到 `meta.terminal` 三态与实际整数 `exit_code`（bool/None 不算）才算完成。`exit_code` 允许非零——
+  这一步验证的是「失败也能收尾」。回归：`tests/test_wheel_smoke_lifecycle.py`。
 
 ### 发行脚本的两条硬契约
 
@@ -1365,8 +1407,12 @@ required field of `weflow`/`qqflow` → that plugin self-disables via `PluginDis
   CRLF，还原后 bytes 已变而文本比较相等，自校验检不出文件被动过；首次写入也在 `try` 内，部分写入同样走恢复。
 - **sdist 检查的现场留存**（`scripts/sdist_check.py`）：用显式成功状态而不是 `finally` 里的 `sys.exc_info()`——
   `except` 分支 `return` 时该值已回到 `None`，用它判断会把检查失败的现场照常删掉，而提示同时声称「现场保留在 …」。
-  任何失败（含 `KeyboardInterrupt` 等意外中断）都保留现场；清理取消 `ignore_errors`，清理失败计入退出码——
-  「检查通过」包含「清理成功」。
+  失败分两类：**检查类失败**（`CheckFailure`）打印说明、保留现场、返回 1；**意外异常/中断**打印现场路径后
+  **按原类型继续传播**（含 `KeyboardInterrupt`）——吞掉它落回 `return 1` 会让「保留现场后再传播」的说明与实现相反：
+  排查者按堆栈找线索却没有堆栈，也分不清是检查失败还是脚本自身的 bug。清理取消 `ignore_errors`，清理失败计入
+  退出码——「检查通过」包含「清理成功」。回归：`tests/test_sdist_check_entry.py`（其修正过程本身就是教训：
+  清理用例的 `build_sdist` 桩返回了错误类型，被旧实现的吞异常转成预期退出码，用例长期假通过、清理分支从未被
+  执行——桩必须返回 `Path`）。
 
 ### Windows 控制台编码与 CI 门禁基线
 
@@ -1394,3 +1440,9 @@ required field of `weflow`/`qqflow` → that plugin self-disables via `PluginDis
   无操作。旧实现用推送载荷 `commits` 数组的长度推算 `HEAD~N`——数组长度不等于第一父链步数（含合并会错位、
   载荷截断会漏扫），首次推送的根提交会越界，数组为空时 HEAD~0 扫了个空 diff 还报成功。回归：
   `tests/test_ci_scan.py` 用临时仓库构造真实 DAG 覆盖上述各分支与退出码承诺。
+- **「读不到」不等于「不存在」**（`scripts/forbidden_refs.py` 的双端内容扫描）：新增行所在文件在新端读取失败时，
+  先用 `git cat-file -e` 分流——新端确实没有该路径（纯删除没有新增行）是合法跳过；**该有而读不到**（git 异常、
+  对象损坏、索引被改写）必须抛错并由入口转退出码 2。一律 continue 等于漏扫还打印「未发现编号引用」——门禁失守
+  比扫不出来更糟。注意 cat-file 的退出码不足以区分两种情况（rev 本身非法与路径缺失同为 128），按 stderr 文案判定
+  「does not exist」才是 git 明确回答「不在」；git 调用与 `_git` 共用参数口径（两处各写一份必然漂移）。回归：
+  `tests/test_no_plan_refs.py` 的读取分流用例（桩返回 None 而非抛错——抛错在旧实现下同样得到退出码 2，零判别力）。
