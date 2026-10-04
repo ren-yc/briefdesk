@@ -41,6 +41,10 @@ powershell -File scripts/sync_vendor.ps1
   qqflow `sdk-dist`（`b6f1f06`，源自 qqflow-server master `c840db5`）。上游生成管线新增确定性
   规范化（逐行去行尾空白、折叠结尾空行、保证单个结尾换行），镜像随之更新；此次同步后
   vendor 内不再有条目级空白问题，范围级空白门禁对镜像部分归零。
+- `list_all_sessions` 页大小参数同步：weflow `sdk-dist`（`5345d6d`，源自 weflow-server master
+  `12d68f2`）、qqflow `sdk-dist`（`819690b`，源自 qqflow-server master `cdf7418`）。上游改动：
+  该方法新增 `page_size`（服务端上限 10000 条/页）与 `keyword`，供**每轮都重读列表**的轮询
+  消费者一次取满——否则 4000 个会话要发 40 个请求。传 `None` 保持服务端默认页，默认值未变。
 - SDK 0.8.0 公共面扩展同步：weflow `sdk-dist`（`682fee7`，源自 weflow-server master `9d26033`）、
   qqflow `sdk-dist`（`4ca7666`，源自 qqflow-server master `dbd090f`）。上游改动：**新增七项公共面**
   （`health` / `accounts` / `register`（非阻塞，原始 `state`/`status`）/ `wait_ready` /
