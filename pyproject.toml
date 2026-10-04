@@ -130,6 +130,20 @@ dev = [
 plugins = ["pydantic.mypy"]
 # vendor/ 是 git subtree 的上游镜像（禁改）：不参加本仓类型检查
 exclude = ["vendor"]
+# 但**要把 vendor 放进模块搜索路径**：插件运行期 import 的就是这份镜像
+# （import weflow_sdk → vendor/weflow_sdk）。本仓以 editable 方式安装，
+# setuptools 为「多根 packages.find」生成的是 finder 式 editable（PEP 660），
+# mypy 不跟随 finder——只装 editable 时它报 import-not-found，而运行期导入
+# 是好的（实测：运行时解析到 vendor/weflow_sdk）。于是类型门禁会红在一个
+# 只有它看得见的问题上。指向 vendor 后，门禁检查的正是随包分发的那份。
+mypy_path = "vendor"
+
+# vendor 只提供类型，不参与被检查：镜像里的生成代码有自己的告警（pydantic v2 的
+# Self 返回、dateutil 缺 stubs 等），修它等于改上游镜像——那是禁改的。这里
+# 只静默**镜像内部**的报告；本仓代码使用 SDK 时的类型错误照常报。
+[[tool.mypy.overrides]]
+module = ["weflow_sdk.*", "qqflow_sdk.*"]
+ignore_errors = true
 
 # tests/ 纳入门禁的范围是「签名级」检查（函数注解、import、模块级语句）：
 # 实测开启 check_untyped_defs 后全量函数体检查会在测试套件上产生约 200 个
