@@ -444,3 +444,62 @@ def test_main_maps_unreadable_new_side_to_exit_2(tmp_path: Path, monkeypatch: py
     assert forbidden_refs.main(["--base", first, "--head", second]) == 2
     captured = capsys.readouterr()
     assert "未发现编号引用" not in captured.out, "漏扫不得伪装成通过"
+
+
+# ── 非 ASCII 路径：git 的引号/转义不得让文件被丢掉或读不到 ──
+
+
+def _repo_with_non_ascii_paths(tmp_path: Path) -> tuple[Path, str, str]:
+    """双提交仓库：非 ASCII 文件名与 ASCII 对照各新增一行命中，返回 (repo, first, second)。"""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+
+    def git(*args: str) -> str:
+        proc = subprocess.run(
+            ["git", *args], cwd=repo, capture_output=True, text=True,
+            encoding="utf-8", errors="replace", check=True,
+        )
+        return proc.stdout.strip()
+
+    hit = f"# 复核 {_ref('P', 1)}-1 示例"
+    git("init", "-q")
+    git("config", "user.email", "probe@example.invalid")
+    git("config", "user.name", "probe")
+    for name in ("plain.py", "配置说明.py"):
+        (repo / name).write_text("x = 1" + chr(10), encoding="utf-8")
+    git("add", "-A")
+    git("commit", "-qm", "first")
+    first = git("rev-parse", "HEAD")
+    for name in ("plain.py", "配置说明.py"):
+        (repo / name).write_text("x = 1" + chr(10) + hit + chr(10), encoding="utf-8")
+    git("add", "-A")
+    git("commit", "-qm", "second")
+    return repo, first, git("rev-parse", "HEAD")
+
+
+def test_tracked_files_and_tree_scan_keep_non_ascii_paths(tmp_path: Path) -> None:
+    """ls-files 默认给非 ASCII 路径加引号：后缀过滤与读取都不得因此丢掉该文件。
+
+    引号形态既让 endswith(_TEXT_SUFFIXES) 失配，也让拼出的路径不存在——全量扫描会
+    静默漏掉它：门禁看起来跑过，却没扫到这个文件。
+    """
+    from scripts import forbidden_refs
+
+    repo, _first, _second = _repo_with_non_ascii_paths(tmp_path)
+    names = forbidden_refs.tracked_files(repo)
+    assert "配置说明.py" in names, f"非 ASCII 文件被后缀过滤丢掉：{names}"
+    assert {hit.path for hit in forbidden_refs.scan_tree(repo)} == {"plain.py", "配置说明.py"}
+
+
+def test_incremental_scan_keeps_non_ascii_paths(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """增量扫描同样按原始路径：diff 头行的引号不得让新增行读不到（旧行为是退出 2）。"""
+    from scripts import forbidden_refs
+
+    repo, first, second = _repo_with_non_ascii_paths(tmp_path)
+    monkeypatch.chdir(repo)
+    diff_text = forbidden_refs._range_diff(first)
+    assert "配置说明.py" in forbidden_refs._added_lines(diff_text), "diff 头行的路径被引号破坏"
+    hits = forbidden_refs.scan_diff(diff_text, rev=None, staged=False, new_side=second)
+    assert {hit.path for hit in hits} == {"plain.py", "配置说明.py"}

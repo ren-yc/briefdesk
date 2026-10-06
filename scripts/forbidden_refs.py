@@ -302,8 +302,11 @@ def scan_text(path: str, text: str) -> list[Hit]:
 
 
 def _git(args: list[str], *, cwd: Path | None = None) -> str:
+    # 统一关掉 core.quotePath：默认开启时 git 会给含非 ASCII 的路径加引号并转义，
+    # ls-files 的名单会因此在后缀过滤处失配（静默漏扫），diff 头行的路径也拼不出
+    # 真实文件（误判「读不到」退出 2）。路径原样输出才是扫描器要的形态。
     proc = subprocess.run(
-        ["git", *args],
+        ["git", "-c", "core.quotePath=false", *args],
         cwd=str(cwd) if cwd is not None else None,
         capture_output=True,
         text=True,
