@@ -1300,8 +1300,8 @@ required field of `weflow`/`qqflow` → that plugin self-disables via `PluginDis
 - **日志行格式与来源列**（跨模块契约，新增日志按此写）：行格式为 `时间戳 LEVEL: 来源 message`。
   - 「来源」由 `logger.short_logger_name()` 从真实 logger 名派生：剥掉 `briefdesk.`/`plugins.` 两段公共前缀（每行重复且零信息量）、按
     `_NAME_ALIASES` 把 `weflow_legacy` 归一为源名形态 `weflow-legacy`（模块名用下划线、插件名/`sessions.source`/`poll_cycle`
-    的 `[%s]` 用连字符，不归一则按源名 grep 会漏一半）、再 `ljust(_NAME_WIDTH=23)` 定宽补齐（取**建了 logger 的模块**中最长短名
-    `weflow-legacy.normalize`——没建 logger 的模块其名字永远不进该列，不参与定宽；超宽不截断，只让该行消息起点右移）。第三方
+    的 `[%s]` 用连字符，不归一则按源名 grep 会漏一半）、再 `ljust(_NAME_WIDTH=26)` 定宽补齐（取**建了 logger 的模块**中最长短名
+    `server.routes_settings_env`——没建 logger 的模块其名字永远不进该列，不参与定宽；该值随**建了 logger 的模块集合**变化，由 `tests/test_log_redaction.py` 的 `ShortLoggerNameTest` 从真实包树枚举兜住（列宽不足即红）；超宽不截断，只让该行消息起点右移）。第三方
     logger（uvicorn/httpx/PIL）原样保留。
   - 只改**显示**：真实 `record.name` 不变——大量 `assertLogs("briefdesk.plugins.<pkg>.<mod>")` 依赖它，`briefdesk.*` 也要能整
     树设级别。
@@ -1369,7 +1369,7 @@ required field of `weflow`/`qqflow` → that plugin self-disables via `PluginDis
 
 - **Windows**：包装进程被指进 `KILL_ON_JOB_CLOSE` 的 Job，句柄取自 `Popen` **持有的**进程句柄（不按 PID 重新
   `OpenProcess`——句柄已退出、PID 被复用时会把无关进程指进 Job）；清理先 `TerminateJobObject` 再等
-  `ActiveProcesses` 归零，最后关句柄并回收包装进程，确认计数之前不关句柄（关了就没有内核兜底的依据）。
+  `ActiveProcesses` 归零，最后关句柄并回收包装进程，确认计数之前不关句柄（关了就没有内核兜底的依据）。**归零确认才算清理成功**：查询失败（`None`）与等待超时都不算归零，按清理失败上抛（`close_all` 聚合），不静默放过。
   嵌套 Job 被 runner 拒绝时显式失败，不绕开其管理。父进程硬死时由内核兜底。
 - **唯一规范顺序**（`run()` 与 `start_app()` 共用）：`_spawn_wrapper`（写 PENDING → Popen → 记组号，**不放行**）
   → 立即 `proc.poll()`（此时还没放行，已退出只可能是 wrapper 自身启动失败 → 报「包装进程提前退出」并清理，
