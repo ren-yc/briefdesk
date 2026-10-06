@@ -196,12 +196,17 @@ class TestSpawnReleaseOrdering:
         finally:
             cmds.close_all()
 
+    @pytest.mark.skipif(sys.platform != "win32", reason="Windows Job 路径")
     def test_wrapper_early_exit_before_release_reported_as_early_exit(self, root: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         """wrapper 在放行前自行退出：报「包装进程提前退出」，不误报嵌套 Job 被拒。
 
         新时序下 poll 紧邻 spawn，真实 wrapper 不可能确定性地在此之前退出——
         把 _WRAPPER_SOURCE 换成立即退出的变体，并把 spawn 包装成「等它退出后
-        再返回」，poll 必然看到已退出。"""
+        再返回」，poll 必然看到已退出。
+
+        「提前退出」判定只在 Windows 分支（POSIX 的 poll 会回收子进程，一旦回收就
+        无法再向它所在的进程组发信号），所以本用例限定 Windows：POSIX 上它等满总
+        期限后报的是「未完成」，与生产分支不匹配。"""
         exit_source = smoke_process._WRAPPER_SOURCE.replace(
             "    while True:",
             "    import sys as _s\n    _s.exit(9)\n    while True:",
@@ -213,6 +218,9 @@ class TestSpawnReleaseOrdering:
         def _spawn_then_wait(self, owned, cmd, *, env, cwd):
             proc = real_spawn(self, owned, cmd, env=env, cwd=cwd)
             proc.wait(timeout=10)
+            # 已 wait 回收的进程不得再向旧进程组发信号（组号可能已被复用）：桩在这里
+            # 补上真实清理路径会置的标记，保持「回收过就只报告不误杀」的不变式。
+            owned.reaped = True
             return proc
 
         monkeypatch.setattr(SmokeCommands, "_spawn_wrapper", _spawn_then_wait)
