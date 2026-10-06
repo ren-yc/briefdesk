@@ -274,8 +274,8 @@ class StagedCommitError(OSError):
 
     删除失败被吞成 ok:true 是静默丢写入（文件仍在磁盘、内容原样）；写/替换失败
     若不接错误面，OSError 会穿出路由变成无 detail 的 500。继承 OSError 以兼容
-    既有「写入失败抛 OSError」的调用方契约。stage 指出失败阶段（write/replace/
-    delete），供路由映射结构化明细；「文件本就不存在」不算失败（删除幂等）。
+    既有「写入失败抛 OSError」的调用方契约。stage 指出失败阶段（mkdir/write/
+    replace/delete），供路由映射结构化明细；「文件本就不存在」不算失败（删除幂等）。
     """
 
     def __init__(self, stage: str, message: str) -> None:
@@ -353,6 +353,19 @@ def read_staged_from_bytes(candidate: bytes | None) -> dict[str, str]:
     return {k: v for k, v in raw.items() if v is not None}
 
 
+def _discard_tmp(tmp: Path) -> None:
+    """尽力清理残留 .tmp；清理自身失败只记 debug，绝不顶替原始提交错误。
+
+    调用点都在 except OSError 分支里：清理异常若从这里穿出，调用方正要构造的
+    StagedCommitError（带真实失败阶段）会被它顶掉；路由只捕 StagedCommitError，
+    裸 OSError 会变成无 detail 的 500——原始原因与阶段一起丢失。
+    """
+    try:
+        tmp.unlink(missing_ok=True)
+    except OSError:
+        logger.debug("暂存临时文件清理失败: %s", tmp, exc_info=True)
+
+
 def commit_staged_write(candidate: bytes | None) -> None:
     """提交 prepare 产出的候选 bytes（或删除文件）；失败时原文件保持不变。
 
@@ -372,12 +385,18 @@ def commit_staged_write(candidate: bytes | None) -> None:
                 "delete", f"暂存文件删除失败: {path}（{error}）"
             ) from error
         return
-    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as error:
+        # 目录创建失败同样要结构化：裸 OSError 穿出路由只会留下无 detail 的 500
+        raise StagedCommitError(
+            "mkdir", f"暂存目录创建失败: {path.parent}（{error}）"
+        ) from error
     tmp = path.with_suffix(path.suffix + ".tmp")
     try:
         tmp.write_bytes(candidate)
     except OSError as error:
-        tmp.unlink(missing_ok=True)
+        _discard_tmp(tmp)
         raise StagedCommitError(
             "write", f"暂存状态写入失败: {path}（{error}）"
         ) from error
@@ -385,7 +404,7 @@ def commit_staged_write(candidate: bytes | None) -> None:
         os.replace(tmp, path)
     except OSError as error:
         # 写入/替换失败时清理残留 .tmp（原文件未被 os.replace 触碰，保持不变）
-        tmp.unlink(missing_ok=True)
+        _discard_tmp(tmp)
         raise StagedCommitError(
             "replace", f"暂存状态替换失败: {path}（{error}）"
         ) from error

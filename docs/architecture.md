@@ -1159,7 +1159,7 @@ required field of `weflow`/`qqflow` → that plugin self-disables via `PluginDis
   `KEY=VALUE` 拆成伪键行，「 #」是 dotenv 行内注释起点（回读截断会写出与用户所见不同的名单）。回归：`WholeValueTemplateTest`。
   暂存文件读不出来（权限/编码）时 PUT 直接拒绝写入（`StagedReadError` → 409；旧行为把读失败当空文件，下一次写入会抹掉整个
   暂存态）。**写方向同样不得静默**：`commit_staged_write` 的写入/替换/删除失败抛 `StagedCommitError`（继承 `OSError`，
-  只忽略「文件本就不存在」），路由统一映射为 500 + `{type: "staged_commit_failed", stage: write|replace|delete}`——
+  只忽略「文件本就不存在」），路由统一映射为 500 + `{type: "staged_commit_failed", stage: mkdir|write|replace|delete}`——
   删除失败被吞成 `ok:true` 是静默丢写入（文件仍在磁盘、内容原样），而裸 `OSError` 穿出路由只会留下无 detail 的 500；
   不用 409（那是「客户端可调整后重试」，OS 占用改多少次都一样）。写后回传状态用严格读取 `read_staged_strict()`：
   吞异常的展示口径会把「已写入但读不出」变成 `ok:true` + 空明细（比报错更坏），此时返回 500 +

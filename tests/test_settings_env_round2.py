@@ -489,6 +489,112 @@ class StagedCommitFailureTest(StagedFileTestCase):
             "替换失败时原文件必须不变",
         )
 
+    def test_mkdir_permission_error_is_500_with_stage(self) -> None:
+        """目录创建失败同样必须结构化：裸 OSError 穿出路由只会是无 detail 的 500。"""
+        real_mkdir = Path.mkdir
+
+        def _boom(path: Path, *a: object, **k: object) -> None:
+            if path == self.staged_path.parent:
+                raise PermissionError("parent dir denied")
+            real_mkdir(path, *a, **k)  # type: ignore[arg-type]
+
+        with patch.object(Path, "mkdir", _boom):
+            res = self.client.put(
+                "/api/settings/env",
+                json={"items": {"LOG_LEVEL": "INFO"}},
+            )
+        self.assertEqual(res.status_code, 500)
+        detail = res.json()["detail"]
+        self.assertEqual(detail["type"], "staged_commit_failed")
+        self.assertEqual(detail["stage"], "mkdir")
+        self.assertFalse(self.staged_path.exists(), "目录都没建起来，不应留下文件")
+
+    def test_write_failure_with_cleanup_failure_keeps_structured_error(self) -> None:
+        """写失败后 .tmp 清理再失败：清理不得顶替原始阶段，仍须是结构化 500。"""
+        real_write = Path.write_bytes
+        real_unlink = Path.unlink
+
+        def _write_boom(path: Path, *a: object, **k: object) -> int:
+            if path.suffix == ".tmp":
+                raise OSError("disk full")
+            return real_write(path, *a, **k)  # type: ignore[arg-type]
+
+        def _unlink_boom(path: Path, *a: object, **k: object) -> None:
+            if path.suffix == ".tmp":
+                raise PermissionError("tmp locked")
+            real_unlink(path, *a, **k)  # type: ignore[arg-type]
+
+        with (
+            patch.object(Path, "write_bytes", _write_boom),
+            patch.object(Path, "unlink", _unlink_boom),
+        ):
+            res = self.client.put(
+                "/api/settings/env",
+                json={"items": {"LOG_LEVEL": "INFO"}},
+            )
+        self.assertEqual(res.status_code, 500)
+        detail = res.json()["detail"]
+        self.assertEqual(detail["type"], "staged_commit_failed")
+        self.assertEqual(detail["stage"], "write")
+
+    def test_replace_failure_with_cleanup_failure_keeps_structured_error(self) -> None:
+        """替换失败后 .tmp 清理再失败：原文件不变，阶段仍是 replace。"""
+        write_staged({"LOG_LEVEL": "DEBUG"})
+        real_unlink = Path.unlink
+
+        def _unlink_boom(path: Path, *a: object, **k: object) -> None:
+            if path.suffix == ".tmp":
+                raise PermissionError("tmp locked")
+            real_unlink(path, *a, **k)  # type: ignore[arg-type]
+
+        with (
+            patch.object(
+                settings_env.os, "replace", side_effect=OSError("replace denied")
+            ),
+            patch.object(Path, "unlink", _unlink_boom),
+        ):
+            res = self.client.put(
+                "/api/settings/env",
+                json={"items": {"LOG_LEVEL": "INFO"}},
+            )
+        self.assertEqual(res.status_code, 500)
+        detail = res.json()["detail"]
+        self.assertEqual(detail["type"], "staged_commit_failed")
+        self.assertEqual(detail["stage"], "replace")
+        self.assertEqual(
+            self.staged_path.read_text(encoding="utf-8"),
+            "LOG_LEVEL=DEBUG\n",
+            "替换失败时原文件必须不变",
+        )
+
+    def test_commit_error_keeps_original_cause_when_cleanup_fails(self) -> None:
+        """清理失败不得顶替原始原因：__cause__ 必须是真实的提交失败异常。
+
+        路由的 500 明细里只有固定文案（原始 OSError 文本不回显），原因是否保留
+        只能直调 commit_staged_write 从 __cause__ 断言。
+        """
+        original = OSError("commit denied")
+        real_unlink = Path.unlink
+
+        def _unlink_boom(path: Path, *a: object, **k: object) -> None:
+            if path.suffix == ".tmp":
+                raise PermissionError("tmp locked")
+            real_unlink(path, *a, **k)  # type: ignore[arg-type]
+
+        for stage, failing in (
+            ("write", patch.object(Path, "write_bytes", side_effect=original)),
+            ("replace", patch.object(settings_env.os, "replace", side_effect=original)),
+        ):
+            with (
+                self.subTest(stage=stage),
+                failing,
+                patch.object(Path, "unlink", _unlink_boom),
+                self.assertRaises(settings_env.StagedCommitError) as ctx,
+            ):
+                settings_env.commit_staged_write(b"LOG_LEVEL=INFO\n")
+            self.assertEqual(ctx.exception.stage, stage)
+            self.assertIs(ctx.exception.__cause__, original)
+
     def test_post_write_reread_failure_is_500_state_unknown(self) -> None:
         """写后严格重读失败：500 + staged_state_unknown，不得回 200 ok:true。
 
