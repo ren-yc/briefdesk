@@ -234,7 +234,11 @@ class TestSpawnReleaseOrdering:
             released.append(True)
             real_release(owned)
 
-        monkeypatch.setattr(SmokeCommands, "_release", _tracking_release)
+        # 生产 _release 是 @staticmethod，调用点是 self._release(owned)：桩以普通函数挂到
+        # 类上会被绑定、多收一个 self 而抛 TypeError，released 永远为空——断言恒真、等于
+        # 没测。包成 staticmethod 才让跟踪生效：把放行提到提前退出判定之前时，本用例必须
+        # 给出 assert released == [] 的失败，而不是 TypeError。
+        monkeypatch.setattr(SmokeCommands, "_release", staticmethod(_tracking_release))
         try:
             with pytest.raises(SmokeCommandError, match="提前退出") as exc_info:
                 cmds.run([sys.executable, "-c", "print('never')"], timeout=30)
