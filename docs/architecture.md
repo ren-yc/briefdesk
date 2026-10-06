@@ -1429,6 +1429,10 @@ required field of `weflow`/`qqflow` → that plugin self-disables via `PluginDis
   调用点随后 `AttributeError`，宽松判断则直接漏判）。捕获型调用一律写
   `encoding="utf-8", errors="replace"`，并让子进程也按 UTF-8 输出（注入 `PYTHONIOENCODING=utf-8`）；
   守卫见 `tests/test_subprocess_encoding.py`。
+- **文件内容一律 UTF-8、不带 BOM**：上面的重配只管**流的编码**，文件本身另有一层约定——文本类文件必须是
+  UTF-8 且不带 BOM，守卫见 `tests/test_text_encoding.py`。「文本类」由 git 的内容判定给出
+  （`git ls-files --eol` 工作区侧 `w/` ≠ `-text`，含空文件与工作区缺失），不按后缀白名单，故新增扩展名
+  自动覆盖；git 判为二进制的文件（含 NUL 的 UTF-16、内容为二进制却挂文本后缀）豁免。编辑器侧见 `.editorconfig`。
 - **CI 扫描范围只认事件载荷里的固定 SHA**，由 `scripts/ci_scan.py` 单点解析与编排（workflow 里只有
   一次 `python scripts/ci_scan.py`）。三个扫描器共用同一范围：**内容扫描比较两端树的差异**（双端
   `--base/--head`，直接 `git diff base head`，不构造三点范围——三点会引入 merge-base 这个隐藏基线），
