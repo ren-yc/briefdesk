@@ -625,7 +625,8 @@ def wait_benchmark_terminal(
 ) -> Path:
     """按 run_id 轮询到运行终态；协议错误立即失败，临时故障在期限内重试。
 
-    判据（与 supervisor 的三态契约同源）：meta.json 存在、meta.run_id 一致、
+    `running` 存在但非 bool（含 null）是协议失败，字段缺失按过渡态重试；判据
+    （与 supervisor 的三态契约同源）：meta.json 存在、meta.run_id 一致、
     terminal.state ∈ {completed, failed-recorded, aborted}、terminal.exit_code 是
     实际整数（bool/None 不算）。exit_code 允许非零——本步骤验证的是「失败也能
     收尾」，不要求业务成功。meta 由 supervisor 在 spawn 前先写、终态后补写，
@@ -661,6 +662,11 @@ def wait_benchmark_terminal(
                 state = None
             if not isinstance(state, dict):
                 raise SmokeFailure(f"基准状态响应不是 JSON 对象: {body[:200]}")
+            # 字段存在即必须有确定语义：None/字符串/数字说明响应形态已变，按过渡态
+            # 继续等会把它拖成期限耗尽，把「契约被破坏」误报成「收尾慢」（回归见
+            # tests/test_wheel_smoke_lifecycle.py 的非 bool 用例）
+            if "running" in state and not isinstance(state["running"], bool):
+                raise SmokeFailure(f"基准状态响应的 running 不是布尔值: {body[:200]}")
             if state.get("running") is False and state.get("run_id") == run_id:
                 run_dir = _locate_run_dir(runs_root, run_id, deadline)
                 if run_dir is not None:

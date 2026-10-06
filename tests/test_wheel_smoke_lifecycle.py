@@ -102,6 +102,37 @@ class TestWaitBenchmarkTerminal:
         with pytest.raises(SmokeFailure, match="不是 JSON 对象"):
             wait_benchmark_terminal("http://x", _RUN_ID, runs, timeout=30, fetcher=fetch)
 
+    @pytest.mark.parametrize("running", [None, "false", 1, 0, []])
+    def test_non_bool_running_is_protocol_failure(
+        self, tmp_path: Path, no_sleep: None, running: Any
+    ) -> None:
+        """running 存在但非 bool（含 null）是协议失败，不能按过渡态等到期限耗尽。
+
+        判别构造：断言必须匹配该分支的**专属文案**——只写
+        pytest.raises(SmokeFailure) 在缺陷实现下也会因期限耗尽而通过（只是消息
+        不同），自检会落空。显式 null 与「字段缺失」必须分开判定：
+        `state.get("running") is None` 会把 null 当成缺失、按过渡态放行。
+        """
+        runs = tmp_path / "runs"
+        fetch = _fetcher_seq([(200, json.dumps({"running": running, "run_id": _RUN_ID}))])
+        with pytest.raises(SmokeFailure, match="running 不是布尔值"):
+            wait_benchmark_terminal("http://x", _RUN_ID, runs, timeout=2, fetcher=fetch)
+        assert fetch.state["n"] == 1, "协议失败不得继续轮询"
+
+    def test_missing_running_key_keeps_waiting(self, tmp_path: Path, no_sleep: None) -> None:
+        """字段缺失是过渡态：继续等到出现终态，不得判成协议失败。"""
+        runs = tmp_path / "runs"
+        made = _make_run_dir(runs, "run-x", _terminal_meta())
+        fetch = _fetcher_seq(
+            [
+                (200, json.dumps({"run_id": _RUN_ID})),
+                (200, json.dumps({"running": False, "run_id": _RUN_ID})),
+            ]
+        )
+        got = wait_benchmark_terminal("http://x", _RUN_ID, runs, timeout=5, fetcher=fetch)
+        assert got == made
+        assert fetch.state["n"] == 2
+
     def test_missing_run_id_is_transitional_keeps_waiting(self, tmp_path: Path, no_sleep: None) -> None:
         """running False 但没带 run_id 是过渡状态：继续等，不判完成也不判失败。"""
         runs = tmp_path / "runs"
