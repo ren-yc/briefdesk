@@ -629,7 +629,9 @@ def wait_benchmark_terminal(
     terminal.state ∈ {completed, failed-recorded, aborted}、terminal.exit_code 是
     实际整数（bool/None 不算）。exit_code 允许非零——本步骤验证的是「失败也能
     收尾」，不要求业务成功。meta 由 supervisor 在 spawn 前先写、终态后补写，
-    中间态（缺文件/半写 JSON）按期限重试；只有期限耗尽才失败。
+    中间态（缺文件/半写 JSON）按期限重试；只有期限耗尽才失败。期限在循环开头、
+    响应返回后与接受终态前各核对一次，单次请求的 timeout 收敛到剩余预算——否则
+    跨过期限后返回的合法终态仍会被接受。
 
     fetcher 缺省为 http（生产形态不变）；注入是为了让终态状态机的协议分支
     在 pytest 内可判定（回归见 tests/test_wheel_smoke_lifecycle.py）——真跑
@@ -637,8 +639,21 @@ def wait_benchmark_terminal(
     """
     fetch = fetcher if fetcher is not None else http
     deadline = time.monotonic() + timeout
+
+    def _deadline_passed() -> None:
+        # 三处共用同一条失败消息（调用方按「按 run_id 核对的终态」断言）
+        if time.monotonic() >= deadline:
+            raise SmokeFailure(
+                f"基准运行 {run_id} 未在 {timeout:.0f}s 内出现按 run_id 核对的终态（清理契约失效？）"
+            )
+
     while True:
-        status, body = fetch(f"{base}/api/benchmark/run", timeout=5)
+        _deadline_passed()
+        # 单次请求不得超过剩余预算：固定 5s 会在期限将到时白等一轮，跨过期限后
+        # 返回的响应还会被当作有效结果
+        remaining = max(deadline - time.monotonic(), 0.1)
+        status, body = fetch(f"{base}/api/benchmark/run", timeout=min(5, remaining))
+        _deadline_passed()
         if status == 200:
             try:
                 state = json.loads(body)
@@ -649,15 +664,12 @@ def wait_benchmark_terminal(
             if state.get("running") is False and state.get("run_id") == run_id:
                 run_dir = _locate_run_dir(runs_root, run_id, deadline)
                 if run_dir is not None:
+                    _deadline_passed()  # 定位期间可能已跨过期限：合法终态也不接受
                     return run_dir
         elif status in (502, 503, 504):
             pass  # 应用临时不可达（收尾中的重启窗口）：期限内重试
         elif status != 0 and status < 500:
             raise SmokeFailure(f"基准状态请求失败: HTTP {status} {body[:200]}")
-        if time.monotonic() >= deadline:
-            raise SmokeFailure(
-                f"基准运行 {run_id} 未在 {timeout:.0f}s 内出现按 run_id 核对的终态（清理契约失效？）"
-            )
         time.sleep(1)
 
 
