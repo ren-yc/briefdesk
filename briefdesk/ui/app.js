@@ -5308,9 +5308,15 @@ function renderPluginToggles() {
   const pluginsOverridden = !!envData.pluginsOverridden
     || envData.pluginsSource === "env" || envData.pluginsSource === "dotenv";
   // 预期名单不可用：顶部错误说明（不是「全部关闭」的推断）
+  // 错误块只追加指引、不改写前缀（「插件预期名单无法解析」是既有文案契约）：坏值可能
+  // 落在 env / 项目 .env / 本机配置三层中的任意一层，用户需要知道本机配置是哪份文件、
+  // 以及怎么原子清除本机两键（PUT 的 null = 移除暂存项，一次请求同时清两键）。
   const expectedErrorNotice = envData.pluginsExpectedError
     ? '<div class="plugins-env-notice">插件预期名单无法解析：' + esc(envData.pluginsExpectedError)
-      + "——请修正该来源（环境变量 / 项目 .env / 本机配置）后刷新。开关已停用。</div>"
+      + "——请修正该来源（环境变量 / 项目 .env / 本机配置）后刷新。开关已停用。"
+      + "本机配置（暂存文件）：" + esc(envData.filePath)
+      + "；若坏值来自该文件，可提交 "
+      + "{'items': {'PLUGINS': null, 'PLUGINS_REQUIRED': null}} 原子清除本机两键后重启。</div>"
     : "";
   const envNotice = pluginsOverridden
     ? '<div class="plugins-env-notice">PLUGINS 当前由「' + esc(_envSourceLabel(envData.pluginsSource))

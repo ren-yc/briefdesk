@@ -1074,6 +1074,22 @@ class SourceLayerTest(StagedFileTestCase):
         with _env_without("SERVER_PORT"), patch.dict(os.environ, {"server_port": "3222"}):
             self.assertEqual(source_of("SERVER_PORT"), "env")
 
+    def test_lookup_value_skips_none_homonym(self) -> None:
+        """同义键（仅大小写不同）中前者为 None 时取后者的值。
+
+        None 表示该键没有值（dotenv 的无值行解析结果就是 None）；命中即返回会把
+        另一个变体的有值行挡住。这是增强：只有同义键并存且其中一个是无值行的罕见
+        形态会改变取值。
+        """
+        self.assertEqual(
+            settings_env._lookup_value({"plugins": None, "PLUGINS": '["alpha"]'}, "PLUGINS"),
+            '["alpha"]',
+        )
+        self.assertEqual(
+            settings_env._lookup_value({"plugins": '["beta"]', "PLUGINS": None}, "PLUGINS"),
+            '["beta"]',
+        )
+
 
 class FieldEnvKeyTest(unittest.TestCase):
     """字段 → 环境变量键：alias 优先，否则 env_prefix + 字段名大写。"""

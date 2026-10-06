@@ -90,10 +90,16 @@ def _env_value(alias: str) -> str | None:
 
 
 def _lookup_value(values: Mapping[str, str | None], alias: str) -> str | None:
-    """大小写不敏感查表（与 pydantic-settings 的默认口径一致）。"""
+    """大小写不敏感查表（与 pydantic-settings 的默认口径一致）。
+
+    值为 None 的同义键不算命中，继续找下一个：None 表示该键没有值（dotenv 的无值行
+    解析结果就是 None），命中即返回会让另一个大小写变体的有值行被挡住。空串仍是
+    「有值」（见 _file_value）。这是增强——只有同义键并存且其中一个是无值行的罕见
+    形态会改变取值。
+    """
     target = alias.upper()
     for key, value in values.items():
-        if key is not None and key.upper() == target:
+        if key is not None and key.upper() == target and value is not None:
             return value
     return None
 

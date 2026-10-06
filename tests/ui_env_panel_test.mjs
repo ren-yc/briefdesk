@@ -827,6 +827,11 @@ sandbox.renderPluginToggles();
   const html = getElement("plugins-list").innerHTML;
   assert.match(html, /无法解析/, "预期未知必须显示错误说明，不能显示「全关」引导");
   assert.doesNotMatch(html, /当前未启用任何可选插件/, "不得做「全部关闭」的推断");
+  assert.ok(html.includes("C:/tmp/settings.env"), "错误说明必须给出本机配置的文件路径");
+  assert.ok(
+    html.includes("{'items': {'PLUGINS': null, 'PLUGINS_REQUIRED': null}}"),
+    "错误说明必须给出原子清除本机两键的恢复指引",
+  );
   // 防御断言：未知时 _pluginChanges 不得产出 PLUGINS 假更改
   vm.runInContext("pluginDraftSet = new Set();", sandbox);
   assert.deepEqual(JSON.parse(JSON.stringify(sandbox._pluginChanges())), {}, "预期未知不得提交清空名单的假更改");
