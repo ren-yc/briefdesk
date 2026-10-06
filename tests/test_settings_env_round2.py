@@ -371,14 +371,46 @@ class WholeValueTemplateTest(StagedFileTestCase):
         self.assertNotIn("PLUGINS", settings_env.read_staged())
 
     def test_multiline_template_rejected_422(self) -> None:
-        """放宽处必须补换行拒绝：multi 分支走不到通用 text 尾巴。"""
-        draft = '${BD_A:-["a"' + chr(10) + "]} ",
+        """放宽处必须补换行拒绝：multi 分支走不到通用 text 尾巴。
+
+        draft 必须是字符串：元组会被 payload 校验在路由函数体之前挡下（422 的
+        detail 是列表），根本走不到这里要证明的规范化层。
+        """
+        draft = '${BD_A:-["a"' + chr(10) + "]} "
+        self.assertIsInstance(draft, str)
         res = self.client.put(
             "/api/settings/env",
             json={"items": {"PLUGINS": draft}},
         )
         self.assertEqual(res.status_code, 422)
+        detail = res.json()["detail"]
+        # 字符串 detail = 规范化层抛的文案；payload 层 422 的 detail 是列表
+        self.assertIsInstance(detail, str)
+        self.assertIn("换行", detail)
         self.assertNotIn("PLUGINS", settings_env.read_staged())
+
+    def test_carriage_return_template_rejected_422(self) -> None:
+        """CR 变体同样要拒：dotenv 按行拆分时 CR 与 LF 等价。"""
+        draft = '${BD_A:-["a"' + chr(13) + "]} "
+        self.assertIsInstance(draft, str)
+        res = self.client.put(
+            "/api/settings/env",
+            json={"items": {"PLUGINS": draft}},
+        )
+        self.assertEqual(res.status_code, 422)
+        detail = res.json()["detail"]
+        self.assertIsInstance(detail, str)
+        self.assertIn("换行", detail)
+        self.assertNotIn("PLUGINS", settings_env.read_staged())
+
+    def test_prepare_rejects_newline_value_directly(self) -> None:
+        """规范化层之外的第二道：不经路由直调 prepare 同样拒绝换行值。
+
+        路由层 422 由 normalize_setting 给出；外部编辑器/旧残留经其它路径写入时
+        靠 prepare 拦下，否则换行会把 KEY=VALUE 行拆出伪键。
+        """
+        with self.assertRaises(ValueError):
+            settings_env.prepare_staged_write({"LOG_LEVEL": "a" + chr(10) + "b"})
 
     def test_inline_comment_template_rejected_422(self) -> None:
         """放宽处必须补「 #」拒绝：dotenv 回读截断会写出与用户所见不同的名单。"""
