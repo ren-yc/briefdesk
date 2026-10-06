@@ -858,9 +858,9 @@ def main() -> int:
             assert_no_leaks(venv, data_dir, cache_dir, settings_file, real_runs_root, real_runs_before)
         elif cleanup_error is not None:
             raise SmokeFailure(f"所属进程未全部确认退出，跳过最终检查并保留现场: {cleanup_error}")
-        # 「冒烟通过」只在 finally 的完整收尾（现场删除成功）后打印：
-        # 收尾清理或现场删除失败都属于非成功路径，提前打印会让失败输出混进成功文案。
-        return 0
+        # 不在此处 return：try 内的返回会把「成功」压栈，finally 里置位的 primary_error
+        # 再也改变不了它——收尾清理或现场删除失败会被静默报成通过（退出码 0）。
+        # 「冒烟通过」文案与返回值统一由 try/finally 之后的出口按 primary_error 决定。
     except SmokeFailure as error:
         primary_error = error
     except SmokeCommandError as error:
