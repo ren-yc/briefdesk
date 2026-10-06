@@ -370,23 +370,15 @@ def _patch_git_cwd(monkeypatch: pytest.MonkeyPatch, repo: Path) -> None:
             raise RuntimeError(f"git {' '.join(args)} 失败：{proc.stderr.strip()}")
         return proc.stdout
 
-    def _git_result(args: list[str], *, cwd: Path | None = None) -> tuple[int, str]:
-        proc = subprocess.run(
-            ["git", *args], cwd=str(cwd or repo), capture_output=True, text=True,
-            encoding="utf-8", errors="replace", check=False,
-        )
-        return proc.returncode, proc.stderr.strip()
-
     monkeypatch.setattr(forbidden_refs, "_git", _git)
-    monkeypatch.setattr(forbidden_refs, "_git_result", _git_result)
 
 
 def test_scan_diff_raises_when_present_file_cannot_be_read(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """新端确实有该文件却读不到：必须抛错，不得静默跳过当作「没内容可扫」。
+    """有新增行却读不到新端：必须抛错，不得静默跳过当作「没内容可扫」。
 
     桩返回 None（不是抛错）——抛错在「None 即跳过」的旧实现下同样会经 main
     的异常路径得到退出码 2，用例照样绿，等于零判别力。这里模拟的是读取本身
-    失败（对象损坏 / 索引被改写）而 cat-file 明确回答「文件在」的分歧场景。
+    失败（对象损坏 / 索引被改写）：新增行已经证明新端该有这个文件。
     """
     from scripts import forbidden_refs
 
@@ -398,8 +390,6 @@ def test_scan_diff_raises_when_present_file_cannot_be_read(tmp_path: Path, monke
     ).stdout
     assert "+two" in diff_text, "夹具必须产生新增行"
     monkeypatch.setattr(forbidden_refs, "_file_at_rev", lambda rev, path: None)
-    # 前提确认：新端真的有这个路径（否则跳过是合法的，用例失去意义）
-    assert forbidden_refs._file_exists_at(second, "a.txt") is True
     with pytest.raises(RuntimeError, match="读不到"):
         forbidden_refs.scan_diff(diff_text, rev=None, staged=False, new_side=second)
 
@@ -422,8 +412,12 @@ def test_scan_diff_skips_pure_deletion(tmp_path: Path, monkeypatch: pytest.Monke
     assert forbidden_refs.scan_diff(diff_text, rev=None, staged=False, new_side=deleted) == []
 
 
-def test_scan_diff_raises_when_existence_check_itself_fails(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """存在性判定本身失败（rev 非法 / git 环境坏）：按扫描未执行抛错，不判「不存在」。"""
+def test_scan_diff_fails_closed_when_new_side_rev_is_invalid(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """新端 rev 非法（基线引用失效等）：按扫描未执行抛错，不得判「没有该文件」。
+
+    这条不桩 _file_at_rev，走的是真实的 git 失败路径——rev 取不到时「读不到」
+    与「文件不存在」无法区分，只能失败关闭。
+    """
     from scripts import forbidden_refs
 
     repo, first, second = _repo_with_added_lines(tmp_path)
@@ -432,8 +426,8 @@ def test_scan_diff_raises_when_existence_check_itself_fails(tmp_path: Path, monk
         ["git", "diff", "--unified=0", first, second], cwd=repo, capture_output=True,
         text=True, encoding="utf-8", errors="replace", check=True,
     ).stdout
-    monkeypatch.setattr(forbidden_refs, "_file_at_rev", lambda rev, path: None)
-    with pytest.raises(RuntimeError, match="无法判定"):
+    assert "+two" in diff_text, "夹具必须产生新增行"
+    with pytest.raises(RuntimeError, match="读不到"):
         forbidden_refs.scan_diff(diff_text, rev=None, staged=False, new_side="no-such-rev")
 
 
