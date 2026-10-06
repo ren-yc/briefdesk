@@ -335,14 +335,21 @@ def tracked_files(root: Path | None = None) -> list[str]:
 
 
 def scan_tree(root: Path | None = None) -> list[Hit]:
-    """全量扫描跟踪文件（收口核查用；基线机制见 tests/test_no_plan_refs.py）。"""
+    """全量扫描跟踪文件（收口核查用；基线机制见 tests/test_no_plan_refs.py）。
+
+    文本后缀的跟踪文件读不出来（非 UTF-8、工作区缺该文件、权限拒绝）时按**命中**
+    报出，而不是跳过：跳过等于「跑过了但没扫」——scan_tree 返回 0 命中、入口退出 0，
+    门禁看起来是绿的，而该文件的注释与文档正文从未被读过。报成命中后调用方（入口的
+    退出码 1、pytest 守卫的断言）都看得见。
+    """
     base = root or Path.cwd()
     hits: list[Hit] = []
     for rel in tracked_files(base):
         path = base / rel
         try:
             source = path.read_text(encoding="utf-8")
-        except (OSError, UnicodeDecodeError):
+        except (OSError, UnicodeDecodeError) as error:
+            hits.append(Hit(rel, 0, "读取失败", f"{type(error).__name__}：该文件未纳入扫描"))
             continue
         hits.extend(scan_source(rel, source))
     return hits

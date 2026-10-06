@@ -503,3 +503,60 @@ def test_incremental_scan_keeps_non_ascii_paths(
     assert "配置说明.py" in forbidden_refs._added_lines(diff_text), "diff 头行的路径被引号破坏"
     hits = forbidden_refs.scan_diff(diff_text, rev=None, staged=False, new_side=second)
     assert {hit.path for hit in hits} == {"plain.py", "配置说明.py"}
+
+
+# ── 全量扫描：读不到的文件必须响亮，不得静默跳过 ──
+
+
+def _repo_with_unreadable_text_files(tmp_path: Path) -> Path:
+    """仓库：一个可读文件、一个 GBK 文本文件、一个跟踪后被从工作区删除的文件。"""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+
+    def git(*args: str) -> str:
+        proc = subprocess.run(
+            ["git", *args], cwd=repo, capture_output=True, text=True,
+            encoding="utf-8", errors="replace", check=True,
+        )
+        return proc.stdout.strip()
+
+    git("init", "-q")
+    git("config", "user.email", "probe@example.invalid")
+    git("config", "user.name", "probe")
+    (repo / "ok.py").write_text("x = 1" + chr(10), encoding="utf-8")
+    (repo / "gbk.md").write_bytes("# 标题".encode("gbk"))
+    (repo / "gone.py").write_text("y = 1" + chr(10), encoding="utf-8")
+    git("add", "-A")
+    git("commit", "-qm", "init")
+    (repo / "gone.py").unlink()
+    return repo
+
+
+def test_scan_tree_reports_unreadable_files_instead_of_skipping(tmp_path: Path) -> None:
+    """非 UTF-8 / 工作区缺失的跟踪文件必须报出，不能静默跳过。
+
+    静默跳过等于「跑过了但没扫」：scan_tree 返回 0 命中、入口退出 0，门禁看起来是
+    绿的，而该文件的注释与文档正文从未被读过。
+    """
+    from scripts import forbidden_refs
+
+    repo = _repo_with_unreadable_text_files(tmp_path)
+    by_path = {hit.path: hit for hit in forbidden_refs.scan_tree(repo)}
+    assert set(by_path) == {"gbk.md", "gone.py"}, f"读不到的文件必须被报出：{sorted(by_path)}"
+    for rel in ("gbk.md", "gone.py"):
+        assert by_path[rel].rule == "读取失败", by_path[rel]
+        assert by_path[rel].line == 0, by_path[rel]
+
+
+def test_main_tree_fails_when_a_tracked_file_is_unreadable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+) -> None:
+    """入口收口：全量模式下有文件读不到时不得打印「未发现编号引用」。"""
+    from scripts import forbidden_refs
+
+    repo = _repo_with_unreadable_text_files(tmp_path)
+    monkeypatch.chdir(repo)
+    assert forbidden_refs.main(["--tree"]) == 1
+    captured = capsys.readouterr()
+    assert "未发现编号引用" not in captured.out, "读不到不得伪装成通过"
+    assert "读取失败" in captured.out, "必须点名读不到的文件"
