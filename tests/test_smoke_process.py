@@ -10,6 +10,7 @@ Windows，本地能跑；POSIX 分支只做导入级冒烟（CI 的 isolation-sm
 
 import json
 import os
+import signal
 import sys
 import time
 from pathlib import Path
@@ -356,3 +357,64 @@ class TestJobCleanupConfirmsZero:
         monkeypatch.setattr(smoke_process._kernel32, "TerminateJobObject", lambda _job, _code: 1)
         with pytest.raises(SmokeCommandError, match="查询失败"):
             smoke_process._terminate_job(object(), grace_seconds=0.0)
+
+
+class TestPosixSigchldPrecondition:
+    """POSIX 启动前置：宿主自动回收 SIGCHLD 时拒绝构造，不静默改写宿主处理器。
+
+    被忽略或自定义回收时 wrapper 退出即被内核收走，组信号与 wait 的时序失去依据
+    （清理结果不可知却报成功）。Windows 分支不走这条路（Job 内核对象负责回收），
+    所以用例显式把 _IS_WINDOWS 置 False。
+
+    Windows 的 signal 模块没有 SIGCHLD：必须先把该属性注入模块命名空间，否则生产
+    代码在实参求值处就抛 AttributeError，三例会以错误（而非按设计的拒绝/通过）
+    收场——「Windows 也能覆盖这条前置」的前提正是这个注入。
+    """
+
+    @pytest.fixture()
+    def sigchld_probe(self, monkeypatch: pytest.MonkeyPatch) -> list[int]:
+        """构造 POSIX 前提并返回「假 getsignal 收到的信号号」记录表。"""
+        monkeypatch.setattr(smoke_process, "_IS_WINDOWS", False)
+        monkeypatch.setattr(signal, "SIGCHLD", 17, raising=False)
+        return []
+
+    def test_ignored_sigchld_is_rejected(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, sigchld_probe: list[int]
+    ) -> None:
+        def fake_getsignal(sig: int) -> Any:
+            sigchld_probe.append(sig)
+            return signal.SIG_IGN
+
+        monkeypatch.setattr(signal, "getsignal", fake_getsignal)
+        with pytest.raises(SmokeCommandError, match="SIGCHLD 为默认处置"):
+            SmokeCommands(tmp_path)
+        assert sigchld_probe == [signal.SIGCHLD], "检查必须针对 SIGCHLD"  # type: ignore[attr-defined]
+
+    def test_custom_sigchld_handler_is_rejected(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, sigchld_probe: list[int]
+    ) -> None:
+        def handler(signum: int, frame: Any) -> None:  # pragma: no cover - 不会被调用
+            pass
+
+        def fake_getsignal(sig: int) -> Any:
+            sigchld_probe.append(sig)
+            return handler
+
+        monkeypatch.setattr(signal, "getsignal", fake_getsignal)
+        with pytest.raises(SmokeCommandError, match="SIGCHLD 为默认处置"):
+            SmokeCommands(tmp_path)
+        assert sigchld_probe == [signal.SIGCHLD], "检查必须针对 SIGCHLD"  # type: ignore[attr-defined]
+
+    def test_default_sigchld_disposition_constructs(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, sigchld_probe: list[int]
+    ) -> None:
+        """默认处置是脚本的固有前提：检查必须放行，不能一律拒绝。"""
+
+        def fake_getsignal(sig: int) -> Any:
+            sigchld_probe.append(sig)
+            return signal.SIG_DFL
+
+        monkeypatch.setattr(signal, "getsignal", fake_getsignal)
+        cmds = SmokeCommands(tmp_path)
+        assert cmds._owned == []
+        assert sigchld_probe == [signal.SIGCHLD], "检查必须针对 SIGCHLD"  # type: ignore[attr-defined]

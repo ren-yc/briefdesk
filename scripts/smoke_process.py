@@ -175,6 +175,16 @@ class SmokeCommands:
     """
 
     def __init__(self, root: Path) -> None:
+        # POSIX 侧的所有权靠进程组信号（TERM→KILL→wait 回收）确认：宿主若把 SIGCHLD
+        # 设为 SIG_IGN 或装了自定义处理器，wrapper 退出即被自动回收，组信号与 wait 的
+        # 时序失去依据——清理结果不可知却报成功。不静默改写宿主处理器，直接拒绝。
+        # 回归见 tests/test_smoke_process.py 的 POSIX 前置用例。
+        # Windows 类型检查下 signal 没有 SIGCHLD（该分支也只在 POSIX 走到）；
+        # 取值必须留在 and 右侧：提前求值会让 Windows 上构造即 AttributeError
+        if not _IS_WINDOWS and signal.getsignal(signal.SIGCHLD) is not signal.SIG_DFL:  # type: ignore[attr-defined]
+            raise SmokeCommandError(
+                "POSIX 侧要求 SIGCHLD 为默认处置：被忽略或自定义回收会让组信号时序失去依据"
+            )
         self._root = root
         self._commands_dir = root / "commands"
         self._commands_dir.mkdir(parents=True, exist_ok=True)
