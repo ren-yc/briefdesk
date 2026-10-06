@@ -412,9 +412,12 @@ class FinishRevokeOrderTest(SupervisorTest):
         observed: dict[str, object] = {}
 
         async def _rotate_boom() -> None:
-            # 关键断言点：轮转抛错的那一刻，撤销必须已经发生
+            # 关键断言点：轮转抛错的那一刻，撤销必须已经发生。
+            # 快照与 running 都不足以证明：_finish 先置 finished，快照遇 finished 即返回 {}、
+            # is_running 也随之变 False——把「清 _current」挪到 _rotate 之后，这两条仍然成立。
             observed["snapshot_during_rotate"] = supervisor.runtime_settings_snapshot()
             observed["running_during_rotate"] = supervisor.state()["running"]
+            observed["current_during_rotate"] = supervisor._current
             raise RuntimeError("轮转炸掉（模拟 _settings/删除失败）")
 
         try:
@@ -438,8 +441,12 @@ class FinishRevokeOrderTest(SupervisorTest):
                 p.stop()
         self.assertEqual(observed["snapshot_during_rotate"], {}, "轮转前必须已撤销快照")
         self.assertIs(observed["running_during_rotate"], False)
+        self.assertIsNone(
+            observed["current_during_rotate"], "轮转前运行指针必须已清空"
+        )
         self.assertEqual(supervisor.runtime_settings_snapshot(), {})
         self.assertFalse(supervisor.state()["running"])
+        self.assertIsNone(supervisor._current, "收尾后运行指针必须已清空")
 
     async def test_old_run_finish_does_not_clear_new_current(self) -> None:
         """旧 run 的收尾只清自己的字段：_finish 按身份判定撤销。
