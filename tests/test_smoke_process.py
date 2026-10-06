@@ -13,6 +13,7 @@ import os
 import sys
 import time
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -247,3 +248,103 @@ class TestSpawnReleaseOrdering:
             assert owned.gate_path.read_bytes() == b"PENDING", "纳管失败不得写放行"
         finally:
             cmds.close_all()
+
+
+class TestJobCleanupConfirmsZero:
+    """Job 清理必须确认归零，未确认即失败。
+
+    旧实现的快速分支在状态文件已发布、wrapper 自然退出后直接置 reaped 并返回，既不查
+    ActiveProcesses 也不调 _terminate_job：wrapper 只等它的直接子进程，孙进程可能仍在
+    Job 内，清理结果不可知却报成功。另一侧 _terminate_job 归零超时后既不抛也不返回状态，
+    注释却写着「调用方据此记失败」。
+    """
+
+    @pytest.fixture()
+    def root(self, tmp_path: Path) -> Path:
+        return tmp_path
+
+    @pytest.mark.skipif(sys.platform != "win32", reason="Windows Job 路径")
+    def test_cleanup_confirms_job_zeroed_after_natural_wrapper_exit(
+        self, root: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """wrapper 自然退出但孙进程仍在 Job 内：清理必须终止并确认归零。
+
+        进程树形状是本用例的前提：直接子进程 spawn 一个活得更久的孙进程（两条命令串进
+        同一个 -c 顺序执行不产生孙进程，用例会空跑、缺陷代码下也通过）。两个 PID 都写进
+        哨兵文件，先按 PID 分别断言它们确实在 Job 内。
+
+        归零采样必须发生在句柄关闭**之前**：close_all 返回时句柄已在 finally 关闭，事后
+        查不到计数。因此截获 _close_handle，在委托真实关闭前查一次 ActiveProcesses。
+        """
+        sentinel = root / "tree.json"
+        child_code = (
+            "import json, os, subprocess, sys, time\n"
+            "from pathlib import Path\n"
+            "grand = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])\n"
+            "Path(r'" + str(sentinel) + "').write_text("
+            "json.dumps([os.getpid(), grand.pid]), encoding='utf-8')\n"
+            "time.sleep(5.0)\n"
+        )
+        cmds = SmokeCommands(root)
+        owned = cmds.start_app([sys.executable, "-c", child_code], env=dict(os.environ), cwd=root)
+        try:
+            # 哨兵用 write_text 直接发布：「文件已存在但内容未写完」的窗口会让读取拿到
+            # 空串或半截内容，轮询必须容忍并重试。
+            pids: list[int] = []
+            deadline = 20.0
+            while len(pids) != 2 and deadline > 0:
+                try:
+                    loaded = json.loads(sentinel.read_text(encoding="utf-8"))
+                except (OSError, ValueError):
+                    loaded = None
+                if isinstance(loaded, list) and len(loaded) == 2 and all(
+                    isinstance(pid, int) for pid in loaded
+                ):
+                    pids = loaded
+                else:
+                    time.sleep(0.05)
+                    deadline -= 0.05
+            assert len(pids) == 2, "直接子进程未在期限内写出完整进程树哨兵"
+            child_pid, grand_pid = pids
+            job = owned._job_handle
+            assert job is not None, "Windows 上必须已指进 Job"
+            assert smoke_process._process_in_job(job, child_pid), "直接子进程不在 Job 内"
+            assert smoke_process._process_in_job(job, grand_pid), "孙进程不在 Job 内"
+
+            # 状态文件发布即代表 wrapper 已等到直接子进程结束
+            deadline = 20.0
+            while not owned.status_path.exists() and deadline > 0:
+                time.sleep(0.05)
+                deadline -= 0.05
+            assert owned.status_path.exists(), "wrapper 未在期限内发布完成状态"
+
+            real_close = smoke_process._close_handle
+            sampled: list[int | None] = []
+
+            def _recording_close(handle: Any) -> None:
+                if handle is not None and handle == job:
+                    sampled.append(smoke_process._active_processes(handle))
+                real_close(handle)
+
+            monkeypatch.setattr(smoke_process, "_close_handle", _recording_close)
+            cmds.close_all(timeout=10)
+            assert sampled == [0], f"Job 句柄关闭时仍有活动进程：{sampled}"
+        finally:
+            cmds.close_all()
+
+    @pytest.mark.skipif(sys.platform != "win32", reason="Windows Job 路径")
+    def test_terminate_job_timeout_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """归零超时不得静默：旧实现只在注释里说「调用方据此记失败」，实际什么都不做。"""
+        monkeypatch.setattr(smoke_process, "_JOB_ZERO_WAIT_FLOOR", 0.05)
+        monkeypatch.setattr(smoke_process, "_active_processes", lambda _job: 1)
+        monkeypatch.setattr(smoke_process._kernel32, "TerminateJobObject", lambda _job, _code: 1)
+        with pytest.raises(SmokeCommandError, match="未归零"):
+            smoke_process._terminate_job(object(), grace_seconds=0.0)
+
+    @pytest.mark.skipif(sys.platform != "win32", reason="Windows Job 路径")
+    def test_active_processes_query_failure_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """查询失败（None）不能当成归零：句柄随即关闭，之后再也查不到计数。"""
+        monkeypatch.setattr(smoke_process, "_active_processes", lambda _job: None)
+        monkeypatch.setattr(smoke_process._kernel32, "TerminateJobObject", lambda _job, _code: 1)
+        with pytest.raises(SmokeCommandError, match="查询失败"):
+            smoke_process._terminate_job(object(), grace_seconds=0.0)

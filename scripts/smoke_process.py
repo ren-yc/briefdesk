@@ -42,6 +42,12 @@ _STATUS_NAME = "status.json"
 #: 结果，但会留下难排查的清理噪音）。
 _WRAPPER_EXIT_GRACE = 2.0
 
+#: TerminateJobObject 之后等 ActiveProcesses 归零的等待下限。内核回收进程有个短
+#: 窗口，只按调用方给的宽限（失败路径常传 0）会把「还没归零」误判成清理失败，CI 上
+#: 表现为抖动。独立成常量是为了让用例能把它压到可测的小值（回归见
+#: tests/test_smoke_process.py 的归零超时与查询失败用例）。
+_JOB_ZERO_WAIT_FLOOR = 5.0
+
 
 class SmokeCommandError(RuntimeError):
     """冒烟命令管理失败（协议/清理/超时）：携带可直接定位的说明。"""
@@ -366,9 +372,11 @@ class SmokeCommands:
     def _cleanup(self, owned: _OwnedCommand, *, grace_seconds: float) -> int | None:
         """终止并回收一条命令的所属进程；返回 wrapper 退出码（已回收时）。
 
-        顺序（Windows）：先 TerminateJobObject 再等 ActiveProcesses 归零，最后关
-        Job 句柄并 wait wrapper——确认计数之前不关句柄（关了就失去内核兜底的
-        计数依据）。POSIX：组 SIGTERM → 宽限 → 组 SIGKILL → wait wrapper。
+        顺序（Windows）：已发布完成状态的命令先等 wrapper 自然退出，仅在
+        ActiveProcesses 为 0 时才走该捷径；其余情况先 TerminateJobObject 再等
+        ActiveProcesses 归零，最后关 Job 句柄并 wait wrapper——确认计数之前不关句柄
+        （关了就失去内核兜底的计数依据）。POSIX：组 SIGTERM → 宽限 → 组 SIGKILL
+        → wait wrapper。
         """
         if owned._cleaned:
             return owned.proc.returncode if owned.proc is not None else None
@@ -383,9 +391,15 @@ class SmokeCommands:
                     try:
                         owned.proc.wait(timeout=_WRAPPER_EXIT_GRACE)
                         owned.reaped = True
-                        return owned.proc.returncode
                     except subprocess.TimeoutExpired:
                         pass
+                    else:
+                        # wrapper 退出只代表它的**直接子进程**结束：命令 spawn 出的
+                        # 孙进程可能仍在 Job 内。归零确认过才敢走这条捷径——否则残留
+                        # 进程只会在 finally 关句柄时由 KILL_ON_JOB_CLOSE 兜底，清理
+                        # 结果不可知却报成功。
+                        if _active_processes(owned._job_handle) == 0:
+                            return owned.proc.returncode
                 _terminate_job(owned._job_handle, grace_seconds=grace_seconds)
             elif not _IS_WINDOWS:
                 # 组信号在回收**之前**发：wrapper 自己先退出不代表组里没有后代
@@ -543,16 +557,24 @@ def _active_processes(job: Any) -> int | None:
 
 
 def _terminate_job(job: Any, *, grace_seconds: float) -> None:
-    """终止 Job 内全部进程并等 ActiveProcesses 归零；失败保留句柄交 finally 关闭兜底。"""
+    """终止 Job 内全部进程并等 ActiveProcesses 归零；未归零或查询失败即抛错。
+
+    归零确认属于清理契约：句柄随后会在 finally 关闭、KILL_ON_JOB_CLOSE 仍会内核兜底
+    终止，但那时已经查不到计数——「可能还有残留」与「确认清干净」不能都报成成功。
+    查询失败（None）同样不算确认，必须让调用方看到失败。
+    """
     if not _kernel32.TerminateJobObject(job, 1):
         raise SmokeCommandError(f"TerminateJobObject 失败（WinError {_last_error()}）")
-    deadline = time.monotonic() + max(grace_seconds, 1.0)
+    wait_seconds = max(grace_seconds, _JOB_ZERO_WAIT_FLOOR)
+    deadline = time.monotonic() + wait_seconds
     while time.monotonic() < deadline:
         active = _active_processes(job)
         if active == 0:
             return
+        if active is None:
+            raise SmokeCommandError("Job 活动进程数查询失败，无法确认归零")
         time.sleep(0.05)
-    # 超时不抛：CloseHandle 的 KILL_ON_JOB_CLOSE 仍会内核兜底；调用方据此记失败
+    raise SmokeCommandError(f"Job 内进程在 {wait_seconds:.0f}s 内未归零，清理结果不可知")
 
 
 if _IS_WINDOWS:
