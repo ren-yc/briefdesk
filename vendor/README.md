@@ -86,5 +86,6 @@ powershell -File scripts/sync_vendor.ps1
   多余空行；上游把残留一次洗完，并在各仓 CI 加了空树口径的空白门禁（与本仓 `quality-gates.yml` 同口径）。
   本仓镜像随之更新（每包 `client.py` 各 7 增 7 删），全量清单保持 113 项（含本说明 `vendor/` 共 114 项，
   均为纯字节变更、无条目增删）。镜像与上游逐 blob 相同（`git ls-tree` 全量比对，两包各 59 / 54 项一致）。
-  同步经 `scripts/sync_vendor.ps1` 完成，本行两个 commit 取自 merge 提交的第二父。上游已洗净后，
-  `.gitattributes` 对镜像的空白豁免**保留作防线**（镜像仍禁改，防未来上游回潮时本仓门禁被迫去动镜像）。
+  同步经 `scripts/sync_vendor.ps1` 完成，本行两个 commit 取自 merge 提交的第二父。上游已洗净并各加了同口径门禁，
+  本仓对镜像的空白豁免（`.gitattributes`）随之移除——镜像纪律仍是禁改；若上游未来回潮脏字节，
+  处理路径是「上游洗 → 重建 sdk-dist（本地分支与 origin 一起快进）→ 本仓重跑同步」，而不是动镜像或恢复豁免。
