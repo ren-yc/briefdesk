@@ -49,6 +49,27 @@ class MalformedSettings(BaseSettings):
     model_config = {"env_prefix": "MALFORMED_"}
 
 
+class ValidatorBoomSettings(BaseSettings):
+    """模型级 validator 抛错的最小形态：投影实例化的另一类异常成因。
+
+    守卫分支（_expected_instance 的 except Exception）被既有用例覆盖的只有
+    缺必填字段与坏环境变量两类成因；validator 抛错若被 pydantic 换成别的
+    通道（不再从 model() 冒泡），本用例先红而字段校验用例不受影响。
+    """
+
+    threshold: int = 4
+
+    model_config = {"env_prefix": "BOOM_"}
+
+    from pydantic import model_validator
+
+    @model_validator(mode="after")
+    def _boom(self) -> "ValidatorBoomSettings":
+        # 错误文本夹带 pydantic 会回显的 input_value 片段：断言脱敏摘要必须
+        # 把它剥掉（守卫依赖 _sanitize_error 的截断口径）。
+        raise ValueError("validator boom [input_value=threshold=4]")
+
+
 def _raise_factory_error() -> str:
     raise RuntimeError("factory boom")
 
@@ -170,6 +191,25 @@ class SettingsSchemaTest(unittest.TestCase):
         self.assertEqual(threshold["type"], "number")
         self.assertIsNone(threshold["current"])
         self.assertEqual(threshold["default"], 4)
+
+    def test_schema_survives_model_validator_failure(self) -> None:
+        """模型级 validator 抛错不得 500：字段元数据照常下发、expected 降级。
+
+        与缺必填字段用例覆盖同一守卫分支，但触发通道不同（validator 异常 vs
+        字段校验异常）——pydantic 改变其中一条通道时另一用例仍有判别力。
+        """
+        schema = build_settings_schema(ValidatorBoomSettings)
+        by_key = {item["key"]: item for item in schema}
+        self.assertEqual(set(by_key), {"BOOM_THRESHOLD"})
+        item = by_key["BOOM_THRESHOLD"]
+        self.assertEqual(item["type"], "number")
+        self.assertEqual(item["default"], 4)
+        # expected 路降级而非 500：坏配置只影响「下次启动值」，修复所需的
+        # 字段元数据必须完整
+        self.assertFalse(item.get("expectedAvailable", True))
+        self.assertTrue(item.get("expectedError"))
+        self.assertNotIn("input_value=", item.get("expectedError", ""), "脱敏摘要不得回显 input_value")
+        self.assertIsNone(item.get("current"))
 
     def test_decimal_step_accepts_exact_decimal_multiples(self) -> None:
         schema = build_settings_schema(AdvancedSettings)

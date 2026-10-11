@@ -244,12 +244,20 @@ def _keep_artifacts(sdist: Path, direct_wheel: Path) -> None:
     """断言全过后把产物保留到 dist/（--keep-artifacts）。
 
     先清空 dist/ 里的 *.whl / *.tar.gz：AGENTS 把「构建前先清空 dist/」写成
-    所有产物类门禁的公共前置，通配命中历史产物会假绿或假红。"""
-    DIST_DIR.mkdir(parents=True, exist_ok=True)
-    for stale in list(DIST_DIR.glob("*.whl")) + list(DIST_DIR.glob("*.tar.gz")):
-        stale.unlink()
-    shutil.copy2(sdist, DIST_DIR / sdist.name)
-    shutil.copy2(direct_wheel, DIST_DIR / direct_wheel.name)
+    所有产物类门禁的公共前置，通配命中历史产物会假绿或假红。
+
+    磁盘满 / 权限等 OSError 是环境性预期失败，必须转成 CheckFailure：让它走
+    except BaseException 会以「意外终止」traceback 收场、退出语义混淆，且此时
+    旧产物已清、新产物可能只复制了一半——检查失败语义（返回 1、现场保留）
+    才是排查者需要的结论。"""
+    try:
+        DIST_DIR.mkdir(parents=True, exist_ok=True)
+        for stale in list(DIST_DIR.glob("*.whl")) + list(DIST_DIR.glob("*.tar.gz")):
+            stale.unlink()
+        shutil.copy2(sdist, DIST_DIR / sdist.name)
+        shutil.copy2(direct_wheel, DIST_DIR / direct_wheel.name)
+    except OSError as error:
+        raise CheckFailure(f"产物保留失败（{error}）") from error
     log(f"产物已保留：{DIST_DIR / sdist.name}、{DIST_DIR / direct_wheel.name}")
 
 
