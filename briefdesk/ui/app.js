@@ -755,12 +755,42 @@ function bindSettingsFormEvents() {
   $settingsModal.addEventListener("input", _updateSaveButton);
   $settingsModal.addEventListener("change", _updateSaveButton);
 
-  // 「插件」面板：逐插件开关（草稿态；保存时并入 PLUGINS 差异统一提交）
+  // 「插件」面板：逐插件开关（草稿态；保存时并入 PLUGINS 差异统一提交）+
+  // 「清除本机插件启用与必选」恢复按钮（预期名单无法解析时的出口）：
+  // 一次 PUT 双 null 原子清除 PLUGINS 与 PLUGINS_REQUIRED 两键，等价于
+  // 按行「恢复默认」两次但单请求原子生效。坏值来自环境变量/项目 .env 时
+  // 清暂存层救不了——错误文案已指引修正该来源，按钮不是那条路的解。
   if ($pluginsList) {
     $pluginsList.addEventListener("change", (e) => {
       const input = e.target.closest("input[data-plugin-toggle]");
       if (input) _onPluginToggle(input.dataset.pluginToggle, input.checked, input);
     });
+    const clearBtn = document.getElementById("plugins-clear-staged");
+    if (clearBtn) {
+      clearBtn.addEventListener("click", async () => {
+        if (clearBtn.disabled) return;
+        if (!confirm("清除本机暂存的插件启用与必选名单？（恢复为默认值，重启生效；环境变量 / 项目 .env 的配置不受影响）")) return;
+        clearBtn.disabled = true;
+        try {
+          // data-plugins-clear：请求体是原子双 null——一次请求同时清两键
+          await putJson("/api/settings/env", { items: { PLUGINS: null, PLUGINS_REQUIRED: null } });
+          showToast("本机插件启用与必选已清除（重启生效）", { type: "success", duration: 4000 });
+          await loadEnvConfig();
+        } catch (err) {
+          console.error("Clear staged plugins error:", err);
+          // 409（组合复检失败）逐条明示，与暂存失败同一套文案模式
+          const issues = err && err.payload && err.payload.detail && err.payload.detail.issues;
+          if (Array.isArray(issues) && issues.length) {
+            showToast("无法清除：" + issues.map(i => i.plugin + "：" + i.detail).join("；"),
+              { type: "error", duration: 8000 });
+          } else {
+            showToast("清除失败，请重试", { type: "error", duration: 6000 });
+          }
+        } finally {
+          clearBtn.disabled = false;
+        }
+      });
+    }
   }
 
   $settingsModal.addEventListener("click", (e) => {
@@ -5313,6 +5343,15 @@ function _pluginRowHtml(p) {
 
 function renderPluginToggles() {
   if (!$pluginsList) return;
+  // 恢复出口的显隐必须先于任何提前 return 收口：名单解析失败时 plugins 常为
+  // 空列表、envData 也可能刚加载失败——这两个分支 return 会跳过函数末尾，
+  // 按钮永远不出现，恰在最需要出口的场景失明。
+  const clearBtnEarly = document.getElementById("plugins-clear-staged");
+  if (clearBtnEarly) {
+    clearBtnEarly.classList.toggle(
+      "hidden", !(envData && envData.pluginsExpectedError)
+    );
+  }
   if (!envData) {
     $pluginsList.innerHTML = '<p class="text-muted">加载失败，请刷新页面重试</p>';
     return;
@@ -5330,14 +5369,14 @@ function renderPluginToggles() {
     || envData.pluginsSource === "env" || envData.pluginsSource === "dotenv";
   // 预期名单不可用：顶部错误说明（不是「全部关闭」的推断）
   // 错误块只追加指引、不改写前缀（「插件预期名单无法解析」是既有文案契约）：坏值可能
-  // 落在 env / 项目 .env / 本机配置三层中的任意一层，用户需要知道本机配置是哪份文件、
-  // 以及怎么原子清除本机两键（PUT 的 null = 移除暂存项，一次请求同时清两键）。
+  // 落在 env / 项目 .env / 本机配置三层中的任意一层——本机暂存层的出口是下方按钮
+  // （一次 PUT 双 null 原子清除两键）；坏值在 env / 项目 .env 时清暂存层救不了，
+  // 指引必须保留「修正该来源」。
   const expectedErrorNotice = envData.pluginsExpectedError
     ? '<div class="plugins-env-notice">插件预期名单无法解析：' + esc(envData.pluginsExpectedError)
-      + "——请修正该来源（环境变量 / 项目 .env / 本机配置）后刷新。开关已停用。"
-      + "本机配置（暂存文件）：" + esc(envData.filePath)
-      + "；若坏值来自该文件，可提交 "
-      + "{'items': {'PLUGINS': null, 'PLUGINS_REQUIRED': null}} 原子清除本机两键后重启。</div>"
+      + "——请修正该来源（环境变量 / 项目 .env）后刷新。开关已停用。"
+      + "若坏值在本机配置（" + esc(envData.filePath) + "），可点下方"
+      + "「清除本机插件启用与必选」按钮恢复默认。</div>"
     : "";
   const envNotice = pluginsOverridden
     ? '<div class="plugins-env-notice">PLUGINS 当前由「' + esc(_envSourceLabel(envData.pluginsSource))

@@ -992,6 +992,9 @@ class FrontendGuardTest(unittest.TestCase):
         html = (_REPO_ROOT / "briefdesk" / "ui" / "index.html").read_text(encoding="utf-8")
         self.assertIn('data-panel="plugins"', html)
         self.assertIn('id="plugins-list"', html)
+        # 恢复出口按钮：坏值落在本机暂存层时的原子清除入口（双 null 一次请求）
+        self.assertIn('id="plugins-clear-staged"', html)
+        self.assertIn("data-plugins-clear", html)
 
     def test_app_js_references_env_endpoints(self) -> None:
         js = (_REPO_ROOT / "briefdesk" / "ui" / "app.js").read_text(encoding="utf-8")
@@ -1008,6 +1011,10 @@ class FrontendGuardTest(unittest.TestCase):
         self.assertIn("_onPluginToggle", js)
         self.assertIn("renderPluginToggles", js)
         self.assertIn("_pluginChanges", js)
+        # 恢复出口：按钮显隐跟随 pluginsExpectedError；请求体是原子双 null
+        self.assertIn("plugins-clear-staged", js)
+        self.assertIn("data-plugins-clear", js)
+        self.assertIn("PLUGINS_REQUIRED: null", js)
         # 多选控件不再注入通配符选项
         self.assertNotIn('opts.unshift("*")', js)
 

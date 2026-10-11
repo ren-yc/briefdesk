@@ -22,6 +22,7 @@ const ESC_MAP = { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&
 // 测试用；不传时 querySelector 恒为 null，与此前行为一致。
 export function makeElement(selectorMap = null) {
   const classes = new Set();
+  const listeners = new Map();
   return {
     innerHTML: "",
     textContent: "",
@@ -31,6 +32,7 @@ export function makeElement(selectorMap = null) {
     dataset: {},
     hidden: false,
     checked: false,
+    disabled: false,
     indeterminate: false,
     // classList 真实记账：app.js 大量使用 add("hidden") 后再 contains("hidden") 判定
     // 幂等（如"已展开就不重复请求上下文"）。恒返回 false 的桩会让这类分支永远走
@@ -45,8 +47,17 @@ export function makeElement(selectorMap = null) {
         return on;
       },
     },
-    addEventListener() {},
+    addEventListener(type, fn) {
+      if (!listeners.has(type)) listeners.set(type, []);
+      listeners.get(type).push(fn);
+    },
     removeEventListener() {},
+    // 派发真实监听器：按钮的点击流用例（确认→请求→toast→刷新）依赖
+    // bindSettingsFormEvents 挂的 handler 真的会跑，no-op 监听会把整条
+    // 路径测成通过。事件对象只带用例需要的字段。
+    async click() {
+      for (const fn of listeners.get("click") || []) await fn({ target: this });
+    },
     querySelector(sel) { return (selectorMap && selectorMap[sel]) || null; },
     querySelectorAll() { return []; },
     closest() { return null; },

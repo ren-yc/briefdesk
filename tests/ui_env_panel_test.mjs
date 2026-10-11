@@ -28,6 +28,10 @@ import { loadAppJs, makeElement } from "./ui_harness.mjs";
 
 const { sandbox, getElement } = loadAppJs();
 
+// setupEvents 挂在 DOMContentLoaded 回调里，vm 永远不触发——需要按钮点击流的
+// 用例手动执行绑定（幂等性由各 listener 只挂一次保证）。
+sandbox.bindSettingsFormEvents();
+
 // envData 是 app.js 顶层 let（全局词法绑定，不在 globalThis 上），
 // 但同一 context 的后续 script 可以对它赋值——借此注入测试夹具。
 function setEnvData(data) {
@@ -829,10 +833,102 @@ sandbox.renderPluginToggles();
   assert.doesNotMatch(html, /当前未启用任何可选插件/, "不得做「全部关闭」的推断");
   assert.ok(html.includes("C:/tmp/settings.env"), "错误说明必须给出本机配置的文件路径");
   assert.ok(
-    html.includes("{'items': {'PLUGINS': null, 'PLUGINS_REQUIRED': null}}"),
-    "错误说明必须给出原子清除本机两键的恢复指引",
+    html.includes("清除本机插件启用与必选"),
+    "坏值可能在本机暂存层：指引必须指向专用恢复按钮，不再让用户手拼 PUT 载荷",
   );
+  // 恢复出口按钮：预期未知时解除隐藏、坏值排除后重新隐藏（renderPluginToggles 收口）
+  const clearBtn = getElement("plugins-clear-staged");
+  assert.ok(!clearBtn.classList.contains("hidden"), "预期未知时恢复按钮必须可见");
   // 防御断言：未知时 _pluginChanges 不得产出 PLUGINS 假更改
   vm.runInContext("pluginDraftSet = new Set();", sandbox);
   assert.deepEqual(JSON.parse(JSON.stringify(sandbox._pluginChanges())), {}, "预期未知不得提交清空名单的假更改");
+}
+
+// ── 10. 恢复出口按钮：坏值排除后隐藏；点击即一次 PUT 双 null 原子清除 ──
+{
+  setEnvData({
+    filePath: "C:/tmp/settings.env",
+    pluginOptions: [],
+    pluginsSource: "default",
+    pluginsOverridden: false,
+    items: [],
+    secrets: [],
+    plugins: [
+      { name: "alpha", core: false, enabled: false, dependencies: [], conflicts: [], status: "disabled", reason: "" },
+    ],
+  });
+  sandbox._pluginSets();
+  sandbox.renderPluginToggles();
+  const clearBtn = getElement("plugins-clear-staged");
+  assert.ok(clearBtn.classList.contains("hidden"), "坏值排除后恢复按钮必须重新隐藏");
+
+  // 点击流：确认 → PUT 双 null → 成功 toast → loadEnvConfig 重取
+  setEnvData({
+    filePath: "C:/tmp/settings.env",
+    pluginOptions: [],
+    pluginsExpectedError: "PLUGINS 不是合法 JSON",
+    pluginsSource: "default",
+    pluginsOverridden: false,
+    items: [],
+    secrets: [],
+    plugins: [],
+  });
+  sandbox._pluginSets();
+  sandbox.renderPluginToggles();
+  assert.ok(!clearBtn.classList.contains("hidden"), "重新渲染后按钮再次解除隐藏");
+
+  const calls = [];
+  sandbox.confirm = () => true;
+  sandbox.putJson = async (url, payload) => {
+    calls.push({ url, payload });
+    return { items: {} };
+  };
+  const reloads = [];
+  sandbox.loadEnvConfig = async () => reloads.push(true);
+  const toasts = [];
+  sandbox.showToast = (msg, opts) => toasts.push({ msg, opts });
+  await clearBtn.click();
+  assert.equal(calls.length, 1, "清除必须恰好发一次 PUT");
+  assert.equal(calls[0].url, "/api/settings/env");
+  // 不用 deepEqual：跨 vm 实例的对象原型不同，deepStrictEqual 会误报。
+  // 改断言两键存在且值恰为 null——「原子双 null」的实质是键集与值。
+  assert.deepEqual(
+    Object.keys(calls[0].payload.items).sort(),
+    ["PLUGINS", "PLUGINS_REQUIRED"],
+    "载荷必须恰好只清这两键",
+  );
+  assert.ok(
+    calls[0].payload.items.PLUGINS === null && calls[0].payload.items.PLUGINS_REQUIRED === null,
+    "两键值必须都是 null（服务端语义：null = 移除暂存项）",
+  );
+  assert.ok(toasts.some(t => t.msg.includes("已清除")), "成功后必须明示已清除");
+  assert.equal(reloads.length, 1, "清除后必须重取面板数据");
+  assert.ok(!clearBtn.disabled, "完成后按钮必须恢复可用");
+}
+// ── 11. 恢复出口按钮：用户取消确认不发请求；PUT 失败显式报错且按钮复位 ──
+{
+  const calls = [];
+  sandbox.confirm = () => false;
+  sandbox.putJson = async (url, payload) => {
+    calls.push({ url, payload });
+    return { items: {} };
+  };
+  const clearBtn = getElement("plugins-clear-staged");
+  await clearBtn.click();
+  assert.equal(calls.length, 0, "取消确认不得发出清除请求");
+
+  sandbox.confirm = () => true;
+  sandbox.putJson = async () => {
+    const err = new Error("409");
+    err.payload = { detail: { issues: [{ plugin: "weflow", detail: "必选但未启用" }] } };
+    throw err;
+  };
+  const toasts = [];
+  sandbox.showToast = (msg, opts) => toasts.push({ msg, opts });
+  await clearBtn.click();
+  assert.ok(
+    toasts.some(t => t.opts && t.opts.type === "error" && t.msg.includes("weflow")),
+    "409 明细必须逐条明示（与暂存失败同一套文案模式）",
+  );
+  assert.ok(!clearBtn.disabled, "失败后按钮必须恢复可用，允许重试");
 }

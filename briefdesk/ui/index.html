@@ -260,6 +260,10 @@
             <h3 class="settings-section">插件</h3>
             <p class="text-muted settings-hint">核心插件始终启用（无开关）；可选插件（消息源等）在此逐个启用/禁用——更改暂存到本机配置文件，<strong>重启应用后生效</strong>，开关操作时即校验依赖与互斥关系。插件的前端（入口/视图）随插件包分发，未加载插件的功能入口不出现。</p>
             <div id="plugins-list" class="plugins-list"><p class="text-muted">加载中...</p></div>
+            <!-- 恢复出口：预期名单无法解析（坏值在本机暂存层）时由 renderPluginToggles
+                 解除隐藏；一次 PUT 双 null 原子清除 PLUGINS 与 PLUGINS_REQUIRED。
+                 不能放进 #plugins-list 内——该容器每次渲染整体重写 innerHTML。 -->
+            <button type="button" id="plugins-clear-staged" class="settings-outline-btn hidden" data-plugins-clear>清除本机插件启用与必选</button>
           </section>
 
           <section class="settings-panel hidden" data-panel="env">
