@@ -93,8 +93,10 @@ jobs:
         run: python -m pytest tests/
 
   # 独立的 Linux 冒烟 job：只覆盖 POSIX 侧的子进程与终止语义（Windows job 跑不到
-  # 这些差异），不扩全量矩阵——全量仍只在 windows-latest 跑。选中的两个文件是纯
+  # 这些差异），不扩全量矩阵——全量仍只在 windows-latest 跑。选中的三个文件是纯
   # Python（不需要 Node），也不跑 ruff/mypy：那两项与平台无关，Windows job 已覆盖。
+  # 进程所有权脚本的真实 spawn / 进程组信号清理只在 POSIX 上有行为级覆盖价值，
+  # 其协议用例随本 job 在真 Linux 上执行（Windows 上这些用例多数只能 skip）。
   isolation-smoke:
     name: Isolation smoke (linux)
     runs-on: ubuntu-latest
@@ -126,10 +128,11 @@ jobs:
           pip install -e . --no-deps
 
       # 只跑进程监管与隔离这一组：直接给路径而不是 -k 选择器——避免随将来新增文件
-      # 意外扩缩，也不依赖 nodeid 子串匹配
-      - name: Test (benchmark runner contract + isolation)
+      # 意外扩缩，也不依赖 nodeid 子串匹配。进程所有权用例在此获得真实的 POSIX
+      # 行为覆盖（真 spawn / 真进程组信号），Windows 全量矩阵只跑得到其协议部分。
+      - name: Test (benchmark runner contract + isolation + process ownership)
         run: |
-          python -m pytest tests/test_benchmark_runner_contract.py tests/test_benchmark_isolation.py
+          python -m pytest tests/test_benchmark_runner_contract.py tests/test_benchmark_isolation.py tests/test_smoke_process.py
 
   # 独立 wheel 冒烟 job：构建 → wheel 资源清单断言 → 全新 venv 非 editable 安装 →
   # 真进程启动（console script）+ HTTP 探活 + 真实写入（配置保存 / 用例导出 /

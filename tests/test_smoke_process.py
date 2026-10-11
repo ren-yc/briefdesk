@@ -3,7 +3,8 @@
 纯协议部分（状态解析）直接测；进程部分用**真实短命子进程**验证（不需要 CI 的
 合成进程树 job 也能覆盖的路径）：正常完成、非零退出、包装层失败、许可门、
 close_all 回收。Windows 侧的 Job 断言走真实 ctypes 路径——本仓库主平台就是
-Windows，本地能跑；POSIX 分支只做导入级冒烟（CI 的 isolation-smoke 覆盖行为）。
+Windows，本地能跑；POSIX 分支的行为用例（真实 spawn / 进程组信号清理）在 CI
+的 isolation-smoke job（Linux）上执行，Windows 本地只跑协议与注入替身用例。
 
 数据一律虚构（见 AGENTS.md）。
 """
