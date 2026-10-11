@@ -4,7 +4,8 @@
 # 门禁（git diff --check 空树口径，见 quality-gates.yml 与 AGENTS.md）若把它也
 # 算进来，唯一出路就是去动镜像——那是有意禁止的。与 pyproject 里 ruff
 # exclude = ["vendor"]、mypy 对镜像 ignore_errors 同一口径：**收窄门禁作用域，
-# 不改镜像内容**。上游自身没有空白门禁，这类残留因此在上游 CI 里不会露头。
+# 不改镜像内容**。上游现已各自加了空树口径的空白门禁并洗净残留，此处豁免因此退化为**防线**：
+# 镜像纪律仍是禁改，若上游未来回潮空白，本仓门禁也不该被逼去动镜像。
 #
 # 豁免面按「上游镜像的两棵包目录」精确划定（与 runtime_manifest.VENDOR_PACKAGES
 # 同一组路径），vendor/README.md 是本仓自己写的说明，照常受门禁。

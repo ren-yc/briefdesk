@@ -79,3 +79,12 @@ powershell -File scripts/sync_vendor.ps1
   静默失效，判定已改为顺 `__cause__` 链识别（回归见 `tests/test_client_retry.py`）。镜像与上游逐 blob
   相同（`git ls-tree` 全量比对）。同步经 `scripts/sync_vendor.ps1` 完成，本行两个 commit 取自 merge 提交
   的第二父。
+
+- SDK 0.9.0 空白卫生同步：weflow `sdk-dist`（`0a6fd8b`，源自 weflow-server master `7723af0`）、
+  qqflow `sdk-dist`（`53c0899`，源自 qqflow-server master `57d630e`）。上游改动**只动字节、不动语义**：
+  机械改写把 `_validate(gen.X, ` 续行的 7+7 处行尾空白写进了两 SDK 手写层 `client.py`，另有若干文件末尾
+  多余空行；上游把残留一次洗完，并在各仓 CI 加了空树口径的空白门禁（与本仓 `quality-gates.yml` 同口径）。
+  本仓镜像随之更新（每包 `client.py` 各 7 增 7 删），全量清单保持 113 项（含本说明 `vendor/` 共 114 项，
+  均为纯字节变更、无条目增删）。镜像与上游逐 blob 相同（`git ls-tree` 全量比对，两包各 59 / 54 项一致）。
+  同步经 `scripts/sync_vendor.ps1` 完成，本行两个 commit 取自 merge 提交的第二父。上游已洗净后，
+  `.gitattributes` 对镜像的空白豁免**保留作防线**（镜像仍禁改，防未来上游回潮时本仓门禁被迫去动镜像）。
