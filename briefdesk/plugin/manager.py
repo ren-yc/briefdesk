@@ -407,7 +407,21 @@ class PluginManager:
         为什么由 manager 统一保存：设置页要展示「本进程正在用的值」，而插件每次
         `settings_schema()` 现场构造实例展示的是「按当前文件解析的值」——运行中
         改过文件后两者不一致（配置无热应用，后者其实是下次启动值）。
+
+        动态运行配置插件（settings_model）：采用时点在每次运行开始，setup 期
+        缓存实例必然过期——只登记模型类型，运行值经 settings_snapshot() 在
+        schema 组装时从插件内存现读，不缓存实例。
         """
+        model_getter = getattr(plugin, "settings_model", None)
+        if callable(model_getter):
+            try:
+                model = model_getter()
+            except Exception:
+                logger.exception("读取插件 %s 设置模型失败", name)
+                return
+            if model is not None:
+                settings_env.capture_model_sources(model)
+            return
         getter = getattr(plugin, "settings_instance", None)
         if not callable(getter):
             return
@@ -440,6 +454,27 @@ class PluginManager:
                 continue
             instance = self._plugin_settings.get(name)
             running = rec.status == "loaded" and instance is not None
+            # 动态运行配置：运行值来自插件内存快照（每次运行开始采用），不是 setup 缓存。
+            # 快照以字段名为键，这里翻译成环境键（schema item 的 key 口径）。
+            snapshot: dict[str, Any] | None = None
+            if rec.status == "loaded":
+                snap_getter = getattr(rec.plugin, "settings_snapshot", None)
+                if callable(snap_getter):
+                    try:
+                        snap = snap_getter()
+                        if isinstance(snap, dict):
+                            snapshot = {}
+                            model_getter2 = getattr(rec.plugin, "settings_model", None)
+                            model = model_getter2() if callable(model_getter2) else None
+                            if model is not None:
+                                for field_name, value in snap.items():
+                                    if field_name in model.model_fields:
+                                        snapshot[settings_env.field_env_key(model, field_name)] = value
+                        else:
+                            snapshot = None
+                    except Exception:
+                        logger.exception("读取插件 %s 运行快照失败", name)
+                        snapshot = None
             try:
                 if _accepts_instance(callback):
                     fields = callback(instance=instance, running=running)
@@ -463,6 +498,12 @@ class PluginManager:
                     item.pop("current", None)
                     item.pop("source", None)
                     item["running"] = False
+                if snapshot is not None and item["key"] in snapshot:
+                    # 覆盖为本次运行真实采用的值：只动该键的 current（expected_*
+                    # 仍由 schema 侧按当前文件解析——「下次运行采用」语义不变）
+                    item["current"] = snapshot[item["key"]]
+                    item["source"] = "run"
+                    item["running"] = True
                 result.append(item)
         return result
 

@@ -257,7 +257,26 @@ def normalize_setting(meta: dict[str, Any], raw: str) -> str:
     """按 schema 元数据校验并规范化一个暂存值。"""
     setting_type = meta.get("type")
     if setting_type == "multi":
-        parsed = json.loads(raw)
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            if "${" not in raw:
+                raise
+            # 整值模板草稿：原文不是 JSON，但 dotenv 回读会展开 ${VAR}，展开后
+            # 可能是合法数组——落盘原文（不做 json.dumps 规范化，否则模板被改写、
+            # 与回读的展开口径不一致），最终合法性由候选字节回读判定：展开后
+            # 非法在组合预检 409 且不落盘。json.loads 成功但元素非全字符串时不
+            # 放宽（类型仍按「须为 JSON 字符串数组」拒），与逐层解码只对胜出值
+            # 判类型同口径。
+            # 放宽不等于放行注入：multi 分支走不到通用 text 尾巴，两道拒绝必须
+            # 在此补上——换行会把 KEY=VALUE 行拆出伪键（可注入任意配置行，含
+            # 密钥名）；「 #」是 dotenv 行内注释起点，回读截断会写出与用户所见
+            # 不同的名单。
+            if "\n" in raw or "\r" in raw:
+                raise ValueError("值不能包含换行符")
+            if " #" in raw:
+                raise ValueError("值不能包含「 #」（dotenv 行内注释起点）")
+            return raw
         if not isinstance(parsed, list) or not all(
             isinstance(value, str) for value in parsed
         ):

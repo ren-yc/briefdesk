@@ -39,13 +39,15 @@ def test_read_base_version_reads_this_project() -> None:
 
 def test_patched_version_restores_original_bytes(tmp_path: Path) -> None:
     pyproject = tmp_path / "pyproject.toml"
-    original = '[project]\nname = "briefdesk"\nversion = "0.1.0"\n'
-    pyproject.write_text(original, encoding="utf-8")
+    original = b'[project]\r\nname = "briefdesk"\nversion = "0.1.0"\n[tool]\nversion = "9.9"\n'
+    pyproject.write_bytes(original)
 
     with patched_version(pyproject, "0.1.0.dev7"):
-        assert 'version = "0.1.0.dev7"' in pyproject.read_text(encoding="utf-8")
+        assert b'version = "0.1.0.dev7"' in pyproject.read_bytes()
+        # 工具表里的 version 不得被波及：只替换 [project] 下的那一处
+        assert b'version = "9.9"' in pyproject.read_bytes()
 
-    assert pyproject.read_text(encoding="utf-8") == original, "退出上下文必须逐字节还原"
+    assert pyproject.read_bytes() == original, "退出上下文必须逐字节还原"
 
 
 def test_index_table_covers_both_targets() -> None:
@@ -115,12 +117,56 @@ def test_artifact_members_reject_sdist_without_metadata(tmp_path: Path) -> None:
 
 
 def test_patched_version_requires_static_version_line(tmp_path: Path) -> None:
-    """没有静态 version 行时响亮失败，并且**不得**改动文件。"""
+    """没有静态 [project].version 时响亮失败，并且**不得**改动文件。"""
     pyproject = tmp_path / "pyproject.toml"
-    original = '[project]\nname = "briefdesk"\n'
-    pyproject.write_text(original, encoding="utf-8")
+    original = b'[project]\nname = "briefdesk"\n'
+    pyproject.write_bytes(original)
 
     with pytest.raises(ReleaseCheckFailure), patched_version(pyproject, "0.1.0.dev1"):
         pass
 
-    assert pyproject.read_text(encoding="utf-8") == original
+    assert pyproject.read_bytes() == original
+
+
+def test_patched_version_rejects_ambiguous_target(tmp_path: Path) -> None:
+    """静态 version 值在文件中出现两次（另一处是注释）时，替换有歧义：写盘前拒绝。"""
+    pyproject = tmp_path / "pyproject.toml"
+    # 注释里重复出现同一 version 值：bytes 定位会命中两处，属歧义目标
+    original = b'[project]\nversion = "0.1.0"\n# version = "0.1.0" was here\n'
+    pyproject.write_bytes(original)
+
+    with pytest.raises(ReleaseCheckFailure, match="出现多次"), patched_version(pyproject, "0.1.0.dev1"):
+        pass
+
+    assert pyproject.read_bytes() == original
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        b'[project]\nversion = "0.1.0"\n',  # LF-only
+        b'[project]\r\nversion = "0.1.0"\r\n',  # CRLF-only
+        b'[project]\r\nversion = "0.1.0"\nname = "x"\r\n',  # 混合换行
+        b'[project]\nversion = "0.1.0"\nname = "x"',  # 无末尾换行
+    ],
+)
+def test_patched_version_preserves_bytes_exactly(tmp_path: Path, content: bytes) -> None:
+    """换行形态各异时，进出上下文都必须 bytes 级不变（文本模式会把 LF 规范化成 CRLF）。"""
+    pyproject = tmp_path / "pyproject.toml"
+    pyproject.write_bytes(content)
+
+    with patched_version(pyproject, "0.1.0.dev1"):
+        pass
+
+    assert pyproject.read_bytes() == content
+
+
+def test_patched_version_rejects_tool_table_version_only(tmp_path: Path) -> None:
+    """version 只存在于工具表（无 [project].version）时不得错杀工具表值。"""
+    pyproject = tmp_path / "pyproject.toml"
+    original = b'[tool]\nversion = "0.1.0"\n'
+    pyproject.write_bytes(original)
+
+    with pytest.raises(ReleaseCheckFailure), patched_version(pyproject, "0.1.0.dev1"):
+        pass
+    assert pyproject.read_bytes() == original

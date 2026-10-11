@@ -302,9 +302,12 @@ def scan_text(path: str, text: str) -> list[Hit]:
 
 
 def _git(args: list[str], *, cwd: Path | None = None) -> str:
+    # 统一关掉 core.quotePath：默认开启时 git 会给含非 ASCII 的路径加引号并转义，
+    # ls-files 的名单会因此在后缀过滤处失配（静默漏扫），diff 头行的路径也拼不出
+    # 真实文件（误判「读不到」退出 2）。路径原样输出才是扫描器要的形态。
     proc = subprocess.run(
-        ["git", *args],
-        cwd=cwd,
+        ["git", "-c", "core.quotePath=false", *args],
+        cwd=str(cwd) if cwd is not None else None,
         capture_output=True,
         text=True,
         encoding="utf-8",
@@ -332,14 +335,21 @@ def tracked_files(root: Path | None = None) -> list[str]:
 
 
 def scan_tree(root: Path | None = None) -> list[Hit]:
-    """全量扫描跟踪文件（收口核查用；基线机制见 tests/test_no_plan_refs.py）。"""
+    """全量扫描跟踪文件（收口核查用；基线机制见 tests/test_no_plan_refs.py）。
+
+    文本后缀的跟踪文件读不出来（非 UTF-8、工作区缺该文件、权限拒绝）时按**命中**
+    报出，而不是跳过：跳过等于「跑过了但没扫」——scan_tree 返回 0 命中、入口退出 0，
+    门禁看起来是绿的，而该文件的注释与文档正文从未被读过。报成命中后调用方（入口的
+    退出码 1、pytest 守卫的断言）都看得见。
+    """
     base = root or Path.cwd()
     hits: list[Hit] = []
     for rel in tracked_files(base):
         path = base / rel
         try:
             source = path.read_text(encoding="utf-8")
-        except (OSError, UnicodeDecodeError):
+        except (OSError, UnicodeDecodeError) as error:
+            hits.append(Hit(rel, 0, "读取失败", f"{type(error).__name__}：该文件未纳入扫描"))
             continue
         hits.extend(scan_source(rel, source))
     return hits
@@ -349,7 +359,13 @@ _HUNK_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
 
 
 def _added_lines(diff_text: str) -> dict[str, set[int]]:
-    """从 unified diff 解析「新增行的新文件行号」：{路径: {行号}}。"""
+    """从 unified diff 解析「新增行的新文件行号」：{路径: {行号}}。
+
+    已知限制：git 的 core.quotePath（默认开）会给含非 ASCII 的路径加引号并
+    转义，`b/` 前缀的剥除随之错位，该路径被记成一个读不到的名字，扫描按
+    未执行退出 2——方向正确（宁可阻断不放过），彻底修法（按 `-z` 或
+    `--no-prefix` 解析）另立跟进。仓库当前没有非 ASCII 路径。
+    """
     added: dict[str, set[int]] = {}
     current: str | None = None
     lineno = 0
@@ -374,7 +390,12 @@ def _added_lines(diff_text: str) -> dict[str, set[int]]:
 
 
 def _file_at_rev(rev: str, path: str) -> str | None:
-    """取某版本下的文件内容；失败（新增/删除文件）返回 None。"""
+    """取某版本下的文件内容；读不到（新增文件、git 异常）返回 None。
+
+    None 只表示「这次没读到」，不表示文件不存在——调用方不得据此跳过
+    （见 scan_diff）。纯删除的新端在 diff 里是 `+++ /dev/null`，根本不会
+    进入新增行表，走不到这里。
+    """
     try:
         return _git(["show", f"{rev}:{path}"])
     except RuntimeError:
@@ -390,25 +411,36 @@ def scan_lines(path: str, source: str, lines: set[int]) -> list[Hit]:
     return [hit for hit in scan_source(path, source) if hit.line in lines]
 
 
-def scan_diff(diff_text: str, *, rev: str | None, staged: bool) -> list[Hit]:
+def scan_diff(
+    diff_text: str, *, rev: str | None, staged: bool, new_side: str | None = None
+) -> list[Hit]:
     """扫描增量变更：只报新增行上的命中。
 
     定位方式：先解析新增行行号，再取该文件的**完整版本**做语法分段，
     只保留落在新增行上的命中——这样 docstring 内的行号依然精确，
     且规则 4 仍能按「注释 / 文档语境」判定。
 
-    版本选择：行号是**新文件**（HEAD / 工作区）的行号，因此内容必须取
-    「新增侧」的版本——staged 取索引（:0），CI 比较基线...HEAD 时取 HEAD。
-    取基线 ref 会把新行号套到旧内容上，报出一堆「本轮已删除」的假命中。
-    取不到（文件为新增或删除）时跳过该文件。
+    版本选择：行号是**新文件**（新端 / 工作区）的行号，因此内容必须取
+    「新增侧」的版本——staged 取索引（:0），双端模式取调用方给定的新端 OID，
+    旧 --ref 模式取 HEAD。取基线 ref 会把新行号套到旧内容上，报出一堆
+    「本轮已删除」的假命中。
+
+    有新增行就要求新端读得到：能走到读取这一步的路径都带着新增行，说明新端
+    **该有**这个文件，读不到（git 异常、对象损坏、索引被改写）必须抛错。曾用
+    `git cat-file -e` 的退出码与 stderr 英文文案分流「纯删除可以跳过」，但纯删除
+    的 `+++ /dev/null` 根本不入新增行表，那个分支只会掩盖「有新增行却读不到」，
+    文案判定还让结论随 git 的 locale 漂移。静默跳过等于漏扫，还会照样打印
+    「未发现编号引用」，让门禁看起来跑过。抛错由 main 的既有异常路径转成退出码 2
+    （扫描未执行，拒绝放行）。
     """
     hits: list[Hit] = []
+    new_rev = ":0" if staged else (new_side or "HEAD")
     for path, lines in _added_lines(diff_text).items():
         if not lines:
             continue
-        source = _file_at_rev(":0" if staged else "HEAD", path)
+        source = _file_at_rev(new_rev, path)
         if source is None:
-            continue
+            raise RuntimeError(f"新增行所在文件读不到：{new_rev}:{path}")
         hits.extend(scan_lines(path, source, lines))
     return hits
 
@@ -438,6 +470,29 @@ def scan_commit_message(message: str) -> list[Hit]:
     return scan_text("<commit-message>", strip_git_commentary(message))
 
 
+def _commits_between(base: str | None, head: str, *, cwd: Path | None = None) -> list[str]:
+    """提交集合：base 为 None 时取 head 的全部祖先（首次推送的已知空边界）。"""
+    args = ["rev-list", "--reverse", head] if base is None else ["rev-list", "--reverse", head, "--not", base]
+    out = _git(args, cwd=cwd)
+    return [line.strip() for line in out.splitlines() if line.strip()]
+
+
+def _commit_message(sha: str, *, cwd: Path | None = None) -> str:
+    """单条提交信息（subject + body）；读取失败抛错由调用方转 2。"""
+    return _git(["show", "-s", "--format=%B", sha], cwd=cwd)
+
+
+def scan_commit_range(
+    base: str | None, head: str, *, cwd: Path | None = None
+) -> tuple[list[Hit], int]:
+    """扫描一段提交的全部信息；返回 (命中, 提交数)。合法空集合返回 ([], 0)。"""
+    hits: list[Hit] = []
+    shas = _commits_between(base, head, cwd=cwd)
+    for sha in shas:
+        hits.extend(scan_commit_message(_commit_message(sha, cwd=cwd)))
+    return hits, len(shas)
+
+
 def _format(hits: Iterable[Hit]) -> str:
     return "\n".join(
         f"  {hit.path}:{hit.line} [{hit.rule}] {hit.text[:120]}" for hit in hits
@@ -457,19 +512,44 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--ref", default=None, help="扫描相对该基线的差异（CI 用）")
     parser.add_argument("--tree", action="store_true", help="全量扫描跟踪文件")
     parser.add_argument("--message-file", default=None, help="扫描提交信息文件")
+    parser.add_argument("--base", default=None, help="双端模式基线（事件固定 SHA 或空树对象）")
+    parser.add_argument("--head", default=None, help="双端模式新端（事件固定 SHA）")
+    parser.add_argument(
+        "--commits",
+        action="store_true",
+        help="扫描提交信息集合（配合 --base/--head；无 --base 时取 head 全部祖先）",
+    )
     args = parser.parse_args(argv)
 
     # git 取不到差异时必须拒绝放行：当作空 diff 会「扫描没跑却通过」，
     # 与 scripts/secret_scan.py 同口径（退出码 2）。CI 里 fetch 失败或基线
     # 引用无效都会走到这里，静默通过等于门禁失守。
+    if (args.base is None) != (args.head is None) and not args.commits:
+        print("[forbidden-refs] --base 与 --head 必须成对给出；拒绝放行", file=sys.stderr)
+        return 2
     try:
         if args.message_file:
             text = Path(args.message_file).read_text(encoding="utf-8", errors="replace")
             hits = scan_commit_message(text)
             target = f"提交信息 {args.message_file}"
+        elif args.commits:
+            if not args.head:
+                print("[forbidden-refs] --commits 需要 --head；拒绝放行", file=sys.stderr)
+                return 2
+            hits, count = scan_commit_range(args.base, args.head)
+            scope = "全部祖先" if args.base is None else f"{args.base[:12]}..{args.head[:12]}"
+            target = f"提交信息集合（{scope}，{count} 条）"
         elif args.tree:
             hits = scan_tree()
             target = "全量跟踪文件"
+        elif args.base and args.head:
+            hits = scan_diff(
+                _git(["diff", "--unified=0", args.base, args.head]),
+                rev=None,
+                staged=False,
+                new_side=args.head,
+            )
+            target = f"{args.base[:12]}..{args.head[:12]} 的新增行"
         elif args.ref:
             hits = scan_diff(_range_diff(args.ref), rev=args.ref, staged=False)
             target = f"相对 {args.ref} 的差异"

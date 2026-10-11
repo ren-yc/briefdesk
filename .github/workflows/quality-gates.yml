@@ -64,66 +64,14 @@ jobs:
           pip install -r requirements-dev.txt
           pip install -e . --no-deps
 
-      # 推送事件的差异基线：正常推送用 event.before；首次推送（零 SHA）或强推
-      # （重写历史后旧 tip 在全新克隆里不可达）时改用推送载荷回推的等价基线——
-      # 本次推送的 N 个提交正是 HEAD 起往前 N 个，HEAD~N 即「推送前的位置」，
-      # 扫描范围与正常推送一致。基线不可达时若直接拒绝放行，强推后的门禁会假红。
-      - name: Resolve push base
-        if: github.event_name == 'push'
-        shell: bash
-        run: |
-          before="${{ github.event.before }}"
-          if [ -z "$before" ] || [ "$before" = "0000000000000000000000000000000000000000" ] \
-             || ! git cat-file -e "${before}^{commit}" 2>/dev/null; then
-            set -- ${{ join(github.event.commits.*.id, ' ') }}
-            before="HEAD~$#"
-          fi
-          echo "PUSH_BASE=$before" >> "$GITHUB_ENV"
-          echo "push base: $before"
-      - name: Secret scan (PR diff)
-        if: github.event_name == 'pull_request'
-        run: |
-          git fetch origin master
-          python scripts/secret_scan.py --ref origin/master
-
-      - name: Secret scan (push diff)
-        if: github.event_name == 'push'
-        shell: bash
-        run: |
-          python scripts/secret_scan.py --ref "$PUSH_BASE"
-
-      # AGENTS.md「注释、文档与提交信息规范」：本地钩子覆盖提交前，但可被 --no-verify
-      # 绕过，CI 是共享兜底。ref 口径与上方密钥扫描一致；与钩子不同，这里只看差异，
-      # 因此存量基线不受影响。
-      - name: Forbidden plan-reference scan (PR diff)
-        if: github.event_name == 'pull_request'
-        run: |
-          git fetch origin master
-          python scripts/forbidden_refs.py --ref origin/master
-
-      - name: Forbidden plan-reference scan (push diff)
-        if: github.event_name == 'push'
-        shell: bash
-        run: |
-          python scripts/forbidden_refs.py --ref "$PUSH_BASE"
-
-      # AGENTS.md「注释、文档与提交信息规范」：提交信息只能靠 rebase 事后修订，
-      # 本地 commit-msg 钩子可被 --no-verify 绕过；直接推 master 的路径也没有 PR
-      # 审查兜底，只有 CI 能拦。范围口径与上方两个差异扫描一致（PR 用 origin/master，
-      # push 用 event.before），逐条取出提交信息文本交给扫描器。
-      - name: Forbidden plan-reference scan (commit messages)
-        shell: bash
-        run: |
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            git fetch origin master
-            base="origin/master"
-          else
-            base="$PUSH_BASE"
-          fi
-          for sha in $(git log --format=%H "$base"..HEAD); do
-            git show -s --format=%B "$sha" > "$RUNNER_TEMP/commit-msg.txt"
-            python scripts/forbidden_refs.py --message-file "$RUNNER_TEMP/commit-msg.txt" || exit 1
-          done
+      # 事件范围扫描：范围只认事件载荷里的固定 SHA（PR 用 base/head，push 用
+      # before/after），由 scripts/ci_scan.py 解析并统一编排三项扫描。
+      # 旧实现用推送载荷的 commits 数组长度推算 HEAD~N——数组长度不等于第一父链
+      # 步数（含合并会错位、载荷截断会漏扫、根提交会越界），且取不到基线时会静默
+      # 换成别的范围。现改为：取不到基线先精确 fetch 该 SHA，仍失败即退出 2 阻断，
+      # 不静默改成全量或空范围（首次推送的全零 before 是已知空边界，照常扫描）。
+      - name: Event-range scans (secret / plan-reference / commit messages)
+        run: python scripts/ci_scan.py
 
       # AGENTS.md's 4th gate. The pre-commit hook only runs the secret scan, so
       # without this step the check rests on the author remembering it.

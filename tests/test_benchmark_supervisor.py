@@ -338,5 +338,143 @@ class SupervisorTest(unittest.IsolatedAsyncioTestCase):
             await supervisor.gc_orphans()  # 不得向上抛：抛了会让插件被标记 failed
 
 
+class RuntimeSettingsSnapshotTest(SupervisorTest):
+    """运行参数采用时点：start 冻结进 _Run，运行中改配置不影响活动运行。
+
+    旧实现把 settings 对象直接交给监控协程，每次读的是解析时的命名空间——
+    运行中换掉 _settings 的返回值就会改变活动运行的阈值（页面值与真实运行
+    各说各话）。快照必须冻结在 _Run 上。
+    """
+
+    async def test_start_freezes_runtime_settings_into_run(self) -> None:
+        self.settings = _settings(run_timeout_seconds=999, run_stall_seconds=888)
+        patchers = self._pin_spawn()
+        for p in patchers:
+            p.start()
+        try:
+            await supervisor.start(["dedup"])
+            run = supervisor._current
+            assert run is not None
+            self.assertEqual(run.run_timeout_seconds, 999)
+            self.assertEqual(run.run_stall_seconds, 888)
+            self.assertEqual(run.pause_pipeline, False)
+            # 运行中改配置：活动快照不变（「下次运行采用」才是 expected 的事）
+            self.settings = _settings(run_timeout_seconds=1, run_stall_seconds=1)
+            self.assertEqual(run.run_timeout_seconds, 999)
+            self.assertEqual(supervisor.runtime_settings_snapshot()["run_timeout_seconds"], 999)
+        finally:
+            for p in patchers:
+                p.stop()
+        await supervisor.stop_all()
+
+    async def test_snapshot_revoked_after_finish(self) -> None:
+        patchers = self._pin_spawn()
+        for p in patchers:
+            p.start()
+        try:
+            await supervisor.start(["dedup"])
+            self.assertNotEqual(supervisor.runtime_settings_snapshot(), {})
+        finally:
+            for p in patchers:
+                p.stop()
+        await supervisor.stop_all()
+        self.assertEqual(
+            supervisor.runtime_settings_snapshot(),
+            {},
+            "运行收尾后不得继续露出旧 current 的快照"
+        )
+
+    async def test_keep_runs_read_fresh_at_each_rotate(self) -> None:
+        """keep_runs 每次清理重读：start 之后的改动要影响下一次轮转。"""
+        _make_completed(self.run_root / "a", "2026-01-01 00:00:00", "a")
+        _make_completed(self.run_root / "b", "2026-01-02 00:00:00", "b")
+        self.settings = _settings(keep_runs=5)
+        await supervisor._rotate()
+        self.assertEqual(len(list(self.run_root.iterdir())), 2)
+        self.settings = _settings(keep_runs=1)
+        await supervisor._rotate()
+        names = {p.name for p in self.run_root.iterdir()}
+        self.assertEqual(names, {"b"}, "keep_runs=1 只留最新的 completed")
+
+
+class FinishRevokeOrderTest(SupervisorTest):
+    """撤销顺序：_finish 先标 finished 并撤销 _current，之后才轮转。
+
+    旧缺陷是「先轮转、后撤销」：轮转里 _settings()/删除抛错时 _current 还
+    指向已完成的运行，设置页继续显示一份本该消失的「本次基准运行采用」。
+    只在收尾结束后读一次快照看不到这个窗口，所以断言点在 _rotate 内部。
+    """
+
+    async def test_snapshot_revoked_before_rotate_raises(self) -> None:
+        patchers = self._pin_spawn()
+        for p in patchers:
+            p.start()
+        observed: dict[str, object] = {}
+
+        async def _rotate_boom() -> None:
+            # 关键断言点：轮转抛错的那一刻，撤销必须已经发生。
+            # 快照与 running 都不足以证明：_finish 先置 finished，快照遇 finished 即返回 {}、
+            # is_running 也随之变 False——把「清 _current」挪到 _rotate 之后，这两条仍然成立。
+            observed["snapshot_during_rotate"] = supervisor.runtime_settings_snapshot()
+            observed["running_during_rotate"] = supervisor.state()["running"]
+            observed["current_during_rotate"] = supervisor._current
+            raise RuntimeError("轮转炸掉（模拟 _settings/删除失败）")
+
+        try:
+            await supervisor.start(["dedup"])
+            run = supervisor._current
+            assert run is not None
+            self.assertNotEqual(supervisor.runtime_settings_snapshot(), {})
+            with patch.object(supervisor, "_rotate", new=_rotate_boom):
+                await supervisor.cancel()
+                for _ in range(400):
+                    if run.monitor is not None and run.monitor.done():
+                        break
+                    await asyncio.sleep(0.05)
+                # 取回监控任务的异常（顺带断言轮转错误确实向上传播）
+                monitor = run.monitor
+                assert monitor is not None
+                with self.assertRaises(RuntimeError):
+                    await monitor
+        finally:
+            for p in patchers:
+                p.stop()
+        self.assertEqual(observed["snapshot_during_rotate"], {}, "轮转前必须已撤销快照")
+        self.assertIs(observed["running_during_rotate"], False)
+        self.assertIsNone(
+            observed["current_during_rotate"], "轮转前运行指针必须已清空"
+        )
+        self.assertEqual(supervisor.runtime_settings_snapshot(), {})
+        self.assertFalse(supervisor.state()["running"])
+        self.assertIsNone(supervisor._current, "收尾后运行指针必须已清空")
+
+    async def test_old_run_finish_does_not_clear_new_current(self) -> None:
+        """旧 run 的收尾只清自己的字段：_finish 按身份判定撤销。
+
+        若退回无条件 _current = None，第二个运行的快照会被第一个运行的收尾
+        误清。这里对一个已退役的 run 手动补一次 _finish，断言当前运行不受影响。
+        """
+        patchers = self._pin_spawn()
+        for p in patchers:
+            p.start()
+        try:
+            await supervisor.start(["dedup"])
+            run_a = supervisor._current
+            assert run_a is not None
+            stale_dir = self.run_root / "stale"
+            stale_dir.mkdir()
+            stale = supervisor._Run(
+                run_id="stale-id", run_dir=stale_dir, features=["dedup"],
+                started_at="2026-01-01 00:00:00", t0=0.0, pause=False,
+            )
+            await supervisor._finish(stale)
+            self.assertIs(supervisor._current, run_a)
+            self.assertNotEqual(supervisor.runtime_settings_snapshot(), {})
+            self.assertEqual(supervisor.state()["run_id"], run_a.run_id)
+        finally:
+            for p in patchers:
+                p.stop()
+
+
 if __name__ == "__main__":
     unittest.main()

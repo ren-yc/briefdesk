@@ -191,6 +191,28 @@ def _on_items_deleted(self, item_ids: list[str]) -> None:
   才是「本进程正在用的值」；不实现这两个钩子的旧插件仍可用，只是字段不带运行快照
   （框架按 `running=False` 展示「无运行值」）。字段类型/默认值/约束/密钥状态由框架统一生成，
   密钥不回传明文。
+
+  **运行期才采用配置的插件**（采用时点晚于 setup，如 benchmark 的三个运行参数）应改声明两个可选钩子，
+  而不是 `settings_instance()`：
+
+  ```python
+  def settings_model(self) -> type[BaseSettings]:
+      """动态运行配置：manager 只登记模型类型，不缓存 setup 期实例。"""
+      from myplug.config import MySettings
+
+      return MySettings
+
+  def settings_snapshot(self) -> dict[str, Any]:
+      """当前活动运行的采用值（**字段名**为键）；没有活动运行返回 {}。
+
+      只读内存：不得读文件、不得构造新实例、不得访问网络——设置页与前端轮询都会调它。
+      """
+      return {...}
+  ```
+
+  manager 会把这些键翻译成环境键并覆盖对应行的 `current`（`source` 下发 `run`），`expected_*` 仍按当前文件
+  解析——于是「本次运行采用」与「下次运行采用」是两个可分辨的答案。没有活动运行时不要给 `current`：
+  拿「按当前文件解析的值」冒充运行值，正是运行中改配置后页面与实际不一致的成因。
 - **必填校验**：`briefdesk.plugin.config_helpers.validate_required_config(settings, {...})`
   统一检查必填项（缺失时一次性列出全部环境变量名），在 setup 抛 `PluginDisabledError`。
 

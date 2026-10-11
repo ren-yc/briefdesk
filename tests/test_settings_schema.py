@@ -286,13 +286,54 @@ class PluginRunningSnapshotTest(unittest.TestCase):
         fields = manager.settings_schema()
         return {i["key"]: i for i in fields if i.get("plugin") == "benchmark"}
 
-    def test_loaded_plugin_exposes_running_values(self) -> None:
+    def test_loaded_dynamic_plugin_idle_has_no_current(self) -> None:
+        """动态运行配置（采用时点=运行开始）：无活动运行时不伪造 current。
+
+        旧行为缓存 setup 期实例并把「按当前文件解析的值」冒充运行值——运行中改过
+        配置后两者背离。新契约：空闲时只有 expected（下次运行采用），current 等
+        活动运行开始才有。
+        """
         items = self._items(loaded=True)
-        item = items["BENCHMARK_KEEP_RUNS"]
-        self.assertTrue(item["running"])
-        self.assertIn("current", item)
-        self.assertIn("source", item)
-        self.assertIn("expected_value", item)
+        for key in ("BENCHMARK_KEEP_RUNS", "BENCHMARK_PAUSE_PIPELINE"):
+            item = items[key]
+            self.assertFalse(item["running"])
+            self.assertNotIn("current", item, "空闲时不得拿下次运行值冒充运行值")
+            self.assertNotIn("source", item)
+            self.assertIn("expected_value", item, "下次运行值仍要能预配置")
+
+    def test_loaded_dynamic_plugin_active_run_exposes_adopted_values(self) -> None:
+        """活动运行期间：三个运行参数展示 supervisor 冻结的采用值（source=run）。"""
+        from briefdesk.plugin.manager import PluginManager
+        from briefdesk.plugins.benchmark import supervisor as bench_supervisor
+        from briefdesk.plugins.benchmark.plugin import BenchmarkPlugin
+
+        plugin = BenchmarkPlugin()
+        manager = PluginManager()
+        manager.register(plugin)
+        manager._mark(plugin.name, "loaded")
+        manager._capture_settings(plugin.name, plugin)
+        # 伪造一个活动运行（只设内存快照，不真启动）：timeout 故意取一个
+        # 与任何默认值都不同的值，证明展示的是「采用值」而不是重新解析结果
+        run = bench_supervisor._Run(
+            run_id="test-run", run_dir=Path("."), features=[],
+            started_at="2026-01-01 00:00:00", t0=0.0,
+            pause_pipeline=False, run_timeout_seconds=12345, run_stall_seconds=777,
+        )
+        run.finished = False
+        old = bench_supervisor._current
+        bench_supervisor._current = run
+        try:
+            fields = manager.settings_schema()
+        finally:
+            bench_supervisor._current = old
+        items = {i["key"]: i for i in fields if i.get("plugin") == "benchmark"}
+        timeout_item = items["BENCHMARK_RUN_TIMEOUT_SECONDS"]
+        self.assertEqual(timeout_item["current"], 12345)
+        self.assertEqual(timeout_item["source"], "run")
+        self.assertTrue(timeout_item["running"])
+        # keep_runs 不在运行快照里：它的采用时点是「下次清理」，没有运行 current
+        self.assertNotIn("current", items["BENCHMARK_KEEP_RUNS"])
+        self.assertIn("expected_value", items["BENCHMARK_KEEP_RUNS"])
 
     def test_unloaded_plugin_has_no_running_value(self) -> None:
         items = self._items(loaded=False)

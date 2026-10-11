@@ -14,6 +14,7 @@
 
 import asyncio
 import json
+import logging
 from typing import Any
 
 from fastapi import APIRouter, HTTPException
@@ -41,12 +42,17 @@ from briefdesk.server.web_plugins import (
 from briefdesk.settings_env import (
     SOURCE_DOTENV,
     SOURCE_ENV,
-    composed_value,
+    StagedCommitError,
+    StagedReadError,
+    commit_staged_write,
     get_settings_file,
+    prepare_staged_write,
     read_staged,
+    read_staged_from_bytes,
+    read_staged_strict,
+    resolve_alias_layers,
     source_of,
     startup_source,
-    write_staged,
 )
 from briefdesk.settings_schema import (
     build_settings_schema,
@@ -55,6 +61,8 @@ from briefdesk.settings_schema import (
 )
 
 router = APIRouter()
+
+logger = logging.getLogger(__name__)
 
 # 单进程写锁 + 原子写：并发 PUT 串行化
 _write_lock = asyncio.Lock()
@@ -241,52 +249,110 @@ def _fresh_item_state(key: str, staged_now: dict[str, str]) -> dict[str, Any]:
     return _item_state(meta, staged_now.get(key))
 
 
+class _PluginsUnresolvable(Exception):
+    """插件名单无法解析为合法的字符串数组（含各层坏值与名单缺失语义）。
+
+    显式不可用而不是回落旧值：删除最后一个 PLUGINS 暂存后回落启动 config.plugins，
+    会放行「保存成功、重启必失败」的必选组合；解析失败被静默吞掉则会把坏 JSON
+    等同于「无冲突」放行。两类都必须让 PUT 以 409 点名。
+    """
+
+    def __init__(self, key: str, detail: str) -> None:
+        super().__init__(detail)
+        self.key = key
+        self.detail = detail
+
+
+def _dedupe_issues(issues: list[dict[str, str]]) -> list[dict[str, str]]:
+    """同名 issue 去重：启用名单不可解析时，候选解析与必选复检会各报一条。
+
+    两条内容相同，重复下发只会让 409 的明细看起来像两个独立问题。
+    """
+    seen: set[tuple[tuple[str, str], ...]] = set()
+    unique: list[dict[str, str]] = []
+    for issue in issues:
+        key = tuple(sorted((k, str(v)) for k, v in issue.items()))
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(issue)
+    return unique
+
+
+def _resolve_plugin_list(key: str, staged_override: dict[str, str] | None = None) -> list[str] | None:
+    """按共享层序解析 PLUGINS / PLUGINS_REQUIRED 为字符串数组。
+
+    返回 None 表示所有层都未提供（真实默认 []）；解析失败/元素非字符串抛
+    _PluginsUnresolvable——不回落 config.plugins、不过滤坏元素。空串是「已提供
+    的坏值」（数组字段会解码失败），按不可用处理，不等同未设置。
+
+    逐层解码判可用性、胜出值判类型，两者与真实构造语义一一对应：任一层提供了
+    该键但 JSON 解码失败即不可用（真实 Settings() 会在那一层解码失败，只看胜出
+    值会放行「保存成功、下次启动失败」的配置）；元素类型只对胜出值判——低层
+    合法 JSON 但被高层覆盖的错类型（如 [17]）按 pydantic 合并语义是可启动的。
+    层序与胜出值共用 resolve_alias_layers 一份定义（来源展示取自同一结果）。
+    """
+    layers = resolve_alias_layers(key, staged_override=staged_override)
+    if not layers:
+        return None
+    winning_source, raw = layers[0]
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise _PluginsUnresolvable(
+            key, f"{key} 不是合法 JSON（{exc.msg}，来源 {winning_source}）"
+        ) from exc
+    for source, value in layers[1:]:
+        try:
+            json.loads(value)
+        except json.JSONDecodeError as exc:
+            raise _PluginsUnresolvable(
+                key, f"{key} 不是合法 JSON（{exc.msg}，来源 {source}）"
+            ) from exc
+    if not isinstance(parsed, list) or not all(isinstance(n, str) for n in parsed):
+        raise _PluginsUnresolvable(key, f"{key} 须为 JSON 字符串数组")
+    return parsed
+
+
 def _desired_plugins(staged_override: dict[str, str] | None = None) -> list[str]:
     """下次启动的可选插件启用列表：按**共享层序**合成（env > 项目 .env > 暂存）。
 
     只看暂存会漏掉被 .env/环境变量压住的情形——那种组合重启后由更高层决定，
     校验必须按实际生效的组合判，否则会放行「重启即中止」的配置。
     staged_override 传「写入之后的暂存态」时按它取值（PUT 落盘前预检）。
-
-    解析失败属防御分支（暂存值写入时已过 normalize_setting 校验）。
+    所有层都未提供时取模型默认 []——不是启动 config.plugins（那是本进程的旧值，
+    下次启动已不生效）。解析失败属防御分支（暂存值写入时已过 normalize_setting，
+    但高层 env/.env 里的坏值仍会走到这里）。
     """
-    raw, _source = composed_value("PLUGINS", staged_override=staged_override)
-    if raw is None:
-        return list(config.plugins)
-    try:
-        parsed = json.loads(raw)
-    except json.JSONDecodeError:
-        return list(config.plugins)
-    if not isinstance(parsed, list) or not all(isinstance(n, str) for n in parsed):
-        return list(config.plugins)
-    return parsed
+    parsed = _resolve_plugin_list("PLUGINS", staged_override=staged_override)
+    return parsed if parsed is not None else []
 
 
 def _required_plugin_issues(staged: dict[str, str]) -> list[dict[str, str]]:
     """PLUGINS_REQUIRED 与 PLUGINS 的自洽复检（写入暂存之前的快返回）。
 
     两个键由「插件」面板分别写入：单独看各自合法，合起来却可能矛盾——某插件被
-    勾成必选却不在启用列表里。这种组合在暂存时看不出来，要等到**下次启动**才由
-    PluginManager 抛「必选插件未就绪」，用户得回头比对两份名单才知道该改哪个。
-    这里提前拦下，并按依赖复检同一形状回 issue 明细。
+    勾成必选却不在启用列表里。这里提前拦下，并按依赖复检同一形状回 issue 明细。
+    名单解析失败/必选名单混入非字符串都属不可用：显式报 issue，不静默过滤后放行
+    （过滤会让 REQUIRED=[17] 这类坏值留到启动期才炸）。
 
     核心插件恒装配，列入必选视为恒满足（面板也不提供它们的必选芯片）。
     """
-    raw, _source = composed_value("PLUGINS_REQUIRED", staged_override=staged)
-    if raw is None:
-        return []
     try:
-        parsed = json.loads(raw)
-    except json.JSONDecodeError:
-        return []
-    if not isinstance(parsed, list):
-        return []
-    required = [n for n in parsed if isinstance(n, str)]
+        parsed = _resolve_plugin_list("PLUGINS_REQUIRED", staged_override=staged)
+        required = parsed if parsed is not None else []
+    except _PluginsUnresolvable as exc:
+        return [{"type": "unavailable", "key": exc.key, "detail": exc.detail}]
     if not required:
         return []
     known = {p.get("name") for p in get_plugins_info() if p.get("name")}
     core = {p.get("name") for p in get_plugins_info() if p.get("core")}
-    desired = set(_desired_plugins(staged))
+    # 启用名单本身不可解析时同样按不可用报：这里若让 _PluginsUnresolvable 冒出去，
+    # 路由会变成 500——坏名单（高层 env/项目 .env 或暂存）配有效必选名单时必然触发。
+    try:
+        desired = set(_desired_plugins(staged))
+    except _PluginsUnresolvable as exc:
+        return [{"type": "unavailable", "key": exc.key, "detail": exc.detail}]
     issues: list[dict[str, str]] = []
     for name in required:
         if known and name not in known:
@@ -298,23 +364,30 @@ def _required_plugin_issues(staged: dict[str, str]) -> list[dict[str, str]]:
                 {
                     "type": "required_not_enabled",
                     "plugin": name,
-                    "detail": (
-                        f"被勾成必选但不在启用列表里: {name}"
-                        "（下次启动会因必选插件未就绪而中止）"
-                    ),
+                    "detail": f"必选插件 {name} 不在启用列表中（重启将无法启动）",
                 }
             )
     return issues
 
 
-def _plugin_toggle_data(staged: dict[str, str]) -> list[dict[str, Any]]:
+def _plugin_toggle_data(staged: dict[str, str]) -> tuple[list[dict[str, Any]], str | None]:
     """「插件」面板数据：声明元数据 + 期望启用态 + 当前进程装配状态。
+
+    返回 (面板数据, 预期不可用说明)。名单无法解析时 enabled 没有可信答案——
+    面板项的 enabled 置 None（前端显式未知，不渲染成「全关」），说明文案随
+    pluginsExpectedError 下发；不抛错：设置页不能因坏名单整页 500。
 
     加载失败记录（无插件实例、元数据缺失）兜底追加，保证面板仍可见其
     失败原因。
     """
+    try:
+        parsed = _resolve_plugin_list("PLUGINS", staged_override=staged)
+        desired = set(parsed) if parsed is not None else set()
+        unavailable: str | None = None
+    except _PluginsUnresolvable as exc:
+        desired = set()
+        unavailable = exc.detail
     runtime = {p.get("name"): p for p in get_plugins_info() if p.get("name")}
-    desired = set(_desired_plugins(staged))
     plugins: list[dict[str, Any]] = []
     seen: set[str] = set()
     for meta in get_plugin_meta():
@@ -324,7 +397,8 @@ def _plugin_toggle_data(staged: dict[str, str]) -> list[dict[str, Any]]:
         plugins.append(
             {
                 **meta,
-                "enabled": True if meta["core"] else name in desired,
+                # 未知预期：None = 显式未知，区别于 False（确定关闭）
+                "enabled": True if meta["core"] else (name in desired if unavailable is None else None),
                 "status": rt.get("status", "discovered"),
                 "reason": rt.get("reason", ""),
             }
@@ -339,17 +413,30 @@ def _plugin_toggle_data(staged: dict[str, str]) -> list[dict[str, Any]]:
                 "dependencies": [],
                 "conflicts": [],
                 "core": False,
-                "enabled": name in desired,
+                "enabled": name in desired if unavailable is None else None,
                 "status": rt.get("status", ""),
                 "reason": rt.get("reason", ""),
             }
         )
-    return plugins
+    return plugins, unavailable
 
 
 def _plugins_source() -> str:
-    """PLUGINS 的运行来源：启动快照优先，未捕获时退回实时判定（测试场景）。"""
-    return startup_source("PLUGINS") or source_of("PLUGINS")
+    """PLUGINS 的运行来源：返回**真正压住该键的那一层**。
+
+    显示与开关禁用判据必须是同一个答案：enabled 按实时层序合成（_desired_plugins），
+    开关可编辑性必须与它一致。方向不能写反：启动快照回落 default 是「无快照」的
+    占位值（真值字符串）——运行中往项目 .env 新增 PLUGINS 时若先取启动侧，实时
+    的 dotenv 永远被 default 挡住，开关显示可编辑、草稿重启却不生效。
+    """
+    startup = startup_source("PLUGINS")
+    realtime = source_of("PLUGINS")
+    # 优先取「压住它的层」（实时侧在前：草稿的生效与否由当前文件状态决定）；
+    # 两侧都没被压住时才是运行值/快照/默认。
+    for value in (realtime, startup):
+        if value in (SOURCE_ENV, SOURCE_DOTENV):
+            return value
+    return realtime or startup or "default"
 
 
 def _normalize(key: str, raw: str) -> str:
@@ -399,15 +486,21 @@ async def api_settings_env():
                 "keyringConfigured": keyring_configured,
             }
         )
+    plugins_data, plugins_expected_error = _plugin_toggle_data(staged)
+    # 来源判定一次求值后复用：函数内读盘（source_of 走文件层），两次独立调用在
+    # 文件刚好被外部改动的间隙会给出互相矛盾的来源与覆盖态。
+    plugins_source = _plugins_source()
     return {
         "filePath": str(get_settings_file()),
         "items": items,
         "pluginOptions": plugin_names,
-        "plugins": _plugin_toggle_data(staged),
-        # PLUGINS 的来源取启动快照（与「本进程开关是否生效」同一时点）；被 env 或
-        # 项目 .env 压住时前端禁用开关。
-        "pluginsSource": _plugins_source(),
-        "pluginsOverridden": _plugins_source() in (SOURCE_ENV, SOURCE_DOTENV),
+        "plugins": plugins_data,
+        # PLUGINS 的来源 = 真正压住该键的那一层（env/dotenv 时前端禁用开关）。
+        "pluginsSource": plugins_source,
+        "pluginsOverridden": plugins_source in (SOURCE_ENV, SOURCE_DOTENV),
+        # 预期名单不可用（坏 JSON/非字符串数组）时显式说明：开关与启停展示不能
+        # 把未知当「全关」，也不能假装一切正常。
+        "pluginsExpectedError": plugins_expected_error or "",
         "secrets": secrets,
     }
 
@@ -423,7 +516,12 @@ class SecretsPutPayload(BaseModel):
 
 @app.put("/api/settings/env")
 async def api_settings_env_put(payload: EnvPutPayload):
-    """批量暂存：{items: {KEY: value|null}}；null = 恢复默认（移除暂存）。"""
+    """批量暂存：{items: {KEY: value|null}}；null = 恢复默认（移除暂存）。
+
+    校验与提交针对同一份候选字节：预检看到的就是落盘后的解析结果（值含
+    ${VAR} 展开时，内存 dict 合并直接 json.loads 会看到展开前的原文）。锁内
+    严格读取——暂存读不出来时拒绝写入，不把读失败当「无暂存」覆盖成空。
+    """
     raw_items = payload.items
     if not isinstance(raw_items, dict):
         raise HTTPException(422, "请求体须为 {items: {KEY: value|null}}")
@@ -440,42 +538,65 @@ async def api_settings_env_put(payload: EnvPutPayload):
         if not isinstance(raw, str):
             raise HTTPException(422, f"{key}: 值须为字符串或 null")
         updates[key] = _normalize(key, raw)
-    # 插件相关键的组合复检（暂存前失败快返回，409 携带 issue 明细）。
-    # 单键合法 ≠ 组合合法：PLUGINS 的依赖/互斥复检，与 PLUGINS_REQUIRED ⊆ PLUGINS
-    # 的自洽检查，都按「本次写入之后 **且按共享层序合成** 的组合」看——只读暂存会
-    # 漏掉被 .env/环境变量压住的情形（那种组合重启后按更高层生效，可能直接中止启动）。
-    if {"PLUGINS", "PLUGINS_REQUIRED"} & set(updates):
-        merged = dict(read_staged())
-        for key, value in updates.items():
-            if value is None:
-                merged.pop(key, None)
-            else:
-                merged[key] = value
-        issues: list[dict[str, str]] = []
-        if "PLUGINS" in updates:
-            raw = updates["PLUGINS"]
-            if raw is not None:
-                try:
-                    parsed = json.loads(raw)
-                except json.JSONDecodeError as exc:
-                    raise HTTPException(422, f"PLUGINS: 校验失败（{exc}）") from exc
-                if not isinstance(parsed, list) or not all(
-                    isinstance(n, str) for n in parsed
-                ):
-                    raise HTTPException(422, "PLUGINS: 值须为 JSON 字符串数组")
-            # 包装层约定：无管理器可校验时返回 None（测试/未装配），不是「无问题」
-            # 的语义——这里统一成列表，避免下面的 += 变成 None + list
-            issues = list(
-                validate_plugin_selection(_desired_plugins(merged)) or []
-            )
-        issues += _required_plugin_issues(merged)
-        if issues:
-            raise HTTPException(status_code=409, detail={"issues": issues})
     async with _write_lock:
-        write_staged(updates)
-    # 写后重读暂存，回传受影响键的最终态：前端据此做行级贴片，不必整面
-    # 重拉（整面重载会丢其它行的未暂存编辑与「插件」面板的开关草稿）
-    staged_now = read_staged()
+        # 严格读取现有暂存并合成候选字节：读不出可靠旧值时拒绝写入——
+        # 当空覆盖等于把整个暂存态静默抹掉。
+        try:
+            _merged, candidate = prepare_staged_write(updates)
+        except StagedReadError as exc:
+            raise HTTPException(409, f"暂存状态无法读取，拒绝写入: {exc}") from exc
+        # 插件组合复检只看**候选字节回读**（dotenv 解析过一遍，含变量展开），
+        # 与提交后的解析严格同源；单键 422 校验已在 _normalize 完成。
+        if {"PLUGINS", "PLUGINS_REQUIRED"} & set(updates):
+            try:
+                _candidate_staged = read_staged_from_bytes(candidate)
+            except (OSError, UnicodeDecodeError) as exc:
+                raise HTTPException(409, f"候选暂存无法解析，拒绝写入: {exc}") from exc
+            issues: list[dict[str, str]] = []
+            try:
+                desired = _desired_plugins(_candidate_staged)
+            except _PluginsUnresolvable as exc:
+                issues.append({"type": "unavailable", "key": exc.key, "detail": exc.detail})
+                desired = []
+            if "PLUGINS" in updates and issues == []:
+                # 包装层约定：无管理器可校验时返回 None（测试/未装配），不是「无问题」
+                # 的语义——这里统一成列表，避免 None + list
+                issues = list(validate_plugin_selection(desired) or [])
+            issues += _required_plugin_issues(_candidate_staged)
+            if issues:
+                raise HTTPException(status_code=409, detail={"issues": _dedupe_issues(issues)})
+        try:
+            commit_staged_write(candidate)
+        except StagedCommitError as exc:
+            # 写入/替换/删除失败必须显式失败：静默 ok:true 是丢写入。不用 409——
+            # 那是「客户端可调整后重试」的语义，OS 层失败改多少次都一样；也不回显
+            # 暂存值（可能含敏感内容）。日志脱敏：只记阶段与异常类别。
+            logger.error(
+                "暂存提交失败（%s）: %s", exc.stage, type(exc).__name__
+            )
+            raise HTTPException(
+                500,
+                {
+                    "type": "staged_commit_failed",
+                    "stage": exc.stage,
+                    "message": f"暂存状态提交失败（{exc.stage}），请稍后重试",
+                },
+            ) from exc
+    # 写后重读暂存（严格口径：吞 OSError 的展示读取会把「已写入但读不出」变成
+    # ok:true + 空状态，比报错更坏），回传受影响键的最终态：前端据此做行级贴片，
+    # 不必整面重拉（整面重载会丢其它行的未暂存编辑与「插件」面板的开关草稿）。
+    # 重读失败时写入已发生：明确「已写入、状态未知」，不得谎报未保存。
+    try:
+        staged_now = read_staged_strict()
+    except StagedReadError as exc:
+        logger.error("暂存写入后重读失败: %s", type(exc).__name__)
+        raise HTTPException(
+            500,
+            {
+                "type": "staged_state_unknown",
+                "message": "配置已写入，但当前状态未知（读取失败），请刷新确认",
+            },
+        ) from exc
     return {
         "ok": True,
         "filePath": str(get_settings_file()),

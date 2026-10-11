@@ -60,7 +60,6 @@ INDEXES = {
     },
 }
 
-_VERSION_RE = re.compile(r'(?m)^version = "[^"]*"$')
 _DEV_SUFFIX_RE = re.compile(r"\.dev\d+$")
 
 
@@ -123,21 +122,56 @@ def fetch_published_versions(index_json: str, project: str = PROJECT_NAME) -> se
     return set(payload.get("releases", {}))
 
 
+def _apply_version(original: bytes, version: str, *, path_for_message: Path) -> bytes:
+    """构造替换了 [project].version 的候选 bytes；定位或语义校验失败即抛错（不写盘）。
+
+    为什么按字节替换而不是改写后重序列化 TOML：注释、空行、CRLF/LF 混合换行与键序
+    都必须原样保留——文本模式读写在 Windows 会把 LF 规范化成 CRLF，bytes 变了而
+    文本比较相等，试发一次就弄脏整个文件。target 取「静态值本身」而不是任意
+    version 行：`[tool]\nversion = "..."` 这类工具表版本不会被波及。
+    """
+    data = tomllib.loads(original.decode("utf-8"))
+    static = data.get("project", {}).get("version")
+    if not isinstance(static, str) or not static:
+        raise ReleaseCheckFailure(f"{path_for_message.name} 里没有静态 [project].version")
+    target = f'version = "{static}"'.encode()
+    replacement = f'version = "{version}"'.encode()
+    first = original.find(target)
+    if first < 0:
+        raise ReleaseCheckFailure(
+            f'{path_for_message.name} 的 [project].version 不是预期的 version = "<值>" 单行形态'
+        )
+    if original.find(target, first + 1) >= 0:
+        raise ReleaseCheckFailure(
+            f'{path_for_message.name} 里 version = "{static}" 出现多次，替换目标有歧义'
+        )
+    replaced = original[:first] + replacement + original[first + len(target):]
+    # 语义双断言：替换后必须仍可解析，且除 project.version 外整棵树逐项相等——
+    # 目标值出现在注释/字符串里、或字节定位越界碰到别的表时都在这里拦下。
+    new_data = tomllib.loads(replaced.decode("utf-8"))
+    if new_data.get("project", {}).get("version") != version:
+        raise ReleaseCheckFailure("替换后 [project].version 不是目标值")
+    new_data.setdefault("project", {})["version"] = static
+    if new_data != data:
+        raise ReleaseCheckFailure("替换波及了 project.version 之外的 TOML 内容")
+    return replaced
+
+
 @contextmanager
 def patched_version(pyproject: Path, version: str):
-    """构建期间把 version 改成给定值，退出时**逐字节**还原原文件。"""
-    original = pyproject.read_text(encoding="utf-8")
-    replaced, count = _VERSION_RE.subn(f'version = "{version}"', original, count=1)
-    if count != 1:
-        raise ReleaseCheckFailure(
-            f'{pyproject.name} 的 version 行不是预期的 version = "<值>" 形态'
-        )
-    pyproject.write_text(replaced, encoding="utf-8")
+    """构建期间把 [project].version 改成给定值，退出时**逐字节**还原原文件。
+
+    首次写入也进 try：部分写入后抛错同样要尝试恢复。恢复后用 bytes 相等自校验——
+    文本比较在换行被规范化时检不出文件已被改写。
+    """
+    original = pyproject.read_bytes()
+    replaced = _apply_version(original, version, path_for_message=pyproject)
     try:
+        pyproject.write_bytes(replaced)
         yield
     finally:
-        pyproject.write_text(original, encoding="utf-8")
-        if pyproject.read_text(encoding="utf-8") != original:
+        pyproject.write_bytes(original)
+        if pyproject.read_bytes() != original:
             raise ReleaseCheckFailure(f"{pyproject.name} 还原失败——请用 git diff 检查并手工恢复")
 
 

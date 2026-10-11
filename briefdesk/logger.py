@@ -52,9 +52,9 @@ _NAME_STRIP_PREFIXES = ("briefdesk.", "plugins.")
 # 会漏掉一半。
 _NAME_ALIASES = {"weflow_legacy": "weflow-legacy"}
 
-# 短名列宽：取全项目最长短名（weflow-legacy.normalize = 23）。超宽不截断
+# 短名列宽：取全项目最长短名（server.routes_settings_env = 26）。超宽不截断
 # （截断会毁掉 grep），只是那一行的消息起点右移。
-_NAME_WIDTH = 23
+_NAME_WIDTH = 26
 
 # 行格式：来源列用 %(shortname)s（本模块在 format() 里注入）而非 %(name)s。
 # 提为模块常量供测试钉住，防止重构时退回不定宽的全限定名。

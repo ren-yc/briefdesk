@@ -96,3 +96,38 @@ class SecretScanFailClosedTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class SecretScanDualEndpointTest(unittest.TestCase):
+    """双端模式：直接比较事件给定的两个端点（不引入 merge-base 隐藏基线）。"""
+
+    def test_base_and_head_must_come_in_pairs(self) -> None:
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            self.assertEqual(main(["--base", "a" * 40]), 2)
+        self.assertIn("成对", stderr.getvalue())
+
+    def test_dual_endpoint_uses_two_dot_diff(self) -> None:
+        captured: list[list[str]] = []
+
+        def fake_run(cmd, **_kwargs):
+            captured.append(list(cmd))
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        with patch("scripts.secret_scan.subprocess.run", side_effect=fake_run):
+            code = main(["--base", "1" * 40, "--head", "2" * 40])
+        self.assertEqual(code, 0)
+        self.assertEqual(len(captured), 1)
+        args = captured[0]
+        self.assertIn("1" * 40, args)
+        self.assertIn("2" * 40, args)
+        self.assertNotIn("1" * 40 + "..." + "2" * 40, args, "不得构造三点范围")
+
+    def test_git_failure_in_dual_mode_returns_2(self) -> None:
+        with patch(
+            "scripts.secret_scan.subprocess.run",
+            return_value=SimpleNamespace(returncode=128, stdout="", stderr="fatal"),
+        ):
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                self.assertEqual(main(["--base", "1" * 40, "--head", "2" * 40]), 2)
+        self.assertIn("拒绝放行", stderr.getvalue())
