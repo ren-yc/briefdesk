@@ -142,6 +142,7 @@ def build_settings_schema(
     hints: dict[str, str] | None = None,
     warnings: dict[str, str] | None = None,
     options: dict[str, list[str]] | None = None,
+    apply_when: dict[str, str] | None = None,
 ) -> list[dict[str, Any]]:
     """从 Settings 模型生成设置字段描述。
 
@@ -156,6 +157,12 @@ def build_settings_schema(
     - 密钥字段：只下发 `configured`，不参与上述任何值时点。
 
     返回值只包含可 JSON 序列化内容，密钥字段不包含明文。
+
+    `apply_when`（字段名 → 采用时点）：声明该字段暂存后的采用时点语义，
+    未声明的字段回落 `"restart"`。取值约定：`restart`（重启进程生效，缺省）/
+    `next_run`（下次基准运行开始解析并冻结）/ `next_cleanup`（下次运行目录
+    清理时重读）。语义归属在模型侧——核心不认识插件字段，硬编码映射会让
+    每个非重启字段都得改核心；与 labels/hints 同形经参数传入是既有扩展面。
     """
     settings: BaseSettings | None = instance
     if settings is None and running:
@@ -170,6 +177,7 @@ def build_settings_schema(
     hints = hints or {}
     warnings = warnings or {}
     options = options or {}
+    apply_when = apply_when or {}
     result: list[dict[str, Any]] = []
     for name, field in model.model_fields.items():
         key = _field_key(model, name)
@@ -183,7 +191,11 @@ def build_settings_schema(
             "label": labels.get(name, _label_from_name(name)),
             "plugin": plugin,
             "secret": secret,
-            "restart": True,
+            # 采用时点：旧字段只有「重启生效」一义，静态 restart 改为可声明的
+            # applyWhen——benchmark 三参数是「下次运行采用」、keep_runs 是
+            # 「下次清理重读」，前端按它显示采用时点文案（写死「重启生效」会把
+            # 暂存的运行参数误标成要重启）。
+            "applyWhen": apply_when.get(name, "restart"),
             "running": running,
         }
         if not running:

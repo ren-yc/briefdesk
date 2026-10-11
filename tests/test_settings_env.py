@@ -491,6 +491,30 @@ class EnvRoutesTest(StagedFileTestCase):
         }
         self.assertTrue(expected <= keys)
 
+    def test_schema_carries_apply_when_per_field(self) -> None:
+        """GET 随 schema 下发采用时点：插件声明项按声明、核心项回落 restart。
+        回调只在 main 启动序列注入，测试里以 benchmark 的真实 schema 作桩——
+        合并层（{**meta, **_item_state}）必须原样透传 applyWhen，丢字段会让
+        前端把运行参数误标成「重启生效」。"""
+        from briefdesk.plugins.benchmark.plugin import BenchmarkPlugin
+
+        items = {
+            item["key"]: item
+            for item in self.client.get("/api/settings/env").json()["items"]
+        }
+        self.assertEqual(items["LOG_LEVEL"]["applyWhen"], "restart")
+        with patch.object(
+            settings_routes,
+            "get_settings_schema",
+            return_value=BenchmarkPlugin().settings_schema(),
+        ):
+            items = {
+                item["key"]: item
+                for item in self.client.get("/api/settings/env").json()["items"]
+            }
+        self.assertEqual(items["BENCHMARK_PAUSE_PIPELINE"]["applyWhen"], "next_run")
+        self.assertEqual(items["BENCHMARK_KEEP_RUNS"]["applyWhen"], "next_cleanup")
+
     def test_ai_reasoning_effort_is_select_with_all_values(self) -> None:
         """推理强度必须渲染成下拉：options 按环境键名登记，否则只是文本框。"""
         from briefdesk.config import REASONING_EFFORT_VALUES

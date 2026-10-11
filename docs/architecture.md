@@ -88,7 +88,7 @@ weflow-server :5033        WeFlow(legacy) :5031        qqflow-server :5032
 | `briefdesk/config.py` | `pydantic-settings` 配置（.env + UI 暂存文件；密钥 `SecretStr` 掩码；解析链见「配置」节）。[详见下文](#briefdeskconfigpy) |
 | `briefdesk/settings_env.py` | UI「启动配置」暂存层：`get_settings_file()`（委托 `paths.settings_file()`，可经 `BRIEFDESK_SETTINGS_FILE` 覆盖）、`read_staged`/`write_staged`（`KEY=VALUE` 行、原子写、空则删文件）、`dotenv_layers()`（**唯一的有序层定义**：项目 .env → 用户暂存，解析与展示共用）、`source_of`（env/dotenv/override/default；大小写不敏感、空串算已提供）、`field_env_key`（字段 → 环境变量键，与 settings_schema 共用）、值查询（`composed_value`：env > 项目 .env > 暂存，PUT 预检可按写后暂存态取值）、启动快照（按模型登记 `capture_model_sources`/`model_sources`，核心另有 `capture_startup_sources`/`startup_source`）。不 import config。 |
 | `briefdesk/settings_base.py` | `KeyringSettingsBase`——app 级与各源插件 Settings 的公共基类：密钥环源挂载 + 两个独立 dotenv 来源（项目 .env 高于暂存）+ 显式 `_env_file` 契约（ContextVar 捕获显式性，`model_config["env_file"]` 恒为 None）。[详见下文](#briefdesksettings_basepy) |
-| `briefdesk/settings_schema.py` | 从核心或插件 `BaseSettings` 模型生成 JSON 安全的设置 schema（字段类型、默认值、约束、密钥配置状态，以及**三个时点**的取值：运行快照 `current`/`source`、下次启动 `expected_value`/`expected_source`）；统一规范化/校验前端暂存值，密钥不回传明文。 |
+| `briefdesk/settings_schema.py` | 从核心或插件 `BaseSettings` 模型生成 JSON 安全的设置 schema（字段类型、默认值、约束、密钥配置状态，以及**三个时点**的取值：运行快照 `current`/`source`、下次启动 `expected_value`/`expected_source`；每项另带 `applyWhen` 采用时点——`restart` 缺省 / `next_run` / `next_cleanup`，由调用方经 `apply_when` 参数按字段声明，前端按它显示采用时点文案）；统一规范化/校验前端暂存值，密钥不回传明文。 |
 | `briefdesk/plugins/weflow_legacy/normalize.py` | Two normalization paths: `normalize_sse` and `normalize_rest` both produce **lists** of `InternalMessage`。[详见下文](#briefdeskpluginsweflow_legacynormalizepy) |
 | `briefdesk/pipeline.py` | `process_all_batches()` — 管道**骨架**：入口过滤、raw 落库、批次编排与阶段调度（不 import 任何 AI/OCR 实现）。[详见下文](#briefdeskpipelinepy) |
 | `briefdesk/db.py` | All SQLite via `aiosqlite`（单连接单例、存储锁、schema 迁移与备份/恢复）。[详见下文](#briefdeskdbpy) |
@@ -1157,6 +1157,9 @@ required field of `weflow`/`qqflow` → that plugin self-disables via `PluginDis
   （keyring 写入/清除，明文永不下发；密钥状态同时区分有效配置 `configured` 与钥匙串条目 `keyringConfigured`）；写入后**重启生效**
   （配置在启动时快照，无热应用）。GET 每行给三组值（见「三个时点」）：实际生效徽章按 `override_source` 措辞（「已被「项目 .env」覆盖」），
   并在有草稿时显示「下次启动生效」；`expectedAvailable=false` 表示按当前文件解析失败（坏配置不 500，仍给脱敏摘要与全部字段元数据）。
+  每项 schema 带 `applyWhen` 采用时点（`restart` 缺省 / `next_run` / `next_cleanup`，由插件 `settings_schema()` 经
+  `apply_when` 参数按字段声明；benchmark 三个运行参数为 `next_run`、`keep_runs` 为 `next_cleanup`）——前端暂存徽章、
+  草稿生效行与保存 toast 按它措辞，写死「重启生效」会把运行参数误标成要重启（与 `expected_*` 的「下次运行/清理采用」语义一致）。
   PUT 的插件组合复检（`PLUGINS` / `PLUGINS_REQUIRED` 任一被写都要跑）按**候选字节**判定：先在写锁内严格读取现有暂存并合成
   「提交后会落盘的那份字节」，再用与真实回读同一套 dotenv 规则解析（含 `${VAR}` 展开）——内存 dict 合并直接 `json.loads` 看到的是
   展开前的原文，预检结论会与提交后的实际组合不一致。名单解析失败 / 元素非字符串**不是**「无冲突」：显式返回 409 + `unavailable` issue，

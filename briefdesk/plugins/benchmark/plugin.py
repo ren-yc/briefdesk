@@ -95,6 +95,15 @@ class BenchmarkPlugin(WebPlugin, StagePlugin):
                     "父进程还会按 --progress-every 线性放大本值"
                 ),
             },
+            # 采用时点契约（config.py 的 BenchmarkSettings docstring 是字面依据）：
+            # 三个运行参数在每次基准运行开始解析并冻结 → next_run；
+            # keep_runs 在每次运行目录清理时重读 → next_cleanup。
+            apply_when={
+                "pause_pipeline": "next_run",
+                "run_timeout_seconds": "next_run",
+                "run_stall_seconds": "next_run",
+                "keep_runs": "next_cleanup",
+            },
         )
 
     def router(self) -> APIRouter:

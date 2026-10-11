@@ -4377,7 +4377,10 @@ async function saveAllSettings() {
       // 名称冲突中止：暂存段若已提交仍需明示并刷新面板，避免用户不知道
       // 配置已暂存（数据已在服务端，只是缺反馈）
       if (staged === "committed") {
-        showToast("已暂存，重启应用后生效", { type: "success", duration: 4000 });
+        // 整批保存的受众是混合时点的批量（含 benchmark 的 next_run/next_cleanup 项），
+        // 统一写「重启生效」会把运行参数误标成要重启——措辞中性化，行内徽章已按
+        // 各项 applyWhen 精确标注时点。
+        showToast("已暂存，按各配置项时点生效", { type: "success", duration: 4000 });
         await loadEnvConfig();
       }
       return; // 名称冲突已弹窗说明，中止本次保存
@@ -4406,11 +4409,11 @@ async function saveAllSettings() {
     if (staged === "committed" && (opsApplied || opsDeferred)) {
       closeSettingsModal({ force: true });
       showToast("设置已保存", { type: "success", duration: 2500 });
-      showToast("启动配置已暂存，重启应用后生效", { type: "success", duration: 4000 });
+      showToast("启动配置已暂存，按各配置项时点生效", { type: "success", duration: 4000 });
       startRefreshTimer();
       fetchData();
     } else if (staged === "committed") {
-      showToast("已暂存，重启应用后生效", { type: "success", duration: 4000 });
+      showToast("已暂存，按各配置项时点生效", { type: "success", duration: 4000 });
       await loadEnvConfig(); // 刷新面板显示已暂存徽标（并复位开关草稿）
     } else if (opsApplied || opsDeferred || intervalChanged) {
       closeSettingsModal({ force: true });
@@ -4454,6 +4457,22 @@ function _envSourceLabel(source) {
   return labels[source] || String(source || "");
 }
 
+// 采用时点 → 界面措辞（与后端 schema 的 applyWhen 一一对应；缺省 restart 兼容
+// 未带该字段的旧响应）。基准参数是「下次运行采用」、keep_runs 是「下次清理采用」，
+// 写死「重启生效」会把暂存的运行参数误标成要重启。
+function _applyWhenLabel(item) {
+  const labels = { restart: "重启生效", next_run: "下次基准运行采用", next_cleanup: "下次运行目录清理时采用" };
+  return labels[item && item.applyWhen] || "重启生效";
+}
+
+// 草稿生效行的前缀（_envEffectiveHtml 用）：restart 的既有契约措辞是
+// 「下次启动生效」（该行展示的 expected_* 本就是「下次启动」值），与徽章/
+// toast 的短文案「重启生效」不同形——两处混用一个映射会改掉既有契约措辞。
+function _applyWhenEffectivePrefix(item) {
+  if (!item || !item.applyWhen || item.applyWhen === "restart") return "下次启动生效";
+  return _applyWhenLabel(item);
+}
+
 function _envValueText(value) {
   if (value === null || value === undefined) return "—";
   if (Array.isArray(value)) return value.length ? value.join("、") : "（空）";
@@ -4464,7 +4483,7 @@ function _envValueText(value) {
 function _envBadges(item, { skipPluginBadge = false } = {}) {
   const badges = [];
   if (item.staged !== null && item.staged !== undefined) {
-    badges.push('<span class="env-badge env-badge-staged">已暂存 · 重启生效</span>');
+    badges.push('<span class="env-badge env-badge-staged">已暂存 · ' + esc(_applyWhenLabel(item)) + "</span>");
   }
   // 被更高优先层（环境变量 / 项目 .env）压住：按来源措辞提示，取代旧的「环境变量
   // 优先」——两者是同一套覆盖规则，插件面板顶部警示也用这套措辞。
@@ -4493,7 +4512,9 @@ function _envEffectiveHtml(item) {
     if (item.expectedAvailable === false) {
       parts.push("下次启动值不可用：" + esc(item.expectedError || "配置解析失败"));
     } else if (item.expected_value !== undefined) {
-      parts.push("下次启动生效：" + esc(_envValueText(item.expected_value))
+      // benchmark 的 expected_* 语义是「下次运行/下次清理采用」（后端按模型时点
+      // 解析），前缀按时点措辞，统一写「下次启动」会与实际采用时点矛盾。
+      parts.push(esc(_applyWhenEffectivePrefix(item)) + "：" + esc(_envValueText(item.expected_value))
         + "（来源：" + esc(_envSourceLabel(item.expected_source)) + "）");
     }
   }
@@ -4806,7 +4827,7 @@ async function restoreEnvKey(key) {
   try {
     const res = await putJson("/api/settings/env", { items: { [key]: null } });
     _patchEnvItem(key, res.items && res.items[key]);
-    showToast(key + " 已恢复默认（重启生效）", { type: "success", duration: 3000 });
+    showToast(key + " 已恢复默认（" + _applyWhenLabel(res.items && res.items[key]) + "）", { type: "success", duration: 3000 });
   } catch {
     showToast("操作失败，请重试", { type: "error", duration: 4000 });
   }

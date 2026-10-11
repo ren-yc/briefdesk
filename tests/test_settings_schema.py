@@ -9,6 +9,7 @@ from unittest.mock import patch
 from pydantic import Field, SecretStr
 from pydantic_settings import BaseSettings
 
+from briefdesk.plugins.benchmark.plugin import BenchmarkPlugin
 from briefdesk.plugins.qqflow.plugin import QqFlowPlugin
 from briefdesk.plugins.rag.plugin import RagPlugin
 from briefdesk.plugins.weflow_legacy.plugin import WeFlowLegacyPlugin
@@ -188,6 +189,31 @@ class SettingsSchemaTest(unittest.TestCase):
         self.assertTrue(qqflow["QQFLOW_KEY"]["secret"])
         self.assertEqual(rag["RAG_GROUP_ONLY"]["type"], "boolean")
         self.assertEqual(rag["RAG_TOP_K"]["min"], 1)
+
+    def test_apply_when_defaults_to_restart_and_is_declared_per_field(self) -> None:
+        """采用时点元数据：未声明回落 restart；benchmark 四字段按其采用时点
+        契约声明（三个运行参数 next_run、keep_runs next_cleanup）。前端按
+        applyWhen 显示采用时点文案，缺省措辞「重启生效」对运行参数是误导。"""
+        core = {item["key"]: item for item in build_settings_schema(ExampleSettings)}
+        self.assertEqual(core["EXAMPLE_LIMIT"]["applyWhen"], "restart")
+        self.assertNotIn("restart", core["EXAMPLE_LIMIT"], "旧静态 restart 字段应被 applyWhen 取代")
+
+        benchmark = {
+            item["key"]: item
+            for item in BenchmarkPlugin().settings_schema()
+        }
+        self.assertEqual(
+            benchmark["BENCHMARK_PAUSE_PIPELINE"]["applyWhen"], "next_run"
+        )
+        self.assertEqual(
+            benchmark["BENCHMARK_RUN_TIMEOUT_SECONDS"]["applyWhen"], "next_run"
+        )
+        self.assertEqual(
+            benchmark["BENCHMARK_RUN_STALL_SECONDS"]["applyWhen"], "next_run"
+        )
+        self.assertEqual(
+            benchmark["BENCHMARK_KEEP_RUNS"]["applyWhen"], "next_cleanup"
+        )
 
     def test_source_api_base_carries_url_contract_hint(self) -> None:
         """三源 base_url 契约：设置页必须提示「根地址/反代子路径前缀、
