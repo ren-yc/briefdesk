@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import json as _json
 import logging
+import urllib.parse
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
 from typing import Any
@@ -28,6 +29,24 @@ from pydantic import ValidationError
 from .generated.weflow_sdk import models as gen
 
 log = logging.getLogger(__name__)
+
+# Published connect budget (seconds) for every request the SDK makes: a server
+# that is not there must fail fast rather than hang a caller.
+CONNECT_TIMEOUT = 5.0
+
+# Published read budget for ordinary JSON requests, charged per read operation.
+READ_TIMEOUT = 30.0
+
+# Stall budget for the requests whose cost is set by the data or by server-side
+# work (a full-roster message count, a media body, an export trigger, a sync
+# pass, the SSE stream). httpx charges it per read operation and resets it on
+# progress, so a 500 MB download or a minutes-long first pull never trips it *while
+# advancing* - but a connection that goes silent (peer killed without a FIN, a NAT
+# that dropped the mapping, a laptop resuming from sleep) surfaces instead of
+# hanging the caller forever. 90s is about four times the server keep-alive
+# interval (25s): one missed ping plus a scheduling hiccup stays healthy, a black
+# hole does not.
+STALL_TIMEOUT = 90.0
 
 # 200-with-refusal vocabulary across the two servers: the weflow server
 # currently emits only account_conflict, the qqflow sibling adds
@@ -56,13 +75,26 @@ class ClientError(Exception):
     """Base error for the behavior layer."""
 
 
+class TransportError(ClientError):
+    """The request never produced an HTTP response (connect, timeout, reset),
+    or was never sent at all because httpx could not parse the URL.
+
+    Why this exists: ``httpx`` raises its own exception family, so a caller doing
+    ``except ClientError`` used to miss **every** network failure while catching
+    every server refusal. Wrapping puts both under one root.
+    """
+
+
 class StatusError(ClientError):
     """The server answered, but not with a usable body."""
 
-    def __init__(self, status: int, url: str) -> None:
-        super().__init__(f"HTTP {status} on {url}")
+    def __init__(self, status: int, url: str, detail: str | None = None) -> None:
+        note = f" ({detail})" if detail else ""
+        super().__init__(f"HTTP {status} on {url}{note}")
         self.status = status
         self.url = url
+        #: Why this status matters (e.g. the refusal state a 200 carried).
+        self.detail = detail
 
 
 class ShapeError(ClientError):
@@ -104,13 +136,60 @@ class RegisterOutcome:
     body: dict[str, Any]
 
 
+def _encode_path_segment(s: str) -> str:
+    """Percent-encode one path segment (unreserved set plus ``@``, which ids use).
+
+    Why: an id containing ``#`` or ``?`` interpolated straight into a URL string is
+    read as a fragment or query, so the request silently targets a different path.
+    The Rust client encodes too - the same input must not mean two things.
+    """
+    return urllib.parse.quote(s, safe="-._~@")
+
+
 def _validate_time_bound(field: str, value: str) -> None:
     """Accept a bare ``YYYYMMDD`` date or unix seconds - the server parses
     both, so rejecting either here would block a legal request."""
-    if not value.isdigit():
+    # `str.isdigit()` also accepts non-ASCII digits (full-width, superscript),
+    # which the server rejects with a 400. The Rust client refuses them locally,
+    # so the same input must yield the same error class on both sides.
+    if not value.isascii() or not value.isdigit():
         raise BadDate(
             f"invalid time bound {field}={value!r}: expected YYYYMMDD or unix seconds"
         )
+
+
+def _message_query_params(
+    talker: str,
+    keyword: str | None,
+    start: str | None,
+    end: str | None,
+    limit: int | None,
+    offset: int | None,
+    media: bool,
+) -> dict[str, str]:
+    """Query for either messages face.
+
+    The native face (``/api/v1/messages``) and the ChatLab face
+    (``/chatlab/messages``) take the **same** query surface - only the
+    envelope differs. Building it in two places is how the two faces end up
+    answering the same request with different pages.
+    """
+    if not talker:
+        raise ShapeError("talker must not be empty")
+    query: dict[str, str] = {"talker": talker}
+    if keyword is not None:
+        query["keyword"] = keyword
+    for field, value in (("start", start), ("end", end)):
+        if value is not None:
+            _validate_time_bound(field, value)
+            query[field] = value
+    if limit is not None:
+        query["limit"] = str(limit)
+    if offset is not None:
+        query["offset"] = str(offset)
+    if media:
+        query["media"] = "1"
+    return query
 
 
 @dataclass(frozen=True)
@@ -153,8 +232,25 @@ class Client:
     never in the URL.
     """
 
-    def __init__(self, base_url: str, token: str, timeout: float = 30.0) -> None:
-        self._http = httpx.AsyncClient(timeout=timeout)
+    def __init__(
+        self,
+        base_url: str,
+        token: str,
+        timeout: float = READ_TIMEOUT,
+        stall_timeout: float = STALL_TIMEOUT,
+    ) -> None:
+        """Point a client at a server.
+
+        ``timeout`` bounds one read of an ordinary JSON response; ``stall_timeout``
+        bounds one read of a request whose size or server-side work is unbounded
+        (roster counts, media bytes, ``sync_now``, the SSE stream). Both are charged
+        per read operation rather than as a total deadline, so a slow answer that
+        keeps arriving is never cut off while one that goes silent still fails.
+        Pass a large ``stall_timeout`` to opt a stream out of stall detection.
+        """
+        self._timeout = httpx.Timeout(timeout, connect=CONNECT_TIMEOUT)
+        self._long_timeout = httpx.Timeout(stall_timeout, connect=CONNECT_TIMEOUT)
+        self._http = httpx.AsyncClient(timeout=self._timeout)
         self._base = base_url.rstrip("/")
         self._token = token
 
@@ -172,22 +268,65 @@ class Client:
     def _url(self, path: str) -> str:
         return self._base + path
 
-    async def _get_json(self, path: str, query: dict[str, str]):
+    async def _http_get(self, url: str, **kwargs: Any) -> httpx.Response:
+        """GET that maps `httpx` transport failures into :class:`TransportError`."""
+        try:
+            return await self._http.get(url, **kwargs)
+        except (httpx.HTTPError, httpx.InvalidURL) as exc:
+            raise TransportError(f"{type(exc).__name__} on {url}: {exc}") from exc
+
+    async def _http_post(self, url: str, **kwargs: Any) -> httpx.Response:
+        """POST with the same transport-failure mapping as :meth:`_http_get`.
+
+        Every public request entry must go through one of these two: an entry
+        that calls ``self._http`` directly lets a raw `httpx.ConnectError`
+        escape the ClientError tree, and callers that classify
+        ``except ClientError`` then miss transport failures for that route
+        alone (regression: test_transport_failures_are_client_errors walks one
+        representative per transport method)."""
+        try:
+            return await self._http.post(url, **kwargs)
+        except (httpx.HTTPError, httpx.InvalidURL) as exc:
+            raise TransportError(f"{type(exc).__name__} on {url}: {exc}") from exc
+
+    async def _get_json(
+        self, path: str, query: dict[str, str], *, long: bool = False
+    ):
         url = self._url(path)
-        resp = await self._http.get(
+        resp = await self._http_get(
             url,
             headers={"Authorization": f"Bearer {self._token}"},
             params=query,
+            timeout=self._long_timeout if long else self._timeout,
         )
         return await self._decode(resp, url)
 
     @staticmethod
     async def _decode(resp: httpx.Response, url: str):
-        if resp.status_code >= 400:
+        # Non-2xx, not just 4xx/5xx: the Rust client treats anything outside
+        # 200..300 as an error, and a surfaced 3xx would otherwise fall into
+        # `resp.json()` and come out as a shape error instead of a status error.
+        if not 200 <= resp.status_code < 300:
             raise StatusError(resp.status_code, url)
         try:
             return resp.json()
         except _json.JSONDecodeError as exc:  # pragma: no cover - defensive
+            raise ShapeError(str(exc)) from exc
+
+
+    @staticmethod
+    def _validate(model: Any, payload: Any) -> Any:
+        """`model_validate` with shape corruption kept inside ShapeError.
+
+        A 200 with a body of the wrong *type* (a list where the route
+        returns an object, a string where a number lives) raises pydantic's
+        own ValidationError, which is not a ClientError. Callers that
+        classify ``except ClientError`` would see it escape for that route
+        alone (regression: test_health_shape_corruption_is_a_shape_error
+        feeds a 200 whose `account` field is a number)."""
+        try:
+            return model.model_validate(payload)
+        except ValidationError as exc:
             raise ShapeError(str(exc)) from exc
 
     # ---- readiness ------------------------------------------------------
@@ -203,21 +342,51 @@ class Client:
         """
         deadline = asyncio.get_running_loop().time() + timeout
         last_state = "not-registered"
+        dropped = 0
         while True:
-            listing = gen.AccountsList.model_validate(
-                await self._get_json("/api/v1/accounts", {})
+            # A dropped round is waiting, not failure: this poll exists to ride out
+            # a transient connect blip or a momentary 5xx while the index is still
+            # coming up. A 4xx is a misconfiguration, and a listing that no longer
+            # matches the declared shape is a broken contract - both propagate
+            # instead of being waited out.
+            try:
+                listing = self._validate(
+                    gen.AccountsList, await self._get_json("/api/v1/accounts", {})
+                )
+            except TransportError as exc:
+                listing = None
+                dropped += 1
+                last_state = f"unreachable ({exc})"
+            except StatusError as exc:
+                if 500 <= exc.status < 600:
+                    listing = None
+                    dropped += 1
+                    last_state = f"server error {exc.status} on the listing"
+                else:
+                    raise
+            mine = (
+                next((a for a in listing.accounts if a.wxid == account), None)
+                if listing is not None
+                else None
             )
-            mine = next((a for a in listing.accounts if a.wxid == account), None)
             if mine is not None:
                 if mine.state is gen.AccountStatus.READY:
                     return
                 if mine.state is gen.AccountStatus.ERROR:
                     raise NotReady(timeout, f"error: {mine.error or ''}")
                 last_state = str(mine.state.value)
-            else:
+            elif listing is not None:
                 last_state = "not-registered"
             if asyncio.get_running_loop().time() >= deadline:
-                raise NotReady(timeout, last_state)
+                # Naming the dropped rounds is the difference between "indexing, keep
+                # waiting" and "this server never answered once" - both end at the
+                # same deadline, and only one of them is a caller-side problem.
+                raise NotReady(
+                    timeout,
+                    last_state
+                    if not dropped
+                    else f"{last_state}; {dropped} poll(s) never got through",
+                )
             await asyncio.sleep(0.25)
 
     async def ensure_ready(self, account: str, body: dict, timeout: float = 120.0) -> None:
@@ -234,7 +403,7 @@ class Client:
         outcome = await self.register(body)
         if outcome.state in _REFUSAL_STATES:
             url = self._url("/api/v1/accounts")
-            raise StatusError(200, f"{url} (state={outcome.state})")
+            raise StatusError(200, url, f"state={outcome.state}")
         await self.wait_ready(account, timeout)
 
     # ---- health / accounts / register -----------------------------------
@@ -247,8 +416,8 @@ class Client:
         here, and a test pins that.
         """
         url = self._url("/health")
-        resp = await self._http.get(url)
-        return gen.Health.model_validate(await self._decode(resp, url))
+        resp = await self._http_get(url)
+        return self._validate(gen.Health, await self._decode(resp, url))
 
     async def accounts(self) -> list[gen.AccountStateView]:
         """``GET /api/v1/accounts`` - one entry per bound account.
@@ -256,7 +425,7 @@ class Client:
         The failure reason (``error``) and the message count live only here;
         ``/health`` collapses everything to a scalar phase.
         """
-        listing = gen.AccountsList.model_validate(
+        listing = self._validate(gen.AccountsList, 
             await self._get_json("/api/v1/accounts", {})
         )
         return listing.accounts
@@ -271,7 +440,7 @@ class Client:
         HTTP error) use this pair instead.
         """
         url = self._url("/api/v1/accounts")
-        resp = await self._http.post(
+        resp = await self._http_post(
             url,
             headers={"Authorization": f"Bearer {self._token}"},
             json=body,
@@ -286,7 +455,60 @@ class Client:
             body=payload,
         )
 
-    # ---- drain_session --------------------------------------------------
+    async def sync_now(self) -> gen.SyncResult:
+        """``POST /api/v1/sync`` - run one manual incremental sync and return
+        its counters.
+
+        The watcher runs the same sync on file changes, so this exists for a
+        caller that must have a fresh read *now* rather than eventually (the
+        `sync` CLI subcommand and the `sync_now` MCP tool both do). It is a
+        write against the server's state - it advances watermarks and may export
+        media - so it is deliberately absent from every polling path: only a
+        caller that asked for it triggers it.
+        """
+        url = self._url("/api/v1/sync")
+        # A sync pass indexes and may export media: bounded only by the size of
+        # the library, never by a fixed budget.
+        resp = await self._http_post(
+            url,
+            headers={"Authorization": f"Bearer {self._token}"},
+            timeout=self._long_timeout,
+        )
+        return self._validate(gen.SyncResult, await self._decode(resp, url))
+
+    # ---- pull_page / drain_session --------------------------------------
+
+    async def pull_page(
+        self,
+        talker: str,
+        since: int | None,
+        offset: int = 0,
+        limit: int | None = None,
+    ) -> gen.PullEnvelope:
+        """Fetch **one page** of the ChatLab Pull cursor loop.
+
+        :meth:`drain_session` is this in a loop; the single-page entry exists
+        for callers that must bound a single request. ``since`` is
+        **exclusive** and ``offset`` advances within one timestamp group.
+        Both cursors come back in ``sync`` and must be echoed verbatim: the
+        server pages by (timestamp group, offset), and a client-derived
+        cursor is how pages get silently skipped or replayed.
+
+        ``limit`` is a per-page cap (the server caps it at 5000). ``None``
+        means the server default, which is also 5000.
+        """
+        query: dict[str, str] = {}
+        if since is not None:
+            query["since"] = str(since)
+        if offset:
+            query["offset"] = str(offset)
+        if limit is not None:
+            query["limit"] = str(limit)
+        return self._validate(gen.PullEnvelope, 
+            await self._get_json(
+            f"/api/v1/sessions/{_encode_path_segment(talker)}/messages", query
+        )
+        )
 
     async def drain_session(
         self,
@@ -302,17 +524,10 @@ class Client:
         get silently skipped or replayed.
         """
         next_since = since
-        next_offset: int | None = None
+        next_offset = 0
         total = 0
         while True:
-            query: dict[str, str] = {}
-            if next_since is not None:
-                query["since"] = str(next_since)
-            if next_offset is not None:
-                query["offset"] = str(next_offset)
-            page = gen.PullEnvelope.model_validate(
-                await self._get_json(f"/api/v1/sessions/{talker}/messages", query)
-            )
+            page = await self.pull_page(talker, next_since, next_offset)
             total += len(page.messages)
             on_page(page.messages)
             if not page.sync.has_more:
@@ -350,7 +565,7 @@ class Client:
                 query["limit"] = str(page_size)
             if keyword is not None:
                 query["keyword"] = keyword
-            page = gen.SessionsNative.model_validate(
+            page = self._validate(gen.SessionsNative, 
                 await self._get_json("/api/v1/sessions", query)
             )
             count = len(page.sessions)
@@ -369,8 +584,14 @@ class Client:
 
     # ---- media_bytes ----------------------------------------------------
 
-    async def media_bytes(self, message: gen.ChatlabMessage) -> bytes:
+    async def media_bytes(self, message: gen.ChatlabMessage, talker: str) -> bytes:
         """Fetch media bytes for a uniquely-named handle.
+
+        ``talker`` is the **session id** the export side door needs; it is NOT
+        ``message.account_name`` (that is the sender's display name, which only
+        coincides with the session id for 1:1 chats where the display name was
+        never customized - real data breaks the coincidence, so the caller owns
+        the value).
 
         One automatic retry after a 404: the caller may have serialized the
         handle before the export finished, and the ``media=1`` re-export is
@@ -378,17 +599,34 @@ class Client:
         exportable and the error propagates.
         """
         if message.media is None:
-            raise StatusError(404, "(no media on message)")
+            raise ShapeError("(no media on message): nothing to fetch")
+        if not talker.strip():
+            # Whitespace included, matching the Rust client: this is the media family,
+            # where an empty handle addresses a different path than the caller means.
+            raise ShapeError("talker must not be empty")
         name = message.media.file_name
-        url = self._url(f"/api/v1/media/{name}")
-        resp = await self._http.get(url, headers={"Authorization": f"Bearer {self._token}"})
+        if not name.strip():
+            # Fail-fast, whitespace included (the Rust client trims too): an empty
+            # handle addresses a different path than the caller means, and the
+            # server cannot tell "no file name" from "some file I never heard of".
+            raise ShapeError("media file_name must not be empty")
+        url = self._url(f"/api/v1/media/{_encode_path_segment(name)}")
+        auth = {"Authorization": f"Bearer {self._token}"}
+        # Media size is whatever the sender uploaded; the export trigger behind a
+        # 404 copies whole files. Neither has a meaningful read budget.
+        resp = await self._http_get(url, headers=auth, timeout=self._long_timeout)
         if resp.status_code == 404:
             await self._get_json(
                 "/chatlab/messages",
-                {"talker": message.account_name, "media": "1"},
+                {"talker": talker, "media": "1"},
+                long=True,
             )
-            resp = await self._http.get(url, headers={"Authorization": f"Bearer {self._token}"})
-        if resp.status_code >= 400:
+            resp = await self._http_get(url, headers=auth, timeout=self._long_timeout)
+        # Not-2xx (not just 4xx/5xx): a 3xx falling through to `return` hands
+        # the caller an empty redirect body as media bytes with no error signal
+        # - same rule as _decode / media_bytes_by_id.
+        # (regression: test_media_bytes_rejects_redirect_like_statuses)
+        if not 200 <= resp.status_code < 300:
             raise StatusError(resp.status_code, url)
         return resp.content
 
@@ -416,23 +654,42 @@ class Client:
         is stable across a live database, while offset paging over a growing
         table can shift.
         """
-        if not talker:
-            raise ShapeError("talker must not be empty")
-        query: dict[str, str] = {"talker": talker}
-        if keyword is not None:
-            query["keyword"] = keyword
-        for field, value in (("start", start), ("end", end)):
-            if value is not None:
-                _validate_time_bound(field, value)
-                query[field] = value
-        if limit is not None:
-            query["limit"] = str(limit)
-        if offset is not None:
-            query["offset"] = str(offset)
-        if media:
-            query["media"] = "1"
-        return gen.MessagesNative.model_validate(
+        query = _message_query_params(
+            talker, keyword, start, end, limit, offset, media
+        )
+        return self._validate(gen.MessagesNative, 
             await self._get_json("/api/v1/messages", query)
+        )
+
+    async def chatlab_messages(
+        self,
+        talker: str,
+        *,
+        keyword: str | None = None,
+        start: str | None = None,
+        end: str | None = None,
+        limit: int | None = None,
+        offset: int | None = None,
+        media: bool = False,
+    ) -> gen.ChatlabMessages:
+        """``GET /chatlab/messages`` - the **ChatLab-shaped** messages face.
+
+        Same query surface as :meth:`list_messages`, different envelope:
+        ascending by time, ChatLab type codes, ``media`` on the message,
+        ``count``/``page`` for paging and **no** ``success`` key. Project from
+        this face when the caller wants ChatLab field names; the native face
+        is the only one carrying ``raw_content``/``is_send``.
+
+        ``offset`` is this face's paging cursor: the wire also accepts
+        ``cursor``, but the two are the same integer, so advancing by the page
+        size and passing ``page.next_cursor`` are equivalent - and it keeps
+        the two faces from growing different paging parameters for one list.
+        """
+        query = _message_query_params(
+            talker, keyword, start, end, limit, offset, media
+        )
+        return self._validate(gen.ChatlabMessages, 
+            await self._get_json("/chatlab/messages", query)
         )
 
     async def contacts(
@@ -454,8 +711,41 @@ class Client:
             query["offset"] = str(offset)
         if keyword is not None:
             query["keyword"] = keyword
-        return gen.Contacts.model_validate(
+        return self._validate(gen.Contacts, 
             await self._get_json("/api/v1/contacts", query)
+        )
+
+    async def group_members(
+        self,
+        chatroom: str,
+        *,
+        include_message_counts: bool = False,
+    ) -> gen.GroupMembers:
+        """``GET /api/v1/group-members`` - group members (**roster union speakers**).
+
+        Silent members (in the roster, never spoke) appear too, with
+        ``message_count`` 0 - listing only speakers would make "who is in this
+        group" depend on who talked last. The server counts real numbers only
+        when ``include_message_counts`` is true (otherwise the whole column
+        reads 0: counting scans the entire conversation, which is not free);
+        when off the parameter is **omitted**, not sent as ``0``. Roster and
+        messages live in the memory index: this request neither reads disks
+        nor triggers a sync.
+        """
+        if not chatroom:
+            # Same fail-fast as `talker` everywhere else: an empty key asks the
+            # server a different question, and a 200 with an empty roster would
+            # read as "this group has no members".
+            raise ShapeError("chatroom must not be empty")
+        query: dict[str, str] = {"chatroomId": chatroom}
+        if include_message_counts:
+            query["includeMessageCounts"] = "1"
+        # Counting messages scans every session behind each roster entry: that is
+        # exactly the request the published read budget must not apply to.
+        return self._validate(gen.GroupMembers, 
+            await self._get_json(
+                "/api/v1/group-members", query, long=include_message_counts
+            )
         )
 
     async def media_bytes_by_id(self, media_id: str) -> bytes:
@@ -466,11 +756,21 @@ class Client:
         :meth:`media_bytes` when a ChatLab message is at hand - that one also
         triggers an export and retries once on a 404.
         """
-        url = self._url(f"/api/v1/media/{media_id}")
-        resp = await self._http.get(
-            url, headers={"Authorization": f"Bearer {self._token}"}
+        if not media_id.strip():
+            # Whitespace counts as empty, matching the Rust client: an empty handle
+            # addresses a *different* path, and the
+            # server answering "no such file" would dress up a caller mistake as an
+            # unexportable handle. (The check sits after the docstring: a statement
+            # before it turns the docstring into a discarded expression, so help()
+            # and API docs generators would lose this method entirely.)
+            raise ShapeError("media_id must not be empty")
+        url = self._url(f"/api/v1/media/{_encode_path_segment(media_id)}")
+        resp = await self._http_get(
+            url,
+            headers={"Authorization": f"Bearer {self._token}"},
+            timeout=self._long_timeout,
         )
-        if resp.status_code >= 400:
+        if not 200 <= resp.status_code < 300:
             raise StatusError(resp.status_code, url)
         return resp.content
 
@@ -520,9 +820,16 @@ class Client:
                     headers["Last-Event-ID"] = last_event_id
                 overflow = False
                 async with self._http.stream(
-                    "GET", self._url("/api/v1/push/messages"), headers=headers
+                    "GET",
+                    self._url("/api/v1/push/messages"),
+                    headers=headers,
+                    timeout=self._long_timeout,
                 ) as resp:
-                    if resp.status_code >= 400:
+                    # 3xx is also a failure (same not-2xx rule as _decode /
+                    # media_bytes): a 302 decoded as a readable stream ends in
+                    # an empty-body EOF, resetting the backoff and looping
+                    # forever at 0.5s with no error signal to the caller.
+                    if not 200 <= resp.status_code < 300:
                         raise StatusError(resp.status_code, self._url("/api/v1/push/messages"))
                     # The old shape reset backoff right here, on every
                     # 200: a server that connects fine and then emits
@@ -609,6 +916,12 @@ class Client:
                             clean_exit = True
                     # Overflow: skip the EOF flush entirely (an un-trusted
                     # stream must not deliver its tail) and keep escalating.
+            except httpx.InvalidURL as exc:
+                # Not a stream hiccup: this client cannot parse its own URL, so every
+                # reconnect fails identically. Swallowing it would turn a
+                # configuration mistake into a stream that never yields and never
+                # errors - the two other entry points raise, so raise here too.
+                raise TransportError(f"unusable base_url for SSE: {exc}") from exc
             except httpx.HTTPError as exc:
                 log.warning("SSE stream error, reconnecting: %s", exc)
             if clean_exit:
@@ -625,11 +938,11 @@ class Client:
             raise ShapeError(str(exc)) from exc
         kind = payload.get("event", frame.event or "")
         if kind == "message.new":
-            return gen.EventNew.model_validate(payload)
+            return Client._validate(gen.EventNew, payload)
         if kind == "message.revoke":
-            return gen.EventRevoke.model_validate(payload)
+            return Client._validate(gen.EventRevoke, payload)
         if kind == "sync":
-            return gen.EventSync.model_validate(payload)
+            return Client._validate(gen.EventSync, payload)
         # Notification face / unknown kinds: meta-only pass-through so a new
         # server event kind degrades instead of killing the stream.
         log.debug("ignoring unknown SSE event kind: %s", kind)
