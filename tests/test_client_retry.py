@@ -93,6 +93,70 @@ class TestWithConnectRetry:
         assert result == "ok"
         assert calls == 2
 
+    async def test_connect_error_behind_wrapper_is_retried(self):
+        """包在别的异常里也要认：SDK 用 raise TransportError(...) from ConnectError",
+
+        承载传输失败。判定若只看外层类型，重试会静默失效——上游重启窗口里
+        第一次拒连直接冒泡成 lastError，重试次数为 0，测试不红、日志不报错。
+        这里用本模块自定义的包装类，避免这条单元断言依赖 vendor 的具体类型。
+        """
+
+        class Wrapped(Exception):
+            pass
+
+        calls = 0
+
+        async def fn():
+            nonlocal calls
+            calls += 1
+            if calls < 3:
+                raise Wrapped("transport failed") from httpx.ConnectError("refused")
+            return "ok"
+
+        result = await with_connect_retry(fn, base_delay=0)
+        assert result == "ok"
+        assert calls == 3
+
+    async def test_exception_only_contextually_connected_is_not_retried(self):
+        """只沿 __cause__，不沿 __context__：否则无关失败被误判成可重试。",
+
+        失败模式：处理某异常期间又起了另一个异常（__context__ 偶然关系），按
+        __context__ 判定会让它白付 0.5s/1s 退避——轮询热路径上的额外延迟。
+        """
+
+        class Wrapped(Exception):
+            pass
+
+        calls = 0
+
+        async def fn():
+            nonlocal calls
+            calls += 1
+            try:
+                raise httpx.ConnectError("refused")
+            except httpx.ConnectError:
+                raise Wrapped("unrelated")  # 只有 __context__，没有 __cause__
+
+        with pytest.raises(Wrapped):
+            await with_connect_retry(fn, attempts=3, base_delay=0)
+        assert calls == 1
+
+    async def test_wrapped_non_connect_error_is_not_retried(self):
+        """非连接类失败即使带包装也不重试（状态错误由调用方语义处理）。"""
+
+        class Wrapped(Exception):
+            pass
+
+        calls = 0
+
+        async def fn():
+            nonlocal calls
+            calls += 1
+            raise Wrapped("boom") from ValueError("not a transport failure")
+
+        with pytest.raises(Wrapped):
+            await with_connect_retry(fn, attempts=3, base_delay=0)
+        assert calls == 1
 
 class TestQqFlowClientRetry:
     def _client_with_get(self, side_effect):
@@ -158,11 +222,14 @@ class TestQqFlowClientRetry:
         assert fake.get.call_count == 2
 
     async def test_exhausted_connect_error_still_raises(self):
-        # 重试耗尽：原样上抛（poll_cycle 的 lastError 行为保持不变）
+        # 重试耗尽：上抛出 request_fn 的那个异常对象。SDK 承载 HTTP 后传输失败
+        # 被包进 SDK 错误树，因此外层是 TransportError、原 httpx 异常在 __cause__
+        # 上（poll_cycle 只取 str(e) 写 session_errors，堆栈与归因都保留）。
         err = httpx.ConnectError("All connection attempts failed")
         client, fake = self._client_with_get([err, httpx.ConnectError("refused"), httpx.ConnectError("refused")])
-        with pytest.raises(httpx.ConnectError):
+        with pytest.raises(qqflow_sdk.TransportError) as caught:
             await client.fetch_contacts()
+        assert isinstance(caught.value.__cause__, httpx.ConnectError)
         assert fake.get.call_count == 3
 
 

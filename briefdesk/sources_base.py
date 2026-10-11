@@ -35,6 +35,35 @@ type BatchHandler = Callable[[list[InternalMessage]], Coroutine[Any, Any, None]]
 # 应用层提供的已处理查询端口:输入候选 msg_ids,返回其中已处理的子集
 type ProcessedQuery = Callable[[list[str]], Coroutine[Any, Any, set[str]]]
 
+#: 连接阶段失败的判据：拒连与连接超时在 httpx 中平级（不是父子），必须并列列出。
+_CONNECT_ERRORS = (httpx.ConnectError, httpx.ConnectTimeout)
+
+
+def _connect_error(exc: BaseException) -> httpx.TransportError | None:
+    """在异常链里找连接类失败：找到返回它，否则返回 None。
+
+    为什么顺链查找而不是直接 except：vendor SDK 从 0.9.0 起把所有传输失败
+    包进自己的错误树（raise TransportError(...) from exc）。于是
+    except (httpx.ConnectError, httpx.ConnectTimeout) 在「HTTP 由 SDK 承载」
+    的源（weflow / qqflow）上**永不命中**：连接级重试静默失效——失败模式是
+    上游重启窗口里第一次拒连直接冒泡成 lastError，重试次数为 0，测试不红、
+    日志不报错，只是少了几次本该发生的重试。自持 httpx 的旧源
+    （weflow-legacy）仍直接抛 httpx 异常，两条路径都必须认。
+
+    只沿 __cause__（显式 raise ... from）走，不走 __context__：后者是「处理某
+    异常期间又起了另一个异常」的偶然关系，会把无关失败误判成可重试，在轮询
+    热路径上白付退避延迟。id 集合防自引用环。
+    """
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, _CONNECT_ERRORS):
+            return current
+        current = current.__cause__
+    return None
+
+
 async def with_connect_retry[T](
     request_fn: Callable[[], Awaitable[T]],
     *,
@@ -50,17 +79,22 @@ async def with_connect_retry[T](
       qqflow 503 就绪门控走 QqFlowNotReadyError，语义保持不变）；
     - 不用于 SSE 流（stream_events 已有监听器级退避重连）；
     - 每次重试新建请求调用（request_fn 无参工厂），天然重放。
-    耗尽后原样上抛最后一次异常（错误对象与堆栈保留，
-    poll_cycle 的 lastError 行为不变）。
+    连接阶段的判定经 _connect_error 顺 __cause__ 链，因此 SDK 把拒连包进
+    自己的错误树后重试照旧生效（回归见 tests/test_client_retry.py）。
+    耗尽后原样上抛最后一次异常对象（即出 request_fn 的那个：SDK 承载 HTTP
+    的源上是包好的 TransportError，其 __cause__ 仍是原 httpx 异常——错误对象
+    与堆栈保留，poll_cycle 的 lastError 行为不变）。
     """
     if attempts < 1:
         raise ValueError("attempts must be >= 1")
     delay = base_delay
-    last_error: httpx.TransportError | None = None
+    last_error: BaseException | None = None
     for attempt in range(1, attempts + 1):
         try:
             return await request_fn()
-        except (httpx.ConnectError, httpx.ConnectTimeout) as e:
+        except Exception as e:  # 只拦连接类失败（判定见 _connect_error），其余原样上抛
+            if _connect_error(e) is None:
+                raise
             last_error = e
             if attempt < attempts:
                 logger.debug(

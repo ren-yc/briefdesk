@@ -543,10 +543,13 @@ getattr 探测调用）——server 只依赖它；`SourceRuntime`（`client`/`l
 实现 `SourceRuntime` 并以插件发布（`briefdesk/plugins/*`，entry point 组 `briefdesk.plugins`，启用走 `PLUGINS`）**。通
 用
 类型 `ConnectionStatus`、`BatchHandler`、`ProcessedQuery`、异常 `SourceError`/`MediaError`（`download_media`
-失败统一抛 `MediaError`，server 据此映射 404）；**`with_connect_retry`**（连接类失败短退避重试：捕获
-`httpx.ConnectError`/`ConnectTimeout`，0.5s/1s 共 2 次等待、3 次尝试，耗尽原样上抛；不重试 HTTP 状态错误与 503 门控、不用于 SSE 流（监听器已有退
-避
-重连））。**`iter_sse_data_events(resp, log=...)`：三源 SSE 帧解析的唯一实现**——按字节以 LF 切行（剥行尾 CR），空行分帧，逐 `data:` 行 JSON 解析；
+失败统一抛 `MediaError`，server 据此映射 404）；**`with_connect_retry`**（连接类失败短退避重试：0.5s/1s 共 2 次等待、3 次尝试，耗尽上抛
+`request_fn` 抛出的那个异常对象；不重试 HTTP 状态错误与 503 门控、不用于 SSE 流（监听器已有退避重连））。**连接阶段的判定经
+`_connect_error` 顺 `__cause__` 链找 `httpx.ConnectError`/`ConnectTimeout`**，因为 vendor SDK 0.9.0 起把全部传输失败包进自己的错误树
+（`raise TransportError(...) from exc`）：只 except httpx 原类型时，「HTTP 由 SDK 承载」的两个源上重试会**静默失效**（第一次拒连即冒泡，
+重试次数 0，测试不红、日志不报错）；自持 httpx 的 weflow-legacy 仍直接抛原类型，故两条路径都要认。只认 `__cause__`、不认 `__context__`——
+后者是「处理期间又起异常」的偶然关系，按它判定会把无关失败误判成可重试、在轮询热路径白付退避延迟（回归见
+`tests/test_client_retry.py`）。**`iter_sse_data_events(resp, log=...)`：三源 SSE 帧解析的唯一实现**——按字节以 LF 切行（剥行尾 CR），空行分帧，逐 `data:` 行 JSON 解析；
   **不用 `aiter_lines`**（其 `splitlines` 语义把 U+0085/U+2028/U+2029 当换行，会拆断含这些字符的 JSON——上游 serde_json 不转义它们）；解析失败 WARNING（只记字节数）；缓冲上限按**帧内累计字节**计量（已切出未成帧的行 + 未切行残留，帧结束归零）——只量未切行残留会漏掉「行连续但无空行」的畸形流（每行切出即归零，上限永远撞不到），超限记 WARNING 后结束流。**另提供共享 `BatchBuffer`（实时批缓冲）/`DrainableListenerMixin`（关停冲刷收尾）与 `make_sse_timeout`（SSE 读超时构造）
 ，weflow-legacy/qqflow 监听器共用**；`session_log_prefix(index, total, label)` 为会话级日志行首（`  [3/12] 群名: `）的单源
 定
@@ -667,7 +670,8 @@ runtime.close() 按 stop → await listener.aclose（冲刷残余缓冲与 in-fl
 页
  miss）判定，命中在监听器层丢弃并计入 SSE 统计。`QQFLOW_API_TOKEN`/`QQFLOW_QQ`/`QQFLOW_KEY` 必填，缺失任一 →
 QqFlowPlugin.setup 抛 PluginDisabledError 自禁用。**REST 连接类失败短退避重试**：
-`_get`/`fetch_health`/`register_account` 经 `with_connect_retry` 包裹（连接拒绝/超时自动重试 3 次，耗尽原样上抛；503 门控语义不变）
+`_get`/`fetch_health`/`register_account` 经 `with_connect_retry` 包裹（连接拒绝/超时自动重试 3 次——SDK 把拒连包成 `TransportError`
+后仍生效，见上；耗尽上抛 `TransportError`，原 httpx 异常在其 `__cause__`；503 门控语义不变）
 。
 
 #### briefdesk/plugins/weflow_legacy/client.py
@@ -681,7 +685,8 @@ QqFlowPlugin.setup 抛 PluginDisabledError 自禁用。**REST 连接类失败短
 公众号）、`fetch_message_media()`（SSE rawid 回查 REST 获取 mediaUrl；limit 放宽至 `_LOOKUP_LIMIT`=200 且
 `retry_on_empty=False`——miss 是常见路径，不在热路径对空结果重试）、`download_media()`（带鉴权下载媒体文件字节，供 OCR）、
 `connection_status`、`close()`。**REST 连接类失败短退避重试**：`_get`（含 `retry_on_empty` 二次请求，重试响应非 2xx 走与主路径相同的
-RuntimeError 出口——静默保留首次空 data 会把上游错误伪装成正常空结果）经 `with_connect_retry` 包裹（连接拒绝/超时自动重试 3 次，耗尽原样上抛）；
+RuntimeError 出口——静默保留首次空 data 会把上游错误伪装成正常空结果）经 `with_connect_retry` 包裹（连接拒绝/超时自动重试 3 次，耗尽原样上抛；
+本源自持 httpx、不经 SDK 错误树，抛出的就是 `httpx` 原类型）；
 `fetch_messages` 查询参数经 `params=` 由 httpx 编码（防会话 ID 含保留字符时手拼查询串出错）。
 
 #### briefdesk/plugins/weflow_legacy/sse.py
@@ -1316,7 +1321,7 @@ required field of `weflow`/`qqflow` → that plugin self-disables via `PluginDis
 ### 启动期上游连接竞态
 
 - briefdesk 启动即发起「首轮回填（REST）+ SSE 首连」，若上游（qqflow-server / WeFlow）TCP 尚未监听，REST 侧由 `with_connect_retry`
-  短退避自愈（3 次尝试、2 次等待 ≈0.5s/1s，耗尽仍写 lastError）；SSE 侧由监听器退避重连自愈。上游就绪慢于重试窗口时仍会记一次 lastError——彻底消除需「启动回填前置探活」（暂未实
+  短退避自愈（3 次尝试、2 次等待 ≈0.5s/1s，耗尽仍写 lastError；判定顺 `__cause__`，故上游 SDK 的传输失败包装不影响它）；SSE 侧由监听器退避重连自愈。上游就绪慢于重试窗口时仍会记一次 lastError——彻底消除需「启动回填前置探活」（暂未实
   施）。
 
 ### `/health` 的标量阶段不含身份 → 「服务端就绪」≠「我的账号就绪」

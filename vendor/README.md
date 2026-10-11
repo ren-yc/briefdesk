@@ -63,3 +63,19 @@ powershell -File scripts/sync_vendor.ps1
   撤销从未生效的 `poll_interval` 形参；包目录新增 `LICENSE`（本仓 `package-data` 同步声明，
   vendor 全量清单随之 109 → 111 项）。同步经 `scripts/sync_vendor.ps1` 完成，脚本打印的
   记录行即本节两行的来源（squash 标记取自 merge 提交的第二父）。
+
+- SDK 0.9.0 行为层与文档面同步：weflow `sdk-dist`（`09e7bee`，源自 weflow-server master `9d18764`）、
+  qqflow `sdk-dist`（`c2a733e`，源自 qqflow-server master `72bf8ab`）。上游改动（两 SDK 同构）：**新增四项公共面**
+  `sync_now()` / `pull_page()` / `chatlab_messages()` / `group_members()`；**传输失败进 SDK 错误树**——新增
+  `TransportError(ClientError)`，`httpx` 的传输失败与不可解析 URL 一律在 `raise TransportError(...) from exc`
+  下重抛，`except ClientError` 从此能兜住网络故障；**超时分层并发布为常量** `CONNECT_TIMEOUT` 5s /
+  `READ_TIMEOUT` 30s / `STALL_TIMEOUT` 90s，`Client.__init__` 随之新增 `stall_timeout` 形参（体积或服务端
+  耗时不定的请求走 stall 预算，按读操作计费而非总时限）；**`media_bytes()` 新增必填 `talker`**（导出侧门
+  需要会话 id，重试也改用会话 id）；路径段改百分号编码；空 `chatroom` / 空 `media_id` 立即 `ShapeError`
+  拒绝（此前会向服务端问出一个语义不同的问题）；生成层随版本号重生成（内嵌 `info.version` 0.8.0 → 0.9.0）。
+  本轮只改既有文件、没有新增或删除条目，全量清单保持 113 项（含本说明文件则 `vendor/` 共 114 项；
+  该数字是 `git ls-files` 派生量，不被任何门禁钉死）。**本仓受影响处**：SDK 承载 HTTP 后
+  `with_connect_retry` 原先只 except httpx 原类型的写法在 weflow / qqflow 两源上永不命中、连接级重试
+  静默失效，判定已改为顺 `__cause__` 链识别（回归见 `tests/test_client_retry.py`）。镜像与上游逐 blob
+  相同（`git ls-tree` 全量比对）。同步经 `scripts/sync_vendor.ps1` 完成，本行两个 commit 取自 merge 提交
+  的第二父。
