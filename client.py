@@ -481,7 +481,7 @@ class Client:
         The failure reason (``error``) and the message count live only here;
         ``/health`` collapses everything to a scalar phase.
         """
-        listing = self._validate(gen.AccountsList, 
+        listing = self._validate(gen.AccountsList,
             await self._get_json("/api/v1/accounts", {})
         )
         return listing.accounts
@@ -558,7 +558,7 @@ class Client:
             query["offset"] = str(offset)
         if limit is not None:
             query["limit"] = str(limit)
-        return self._validate(gen.PullEnvelope, 
+        return self._validate(gen.PullEnvelope,
             await self._get_json(
             f"/api/v1/sessions/{_encode_path_segment(talker)}/messages", query
         )
@@ -619,7 +619,7 @@ class Client:
                 query["limit"] = str(page_size)
             if keyword is not None:
                 query["keyword"] = keyword
-            page = self._validate(gen.SessionsNative, 
+            page = self._validate(gen.SessionsNative,
                 await self._get_json("/api/v1/sessions", query)
             )
             count = len(page.sessions)
@@ -711,7 +711,7 @@ class Client:
         query = _message_query_params(
             talker, keyword, start, end, limit, offset, media
         )
-        return self._validate(gen.MessagesNative, 
+        return self._validate(gen.MessagesNative,
             await self._get_json("/api/v1/messages", query)
         )
 
@@ -742,7 +742,7 @@ class Client:
         query = _message_query_params(
             talker, keyword, start, end, limit, offset, media
         )
-        return self._validate(gen.ChatlabMessages, 
+        return self._validate(gen.ChatlabMessages,
             await self._get_json("/chatlab/messages", query)
         )
 
@@ -765,7 +765,7 @@ class Client:
             query["offset"] = str(offset)
         if keyword is not None:
             query["keyword"] = keyword
-        return self._validate(gen.Contacts, 
+        return self._validate(gen.Contacts,
             await self._get_json("/api/v1/contacts", query)
         )
 
@@ -793,7 +793,7 @@ class Client:
             query["includeMessageCounts"] = "1"
         # Counting messages scans every session behind each roster entry: that is
         # exactly the request the published read budget must not apply to.
-        return self._validate(gen.GroupMembers, 
+        return self._validate(gen.GroupMembers,
             await self._get_json(
                 "/api/v1/group-members", query, long=include_message_counts
             )
