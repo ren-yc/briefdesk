@@ -1,6 +1,6 @@
 // 启动配置（设置 → 启动配置/插件）面板逻辑回归（Node vm 加载真实 briefdesk/ui/app.js）。
 //
-// 守八件事：
+// 守十二件事：
 // 1. _collectEnvChanges 的布尔分支必须跳过未变化项——此前缺失相等性检查，
 //    每次「暂存更改」都会把所有布尔项重写进暂存文件，「没有需要暂存的更改」
 //    永不触发，差异计数常驻虚高；
@@ -18,6 +18,10 @@
 //    整面重载会丢其它行的未暂存编辑、「插件」面板开关草稿与搜索过滤态。
 // 8. 无运行值条目（未装配插件不下发 current）不得产生假差异，且仍可预配置；
 //    select 的当前值不在选项内时必须渲染为选中项。
+// 9. 插件预期未知（enabled===null）不得折进空集合，恢复出口按钮随坏值显隐。
+// 10-11. 恢复出口按钮：点击即一次 PUT 双 null 原子清除；取消确认不发请求、
+//        失败逐条明示并复位按钮。
+// 12. 密钥行「取消」是纯前端态还原：不发请求、不整面重绘、不碰其它行。
 //
 // 数据一律虚构（见 AGENTS.md）。
 
@@ -931,4 +935,100 @@ sandbox.renderPluginToggles();
     "409 明细必须逐条明示（与暂存失败同一套文案模式）",
   );
   assert.ok(!clearBtn.disabled, "失败后按钮必须恢复可用，允许重试");
+}
+
+// ── 12. 密钥行「取消」：纯前端态还原（不发请求、不整面重绘、不碰其它行）──
+// 「取消」只随钥匙串托管行渲染：它把「替换」展开的输入框收回、清掉半输入、
+// 还原「替换」入口。任一步走偏都会让该行既无输入框也无入口（行内再无配置
+// 门路）；把它实现成「清掉该键暂存值」而走 PUT，语义上是很容易犯的误解——
+// 用户点「取消」绝不该产生任何写入。
+{
+  setEnvData({
+    filePath: "C:/tmp/settings.env",
+    pluginOptions: [],
+    items: [],
+    secrets: [
+      { name: "ALPHA_TOKEN", label: "Alpha 令牌", plugin: "", configured: true, keyringConfigured: true },
+      { name: "BETA_TOKEN", label: "Beta 令牌", plugin: "", configured: true, keyringConfigured: true },
+    ],
+  });
+  sandbox.renderEnvConfig();
+
+  // harness 不解析 innerHTML，点击流的行树只能手工搭——树与渲染结果之间没有
+  // 解析器做桥，「取消按钮是否真渲染在含输入框的 .env-row 内」这类结构回归
+  // 本用例看不见，渲染面由第 4 节的字符串断言钉住。
+  const mkSecretRow = () => {
+    const input = makeElement();
+    const box = makeElement();
+    box.classList.add("hidden"); // 钥匙串托管行：输入框初始收起
+    box.querySelector = (sel) => (sel === "input" ? input : null);
+    const replace = makeElement(); // 「替换」入口初始可见
+    const cancel = makeElement();
+    const row = makeElement();
+    row.querySelector = (sel) => {
+      if (sel === ".env-secret-input") return box;
+      if (sel === "[data-sec-replace]") return replace;
+      return null;
+    };
+    replace.closest = (sel) => (sel === ".env-row" ? row : null);
+    cancel.closest = (sel) => (sel === ".env-row" ? row : null);
+    return { row, box, input, replace, cancel };
+  };
+  const alpha = mkSecretRow();
+  const beta = mkSecretRow();
+
+  // 「取消」的 handler 是委托在 #env-secrets 上的（靠 e.target.closest 分流
+  // set→clear→replace→cancel），harness 的 click() 以 {target: this} 派发——
+  // 因此把「命中哪个按钮」表达成容器 closest 的路由表。非目标选择器一律返回
+  // null：否则会顺带命中 set/clear（它们发请求）或 replace（把刚展开的又收起）。
+  const secRoot = getElement("env-secrets");
+  const route = (spec) => { secRoot.closest = (sel) => spec[sel] || null; };
+  secRoot.querySelectorAll = (sel) => (sel === ".env-row" ? [alpha.row, beta.row] : []);
+
+  const calls = [];
+  sandbox.fetch = async (url, opts = {}) => {
+    calls.push({ url: String(url), method: opts.method || "GET" });
+    return { ok: true, json: async () => ({}) };
+  };
+  const toasts = [];
+  const realToast = sandbox.showToast;
+  sandbox.showToast = (msg) => toasts.push(msg);
+  const renders = [];
+  const realRender = sandbox.renderEnvConfig;
+  sandbox.renderEnvConfig = (...a) => { renders.push(1); return realRender(...a); };
+  const reloads = [];
+  const realLoad = sandbox.loadEnvConfig;
+  sandbox.loadEnvConfig = async (...a) => { reloads.push(1); return realLoad(...a); };
+
+  // 前置：走真实「替换」分支展开（不手工置态——顺带钉住展开/取消互逆）
+  route({ "[data-sec-replace]": alpha.replace });
+  await secRoot.click();
+  assert.equal(alpha.box.classList.contains("hidden"), false, "「替换」应展开输入框");
+  assert.equal(alpha.replace.classList.contains("hidden"), true, "展开后「替换」入口应隐藏");
+
+  alpha.input.value = "半截输入";
+  beta.box.classList.remove("hidden");
+  beta.input.value = "另一行的半截输入";
+  calls.length = 0; renders.length = 0; reloads.length = 0;
+
+  route({ "[data-sec-cancel]": alpha.cancel });
+  await secRoot.click();
+
+  assert.deepEqual(calls, [], "「取消」是纯前端态还原：不得发出任何请求（含 PUT /api/settings/env）");
+  assert.equal(alpha.input.value, "", "「取消」应清掉本行半输入值");
+  assert.equal(alpha.box.classList.contains("hidden"), true, "「取消」应收起本行输入框");
+  assert.equal(alpha.replace.classList.contains("hidden"), false, "「取消」应还原本行「替换」入口");
+  assert.deepEqual(renders, [], "「取消」不得整面重绘（renderEnvConfig 重绘会丢其它行的编辑态）");
+  assert.deepEqual(reloads, [], "「取消」不得重取面板数据（loadEnvConfig 整面重载同害）");
+  assert.equal(beta.input.value, "另一行的半截输入", "「取消」不得清其它行的半输入");
+  assert.equal(beta.box.classList.contains("hidden"), false, "「取消」不得收起其它行的输入框");
+  assert.deepEqual(toasts, [], "「取消」不得提示成功/失败");
+
+  // 还原共享桩，后续块不受本块的容器覆写影响
+  delete sandbox.fetch;
+  sandbox.showToast = realToast;
+  sandbox.renderEnvConfig = realRender;
+  sandbox.loadEnvConfig = realLoad;
+  secRoot.closest = () => null;
+  secRoot.querySelectorAll = () => [];
 }
