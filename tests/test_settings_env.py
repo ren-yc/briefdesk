@@ -15,7 +15,7 @@ import tempfile
 import unittest
 from contextlib import contextmanager
 from pathlib import Path
-from typing import ClassVar
+from typing import Any, ClassVar
 from unittest.mock import patch
 
 import keyring
@@ -1345,6 +1345,86 @@ class ShadowedEnvWarningTest(unittest.TestCase):
             self.assertNoLogs("briefdesk.main", level="WARNING"),
         ):
             self.assertEqual(main_mod._warn_shadowed_env_keys(), [])
+
+
+class SchemaRebuildCountTest(StagedFileTestCase):
+    """每次请求的全量 schema 构建次数固定，不随提交键数增长。
+
+    失败模式：路由是 `async def` 而 schema 构建同步读盘——旧实现 PUT 对每个键
+    各重建全量（白名单/规范化/回传 = 3K 次），多键保存期间事件循环整体停摆，
+    SSE 与所有 API 一起卡住；GET 也把插件 schema 建两遍（非密钥项与密钥项各
+    一遍）。计数直接钉构建入口（`_core_schema` 每次核心全量恰好跑一遍），
+    比时间断言确定。回归位置即本类。
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        # 与 EnvRoutesTest 同款同源 Origin（CSRF 中间件要求）；不继承该类——
+        # 会把它的用例重复收集一遍
+        self.client = TestClient(
+            srv.app,
+            base_url="http://localhost",
+            headers={"Origin": "http://localhost"},
+        )
+
+    def _patched_counts(self) -> tuple[dict[str, int], list[Any]]:
+        counts = {"core": 0, "dynamic": 0}
+        real_core = settings_routes._core_schema
+        real_dynamic = settings_routes.get_settings_schema
+
+        def _count_core() -> Any:
+            counts["core"] += 1
+            return real_core()
+
+        def _count_dynamic() -> Any:
+            counts["dynamic"] += 1
+            return real_dynamic()
+
+        return counts, [_count_core, _count_dynamic]
+
+    def test_get_builds_core_and_plugin_schema_once(self) -> None:
+        counts, (core, dynamic) = self._patched_counts()
+        with (
+            patch.object(settings_routes, "_core_schema", core),
+            patch.object(settings_routes, "get_settings_schema", dynamic),
+        ):
+            res = self.client.get("/api/settings/env")
+        self.assertEqual(res.status_code, 200)
+        self.assertEqual(counts["core"], 1, "GET 的核心 schema 必须恰好构建一次")
+        self.assertEqual(counts["dynamic"], 1, "GET 的插件 schema 必须恰好构建一次")
+
+    def _put_counts(self, items: dict[str, Any]) -> dict[str, int]:
+        counts, (core, dynamic) = self._patched_counts()
+        with (
+            patch.object(settings_routes, "_core_schema", core),
+            patch.object(settings_routes, "get_settings_schema", dynamic),
+        ):
+            res = self.client.put("/api/settings/env", json={"items": items})
+        self.assertEqual(res.status_code, 200)
+        return counts
+
+    def test_put_build_count_independent_of_key_count(self) -> None:
+        """一次成功 PUT 恒为「写前 + 写后」两份快照：与键数无关。
+
+        回传阶段必须用提交后的文件状态重建（expected_* 语义），所以是 2 不是
+        1；键数从 1 涨到 5 时构建数不得变化——这正是旧实现 3K 停摆的判别点。
+        """
+        one = self._put_counts({"LOG_LEVEL": "DEBUG"})
+        self.assertEqual(
+            one, {"core": 2, "dynamic": 2}, "PUT 应恰为写前/写后各构建一次"
+        )
+        five = self._put_counts(
+            {
+                "LOG_LEVEL": "INFO",
+                "POLL_INTERVAL_SECONDS": "7",
+                "MAX_CLASSIFY_TOKENS": "1200",
+                "BACKFILL_HOURS": "24",
+                "IGNORED_EXPIRY_HOURS": "48",
+            }
+        )
+        self.assertEqual(
+            five, {"core": 2, "dynamic": 2}, "构建次数不得随提交键数增长"
+        )
 
 
 class ModelRegistryContractTest(unittest.TestCase):

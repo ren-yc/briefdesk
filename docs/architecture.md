@@ -1122,8 +1122,9 @@ required field of `weflow`/`qqflow` → that plugin self-disables via `PluginDis
 已复现的一例是小写键（解析按大小写不敏感采纳，判定若精确匹配就会误报 `default`）。
 
 - **三个时点必须分清**（设置页每行同时带这三组字段，混用会显示「已生效」而实际没有）：
-  `current`/`source` 是**运行快照**（本进程正在用的值；来源读按模型登记的 `capture_model_sources()`——核心 Settings
-  在 `config` 构造后登记，插件模型在插件 setup 成功后由 PluginManager 登记）；`staged` 是草稿；
+  `current`/`source` 是**运行快照**（本进程正在用的值；来源读按模型登记的快照——核心 Settings
+  在 `config` 构造后登记，插件模型在插件 setup 成功后由 PluginManager 登记；渲染**未登记**模型时按当前层序
+  现算、不登记，见 `settings_env.register_model`/`model_source_snapshot`）；`staged` 是草稿；
   `expected_value`/`expected_source` 是**按当前文件重新解析**的「下次启动生效值/来源」（`source_of()` 实时判定）。
   覆盖态 `overridden`/`override_source`/`override_value` 属**预期**语义（与 `expected_*` 同源）：草稿存在且下次启动
   会被 env / 项目 .env 压住时为真；`override_value` 给的是压住它的那一层的值。插件未装配/无运行实例时字段带
@@ -1136,6 +1137,13 @@ required field of `weflow`/`qqflow` → that plugin self-disables via `PluginDis
   同一套归一（`null/undefined → ""`）算基准——两侧不一致时「没动过」会被判成改动并提交空串，数字项必被
   `normalize_setting` 以「须为数字（留空不等于恢复默认）」422 拦下，整次保存失败（界面只显示笼统的
   「暂存失败，请检查输入后重试」）。清掉已暂存的值走行内「恢复默认」，不要靠清空输入框。
+- **全量 schema 每请求至多两份快照**（`routes_settings_env.py`）：一次 GET 恰好核心与插件 schema 各构建一遍
+  （非密钥项与密钥项共用同一份插件结果）；一次成功 PUT 恰好写前（白名单+规范化）、写后（行级贴片的
+  `expected_*` 要反映提交后的文件）各构建一遍，**与提交键数无关**。构建是同步读盘而路由是 `async def`，
+  旧实现按键重建（K 键 = 3K 次全量）会冻结事件循环、SSE 与全部 API 一起停摆——回归由
+  `tests/test_settings_env.py` 的 `SchemaRebuildCountTest` 计数钉住，改这两个路由前先想清楚新增的
+  `_all_schema()` 调用属于哪个时点。`DELETE /api/settings/secrets/{name}` 的两次 `_secret_schema()` 是
+  删除前/删除后两个时点（白名单 vs 「删除后解析链还剩什么」的回传），不是重复劳动。
 
 - **环境变量会压住项目 `.env`**：同名键只要在进程环境里存在，`.env` 的改动就不生效（设置页会标
   「已被环境变量覆盖」，但排查「改了没反应」时要先看 `Get-ChildItem env:<KEY>` / `printenv <KEY>`）。

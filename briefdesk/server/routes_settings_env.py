@@ -163,12 +163,18 @@ _SECRET_LABELS = {
 }
 
 
-def _all_schema() -> list[dict[str, Any]]:
+def _all_schema(dynamic: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
     """核心字段加全部已发现插件的可选字段（含禁用/自禁用插件，便于启用前
-    预配置必填项），按 key 去重。"""
+    预配置必填项），按 key 去重。
+
+    `dynamic` 传入本次请求已构建的插件 schema：一次 GET/PUT 要同时用非密钥项
+    与密钥项，各建一遍会把插件侧的解析成本翻倍（每项含逐字段的来源判定与
+    一次实例构造）。缺省时自行取，兼容单点调用。
+    """
     result: list[dict[str, Any]] = []
     seen: set[str] = set()
-    for item in [*_core_schema(), *get_settings_schema()]:
+    shared_dynamic = get_settings_schema() if dynamic is None else dynamic
+    for item in [*_core_schema(), *shared_dynamic]:
         key = item.get("key")
         if not isinstance(key, str) or item.get("secret") or key in seen:
             continue
@@ -177,12 +183,15 @@ def _all_schema() -> list[dict[str, Any]]:
     return result
 
 
-def _secret_schema() -> list[dict[str, Any]]:
-    """核心密钥加当前选中插件密钥；无 manager 时保留旧版兼容列表。"""
-    dynamic = get_settings_schema()
+def _secret_schema(dynamic: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
+    """核心密钥加当前选中插件密钥；无 manager 时保留旧版兼容列表。
+
+    `dynamic` 与 `_all_schema` 共用同一份插件 schema（见其 docstring 的成本理由）。
+    """
+    plugin_items = get_settings_schema() if dynamic is None else dynamic
     result = [*(_CORE_SECRET_SCHEMA)]
-    if dynamic or has_settings_schema_callback():
-        result.extend(item for item in dynamic if item.get("secret"))
+    if plugin_items or has_settings_schema_callback():
+        result.extend(item for item in plugin_items if item.get("secret"))
     else:
         result.extend(
             {
@@ -204,8 +213,8 @@ def _secret_schema() -> list[dict[str, Any]]:
     return unique
 
 
-def _schema_of(key: str) -> dict:
-    for meta in _all_schema():
+def _schema_of(key: str, schema: list[dict[str, Any]] | None = None) -> dict:
+    for meta in (_all_schema() if schema is None else schema):
         if meta["key"] == key:
             return meta
     raise KeyError(key)
@@ -243,9 +252,11 @@ def _item_state(meta: dict[str, Any], raw_staged: str | None) -> dict[str, Any]:
     }
 
 
-def _fresh_item_state(key: str, staged_now: dict[str, str]) -> dict[str, Any]:
+def _fresh_item_state(
+    key: str, staged_now: dict[str, str], schema: list[dict[str, Any]] | None = None
+) -> dict[str, Any]:
     """写操作后该键的最终状态（与 GET 同口径，供前端行级贴片）。"""
-    meta = _schema_of(key)  # PUT 白名单已放行，必命中
+    meta = _schema_of(key, schema)  # PUT 白名单已放行，必命中
     return _item_state(meta, staged_now.get(key))
 
 
@@ -439,10 +450,10 @@ def _plugins_source() -> str:
     return realtime or startup or "default"
 
 
-def _normalize(key: str, raw: str) -> str:
+def _normalize(key: str, raw: str, schema: list[dict[str, Any]] | None = None) -> str:
     """动态 schema + 类型/约束校验，返回规范化的暂存字符串。"""
     try:
-        meta = _schema_of(key)
+        meta = _schema_of(key, schema)
         return normalize_setting(meta, raw)
     except HTTPException:
         raise
@@ -455,18 +466,23 @@ def _normalize(key: str, raw: str) -> str:
 
 @app.get("/api/settings/env")
 async def api_settings_env():
-    """启动配置面板数据：元数据 + 生效/暂存/来源 + 密钥状态 + 文件路径。"""
+    """启动配置面板数据：元数据 + 生效/暂存/来源 + 密钥状态 + 文件路径。
+
+    插件侧 schema 本请求只构建一次（非密钥项与密钥项共用）：每项含逐字段的
+    来源判定与一次实例构造，构建两遍把面板打开的成本直接翻倍。
+    """
     staged = read_staged()
+    dynamic = get_settings_schema()
     items = [
         {**meta, **_item_state(meta, staged.get(meta["key"]))}
-        for meta in _all_schema()
+        for meta in _all_schema(dynamic)
     ]
     # PLUGINS_REQUIRED 芯片选项：仅可选插件（核心插件恒装配，列入无意义）
     plugin_names = sorted(
         {p.get("name", "") for p in get_plugins_info() if not p.get("core")} - {""}
     )
     secrets = []
-    for meta in _secret_schema():
+    for meta in _secret_schema(dynamic):
         name = meta["key"]
         if name == DB_KEYS_BASE:
             keyring_configured = get_db_keys() is not None
@@ -525,11 +541,17 @@ async def api_settings_env_put(payload: EnvPutPayload):
     raw_items = payload.items
     if not isinstance(raw_items, dict):
         raise HTTPException(422, "请求体须为 {items: {KEY: value|null}}")
+    # 白名单与单键校验共用**写入前**的一份 schema：旧实现对每个键各重建全量
+    # （白名单/规范化/回传 = 3K 次，每次含逐字段来源判定与一次实例构造），
+    # 路由是 async def 而构建同步读盘——多键保存会冻结事件循环，SSE 与全部
+    # API 一起停摆。构建数由 tests/test_settings_env.py 的 SchemaRebuildCountTest
+    # 直接钉住（计数比时间断言确定）。
+    pre_schema = _all_schema()
     updates: dict[str, str | None] = {}
     for key, raw in raw_items.items():
         # 键名先过白名单（null 删除路径同样受白名单约束）
         try:
-            _schema_of(key)
+            _schema_of(key, pre_schema)
         except KeyError as exc:
             raise HTTPException(422, f"未知配置项: {key}") from exc
         if raw is None:
@@ -537,7 +559,7 @@ async def api_settings_env_put(payload: EnvPutPayload):
             continue
         if not isinstance(raw, str):
             raise HTTPException(422, f"{key}: 值须为字符串或 null")
-        updates[key] = _normalize(key, raw)
+        updates[key] = _normalize(key, raw, pre_schema)
     async with _write_lock:
         # 严格读取现有暂存并合成候选字节：读不出可靠旧值时拒绝写入——
         # 当空覆盖等于把整个暂存态静默抹掉。
@@ -597,10 +619,14 @@ async def api_settings_env_put(payload: EnvPutPayload):
                 "message": "配置已写入，但当前状态未知（读取失败），请刷新确认",
             },
         ) from exc
+    # expected_* 必须反映**提交后**的文件状态（pre_schema 里的下次启动值是写前的），
+    # 所以回传阶段重建一份、全部受影响键共用——一次成功 PUT 的构建数因此是 2
+    # （写前 + 写后两个时点），而不是 3K。失败路径（409/422/500）走不到这里。
+    post_schema = _all_schema()
     return {
         "ok": True,
         "filePath": str(get_settings_file()),
-        "items": {key: _fresh_item_state(key, staged_now) for key in updates},
+        "items": {key: _fresh_item_state(key, staged_now, post_schema) for key in updates},
     }
 
 
@@ -634,7 +660,10 @@ async def api_secrets_delete(name: str):
     else:
         delete_secret(name)
     # configured 是否仍为真取决于该密钥是否另有环境变量/.env 配置——只有
-    # 服务端能判定，回传供前端行级贴片（keyringConfigured 删除后恒为 False）
+    # 服务端能判定，回传供前端行级贴片（keyringConfigured 删除后恒为 False）。
+    # 这里的 _secret_schema() 必须构建在删除**之后**：白名单那次是删除前的
+    # 时点，回传要的是「删除后解析链还剩什么」——两次构建是两个时点语义，
+    # 不是重复劳动，不得合并成一份。
     meta = next((m for m in _secret_schema() if m["key"] == name), None)
     return {
         "ok": True,
