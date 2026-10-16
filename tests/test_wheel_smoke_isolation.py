@@ -263,3 +263,109 @@ class TestSuccessPathExitCode:
         captured = capsys.readouterr()
         assert "冒烟收尾清理失败" in captured.err
         assert "冒烟通过" not in captured.out + captured.err
+
+
+#: venv 解释器哨兵：成功路径装置把 venv_python 一并 no-op 成返回 None，
+#: 「实参是 venv 里的解释器」必须换成可辨识的返回值才判得出来（回归见本节）。
+_VENV_PY_SENTINEL = Path("venv-python-sentinel")
+
+
+class TestVendorAssertCallSite:
+    """vendor 消费者断言（assert_vendor_importable）调用点的入口级契约。
+
+    成功路径装置把它整体 no-op（否则真实断言会跑在桩 venv 里），于是调用点
+    本身没有守卫：删掉调用行、挪到应用启动之后、传成宿主解释器，既有用例全绿。
+    三类静默失败各有实害——调用点消失后 vendor 装坏只能靠应用启动间接暴露；
+    挪到启动之后，坏包先撞上 wait_ready 超时，报错指向「应用未就绪 + 日志尾部」
+    而非「vendor 坏了」，把人引向错方向；传宿主解释器时导入落在源码树，
+    检查恒通过等于没查。
+
+    做法：复用成功路径装置，只在被测契约的四个锚点局部重打桩为记录桩，
+    装置与既有用例零改动（不继承 TestSuccessPathExitCode——那会把父类两个
+    用例重复收集一遍）。
+    """
+
+    def _stub_with_recorder(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> tuple[Any, Path, "_SuccessCommands", list[tuple[str, tuple[Any, ...]]]]:
+        wheel_smoke_obj, scene, commands = TestSuccessPathExitCode()._stub_success_main(
+            monkeypatch, tmp_path, lambda _index: None
+        )
+        calls: list[tuple[str, tuple[Any, ...]]] = []
+
+        def _record(name: str, result: Any = None) -> Callable[..., Any]:
+            def _stub(*args: Any, **_kwargs: Any) -> Any:
+                calls.append((name, args))
+                return result
+
+            return _stub
+
+        # console_script 在此兼作「应用启动之前」的顺序锚点：它就在
+        # commands.start_app 的实参里被调用，vendor 检查挪到其后必然越界。
+        monkeypatch.setattr(wheel_smoke_obj, "install_wheel", _record("install_wheel"))
+        monkeypatch.setattr(
+            wheel_smoke_obj, "venv_python", _record("venv_python", _VENV_PY_SENTINEL)
+        )
+        monkeypatch.setattr(
+            wheel_smoke_obj, "assert_vendor_importable", _record("assert_vendor_importable")
+        )
+        monkeypatch.setattr(wheel_smoke_obj, "console_script", _record("console_script"))
+        return wheel_smoke_obj, scene, commands, calls
+
+    def test_called_once_with_venv_python_between_install_and_launch(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture,
+    ) -> None:
+        wheel_smoke, scene, _commands, calls = self._stub_with_recorder(monkeypatch, tmp_path)
+        assert wheel_smoke.main() == 0, "记录桩不得改变成功路径的退出语义"
+        captured = capsys.readouterr()
+        assert "冒烟通过" in captured.out + captured.err, "必须走在成功路径上"
+
+        vendor_calls = [args for name, args in calls if name == "assert_vendor_importable"]
+        assert len(vendor_calls) == 1, "vendor 消费者断言必须恰好调用一次（删掉或复制调用点都应在此变红）"
+        python_arg, cwd_arg = vendor_calls[0]
+        assert python_arg is _VENV_PY_SENTINEL, (
+            "必须拿 venv 里的解释器——传宿主 sys.executable 时导入落在源码树，检查恒过等于没查"
+        )
+        assert cwd_arg == scene, (
+            "cwd 必须是本次冒烟的临时根——仓库根会把仓库树带进 sys.path，同样检不到装的包"
+        )
+
+        names = [name for name, _args in calls]
+        assert names.index("install_wheel") < names.index("assert_vendor_importable"), (
+            "vendor 检查必须在装包之后——wheel 安装完成之前 venv 里没有 vendor 包可导"
+        )
+        assert names.index("assert_vendor_importable") < names.index("console_script"), (
+            "vendor 检查必须在应用启动之前——挪到启动后坏包的报错会变成「应用未就绪」，指向错误方向"
+        )
+
+    def test_vendor_failure_stops_before_app_start(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture,
+    ) -> None:
+        """失败即收口：vendor 断言失败必须非零退出、保留现场、绝不启动应用。
+
+        比顺序索引更硬的「启动前」——若未来有人把检查挪进别的函数，只要失败
+        仍在启动前收口，本用例仍然成立。
+        """
+        wheel_smoke, scene, commands, _calls = self._stub_with_recorder(monkeypatch, tmp_path)
+        started: list[list[str]] = []
+
+        def _start(cmd: list[str], *, env: dict[str, str], cwd: Path) -> _SuccessApp:
+            started.append(cmd)
+            return _SuccessApp(Path("fake-app.log"))
+
+        monkeypatch.setattr(commands, "start_app", _start)
+
+        def _boom(_python: Path, _cwd: Path) -> None:
+            raise SmokeFailure("vendor 消费者断言未通过（模拟）")
+
+        monkeypatch.setattr(wheel_smoke, "assert_vendor_importable", _boom)
+        assert wheel_smoke.main() == 1, "vendor 断言失败必须以非零退出码收口"
+        assert started == [], "vendor 检查失败必须在启动应用之前收口"
+        assert scene.exists(), "失败路径保留现场"
+        assert "vendor 消费者断言未通过" in capsys.readouterr().err
