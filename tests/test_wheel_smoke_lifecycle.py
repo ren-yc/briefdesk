@@ -325,3 +325,63 @@ class TestRuntimeDirProbeGuard:
     def test_probe_still_carries_installed_guard(self) -> None:
         """探针必须带着「导入落在 site-packages」的守卫：源码树会掩盖非安装包的问题。"""
         assert wheel_smoke.RUNTIME_DIR_PROBE.startswith(wheel_smoke.INSTALLED_GUARD)
+
+
+class TestVendorProbeContract:
+    """vendor 消费者断言（assert_vendor_importable）函数本体的离线回归。
+
+    为什么单独测：调用点在 CI 的 wheel-smoke job 里端到端跑，本地没有任何防线
+    覆盖探针的判据形状——探针片段是函数内的局部拼接串，模块常量的文本守卫
+    （上面的 RUNTIME_DIR_PROBE 那组）够不到它。若有人把判据改松（`in out` 换成
+    恒真条件、或删掉 VENDOR-OK 标记），vendor 装坏也会被报成「通过」，而这条
+    路径正是 CI 上唯一会跑到「装进 venv 的包能否导入」的环节。桩掉 run() 即可
+    离线拿到真实探针串与实参，不需要真起进程。
+    """
+
+    def test_missing_marker_is_a_smoke_failure(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """输出缺标记 → 显式 SmokeFailure；且断言命令形状与 cwd 真的传下去了。
+
+        判别构造：match 用该分支专属文案「输出缺标记」——只写 pytest.raises(SmokeFailure)
+        会在别的失败分支（如 run 自身抛错）假通过（教训同 TestWaitBenchmarkTerminal
+        的专属文案断言）。
+        """
+        seen: dict[str, Any] = {}
+
+        def _fake_run(
+            cmd: list[str],
+            *,
+            env: dict[str, str] | None = None,
+            timeout: int = 900,
+            cwd: Path | None = None,
+        ) -> str:
+            seen["cmd"] = cmd
+            seen["timeout"] = timeout
+            seen["cwd"] = cwd
+            return "Traceback (most recent call last):\nModuleNotFoundError: No module named 'weflow_sdk'\n"
+
+        monkeypatch.setattr(wheel_smoke, "run", _fake_run)
+        python = tmp_path / "venv" / "Scripts" / "python.exe"
+        cwd = tmp_path / "scene"
+        with pytest.raises(SmokeFailure, match="输出缺标记"):
+            wheel_smoke.assert_vendor_importable(python, cwd)
+
+        assert seen["cmd"][0] == str(python), "必须用传入的解释器跑探针"
+        assert seen["cmd"][1] == "-c", "探针走 python -c 内联片段"
+        probe = seen["cmd"][2]
+        assert probe.startswith(wheel_smoke.INSTALLED_GUARD), "探针必须带 site-packages 导入守卫"
+        assert "VENDOR-OK" in probe, "探针成功路径必须打 VENDOR-OK 标记"
+        assert "weflow_sdk" in probe and "qqflow_sdk" in probe, "两包都须在探针覆盖内"
+        assert seen["cwd"] == cwd, "cwd 必须真传给子进程——落仓库根会让导入命中源码树"
+
+    def test_marker_present_passes(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """输出含标记 → 不抛（判据只认标记，不把 stderr 噪音当失败信号）。"""
+        monkeypatch.setattr(
+            wheel_smoke,
+            "run",
+            lambda *_args, **_kwargs: "some noise\nVENDOR-OK\n",
+        )
+        wheel_smoke.assert_vendor_importable(tmp_path / "python.exe", tmp_path)  # 不抛即通过
