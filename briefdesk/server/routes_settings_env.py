@@ -661,9 +661,11 @@ async def api_secrets_delete(name: str):
         delete_secret(name)
     # configured 是否仍为真取决于该密钥是否另有环境变量/.env 配置——只有
     # 服务端能判定，回传供前端行级贴片（keyringConfigured 删除后恒为 False）。
-    # 这里的 _secret_schema() 必须构建在删除**之后**：白名单那次是删除前的
-    # 时点，回传要的是「删除后解析链还剩什么」——两次构建是两个时点语义，
-    # 不是重复劳动，不得合并成一份。
+    # 这里的第二次 _secret_schema() 构建在删除**之后**：白名单那次是删除前的
+    # 时点，回传要的是「删除后解析链还剩什么」——对**插件密钥**（动态项，每次
+    # 构建现算 configured）这是两个时点语义，不得合并成一份。已知边界：核心
+    # 密钥的 configured 来自 import 期常量 _CORE_SECRET_SCHEMA，删除后回传的
+    # configured 不反映本次删除（要重启才对），与旧实现一致，另单处理。
     meta = next((m for m in _secret_schema() if m["key"] == name), None)
     return {
         "ok": True,

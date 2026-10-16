@@ -1142,8 +1142,9 @@ required field of `weflow`/`qqflow` → that plugin self-disables via `PluginDis
   `expected_*` 要反映提交后的文件）各构建一遍，**与提交键数无关**。构建是同步读盘而路由是 `async def`，
   旧实现按键重建（K 键 = 3K 次全量）会冻结事件循环、SSE 与全部 API 一起停摆——回归由
   `tests/test_settings_env.py` 的 `SchemaRebuildCountTest` 计数钉住，改这两个路由前先想清楚新增的
-  `_all_schema()` 调用属于哪个时点。`DELETE /api/settings/secrets/{name}` 的两次 `_secret_schema()` 是
-  删除前/删除后两个时点（白名单 vs 「删除后解析链还剩什么」的回传），不是重复劳动。
+  `_all_schema()` 调用属于哪个时点。`DELETE /api/settings/secrets/{name}` 的两次 `_secret_schema()` 对**插件密钥**
+  是删除前/删除后两个时点（白名单 vs 「删除后解析链还剩什么」的回传），不是重复劳动；核心密钥的 `configured`
+  来自 import 期常量 `_CORE_SECRET_SCHEMA`，删除后回传不反映本次删除（既有边界，另单处理）。
 
 - **环境变量会压住项目 `.env`**：同名键只要在进程环境里存在，`.env` 的改动就不生效（设置页会标
   「已被环境变量覆盖」，但排查「改了没反应」时要先看 `Get-ChildItem env:<KEY>` / `printenv <KEY>`）。
