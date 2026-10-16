@@ -20,8 +20,8 @@ from pydantic.fields import PydanticUndefined
 from pydantic_settings import BaseSettings
 
 from briefdesk.settings_env import (
-    capture_model_sources,
     field_env_key,
+    model_source_snapshot,
     model_sources,
     source_of,
 )
@@ -149,7 +149,8 @@ def build_settings_schema(
     三个时点必须分清（混用会让设置页显示「已生效」而实际没有）：
 
     - `current` / `source`：**运行快照**——本进程正在用的值，以及它来自哪一层
-      （来源读按模型登记的快照，见 settings_env.capture_model_sources）。
+      （来源读按模型登记的快照，见 settings_env.register_model；渲染时未登记的
+      模型按当前层序现算、**不登记**——登记只发生在生效时刻）。
       `running=False`（插件未装配/装配失败/无运行实例）时不展示这两项，item 带
       `running: False`，由前端显示「无运行值」，而不是拿下次启动值冒充。
     - `expected_value` / `expected_source`：按**当前文件与环境**重新解析得到的
@@ -171,7 +172,7 @@ def build_settings_schema(
         except Exception:  # noqa: BLE001 — schema 不应被无效配置阻断
             # 必填字段缺失或环境变量格式错误时，字段元数据仍可用于修复配置。
             settings = None
-    sources = model_sources(model) or capture_model_sources(model)
+    sources = model_sources(model) or model_source_snapshot(model)
     expected, expected_error = _expected_instance(model)
     labels = labels or {}
     hints = hints or {}

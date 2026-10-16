@@ -21,6 +21,7 @@ from unittest.mock import patch
 import keyring
 from keyring.backend import KeyringBackend
 from pydantic import Field, SecretStr
+from pydantic_settings import SettingsConfigDict
 from starlette.testclient import TestClient
 
 import briefdesk.server as srv
@@ -1344,3 +1345,82 @@ class ShadowedEnvWarningTest(unittest.TestCase):
             self.assertNoLogs("briefdesk.main", level="WARNING"),
         ):
             self.assertEqual(main_mod._warn_shadowed_env_keys(), [])
+
+
+class ModelRegistryContractTest(unittest.TestCase):
+    """模型登记表的契约：登记只发生在生效时刻，渲染 schema 不得顺手登记。
+
+    旧实现把「算快照」与「登记」焊死在一个函数里，而 PluginManager 的
+    settings_schema() 遍历**全部已发现**插件（含禁用/未装配）去渲染预配置项——
+    于是「打开一次设置页」就把未生效的模型冻进登记表；启动期聚合提示
+    （消费 registered_models 的「本进程在用的模型集合」）随后拿渲染时刻的
+    文件状态当运行事实。守卫用例见本类两条（回归位置）。
+    """
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.staged_path = Path(self._tmp.name) / "settings.env"
+        self._env_patch = patch.dict(
+            os.environ, {"BRIEFDESK_SETTINGS_FILE": str(self.staged_path)}
+        )
+        self._env_patch.start()
+        self.addCleanup(self._env_patch.stop)
+        # 进程级 dict：用例必须自恢复，泄漏会污染后续用例对登记集合的观察
+        self._saved_sources = dict(settings_env._model_sources)
+        self._saved_core = settings_env._core_sources
+        self.addCleanup(self._restore_registry)
+
+    def _restore_registry(self) -> None:
+        settings_env._model_sources.clear()
+        settings_env._model_sources.update(self._saved_sources)
+        settings_env._core_sources = self._saved_core
+
+    def test_rendering_schema_does_not_register_model(self) -> None:
+        """未登记模型：渲染出 source 展示值，但不进登记表。"""
+        from briefdesk.settings_schema import build_settings_schema
+
+        class _ProbeModel(KeyringSettingsBase):
+            threshold: int = 4
+
+            model_config = SettingsConfigDict(env_prefix="REGPROBE_")
+
+        self.assertNotIn(_ProbeModel, settings_env.registered_models())
+        items = build_settings_schema(_ProbeModel, _ProbeModel(), running=True)
+        probe = next(i for i in items if i["key"] == "REGPROBE_THRESHOLD")
+        self.assertEqual(probe["source"], "default", "未登记模型按当前层序现算展示")
+        self.assertNotIn(
+            _ProbeModel,
+            settings_env.registered_models(),
+            "渲染 schema 不得顺手登记未生效模型（污染 registered_models 契约）",
+        )
+
+    def test_register_freezes_snapshot_until_re_registered(self) -> None:
+        """登记即冻结：文件后续变化不改动已登记的运行快照。"""
+
+        class _ProbeModel(KeyringSettingsBase):
+            threshold: int = 4
+
+            model_config = SettingsConfigDict(env_prefix="REGPROBE_")
+
+        settings_env.register_model(_ProbeModel)
+        self.staged_path.write_text("REGPROBE_THRESHOLD=9\n", encoding="utf-8")
+        snapshot = settings_env.model_sources(_ProbeModel)
+        self.assertIsNotNone(snapshot)
+        assert snapshot is not None
+        self.assertEqual(
+            snapshot["REGPROBE_THRESHOLD"],
+            "default",
+            "登记时刻即生效时刻——运行快照不随运行中改文件漂移",
+        )
+        self.assertEqual(
+            settings_env.source_of("REGPROBE_THRESHOLD"),
+            "override",
+            "下次启动值（实时判定）仍随文件变化——两者必须是两个答案",
+        )
+        # 重新登记（模拟新的生效时刻）才会看到新层
+        settings_env.register_model(_ProbeModel)
+        refrozen = settings_env.model_sources(_ProbeModel)
+        self.assertIsNotNone(refrozen)
+        assert refrozen is not None
+        self.assertEqual(refrozen["REGPROBE_THRESHOLD"], "override")

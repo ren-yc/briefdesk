@@ -223,20 +223,37 @@ _model_sources: dict[type[BaseSettings], dict[str, str]] = {}
 _core_sources: dict[str, str] | None = None
 
 
-def capture_model_sources(model: type[BaseSettings]) -> dict[str, str]:
-    """按共享层序反推该模型各字段**此刻**的来源并登记，供设置页展示。
+def model_source_snapshot(model: type[BaseSettings]) -> dict[str, str]:
+    """按共享层序反推该模型各字段**此刻**的来源快照；纯计算，不登记。
 
-    为什么不能每次渲染都实时判定：`config`/插件实例在启动时构造、无热应用——
-    运行中改文件不会改变本进程实际生效的值。"下次启动生效"另有 `expected_*`
-    表达，两者混用会出现「显示已生效、实际没生效」。密钥字段也一并登记，
-    但展示侧不消费（密钥走 configured/keyringConfigured）。
+    渲染路径对**未登记**模型走这条：拿当前时刻的最好近似展示，登记权留给
+    真正的生效时刻（见 `register_model`）。登记与计算分离后，「打开一次设置页」
+    不会再把「已发现但未装配」的插件模型冻进登记表——`registered_models()`
+    声称的「核心 + 装配成功」若被渲染污染，启动期聚合提示会拿渲染时刻的
+    文件状态当运行事实（回归见 tests/test_settings_env.py 的登记契约用例）。
     """
-    snapshot = {
+    return {
         key: source_of(key)
         for key in (field_env_key(model, name) for name in model.model_fields)
     }
+
+
+def register_model(model: type[BaseSettings]) -> dict[str, str]:
+    """计算来源快照并**登记**为该模型的运行快照；登记时刻即生效时刻。
+
+    为什么登记必须绑定生效时刻而不是渲染时刻：`config`/插件实例在启动时构造、
+    无热应用——运行中改文件不会改变本进程实际生效的值。"下次启动生效"另有
+    `expected_*` 表达，两者混用会出现「显示已生效、实际没生效」。密钥字段也
+    一并登记，但展示侧不消费（密钥走 configured/keyringConfigured）。
+    """
+    snapshot = model_source_snapshot(model)
     _model_sources[model] = snapshot
     return snapshot
+
+
+def capture_model_sources(model: type[BaseSettings]) -> dict[str, str]:
+    """兼容入口（等价 `register_model`）：既有生效时刻调用点语义不变。"""
+    return register_model(model)
 
 
 def model_sources(model: type[BaseSettings]) -> dict[str, str] | None:
