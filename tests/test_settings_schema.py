@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Annotated
 from unittest.mock import patch
 
-from pydantic import Field, SecretStr
+from pydantic import Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings
 
 from briefdesk.plugins.benchmark.plugin import BenchmarkPlugin
@@ -60,8 +60,6 @@ class ValidatorBoomSettings(BaseSettings):
     threshold: int = 4
 
     model_config = {"env_prefix": "BOOM_"}
-
-    from pydantic import model_validator
 
     @model_validator(mode="after")
     def _boom(self) -> "ValidatorBoomSettings":
