@@ -506,10 +506,10 @@ def assert_installed_resources(python: Path, cwd: Path) -> None:
 
 
 def assert_vendor_importable(python: Path, cwd: Path) -> None:
-    """vendor SDK 的「第一个真实消费者」断言：装完能导入、公共形状对。
+    """vendor SDK 的随包可达性与公共形状断言：装完能导入、形状对。
 
-    这是随包分发从「文件在包里」到「可用」的最短验证——不做任何运行期
-    数据通路（插件仍走自己的 httpx 直连），也不碰上游公共面口径。断言走
+    运行期的真实消费者是两插件的 `_api()`（vendor Client），本断言只做
+    分发侧验证——不碰任何运行期数据通路，也不碰上游公共面口径。断言走
     **模块路径**（weflow_sdk.client._REFUSAL_STATES 只在模块层可达，包顶层
     刻意不再导出——为这条断言去上游加再导出会改动已登记的公共面并触发
     重新 split/re-vendor，得不偿失）。

@@ -4,9 +4,9 @@
 避免业务层反向依赖表现层；源客户端与监听器注册表也收在这里
 （组合根 main 注入、server 查询）。
 
-相对时间展示在前端计算：卡片行 relativeTime 与状态面板的 relativeSync
-均由前端按 msg_time/lastSync 自行换算，本模块只下发原始时间数据
-（items 的 msg_time/created_at、lastSync）。
+相对时间展示在前端计算：卡片行的 `itemRelativeTime` 与状态面板的
+`syncRelativeText`（都经 `relativeTimeStr` 换算）在前端按 msg_time/lastSync
+自行换算，本模块只下发原始时间数据（items 的 msg_time/created_at、lastSync）。
 """
 
 from datetime import UTC, datetime, timedelta

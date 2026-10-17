@@ -1,7 +1,6 @@
 """本地访问守卫：Host 白名单（防 DNS rebinding）+ 变更接口同源校验 + 安全响应头。
 
-从原 server.py 拆出：本模块导入即向 `briefdesk.server.app`
-注册 http 中间件。
+导入即向 `briefdesk.server.app` 注册 http 中间件（装配顺序见 server/__init__.py）。
 """
 
 from urllib.parse import urlsplit

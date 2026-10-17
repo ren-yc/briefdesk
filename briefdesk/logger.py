@@ -92,7 +92,7 @@ _STATUS_CODE_COLORS = {
 # （如 weflow-legacy SSE 的 ?access_token=）会出现在 uvicorn access log 请求行中。
 # 按参数键名判定：键名按 [_-] 分段，任一分段命中敏感词即掩码——覆盖
 # auth_token / session_token / secret_key / access_key / api_secret /
-# refresh_token / signature 等常见变体（审查回归），同时不误伤
+# refresh_token / signature 等常见变体，同时不误伤
 # keyword / tokenizer 等整词含敏感词子串的普通参数。
 _QUERY_SECRET_PARAM_RE = re.compile(r"([?&])([a-z0-9_-]+)=([^&\s]*)", re.IGNORECASE)
 _SECRET_KEY_SEGMENTS = frozenset(

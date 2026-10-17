@@ -70,8 +70,7 @@ async def _refresh_all(sources: list[SourceRuntime]) -> None:
 
     单个源刷新失败不影响其它源的会话结果落库。
     网络拉取（refresh_sessions）在存储锁外；会话落库与全应用写路径共用
-    storage_lock 串行化——单连接隐式事务下锁外 commit 会把管道未完成的
-    多步写一并提交（部分写入提前可见），见 db.storage_lock 注释。
+    storage_lock 串行化（为什么必须串行：见 db.storage_lock 的权威论证）。
     """
     results = await asyncio.gather(
         *(s.refresh_sessions() for s in sources), return_exceptions=True
@@ -258,7 +257,7 @@ async def _run() -> None:
         set_plugin_meta_callback(manager.plugin_meta)
         set_plugin_validation_callback(manager.validate_selection)
         if not runtimes:
-            # 零源降级启动（决策 ①=1B）：不再中止——UI/设置/向导可用，
+            # 零源降级启动：不再中止——UI/设置/向导可用，
             # 消息采集不可用，状态栏明示；这也是三源统一「缺配置自禁用」
             # 语义的前提（否则唯一启用的源自禁用会触发零源中止）
             logger.warning(
@@ -300,9 +299,9 @@ async def _run() -> None:
         )
         server_task = asyncio.create_task(server.serve())
 
-        # 4. 插件激活（当前各内置插件 activate 均无副作用；消息源实时监听须在
-        #    uvicorn serve 任务创建后启动，避免事件循环被 SSE 长连接独占阻塞）→
-        #    逐个启动实时监听
+        # 4. 插件激活（benchmark 清残目录+轮转、rag 持锁建表+拉起回填，均为有意的
+        #    启动兜底；消息源实时监听须在 activate 之后、且 uvicorn serve 任务已
+        #    创建后启动，避免事件循环被 SSE 长连接独占阻塞）→ 逐个启动实时监听
         phase_start = time_module.perf_counter()
         await manager.activate_all(ctx)
         for s in runtimes:

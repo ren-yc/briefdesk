@@ -102,7 +102,7 @@ class TestNormalizeSseImageLookup:
         assert msgs[0].image_urls == ["wxid_test_0001/images/abc.jpg"]
 
     async def test_non_image_type_skips_lookup_and_drops(self):
-        # 审查回归：type 非图片跳过回查后整条丢弃（纯占位符无信息价值，
+        # 回归防线：type 非图片跳过回查后整条丢弃（纯占位符无信息价值，
         # 与 REST 路径丢弃语义对齐；旧实现放行为纯文本 "[图片]" 噪音卡）
         client = _FakeClient(contacts={}, messages=[])
         client.fetch_message_media = AsyncMock()  # type: ignore[method-assign]

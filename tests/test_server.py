@@ -128,7 +128,7 @@ class LocalSecurityGuardTest(unittest.TestCase):
         self.assertEqual(resp.status_code, 403)
 
     def test_rejects_post_without_origin_and_referer(self):
-        # 审查修复 #3：Origin/Referer 双缺失不得静默放行变更接口（旧浏览器/
+        # Origin/Referer 双缺失不得静默放行变更接口（旧浏览器/
         # 隐私扩展剥离 Referer 后 CSRF 防护失效）——裸 client 不带默认头
         with TestClient(srv.app, base_url="http://localhost") as bare:
             resp = bare.post("/api/sync")
@@ -166,7 +166,7 @@ class LocalSecurityGuardTest(unittest.TestCase):
 
 
 class RestoreTempDirTest(unittest.TestCase):
-    """审查回归：restore 临时文件必须落在库文件同目录——os.replace 不允许
+    """回归防线：restore 临时文件必须落在库文件同目录——os.replace 不允许
     跨文件系统，mkstemp 缺省走系统 TEMP 时与 DB_PATH 跨盘（Windows 典型布局）
     必然 WinError 17，恢复功能整体不可用。"""
 
@@ -308,7 +308,7 @@ class ParseFlagTest(unittest.TestCase):
 
 
 class ReminderApiTest(unittest.TestCase):
-    """提醒端点（reminders Web 插件）：#10 aware→本地换算、参数校验，以及 #3A 到期查询路由。"""
+    """提醒端点（reminders Web 插件）：aware 时间→本地换算、参数校验，以及到期/已忽略卡片的查询路由。"""
 
     def setUp(self):
         self.client = _client()
@@ -550,7 +550,7 @@ class GroupCountFieldTest(unittest.TestCase):
 
 
 class MediaContentTypeTest(unittest.TestCase):
-    """审查修复 #2：媒体代理 Content-Type 白名单，掐断同源文档渲染 XSS 面。
+    """媒体代理必须做 Content-Type 白名单，掐断同源文档渲染 XSS 面。
 
     最终类型必须是安全位图（png/jpeg/gif/webp/bmp）；SVG/HTML 等可承载
     脚本的类型一律降级 application/octet-stream + attachment 强制下载。
@@ -629,7 +629,7 @@ class MediaContentTypeTest(unittest.TestCase):
 
 
 class SpaFallbackExtensionTest(unittest.TestCase):
-    """审查修复 #8：带扩展名的未知静态资源 404，不回退 SPA 首页。
+    """带扩展名的未知静态资源必须 404，不回退 SPA 首页。
 
     回退 index.html 会以 200 + text/html 应答 .js/.css 等资源请求，
     触发浏览器严格 MIME 检查告警；SPA 路由（无扩展名）仍回退首页。
@@ -662,7 +662,7 @@ class SpaFallbackExtensionTest(unittest.TestCase):
 
 
 class CsvExportFormulaInjectionTest(unittest.TestCase):
-    """审查修复 #4：CSV 导出对公式前缀（=/+/-/@/Tab）单元格前置单引号转义。"""
+    """CSV 导出必须对公式前缀（=/+/-/@/Tab）单元格前置单引号转义——否则表格软件打开即执行公式。"""
 
     def test_items_export_escapes_formula_prefixes(self):
         client = _client()
@@ -753,7 +753,7 @@ class CsvExportFormulaInjectionTest(unittest.TestCase):
 
 
 class IgnoreClearsDedupCacheEventTest(unittest.TestCase):
-    """审查修复 #5：忽略卡片后发布 items_deleted，使去重缓存与预热口径一致。
+    """忽略卡片后必须发布 items_deleted，使去重缓存与预热口径一致。
 
     去重缓存预热只载入 is_verified >= 0 的条目；忽略后若不清内存缓存，
     被忽略卡仍参与判重，相似新消息被永久跳过不显示（直到重启）。

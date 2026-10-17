@@ -28,7 +28,7 @@ from briefdesk.settings_base import KeyringSettingsBase
 class RagSettings(KeyringSettingsBase):
     """RAG 插件配置，密钥字段支持系统密钥环。"""
 
-    # 密钥解析链（keyring > 环境变量 > .env > 默认值），见 briefdesk/secrets_store.py
+    # 密钥解析链（keyring > 环境变量 > 项目 .env > 用户暂存文件 > 默认值），见 briefdesk/secrets_store.py
     KEYRING_FIELDS: ClassVar[dict[str, str]] = {
         "api_key": "RAG_API_KEY",
     }

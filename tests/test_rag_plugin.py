@@ -1,4 +1,4 @@
-"""RAG 插件测试：装配自禁用、库层、索引、回填、检索、问答路由与审查回归。"""
+"""RAG 插件测试：装配自禁用、库层、索引、回填、检索与问答路由。"""
 
 import asyncio
 import unittest
@@ -581,7 +581,7 @@ class TestRagBackfill(_MemoryEngineBase):
         assert sorted(await self._chunk_ids()) == ["d1", "d3"]
 
     async def test_placeholder_rows_do_not_starve_budget_window(self):
-        """审查回归：纯占位符行不可索引却永远满足反连接——旧实现中它们每轮
+        """回归防线：纯占位符行不可索引却永远满足反连接——旧实现中它们每轮
         占满 LIMIT 预算窗口、rows 为空时 return 0 被当作「回填完成」，比它们
         更早的真实消息永远得不到索引且无任何告警。现登记 rag_skipped 消费
         出队，预算窗口逐轮推进到真实消息。"""

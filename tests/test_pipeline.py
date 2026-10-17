@@ -1230,7 +1230,7 @@ class TestConversationMergeStage:
         assert rows[0]["msg_time"] == 180
 
     async def test_merge_inherits_article_url_from_absorbed_card(self):
-        # 审查回归：被吸收卡的原文链接不得随合并消失（存活卡无链接时继承）
+        # 回归防线：被吸收卡的原文链接不得随合并消失（存活卡无链接时继承）
         await self._seed_cand("c1", 100, title="讲座预告", quote="讲座预告")
         msg = InternalMessage(
             msg_id="m2",

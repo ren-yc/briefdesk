@@ -1,10 +1,17 @@
+// ── 全局形态约定（跨区块共用；各处不再重复解释）──
+// 本文件是同源 classic script：插件前端注入后与它共享同一全局作用域。因此
+// ①对外可复用的助手一律写成顶层 function 声明（会挂 window），不得改成
+//   const 箭头 / ESM / IIFE 包裹——都不挂 window，插件会 ReferenceError；
+// ②接线按区块拆成 bindXxxEvents()，setupEvents 只按序派发。
+// 完整约束与失败模式见 docs/architecture.md 的前端形态小节。
+//
 // ── localStorage 单源 ──
 // 隐私模式/配额耗尽/站点存储被策略禁用时，localStorage 的读写都会抛异常。此前
 // 24 个调用点里只有一半带 try——未包的那些一旦抛出会中断整个事件处理函数，导致
 // 「持久化失败」升级成「功能不响应」：主题芯片不再调 applyTheme()、折叠开关不重
 // 渲染、隐藏已截止开关连按钮态都不更新。故读写一律经此四个助手，异常在此吞掉，
 // 调用点只需处理"取不到值"这一种情况（返回 fallback）。
-// 写成 function 声明（非 const 箭头）以便插件前端复用，见 docs/architecture.md。
+// 写成 function 声明（见文件头的全局形态约定），以便插件前端复用。
 function lsGet(key, fallback = null) {
   try {
     const v = localStorage.getItem(key);
@@ -70,10 +77,10 @@ let searchCats = [];            // 搜索过滤条用的启用类别（含颜色
 let searchGroups = [];          // 搜索过滤条用的完整来源群选项（不受分页截断）
 let searchFilterCat = "";       // 搜索模式下选中的类别过滤（"" = 全部类别）
 let searchFilterRange = "";     // 搜索模式下的时间范围过滤："" | "1d" | "3d" | "7d"
-let searchHistory = [];         // 搜索历史（localStorage briefdesk.searchHistory，最多 10 条）
+let searchHistory = [];         // 搜索历史（localStorage briefdesk.searchHistory，条数上限见 SEARCH_HISTORY_MAX）
 let searchHistIndex = -1;       // 历史下拉中当前高亮项下标（-1 = 无）
 let timeTicker = null;          // 相对时间每分钟刷新定时器
-let manualSyncWait = false;     // 手动点击同步后等待 synced 事件
+let manualSyncWait = false;     // 手动点击同步后等待 items_updated 事件（payload.synced）
 let syncWaitTimer = null;       // 手动同步兜底超时
 let lastUndo = null;            // 最近一次可撤销的卡片操作 { id, prevValue }
 
@@ -111,7 +118,7 @@ const SESSION_TIME_PRESETS = { "6": 6, "12": 12, "24": 24, "48": 48, "72": 72, "
 let enabledSources = []; // 实际启用消息源（/api/status 的 sources keys，决定筛选芯片）
 let catSeq = 0; // 新增类别行的临时 key 计数器
 
-// ── 第一梯队功能状态 ──
+// ── 列表与批量操作状态 ──
 let batchMode = false;          // 批量操作模式
 let selectedIds = new Set();    // 批量模式已选卡片 id
 let hasMore = false;            // /api/items 是否还有下一页
@@ -358,10 +365,7 @@ document.addEventListener("visibilitychange", () => {
 
 // ── Events ──
 // 接线按区块拆成 bindXxxEvents()，setupEvents 只做派发。三条纪律：
-// 1) 必须是顶层 function 声明。app.js 是同源 classic script，插件前端注入后与它
-//    共享同一全局作用域，不能 ESM 化也不能 IIFE 包裹（见 docs/architecture.md）；
-//    嵌套定义等于没拆，而顶层 const 不挂 window，与文件内既有 200+ 个顶层
-//    function 不同口径。
+// 1) 必须是顶层 function 声明（理由见文件头的全局形态约定）：嵌套定义等于没拆。
 // 2) setupEvents 里的调用顺序 = 注册顺序 = 同 target 同事件类型的触发顺序。
 //    document 上有多个 click/keydown（状态面板、引用折叠、「⋯」菜单、Esc、
 //    搜索历史 mousedown），换顺序会改行为，且没有任何 gate 能发现：
@@ -799,13 +803,13 @@ function bindSettingsFormEvents() {
 }
 
 function bindSyncButtonEvents() {
-  // 立即同步：接后端真实状态——409 提示已在同步；成功则等 synced SSE 事件
-  // （或 120s 兜底超时）恢复按钮，不再假装转 2 秒
+  // 立即同步：接后端真实状态——409 提示已在同步；成功则等 items_updated SSE 事件
+  // （payload.synced，或 120s 兜底超时）恢复按钮，不再假装转 2 秒
   $syncBtn.addEventListener("click", async () => {
     if ($syncBtn.disabled) return;
     try {
       // 保留裸 fetch：409（已在同步中）要按状态码分流成 info 提示而非错误，
-      // reqJson 把所有非 2xx 抹平成同一个 Error，拿不回状态码。
+      // reqJson 把所有非 2xx 抹平成同一个 Error，拿不回状态码（约定见 HTTP 单源段）。
       const res = await fetch("/api/sync", { method: "POST" });
       if (res.status === 409) {
         showToast("同步已在后台进行中，无需重复触发", { type: "info", duration: 4000 });
@@ -1131,7 +1135,7 @@ function bindAboutPanelEvents() {
     const fd = new FormData();
     fd.append("file", f);
     try {
-      // 保留裸 fetch：multipart/FormData 上传，reqJson 只走 JSON 序列化
+      // 保留裸 fetch：multipart/FormData 上传，reqJson 只处理 JSON 请求体
       const res = await fetch("/api/restore", { method: "POST", body: fd });
       const data = await res.json().catch(() => ({}));
       if (!res.ok) {
@@ -1536,9 +1540,9 @@ function clearSearch() {
 // 落到同一套动作：清搜索 → 切分类 → 回「未处理」→ 同步导航态/hash → 重拉。
 // 各处的「先关掉自己」（closeGroupOverlay / closeSubjectTimeline / closeCalDetail
 // 等）留在调用点，因为关什么只有调用点知道。
-// 写成 function 声明供插件前端复用：calendar 原先直接改核心的 currentCategory /
-// currentVerified 两个模块级 let，这层耦合没有任何守卫兜底（改名只在用户点到
-// 日历里的类别标签时才炸），改为经此入口。见 docs/architecture.md 的形态约束。
+// 写成 function 声明供插件前端复用（见文件头的全局形态约定）：calendar 原先直接改
+// 核心的 currentCategory / currentVerified 两个模块级 let，这层耦合没有任何守卫
+// 兜底（改名只在用户点到日历里的类别标签时才炸），改为经此入口。
 function gotoCategory(cat) {
   if (!cat) return;
   clearSearch();
@@ -3023,7 +3027,7 @@ function popModalFocus(modal) {
   _syncInertBackground();
   const t = entry.trigger;
   if (t && document.contains(t) && typeof t.focus === "function") {
-    // 背景刚解除 inert，同步 focus 可能被忽略，推到下一帧
+    // 背景刚解除 inert，同步 focus 可能被忽略，推到下一个宏任务再聚焦
     setTimeout(() => { if (document.contains(t)) t.focus(); }, 0);
   }
 }
@@ -3487,11 +3491,11 @@ const _STATUS_ICONS = {
 };
 const _STATUS_LABELS = { online: "在线", reconnecting: "重连中", offline: "离线" };
 
-// 各消息源在线状态 → { overall, partsHtml }（指示器圆点颜色与文字共用）
+// 各消息源在线状态 → { overall, parts }（指示器圆点颜色与文字共用；parts 是文案数组）
 function _statusParts(status) {
   const sources = Object.entries(status.sources || {});
   if (!sources.length) {
-    // 零源降级启动（决策 ①=1B）：明示采集不可用，替代含混的「未连接」
+    // 零源降级启动：明示采集不可用，替代含混的「未连接」
     return { overall: "offline", parts: ["无消息源（检查插件配置，降级运行）"] };
   }
   const states = sources.map(([, s]) => s.status || "offline");
@@ -4275,9 +4279,9 @@ function collectAllOps() {
 }
 
 // ── HTTP 单源：全部 JSON 接口调用只走这一层 ──
-// 此前 30+ 个站点各自手抄 fetch + res.ok 判断，错误形状分裂成 6 种
-// （`HTTP ${status}` / "HTTP " + status / 静默 return / 置 null / 只 console /
-// 什么都不查），同一个 500 在不同入口表现不同，排障时无从对齐。现在错误形状
+// 此前各调用点手抄 fetch + res.ok 判断，错误形状各自为政（状态码格式不一、
+// 有的静默返回 null、有的只 console 不抛），同一个 500 在不同入口表现不同，
+// 排障时无从对齐。现在错误形状
 // 只有一种：非 2xx 抛 `HTTP <code>`。「失败静默降级」的调用点写
 // `.catch(() => null)`——把降级意图摊在调用点上，而非藏进各自的 res.ok 分支。
 async function reqJson(url, { method = "GET", body } = {}) {
@@ -4297,9 +4301,8 @@ async function reqJson(url, { method = "GET", body } = {}) {
   return res.json();
 }
 
-// 以下薄封装刻意用 function 声明而非 const 箭头：插件前端以同源 classic script
-// 注入、共享全局作用域，function 声明会挂到 window 上（const 不会），插件既可
-// 裸名调用也可 window.postJson 取用。收敛内部实现不该顺手收窄这层对外契约。
+// 以下薄封装刻意用 function 声明而非 const 箭头（见文件头的全局形态约定）：
+// 插件以裸名或 window.postJson 取用，收敛内部实现不该顺手收窄这层对外契约。
 function getJson(url) {
   return reqJson(url);
 }
@@ -5407,7 +5410,9 @@ async function loadPluginFrontends() {
   // 由本加载器统一装配。核心不写死任何插件功能入口。
   // 1) 读取 /api/plugins 元数据，取已加载（loaded）插件名单；
   // 2) 声明式入口：index.html 中带 [data-plugin-entry="<name>"] 的元素默认隐藏，
-  //    显隐由对应插件 ui.js 决定；
+  //    显隐由对应插件 ui.js 决定。**当前仓库内零实例**（index.html 与内置插件的
+  //    ui.js 都自己注入 DOM，不用静态入口），选择器因此恒空转——它是给「插件要往
+  //    核心页面放静态入口」预留的约定，不是现有插件的装配路径。
   // 3) 只对声明了前端资源的插件（has_frontend=true）注入
   //    /plugin-assets/<name>/ui.css（样式）与 ui.js（脚本）——无前端资源的
   //    插件（如 weflow-legacy/ai_provider）不请求，避免 404 触发浏览器严格 MIME
@@ -5420,7 +5425,7 @@ async function loadPluginFrontends() {
     .filter(p => p.status === "loaded");
   const loaded = new Set(loadedPlugins.map(p => p.name));
 
-  // 声明式入口默认隐藏：未加载插件的入口不显示
+  // 声明式入口默认隐藏：未加载插件的入口不显示（当前无元素命中，见上方步骤 2）
   document.querySelectorAll("[data-plugin-entry]").forEach(el => el.classList.add("hidden"));
 
   for (const p of loadedPlugins) {
@@ -5757,8 +5762,8 @@ const blockList = createKeywordList({
   addedToast: "黑名单已添加，命中卡片将隐藏",
 });
 
-// 以下四个保持 function 声明：渲染路径（renderCard/renderItemRow）与查询构造大量调用，
-// 且顶层 function 才挂 window，供插件前端复用（见 docs/architecture.md 的形态约束）
+// 以下五个保持 function 声明（见文件头的全局形态约定）：渲染路径（renderCard/renderItemRow）
+// 与查询构造大量调用，且需要对插件前端可见。
 function enabledSubKeywords() { return subsList.enabledKeywords(); }
 function isSubscribed(item) { return subsList.matches(item); }
 function isBlocked(item) { return blockList.matches(item); }
@@ -5779,7 +5784,7 @@ function updateSubsBadge() {
 }
 
 // ── 数据导出下载（Content-Disposition 文件名）──
-// 保留裸 fetch：要读响应头取文件名 + 取 blob，reqJson 只返回解析后的 JSON
+// 保留裸 fetch：要读响应头取文件名 + 取 blob（reqJson 只见 JSON 体，约定见 HTTP 单源段）
 async function downloadExport(url) {
   try {
     const res = await fetch(url);

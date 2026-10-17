@@ -39,8 +39,8 @@ async def upsert_sessions_from_infos(sessions: list[SessionInfo]) -> None:
     """会话信息批量落库（main 实时刷新与 poll_cycle 轮询两条路径共用）。
 
     批量单事务写入（bulk_upsert_sessions），整批一次 commit——调用方须持
-    db.storage_lock：会话写与全应用写路径串行化，锁内逐行 commit 会把
-    管道未完成的多步写一并提交（部分写入提前可见），并拉长存储锁窗口。
+    db.storage_lock（不变量见该锁的权威论证）：整批提交而非逐行提交，
+    持锁窗口最短。
     """
     await bulk_upsert_sessions(
         [
@@ -93,10 +93,9 @@ async def run_poll_cycle(source: SourceRuntime) -> None:
             lambda ids: are_messages_processed(source.name, ids),
             window_start_by_session=windows,
         )
-        # 源只产出数据，写库统一在此完成（顺序与重构前一致：contacts 先、
-        # sessions 后）。contacts/sessions 批量 upsert 与全应用写路径共用
-        # 存储锁串行化：单连接隐式事务下锁外 commit 会把管道未完成的多步写
-        # 提前提交（部分写入提前可见），见 db.storage_lock。
+        # 源只产出数据，写库统一在此完成（contacts 先、sessions 后）。
+        # contacts/sessions 批量 upsert 与全应用写路径共用 storage_lock 串行化
+        # （不变量见 db.storage_lock 的权威论证）。
         async with storage_lock:
             await bulk_upsert_contacts(
                 [(c.source, c.sender_id, c.display_name) for c in result.contacts]

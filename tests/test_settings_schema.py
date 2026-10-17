@@ -137,7 +137,7 @@ class SettingsSchemaTest(unittest.TestCase):
             normalize_setting(by_key["PLAIN_GREETING"], "hello # comment")
 
     def test_text_value_rejects_newlines_and_inline_comment(self) -> None:
-        # 审查回归：text 型暂存值含 CR/LF 时会向暂存文件注入任意 KEY=VALUE 行
+        # 回归防线：text 型暂存值含 CR/LF 时会向暂存文件注入任意 KEY=VALUE 行
         # （绕过键白名单与「密钥只走 keyring」分层）；「 #」是 dotenv 行内
         # 注释起点，回读被截断，一并拒绝
         meta = {"type": "text"}

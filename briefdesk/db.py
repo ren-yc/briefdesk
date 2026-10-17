@@ -28,14 +28,24 @@ _embed_db: aiosqlite.Connection | None = None
 # 该标志无需复位通道。
 _db_closed = False
 _lock = asyncio.Lock()
-# 向量专用连接的语句级互斥：load/upsert 在同一连接上串行执行，
-# 避免读游标活动期间另一协程 COMMIT 触发 "statements in progress"。
+# 向量专用连接的语句级互斥（动机与边界见 get_embed_db 的 docstring）：
 _embed_lock = asyncio.Lock()
 
-# pipeline 入库与 server 删除共用的存储锁。
-# server 删除必须在「DB 删除 → 去重缓存移除」之间持有此锁，
-# 否则 pipeline 的 check_dedup 可能命中已删除条目，把相似新消息
-# 判重后标记 processed，造成该消息在本回填窗口内永久丢失。
+# pipeline 入库与 server 删除共用的存储锁。本节是「为什么要跨模块持这把锁」的
+# 单点权威论证——其余调用点（main / pipeline / poll_cycle / routes_items 等）
+# 只写一行指针指回来，各自扩写会在下一次改动时漂移成互相矛盾的口径。
+# 两个失败模式：
+# 1) 删除侧不持锁：server 删除必须在「DB 删除 → 去重缓存移除」之间持有此锁，
+#    否则 pipeline 的 check_dedup 可能命中已删除条目，把相似新消息判重后标记
+#    processed，造成该消息在本回填窗口内永久丢失。
+# 2) 写入侧在锁外 commit：共享单连接 + 隐式事务下，任一协程的 commit 会连同
+#    别的协程**当前持锁段里尚未提交**的写一并提交（如 dedup 刚 insert、同段的
+#    post_insert 合并还没跑），部分写入提前可见——后续判重与合并都撞见半截状态。
+#    故约定：**进入并发阶段后**，共享连接上的 commit 必须发生在持有
+#    storage_lock 期间。启动期是例外——建库与过期清理（purge_expired_ignored）
+#    等单线程初始化不持锁，那时 pipeline 与实时路径都还没跑，不存在可被连带
+#    提交的他人多步写；一旦管道开始跑，就不再有这个例外。atomic_transaction
+#    只负责「成功提交/失败回滚」的原子性，不提供互斥，锁外用它同样击穿本不变量。
 #
 # 加锁顺序恒为 storage_lock → _embed_lock（dedup 向量落库、rag GC 均按此序）；
 # 禁止反向嵌套——两把锁跨连接，反向会与既有持锁路径形成环（死锁）。
@@ -234,7 +244,7 @@ class ItemInput(TypedDict):
 
 
 class ItemRow(ItemInput):
-    """Row from the `items` table — ItemInput 加 DB 生成的 id/created_at/
+    """`items` 表的一行 —— ItemInput 加上 DB 生成的 id/created_at/
     verified_at，另加仅查询行携带的 remind_at。"""
 
     id: str
@@ -244,7 +254,7 @@ class ItemRow(ItemInput):
 
 
 class ReminderRow(TypedDict):
-    """Row from `get_due_reminders` — 到期提醒所需最小字段。"""
+    """`get_due_reminders` 返回的一行 —— 到期提醒所需最小字段。"""
 
     id: str
     title: str
@@ -253,7 +263,7 @@ class ReminderRow(TypedDict):
 
 
 class SessionRow(TypedDict):
-    """Row from the `sessions` table."""
+    """`sessions` 表的一行。"""
 
     source: str
     session_id: str
@@ -267,7 +277,7 @@ class SessionRow(TypedDict):
 
 
 class CategoryCount(TypedDict):
-    """Row from `get_category_counts`."""
+    """`get_category_counts` 返回的一行（类别 + 计数）。"""
 
     key: str
     count: int
@@ -275,7 +285,7 @@ class CategoryCount(TypedDict):
 
 
 class CategoryRow(TypedDict):
-    """Row from the `categories` table."""
+    """`categories` 表的一行。"""
 
     id: int
     name: str
@@ -286,20 +296,20 @@ class CategoryRow(TypedDict):
 
 
 class CategoryDetail(CategoryRow):
-    """CategoryRow 加该类别下 items 卡片数（删除确认框显示用）。"""
+    """CategoryRow 加上该类别下的 items 卡片数（删除确认框显示用）。"""
 
     item_count: int
 
 
 class CategoryColor(TypedDict):
-    """Row from `get_enabled_category_colors` — 启用类别的名称与颜色。"""
+    """`get_enabled_category_colors` 返回的一行 —— 启用类别的名称与颜色。"""
 
     name: str
     color: str
 
 
 class RawMsgInput(TypedDict):
-    """Payload for `bulk_insert_raw_messages`."""
+    """`bulk_insert_raw_messages` 的入参形状。"""
 
     source: str
     msg_id: str
@@ -313,7 +323,7 @@ class RawMsgInput(TypedDict):
 
 
 class ItemText(TypedDict):
-    """Row from `get_all_item_texts`."""
+    """`get_all_item_texts` 返回的一行（id + 原文相关字段）。"""
 
     id: str
     source: str
@@ -324,7 +334,7 @@ class ItemText(TypedDict):
 
 
 class ItemsPage(TypedDict):
-    """A page of cards plus counts for the exact same filter set."""
+    """同一过滤条件下一页卡片 + 整份列表计数。"""
 
     items: list[ItemRow]
     total_count: int
@@ -341,7 +351,7 @@ _ITEM_TIME_RE = re.compile(
 
 
 def _parse_item_time(value: object) -> tuple[datetime, bool] | None:
-    """Parse stored local card time and report whether it is date-only."""
+    """解析库里存的卡片本地时间，并报告它是否只有日期。"""
     if not isinstance(value, str):
         return None
     value = value.strip()
@@ -371,10 +381,10 @@ def _stored_time_expired(value: object, now: datetime) -> bool:
 def item_is_expired(
     start: object, end: object, extra_times: object, now_local: object
 ) -> bool:
-    """Match the card-level expiry semantics used by the frontend.
+    """与前端一致的卡片级截止语义。
 
-    A card expires only when its primary end time is past and no main/extra
-    time point remains upcoming. Date-only deadlines stay active all day.
+    只有「主结束时间已过 且 再无主/附加时间点在未来」才算过期；只有日期的
+    截止当天全天有效。
     """
     if not isinstance(now_local, str):
         return False
@@ -509,7 +519,7 @@ async def get_db() -> aiosqlite.Connection:
 
 
 def get_embed_lock() -> asyncio.Lock:
-    """向量专用连接的语句级互斥锁（插件共享该连接约定时使用，如 rag）。"""
+    """向量专用连接的语句级互斥锁（插件共享该连接约定时使用，如 rag；动机见 get_embed_db）。"""
 
     return _embed_lock
 
@@ -517,12 +527,20 @@ def get_embed_lock() -> asyncio.Lock:
 async def get_embed_db() -> aiosqlite.Connection:
     """向量持久化专用连接（与主连接隔离，WAL + busy_timeout）。
 
-    动机：SQLite 的"活动语句"检查是 per-connection 的——主连接上并发读取
-    （pipeline 的 async-for 游标）可能让 COMMIT 报 "cannot commit
-    transaction - SQL statements in progress"。向量读写走独立连接后，
-    主连接的并发读不再影响落库；写写竞争由 WAL + busy_timeout 兜底。
+    **本节是「为什么向量读写要另开连接、再挂一把锁」的单点权威论证**，其余
+    调用点只写一行指针。
+
+    为什么另开连接：SQLite 的"活动语句"检查是 per-connection 的——主连接上
+    并发读取（pipeline 的 async-for 游标）可能让 COMMIT 报 "cannot commit
+    transaction - SQL statements in progress"。向量读写走独立连接后，主连接的
+    并发读不再影响落库；写写竞争由 WAL + busy_timeout 兜底。
+
+    为什么还要 _embed_lock：独立连接只隔离了「主连接 vs 向量连接」，向量连接
+    自身仍会被多个协程共享（dedup 向量落库、rag 回填/GC 都在用），同一连接上
+    的 load/upsert 游标与 commit 交错会重演同一类 OperationalError。锁只罩住
+    短临界区，不含任何网络等待——远程嵌入请求必须在锁外完成。
+
     表结构用 init_schema 幂等补建（同文件，正常启动时主连接已建好）。
-    语句级互斥由 _embed_lock 保证（load/upsert 短临界区，不含网络等待）。
     """
     global _embed_db
     if _db_closed:
@@ -1109,7 +1127,9 @@ async def insert_item(item: ItemInput) -> str:
     await db.commit()
     if row is not None:
         return str(row["id"])
-    # 冲突路径：返回已存在的真实行 id（与幽灵 id 语义一致但指向真实数据）
+    # 冲突路径：返回冲突行的**真实 id**——这正是为了避免把未插入的新 uuid
+    # 当「幽灵 id」交给去重缓存/合并阶段（见上方 insert_item 的说明）；只有
+    # 冲突却查不到行（理论不可达）才落到末尾兜底。
     row2 = await _fetchone(
         db,
         "SELECT id FROM items WHERE source = ? AND source_msg_id = ?",
@@ -1274,7 +1294,7 @@ async def get_items_page(
     hide_expired: bool = False,
     now_local: str | None = None,
 ) -> ItemsPage:
-    """Return one stable page and full-list counts under identical filters."""
+    """在相同过滤条件下返回一页稳定结果与整份列表计数。"""
     db = await get_db()
     where, params = _items_where(
         category,
@@ -2263,8 +2283,9 @@ async def bulk_insert_raw_messages(messages: list[RawMsgInput]) -> None:
 
 _OCR_MARKER_LINE_RE = re.compile(r"^\[(?:OCR|图片 \d+ OCR 结果)\]$")
 
-# weflow-legacy 图片 raw 占位符为 [图片]，qqflow 为 [image]；两者都在上下文里
-# 回填 items.source_quote 的 OCR 正文，保持一致的展示行为。
+# 图片 raw 占位符：weflow 与 weflow-legacy 为 [图片]；qqflow 的图片占位符常量是
+# [image]（其附件判定另接受任意单段方括号，故 [图片] 也可能出现）。三源都在
+# 上下文里回填 items.source_quote 的 OCR 正文，保持一致的展示行为。
 _IMAGE_PLACEHOLDER_RE = re.compile(r"^\[(?:图片|image)\]$")
 
 
@@ -2444,8 +2465,8 @@ async def get_existing_item_ids(item_ids: list[str]) -> set[str]:
 async def load_embeddings(model: str) -> dict[str, list[float]]:
     """读取指定模型的全部已存向量，返回 {item_id: embedding}。
 
-    走向量专用连接（_embed_lock 串行）：不占用主连接，也不与
-    向量写入交错产生活动语句。
+    走向量专用连接并用 _embed_lock 串行（连接与锁的动机见 get_embed_db）：
+    不占用主连接，也不与向量写入交错产生活动语句。
     """
     db = await get_embed_db()
     async with _embed_lock:
@@ -2462,9 +2483,8 @@ async def load_embeddings(model: str) -> dict[str, list[float]]:
 async def upsert_embeddings(rows: list[tuple[str, str, list[float]]]) -> None:
     """批量写入向量（INSERT OR REPLACE，按 item_id 覆盖旧模型的向量）。
 
-    独立 embed 连接 + _embed_lock 串行 + 游标先 close 再 commit：
-    杜绝"活动语句未终结就 COMMIT"导致的 OperationalError
-    （cannot commit transaction - SQL statements in progress）。
+    独立 embed 连接 + _embed_lock（动机见 get_embed_db）+ 游标先 close 再
+    commit：杜绝"活动语句未终结就 COMMIT"导致的 OperationalError。
     跨连接写锁竞争（database is locked）按线性退避重试（0.1s 逐次递增，
     最多 3 次）。
     """

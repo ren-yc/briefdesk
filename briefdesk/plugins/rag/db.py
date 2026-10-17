@@ -1,4 +1,4 @@
-"""RAG 库层 — rag_chunks / rag_chunk_embeddings / rag_fts / rag_skipped 四表数据访问。
+"""RAG 库层 — rag_chunks / rag_chunk_embeddings / rag_fts / rag_meta / rag_skipped 五表数据访问。
 
 rag 表是 raw_messages 的派生索引：插件自管建表（不在核心 EXPECTED_SCHEMA
 内，validate_schema 取交集校验不受影响），不复制事实源语义，可随时重建。
@@ -88,7 +88,7 @@ _SCHEMA = [
     )""",
     # 「永不入索引」记账（纯占位符内容）：这些行永远满足回填反连接
     # （rag_chunks 无对应行）却永远不被消费，不记账会让它们每轮重新
-    # 占满 LIMIT 预算窗口，令更早的真实消息饿死（审查回归）。
+    # 占满 LIMIT 预算窗口，令更早的真实消息饿死。
     # raw_messages 内容不可变，跳过判定跨模型/重建恒成立，无需失效机制。
     """CREATE TABLE IF NOT EXISTS rag_skipped (
         source     TEXT NOT NULL,
@@ -99,7 +99,7 @@ _SCHEMA = [
 
 
 async def ensure_rag_schema(db: aiosqlite.Connection) -> None:
-    """创建 rag 四张基础表（chunks/embeddings/meta/skipped 幂等；FTS 表由 ensure_fts 惰性创建）。"""
+    """创建 rag 五表中的四张普通表（chunks/embeddings/meta/skipped 幂等；FTS 虚拟表由 ensure_fts 惰性创建）。"""
 
     for ddl in _SCHEMA:
         await db.execute(ddl)
@@ -453,7 +453,7 @@ async def gc_orphans(
     get_embed_db 隔离约定一致；跨连接子查询读的是同库已提交快照，安全）。
     rag_skipped 一并对账（其宿主 raw 行消失后登记失去意义）。
     返回清理的总行数：先 COUNT 后 DELETE 显式计数——total_changes 差值
-    会把共享连接上其它协程的无关写入一并计入，显著夸大返回值（审查回归）。
+    会把共享连接上其它协程的无关写入一并计入，显著夸大返回值。
     """
 
     removed = 0

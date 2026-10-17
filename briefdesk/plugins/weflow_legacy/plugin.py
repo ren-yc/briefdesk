@@ -5,7 +5,7 @@ activate 无副作用（监听启动由应用层在服务器就绪后统一编�
 teardown 关闭 runtime（幂等）。
 
 本插件为旧版 WeFlow 消息源，改名腾出 `weflow` 标识给未来新源。必填
-配置校验与 weflow/qqflow 统一（决策 ①=1B：零源降级启动后自禁用不再有
+配置校验与 weflow/qqflow 统一（零源降级启动后自禁用不再有
 「唯一源中止启动」的顾虑，.env.example 亦标注 WEFLOW_LEGACY_API_TOKEN
 必填）：缺失在装配期抛 PluginDisabledError 明示，配置后重启生效。
 """
@@ -71,7 +71,7 @@ class WeFlowLegacyPlugin(SourcePlugin):
 
         settings = wfl_config.WeFlowLegacySettings()
         self._settings = settings
-        # 必填校验与 weflow/qqflow 统一（决策 ①=1B：零源降级启动后，自禁用
+        # 必填校验与 weflow/qqflow 统一（零源降级启动后，自禁用
         # 不再引发「唯一源中止启动」；.env.example 标注本项必填）
         validate_required_config(settings, {
             'api_token': 'WEFLOW_LEGACY_API_TOKEN',

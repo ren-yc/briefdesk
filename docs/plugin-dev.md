@@ -75,16 +75,21 @@ StagePlugin 参与消息处理管道。管道骨架 `briefdesk/pipeline.py` 按�
 
 | 槽位 | 调用时机 | 锁纪律 | 失败/早退语义 |
 |------|----------|--------|----------------|
-| `enrich` | 入口过滤后、分类前（OCR 等输入增强）；`before_run` 锁外、`run` 锁内 | `before_run` 锁外（网络调用只允许在这里）；`run` 锁内 | 可选插件缺失/禁用时 enrich 槽为空：纯占位符图片消息被入口过滤，混合消息降级纯文本；置位 `vision_without_ocr` 公告 |
-| `classify` | enrich 之后；对每批消息调 AI 并把 `ClassifyOutcome` 写入 `batch.outcomes` | `run` 锁内（严禁网络调用——预计算放 `before_run`） | 引擎抛错 → 整批进 `failed` 保留待回填；`outcomes` 缺失按契约违约整批保留 |
-| `dedup` | classify 之后；判重/入库/缓存 | `run` 锁内；`after_run` 向量落库内部持 `storage_lock`（含写锁重试退避，见 `engine.flush_pending_embeddings` 的锁内代价说明） | 判重失败的消息保留待回填；`processed` 标记只给确定终态的行 |
-| `post_insert` | 入库后的派生处理（合并、rag 索引） | `run` 锁内 | 单阶段异常只记日志，不回滚已入库卡片 |
+| `enrich` | 入口过滤后、分类前（OCR 等输入增强）；管道对每批在**锁外**直接调 `run` | **前段相：`run` 在 storage_lock 外**——取图字节等网络调用就是这里的正常工作；管道**不探测**本槽位的 `before_run`/`after_run`，写了不会执行 | 可选插件缺失/禁用时 enrich 槽为空：纯占位符图片消息被入口过滤，混合消息降级纯文本；置位 `vision_without_ocr` 公告 |
+| `classify` | enrich 之后；对每批消息调 AI 并把 `ClassifyOutcome` 写入 `batch.outcomes` | **前段相：`run` 锁外**——AI 请求即本阶段的核心工作；同样不探测 `before_run`/`after_run` | 引擎抛错 → 整批进 `failed` 保留待回填；`outcomes` 缺失按契约违约整批保留 |
+| `dedup` | classify 之后；判重/入库/缓存 | **存储相：`run` 在 storage_lock 内**；`before_run` 由管道在**锁外**调用（行规划/批内预嵌入等重活放这里）；`after_run` 批尾锁外执行，向量落库内部自持 `storage_lock`（含写锁重试退避，见 `engine.flush_pending_embeddings` 的锁内代价说明） | 判重失败的消息保留待回填；`processed` 标记只给确定终态的行 |
+| `post_insert` | 入库后的派生处理（合并、rag 索引） | **存储相：`run` 锁内**；`before_run`/`after_run` 与 dedup 同口径（锁外预计算、批尾锁外收尾） | 单阶段异常只记日志，不回滚已入库卡片 |
 
 通用规则：
 
-- **锁纪律**：`run` 在全局 `storage_lock`（`briefdesk.db`）内执行——单连接 + 隐式事务下，
-  锁外 commit 会把管道未完成的多步写一并提交。**任何远程/网络调用必须在 `before_run`
-  （锁外）完成**，`run` 内只有本地 SQLite。
+- **锁纪律**：管道分两套相位。**前段相**（enrich/classify 的 `run`）在
+  `storage_lock` 外执行，网络调用是这两个槽位的正常工作；**存储相**
+  （dedup/post_insert 的 `run` 与入口 raw 落库）在 `storage_lock` 内执行——
+  单连接 + 隐式事务下，锁外的 commit 会把锁内未完成的多步写提前提交。
+  存储相插件的网络调用与重活放 `before_run`（仅 dedup/post_insert 两个槽位
+  被管道探测）。锁内唯一允许的网络调用是判官类 chat（dedup 判票/strong、
+  merge 判官/标题）：判定与入库有批内顺序依赖（先行消息入库后后续判定要能
+  看到），不能移出锁；以 `_JUDGE_TIMEOUT`（45s）单请求超时约束最坏持锁时间。
 - **早退语义**：`process_all_batches` 在「无启用类别 / classify 或 dedup 阶段缺失 / 分类全失败」
   时返回 False——整批不标记 processed，回填窗口内自动重试；阶段插件不得自行标记
   processed 之外的行。
@@ -180,7 +185,11 @@ def _on_items_deleted(self, item_ids: list[str]) -> None:
 - **配置类**：继承 `briefdesk.settings_base.KeyringSettingsBase`（pydantic-settings），
   用 `model_config` 设 `env_prefix`；字段注释写清对应环境变量与默认值。
 - **密钥字段**：`SecretStr` 类型 + 类级 `KEYRING_FIELDS` 映射（字段名 → 环境变量名）。
-  解析链：**系统密钥环（keyring）→ 环境变量 → .env → 默认值**；`repr`/序列化自动掩码。
+  解析链：**init 参数 > 系统密钥环（keyring）> 环境变量 > 项目 .env > 用户暂存文件
+  （UI「设置」写入的 settings.env）> 默认值**；`repr`/序列化自动掩码。完整口径见
+  `briefdesk/settings_base.py` 的 `KeyringSettingsBase` docstring 与
+  `briefdesk/secrets_store.py` 的模块说明——漏掉「用户暂存文件」这层会让读者误以为
+  设置页保存的密钥不参与解析。
 - **密钥写入**：`briefdesk secrets set <NAME>`（CLI）或 UI「设置 → 启动配置」面板底部的
   「密钥（系统钥匙串）」区；
   **禁止把真实密钥写进 .env 之外的任何仓库文件、日志或示例**。
@@ -190,7 +199,9 @@ def _on_items_deleted(self, item_ids: list[str]) -> None:
   经可选的 `settings_instance()` 钩子取运行实例并登记来源快照，设置页展示的 `current`/`source`
   才是「本进程正在用的值」；不实现这两个钩子的旧插件仍可用，只是字段不带运行快照
   （框架按 `running=False` 展示「无运行值」）。字段类型/默认值/约束/密钥状态由框架统一生成，
-  密钥不回传明文。
+  密钥不回传明文。**文案参数按字段名传**：`labels` / `hints` / `warnings` / `apply_when`
+  的键是**字段名**（如 `top_k`），只有 `options` 按**环境键名**（如 `LOG_LEVEL`）——按环境
+  键名建前四张字典会恒落空且不报错（字段照常渲染，只是没有你的中文文案）。
 
   **运行期才采用配置的插件**（采用时点晚于 setup，如 benchmark 的三个运行参数）应改声明两个可选钩子，
   而不是 `settings_instance()`：

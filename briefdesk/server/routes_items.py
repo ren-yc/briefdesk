@@ -1,5 +1,5 @@
 """核心数据路由（server 子包）：items / verify / sessions / sync / context /
-status / stream 等。从原 server.py 拆出，导入即注册路由。
+status / stream 等。导入即注册路由。
 """
 
 import asyncio
@@ -451,16 +451,17 @@ async def _resync_dedup_cache(ids: list[str], verified: int) -> None:
 @app.post("/api/items/{item_id}/verify")
 async def api_verify(item_id: str, body: dict):
     verified = body.get("verified")
-    # 严格类型判定（对齐 routes_categories._parse_flag）：JSON 布尔 true 在
-    # Python 里 == 1，宽松的 in 判定会把 true 按 1 吸收落库
+    # 严格类型判定（与 routes_categories._parse_flag 同一精神：拒绝宽松 in 判定）：
+    # JSON 布尔 true 在 Python 里 == 1，`in (0,1,-1)` 会把 true 按 1 吸收落库。
+    # 与 _parse_flag 的差异是刻意的：那边是二态开关、bool 合法被归一为 0/1；这里
+    # verified 是 0/1/-1 三态，bool 表达不了 -1（撤销核实），必须拒绝而不是映射。
     if (
         not isinstance(verified, int)
         or isinstance(verified, bool)
         or verified not in (0, 1, -1)
     ):
         raise HTTPException(400, "verified must be 0, 1, or -1")
-    # 与 pipeline 共用存储锁：单连接隐式事务下，锁外 commit 会把管道
-    # 未完成的多步写一并提交（部分写入提前可见）
+    # 与 pipeline 共用存储锁（不变量见 db.storage_lock 的权威论证）
     async with storage_lock:
         if not await update_item_verify(item_id, verified):
             raise HTTPException(404, "Item not found")
@@ -492,8 +493,7 @@ async def api_recategorize(item_id: str, body: dict):
     if not await category_exists(category):
         raise HTTPException(400, f"未知或未启用的类别: {category}")
     # 与 pipeline 共用存储锁：update_item_category 是读-改-写多步事务
-    # （UPDATE items + INSERT recat_log），锁外 commit 会把管道未完成的
-    # 多步写一并提交（部分写入提前可见）——与 api_verify 同理由
+    # （UPDATE items + INSERT recat_log），不变量见 db.storage_lock 的权威论证
     async with storage_lock:
         row = await update_item_category(item_id, category)
     if row is None:
@@ -554,8 +554,8 @@ async def api_sessions():
 
 @app.post("/api/sessions/{source}/{session_id}/toggle")
 async def api_toggle_session(source: str, session_id: str):
-    # 与 pipeline 共用存储锁：toggle 是「翻转 enabled → 清水位」两步写，
-    # 单连接隐式事务下锁外 commit 可能被并发写交叉提交
+    # 与 pipeline 共用存储锁：toggle 是「翻转 enabled → 清水位」两步写
+    # （不变量见 db.storage_lock 的权威论证）
     async with storage_lock:
         updated = await toggle_session(source, session_id)
     if updated is None:
@@ -584,9 +584,11 @@ async def api_refresh_sessions():
     }
 
 
-# API 触发的同步任务句柄（覆盖写即可：trigger_sync 内部已防并发重复）。
-# 官方文档要求对 create_task 结果保存引用，否则任务执行中可能被 GC；
-# 同时为关闭路径保留显式句柄（_cancel_pending_tasks 兜底之外的正通道）。
+# API 触发的同步任务句柄。**唯一用途是保引用防 GC**：asyncio 事件循环只持有
+# task 的弱引用，fire-and-forget 的任务若不在这里留一个强引用，可能在执行中被
+# 回收（官方 create_task 文档明示）。关闭路径不读它——进程关停由
+# main 的 _cancel_pending_tasks 统一兜底，本句柄不是取消通道（覆盖写即可，
+# trigger_sync 内部已防并发重复）。
 _last_sync_task: asyncio.Task[None] | None = None
 
 

@@ -79,8 +79,10 @@ async def ocr_image_bytes(content: bytes) -> str:
         logger.debug("图片无文字，返回空结果 (%d bytes)", len(content))
         return ""
     except Exception as e:
-        # 仅 DEBUG：唯一调用方（ocr 插件 enrich）按"跳过 OCR、卡片仍以原文入库"
-        # 记 WARNING。此处再打 ERROR 既重复又抬高了严重度——OCR 失败不阻断管道。
+        # 仅 DEBUG：调用方 ocr_images_bytes 已逐图捕获（该图跳过、继续同消息
+        # 其余图片），整批全失败也只返回空串、不冒泡——ocr 插件那侧的 WARNING
+        # 兜的是批量入口自身的非预期异常，不是单图失败。此处再打 ERROR 既重复
+        # 又抬高了严重度——OCR 失败不阻断管道。
         logger.debug("OCR 识别失败 (%d bytes): %s", len(content), e)
         raise
 

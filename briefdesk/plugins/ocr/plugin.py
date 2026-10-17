@@ -1,4 +1,8 @@
-"""OCR 增强阶段插件（slot=enrich）— 图片文字识别后以 [OCR] 前缀替换 content。
+"""OCR 增强阶段插件（slot=enrich）— 图片文字识别后把文本并入 content。
+
+两种形态（判定与改写都在 `OcrPlugin.run`，按 PLACEHOLDER_ONLY_RE 分流）：纯占位符
+消息整体替换为 `[OCR]\\n<正文>`；图+文混合消息保留人工原文，OCR 文本作为附加段
+追加——混合消息里用户写的字信息密度更高，替换掉会丢分类/去重的完整上下文。
 
 图片下载归消息源客户端（SourceClient.download_media），本插件只做
 下载 → 识别 → 脱敏 → 替换。单条失败（MediaError / 识别异常）只跳过

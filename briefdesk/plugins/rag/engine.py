@@ -7,7 +7,7 @@
 
 作用域语义（隐私边界，见 architecture.md）：启用会话恒为前提；
 RAG_GROUP_ONLY（默认开）进一步限定群聊——停用会话即时不可问出。
-rag 四表（chunks/embeddings/fts/skipped）是 raw_messages 的派生索引；向量表
+rag 五表（chunks/embeddings/fts/meta/skipped）是 raw_messages 的派生索引；向量表
 走专用连接（get_embed_db 同款隔离约定），脏行删除不与主连接上的管道事务
 互相提交；共享连接上的写统一持 db.get_embed_lock()/pipeline 存储锁。
 """
@@ -321,8 +321,8 @@ class RagEngine:
         0 关闭，-1 全量。last_cycle_embed_failed 供维护循环做失败退避。
 
         写路径持 pipeline 存储锁（本方法运行于维护循环、不在锁内）：
-        chunks/FTS/skipped 落主连接，锁外 commit 会把管道未完成的多步写
-        提前提交——与 db.py 事务纪律一致；嵌入（网络）在锁外。
+        chunks/FTS/skipped 落主连接，不变量见 db.storage_lock 的权威论证；
+        嵌入（网络）在锁外。
         """
 
         self.last_cycle_embed_failed = False
@@ -334,7 +334,7 @@ class RagEngine:
         # 作用域谓词与检索侧共用单源（这里过滤 raw_messages，别名 r）；
         # NOT EXISTS 排除已登记 skipped 的「永不入索引」行——占位符消息永远
         # 满足反连接却永远不被消费，不排除会每轮占满预算窗口，令更早的
-        # 真实消息饿死（审查回归）
+        # 真实消息饿死
         scope, scope_params = scope_sql(self.settings.group_only, alias="r")
         # 内容以既有 chunk 优先：raw_messages 在管道入口（OCR 之前）落库，而实时
         # 索引写入的是 OCR 增强后的文本；换嵌入模型回填时若用原文覆盖，会把 OCR
@@ -452,9 +452,9 @@ class RagEngine:
         缓存内本次未 fetch 到的条目——否则「删除信号」被归零计数吞掉，
         已删内容持续可被检索。
 
-        force_full 的水位归零已下移到 _refresh_vector_cache 内、窗口守卫之后：
-        归零会让「行数回退 → 整表重建」的删除检测恒为假，窗口内归零会使窗口
-        结束后被删除的内容最长一个维护周期（默认 3600s）内仍可被问答引用。
+        水位归零发生在 _refresh_vector_cache 内、行数回退守卫之前：force_full
+        轮次守卫恒不触发（count_seen 已归零），删除检测完全由 fetch 后的 key
+        差集剔除承担——该剔除位于 raw_rows 判空之前，全表删光也收敛。
         """
 
         async with self._refresh_lock:
@@ -527,7 +527,7 @@ class RagEngine:
                 self._rebuild_matrix()
             return
         entries, bad_keys = await asyncio.to_thread(parse_embedding_rows, raw_rows)
-        # 维度对账（审查回归）：同模型名下供应商原地换维度或历史脏行会让
+        # 维度对账：同模型名下供应商原地换维度或历史脏行会让
         # float32 矩阵重组抛 inhomogeneous shape、/api/rag/ask 持续 500 直到
         # 人工清表。以现有缓存维度为基准（无缓存取批内多数维度），不一致的
         # 行按脏行同款删除（回填反连接重嵌入，产出当前模型维度，全表收敛）；

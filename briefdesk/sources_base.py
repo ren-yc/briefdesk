@@ -217,13 +217,14 @@ async def iter_sse_data_events(
 def build_endpoint_url(base_url: str, path: str) -> str:
     """按 base_url 的路径前缀拼接端点（三源共享，REST/SSE/媒体同源语义）。
 
-    保留 scheme/host/port 与 base 自带的查询串，base 的路径前缀（反代
-    子路径部署）原样保留——区别于 `httpx.URL.join` 的绝对路径 join 语义
-    （后者会替换掉 base 的路径前缀，曾导致 REST 走相对路径合并而
+    行为：保留 scheme/host/port；base 的路径前缀（反代子路径部署）原样保留，
+    base 若带查询串也原样保留（区别于 `httpx.URL.join` 的绝对路径 join 语义——
+    后者会替换掉 base 的路径前缀，曾导致 REST 走相对路径合并而
     SSE/媒体 404 的三路口径分叉）。
 
-    契约：base_url 必须是服务根地址或反代子路径前缀，不得携带查询串、
-    不得填完整端点路径（误配完整端点会产出坏 URL，由文档约束兜住）。
+    调用方契约：base_url 应是服务根地址或反代子路径前缀，**不要**填查询串
+    （配置文档均按此约束）或完整端点路径——保留查询串是实现行为，不是鼓励
+    上游配置携带它；误配完整端点会产出坏 URL，由文档约束兜住。
     """
     base = httpx.URL(base_url)
     prefix = base.path.rstrip("/")
@@ -429,7 +430,7 @@ class BatchBuffer:
                 # 与 _safe_flush 同口径：异常记日志不上抛（残余消息未标
                 # processed，由回填窗口重试恢复）。若上抛，下方 in-flight
                 # 等待会被跳过——teardown 继续推进（close_db 等），先前
-                # in-flight 批可能撞上已关闭的 DB（审查回归）
+                # in-flight 批可能撞上已关闭的 DB
                 logger.exception("关停冲刷失败（%d 条，下轮回填重试）", len(batch))
         pending = [t for t in self._inflight if not t.done()]
         if pending:

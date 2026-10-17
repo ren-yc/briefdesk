@@ -823,8 +823,8 @@ class TestImageUrlShortCircuit:
 
 
 class DedupTieredCandidateTest(unittest.IsolatedAsyncioTestCase):
-    """门禁分级与兜底回归：弱候选低置信复核（②）、重叠兜底（①）、
-    strong 剔除收窄（④）与无候选诊断（⑥）。
+    """门禁分级与兜底回归：弱候选低置信复核、重叠兜底、
+    strong 剔除收窄与无候选诊断。
 
     回归背景：两条同题招新消息嵌入余弦 0.7528 < 0.80 门禁，
     唯一真实候选被预筛静默丢弃 → 重复卡入库且无任何日志。

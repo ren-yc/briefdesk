@@ -1,6 +1,6 @@
 """类别管理路由（server 子包）：categories CRUD + 级联删除 + 事件通知。
 
-从原 server.py 拆出，导入即注册路由。
+导入即注册路由（装配顺序见 server/__init__.py）。
 """
 
 import re

@@ -71,7 +71,8 @@ pip install --no-deps --index-url https://test.pypi.org/simple/ briefdesk==0.1.0
 # 2) 依赖：只对正式 PyPI（清单以包元数据为准：pip show briefdesk 的 Requires，
 #    或 https://test.pypi.org/pypi/briefdesk/json）
 pip install fastapi "uvicorn[standard]" httpx aiosqlite pydantic pydantic-settings \
-    openai python-dotenv Pillow numpy json-repair python-multipart keyring platformdirs
+    openai python-dotenv Pillow numpy json-repair python-multipart keyring platformdirs \
+    python-dateutil typing-extensions
 ```
 
 **不要**改成 `--index-url https://test.pypi.org/simple/ --extra-index-url https://pypi.org/simple/` 一步装：
@@ -108,6 +109,8 @@ vs 正式 PyPI 的 `0.142.x`），依赖会被影子化成残缺包、构建直�
 - `python-multipart`（表单解析）
 - `keyring`（系统密钥环：密钥型配置的第一解析层）
 - `platformdirs`（用户配置目录定位）
+- `python-dateutil`、`typing-extensions`（vendor SDK 生成层 import 期需要；插件装配对每个
+  entry point 无条件 `load()`，缺项时该源被记 `failed` 并打 ERROR，向导/插件面板可见）
 
 OCR 依赖为**可选**（`pip install -e ".[ocr]"`）：
 
@@ -136,20 +139,23 @@ OCR 依赖为**可选**（`pip install -e ".[ocr]"`）：
 
 | 环境变量 | 默认 | 说明 |
 |---|---|---|
-| `PLUGINS` | `[]` | 可选插件（消息源/ocr/benchmark）显式启用列表（JSON 数组，无通配）；核心插件恒装配，亦可在设置页「插件」面板逐个开关（不再使用 SOURCES） |
+| `PLUGINS` | `[]` | 可选插件（消息源/ocr/benchmark）显式启用列表（JSON 数组，无通配）；核心插件恒装配，亦可在设置页「插件」面板逐个开关 |
 | `POLL_OVERLAP_SECONDS` | `300` | 增量轮询窗口与水位间的重叠秒数（吸收边界秒/时钟偏差/翻页偏移；重叠部分由已处理表去重，无 AI 开销） |
 | `POLL_INTERVAL_SECONDS` | `0`（禁用） | 周期同步间隔（秒）：SSE 断连窗口的消息补齐兜底，>0 时按周期自动触发与「同步消息」同路径的同步（进行中互斥） |
 | `IGNORE_SELF` | `true` | 过滤本账号自己发送的消息（SSE 实时 + REST 回填） |
 | `MAX_CLASSIFY_TOKENS` | `8192` | 单次 AI 分类最大输出 token（触顶截断会破坏 JSON） |
 | `AI_MAX_CONCURRENCY` | `4` | AI 请求最大并发，`0` = 不限制（本地模型建议设 1） |
 | `AI_REASONING_EFFORT` | `auto` | 推理强度：`auto` 不干预 / `off` 尽力关闭思考（发送 `reasoning_effort="none"`，端点明确拒收时自动改为不发送）/ `omit` 永不发送 / `minimal`…`max` 固定强度。DeepSeek 等思考系模型建议 `off`：思考输出挤占 max_tokens 会截断丢批（取值必须全小写） |
+| `AI_JSON_MODE` | `auto` | JSON 严格输出（`response_format=json_object`）：`auto` 启发式（ollama 端点或 deepseek-v4 系列）/ `on` 强制开 / `off` 强制关 |
 | `AI_VISION_ENABLED` | `false` | 视觉模型开关：AI_MODEL 支持图片输入时开启，含图消息将 OCR 文本连同图片一并送入分类（需启用 ocr 插件；端点不支持图片时自动降级纯文本重试并公告提示） |
 | `AI_VISION_MAX_IMAGES` | `4` | 单条消息随分类请求附图上限（1–20；多图超出部分只发 OCR 文本） |
 | `REALTIME_BATCH_MAX_COUNT` / `REALTIME_BATCH_TIMEOUT_MS` | `1` / `180000` | 实时批缓冲（攒够条数 / 超时毫秒触发处理） |
 | `BACKFILL_BATCH_MAX_COUNT` | `10` | 回填时单批 AI 分类的消息条数（默认已由 20 调为 10：批越大 AI 返回 index 漂移的绝对误差面越大） |
 | `IGNORED_EXPIRY_HOURS` | `0`（禁用） | 启动时清理超过该时长的已忽略条目 |
 | `MERGE_WINDOW_MINUTES` / `MERGE_MAX_CANDIDATES` | `10` / `3` | 会话内同话题片段合并窗口（分钟）/ 候选上限；`0` = 禁用合并 |
+| `BENCHMARK_PAUSE_PIPELINE` / `BENCHMARK_KEEP_RUNS` / `BENCHMARK_RUN_TIMEOUT_SECONDS` / `BENCHMARK_RUN_STALL_SECONDS` | `true` / `5` / `0`（不限）/ `600` | benchmark 插件专属（需启用 benchmark 插件）：运行期暂停管道 / 保留运行产物数 / 单次运行总时长上限 / 无进展终止阈值 |
 | `EMBED_API_BASE` / `EMBED_MODEL` / `EMBED_API_KEY` | 空（禁用） | 嵌入向量去重：填入嵌入服务地址后启用余弦预筛（留空回退字符重叠预过滤） |
+| `EMBED_BATCH_SIZE` | `20` | 单次嵌入请求的批量条数（历史缓存加载 + 逐批预嵌入共用） |
 | `DEDUP_SIMILARITY_THRESHOLD` / `DEDUP_EMBED_THRESHOLD` / `DEDUP_EMBED_TOP_K` / `DEDUP_EMBED_FALLBACK_THRESHOLD` / `DEDUP_STRONG_THRESHOLD` | `0.3` / `0.80` / `3` / `0.65` / `0.99` | 去重预筛与 AI 判重门禁阈值 |
 | `LOG_LEVEL` | `INFO` | 日志级别（DEBUG 开逐条细节，并放出 uvicorn 的 HTTP 请求日志——默认静默以免逐请求刷屏） |
 | `DB_PATH` / `SERVER_PORT` | 用户数据目录 `data/briefdesk.sqlite` / `3000` | SQLite 路径 / Web 端口 |
@@ -201,7 +207,7 @@ briefdesk/
 │   ├── ai_ports.py         # AI 供应商端口（引擎经端口函数调用，核心不依赖具体供应商）
 │   ├── sources_base.py     # 消息源核心契约（SourceClient / RealtimeListener / SourceRuntime）
 │   ├── types.py            # 跨模块基础类型（含管道跨插件契约）
-│   ├── server/             # FastAPI 服务子包（app/中间件/核心路由/类别路由/媒体代理/静态托管/插件注入/回调）
+│   ├── server/             # FastAPI 服务子包（app/中间件/核心路由/类别路由/设置与环境键路由/媒体代理/静态托管/插件注入/回调）
 │   └── plugins/            # 内置插件（消息源 + AI 供应商 + 管道阶段 + Web 插件）
 │       ├── weflow/             # weflow 消息源（微信 4.x，weflow-server :5033；同构六文件分层；API 契约见上游文档）
 │       ├── weflow_legacy/      # WeFlow Legacy 消息源（plugin.py + client/config/normalize/poller/runtime/sse + weflow-legacy-api.md）
@@ -239,7 +245,7 @@ briefdesk/
 - 插件分核心/可选两层：核心插件（ai_provider/classify/dedup/merge/rag/
   calendar/reminders）恒装配；可选插件（weflow/weflow-legacy/qqflow/ocr/
   benchmark）默认禁用，经 `PLUGINS` 显式列名或设置页「插件」面板逐个开关
-  启用（不再使用 SOURCES）；插件可声明 `conflicts` 互斥（weflow 与
+  启用；插件可声明 `conflicts` 互斥（weflow 与
   weflow-legacy 互斥——同一上游新旧采集器，同开会重复采集）
 - 管道阶段化：OCR / AI 分类 / 语义去重 / 同话题合并各是一个阶段插件
   （`briefdesk/plugins/{ocr,classify,dedup,merge}/`，槽位
@@ -264,9 +270,6 @@ briefdesk/
   `registerItemRowExtension` 行内扩展接入卡片动作区与 `handleRowAction`，
   经 `data-plugin-slot` 注入设置面板）；核心 `briefdesk/ui/` 只留通用加载器与两类
   扩展钩子（`TestCoreFrontendBoundary` 守卫），不写死任何插件功能入口
-
-当前阶段：消息源、管道四阶段、AI 供应商与 Web 插件全部插件化，
-插件化改造完成（本体只保留存储、管道骨架、HTTP 与状态总线等核心）。
 
 ## 架构
 

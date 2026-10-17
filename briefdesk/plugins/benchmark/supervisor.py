@@ -5,7 +5,7 @@
 子进程后补写终态记录，并**在回收时**触发一次轮转——轮转只挂在插件 activate 上的话，
 长驻进程里 run_dir 会无限增长。
 
-结果分类统一引用三态判据（见 §3.2 的契约）：
+结果分类的三态判据（与 `_classify` 的判定一一对应）：
 
 - completed：最后一行是 done 终态行 + 两份报告齐全 → 唯一可被 /report 选中的形态；
 - failed-recorded：最后一行是 error 终态行（报告可缺）；
@@ -454,6 +454,9 @@ async def _monitor(run: _Run) -> None:
 
     看门狗只用 progress.jsonl 的**行数增长**判进展（不探活、也不拿最后一行判存活），
     阈值按 --progress-every 线性放大——进度节流后相邻两行之间最坏隔着 N 条用例。
+    注意：Web 路径恒为 1（`_Run.progress_every` 默认值，不是设置项、start 也不从配置
+    冻结），因此本处的放大只对 CLI 直跑传了 --progress-every 时生效，Web 侧等价于
+    不放大。
     """
     stall = max(1, run.run_stall_seconds) * max(1, run.progress_every)
     timeout = run.run_timeout_seconds
@@ -601,7 +604,8 @@ def _last_from_disk() -> dict[str, Any] | None:
 
 
 def state() -> dict[str, Any]:
-    """GET /api/benchmark/run 的载荷：形状与改造前一致，只多一个 progress。
+    """GET /api/benchmark/run 的载荷：形状与改造前一致，多 progress 与 runtime_settings
+    （本次运行采用的运行参数，current 时点）。
 
     运行期间**不扫盘**取上一次的摘要：这是前端 3s 轮询的热路径，而扫盘是同步 I/O
     （会阻塞事件循环）；前端在运行中只读 running/progress，摘要要等运行结束——那时

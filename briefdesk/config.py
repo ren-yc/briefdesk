@@ -21,7 +21,7 @@ REASONING_EFFORT_VALUES: tuple[str, ...] = (
 class Settings(KeyringSettingsBase):
     """应用配置，从 .env 读取，密钥字段支持系统密钥环。"""
 
-    # 密钥解析链（keyring > 环境变量 > .env > 默认值）：
+    # 密钥解析链（keyring > 环境变量 > 项目 .env > 用户暂存文件 > 默认值）：
     # 系统密钥环由 CLI `briefdesk secrets set` 写入，见 briefdesk/secrets_store.py
     KEYRING_FIELDS: ClassVar[dict[str, str]] = {
         "ai_api_key": "AI_API_KEY",
@@ -100,8 +100,11 @@ class Settings(KeyringSettingsBase):
 
     ignore_self: bool = Field(default=True, alias="IGNORE_SELF")
     """过滤本账号自己发送的消息（所有消息入口：SSE 实时 + REST 回填）。
-    weflow-legacy REST 按 isSend 判定、SSE 上游已不推送自消息；qqflow REST 按
-    自身 UID（u_<QQFLOW_QQ>）判定、SSE 事件无发送者标识需按消息回查 REST。"""
+    weflow / weflow-legacy REST 按 isSend 判定；两源的 SSE 上游都不推自消息
+    （weflow-server 推送端据 isSend=1 主动跳过，weflow-legacy 的 SSE 上游已不
+    推送）。qqflow REST 先按 isSend（上游 40013 方向列归一化为 {0,1}）判，
+    isSend=0 时再按自身 UID（u_<QQFLOW_QQ>）兜底——部分 QQ 版本缺该列；
+    SSE 事件无发送者标识，需按消息回查 REST。"""
 
     realtime_batch_max_count: int = Field(
         default=1, alias="REALTIME_BATCH_MAX_COUNT", gt=0

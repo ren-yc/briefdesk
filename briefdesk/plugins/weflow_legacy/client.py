@@ -190,8 +190,10 @@ class WeFlowLegacyClient(SourceClient):
         """获取共享的 httpx 客户端（懒初始化）。"""
         if self._client is None:
             # base_url 原样使用 _base_url：httpx 的 base_url 合并规则会正确处理
-            # 绝对路径请求；媒体/SSE 的 URL 统一走 URL.join（见 _build_media_url
-            # 与 stream_events），不再依赖 base 的形态。
+            # 绝对路径请求；媒体/SSE 的 URL 统一走共享助手 build_endpoint_url
+            # （按 base 的路径前缀拼接、保留 base 自带查询串，见 _build_media_url
+            # 与 stream_events）——httpx 原生 URL.join 会丢弃 base 路径前缀，
+            # 反代子路径部署下必 404，故不使用。
             self._client = httpx.AsyncClient(
                 base_url=self._base_url,
                 timeout=httpx.Timeout(30.0),
@@ -264,7 +266,7 @@ class WeFlowLegacyClient(SourceClient):
                 if not resp.is_success:
                     # 重试响应失败必须走与主路径相同的错误出口：静默保留
                     # 首次的空 data 会让调用方拿到"成功"的空结果，把上游
-                    # 4xx/5xx 伪装成正常翻页终止（审查回归）。
+                    # 4xx/5xx 伪装成正常翻页终止。
                     # not_found_ok 的 404 降级同样适用于重试分支，
                     # 否则脏会话重试遇 404 本可降级空信封却令整会话失败。
                     if not_found_ok and resp.status_code == 404:

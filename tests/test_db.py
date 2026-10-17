@@ -653,7 +653,7 @@ class TestItemsPage:
 
 
 class TestReminderAndCalendar:
-    """#3A/#13：到期提醒查询 + 已忽略卡片不提醒/不进日历但保留数据。"""
+    """到期提醒查询 + 已忽略卡片不提醒/不进日历但保留数据。"""
 
     @pytest.fixture(autouse=True)
     async def _autouse_setup(self):
@@ -782,7 +782,7 @@ class TestReminderAndCalendar:
 
 
 class TestSubjectTimelineNormalization:
-    """#9B（修正版）：subject 写时归一化，时间线按归一化键跨写法聚合。"""
+    """subject 写时归一化，时间线按归一化键跨写法聚合。"""
 
     @pytest.fixture(autouse=True)
     async def _autouse_setup(self):
@@ -1939,7 +1939,7 @@ class TestEmbeddingsDb:
         await main_db.close()
 
 
-# ── 审查修复回归测试（内存库，不触碰应用数据库文件）──
+# ── 数据库写路径回归测试（内存库，不触碰应用数据库文件）──
 
 
 class _InMemoryDbTest:
@@ -1978,7 +1978,7 @@ class _InMemoryDbTest:
 
 
 class TestCategoryRenameSync(_InMemoryDbTest):
-    """审查修复 #1 回归保护：类别改名必须在同一事务内同步 items.category。"""
+    """类别改名必须在同一事务内同步 items.category——否则旧名卡片失联。"""
 
     async def test_rename_updates_items_category_in_same_transaction(self):
         p1, p2 = self._patch_db()
@@ -1999,7 +1999,8 @@ class TestCategoryRenameSync(_InMemoryDbTest):
 
 
 class TestDeleteCategoryPurgeCascade(_InMemoryDbTest):
-    """审查修复 #1 回归保护：purge 级联删三表且 processed_messages 保留。"""
+    """purge 类别必须级联删 items/raw_messages/rag embeddings 三表且 processed_messages 保留——
+    残留行会让已删卡片继续出现在检索与回填判定中。"""
 
     async def test_purge_deletes_items_raw_embeddings_keeps_processed(self):
         p1, p2 = self._patch_db()
@@ -2117,7 +2118,7 @@ class TestInitConnectionCleanup:
 
 
 class TestDeleteItemsRollback(_InMemoryDbTest):
-    """审查修复 #1a：多步写异常路径必须 rollback，不留悬挂事务。
+    """多步写异常路径必须 rollback，不留悬挂事务。
 
     悬挂事务会被下一个不相干写操作的 commit 收尾提交（部分写入提前可见），
     因此异常路径 rollback 后连接必须回到无事务状态。
@@ -2307,7 +2308,8 @@ class TestAtomicTransactionCancel(_InMemoryDbTest):
 
 
 class TestAreMessagesProcessedChunk:
-    """审查修复 #6：are_messages_processed 按 900 条分块防 SQLite 变量上限。
+    """are_messages_processed 必须按 900 条分块查询——单条 IN 列表超过 SQLite
+    SQLITE_MAX_VARIABLE_NUMBER 时整条 SQL 直接报错，回填大批量会全轮失败。
 
     本机 SQLite 3.51 变量上限为 32766（>=3.32），1100 个 id 单次查询不会崩，
     崩溃路径的 RED 无法在本机复现；故直接对分块行为做参数化断言。
@@ -2349,7 +2351,7 @@ class TestAreMessagesProcessedChunk:
 
 
 class TestAreMessagesProcessedLargeSet(_InMemoryDbTest):
-    """审查修复 #6 端到端：1100 个 id 全部已处理 → 返回全集（首跑即绿的保护性测试）。"""
+    """端到端：1100 个 id 全部已处理 → 分块查询必须返回全集（超单语句变量上限的形态）。"""
 
     async def test_1100_processed_ids_all_found(self):
         with patch("briefdesk.db.get_db", new=AsyncMock(return_value=self.db)):
@@ -2360,7 +2362,8 @@ class TestAreMessagesProcessedLargeSet(_InMemoryDbTest):
 
 
 class TestSetItemReminderClearMutex(_InMemoryDbTest):
-    """审查修复 #7：清除提醒仅在已有提醒时命中——rowcount 才能当多标签页互斥判据。"""
+    """清除提醒必须仅在已有提醒时命中——否则无提醒行也返回成功，
+    rowcount 就不能当多标签页互斥判据（重复设提醒会互相覆盖）。"""
 
     async def test_clear_when_no_reminder_returns_false(self):
         with patch("briefdesk.db.get_db", new=AsyncMock(return_value=self.db)):

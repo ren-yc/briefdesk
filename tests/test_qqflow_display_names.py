@@ -142,7 +142,7 @@ class NormalizeSseMediaTest(unittest.TestCase):
 
 
 class PrefilterSenderTest(unittest.TestCase):
-    """qqflow 入口过滤回归（决策 ②=保留未知）：空发送者**不再**入口丢弃
+    """qqflow 入口过滤回归：空发送者**不再**入口丢弃
     （与 weflow/legacy 统一，归一化回退 sender_name="未知"）；纯 UID 内容
     的系统事件（入群/名片/撤回）仍保留丢弃规则。"""
 

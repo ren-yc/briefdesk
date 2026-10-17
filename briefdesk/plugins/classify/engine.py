@@ -241,7 +241,7 @@ def _build_image_parts(groups: list[dict], excluded: set[int] | None = None) -> 
     的消息该轮只发 OCR 文本）。`excluded` 为字符预算剔除的消息 index 集合：
     这些消息不在文本数据区里，附图并标注「消息 N 附图」会邀请 AI 对一个
     不存在的输入行分类——该 index 已在调用方并入 failed 重试，图文同发会
-    产生 index 同时出现在 results 与 failed 的矛盾结果（审查回归），必须
+    产生 index 同时出现在 results 与 failed 的矛盾结果，必须
     一并跳过。全批无可用图片返回空列表，调用方据此维持纯文本 str 请求
     （字节级行为不变）。
     """

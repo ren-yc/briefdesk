@@ -38,7 +38,7 @@ class RedactQueryStringTest(unittest.TestCase):
             self.assertIn(f"{name}=***", out)
 
     def test_masks_compound_key_variants(self) -> None:
-        # 审查回归：auth_token / session_token / secret_key 等复合变体此前
+        # 回归防线：auth_token / session_token / secret_key 等复合变体此前
         # 不命中（token/key/secret 必须是键首），令牌以明文进访问日志
         for name in (
             "auth_token", "session_token", "refresh_token", "secret_key",

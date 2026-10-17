@@ -451,13 +451,16 @@ class QqFlowClient(SourceClient):
 
     # 不再有 fetch_group_members：/api/v1/group-members 的 groupNickname 与
     # 消息自带的 senderName 出自上游同一条 display_sender 链（本群群名片 >
-    # 备注 > 最新消息昵称 > 档案昵称 > UID），逐群再查一次纯属冗余。
+    # 备注 > 最新消息昵称 > 档案昵称 > UID），逐群再查一次纯属冗余。本节是
+    # qqflow 侧这份理由的权威版（poller 只写指针）；weflow 的结论相同但理由
+    # 不同（其 groupNickname 出自恒空的 group_cards），见 weflow/poller.py。
 
     async def fetch_sessions(self) -> list[QqFlowSession]:
         """获取所有会话列表（按 offset 翻页取尽，与 fetch_contacts 同模式）。
 
-        上游 limit 默认 100 且按最后消息时间倒序（上游 API 文档 §4：
-        https://github.com/ren-yc/qqflow-server/blob/v0.5.2/docs/qqflow-server-api.md），
+        上游 limit 默认 100 且按最后消息时间倒序（上游 API 文档 §4 allow-plan-ref，
+        指向下一行那个版本钉定的上游文档、非仓外一次性材料，属可回查引用）：
+        https://github.com/ren-yc/qqflow-server/blob/v0.5.2/docs/qqflow-server-api.md
         不翻页只会发现最近活跃的 100 个会话，更早的会话将永远无法被
         发现/启用/轮询。page_size=10000 = 上游 limit 硬上限：典型规模一个
         请求即取尽（与旧「显式大 limit」实现请求数相同）；旧上游若忽略
@@ -592,8 +595,8 @@ class QqFlowClient(SourceClient):
 
                     # 服务端重启后账号注册表（内存态）丢失；SSE HTTP 200 是服务端
                     # 已恢复的可靠信号，强制重做一次就绪检查 + 引导注册（幂等）。
-                    # 失败仅告警不阻断流：业务 503 由 _get 自愈、重连由监听器
-                    # 退避循环兜底。
+                    # 失败仅告警不阻断流：业务 503 由 _sdk_call 复位就绪门控、下轮
+                    # ensure_ready 自愈，重连由监听器退避循环兜底。
                     try:
                         await self.ensure_ready(force=True)
                     except QqFlowAccountMismatchError:

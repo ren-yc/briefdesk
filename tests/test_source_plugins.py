@@ -52,7 +52,7 @@ class TestWeFlowLegacyPlugin:
         assert registered == [fake_runtime]
 
     async def test_missing_token_self_disables(self):
-        """【决策 ①=1B】必填校验与 weflow/qqflow 统一：缺 token 装配期自禁用。"""
+        """必填校验与 weflow/qqflow 统一：缺 token 装配期自禁用（零源降级启动后自禁用不再有中止顾虑）。"""
         ctx, _ = _ctx()
         plugin = WeFlowLegacyPlugin()
         with patch(

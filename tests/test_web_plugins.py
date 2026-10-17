@@ -340,7 +340,7 @@ class TestPluginFrontendCoreHelper(unittest.TestCase):
 
 
 class TestIncludeRouterIdempotent(unittest.TestCase):
-    """审查修复 #10：include_plugin_router 对同一 router 重复调用幂等。"""
+    """include_plugin_router 对同一 router 重复调用必须幂等——否则重复挂载让路由表出现同路径多份。"""
 
     def test_double_include_inserts_routes_once(self):
         from fastapi import APIRouter

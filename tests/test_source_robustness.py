@@ -577,7 +577,7 @@ class TestWeflowSseDedup:
 
 
 class QqFlowEmptySenderKeptTest(unittest.TestCase):
-    """【决策 ②=保留未知】qqflow 空发送者不再入口丢弃（与 weflow/legacy
+    """qqflow 空发送者不再入口丢弃（与 weflow/legacy
     统一）：归一化阶段回退 sender_name="未知"。"""
 
     def test_pre_filter_sse_keeps_empty_sender(self):

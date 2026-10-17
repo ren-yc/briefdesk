@@ -152,7 +152,7 @@ class SettingsFileTest(StagedFileTestCase):
         self.assertEqual(read_staged(), {"LOG_LEVEL": "DEBUG"})
 
     def test_write_staged_cleans_tmp_on_failure(self) -> None:
-        # 写入/替换失败时残留 .tmp 必须被清理，原文件保持不变（审查回归）
+        # 写入/替换失败时残留 .tmp 必须被清理，原文件保持不变
         write_staged({"LOG_LEVEL": "DEBUG"})
         tmp_path = self.staged_path.parent / (self.staged_path.name + ".tmp")
         with (

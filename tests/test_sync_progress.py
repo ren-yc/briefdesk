@@ -218,7 +218,7 @@ class TestRealtimePublishEvent:
 
 
 class TestRealtimeDropCounter:
-    """审查修复 #9：SSE 订阅队列满丢弃事件必须可观测（累计计数器）。"""
+    """SSE 订阅队列满丢弃事件必须可观测（累计计数器）——静默丢弃会让前端进度永不完成且无从排查。"""
 
     async def test_full_queue_drop_increments_counter(self):
         before = get_dropped_count()

@@ -755,8 +755,8 @@ class WeFlowClient(SourceClient):
 
                     # 服务端重启后账号注册表（内存态）丢失；SSE HTTP 200 是服务端
                     # 已恢复的可靠信号，强制重做一次就绪检查 + 引导注册。
-                    # 失败仅告警不阻断流：业务 503 由 _get 自愈、重连由监听器
-                    # 退避循环兜底。
+                    # 失败仅告警不阻断流：业务 503 由 _sdk_call 复位就绪门控、下轮
+                    # ensure_ready 自愈，重连由监听器退避循环兜底。
                     try:
                         await self.ensure_ready(force=True)
                     except WeFlowAccountMismatchError:

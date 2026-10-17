@@ -1,6 +1,6 @@
 """自包含 HTML 图表报告 — 内联 CSS + SVG 图表，无外部资源，浏览器直接打开。
 
-输入与 JSON 导出共用同一 payload（runner._build_payload 产物）：
+输入与 JSON 导出共用同一 payload（engine._build_payload 产物）：
 {"run_id", "generated_at", "model", "concurrency", "config",
  "elapsed_sec", "features": {feature: {"dataset", "elapsed_sec", "summary": {...}, "cases": [逐用例 dict]}}}
 """

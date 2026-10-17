@@ -19,9 +19,11 @@
 #   and type-checking test-stub idioms is signature-level noise
 #   (see the [tool.mypy] comments in pyproject.toml); AGENTS.md notes the
 #   local gate additionally runs mypy over tests/
-# - secret scan runs on both event types, mirroring the pre-commit hook (which
-#   scans staged content only): PRs diff against origin/master, pushes against
-#   the pre-push commit. Guarding PRs alone would leave the direct-to-master
+# - secret / plan-reference / commit-message scans run on both event types via
+#   one scripts/ci_scan.py call (see the step's comment): PRs resolve the range
+#   from base.sha/head.sha's merge-base to the event head, pushes from the
+#   payload's before/after SHAs — never origin/master and never a HEAD~N guess.
+#   Guarding PRs alone would leave the direct-to-master
 #   path — the one this repo actually uses — unchecked.
 name: CI
 
@@ -73,13 +75,14 @@ jobs:
       - name: Event-range scans (secret / plan-reference / commit messages)
         run: python scripts/ci_scan.py
 
-      # AGENTS.md's 4th gate. The pre-commit hook only runs the secret scan, so
-      # without this step the check rests on the author remembering it.
+      # AGENTS.md's 4th gate. The local hooks cover staged content (pre-commit)
+      # and the commit message (commit-msg), but a working-tree-only whitespace
+      # check goes blind once the problem is committed — so this step owns the
+      # committed-history side.
       # Diffing against the empty-tree SHA covers every tracked file instead of
       # a push range: same behaviour on push and PR, and no all-zeros base to
       # special-case. Verified clean at this baseline. AGENTS.md's local gates
-      # mirror this command, so committed whitespace issues surface before push
-      # (a working-tree-only check goes blind once the problem is committed).
+      # mirror this command, so committed whitespace issues surface before push.
       - name: Whitespace / conflict marker check
         run: git diff --check 4b825dc642cb6eb9a060e54bf8d69288fbee4904..HEAD
 
@@ -119,8 +122,10 @@ jobs:
           cache-dependency-path: requirements-dev.txt
 
       # 依赖口径：先用锁文件（与全量 job 一致）——它顺带验证「锁文件在 3.12 + Linux
-      # 上也能装」。锁文件由 3.14 解析生成，若这里因 rapidocr/onnxruntime 之类重包在
-      # 3.12/Ubuntu 上缺轮子而装不上，收窄为 pip install -e ".[dev]"（本 job 不跑 OCR
+      # 上也能装」。锁文件由 3.12（requires-python 下限）解析生成（见文件头部
+      # pip-compile 那行与 AGENTS 锁文件节：用高版本解析可能钉入排除低版本的 pin）；
+      # 若这里因 rapidocr/onnxruntime 之类重包在 3.12/Ubuntu 上缺轮子而装不上，
+      # 收窄为 pip install -e ".[dev]"（本 job 不跑 OCR
       # 用例，装 [ocr] 重包是纯风险），并在本注释里记录原因与适用范围，不要默默改回去。
       - name: Install dependencies (lockfile + editable package)
         run: |

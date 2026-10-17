@@ -146,8 +146,8 @@ async def poll(
     total_self = 0  # IGNORE_SELF 预滤的自消息数（不进管道、不标记 processed）
     not_ready_skips = 0
     session_idx = 0
-    # 不再查 /api/v1/group-members：其 groupNickname 与消息自带的 senderName
-    # 是上游同一条 display_sender 链的产物，纯冗余（每个启用群省一次请求）。
+    # 不再查 /api/v1/group-members：每群省一次请求。理由（display_sender 链
+    # 单一来源）见 client.fetch_contacts 上方的说明，不在此复述。
 
     for session in enabled_sessions:
         session_idx += 1

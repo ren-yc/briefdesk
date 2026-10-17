@@ -1,6 +1,7 @@
 """keyring 密钥环存储与解析链测试（fake backend 隔离，绝不触碰真实凭据管理器）。
 
-- 优先级链：keyring > 环境变量 > .env > 默认值（app 级与插件级 Settings）
+- 优先级链：keyring > 环境变量 > 项目 .env > 用户暂存文件 > 默认值（app 级与插件级 Settings；
+  口径见 briefdesk/secrets_store.py 模块 docstring）
 - secrets_store 读写/幂等删除/禁用开关
 - `briefdesk secrets` CLI 子命令（不打印明文、拒绝白名单外键名）
 """

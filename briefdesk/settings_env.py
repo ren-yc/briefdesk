@@ -434,10 +434,12 @@ def commit_staged_write(candidate: bytes | None) -> None:
 
 
 def write_staged(updates: dict[str, str | None]) -> None:
-    """按更新项改写暂存文件（兼容入口）：prepare + commit，不留旧写入通道。
+    """按更新项改写暂存文件：prepare + commit 两段合成的**便利入口**。
 
-    原子性：先写同目录临时文件再 os.replace；失败时原文件保持不变。
-    调用方持锁（服务端 PUT 用 _write_lock 串行化）。
+    生产路径（服务端 PUT）不用它——那条路径需要「校验与提交针对同一份候选字节」，
+    所以分开调 prepare_staged_write / commit_staged_write；本函数供测试与外部
+    一次性写入使用，语义与两段连调等价（原子性：先写同目录临时文件再
+    os.replace，失败时原文件保持不变；调用方持锁）。
     """
     _, candidate = prepare_staged_write(updates)
     commit_staged_write(candidate)

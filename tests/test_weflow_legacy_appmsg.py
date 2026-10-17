@@ -398,7 +398,7 @@ class TestPollerPlaceholderLookback:
 
 
 class TestNormalizeSseImageDrop:
-    """审查回归：SSE [图片] 回查未命中时整条丢弃——旧实现放行纯文本
+    """回归防线：SSE [图片] 回查未命中时整条丢弃——旧实现放行纯文本
     "[图片]" 进 AI 分类产生噪音卡，与 REST 路径「无 media.url 丢弃」
     语义不对齐。命中时剥离查询串（旧 access_token 不入 image_urls）。"""
 

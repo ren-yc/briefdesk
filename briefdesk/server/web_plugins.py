@@ -4,8 +4,7 @@
 - `/plugin-assets/{name}/{path}`：插件静态资源（浏览器直连）
 - `include_plugin_router`：把插件路由展开插到 SPA mount 之前
 
-从原 server.py 拆出：本模块导入即向 `briefdesk.server.app`
-注册插件相关路由。
+导入即向 `briefdesk.server.app` 注册插件相关路由（装配顺序见 server/__init__.py）。
 """
 
 from collections.abc import Callable
@@ -155,7 +154,8 @@ async def plugin_assets(name: str, path: str):
 
 
 def _no_cache_file(file):
-    """插件资源随插随改：响应带 no-cache，浏览器每次向服务端校验证书。"""
+    """插件资源随插随改：响应带 no-cache，浏览器每次用前都要向服务端重新验证
+    （revalidate）缓存是否新鲜——不验证就直接复用会拿到改前的旧 ui.js/ui.css。"""
 
     response = FileResponse(file)
     response.headers["Cache-Control"] = "no-cache"

@@ -128,7 +128,7 @@ def embed_model_name() -> str:
 
 
 def loads_json(text: str, *, repair: bool = True) -> object | None:
-    """标准解析优先，失败后用 json_repair 修复兜底（原 ai/client.py）。
+    """标准解析优先，失败后用 json_repair 修复兜底。
 
     json_repair 可修复常见模型输出瑕疵：缺引号/单引号/尾随逗号、
     markdown 围栏残留、前后叙述文本混排、截断补全等。
@@ -152,7 +152,7 @@ def loads_json(text: str, *, repair: bool = True) -> object | None:
 
 def cosine_similarity(a: list[float], b: list[float]) -> float:
     """标量余弦相似度（单对向量，非矩阵批量）：语义对齐裁判等单对比较的
-    共享实现（原 classify 本地 _cosine 与判官数学重复，改一漏一）。
+    共享实现——各引擎若各留一份本地拷贝，改一漏一必然造成判定口径漂移。
 
     numpy 可用走向量化快路径（float64，与纯 Python 同精度）；导入失败时
     回退纯 Python（数值一致，测试随机向量对拍保证）。任一侧范数为 0 →

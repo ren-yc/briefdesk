@@ -18,10 +18,10 @@ briefdesk                  # pyproject console script
 # Opens at http://localhost:3000
 
 # Lint (ruff)
-pip install ruff && ruff check briefdesk/ tests/
+pip install ruff && python -m ruff check briefdesk/ tests/
 
 # Type check (mypy)
-pip install mypy && mypy briefdesk/ tests/
+pip install mypy && python -m mypy briefdesk/ tests/
 
 # Test (pytest, tests/ 目录)
 python -m pytest tests/
@@ -31,7 +31,8 @@ git diff --check
 # 范围级空白检查（空树口径，与 CI 一致；提交后仍可跑）
 git diff --check 4b825dc642cb6eb9a060e54bf8d69288fbee4904..HEAD
 
-# 可选：安装 pre-commit 密钥扫描钩子（staged 新增内容自动扫描，推荐）
+# 可选：安装本地 git 钩子（推荐）——pre-commit 扫 staged 新增内容（密钥 + 编号引用），
+# commit-msg 检查提交信息；见 scripts/install-hooks.ps1 头部说明
 powershell -ExecutionPolicy Bypass -File scripts/install-hooks.ps1
 ```
 
@@ -129,8 +130,10 @@ powershell -ExecutionPolicy Bypass -File scripts/install-hooks.ps1
 ### 注释、文档与提交信息规范（禁止编号引用）
 
 - **禁止编号引用**：代码注释、docstring、测试的文档串、仓库文档与提交信息中，不得写入指向仓库之外一次性材料的条目号。典型形态：
-  - 审查报告 / 计划的条目码（形如「字母码 + 数字」，或「中文方括号 + 序号 + 条目码」）；
-  - 用「复核 / 审查报告 / 审计 / 排期」等词做归因、后面跟一个编号；
+  - 审查报告 / 计划的条目码（形如「字母码 + 数字」或「数字 + 字母码」，或「中文方括号 + 序号 + 条目码」）；
+  - 用「复核 / 审查报告 / 审计 / 排期 / 决策」等词做归因、后面跟一个编号（含带圈数字）；
+  - 裸归因短语（「审查」紧接「修复 / 回归」，无需编号也指向仓外报告）；
+  - 章节指针（`§N` / `§N.M`——仓库内没有带章节号的文档，出现即指向仓外）；
   - 计划 / 会话产物路径（本地计划文件名、会话产物目录名）；
   - 流水号批次（「第 N 批」之类）。
 - **为什么**：这些编号指向仓库外的审查报告或计划文件，仓库读者无法据此还原上下文，报告改版后编号还会失效。注释要说明**为什么这样做**与**失败模式**；提交信息要说明**行为变化**。
@@ -142,11 +145,11 @@ powershell -ExecutionPolicy Bypass -File scripts/install-hooks.ps1
         连接带未提交事务被归还（回归见 tests/test_db.py 的 atomic_transaction 用例）
   ```
 
-- **豁免**（不视为编号引用）：可跟踪的 issue / PR 编号（如 `Fixes #123`，便于外部读者回查）、编码名与标准编号（UTF-8、RFC 5987）、静态检查码（`noqa: F401` 一类）、依赖版本号（小写 `v1.2.3`）、控制字符名（C0 / C1）、领域指标名（如 F 值类指标）、少量固定技术缩写（ES6、MD5、延迟分位等，名单见 `scripts/forbidden_refs.py` 的 `_EXEMPT`）。豁免是**剥离片段后再扫**：同一行夹带的其它编号照常判定。JS 代码行末尾的 `//` 注释与整行注释同口径。提交信息只扫真正入库的部分（`#` 注释行与 `git commit -v` 的 diff 不算）。
+- **豁免**（不视为编号引用）：可跟踪的 issue / PR 编号（如 `Fixes #123`，便于外部读者回查）、编码名与标准编号（UTF-8、RFC 5987）、静态检查码（`noqa: F401` 一类）、依赖版本号（小写 `v1.2.3`）、控制字符名（C0 / C1）、领域指标名（如 F 值类指标）、与条目码同形但后缀字母表封闭的量纲（容量单位 MB/GB、千次记法 K、HTTP 状态类通配 1XX）、十六进制颜色字面量、少量固定技术缩写（ES6、MD5、延迟分位等，名单见 `scripts/forbidden_refs.py` 的 `_EXEMPT`）。豁免是**剥离片段后再扫**：同一行夹带的其它编号照常判定。JS 代码行末尾的 `//` 注释与整行注释同口径。提交信息只扫真正入库的部分（`#` 注释行与 `git commit -v` 的 diff 不算）。
 - **例外**：确实需要在注释里保留某个编号时，在同一行写 `allow-plan-ref` 并说明理由。
 - **扫描面**（决定「漏写会不会被拦」，改动本节时须同步 `iter_segments`）：
-  - **在面内**：`.py .js .mjs .md .yml .yaml .toml .ps1 .sh` 的注释与文档正文，以及提交信息（subject + body，`#` 注释行与 scissors 之后的 diff 不算）。JS 的行内尾注释与整行注释同口径。
-  - **不在面内**：无此类片段的文件（`.html .css .svg .json .example` 等，含 `briefdesk/ui/index.html` 的 HTML 注释与 `briefdesk/ui/style.css` 的 `/* */`）——扫描器对它们返回空片段。往这些文件写注释时不享受门禁兜底，需人工复核。
+  - **在面内**：`.py .js .mjs .md .yml .yaml .toml .ps1 .sh .css` 的注释与文档正文，以及提交信息（subject + body，`#` 注释行与 scissors 之后的 diff 不算）。JS 的行内尾注释与整行注释同口径；CSS 的 `/* */` 块注释同口径。Python 的采集面是**所有**字符串表达式语句——不止各节点首位的 docstring，类体中部的说明串同样入扫。
+  - **不在面内**：无此类片段的文件（`.html .svg .json .example` 等，含 `briefdesk/ui/index.html` 的 HTML 注释）——扫描器对它们返回空片段。往这些文件写注释时不享受门禁兜底，需人工复核。
   - `_EXEMPT` 白名单按**实际命中**增补（当前含少量仓库内暂未出现的防御项）；新增条目要写明它为什么与条目码同形却不是编号。
 - **工具与门禁**：
   - 本地提交：`scripts/install-hooks.ps1` 安装的 pre-commit（密钥 + 编号）与 commit-msg（提交信息）钩子；
@@ -203,14 +206,7 @@ powershell -ExecutionPolicy Bypass -File scripts/install-hooks.ps1
 
 ## 架构指引
 
-简报台是本地网页应用：可插拔消息源采集群聊消息，经统一过滤与阶段化管道（OCR 增强 → AI 分类 → 语义去重 → 同话题合并）写入 SQLite，由 FastAPI 经 SSE 实时推送到原生 JS 前端。
-
-```text
-消息源插件(weflow :5033 / weflow-legacy :5031 / qqflow :5032) → normalize 归一化
-→ pipeline 入口统一过滤 → enrich(OCR) → classify(AI) → dedup(判重/入库)
-→ post_insert(合并) → db(SQLite) → realtime(pub/sub) → server(FastAPI :3000)
-→ briefdesk/ui/ SPA（SSE 实时刷新）
-```
+简报台是本地网页应用：可插拔消息源采集群聊消息，经统一过滤与阶段化管道（OCR 增强 → AI 分类 → 语义去重 → 同话题合并）写入 SQLite，由 FastAPI 经 SSE 实时推送到原生 JS 前端。**数据流、模块职责与槽位契约一律以架构文档为准，此处不复制**——本文件与架构文档各留一份就会出现「改了一处、另一处仍是旧口径」的漂移。
 
 - **完整架构文档**：[docs/architecture.md](docs/architecture.md)——模块职责、插件框架、数据库 schema、server 路由清单、配置项表、设计要点与陷阱。涉及架构的任务先读它。
 - **同步更新义务**（元维护规则）：出现下列改动时，必须回写 `docs/architecture.md` 对应小节：

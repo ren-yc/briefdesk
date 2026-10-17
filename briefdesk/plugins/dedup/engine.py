@@ -468,7 +468,7 @@ class DedupEngine(DedupService):
         无法解析返回 None——None 语义 = 「判定未知」，与 `_parse_same` 的
         None 及 `_collect_verdicts` 的异常整形一致。绝不能返回 False 冒充
         明确 DIFF 判定：strong 短路路径会据此剔除候选，把"最强证据从未
-        成立"伪装成"已否证"，令多数票的分母悄然变小（审查回归）。"""
+        成立"伪装成"已否证"，令多数票的分母悄然变小。"""
         for attempt in (1, 2):
             try:
                 resp = await chat(

@@ -78,12 +78,11 @@ class PluginManager:
 
     def __init__(self, settings: Settings | None = None) -> None:
         self._settings = settings if settings is not None else config
-        self._records: dict[str, PluginRecord] = {}
-        """全部获取到的插件记录（含失败/禁用）"""
+        self._records: dict[str, PluginRecord] = {}  # 全部获取到的插件记录（含失败/禁用）
         self._discovered = False
         self._load_order: list[str] = []  # setup 成功顺序，teardown 逆序
         self._initialized: set[str] = set()
-        #: 插件运行中的设置实例（运行快照来源）；由 _capture_settings 在 setup 后登记
+        # 插件运行中的设置实例（运行快照来源）；由 _capture_settings 在 setup 后登记
         self._plugin_settings: dict[str, Any] = {}
 
     # ── 发现 ──
@@ -520,7 +519,7 @@ class PluginManager:
         name = getattr(obj, "name", None)
         version = str(getattr(obj, "version", ""))
 
-        # 检查obj是不是一个有效的插件实例
+        # 最小契约校验：name 必须是非空字符串（插件其余能力各自按需探测）
         if not isinstance(name, str) or not name:
             self._record_failure(origin, "缺少有效的 name")
             return

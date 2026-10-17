@@ -44,8 +44,8 @@ async def set_reminder(item_id: str, body: dict):
         remind_at = dt.strftime("%Y-%m-%d %H:%M")
     else:
         raise HTTPException(400, "at must be a string or null")
-    # 写路径与 pipeline 共用存储锁串行化：set_item_reminder 是 UPDATE+commit，
-    # 锁外 commit 会把管道未完成的多步写一并提交（部分写入提前可见）
+    # 写路径与 pipeline 共用存储锁串行化：set_item_reminder 是 UPDATE+commit
+    # （不变量见 db.storage_lock 的权威论证）
     async with storage_lock:
         updated = await set_item_reminder(item_id, remind_at)
     if not updated:

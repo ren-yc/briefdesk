@@ -6,7 +6,11 @@
 产物（全部写在 run-dir 内，统一显式 utf-8）：
 
     meta.json       开始工作前写：run_id/features/started_at/pid/db_path/source，
-                    结束时补一条终态记录（type/kind/exit_code/finished_at）
+                    结束时补一条终态记录（type/kind/exit_code/finished_at）。
+                    **双形状**：Web 路径下父进程 supervisor 收尾时整体覆盖写本字段
+                    （改为 type/state/reason，无 kind；覆盖发生在子进程退出之后），
+                    所以 Web 路径的 meta.json 终态是 state 形状，kind 只出现在 CLI
+                    直跑时 runner 自写的形态。测试两侧分别断言这两种形状
     progress.jsonl  每行一条完整 JSON：start | progress | 终态行
     report.json     与既有 payload 同构（前端与图表无需变更）
     report.html     build_html_report 产物

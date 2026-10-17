@@ -1650,7 +1650,7 @@ body.modal-open { overflow: hidden; }
   font-size: 13px; color: var(--text-2);
 }
 
-/* ═══ 第一批新增：搜索历史 / 错误横幅 / 快捷键 / 操作区收纳 ═══ */
+/* ═══ 搜索历史 / 错误横幅 / 快捷键 / 操作区收纳 ═══ */
 
 /* ── 搜索历史下拉（.sidebar-search 子元素，absolute 锚定自身） ── */
 .search-history-dropdown {
