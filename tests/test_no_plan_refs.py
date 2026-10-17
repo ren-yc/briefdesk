@@ -163,6 +163,13 @@ _CASES: list[tuple[str, bool]] = [
     ("# 色值 #F59E0B 与 #fff 两种写法", False),
     (f"# 复核 {'#'}123 的结论", True),
     (f"# 审计 {'#'}1234 的结论", True),
+    # 条目码可带一个分辨子项的小写后缀（同一目拆子项是审查报告的常见写法；
+    # 不放行时这类子项码整体隐身，存量里就有人照着它写注释）
+    (f"# {_ref('F', 6)}a 硬覆盖约束：输出条数=输入条数", True),
+    (f"# {_ref('P', 2)}b：二级说明", True),
+    # 小写字母表只加在「大写字母 + 数字」之后，普通小写标识不受影响
+    ("# v1a 是版本标记不是条目码", False),
+    ("# 模板里的 x1b 转义序列", False),
     # 普通注释
     ("# 关闭后拒绝重建连接，防止残余任务复活", False),
 ]
@@ -203,6 +210,80 @@ def test_css_block_comments_are_scanned() -> None:
     assert len(hits) == 1, hits
     assert hits[0].line == 2
     assert "流水号批次" in hits[0].rule
+
+
+def test_example_and_html_surfaces_are_scanned() -> None:
+    """`.env.example` 的 `#` 注释与 `index.html` 的 `<!-- -->` 同口径入扫。
+
+    失败模式（真实发生过）：`.env.example` 里「见问题报告 §N」是真实漏拦——
+    拓展名不在扫描面时，扫描器对这些文件返回空片段，"没命中"其实是"没扫"。
+    """
+    env = scan_source(".env.example", "# 见问题报告 §4\nKEY=1\n")
+    assert [hit.line for hit in env] == [1], env
+    assert "章节指针" in env[0].rule
+
+    html = scan_source("briefdesk/ui/index.html", "<!-- 方案见 §3 -->\n<p>x</p>\n")
+    assert [hit.line for hit in html] == [1], html
+    assert "章节指针" in html[0].rule
+
+    # 采集面接线也要钉住：漏把后缀加进 _TEXT_SUFFIXES，上面两条仍会绿，
+    # 但全量扫描根本读不到这两个文件
+    tracked = tracked_files(_ROOT)
+    assert any(path.endswith(".example") for path in tracked), "`.example` 未纳入扫描面"
+    assert any(path.endswith(".html") for path in tracked), "`.html` 未纳入扫描面"
+
+
+def test_js_strings_do_not_open_block_comments() -> None:
+    """字符串里的 `/*` 不得开启块注释，否则其后整段代码被当成注释扫。
+
+    失败模式（真实发生过）：`cases/*.fromweb.json` 落在字符串里，朴素状态机把
+    `/*` 当作块注释开口，该文件第 44 行起的代码从此全进扫描面（两百余行）。
+    """
+    source = (
+        "const glob = 'cases/*.fromweb.json';\n"
+        f"const n = 1; // 见 {_ref('F', 2)}\n"
+        "const m = 2;\n"
+    )
+    hits = scan_source("<sample>.js", source)
+    assert [hit.line for hit in hits] == [2], hits
+
+    # 真块注释（含跨行）与模板串里的 `//` 各按各的规则走
+    multi = "/*\n" f" * {_ref('P', 1)}-2 说明\n" " */\nconst x = 1;\n"
+    hits = scan_source("<sample>.js", multi)
+    assert [hit.line for hit in hits] == [2], hits
+
+    template = "const t = `a // b`;\n" f"const y = 1; // 见 {_ref('F', 2)}\n"
+    hits = scan_source("<sample>.js", template)
+    assert [hit.line for hit in hits] == [2], hits
+
+
+def test_claimed_markdown_must_exist_in_tree() -> None:
+    """注释点名的 `.md` 必须在树内，否则读者无法据此回查。
+
+    真实发生过五处：注释引用已被删除的提示词目录与仓库外的缺陷清单，而扫描器
+    只知道 PLAN- / TODO- 一类计划文件名，这类裸文件名一路漏到人工审计才现形。
+    """
+    known = frozenset({"README.md", "docs/architecture.md"})
+
+    missing = scan_source("<sample>.py", "# 模板与 prompts/gone.md 逐字一致\n", known_paths=known)
+    assert len(missing) == 1, missing
+    assert "缺失文档" in missing[0].rule
+
+    assert scan_source("<sample>.py", "# 细节见 docs/architecture.md\n", known_paths=known) == []
+
+    # 带 URL 的行是上游文档链接标签（本仓引用上游文档的唯一方式），不判缺失
+    urled = (
+        "# 见 [upstream-api.md]"
+        "(https://github.com/o/r/blob/v1/docs/upstream-api.md)\n"
+    )
+    assert scan_source("<sample>.py", urled, known_paths=known) == []
+
+    # 通配写法不是具体文件
+    globbed = "# briefdesk/plugins/*/*-api.md 是上游镜像\n"
+    assert scan_source("<sample>.py", globbed, known_paths=known) == []
+
+    # 增量模式没有树快照：同一条文本不传 known_paths 时不得凭空报缺失
+    assert scan_source("<sample>.py", "# 模板与 prompts/gone.md 逐字一致\n") == []
 
 
 @pytest.mark.parametrize(

@@ -8,7 +8,9 @@
   1. 组合编号：中文方括号包裹的「序号 · 条目码」形态；
   2. 归因信号词 + 任意编号：复核 / 审查报告 / 审计 / 排期 / 决策 后面跟编号
      （编号含带圈数字）；
-  3. 条目码：单个大写字母前缀（P / F / C / U / B / S 等）+ 数字，可带次级编号；
+  3. 条目码：单个大写字母前缀（P / F / C / U / B / S 等）+ 数字，可带次级编号，
+     也可带一个分辨子项的小写后缀（「字母 + 数字 + 小写字母」是审查报告里把同一
+     条目拆成子项的常见写法）；
   3b. 反置条目码：数字在前、大写字母在后（外部决策表序号的常见形态），
       只在「见 / 决策 / 条目 / 序号 / 表」一类指针词邻近时判定——裸的「数字+字母」
       与 3D / 5G / 2FA 这类技术名词同形，按形状硬判会连正常行文一起拦下；
@@ -18,7 +20,12 @@
   7. 带圈数字 + 等号 + 码：把就地圈码绑到外部条目表的组合；
   8. 章节指针：§N / §N.M（仓库内没有带章节号的文档；公开标准的章节号豁免）；
   9. 裸归因短语：「审查」紧接「修复 / 回归」且处在标签位（后随冒号 / 括号 / 编号 /
-     行尾），无需编号即指向仓外报告。
+     行尾），无需编号即指向仓外报告；
+  10. 声称的仓库文档不存在：注释里点名的 `.md` 文件在本次扫描的树里找不到。
+      这一条不是猜文件名，而是可证伪的事实——读者按名字去仓库里找不到，注释就
+      等于指向仓外材料（真实发生过：注释引用已被删除的提示词目录与外部缺陷清单）。
+      只在全量扫描生效：增量模式手里没有稳定的树快照，判「不存在」会误伤同时
+      新增的文件；全量扫描随 pytest 与 --tree 必跑，足以兜住存量。
 
 豁免（不构成编号引用）：编码名（UTF-8）、RFC 编号与公开标准的章节号（RFC 5987 §3.2）、
 sha256、C0/C1 控制字符、静态检查码指令及其码表、少量固定技术缩写（见 _EXEMPT）、
@@ -26,8 +33,10 @@ sha256、C0/C1 控制字符、静态检查码指令及其码表、少量固定�
 十六进制颜色字面量（#RRGGBB，至少含一位 A-F），指标语境下的 F 值名，可跟踪的 issue
 编号（形如「#123」，无归因信号词时本就不会命中）、依赖版本号，以及行内显式豁免标记
 allow-plan-ref（用于确实需要保留编号的场景）。豁免片段是**剥离后再扫**，同行其它编号
-照常判定。JS 的行内尾注释与整行注释同样纳入；Python 的采集面是**所有**字符串表达式
-语句（不止各节点首位的 docstring，类体中部的说明串同样扫）；CSS 的 /* */ 块注释纳入。
+照常判定。采集面：JS 的行内尾注释、整行注释与块注释（逐字符状态机，字符串 / 模板串
+里的 `//` `/*` 不算注释开头），Python 的**所有**字符串表达式语句（不止各节点首位的
+docstring，类体中部的说明串同样扫），CSS / HTML 的块注释（`/* */`、`<!-- -->`），
+以及 `.example` 模板文件的 `#` 行注释。
 提交信息只扫会真正进入提交的部分（`#` 注释行与 scissors 之后的 diff 不算）。
 
 用法：
@@ -80,7 +89,11 @@ _R_ATTRIB = (
 # 规则 3：条目码（1-2 个大写字母 + 数字，可带次级编号）。仅大写：小写 v1 之类',
 # 依赖版本号不命中；三字母以上的缩写（RFC8601）因前缀长度限制不命中。
 # 数字位限 1-2：静态检查码（F401 / I001 / UP031 / BLE001）为三位数字，不命中。
-_R_CODE = r"(?<![A-Za-z0-9_])[A-Z]{1,2}[-\u2013\u2014·]?\d{1,2}(?![A-Za-z0-9_])"
+# 允许一个尾随小写字母：审查报告常把同一条目拆成子项（字母 + 数字 + 小写字母），
+# 不放行时这类子项码整体"隐身"——存量里就有人照着它写注释而门禁毫无反应。
+# 误伤面已实测：放开后全库仅命中真实子项码，ES6 / MP3 / F401 一类各自被前缀长度
+# 或既有豁免挡住。
+_R_CODE = r"(?<![A-Za-z0-9_])[A-Z]{1,2}[-\u2013\u2014·]?\d{1,2}[a-z]?(?![A-Za-z0-9_])"
 # 规则 3b：反置条目码（1-2 位数字 + 1-2 个大写字母）——外部决策表的序号形态
 # 是数字在前（「1」+字母），规则 3 结构上看不见它。
 # 判定要求**指针语境**：码前面紧跟「见 / 决策 / 条目 / 序号 / 表」一类词。裸的
@@ -111,6 +124,12 @@ _R_COLON = r"(?<![A-Za-z0-9_])[A-Z]\d{1,2}\s*[：:]"
 _R_PATH = r"(?:IMPLEMENTATION-)?PLAN-[A-Z0-9]|TODO-[A-Z0-9]|\.zcode\b|plan-sess_"
 # 规则 6：流水号批次
 _R_BATCH = r"第\s*[0-9一二三四五六七八九十]+\s*批"
+# 规则 10 的取材模式：注释里点名的 `.md`（可带目录前缀）。首个字符必须是字母数字，
+# 否则 `*-api.md` 这类通配写法会被截成 `-api.md` 当成一个具体文件。
+_R_MD_REF = re.compile(r"(?<![\w./-])(?:[\w-]+/)*\w[\w-]*\.md\b")
+# 带 URL 的行不套规则 10：上游文档镜像的正文不在仓内，但链接指向可公开回查的地址
+# （这也是本仓对上游 API 文档的唯一引用方式），点名的文件名属于链接标签而非仓内路径。
+_URL_LIKE = re.compile(r"https?://|github\.com/|\bblob/")
 
 _RULES: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("组合编号", re.compile(_R_COMBO)),
@@ -182,7 +201,23 @@ _DOMAIN_TOKEN = re.compile(r"\bF1\b")
 # 行内豁免标记：确实需要保留编号时（如引用仓库内文件里的真实标识符）
 _ALLOW_MARKER = "allow-plan-ref"
 
-_TEXT_SUFFIXES = (".py", ".js", ".mjs", ".md", ".yml", ".yaml", ".toml", ".ps1", ".sh", ".css")
+# 纳入扫描面的文本后缀。`.example` 与 `.html` 此前在面外，`.env.example` 里的
+# 「见问题报告 §N」与 `index.html` 的 HTML 注释因此对门禁失明（前者是真实漏拦）。
+# `.svg` 有意不在内：全部是上游图标库的逐字节副本，注释里没有本仓要守的东西。
+_TEXT_SUFFIXES = (
+    ".py",
+    ".js",
+    ".mjs",
+    ".md",
+    ".yml",
+    ".yaml",
+    ".toml",
+    ".ps1",
+    ".sh",
+    ".css",
+    ".html",
+    ".example",
+)
 
 
 @dataclass(frozen=True)
@@ -207,8 +242,19 @@ def _looks_like_prose(line: str) -> bool:
     return bool(_CJK.search(line))
 
 
-def _collect_hits(path: str, line: int, text: str, *, prose: bool = True) -> list[Hit]:
-    """对单个「注释 / 文档片段」套用全部规则。"""
+def _collect_hits(
+    path: str,
+    line: int,
+    text: str,
+    *,
+    prose: bool = True,
+    known_paths: frozenset[str] | None = None,
+) -> list[Hit]:
+    """对单个「注释 / 文档片段」套用全部规则。
+
+    `known_paths` 非空时额外套用规则 10（注释声称的 `.md` 必须在树内）：这一条
+    需要文件树，只有全量扫描能给；增量模式传 None，规则自动休眠。
+    """
     if _ALLOW_MARKER in text:
         return []
     stripped = text
@@ -222,6 +268,13 @@ def _collect_hits(path: str, line: int, text: str, *, prose: bool = True) -> lis
             continue
         if rx.search(stripped):
             matched.append(rule)
+    if known_paths is not None and not _URL_LIKE.search(text):
+        for ref in _R_MD_REF.finditer(stripped):
+            token = ref.group(0)
+            if token in known_paths or Path(token).name in known_paths:
+                continue
+            matched.append("缺失文档")
+            break
     if not matched:
         return []
     # 同一行只报一条（规则名合并），避免基线计数与报告重复膨胀
@@ -263,7 +316,7 @@ def _python_segments(source: str) -> list[tuple[int, str]]:
 
 
 def _line_comment_segments(source: str, markers: tuple[str, ...]) -> list[tuple[int, str]]:
-    """按行注释符号提取片段（JS / shell / yml / toml / ps1）。"""
+    """按行注释符号提取片段（shell / yml / toml / ps1 / .example）。"""
     return [
         (lineno, line)
         for lineno, line in enumerate(source.splitlines(), 1)
@@ -271,85 +324,136 @@ def _line_comment_segments(source: str, markers: tuple[str, ...]) -> list[tuple[
     ]
 
 
-_JS_LINE_START = ("//", "*", "/*")
+_JS_STRINGS = {"'": "single", '"': "double", "`": "template"}
 
 
-def _js_trailing_comment_segments(source: str) -> list[tuple[int, str]]:
-    """提取 JS 代码行末尾的 `// ...` 注释（整行注释由 _line_comment_segments 负责）。
+def _js_comment_segments(source: str) -> list[tuple[int, str]]:
+    """JS / MJS：逐字符状态机提取注释内容（整行、行尾、块注释一并处理）。
 
-    `//` 之前的代码里三种引号都成对时才视为注释起点，排除字符串/模板串内的
-    `//`（如 URL）；`://` 视为 URL 不切。正则字面量里的 `//` 极少见，不处理。
-    此前只扫整行注释，`let a = 1; // <条目码>` 在三种模式下都放行。
+    为什么要逐字符走而不是按行找标记：注释开头与字符串里的 `/` `*` 同形，
+    按行判断必然要把「这一行的引号成对了吗」当成启发式。此前的实现就栽在这里
+    ——`ui.js` 里 `cases/*.fromweb.json` 的 `/*` 落在**字符串内**，朴素状态机
+    把它当成块注释开口，之后再也没有 `*/`，于是该文件第 44 行起两百多行代码
+    全被当成"注释正文"扫描（`--tree` 恰好零命中才没炸，但代码行一旦出现形似
+    条目码的标识符就会误报）。
+
+    覆盖：`//` 行注释（含行尾）、`/* */` 块注释（含跨行）、单/双引号串与模板串
+    的转义、模板串跨行。不覆盖：正则字面量（`/a\\/b/`）与 JSX 文本——仓库不用。
     """
     segments: list[tuple[int, str]] = []
-    for lineno, line in enumerate(source.splitlines(), 1):
-        if line.lstrip().startswith(_JS_LINE_START):
-            continue
-        start = 0
-        while True:
-            idx = line.find("//", start)
-            if idx < 0:
-                break
-            prefix = line[:idx]
-            if idx > 0 and line[idx - 1] == ":":
-                start = idx + 2
+    buf: list[str] = []
+    line = 1
+    state = "code"
+    i = 0
+    total = len(source)
+
+    def flush() -> None:
+        if buf:
+            segments.append((line, "".join(buf)))
+            buf.clear()
+
+    while i < total:
+        ch = source[i]
+        pair = source[i : i + 2]
+        if state == "code":
+            if pair == "//":
+                state = "line"
+                i += 2
                 continue
-            if all(prefix.count(q) % 2 == 0 for q in ('"', "'", "`")):
-                segments.append((lineno, line[idx:]))
-                break
-            start = idx + 2
+            if pair == "/*":
+                state = "block"
+                i += 2
+                continue
+            if ch in _JS_STRINGS:
+                state = _JS_STRINGS[ch]
+            elif ch == "\n":
+                line += 1
+        elif state == "line":
+            if ch == "\n":
+                flush()
+                state = "code"
+                line += 1
+            else:
+                buf.append(ch)
+        elif state == "block":
+            if pair == "*/":
+                flush()
+                state = "code"
+                i += 2
+                continue
+            if ch == "\n":
+                flush()
+                line += 1
+            else:
+                buf.append(ch)
+        else:  # 处于字符串内：注释标记一律不算
+            if ch == "\\":
+                # 反斜杠转义的下一个字符不参与状态判定；但「反斜杠 + 换行」是
+                # 字符串续行，行号仍要前进，否则其后所有行号整体偏移。
+                if source[i + 1 : i + 2] == "\n":
+                    line += 1
+                i += 2
+                continue
+            if ch == "\n":
+                line += 1
+                # 单/双引号串不跨行（未闭合视为该行结束），模板串继续
+                if state != "template":
+                    state = "code"
+            elif (state == "single" and ch == "'") or (
+                state == "double" and ch == '"'
+            ) or (state == "template" and ch == "`"):
+                state = "code"
+        i += 1
+    flush()
     return segments
 
 
-def _block_comment_segments(
+def _markup_comment_segments(
     source: str, opener: str, closer: str
 ) -> list[tuple[int, str]]:
-    """提取块注释片段（JS 的 /* */）。行内的末尾注释由调用方另行处理。"""
-    segments: list[tuple[int, str]] = []
-    inside = False
-    for lineno, line in enumerate(source.splitlines(), 1):
-        if inside or opener in line:
-            segments.append((lineno, line))
-            if closer in line and not inside:
-                continue
-        if opener in line and closer not in line.split(opener, 1)[1]:
-            inside = True
-        elif inside and closer in line:
-            inside = False
-    return segments
+    """CSS / HTML：提取块注释的内容行（`/* */` 与 `<!-- -->`）。
 
-
-def _css_comment_segments(source: str) -> list[tuple[int, str]]:
-    """CSS：提取 /* */ 块注释的内容行。
-
-    此前 .css 不在扫描面，style.css 里的流水号批次措辞一路漏到人工审计才现形
-    （AGENTS「不在面内」小节记录过的失明）。整行按 /* 开、*/ 闭的朴素状态机
-    切；CSS 里没有字符串转义注释的惯用法，误切只会多扫属性行，由 _collect_hits
-    的编号形态门槛兜住（属性行不含中文/条目码，不会命中）。
+    CSS 的块注释此前不在扫描面，`style.css` 里的流水号批次措辞一路漏到人工审计
+    才现形。标记本身在 CSS / HTML 里是字面量（没有字符串转义注释的惯用法），
+    逐行找开口与收口即可；误切只会多扫几行属性 / 标签，由编号形态门槛兜住。
     """
     segments: list[tuple[int, str]] = []
     inside = False
     for lineno, line in enumerate(source.splitlines(), 1):
         buf = line
         if inside:
-            if "*/" in buf:
-                segments.append((lineno, buf[: buf.index("*/")]))
+            if closer in buf:
+                segments.append((lineno, buf[: buf.index(closer)]))
                 inside = False
-                buf = buf[buf.index("*/") + 2 :]
+                buf = buf[buf.index(closer) + len(closer) :]
             else:
                 segments.append((lineno, buf))
                 continue
-        while "/*" in buf:
-            start = buf.index("/*")
-            rest = buf[start + 2 :]
-            if "*/" in rest:
-                segments.append((lineno, rest[: rest.index("*/")]))
-                buf = rest[rest.index("*/") + 2 :]
+        while opener in buf:
+            start = buf.index(opener)
+            rest = buf[start + len(opener) :]
+            if closer in rest:
+                segments.append((lineno, rest[: rest.index(closer)]))
+                buf = rest[rest.index(closer) + len(closer) :]
             else:
                 segments.append((lineno, rest))
                 inside = True
                 break
     return segments
+
+
+def _css_comment_segments(source: str) -> list[tuple[int, str]]:
+    """CSS：`/* */` 块注释。"""
+    return _markup_comment_segments(source, "/*", "*/")
+
+
+def _html_comment_segments(source: str) -> list[tuple[int, str]]:
+    """HTML：`<!-- -->` 注释。
+
+    此前 `.html` 整体不在扫描面（`briefdesk/ui/index.html` 的 HTML 注释对门禁
+    失明），与 `.example` 同属"往这些文件写注释不享受兜底"的盲区。
+    """
+    return _markup_comment_segments(source, "<!--", "-->")
 
 
 def _fenced_lines(source: str) -> list[tuple[int, str]]:
@@ -371,21 +475,21 @@ def iter_segments(path: str, source: str) -> list[tuple[int, str]]:
     if suffix == ".py":
         return _python_segments(source)
     if suffix in (".js", ".mjs"):
-        return (
-            _line_comment_segments(source, _JS_LINE_START)
-            + _js_trailing_comment_segments(source)
-            + _block_comment_segments(source, "/*", "*/")
-        )
+        return _js_comment_segments(source)
     if suffix == ".md":
         return _fenced_lines(source)
     if suffix == ".css":
         return _css_comment_segments(source)
-    if suffix in (".yml", ".yaml", ".toml", ".ps1", ".sh"):
+    if suffix == ".html":
+        return _html_comment_segments(source)
+    if suffix in (".yml", ".yaml", ".toml", ".ps1", ".sh", ".example"):
         return _line_comment_segments(source, ("#",))
     return []
 
 
-def scan_source(path: str, source: str) -> list[Hit]:
+def scan_source(
+    path: str, source: str, *, known_paths: frozenset[str] | None = None
+) -> list[Hit]:
     """扫描单个文件内容的注释 / 文档片段。"""
     hits: list[Hit] = []
     seen: set[tuple[int, int]] = set()
@@ -394,7 +498,7 @@ def scan_source(path: str, source: str) -> list[Hit]:
         if key in seen:
             continue
         seen.add(key)
-        hits.extend(_collect_hits(path, lineno, text))
+        hits.extend(_collect_hits(path, lineno, text, known_paths=known_paths))
     return hits
 
 
@@ -424,6 +528,12 @@ def _git(args: list[str], *, cwd: Path | None = None) -> str:
     return proc.stdout
 
 
+def _tracked_paths(root: Path | None = None) -> list[str]:
+    """全部跟踪文件路径（不按后缀过滤）。规则 10 要拿它判「这个 .md 在不在」。"""
+    out = _git(["ls-files"], cwd=root)
+    return [line for line in out.splitlines() if line]
+
+
 def tracked_files(root: Path | None = None) -> list[str]:
     """列出纳入扫描的跟踪文件（排除未跟踪的本地计划产物）。
 
@@ -431,11 +541,8 @@ def tracked_files(root: Path | None = None) -> list[str]:
     （如 tests/）跑 pytest 而 git 仍在 cwd 执行，拼到 root 后文件不存在，
     读取失败被静默跳过，全量扫描零命中「通过」——等于没扫。
     """
-    out = _git(["ls-files"], cwd=root)
     return [
-        line
-        for line in out.splitlines()
-        if line and line.lower().endswith(_TEXT_SUFFIXES)
+        path for path in _tracked_paths(root) if path.lower().endswith(_TEXT_SUFFIXES)
     ]
 
 
@@ -448,6 +555,10 @@ def scan_tree(root: Path | None = None) -> list[Hit]:
     退出码 1、pytest 守卫的断言）都看得见。
     """
     base = root or Path.cwd()
+    paths = _tracked_paths(base)
+    # 同时收全体路径与裸文件名：注释里两种写法都有（docs/architecture.md /
+    # architecture.md），只要能在树里找到就算可回查。
+    known_paths = frozenset(paths) | frozenset(Path(p).name for p in paths)
     hits: list[Hit] = []
     for rel in tracked_files(base):
         path = base / rel
@@ -456,7 +567,7 @@ def scan_tree(root: Path | None = None) -> list[Hit]:
         except (OSError, UnicodeDecodeError) as error:
             hits.append(Hit(rel, 0, "读取失败", f"{type(error).__name__}：该文件未纳入扫描"))
             continue
-        hits.extend(scan_source(rel, source))
+        hits.extend(scan_source(rel, source, known_paths=known_paths))
     return hits
 
 
