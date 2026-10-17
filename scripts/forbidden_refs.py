@@ -6,17 +6,28 @@
 
 命中规则（详见 _RULES，示例一律写成占位形态，避免规则文本自我命中）：
   1. 组合编号：中文方括号包裹的「序号 · 条目码」形态；
-  2. 归因信号词 + 任意编号：复核 / 审查报告 / 审计 / 排期 后面跟编号；
+  2. 归因信号词 + 任意编号：复核 / 审查报告 / 审计 / 排期 / 决策 后面跟编号
+     （编号含带圈数字）；
   3. 条目码：单个大写字母前缀（P / F / C / U / B / S 等）+ 数字，可带次级编号；
+  3b. 反置条目码：数字在前、大写字母在后（外部决策表序号的常见形态），
+      只在「见 / 决策 / 条目 / 序号 / 表」一类指针词邻近时判定——裸的「数字+字母」
+      与 3D / 5G / 2FA 这类技术名词同形，按形状硬判会连正常行文一起拦下；
   4. 单字母码 + 冒号：字母数字码后紧跟中文或英文冒号；
   5. 计划 / 会话产物路径：本地计划文件名、会话产物目录名；
-  6. 流水号批次：第 N 批。
+  6. 流水号批次：第 N 批；
+  7. 带圈数字 + 等号 + 码：把就地圈码绑到外部条目表的组合；
+  8. 章节指针：§N / §N.M（仓库内没有带章节号的文档；公开标准的章节号豁免）；
+  9. 裸归因短语：「审查」紧接「修复 / 回归」且处在标签位（后随冒号 / 括号 / 编号 /
+     行尾），无需编号即指向仓外报告。
 
-豁免（不构成编号引用）：编码名（UTF-8）、RFC 编号、sha256、C0/C1 控制字符、
-静态检查码指令及其码表、少量固定技术缩写（见 _EXEMPT）、指标语境下的 F 值名，
-可跟踪的 issue 编号（形如「#123」，无归因信号词时本就不会命中）、依赖版本号，
-以及行内显式豁免标记 allow-plan-ref（用于确实需要保留编号的场景）。豁免片段
-是**剥离后再扫**，同行其它编号照常判定。JS 的行内尾注释与整行注释同样纳入。
+豁免（不构成编号引用）：编码名（UTF-8）、RFC 编号与公开标准的章节号（RFC 5987 §3.2）、
+sha256、C0/C1 控制字符、静态检查码指令及其码表、少量固定技术缩写（见 _EXEMPT）、
+容量单位（数字+MB/GB 一类封闭后缀）、千次记法（数字+K）、HTTP 状态类通配（数字+XX）、
+十六进制颜色字面量（#RRGGBB，至少含一位 A-F），指标语境下的 F 值名，可跟踪的 issue
+编号（形如「#123」，无归因信号词时本就不会命中）、依赖版本号，以及行内显式豁免标记
+allow-plan-ref（用于确实需要保留编号的场景）。豁免片段是**剥离后再扫**，同行其它编号
+照常判定。JS 的行内尾注释与整行注释同样纳入；Python 的采集面是**所有**字符串表达式
+语句（不止各节点首位的 docstring，类体中部的说明串同样扫）；CSS 的 /* */ 块注释纳入。
 提交信息只扫会真正进入提交的部分（`#` 注释行与 scissors 之后的 diff 不算）。
 
 用法：
@@ -54,17 +65,46 @@ _CJK = re.compile(r"[\u3400-\u9fff\uf900-\ufaff\u3000-\u303f\uff00-\uffef]")
 
 # 规则 1：组合编号（中文方括号 + 序号 + 分隔符 + 条目码）
 _R_COMBO = r"【\s*\d+\s*[·・]\s*P?\d+\s*】"
-# 规则 2：归因信号词 + 编号。数字后接中文量词（其次 / 第 3 条）不算编号引用。
+# 规则 2：归因信号词 + 编号。数字后接中文量词（其次 / 第 3 条 / 复核 3 处）不算编号
+# 引用——量词表要把常用的一并收进来，漏一个就让「决策 3 项待定」「复核 2 处调用点」
+# 这类正常行文被拦下，作者只能改写或加 allow-plan-ref，反而稀释这个机制。
+# 「决策」入词表：后接 ① / 编号时是「外部决策表的第 N 条」这一指针形态；
+# 单独短语（「注册决策顺序」「设计决策」）不命中——规则要求词后紧跟编号。
+# 带圈数字入编号侧：决策表把圈码当条目序号的存量即此形态。
 _R_ATTRIB = (
-    r"(?:复核|审查报告|审计|排期)\s*[【#]?\s*"
-    r"(?:P\d+(?:[-\u2013\u2014·]\d+)?|[A-Z]{1,2}-?\d{1,3}|#?\d{1,4})"
+    r"(?:复核|审查报告|审计|排期|决策)\s*[【#]?\s*"
+    r"(?:P\d+(?:[-\u2013\u2014·]\d+)?|[A-Z]{1,2}-?\d{1,3}|[\u2460-\u2469]|#?\d{1,4})"
     # (?!\d) 防回溯：四位年份不能被截成前三位而绕过后面的量词排除
-    r"(?!\d)(?!\s*[次条个轮遍张年月日])"
+    r"(?!\d)(?!\s*[次条个轮遍张年月日项处步类种版页周位人篇段行倍秒分千层档件套组家所章节句字])"
 )
 # 规则 3：条目码（1-2 个大写字母 + 数字，可带次级编号）。仅大写：小写 v1 之类',
 # 依赖版本号不命中；三字母以上的缩写（RFC8601）因前缀长度限制不命中。
 # 数字位限 1-2：静态检查码（F401 / I001 / UP031 / BLE001）为三位数字，不命中。
 _R_CODE = r"(?<![A-Za-z0-9_])[A-Z]{1,2}[-\u2013\u2014·]?\d{1,2}(?![A-Za-z0-9_])"
+# 规则 3b：反置条目码（1-2 位数字 + 1-2 个大写字母）——外部决策表的序号形态
+# 是数字在前（「1」+字母），规则 3 结构上看不见它。
+# 判定要求**指针语境**：码前面紧跟「见 / 决策 / 条目 / 序号 / 表」一类词。裸的
+# 「数字+1-2 字母」与常见技术量纲同形且无法区分——3D / 5G / 2FA / 1M 行在技术
+# 注释里很常见，按形状硬判会把它们一起拦下（合法提交被迫改写或加 allow-plan-ref，
+# 反而稀释这个机制）。代价是孤立的「1B」不再命中：那种写法本身没有上下文，
+# 读者也还原不出它指什么。量纲豁免（MB/GB、K、XX）仍在 _EXEMPT 里剥离。
+_R_CODE_REV = (
+    r"(?:参见|见|依据|按照|决策表|决策|条目|序号|表格|表)\s*"
+    r"\d{1,2}[A-Z]{1,2}(?![A-Za-z0-9_])"
+)
+# 规则 7：带圈数字 + 等号 + 码——把就地圈码绑到外部条目表的组合才是指针。
+# 单独出现的圈码是仓库文档的正当编号手段（architecture/dedup 大量使用），
+# 不命中：等号右侧限 1-2 位数字（可带字母后缀），「①=24px」这类不会误伤。
+_R_CIRCLED = r"[\u2460-\u2469]\s*[=＝]\s*\d{1,2}[A-Z]?(?![A-Za-z0-9_])"
+# 规则 8：章节指针——仓库内没有带章节号的文档，出现即指向仓外材料。
+# 两个例外：上游版本钉定的 API 文档（行内 allow-plan-ref 保留）；公开标准的
+# 章节号（在 _EXEMPT 里连同标准名一起剥离，与「RFC 编号」同等对待）。
+_R_SECTION = r"§\s*\d+(?:\.\d+)?"
+# 规则 9：裸归因短语——「审查」与「修复 / 回归」的连写形态，即使没跟编号也指向
+# 仓外审查报告。判定要求它处在**标签位**：后随冒号 / 右括号 / 顿号 / 编号 / 行尾。
+# 「代码审查修复了竞态」这类动词连写没有标签形态，不命中（早期版本按子串硬判，
+# 把正常行文也拦下了）。
+_R_ATTRIB_PHRASE = r"(?:审查修复|审查回归)(?=\s*(?:[：:）)、,，]|[#【]|$))"
 # 规则 4：单字母码 + 冒号（仅用于注释 / 文档语境，见 _looks_like_prose）
 _R_COLON = r"(?<![A-Za-z0-9_])[A-Z]\d{1,2}\s*[：:]"
 # 规则 5：计划 / 会话产物路径
@@ -76,6 +116,10 @@ _RULES: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("组合编号", re.compile(_R_COMBO)),
     ("归因词+编号", re.compile(_R_ATTRIB)),
     ("条目码", re.compile(_R_CODE)),
+    ("反置条目码", re.compile(_R_CODE_REV)),
+    ("带圈数字=码", re.compile(_R_CIRCLED)),
+    ("章节指针", re.compile(_R_SECTION)),
+    ("裸归因短语", re.compile(_R_ATTRIB_PHRASE)),
     ("字母码+冒号", re.compile(_R_COLON)),
     ("计划产物路径", re.compile(_R_PATH)),
     ("流水号批次", re.compile(_R_BATCH)),
@@ -90,6 +134,11 @@ _EXEMPT = tuple(
     re.compile(p, re.IGNORECASE)
     for p in (
         r"UTF-\d+",
+        # 公开标准的章节号（RFC 5987 里的 3.2 节一类）：标准名与章节号都可公开
+        # 回查，与 RFC 编号本身同等对待。必须排在下面的「RFC 编号」之前——剥离
+        # 是顺序执行的，先剥掉标准名就再也认不出后面那个章节指针。
+        # 剥离范围限「标准名 + 章节号」整段，无标准名的孤立章节指针照常命中。
+        r"(?:RFC|ISO|IEC|IEEE|ECMA|ANSI|POSIX|Unicode|W3C)\s*[\d.]*\s*§\s*\d+(?:\.\d+)?",
         r"RFC\s*\d+",
         r"\bsha\d+\b",
         r"\bC0\b",
@@ -105,6 +154,23 @@ _EXEMPT = tuple(
         r"\bP(?:50|75|90|95|99)\b",  # 延迟分位
         r"\bA4\b",  # 纸张
         r"\bEC2\b",
+        # 容量单位（1.6MB / 16MB/回填批 / 1GB 上限）：数字+大写字母与反置条目码
+        # 同形，但单位字母表封闭（KB/MB/GB/TB），读者一望即知不是编号。
+        r"\d+(?:\.\d+)?(?:KB|MB|GB|TB)\b",
+        # 千次记法 / K 作变量（「3K 次」= 3×键数 K 的构建次数）：同为
+        # 数字+单字母，但后随量词「次」或独立成词，不是码。
+        r"(?<![A-Za-z0-9_])\d+K(?![A-Za-z0-9_])",
+        # HTTP 状态类通配（1XX/2XX/…/5XX，vendor 生成代码的注释）：
+        # 数字+双字母形态与反置条目码相同，但 X 不是条目码的数字后缀。
+        r"(?<![A-Za-z0-9_])[1-5]XX(?![A-Za-z0-9_])",
+        # CSS / 十六进制颜色字面量（#F59E0B / #fff）：进入 .css 扫描面后与
+        # 「#数字+字母」形态混淆，按颜色语法整体剥离。
+        # 要求 3-8 位里**至少含一个 A-F**：纯数字的 3 位或 4 位写法不是颜色语法
+        # 的必要形态，却正好是「归因词 + #号数字」这类 issue 编号——早期版本按
+        # `#[0-9A-F]{3,8}` 整段吞掉（IGNORECASE 下纯数字也算），把旧版能拦的
+        # 归因编号一起吃掉了。「#数字+字母」的三色位仍会被放过：它确实是合法 CSS
+        # 颜色写法，宁可漏一个可疑条目码，也不误伤样式表。
+        r"#(?=[0-9A-F]{3,8}\b)[0-9A-F]*[A-F][0-9A-F]*",
     )
 )
 # 领域术语：F1 既是审查条目码，也是分类/判重指标（精确率与召回率的调和平均），
@@ -116,7 +182,7 @@ _DOMAIN_TOKEN = re.compile(r"\bF1\b")
 # 行内豁免标记：确实需要保留编号时（如引用仓库内文件里的真实标识符）
 _ALLOW_MARKER = "allow-plan-ref"
 
-_TEXT_SUFFIXES = (".py", ".js", ".mjs", ".md", ".yml", ".yaml", ".toml", ".ps1", ".sh")
+_TEXT_SUFFIXES = (".py", ".js", ".mjs", ".md", ".yml", ".yaml", ".toml", ".ps1", ".sh", ".css")
 
 
 @dataclass(frozen=True)
@@ -178,17 +244,21 @@ def _python_segments(source: str) -> list[tuple[int, str]]:
         tree = ast.parse(source)
     except SyntaxError:
         return segments
+    # 采集面 = **所有**作为表达式语句出现的字符串，而不是只取各节点 body[0]
+    # 的真 docstring。失败模式（真实发生过）：测试类把说明写成类体里的裸字符串，
+    # 位置在 autouse fixture 之后——ast.get_docstring 取不到它，整段文字对门禁
+    # 完全失明，违规编号就这样留在仓库里（回归见 tests/test_no_plan_refs.py 的
+    # test_non_leading_string_expression_is_collected）。
+    # 代价是普通多行字符串字面量（如 HTML 夹具）也进扫描面：豁免表与「非文档
+    # 语境」的判断因此必须一起扩，宁可多报由人工确认，不做静默放过。
     for node in ast.walk(tree):
-        if not isinstance(
-            node, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
-        ):
+        if not isinstance(node, ast.Expr):
             continue
-        doc = ast.get_docstring(node, clean=False)
-        if not doc:
+        value = node.value
+        if not (isinstance(value, ast.Constant) and isinstance(value.value, str)):
             continue
-        start = node.body[0].lineno
-        for offset, text in enumerate(doc.splitlines()):
-            segments.append((start + offset, text))
+        for offset, text in enumerate(value.value.splitlines()):
+            segments.append((node.lineno + offset, text))
     return segments
 
 
@@ -249,6 +319,39 @@ def _block_comment_segments(
     return segments
 
 
+def _css_comment_segments(source: str) -> list[tuple[int, str]]:
+    """CSS：提取 /* */ 块注释的内容行。
+
+    此前 .css 不在扫描面，style.css 里的流水号批次措辞一路漏到人工审计才现形
+    （AGENTS「不在面内」小节记录过的失明）。整行按 /* 开、*/ 闭的朴素状态机
+    切；CSS 里没有字符串转义注释的惯用法，误切只会多扫属性行，由 _collect_hits
+    的编号形态门槛兜住（属性行不含中文/条目码，不会命中）。
+    """
+    segments: list[tuple[int, str]] = []
+    inside = False
+    for lineno, line in enumerate(source.splitlines(), 1):
+        buf = line
+        if inside:
+            if "*/" in buf:
+                segments.append((lineno, buf[: buf.index("*/")]))
+                inside = False
+                buf = buf[buf.index("*/") + 2 :]
+            else:
+                segments.append((lineno, buf))
+                continue
+        while "/*" in buf:
+            start = buf.index("/*")
+            rest = buf[start + 2 :]
+            if "*/" in rest:
+                segments.append((lineno, rest[: rest.index("*/")]))
+                buf = rest[rest.index("*/") + 2 :]
+            else:
+                segments.append((lineno, rest))
+                inside = True
+                break
+    return segments
+
+
 def _fenced_lines(source: str) -> list[tuple[int, str]]:
     """Markdown：跳过 ``` 围栏内的代码块，其余行视为正文。"""
     segments: list[tuple[int, str]] = []
@@ -275,6 +378,8 @@ def iter_segments(path: str, source: str) -> list[tuple[int, str]]:
         )
     if suffix == ".md":
         return _fenced_lines(source)
+    if suffix == ".css":
+        return _css_comment_segments(source)
     if suffix in (".yml", ".yaml", ".toml", ".ps1", ".sh"):
         return _line_comment_segments(source, ("#",))
     return []

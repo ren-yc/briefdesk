@@ -45,6 +45,11 @@ def _ref(letter: str, number: int) -> str:
     return f"{letter}{number}"
 
 
+def _rev_ref(number: int, letter: str) -> str:
+    """运行期拼接反置条目码（数字在前）：同 _ref，字面量会命中规则 3b。"""
+    return f"{number}{letter}"
+
+
 def test_diff_scan_ignores_unchanged_old_lines() -> None:
     """未改动的旧行不在新增行集合内：即使同文件别处有编号，也不得报出。"""
     source = "\n".join(
@@ -95,6 +100,16 @@ _CASES: list[tuple[str, bool]] = [
     ("# 见 PLAN-XY.md", True),
     # 规则 6：流水号批次
     ("# 第一批改动", True),
+    # 规则 3b：反置条目码（数字在前，外部决策表序号形态）
+    (f"# 见决策表 {_rev_ref(1, 'B')} 的落地", True),
+    # 规则 7：带圈数字 + 等号 + 码（把就地圈码绑到外部条目表）
+    (f"# 决策 {'①'}={_rev_ref(1, 'B')}", True),
+    # 规则 8：章节指针（仓库内没有带章节号的文档）
+    ("# 契约见 §3.2 的说明", True),
+    ("# 契约见 §7 的说明", True),
+    # 规则 9：裸归因短语（无编号也指向仓外审查报告）
+    (f"# {'审查'}修复：示例", True),
+    (f"# {'审查'}回归：示例", True),
     # 豁免：编码名 / RFC 编号 / 控制字符（规则文本本身不得自我命中）
     ("# 统一 UTF-8 编码，避免 U+FFFD", False),
     ("# 非 ASCII 基名走 RFC 5987 扩展", False),
@@ -110,16 +125,44 @@ _CASES: list[tuple[str, bool]] = [
     ("# 关联 Fixes #123 的修复", False),
     # 豁免：行内显式标记
     (f"# {_ref('XY', 3)} allow-plan-ref 保留理由", False),
+    ("# §4 allow-plan-ref 指向版本钉定的上游文档", False),
     # 归因词后接中文量词属于自然行文，不构成编号引用
     ("# 审计第三次发现该问题", False),
     # 归因词后接四位年份：正则不得截断年份绕过量词排除
     ("# 安全审计 2026 年复查", False),
+    # 「决策」短语不带编号时是正当用语（注册决策顺序 / 设计决策）
+    ("# 注册决策顺序都是参数→守卫→路径→密钥", False),
+    ("# 有意不覆盖是设计决策，防回归", False),
     # 常见技术缩写与条目码同形，白名单放过
     ("# 用 ES6 模块语法与 MD5 摘要，P95 延迟", False),
+    # 豁免：容量单位 / 千次记法 / HTTP 状态类通配（反置条目码同形的技术量纲）
+    ("# 单批内存上界约 16MB/回填批，1.6MB 的图也要防", False),
+    ("# 全量重建 = 1GB 上限内的 3K 次构建", False),
+    ("# 404 与 1XX 到 5XX 的其它状态另行处理", False),
     # 豁免是剥离片段而非整行放行：同行夹带的真实编号仍须命中
     (f"# noqa: F401 —— 见复核 {_ref('P', 2)}-18", True),
     (f"# 精确率与召回率的调和平均 F1，另见 {_ref('F', 2)}", True),
     (f"# 参考 RFC 5987 与 {_ref('H', 2)}", True),
+    (f"# 上限 16MB，另见决策 {_rev_ref(2, 'A')}", True),
+    # 就地圈码（无等号绑定）是正当编号手段，不命中
+    ("# 三点：① 快路取账号；② 兜底不硬失败；③ 定夺交上游", False),
+    # 反置条目码只在指针词邻近时判定：裸「数字+字母」是技术名词，不命中
+    ("# 支持 3D 打印与 5G 网络抖动", False),
+    ("# 2B 铅笔 / 3C 数码 / 2FA 双因素", False),
+    ("# 1M 行数据的估算上限", False),
+    # 归因词后接常用量词（项 / 处 / 千）同样是自然行文
+    ("# 决策 3 项待定", False),
+    ("# 复核 3 处调用点", False),
+    ("# 审计 2 千条记录", False),
+    # 公开标准的章节号可公开回查，与标准编号同等豁免；孤立章节指针仍命中
+    ("# 按 RFC 5987 的 3.2 节做扩展", False),
+    ("# ISO 32000 的 7.5 节语法", False),
+    # 「审查 + 修复/回归」处在动词位（后随「了」）不是归因标签
+    (f"# 代码{'审查'}修复了并发竞态", False),
+    # 十六进制颜色豁免要求含 A-F：纯数字的三位形态仍是归因编号
+    ("# 色值 #F59E0B 与 #fff 两种写法", False),
+    (f"# 复核 {'#'}123 的结论", True),
+    (f"# 审计 {'#'}1234 的结论", True),
     # 普通注释
     ("# 关闭后拒绝重建连接，防止残余任务复活", False),
 ]
@@ -129,6 +172,37 @@ _CASES: list[tuple[str, bool]] = [
 def test_rule_matching(text: str, expected: bool) -> None:
     """规则与豁免的自证：样例必须命中，豁免样例必须放过。"""
     assert bool(scan_source("<sample>.py", text)) is expected
+
+
+def test_non_leading_string_expression_is_collected() -> None:
+    """类体中部的裸字符串说明与 docstring 同口径入采集面。
+
+    失败模式（真实发生过）：测试类把说明写在 autouse fixture 之后——它不是
+    docstring，旧实现只取各节点 body[0] 的 ast.get_docstring，整段文字对门禁
+    失明，违规编号就这样留在仓库里。
+    """
+    source = (
+        "class Sample:\n"
+        "    def setUp(self):\n"
+        "        pass\n"
+        f'    "{_ref("XY", 3)} 类体中部说明"\n'
+    )
+    hits = scan_source("<sample>.py", source)
+    assert len(hits) == 1, hits
+    assert hits[0].line == 4
+
+    # 普通字符串字面量（赋值右侧、列表元素）不是注释语境，不得误收
+    benign = 'DATA = [\n    "XY3 夹具内容",\n]\n'
+    assert scan_source("<sample>.py", benign) == []
+
+
+def test_css_block_comments_are_scanned() -> None:
+    """CSS 的 /* */ 注释纳入扫描面（此前 .css 整体失明）。"""
+    source = "/* 说明 */\n.x { color: red; } /* 流水号批次 第 3 批 */\n"
+    hits = scan_source("<sample>.css", source)
+    assert len(hits) == 1, hits
+    assert hits[0].line == 2
+    assert "流水号批次" in hits[0].rule
 
 
 @pytest.mark.parametrize(
