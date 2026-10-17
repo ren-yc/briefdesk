@@ -1,9 +1,9 @@
-"""OpenAI 兼容 AI 供应商引擎 — chat（共享客户端 / thinking 与 JSON 开关 / 并发预算）与嵌入。
+"""OpenAI 兼容 AI 供应商引擎 — chat（共享客户端 / 推理强度与 JSON 开关 / 并发预算）与嵌入。
 
 由 ai_provider 插件持有本引擎；引擎模块（classify/dedup/merge）不直接
-import 本模块，统一经 core 的 briefdesk.ai_ports 端口函数调用。
-loads_json / top_k_similar 为供应商无关工具，定义收归 briefdesk.ai_ports，
-此处 re-export 供实验脚本与测试路径兼容。
+import 本模块，统一经 core 的 briefdesk.ai_ports 端口函数调用。供应商无关的
+工具（JSON 修复解析、余弦相似度）定义在 briefdesk.ai_ports，本模块不 re-export
+——需要它们的一方直接 import 端口模块，避免同一符号两处来源。
 """
 
 import asyncio
@@ -20,7 +20,6 @@ from openai.types import CreateEmbeddingResponse
 from openai.types.chat import ChatCompletion, ChatCompletionMessageParam
 
 from briefdesk import announcements
-from briefdesk.ai_ports import loads_json, top_k_similar  # noqa: F401 — re-export
 from briefdesk.config import config
 from briefdesk.plugin.base import AIProvider, ChatResponse
 
@@ -138,7 +137,6 @@ def _reasoning_kwargs(key: tuple[str, str]) -> dict[str, Any]:
     if mode in ("auto", "omit"):
         return {}
     if mode == "off":
-        # 记忆命中 = 该端点曾明确拒收该参数：不再发送，省掉每次都撞一次 400
         return {} if key in _effort_rejected else {"reasoning_effort": "none"}
     return {"reasoning_effort": mode}
 
@@ -173,8 +171,8 @@ def _names_reasoning_effort(exc: APIStatusError) -> bool:
 async def _create_with_effort_fallback(key: tuple[str, str], call: Any) -> ChatCompletion:
     """带一次能力降级的调用（**必须在已持有并发许可处调用**，内部不再取许可）。
 
-    只对「端点明确拒收 reasoning_effort」降级：改为不发送该参数并记住，避免后续每次
-    调用都撞一次 400（该参数在 OpenAI 规范里是 Optional，省略即交给服务端默认）。
+    只对「端点明确拒收 reasoning_effort」降级：改为不发送该参数并记住，避免后续
+    每次调用都撞一次 400（记忆的键设计与不落盘理由见 _effort_rejected 上方）。
     其它错误原样抛出——把无关 400 也吞成重试会掩盖真配置错误。
     并发首撞时各请求都会各重试一次（可接受的启动成本），但记忆与告警只落一次：
     check 与 add 之间没有 await，事件循环内原子。

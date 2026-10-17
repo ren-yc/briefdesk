@@ -167,6 +167,10 @@ def build_settings_schema(
     `next_run`（下次基准运行开始解析并冻结）/ `next_cleanup`（下次运行目录
     清理时重读）。语义归属在模型侧——核心不认识插件字段，硬编码映射会让
     每个非重启字段都得改核心；与 labels/hints 同形经参数传入是既有扩展面。
+
+    传参的键名口径必须记清：`labels` / `hints` / `warnings` / `apply_when` 按
+    **字段名**（log_level）查，`options` 按**环境键名**（LOG_LEVEL）查。调用方
+    以键名建前四张字典会恒落空且不报错（静默失去文案，字段仍正常渲染）。
     """
     settings: BaseSettings | None = instance
     if settings is None and running:
@@ -202,8 +206,6 @@ def build_settings_schema(
             "applyWhen": apply_when.get(name, "restart"),
             "running": running,
         }
-        if not running:
-            item.pop("current", None)
         if number_kind is not None:
             item["numberKind"] = number_kind
         if name in hints:

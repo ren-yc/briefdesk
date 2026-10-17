@@ -128,13 +128,17 @@ def _core_schema() -> list[dict[str, Any]]:
     必须重建而不是缓存：expected_* 是「按当前文件重新解析」的语义，缓存会把它
     冻结在 import 时刻，用户改完文件后看到的下次启动值仍是旧的；current/source
     来自运行快照，重建不改变其时点。
+
+    文案来源：核心字段的中文 label/hint/warn 由下面的 `_CORE_UI` 覆盖循环给出
+    （按 item["key"] 即环境键名 update），未收录进 `_CORE_UI` 的字段回落
+    `_label_from_name` 的英文标签——补文案就往 `_CORE_UI` 加条目，不要改回向
+    build_settings_schema 传 labels/hints/warnings：它按**字段名**（log_level）
+    查，而这里手里只有环境键名（LOG_LEVEL），传了恒落空且不报错（静默失去
+    文案）。options 是例外：schema 侧按 key 查、真实生效。
     """
     items = build_settings_schema(
         Settings,
         config,
-        labels={key: value["label"] for key, value in _CORE_UI.items() if "label" in value},
-        hints={key: value["hint"] for key, value in _CORE_UI.items() if "hint" in value},
-        warnings={key: value["warn"] for key, value in _CORE_UI.items() if "warn" in value},
         options={
             "LOG_LEVEL": ["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
             # 必须按环境键名登记：settings_schema 以 key 判 select，否则字段只会渲染成
@@ -148,11 +152,8 @@ def _core_schema() -> list[dict[str, Any]]:
 
 
 #: 核心密钥条目：**静态元数据**（label/plugin/白名单键名），从 KEYRING_FIELDS
-#: 派生保持单一真源。不再携带 configured——configured 曾冻结在 import 期快照里，
-#: 运行中删 keyring/改环境变量时徽章谎报（进程实测复现：真实链与 composed_value
-#: 均已无值、冻结 meta 仍报已配置）。现由 `_secret_effective` 每请求按当前解析
-#: 链判定（口径定义见 docs/architecture.md 密钥徽章小节；回归见
-#: tests/test_settings_env.py 的陈旧快照守卫用例）。键集合由用例钉住
+#: 派生保持单一真源。不携带 configured——徽章的 configured 由 `_secret_effective`
+#: 每请求按当前解析链活判定（动机与边界见该函数 docstring）。键集合由用例钉住
 #: == set(Settings.KEYRING_FIELDS.values())。
 _SECRET_LABELS = {
     "AI_API_KEY": "AI API Key",
@@ -246,8 +247,9 @@ def _secret_effective(name: str, *, keyring_truthy: bool | None = None) -> bool:
     留了空串行时「层存在」但真实链采纳 `''`，按存在判会谎报「已配置」（失败模式
     回归见 tests/test_settings_env.py 的空串覆盖用例）。
 
-    替代旧实现里 import 期冻结的 `configured`（真实链已无值而徽章谎报已配置，
-    进程实测复现；守卫见 tests/test_settings_env.py 的陈旧快照用例）。
+    替代旧实现里 import 期冻结的 `configured`：真实链已无值而徽章谎报已配置
+    （进程实测复现；守卫见 tests/test_settings_env.py 的陈旧快照用例）。本节是
+    这条口径的**单点权威**，其余调用点只写一行指针。
     成立前提：各 Settings 模型零参构造且不传 `_env_file`——`composed_value` 看不见
     init 与 file_secret 层，当前核心与全部插件均满足，将来若有用注入形态构造
     密钥，本判定与真实链漂移。已知 exotic 边界：同一 dotenv 文件内大小写变体键
@@ -521,8 +523,8 @@ def _normalize(key: str, raw: str, schema: list[dict[str, Any]] | None = None) -
 async def api_settings_env():
     """启动配置面板数据：元数据 + 生效/暂存/来源 + 密钥状态 + 文件路径。
 
-    插件侧 schema 本请求只构建一次（非密钥项与密钥项共用）：每项含逐字段的
-    来源判定与一次实例构造，构建两遍把面板打开的成本直接翻倍。
+    插件侧 schema 本请求只构建一次（非密钥项与密钥项共用）——每项含逐字段来源
+    判定与一次实例构造，构建遍数与面板打开成本成正比（设计要点见 architecture）。
     """
     staged = read_staged()
     dynamic = get_settings_schema()
@@ -539,8 +541,8 @@ async def api_settings_env():
         name = meta["key"]
         # keyringConfigured = 钥匙串里有真值条目（独立徽章，语义冻结：前端靠它
         # 决定输入框隐藏与「替换/清除」入口，不随 configured 口径改动）。
-        # 插件密钥项同样走活判定：旧口径未装配插件 + env/.env 有值时报「未配置」
-        # （settings is None → configured=None 被 bool 吞掉），活判定顺带修掉
+        # 插件密钥项同样走活判定（见 _secret_effective）：未装配插件时
+        # settings is None，硬编码或快照取值都会与真实链分叉。
         keyring_truthy = _keyring_secret_truthy(name)
         secrets.append(
             {
@@ -592,11 +594,11 @@ async def api_settings_env_put(payload: EnvPutPayload):
     raw_items = payload.items
     if not isinstance(raw_items, dict):
         raise HTTPException(422, "请求体须为 {items: {KEY: value|null}}")
-    # 白名单与单键校验共用**写入前**的一份 schema：旧实现对每个键各重建全量
-    # （白名单/规范化/回传 = 3K 次，每次含逐字段来源判定与一次实例构造），
-    # 路由是 async def 而构建同步读盘——多键保存会冻结事件循环，SSE 与全部
-    # API 一起停摆。构建数由 tests/test_settings_env.py 的 SchemaRebuildCountTest
-    # 直接钉住（计数比时间断言确定）。
+    # 白名单与单键校验共用**写入前**的一份 schema：构建是同步读盘而路由是
+    # async def，逐键重建会让多键保存冻结事件循环、SSE 与全部 API 一起停摆
+    # （成本论证见 architecture 的设计要点）。构建数由
+    # tests/test_settings_env.py 的 SchemaRebuildCountTest 直接钉住（计数比
+    # 时间断言确定）。
     pre_schema = _all_schema()
     updates: dict[str, str | None] = {}
     for key, raw in raw_items.items():
@@ -671,8 +673,8 @@ async def api_settings_env_put(payload: EnvPutPayload):
             },
         ) from exc
     # expected_* 必须反映**提交后**的文件状态（pre_schema 里的下次启动值是写前的），
-    # 所以回传阶段重建一份、全部受影响键共用——一次成功 PUT 的构建数因此是 2
-    # （写前 + 写后两个时点），而不是 3K。失败路径（409/422/500）走不到这里。
+    # 所以回传阶段重建一份、全部受影响键共用——一次成功 PUT 的构建数因此恒为 2
+    # （写前 + 写后两个时点），与提交键数无关。失败路径（409/422/500）走不到这里。
     post_schema = _all_schema()
     return {
         "ok": True,
@@ -720,10 +722,9 @@ async def api_secrets_delete(name: str):
     else:
         delete_secret(name)
     # configured 是否仍为真取决于该密钥是否另有环境变量/.env 等低层配置——只有
-    # 服务端能判定，回传供前端行级贴片（keyringConfigured 删除后恒为 False）。
-    # 活判定（_secret_effective）取代旧口径「删除后第二次构建 _secret_schema() 取
-    # meta」——那次取的是 import 期冻结值（删除后仍谎报已配置）。注意：**白名单那次
-    # 构建（:712 附近）仍必须保留**，它校验的是密钥名合法性，与本判定无关。
+    # 服务端能判定，回传供前端行级贴片（keyringConfigured 删除后恒为 False）；
+    # 判定口径见 _secret_effective。注意：**上方的白名单构建仍必须保留**，它校验
+    # 密钥名合法性，与 configured 判定无关。
     return {
         "ok": True,
         "name": name,

@@ -45,14 +45,14 @@ _IMAGE_MAGIC: tuple[tuple[bytes, str], ...] = (
 )
 
 
-def _sniff_content_type(content: bytes, fallback: str = "") -> str:
-    """按魔数嗅探图片类型；识别失败返回 fallback。"""
+def _sniff_content_type(content: bytes) -> str:
+    """按魔数嗅探图片类型；识别失败返回空串（调用方据此走「未知类型」分支）。"""
     if content.startswith(b"RIFF") and content[8:12] == b"WEBP":
         return "image/webp"
     for magic, ctype in _IMAGE_MAGIC:
         if content.startswith(magic):
             return ctype
-    return fallback
+    return ""
 
 
 # 允许内联展示的安全位图类型（与魔数嗅探集合一致）。
