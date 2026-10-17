@@ -84,6 +84,11 @@ _CORE_UI: dict[str, dict[str, Any]] = {
     "AI_API_KEY": {"label": "AI API Key"},
     "AI_API_BASE": {"label": "AI API 地址"},
     "AI_MODEL": {"label": "AI 模型"},
+    "AI_JSON_MODE": {
+        "label": "JSON 严格输出模式",
+        "hint": "auto=启发式（ollama 端点或 deepseek-v4 系列模型）；"
+                "on=强制开启 response_format=json_object；off=强制关闭",
+    },
     "AI_MAX_CONCURRENCY": {"label": "AI 请求最大并发", "hint": "0 = 不限制；本地模型建议设为 1"},
     "AI_REASONING_EFFORT": {
         "label": "AI 推理强度",
@@ -105,6 +110,10 @@ _CORE_UI: dict[str, dict[str, Any]] = {
     "REALTIME_BATCH_MAX_COUNT": {"label": "实时批缓冲条数", "hint": "攒够条数触发 AI 处理；调大可省 token、实时性略降"},
     "REALTIME_BATCH_TIMEOUT_MS": {"label": "实时批缓冲超时（毫秒）"},
     "BACKFILL_BATCH_MAX_COUNT": {"label": "回填批量（条）", "hint": "回填时单次 AI 分类合并条数；调大省 token"},
+    "POLL_INTERVAL_SECONDS": {
+        "label": "周期同步间隔（秒）",
+        "hint": "0 = 禁用；>0 时按该间隔补齐 SSE 断连窗口的消息（与「同步消息」同路径，进行中互斥）",
+    },
     "POLL_OVERLAP_SECONDS": {"label": "轮询重叠窗口（秒）", "hint": "吸收增量轮询边界偏差；重叠部分去重无 AI 开销"},
     "DEDUP_SIMILARITY_THRESHOLD": {"label": "去重字符重叠阈值"},
     "EMBED_API_BASE": {"label": "嵌入 API 地址", "hint": "留空则禁用嵌入向量去重与相关功能"},

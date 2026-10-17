@@ -526,8 +526,8 @@ class TestReadyGate:
     async def test_404_with_not_found_ok_returns_none(self):
         """会话不存在（brandsessionholder 等）404 → None，由调用方降级。
 
-        上游 sessions 端点仍会列出无消息表的聚合会话，messages 查询对其
-        返回 404（见 bug.md 问题 2，未修），故该兜底必须保留。
+        上游 sessions 会把没有消息表的聚合会话一并列出（如 brandsessionholder），
+        对这些会话查 messages 必然 404——这不是错误，故 404 兜底必须保留。
         """
         client = _client_with_transport(
             lambda _r: httpx.Response(404, json={"success": False, "code": 404})

@@ -240,9 +240,9 @@ class EnsureReadyRejectedStateTest(unittest.IsolatedAsyncioTestCase):
     async def test_mismatch_error_is_not_a_not_ready_error(self):
         """最关键的防回归：账号不符**不能**被当成瞬态未就绪。
 
-        QqFlowNotReadyError 会被 poller/runtime 静默跳过本轮（poller.py:120 等），
-        若不符错误继承了它，这个修复就完全失效 —— 用户看不到 lastError，
-        他人消息继续静默入库。
+        QqFlowNotReadyError 会被 poller/runtime 静默跳过本轮（如 qqflow poller 的
+        `except QqFlowNotReadyError` 分支），若不符错误继承了它，这个修复就完全失效
+        —— 用户看不到 lastError，他人消息继续静默入库。
         """
         assert issubclass(QqFlowAccountMismatchError, SourceError)
         assert not issubclass(QqFlowAccountMismatchError, QqFlowNotReadyError), "不符是稳态故障，必须冒泡，不能走瞬态静默跳过的路径"

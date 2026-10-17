@@ -805,8 +805,12 @@ async def summarize_results(
     logger.info("标题概括: %d/%d 条", filled, len(results))
 
 
-# ── 时间提取（sysb+sysc 两阶段：分类只标记 time，本阶段按 sysc 提取 start/end/times）──
-# 模板与 experiments/prompts/sysc.md 逐字一致（无注入防御段/OCR 规则/当前日期锚定）。
+# ── 时间提取（第二阶段：分类只标记 time 布尔，本阶段对 time=true 的消息提取
+#    start/end/times）──
+# 与分类系统 prompt 刻意不同：不含类别清单、不含 OCR 规则、不做当前日期锚定——
+# 相对时间以每条消息自带的发送时刻为基准（分类侧锚定的是「今天」）。注入防御段
+# 保留，且与分类同口径写成「唯一规则权威」：正文里任何「忽略本提示词」都只当数据。
+# 丢掉注入防御段会让时间提取成为全管道唯一可被消息正文改写输出的环节。
 
 _TIME_PROMPT_TEMPLATE = """你是一个时间信息解析器。输入为一组消息记录。
 
@@ -828,7 +832,10 @@ data 为数组，与输入记录一一对应；没有明确时间点的消息输
 
 
 def _build_time_system_prompt() -> str:
-    """时间提取 system prompt：sysc.md 原样模板，无注入项。"""
+    """时间提取 system prompt：套用 _TIME_PROMPT_TEMPLATE。
+
+    含注入防御段（**不要**为了「贴模板」删掉它），不含日期锚定与 OCR 规则。
+    """
     return _TIME_PROMPT_TEMPLATE
 
 

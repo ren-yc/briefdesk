@@ -279,7 +279,8 @@ class SettingsSchemaTest(unittest.TestCase):
 
     def test_core_settings_expose_vision_fields(self) -> None:
         # vision 路由：新配置项自动进入核心设置 schema（设置页白名单表单），
-        # label/hint 经 _CORE_UI 覆盖层按 env key 合入（routes_settings_env.py:95-96）
+        # label/hint 经 _CORE_UI 覆盖层按 env key 合入（routes_settings_env 的
+        # _core_schema 覆盖循环）
         from briefdesk.server.routes_settings_env import _core_schema
 
         by_key = {item["key"]: item for item in _core_schema()}
@@ -293,6 +294,32 @@ class SettingsSchemaTest(unittest.TestCase):
         self.assertEqual(max_images["numberKind"], "integer")
         self.assertEqual(max_images["min"], 1)
         self.assertEqual(max_images["max"], 20)
+
+    def test_every_core_field_has_curated_copy(self) -> None:
+        """核心字段必须有中文文案，且 _CORE_UI 不得含未知键。
+
+        失败模式（真实发生过）：新增 Settings 字段时忘了在 `_CORE_UI` 补条目，
+        设置页照常渲染、接口照常返回，只是标题回落成 `_label_from_name` 的下划线
+        拆词英文（`POLL_INTERVAL_SECONDS` → `Poll Interval Seconds`）——没有守卫
+        就只能靠肉眼在设置页发现。反向也要查：键名拼错时覆盖静默失效。
+        """
+        from briefdesk.config import Settings
+        from briefdesk.server.routes_settings_env import _CORE_UI
+        from briefdesk.settings_schema import _field_key
+
+        keys = {_field_key(Settings, name) for name in Settings.model_fields}
+        self.assertEqual(
+            sorted(keys - set(_CORE_UI)),
+            [],
+            "这些核心设置缺中文文案（未收录进 _CORE_UI，设置页会显示英文标签）",
+        )
+        self.assertEqual(
+            sorted(set(_CORE_UI) - keys),
+            [],
+            "_CORE_UI 里有 Settings 不认识的键（键名拼写错误时覆盖静默失效）",
+        )
+        for key, copy in _CORE_UI.items():
+            self.assertTrue(copy.get("label"), f"{key} 的 label 不能为空")
 
 
 class DefaultFactorySchemaTest(unittest.TestCase):
