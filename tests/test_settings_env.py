@@ -597,70 +597,57 @@ class EnvRoutesTest(StagedFileTestCase):
             self.assertIn(item["source"], ("default", "dotenv"))
 
     def test_secret_set_get_delete(self) -> None:
-        # 测试只验证 keyring 的写删；宿主项目 .env 可能有真实配置，需排除其
-        # 对“删除 keyring 后仍已配置”的有效影响。
-        core_schema = [
-            {**item, "configured": False}
-            for item in settings_routes._CORE_SECRET_SCHEMA
-        ]
-        with patch.object(settings_routes, "_CORE_SECRET_SCHEMA", core_schema):
-            res = self.client.post(
-                "/api/settings/secrets",
-                json={"name": "AI_API_KEY", "value": _VALID_SECRET},
-            )
-            self.assertEqual(res.status_code, 200)
-            # 钥匙串写入成功即两枚为真（行级贴片依据）
-            self.assertIs(res.json()["configured"], True)
-            self.assertIs(res.json()["keyringConfigured"], True)
-            data = self.client.get("/api/settings/env").json()
-            ai = next(s for s in data["secrets"] if s["name"] == "AI_API_KEY")
-            self.assertTrue(ai["configured"])
-            self.assertTrue(ai["keyringConfigured"])
-            # 明文永不回传
-            self.assertNotIn(_VALID_SECRET, json.dumps(data))
-            res = self.client.delete("/api/settings/secrets/AI_API_KEY")
-            self.assertEqual(res.status_code, 200)
-            # 删除后 keyringConfigured 恒 False；configured 取决于是否另有
-            # 环境变量/.env 配置（本用例核心 schema 快照 configured=False）
-            self.assertIs(res.json()["keyringConfigured"], False)
-            self.assertIs(res.json()["configured"], False)
-            ai = next(
-                s
-                for s in self.client.get("/api/settings/env").json()["secrets"]
-                if s["name"] == "AI_API_KEY"
-            )
-            self.assertFalse(ai["configured"])
-            self.assertFalse(ai["keyringConfigured"])
-            # 幂等删除
-            self.assertEqual(
-                self.client.delete("/api/settings/secrets/AI_API_KEY").status_code,
-                200,
-            )
+        # 活链路冒烟：写入→GET/回传两枚为真、删除→两枚为假，全程无需再 patch
+        # 核心 schema 常量（configured 已改按当前解析链现读，import 期快照不再
+        # 参与判定）。conftest 的 autouse 夹具保证 env/项目 .env 层干净。
+        res = self.client.post(
+            "/api/settings/secrets",
+            json={"name": "AI_API_KEY", "value": _VALID_SECRET},
+        )
+        self.assertEqual(res.status_code, 200)
+        self.assertIs(res.json()["configured"], True)
+        self.assertIs(res.json()["keyringConfigured"], True)
+        data = self.client.get("/api/settings/env").json()
+        ai = next(s for s in data["secrets"] if s["name"] == "AI_API_KEY")
+        self.assertTrue(ai["configured"])
+        self.assertTrue(ai["keyringConfigured"])
+        # 明文永不回传
+        self.assertNotIn(_VALID_SECRET, json.dumps(data))
+        res = self.client.delete("/api/settings/secrets/AI_API_KEY")
+        self.assertEqual(res.status_code, 200)
+        # 删除即未配置：钥匙串空了、也没有任何低层补位（夹具隔离了 env/.env）
+        self.assertIs(res.json()["keyringConfigured"], False)
+        self.assertIs(res.json()["configured"], False)
+        ai = next(
+            s
+            for s in self.client.get("/api/settings/env").json()["secrets"]
+            if s["name"] == "AI_API_KEY"
+        )
+        self.assertFalse(ai["configured"])
+        self.assertFalse(ai["keyringConfigured"])
+        # 幂等删除
+        self.assertEqual(
+            self.client.delete("/api/settings/secrets/AI_API_KEY").status_code,
+            200,
+        )
 
     def test_secret_separates_effective_and_keyring_configuration(self) -> None:
-        core_schema = [
-            {**item, "configured": item["key"] == "AI_API_KEY"}
-            for item in settings_routes._CORE_SECRET_SCHEMA
-        ]
-        with patch.object(settings_routes, "_CORE_SECRET_SCHEMA", core_schema), patch.object(
-            settings_routes, "get_secret", return_value=None
-        ):
+        # 两枚状态独立：env 层有值而钥匙串无条目 → configured=True、
+        # keyringConfigured=False。旧实现靠 patch import 期常量伪造 configured
+        # （正是缺陷温床）；现在按真实注入断言，import 期快照里根本没有该值。
+        with patch.dict(os.environ, {"AI_API_KEY": _VALID_SECRET}):
             data = self.client.get("/api/settings/env").json()
         ai = next(s for s in data["secrets"] if s["name"] == "AI_API_KEY")
         self.assertTrue(ai["configured"])
         self.assertFalse(ai["keyringConfigured"])
+        self.assertNotIn(_VALID_SECRET, json.dumps(data), "configured 只出布尔，不回显值")
 
     def test_keyring_empty_string_not_configured(self) -> None:
         # keyring 空串条目不得判「已配置」——`secrets set X ""`
         # 会在钥匙串留下空串，is not None 会误报已配置，与实际解析链相反。
-        core_schema = [
-            {**item, "configured": False}
-            for item in settings_routes._CORE_SECRET_SCHEMA
-        ]
-        with patch.object(settings_routes, "_CORE_SECRET_SCHEMA", core_schema), patch.object(
-            settings_routes, "get_secret", return_value=""
-        ):
-            data = self.client.get("/api/settings/env").json()
+        # 直接给 fake backend 灌空串（比 patch get_secret 更真实地走读取路径）。
+        keyring.set_password("briefdesk", "AI_API_KEY", "")
+        data = self.client.get("/api/settings/env").json()
         ai = next(s for s in data["secrets"] if s["name"] == "AI_API_KEY")
         self.assertFalse(ai["configured"])
         self.assertFalse(ai["keyringConfigured"], "空串条目应判未配置")
@@ -676,6 +663,144 @@ class EnvRoutesTest(StagedFileTestCase):
         self.assertEqual(res.status_code, 422)
         self.assertEqual(
             self.client.delete("/api/settings/secrets/OTHER").status_code, 422
+        )
+
+
+class SecretConfiguredLiveTest(StagedFileTestCase):
+    """configured 徽章的活判定契约：按当前解析链现读，import 期快照不得生效。
+
+    失败模式（本组用例逐条对应）：旧实现的 configured 冻结在 import 期——
+    运行中删掉钥匙串条目/环境变量后，徽章持续谎报「已配置」直到重启，用户按
+    谎报的来源排查却找不到东西。判定只认**胜出值的真值**，不认层存在性：
+    环境变量留了空串行时真实解析链采纳 ''（未配置），按「层存在」判会谎报。
+    （独立基座 + 自建 client——继承 EnvRoutesTest 会把父类用例重复收集。）
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.client = TestClient(
+            srv.app,
+            base_url="http://localhost",
+            headers={"Origin": "http://localhost"},
+        )
+
+    def _ai_state(self) -> tuple[bool, bool]:
+        s = next(
+            x
+            for x in self.client.get("/api/settings/env").json()["secrets"]
+            if x["name"] == "AI_API_KEY"
+        )
+        return s["configured"], s["keyringConfigured"]
+
+    def test_stale_import_snapshot_never_wins(self) -> None:
+        """杀「configured 读 import 期 meta」回归的稳定形态。
+
+        patch 常量提供的是**陈旧 True**（编码用户症状的成因：import 期当时确有
+        配置），同时各实时层全空——断言活状态胜出（False）。旧消费逻辑在此必红
+        （它信 meta），干净 CI 上同样成立，不依赖宿主环境。
+        """
+        stale = [
+            {**item, "configured": True}
+            for item in settings_routes._CORE_SECRET_SCHEMA
+        ]
+        with patch.object(settings_routes, "_CORE_SECRET_SCHEMA", stale):
+            configured, keyring_configured = self._ai_state()
+        self.assertFalse(
+            configured,
+            "import 期冻结值不得压过实时判定（夹具已隔离 keyring/env/.env 各层）",
+        )
+        self.assertFalse(keyring_configured)
+
+    def test_env_empty_string_is_not_configured(self) -> None:
+        """空串压制形态：环境变量 `AI_API_KEY=` 时真实链采纳 ''（未配置）。
+
+        按「层存在」判（source != default / 层列表非空）在此会谎报 True——
+        这是活判定实现的红线；与 KeyringSource 的真值过滤同口径。
+        """
+        with patch.dict(os.environ, {"AI_API_KEY": ""}):
+            configured, _ = self._ai_state()
+        self.assertFalse(configured, "空串胜出值应按未配置，不得按层存在谎报")
+
+    def test_project_dotenv_layer_counts_as_configured(self) -> None:
+        """项目 .env 层的密钥值也是「已配置（环境变量/.env）」，钥匙串不沾光。"""
+        with tempfile.TemporaryDirectory() as d:
+            project = Path(d) / ".env"
+            project.write_text(f"AI_API_KEY={_VALID_SECRET}\n", encoding="utf-8")
+            with (
+                patch.object(paths, "project_dotenv_path", return_value=project),
+                _env_without("AI_API_KEY"),
+            ):
+                configured, keyring_configured = self._ai_state()
+                body = self.client.get("/api/settings/env").text
+        self.assertTrue(configured)
+        self.assertFalse(keyring_configured, "dotenv 配置不得报成钥匙串配置")
+        self.assertNotIn(_VALID_SECRET, body, "判定读盘只出布尔，响应不得回显值")
+
+    def test_db_keys_unparseable_segments_are_not_configured(self) -> None:
+        """DB_KEYS 判定必须走 get_db_keys()（分段合并＋JSON 校验）而非 get_secret()。
+
+        失败模式：往规范名塞一段非 JSON（模拟坏数据/截断），get_secret 视角
+        「有条目」，解析链视角值不可用（''）——判定若用 get_secret 会在 POST 回传
+        谎报已配置，而紧接着的 GET 说未配置，同一资源两个答案。
+        """
+        keyring.set_password("briefdesk", "WEFLOW_DB_KEYS", "not-json")
+        # 宿主 shell 若导出过 WEFLOW_DB_KEYS，低层会补位成有效值让本用例只在
+        # 开发机红（conftest 只清核心 Settings 的键，DB_KEYS 属插件域）——
+        # 判据必须只看 keyring 段本身，显式排除环境变量层。
+        with _env_without("WEFLOW_DB_KEYS"):
+            data = self.client.get("/api/settings/env").json()
+        db = next(s for s in data["secrets"] if s["name"] == "WEFLOW_DB_KEYS")
+        self.assertFalse(db["configured"], "坏 JSON 的库密钥映射不是有效配置")
+        self.assertFalse(
+            db["keyringConfigured"],
+            "keyringConfigured 同样必须走分段+解析校验（与 _read_value 同源）",
+        )
+
+    def test_keyring_field_names_parity_with_env_keys(self) -> None:
+        """全部模型 KEYRING_FIELDS 值 == field_env_key 值（活判定的承重前提）。
+
+        失败模式：`_secret_effective` 用 schema/env 键查 keyring，而真实链
+        `KeyringSource._read_value` 用 `KEYRING_FIELDS` 的值查——两串分叉时徽章
+        静默报未配置（查了个不存在的名），旧实现从实例取值不受此影响，是活判定
+        **新引入**的耦合。今天 10 对全等；此用例把它变成响亮失败。
+        """
+        from pydantic_settings import BaseSettings
+
+        from briefdesk.plugins.qqflow.config import QqFlowSettings
+        from briefdesk.plugins.rag.config import RagSettings
+        from briefdesk.plugins.weflow.config import WeFlowSettings
+        from briefdesk.plugins.weflow_legacy.config import WeFlowLegacySettings
+
+        models: list[type[BaseSettings]] = [
+            Settings,
+            WeFlowSettings,
+            WeFlowLegacySettings,
+            QqFlowSettings,
+            RagSettings,
+        ]
+        pairs: set[tuple[str, str]] = set()
+        for model in models:
+            for field_name, secret_name in getattr(model, "KEYRING_FIELDS", {}).items():
+                pairs.add((secret_name, field_env_key(model, field_name)))
+        self.assertEqual(len(pairs), 10, f"密钥对数与现状不符：{len(pairs)} 对——新增密钥时同步核对")
+        for secret_name, env_key in pairs:
+            self.assertEqual(
+                env_key,
+                secret_name,
+                f"{secret_name} 的 keyring 查找名与 env 键分叉，活判定会静默报未配置",
+            )
+
+    def test_core_secret_keys_match_keyring_fields(self) -> None:
+        """静态元数据的键集合钉住 == Settings.KEYRING_FIELDS 值集。
+
+        旧实现从 _core_schema() 过滤 secret 派生（SecretStr 注解口径）；静态化
+        改为从 KEYRING_FIELDS 派生（解析链口径）——两条口径今天等价，将来某人
+        只加 SecretStr 字段不登记 KEYRING_FIELDS（或反之）时分叉，白名单会静默
+        漏键。此用例把等价性变成响亮失败。
+        """
+        self.assertEqual(
+            {item["key"] for item in settings_routes._CORE_SECRET_SCHEMA},
+            set(Settings.KEYRING_FIELDS.values()),
         )
 
 

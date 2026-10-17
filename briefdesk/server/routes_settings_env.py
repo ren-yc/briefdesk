@@ -45,6 +45,7 @@ from briefdesk.settings_env import (
     StagedCommitError,
     StagedReadError,
     commit_staged_write,
+    composed_value,
     get_settings_file,
     prepare_staged_write,
     read_staged,
@@ -146,9 +147,13 @@ def _core_schema() -> list[dict[str, Any]]:
     return items
 
 
-#: 核心密钥条目：密钥只下发 configured/掩码，不参与覆盖态（无值时点语义）
-_CORE_SECRET_SCHEMA = [item for item in _core_schema() if item.get("secret")]
-
+#: 核心密钥条目：**静态元数据**（label/plugin/白名单键名），从 KEYRING_FIELDS
+#: 派生保持单一真源。不再携带 configured——configured 曾冻结在 import 期快照里，
+#: 运行中删 keyring/改环境变量时徽章谎报（进程实测复现：真实链与 composed_value
+#: 均已无值、冻结 meta 仍报已配置）。现由 `_secret_effective` 每请求按当前解析
+#: 链判定（口径定义见 docs/architecture.md 密钥徽章小节；回归见
+#: tests/test_settings_env.py 的陈旧快照守卫用例）。键集合由用例钉住
+#: == set(Settings.KEYRING_FIELDS.values())。
 _SECRET_LABELS = {
     "AI_API_KEY": "AI API Key",
     "EMBED_API_KEY": "嵌入 API Key",
@@ -161,6 +166,11 @@ _SECRET_LABELS = {
     "QQFLOW_KEY": "qqflow 引导密钥",
     "RAG_API_KEY": "RAG 问答 API Key",
 }
+
+_CORE_SECRET_SCHEMA: list[dict[str, Any]] = [
+    {"key": name, "label": _SECRET_LABELS.get(name, name), "plugin": "", "secret": True}
+    for name in Settings.KEYRING_FIELDS.values()
+]
 
 
 def _all_schema(dynamic: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
@@ -211,6 +221,49 @@ def _secret_schema(dynamic: list[dict[str, Any]] | None = None) -> list[dict[str
             seen.add(key)
             unique.append(item)
     return unique
+
+
+def _keyring_secret_truthy(name: str) -> bool:
+    """钥匙串里该密钥是否有真值条目（keyringConfigured 徽章的语义，不得挪用）。
+
+    `WEFLOW_DB_KEYS` 走 `get_db_keys()`：分段合并后 `json.loads` 校验不通过时
+    返回 None——用 `get_secret(规范名)` 判会把「存了下落的坏段」报成已配置，
+    与解析链（`KeyringSource._read_value` 同函数）矛盾（回归见
+    tests/test_settings_env.py 的 DB_KEYS 坏 JSON 用例）。空串条目按未配置：
+    `secrets set X ""` 留的空串不得以「已配置」压过环境变量/.env 的有效值
+    （与 `KeyringSource.__call__` 的真值过滤同口径）。
+    """
+    if name == DB_KEYS_BASE:
+        return get_db_keys() is not None
+    return bool(get_secret(name))
+
+
+def _secret_effective(name: str, *, keyring_truthy: bool | None = None) -> bool:
+    """该密钥按**当前完整解析链**是否有有效值（configured 徽章的活判定）。
+
+    口径 = keyring > 环境变量 > 项目 .env > 暂存 的胜出值真值：keyring 层真值，
+    否则 `composed_value` 胜出值的真值。**只判胜出值、不判层存在性**——环境变量
+    留了空串行时「层存在」但真实链采纳 `''`，按存在判会谎报「已配置」（失败模式
+    回归见 tests/test_settings_env.py 的空串覆盖用例）。
+
+    替代旧实现里 import 期冻结的 `configured`（真实链已无值而徽章谎报已配置，
+    进程实测复现；守卫见 tests/test_settings_env.py 的陈旧快照用例）。
+    成立前提：各 Settings 模型零参构造且不传 `_env_file`——`composed_value` 看不见
+    init 与 file_secret 层，当前核心与全部插件均满足，将来若有用注入形态构造
+    密钥，本判定与真实链漂移。已知 exotic 边界：同一 dotenv 文件内大小写变体键
+    并存时，pydantic 的 `parse_env_vars` 取末个、`_lookup_value` 取首个非 None——
+    徽章可能与真实链不一致（与 `source_of` 共享的既有口径差，未另修）。
+    keyring 查找名与 env 键必须同串（本判定用 schema 键查 keyring，真实链
+    `KeyringSource` 用 `KEYRING_FIELDS` 值查）；parity 由用例钉住，分叉即假值。
+    隐私红线：判定经 `composed_value` 读真实文件，只返回 bool；任何日志、异常
+    detail 与响应都不得带出取值。
+    """
+    if keyring_truthy is None:
+        keyring_truthy = _keyring_secret_truthy(name)
+    if keyring_truthy:
+        return True
+    value, _source = composed_value(name)
+    return bool(value)
 
 
 def _schema_of(key: str, schema: list[dict[str, Any]] | None = None) -> dict:
@@ -484,22 +537,20 @@ async def api_settings_env():
     secrets = []
     for meta in _secret_schema(dynamic):
         name = meta["key"]
-        if name == DB_KEYS_BASE:
-            keyring_configured = get_db_keys() is not None
-        else:
-            # 按真值判定而非 is not None——`secrets set X ""` 会在
-            # 钥匙串留下空串条目，is not None 会误判「已配置」，与解析链
-            # （configured_names 等按真值）相反，UI 显示已配置但实际无效。
-            keyring_configured = bool(get_secret(name))
+        # keyringConfigured = 钥匙串里有真值条目（独立徽章，语义冻结：前端靠它
+        # 决定输入框隐藏与「替换/清除」入口，不随 configured 口径改动）。
+        # 插件密钥项同样走活判定：旧口径未装配插件 + env/.env 有值时报「未配置」
+        # （settings is None → configured=None 被 bool 吞掉），活判定顺带修掉
+        keyring_truthy = _keyring_secret_truthy(name)
         secrets.append(
             {
                 "name": name,
                 "label": meta.get("label", _SECRET_LABELS.get(name, name)),
                 "plugin": meta.get("plugin", ""),
-                # configured = 当前解析链是否有有效值；keyringConfigured 只表示
-                # 是否存在钥匙串条目，避免环境变量/.env 配置被误报为钥匙串配置。
-                "configured": bool(meta.get("configured")) or keyring_configured,
-                "keyringConfigured": keyring_configured,
+                # configured = 按当前解析链是否有有效值（活判定，见 _secret_effective）；
+                # keyringConfigured 只表示钥匙串条目，避免环境变量/.env 配置被误报为钥匙串配置。
+                "configured": _secret_effective(name, keyring_truthy=keyring_truthy),
+                "keyringConfigured": keyring_truthy,
             }
         )
     plugins_data, plugins_expected_error = _plugin_toggle_data(staged)
@@ -646,8 +697,17 @@ async def api_secrets_set(payload: SecretsPutPayload):
             set_secret(name, value)
     except Exception as exc:  # SecretsStoreError 等统一转可读错误
         raise HTTPException(500, f"密钥环写入失败: {exc}") from exc
-    # 钥匙串写入成功即两枚为真：keyringConfigured 有条目、configured 是其超集
-    return {"ok": True, "name": name, "configured": True, "keyringConfigured": True}
+    # 回传活判定而非硬编码 True：`set_db_keys` 不校验 JSON，写入非 JSON 值后
+    # 解析链拿不到可用密钥（get_db_keys 全段解析失败返回 None），硬编码会让
+    # POST 说「已配置」而紧接的 GET 说「未配置」自相矛盾（回归见
+    # tests/test_settings_env.py 的 DB_KEYS 坏 JSON 写入用例）。
+    keyring_truthy = _keyring_secret_truthy(name)
+    return {
+        "ok": True,
+        "name": name,
+        "configured": _secret_effective(name, keyring_truthy=keyring_truthy),
+        "keyringConfigured": keyring_truthy,
+    }
 
 
 @app.delete("/api/settings/secrets/{name}")
@@ -659,18 +719,15 @@ async def api_secrets_delete(name: str):
         delete_db_keys()
     else:
         delete_secret(name)
-    # configured 是否仍为真取决于该密钥是否另有环境变量/.env 配置——只有
+    # configured 是否仍为真取决于该密钥是否另有环境变量/.env 等低层配置——只有
     # 服务端能判定，回传供前端行级贴片（keyringConfigured 删除后恒为 False）。
-    # 这里的第二次 _secret_schema() 构建在删除**之后**：白名单那次是删除前的
-    # 时点，回传要的是「删除后解析链还剩什么」——对**插件密钥**（动态项，每次
-    # 构建现算 configured）这是两个时点语义，不得合并成一份。已知边界：核心
-    # 密钥的 configured 来自 import 期常量 _CORE_SECRET_SCHEMA，删除后回传的
-    # configured 不反映本次删除（要重启才对），与旧实现一致，另单处理。
-    meta = next((m for m in _secret_schema() if m["key"] == name), None)
+    # 活判定（_secret_effective）取代旧口径「删除后第二次构建 _secret_schema() 取
+    # meta」——那次取的是 import 期冻结值（删除后仍谎报已配置）。注意：**白名单那次
+    # 构建（:712 附近）仍必须保留**，它校验的是密钥名合法性，与本判定无关。
     return {
         "ok": True,
         "name": name,
-        "configured": bool(meta.get("configured")) if meta else False,
+        "configured": _secret_effective(name, keyring_truthy=False),
         "keyringConfigured": False,
     }
 

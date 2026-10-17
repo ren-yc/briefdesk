@@ -155,7 +155,10 @@ def build_settings_schema(
       `running: False`，由前端显示「无运行值」，而不是拿下次启动值冒充。
     - `expected_value` / `expected_source`：按**当前文件与环境**重新解析得到的
       「下次启动生效值/来源」；解析失败时置 `expectedAvailable=False` + 脱敏摘要。
-    - 密钥字段：只下发 `configured`，不参与上述任何值时点。
+    - 密钥字段：下发 `configured`（**面板不再消费**——routes_settings_env 的徽章走
+      `_secret_effective` 按当前解析链活判定；此字段按运行实例快照取值，正是当年
+      「冻结在 import 期」病灶的形状。**不要**把它接回密钥面板：那会让删除后谎报
+      复活。保留仅为插件自描述用途。）
 
     返回值只包含可 JSON 序列化内容，密钥字段不包含明文。
 

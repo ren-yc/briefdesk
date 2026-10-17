@@ -962,7 +962,7 @@ Key behaviors:
   `pruneSources`（源芯片重渲染时是否清理失效选中项——仅设置侧）。行为守卫见 `tests/ui_session_filter_test.mjs`。**「启动配置」分组**：
   `GET /api/settings/env` 渲染白名单表单（select/number/boolean/多选/文本；`PLUGINS` 项带 hidden 标记、由「插件」面板编辑），
   显示「已暂存 · 重启生效」与「环境变量优先」徽标与暂存文件路径；「恢复默认」PUT null 后由
-  写响应携带的该键最新 staged/source 做**行级贴片**（不整面重载，保住其它行未暂存编辑与「插件」面板开关草稿）；`DB_PATH`/`SERVER_PORT` 有警示确认；「密钥」区只显示 keyring 配置状态，未配置项输入后 POST 写入 keyring、可清除（
+  写响应携带的该键最新 staged/source 做**行级贴片**（不整面重载，保住其它行未暂存编辑与「插件」面板开关草稿）；`DB_PATH`/`SERVER_PORT` 有警示确认；「密钥」区显示两枚独立状态——`configured`（按当前解析链 keyring > 环境变量 > 项目 .env > 暂存是否有有效值，**每请求活判定**；keyring 与两层文件即时反映，环境变量是本进程 exec 时固定的那份——与非密钥项的 `expected_source` 完全同口径）与 `keyringConfigured`（仅钥匙串条目真值，决定输入框隐藏与「替换/清除」入口）；未配置项输入后 POST 写入 keyring、可清除（
   明文不回传、提交后按响应就地重绘该行）
 - **统一保存与脏检查**：底部全局「保存」对所有面板语义一致——一次点击提交
   全部未保存草稿（env/PLUGINS 暂存 PUT + 类别/会话 ops + 刷新间隔 localStorage；
@@ -1142,9 +1142,23 @@ required field of `weflow`/`qqflow` → that plugin self-disables via `PluginDis
   `expected_*` 要反映提交后的文件）各构建一遍，**与提交键数无关**。构建是同步读盘而路由是 `async def`，
   旧实现按键重建（K 键 = 3K 次全量）会冻结事件循环、SSE 与全部 API 一起停摆——回归由
   `tests/test_settings_env.py` 的 `SchemaRebuildCountTest` 计数钉住，改这两个路由前先想清楚新增的
-  `_all_schema()` 调用属于哪个时点。`DELETE /api/settings/secrets/{name}` 的两次 `_secret_schema()` 对**插件密钥**
-  是删除前/删除后两个时点（白名单 vs 「删除后解析链还剩什么」的回传），不是重复劳动；核心密钥的 `configured`
-  来自 import 期常量 `_CORE_SECRET_SCHEMA`，删除后回传不反映本次删除（既有边界，另单处理）。
+  `_all_schema()` 调用属于哪个时点。密钥路由（POST/DELETE）的回传判定走 `_secret_effective` 活链现读，
+  DELETE 不再需要删除后的第二次 schema 构建（旧口径「核心密钥 configured 来自 import 期常量、
+  删除后回传不反映本次删除」已被活判定取代；回归见 `tests/test_settings_env.py` 的
+  `SecretConfiguredLiveTest`）。
+- **密钥徽章 `configured` 的时点 = 「下次启动是否会生效」**（`_secret_effective`，每请求按
+  keyring > 环境变量 > 项目 .env > 暂存的**胜出值真值**现读；不是「本进程正在用」——密钥与非密钥
+  项一样无热应用，运行中删除钥匙串条目后进程内存仍有旧值，徽章表达的是重启后的生效性；与时点
+  小节的 `expected_*` 同一语义）。判定
+  只认胜出值真值、不认层存在性（env 留空串行时真实链采纳 `''`＝未配置，按层存在判会谎报）。成立
+  前提：各 Settings 模型零参构造且不传 `_env_file`（核心与全部插件均满足；`composed_value` 看不见
+  init/file_secret 层）；插件 `KEYRING_FIELDS` 值必须与 `field_env_key` 同串（活判定用 schema 键查
+  keyring，真实链用 KEYRING_FIELDS 值查，分叉即静默假未配置——parity 由 `SecretConfiguredLiveTest`
+  钉住）。成本：每密钥 +2 次 dotenv 解析（10 密钥实测 GET 68→88 次、均值 +16.5ms，相对
+  `_core_schema()` 基线属次要项——这是「不加缓存」的依据；密钥随插件增长线性放大，可见时再按请求
+  memo 层内容）。已知 exotic 边界：同一 dotenv 文件内大小写变体键并存时 `parse_env_vars`
+  （末个胜）与 `_lookup_value`（首个非 None 胜）口径不同，徽章可能与真实链不一致——与 `source_of`
+  共享该既有缺陷，未另修。隐私：判定经文件读取，只返回 bool，任何日志/异常 detail/响应都不得带出取值。
 
 - **环境变量会压住项目 `.env`**：同名键只要在进程环境里存在，`.env` 的改动就不生效（设置页会标
   「已被环境变量覆盖」，但排查「改了没反应」时要先看 `Get-ChildItem env:<KEY>` / `printenv <KEY>`）。
