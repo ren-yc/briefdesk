@@ -28,10 +28,11 @@ from __future__ import annotations
 import asyncio
 import json as _json
 import logging
+import threading
 import urllib.parse
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Coroutine, Iterator
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, TypeVar
 
 import httpx
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field, ValidationError
@@ -425,7 +426,14 @@ class Client:
                     return
                 if mine.state is gen.AccountStatus.ERROR:
                     raise NotReady(timeout, f"error: {mine.error or ''}")
-                last_state = str(mine.state.value)
+                if mine.state is gen.AccountStatus.INDEXING and mine.progress is not None:
+                    p = mine.progress
+                    last_state = (
+                        f"indexing ({p.tables_done} / {p.tables_total} tables, "
+                        f"{p.messages_indexed} messages indexed)"
+                    )
+                else:
+                    last_state = str(mine.state.value)
             elif listing is not None:
                 last_state = "not-registered"
             if asyncio.get_running_loop().time() >= deadline:
@@ -1001,3 +1009,254 @@ class Client:
         # server event kind degrades instead of killing the stream.
         log.debug("ignoring unknown SSE event kind: %s", kind)
         return None
+
+
+_T = TypeVar("_T")
+
+
+class SyncClient:
+    """Synchronous facade over :class:`Client` with its own event-loop thread.
+
+    Why a dedicated thread: a sync caller may already be inside a running
+    asyncio loop (Jupyter, an async web handler, a test harness). Calling
+    ``asyncio.run`` there fails with "cannot be called from a running event
+    loop"; creating a loop in the calling thread and closing it later also
+    conflicts with that thread's loop. Here every coroutine runs on one
+    private loop owned by this object, so the caller's loop is untouched.
+
+    The method surface mirrors :class:`Client` one-to-one; ``watch`` returns a
+    normal iterator that keeps the same reconnect/``Last-Event-ID`` semantics.
+    """
+
+    def __init__(
+        self,
+        base_url: str,
+        token: str,
+        timeout: float = READ_TIMEOUT,
+        stall_timeout: float = STALL_TIMEOUT,
+    ) -> None:
+        self._closed = False
+        self._loop = asyncio.new_event_loop()
+        self._ready = threading.Event()
+        self._thread = threading.Thread(
+            target=self._run_loop, name="qqflow-sync-client", daemon=True
+        )
+        self._thread.start()
+        if not self._ready.wait(timeout=5.0):
+            self._stop_loop()
+            raise ClientError("SyncClient event loop did not start")
+        self._client: Client
+        try:
+            self._client = self._call(
+                self._new_client(base_url, token, timeout, stall_timeout)
+            )
+        except BaseException:
+            self._stop_loop()
+            raise
+
+    # ---- lifecycle ------------------------------------------------------
+
+    def _run_loop(self) -> None:
+        asyncio.set_event_loop(self._loop)
+        # Set ready from *inside* the loop, so __init__ cannot observe a
+        # running thread whose loop has not started scheduling yet.
+        self._loop.call_soon(self._ready.set)
+        try:
+            self._loop.run_forever()
+        finally:
+            self._loop.close()
+
+    async def _new_client(
+        self, base_url: str, token: str, timeout: float, stall_timeout: float
+    ) -> Client:
+        # Construct inside the loop thread: httpx binds its async transport to
+        # the loop that first uses it.
+        return Client(base_url, token, timeout, stall_timeout)
+
+    def _call(self, coro: Coroutine[Any, Any, _T]) -> _T:
+        if self._closed:
+            raise ClientError("SyncClient is closed")
+        if not self._thread.is_alive() or not self._loop.is_running():
+            raise ClientError("SyncClient event loop thread is not running")
+        return asyncio.run_coroutine_threadsafe(coro, self._loop).result()
+
+    def _stop_loop(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        if self._thread.is_alive():
+            try:
+                self._loop.call_soon_threadsafe(self._loop.stop)
+            except RuntimeError:
+                pass
+            self._thread.join(timeout=5.0)
+
+    def close(self) -> None:
+        """Close the HTTP client and stop the loop thread (idempotent)."""
+        if self._closed:
+            return
+        try:
+            self._call(self._client.aclose())
+        finally:
+            self._stop_loop()
+
+    def __enter__(self) -> SyncClient:
+        return self
+
+    def __exit__(self, *exc: Any) -> None:
+        self.close()
+
+    # ---- mirrors of Client ----------------------------------------------
+
+    def wait_ready(self, account: str, timeout: float = 120.0) -> None:
+        self._call(self._client.wait_ready(account, timeout))
+
+    def ensure_ready(self, account: str, body: dict, timeout: float = 120.0) -> None:
+        self._call(self._client.ensure_ready(account, body, timeout))
+
+    def health(self) -> gen.Health:
+        return self._call(self._client.health())
+
+    def accounts(self) -> list[gen.AccountView]:
+        return self._call(self._client.accounts())
+
+    def register(self, body: dict) -> RegisterOutcome:
+        return self._call(self._client.register(body))
+
+    def sync_now(self) -> gen.SyncResult:
+        return self._call(self._client.sync_now())
+
+    def pull_page(
+        self,
+        talker: str,
+        since: int | None,
+        offset: int = 0,
+        limit: int | None = None,
+    ) -> gen.PullEnvelope:
+        return self._call(self._client.pull_page(talker, since, offset, limit))
+
+    def drain_session(
+        self,
+        talker: str,
+        since: int | None,
+        on_page: Callable[[list[gen.PullMessage]], None],
+    ) -> int:
+        # Loop in the caller thread so on_page runs where the caller expects
+        # it; the per-page request itself is still submitted to the loop thread.
+        next_since = since
+        next_offset = 0
+        total = 0
+        while True:
+            page = self.pull_page(talker, next_since, next_offset)
+            total += len(page.messages)
+            on_page(page.messages)
+            if not page.sync.has_more:
+                return total
+            next_since = page.sync.next_since
+            next_offset = page.sync.next_offset
+
+    def list_all_sessions(
+        self,
+        *,
+        page_size: int | None = None,
+        keyword: str | None = None,
+    ) -> list[gen.SessionNative]:
+        return self._call(self._client.list_all_sessions(page_size=page_size, keyword=keyword))
+
+    def media_bytes(self, message: gen.ChatlabMessage, talker: str) -> bytes:
+        return self._call(self._client.media_bytes(message, talker))
+
+    def list_messages(
+        self,
+        talker: str,
+        *,
+        keyword: str | None = None,
+        start: str | None = None,
+        end: str | None = None,
+        limit: int | None = None,
+        offset: int | None = None,
+        media: bool = False,
+    ) -> gen.MessagesNative:
+        return self._call(
+            self._client.list_messages(
+                talker,
+                keyword=keyword,
+                start=start,
+                end=end,
+                limit=limit,
+                offset=offset,
+                media=media,
+            )
+        )
+
+    def chatlab_messages(
+        self,
+        talker: str,
+        *,
+        keyword: str | None = None,
+        start: str | None = None,
+        end: str | None = None,
+        limit: int | None = None,
+        offset: int | None = None,
+        media: bool = False,
+    ) -> gen.ChatlabMessages:
+        return self._call(
+            self._client.chatlab_messages(
+                talker,
+                keyword=keyword,
+                start=start,
+                end=end,
+                limit=limit,
+                offset=offset,
+                media=media,
+            )
+        )
+
+    def contacts(
+        self,
+        *,
+        limit: int | None = None,
+        offset: int | None = None,
+        keyword: str | None = None,
+    ) -> gen.Contacts:
+        return self._call(self._client.contacts(limit=limit, offset=offset, keyword=keyword))
+
+    def group_members(
+        self,
+        chatroom: str,
+        *,
+        include_message_counts: bool = False,
+    ) -> gen.GroupMembers:
+        return self._call(
+            self._client.group_members(
+                chatroom, include_message_counts=include_message_counts
+            )
+        )
+
+    def media_bytes_by_id(self, media_id: str) -> bytes:
+        return self._call(self._client.media_bytes_by_id(media_id))
+
+    def watch(self) -> Iterator[Any]:
+        """Yield live events, closing the async generator on early exit."""
+        # Annotated as Any only to keep ``aclose`` visible to mypy: the public
+        # Client.watch return type is AsyncIterator, which does not declare it.
+        agen: Any = self._client.watch()
+
+        async def _next() -> Any:
+            return await agen.__anext__()
+
+        async def _aclose() -> None:
+            await agen.aclose()
+
+        try:
+            while True:
+                try:
+                    yield self._call(_next())
+                except StopAsyncIteration:
+                    return
+        finally:
+            if not self._closed:
+                try:
+                    self._call(_aclose())
+                except (StopAsyncIteration, ClientError):
+                    pass
