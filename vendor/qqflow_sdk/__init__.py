@@ -21,6 +21,7 @@ from .client import (
     NotReady,
     ShapeError,
     StatusError,
+    SyncClient,
     TransportError,
 )
 
@@ -35,5 +36,6 @@ __all__ = [
     "NotReady",
     "ShapeError",
     "StatusError",
+    "SyncClient",
     "TransportError",
 ]
