@@ -89,3 +89,11 @@ powershell -File scripts/sync_vendor.ps1
   同步经 `scripts/sync_vendor.ps1` 完成，本行两个 commit 取自 merge 提交的第二父。上游已洗净并各加了同口径门禁，
   本仓对镜像的空白豁免（`.gitattributes`）随之移除——镜像纪律仍是禁改；若上游未来回潮脏字节，
   处理路径是「上游洗 → 重建 sdk-dist（本地分支与 origin 一起快进）→ 本仓重跑同步」，而不是动镜像或恢复豁免。
+
+- SDK 0.9.1 发布同步：weflow `sdk-dist`（`7f06d22`，源自 weflow-server master `99c96e9`）、
+  qqflow `sdk-dist`（`d193366`，源自 qqflow-server master `636fc3d`）。上游改动：新增 Python
+  同步门面 `SyncClient`（与 `Client` 方法一一对应，内部专属事件循环线程；`watch()` 返回普通
+  迭代器，`drain_session` 的 `on_page` 在调用方线程执行）；accounts 响应加入可选 `progress`
+  对象对应的生成模型（`index_progress_dto.py`）；两 SDK 版本串升 0.9.1。镜像与上游逐 blob
+  相同（`git ls-tree` 全量比对：weflow 60 项、qqflow 55 项，差异 0）；同步经
+  `scripts/sync_vendor.ps1` 完成，本行两个 commit 取自 merge 提交的第二父。
