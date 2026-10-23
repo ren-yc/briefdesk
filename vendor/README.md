@@ -97,3 +97,12 @@ powershell -File scripts/sync_vendor.ps1
   对象对应的生成模型（`index_progress_dto.py`）；两 SDK 版本串升 0.9.1。镜像与上游逐 blob
   相同（`git ls-tree` 全量比对：weflow 60 项、qqflow 55 项，差异 0）；同步经
   `scripts/sync_vendor.ps1` 完成，本行两个 commit 取自 merge 提交的第二父。
+
+- SDK 0.9.2 发布同步：weflow `sdk-dist`（`86ccd09`，源自 weflow-server master `902a6e9`）、
+  qqflow `sdk-dist`（`8becbab`，源自 qqflow-server master `a4842b4`）。上游改动**只动版本串、
+  不动行为**：0.9.2 收口重生成生成层（docstring 内嵌版本与 spec `info.version` 0.9.1 → 0.9.2），
+  手写层与条目集合无变化——全量清单保持 115 项（含本说明）。镜像与上游逐 blob 相同
+  （`git ls-tree` 全量比对：weflow 60 项、qqflow 55 项，差异 0）。本批发布同时是上游 crates.io
+  Trusted Publishing（OIDC）的首个实发验证：两仓四 crate 与两个 PyPI 包全部由 CI 自主发布
+  成功，本仓 vendor 走既有 subtree 通道不受影响。同步经 `scripts/sync_vendor.ps1` 完成，
+  本行两个 commit 取自 merge 提交的第二父。
