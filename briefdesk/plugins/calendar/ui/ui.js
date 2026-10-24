@@ -236,6 +236,11 @@
     const todayStr = fmtDate(new Date());
     let html = '';
     html += renderCalHead();
+    // 「仅看备忘录截止」过滤后为空：网格照常渲染（保留月份导航语义），
+    // 但补一行空态说明——否则整月空白与「开关失灵」无法区分
+    if (calMemoOnly && !items.length) {
+      html += '<div class="cal-empty" role="status">当前月份没有备忘录卡片的截止/开始时间</div>';
+    }
     html += '<div class="cal-weekdays">' + ["日", "一", "二", "三", "四", "五", "六"].map(w => "<span>" + w + "</span>").join("") + "</div>";
     html += '<div class="cal-grid">';
     const cur = new Date(gridStart);

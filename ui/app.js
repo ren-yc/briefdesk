@@ -5749,6 +5749,12 @@ function syncBatchGroupStates() {
       chk.checked = all;
       chk.indeterminate = partial;
     });
+    // 代表卡绿框跟随组态而非单卡 id：折叠组的选择粒度=视觉粒度，组头/容器/
+    // 代表卡必须一致。此前代表卡被单卡分支跳过而组分支从不改其类名，跨视图
+    // 切换后取消全选时组容器绿框消失、代表卡绿框残留
+    el.querySelectorAll(".item-card").forEach(card => {
+      card.classList.toggle("selected", all);
+    });
   });
   $itemsContainer.querySelectorAll(".group-header[data-key]").forEach(el => {
     const members = groupMap.get(el.dataset.key) || [];
@@ -5760,7 +5766,7 @@ function syncBatchGroupStates() {
     el.classList.toggle("selected", all); // 整组选中 → 组头高亮（与折叠组一致）
   });
   $itemsContainer.querySelectorAll(".item-card[data-id]").forEach(el => {
-    if (el.closest(".group-collapsed")) return; // 折叠组内代表卡已按组态处理
+    if (el.closest(".group-collapsed")) return; // 折叠组代表卡由上方组分支按组态同步
     const sel = selectedIds.has(String(el.dataset.id));
     const chk = el.querySelector(".batch-check input");
     if (chk) chk.checked = sel;

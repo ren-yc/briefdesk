@@ -180,9 +180,9 @@
     if (asking) return;
     const question = ($input.value || "").trim();
     if (question.length < 2) return;
-    let failed = false;
     asking = true;
     $sendBtn.disabled = true;
+    $input.value = ""; // 发送即清空：消息已回显为气泡，输入框保留原文只会被误读为「没发出去」
     addMsg("user", question);
     const turnHistory = history.slice(-20);
     history.push({ role: "user", content: question });
@@ -208,15 +208,12 @@
       }
     } catch {
       thinking.remove();
+      // 失败不回填输入框：问题已作为气泡在对话区可见，回填会与已入列的
+      // user 气泡/history 重复，重试时产生重复消息；重试点气泡旁复制或重打即可
       addMsg("assistant", "问答服务暂时不可用，请稍后再试。");
-      // 失败后把问题填回输入框：finally 里无条件清空，用户想重试
-      // 就得整句重打一遍（问题虽已回显在对话里，但不可编辑）
-      $input.value = question;
-      failed = true;
     } finally {
       asking = false;
       $sendBtn.disabled = false;
-      if (!failed) $input.value = "";
       $input.focus();
     }
   }

@@ -77,6 +77,14 @@ body.calendar-mode #loading-state { display: none !important; }
   .cal-filter-anim .cal-chip, .cal-filter-anim .cal-more { animation: none; }
 }
 
+/* 「仅看备忘录截止」空态：过滤后无卡片时的说明行（非错误，role=status） */
+.cal-empty {
+  padding: 10px 14px; margin-bottom: 12px; text-align: center;
+  font-size: 13px; color: var(--text-3);
+  border: 1px dashed var(--border); border-radius: var(--radius-sm);
+  background: var(--surface);
+}
+
 /* 加载失败占位（保留头部导航，仅替换网格区域） */
 .cal-error {
   display: flex; flex-direction: column; align-items: center; gap: 10px;
