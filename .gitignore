@@ -81,3 +81,5 @@ briefdesk/plugins/benchmark/cases/*.fromweb.json
 .data-review-r2/
 .data-review-r3/
 .data-review-r4/
+.survey/
+undefined
