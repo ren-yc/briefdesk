@@ -190,12 +190,22 @@ class TestStore:
         raw = json.loads(path.read_text(encoding="utf-8"))
         assert raw["feature"] == "classify"
         assert len(raw["cases"]) == 1
+        # 用例来源单点盖章：网页导出统一 origin=cards + 批次指纹
+        assert raw["cases"][0]["origin"] == "cards"
+        assert raw["cases"][0]["batch_fingerprint"]
 
-        # 覆盖导出（同功能文件被替换，不追加）
+        # 合并导出（同 id 覆盖、不同 id 保留——旧覆盖式会静默丢用例）
         other = {**case, "id": "bench-xyz"}
         await bench_store.export_fromweb("classify", [other])
         cases = await bench_store.list_fromweb("classify")
-        assert [c["id"] for c in cases] == ["bench-xyz"]
+        assert sorted(c["id"] for c in cases) == ["bench-abc", "bench-xyz"]
+        # 同 id 重复导出 = 更新而非叠加
+        updated = {**case, "note": "更新说明"}
+        await bench_store.export_fromweb("classify", [updated])
+        cases = await bench_store.list_fromweb("classify")
+        assert sorted(c["id"] for c in cases) == ["bench-abc", "bench-xyz"]
+        kept = next(c for c in cases if c["id"] == "bench-abc")
+        assert kept["note"] == "更新说明"
 
         deleted = await bench_store.delete_all_fromweb("classify")
         assert deleted == 1
@@ -214,6 +224,161 @@ class TestStore:
 
         with pytest.raises(DatasetError):
             await bench_store.export_fromweb("classify", [])
+
+    async def test_export_merges_and_stamps_single_point(self):
+        # 合并写 + 来源盖章单点：同 id 覆盖、指纹同批共享、显式参数可换来源
+        base = {
+            "id": "s1",
+            "messages": [{"msg_id": "m", "content": "活动"}],
+            "expected": [{"index": 0, "category": "活动通知"}],
+        }
+        await bench_store.export_fromweb("classify", [base])
+        path = self.cases_dir / "classify.fromweb.json"
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        fp1 = raw["cases"][0]["batch_fingerprint"]
+        assert raw["cases"][0]["origin"] == "cards"
+
+        # 指纹按调用生成：两次导出指纹不同（uuid4，秒级时间戳不复用）
+        await bench_store.export_fromweb("classify", [{**base, "id": "s2"}])
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        fps = {c["batch_fingerprint"] for c in raw["cases"]}
+        assert len(fps) == 2
+        assert fp1 in fps
+
+        # recorder 复用同一入口：显式声明来源与指纹（对照实验分母的载体）
+        await bench_store.export_fromweb(
+            "classify",
+            [{**base, "id": "r1"}],
+            origin="recorder",
+            fingerprint="rec-fp-1",
+        )
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        rec = next(c for c in raw["cases"] if c["id"] == "r1")
+        assert rec["origin"] == "recorder"
+        assert rec["batch_fingerprint"] == "rec-fp-1"
+        # cards 用例未被二次盖章
+        assert next(c for c in raw["cases"] if c["id"] == "s1")["origin"] == "cards"
+
+    async def test_export_rejects_unreadable_existing(self):
+        from briefdesk.plugins.benchmark.schema import DatasetError
+
+        base = {
+            "id": "s1",
+            "messages": [{"msg_id": "m", "content": "活动"}],
+            "expected": [{"index": 0, "category": "活动通知"}],
+        }
+        path = self.cases_dir / "classify.fromweb.json"
+        # 语法坏
+        path.write_text("{not json", encoding="utf-8")
+        with pytest.raises(DatasetError, match="不可读"):
+            await bench_store.export_fromweb("classify", [base])
+        # 结构非法（能解析但缺 cases 数组）——静默按空合并会换种方式丢数据
+        path.write_text('{"feature": "classify"}', encoding="utf-8")
+        with pytest.raises(DatasetError, match="结构非法"):
+            await bench_store.export_fromweb("classify", [base])
+        # 坏编码（非 UTF-8 字节：GBK 编码的中文 description）
+        bad_bytes = '{"note": "中文描述"}'.encode("gbk")
+        path.write_bytes(bad_bytes)
+        with pytest.raises(DatasetError, match="不可读"):
+            await bench_store.export_fromweb("classify", [base])
+        assert not list(self.cases_dir.glob("*.tmp"))
+
+    async def test_export_drops_unidentifiable_entries_with_warning(
+        self, caplog: pytest.LogCaptureFixture
+    ):
+        base = {
+            "id": "s1",
+            "messages": [{"msg_id": "m", "content": "活动"}],
+            "expected": [{"index": 0, "category": "活动通知"}],
+        }
+        path = self.cases_dir / "classify.fromweb.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "feature": "classify",
+                    "cases": [
+                        {"note": "无 id 的历史条目"},
+                        {"id": "keep-1", "messages": [{"msg_id": "k", "content": "x"}],
+                         "expected": [{"index": 0, "category": "活动通知"}]},
+                    ],
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        with caplog.at_level("WARNING", logger="briefdesk.plugins.benchmark.store"):
+            await bench_store.export_fromweb("classify", [base])
+        assert any("无法识别的条目" in r.message for r in caplog.records)
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        ids = {c["id"] for c in raw["cases"]}
+        assert ids == {"s1", "keep-1"}
+
+    async def test_export_rejects_invalid_origin(self):
+        from briefdesk.plugins.benchmark.schema import DatasetError
+
+        # origin 受控枚举在写入前校验：绕开它会让非法值落盘再被 parse 层丢弃
+        with pytest.raises(DatasetError, match="非法 origin"):
+            await bench_store.export_fromweb(
+                "classify",
+                [{"id": "x", "messages": [{"msg_id": "m", "content": "活动"}],
+                  "expected": [{"index": 0, "category": "活动通知"}]}],
+                origin="cardss",
+            )
+
+    async def test_stable_ids_make_repeated_export_idempotent(self):
+        # 回归位（合并写缺陷）：导出 id 必须内容派生——随机 id 会让「同 id
+        # 更新」分支永不命中，重复导出堆积内容相同的副本（AI 调用翻倍、
+        # 过期期望残留）。同筛选二次导出后用例数必须不变。
+        rows = [
+            {
+                "id": "it1", "title": "团购A", "key_info": "45元",
+                "category": "交易", "session_id": "s1", "source_group": "群A",
+                "sender_name": "甲", "msg_time": 1000, "source": "weflow",
+                "source_msg_id": "m1", "source_quote": "内容1", "content_hash": "h1",
+                "subject": "团购A", "is_verified": 0,
+            },
+            {
+                "id": "it2", "title": "团购B", "key_info": "30元",
+                "category": "交易", "session_id": "s1", "source_group": "群A",
+                "sender_name": "乙", "msg_time": 2000, "source": "weflow",
+                "source_msg_id": "m2", "source_quote": "内容2", "content_hash": "h2",
+                "subject": "团购B", "is_verified": 0,
+            },
+        ]
+        title_cases = bench_store.build_title_cases_from_rows(rows)
+        assert all(c["id"].startswith("case-") for c in title_cases)
+        assert title_cases[0]["id"] == bench_store.build_title_cases_from_rows(rows)[0]["id"]
+
+        first = await bench_store.export_fromweb("title", title_cases)
+        path = self.cases_dir / "title.fromweb.json"
+        n_first = len(json.loads(path.read_text(encoding="utf-8"))["cases"])
+        # 二次导出（同批数据重新构造 → 同 id）：文件内用例数不增长
+        rebuilt = bench_store.build_title_cases_from_rows(rows)
+        await bench_store.export_fromweb("title", rebuilt)
+        n_second = len(json.loads(path.read_text(encoding="utf-8"))["cases"])
+        assert n_second == n_first
+        assert first == path
+
+    async def test_read_fromweb_bad_encoding_skipped(self, caplog: pytest.LogCaptureFixture):
+        # 读取侧兜底回归位：坏编码文件按空列表跳过（Web 运行与 CLI 回落的
+        # 公共路径，一个坏文件不打崩整轮基准），而非抛 UnicodeDecodeError
+        path = self.cases_dir / "dedup.fromweb.json"
+        path.write_bytes('{"note": "中文"}'.encode("gbk"))
+        with caplog.at_level("WARNING", logger="briefdesk.plugins.benchmark.store"):
+            cases = await bench_store.list_fromweb("dedup")
+        assert cases == []
+        assert any("不可读" in r.message for r in caplog.records)
+
+    async def test_export_empty_cases_list_rejected(self):
+        from briefdesk.plugins.benchmark.schema import DatasetError
+
+        (self.cases_dir / "classify.fromweb.json").write_text("[]", encoding="utf-8")
+        with pytest.raises(DatasetError, match="结构非法"):
+            await bench_store.export_fromweb(
+                "classify",
+                [{"id": "x", "messages": [{"msg_id": "m", "content": "活动"}],
+                  "expected": [{"index": 0, "category": "活动通知"}]}],
+            )
 
     async def test_delete_all_by_feature(self):
         # 各功能造一个合法用例
@@ -391,6 +556,10 @@ class TestRecorder:
         cases = await bench_store.list_fromweb("dedup")
         assert len(cases) == 1
         assert cases[0]["expected"]["same"]
+        # recorder 复用 store 入口时必须声明自己的来源（对照实验分母的
+        # 载体；删掉 recorder 的 origin=recorder 传参此断言即红）
+        assert cases[0]["origin"] == "recorder"
+        assert cases[0]["batch_fingerprint"]
 
     async def test_export_empty_keeps_existing_files(self):
         await bench_store.export_fromweb(

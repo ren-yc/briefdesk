@@ -553,6 +553,13 @@ tests/test_web_plugins.py 的核心前端边界守卫测试覆盖）。`GET /api
 建表并按数据集换类别、注入 AI 端口，退出先关连接再还原路径与删目录。用例与产物落用户目录：网页导出与
 「记录导出」写 `BRIEFDESK_DATA_DIR/benchmark/cases/`、CLI 报告默认写 `benchmark/reports/`、运行目录在
 缓存目录；缺省用例查找为「用户用例目录 → 包内示例」，显式 `--cases-dir` 只查该目录、不回落包内示例。
+**用例来源标注与双口径**：每条用例带 `origin`（`manual` 人工核对/recorder 处理记录/cards 网页卡片导出/
+synthetic 合成，受控枚举、未知值校验报错）与 `batch_fingerprint`（导出批次指纹）。`export_fromweb` 是
+来源字段的单点写入处（默认 `origin=cards` + 本调用新指纹；recorder 复用时显式传 `origin=recorder` 与
+自己的指纹），写入为**合并语义**（按 case id 合并、新覆盖旧——旧覆盖式会静默丢用例；既有文件不可读/
+结构非法时拒绝合并覆盖而非静默按空）。消费侧：验收分母只认 `origin=manual`（卡片/记录导出的期望来自
+管道自身判定，混入会让指标虚高）；与入训记录同指纹的用例按批次级互斥出验收分母（只读工具
+`scripts/eval_denominators.py`：分组汇总 + 指纹互斥校验 + 双口径分开统计）。
 
 #### briefdesk/sources_base.py
 
