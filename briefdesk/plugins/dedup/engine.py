@@ -18,6 +18,7 @@ import json
 import logging
 from dataclasses import dataclass
 
+from briefdesk import announcements, telemetry
 from briefdesk.ai_ports import (
     chat,
     embed_model_name,
@@ -162,6 +163,9 @@ def _embedding_text(title: str, quote: str) -> str:
 # 锁内持有 ≈ 2×45s（排队 + 请求）。
 _JUDGE_TIMEOUT = 45.0
 
+# 公告 code：嵌入维度不一致（同名换维度永不自愈的持续性条件横幅）
+_ANNOUNCE_EMBEDDING_DIM_MISMATCH = "embedding_dim_mismatch"
+
 
 class DedupEngine(DedupService):
     """语义去重引擎（显式实现 DedupService 服务端口），封装缓存状态和 AI 判重逻辑。"""
@@ -182,6 +186,9 @@ class DedupEngine(DedupService):
         self._no_emb_logged = False
         self._dim_mismatch_logged = False
         self._cosine_fail_logged = False
+        # 维度不一致的当前状态（_select_candidates 同步上下文内翻转，
+        # check_dedup 尾部按它置位/撤销持续性公告）
+        self._dim_mismatch_active = False
         # 待落库向量（由 add_to_cache 登记、flush_pending_embeddings 批量写入）
         self._pending_embeds: list[tuple[str, str, list[float]]] = []
 
@@ -362,6 +369,18 @@ class DedupEngine(DedupService):
             logger.warning("批内预嵌入失败，本批回退到字符重叠预过滤", exc_info=True)
             return None
 
+    def cached_embedding(self, item_id: str) -> list[float] | None:
+        """按 id 读缓存条目向量（只读；merge 阶段算候选对余弦-真值记录用）。
+
+        条目不存在或无向量（未启用/嵌入失败/重启后未加载）→ None。
+        纯内存访问，无 await——merge 阶段在 dedup 之后串行执行，此缓存
+        已由 dedup 插件的 setup 预热。
+        """
+        for it in self._cache:
+            if it.id == item_id:
+                return it.embedding
+        return None
+
     @staticmethod
     def _content_hash(quote: str) -> str:
         """原文内容哈希，与 build_item_input 的 content_hash 同公式（精确匹配短路用）。
@@ -483,6 +502,7 @@ class DedupEngine(DedupService):
                     max_tokens=128,
                     timeout=_JUDGE_TIMEOUT,
                     max_retries=0,  # SDK 重试会把锁内单次判官最坏耗时放大 3 倍
+                    telemetry_kind="judge.dedup",
                 )
             except Exception as e:
                 # 仅 DEBUG：判定失败是被容错的（调用方 _judge_* 按"该候选降级/
@@ -643,7 +663,27 @@ class DedupEngine(DedupService):
             exact_item, exact_note = exact
             return await self._hit(exact_item, source_group, exact_note)
 
-        candidates, metric = self._select_candidates(title, q_emb)
+        candidates, metric, cosine_ran = self._select_candidates(title, q_emb)
+        # 维度不一致的持续性公告在此统一置位/撤销（_select_candidates 是
+        # 同步上下文，不能 await；标志由它翻转）。撤销判据是「余弦通道本次
+        # 跑通」（维度一致），不能用 metric——零候选后重叠兜底会把 metric
+        # 改写回 overlap，令修复后的第一条消息撤销不到。置位/撤销自身失败
+        # 不连坐判定——降级语义已由候选选取保证。
+        if self._dim_mismatch_active:
+            try:
+                await announcements.announce(
+                    _ANNOUNCE_EMBEDDING_DIM_MISMATCH,
+                    "warning",
+                    "嵌入维度不一致：语义去重已降级为字符重叠，漏判率上升。"
+                    "需重建向量（迁移助手脚本）并重启应用。",
+                )
+            except Exception:
+                logger.debug("维度不一致公告置位失败（忽略）", exc_info=True)
+        elif cosine_ran:
+            try:
+                await announcements.revoke(_ANNOUNCE_EMBEDDING_DIM_MISMATCH)
+            except Exception:
+                logger.debug("维度不一致公告撤销失败（忽略）", exc_info=True)
         if not candidates:
             return DedupResult(is_duplicate=False)
 
@@ -664,11 +704,13 @@ class DedupEngine(DedupService):
 
     def _select_candidates(
         self, title: str, q_emb: list[float] | None
-    ) -> tuple[list[tuple[CachedItem, float]], str]:
+    ) -> tuple[list[tuple[CachedItem, float]], str, bool]:
         """候选选取：嵌入余弦 Top-K（启用且加载成功）或字符重叠单候选（回退/兜底）。
 
-        返回 (候选列表, 度量名)；空列表表示已打无候选 DEBUG 诊断、调用方直接
-        判不重复。纯内存计算，不触网（理由见下方分级注释）。
+        返回 (候选列表, 度量名, 余弦通道是否跑通)；空列表表示已打无候选
+        DEBUG 诊断、调用方直接判不重复。纯内存计算，不触网（理由见下方分级注释）。
+        第三项供公告状态机使用：余弦跑通 = 维度一致（撤销公告的判据）——
+        不可用 metric 代替，metric 会被「零候选后重叠兜底命中」改写回 overlap。
         """
         # 余弦以 fallback 阈值召回（含弱候选区间 [fallback, threshold)），
         # normal/weak 分层在判定前拆分；字符重叠在余弦零候选时兜底。
@@ -687,6 +729,9 @@ class DedupEngine(DedupService):
         metric = "overlap"
         cosine_active = False
         top1_cosine: float | None = None
+        # 维度失配状态按「本次调用」重算：开头复位、失配分支置位——
+        # 维度恢复的调用（余弦正常）自然落到 False，调用方据此撤销公告
+        self._dim_mismatch_active = False
         if q_emb is not None:
             embedded: list[CachedItem] = []
             emb_matrix: list[list[float]] = []
@@ -722,6 +767,8 @@ class DedupEngine(DedupService):
                     # 同批新条目按新维度重嵌）：此时 emb_matrix 是 ragged
                     # list，np.asarray(dtype=float32) 直接抛 ValueError。
                     # 首次带栈（真 numpy 异常也靠这一条定位），其后只 DEBUG。
+                    # 混维是维度不一致的另一种形态：同记遥测并置公告标志
+                    # （等长失配分支同口径）。
                     if not self._cosine_fail_logged:
                         self._cosine_fail_logged = True
                         logger.warning(
@@ -732,12 +779,16 @@ class DedupEngine(DedupService):
                         )
                     else:
                         logger.debug("余弦候选计算失败，回退字符重叠", exc_info=True)
+                    telemetry.record("dedup.dim_mismatch")
+                    self._dim_mismatch_active = True
             elif emb_matrix:
                 # 维度不一致**不会自己恢复**：load_embeddings 按模型名取，
                 # 模型名不变而维度变了（代理换实现/供应商原地升级/改维度参数）
                 # 时旧向量每次重启都照样读出来、missing 为空、永不重嵌。故文案
                 # 必须自己说清持续性——只打一次的 WARNING 若读起来像瞬态抖动，
-                # 就会被放过去。
+                # 就会被放过去。其后同状态降 DEBUG（闸门语义不变）。本方法为
+                # 同步上下文（锁内、禁网络）：公告置位/撤销由 async 调用方
+                # check_dedup 按本标志统一处置。
                 if not self._dim_mismatch_logged:
                     self._dim_mismatch_logged = True
                     logger.warning(
@@ -753,6 +804,8 @@ class DedupEngine(DedupService):
                         len(q_emb),
                         len(emb_matrix[0]),
                     )
+                telemetry.record("dedup.dim_mismatch")
+                self._dim_mismatch_active = True
             elif not self._no_emb_logged:
                 # 首条 INFO（默认级别可见），其后同状态只打 DEBUG（见 __init__）
                 self._no_emb_logged = True
@@ -812,7 +865,7 @@ class DedupEngine(DedupService):
             else:
                 diag.append("缓存为空")
             logger.debug("；".join(diag))
-            return [], metric
+            return [], metric, cosine_active
 
         # 逐条候选记 DEBUG：候选本身不是"阶段或汇总"（见 logger 模块约定），
         # 且判定结果出来前它无法独立解释任何事——判定出口的单行 INFO 已带
@@ -825,7 +878,7 @@ class DedupEngine(DedupService):
                 metric,
                 score * 100,
             )
-        return candidates, metric
+        return candidates, metric, cosine_active
 
     async def _judge_weak(
         self,

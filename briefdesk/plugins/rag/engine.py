@@ -725,10 +725,13 @@ class RagEngine:
     ) -> AskResult:
         """检索 + 引用式回答；检索为空 → 诚实拒答且不调用 AI。"""
 
+        from briefdesk import telemetry
         from briefdesk.plugins.rag.prompts import build_answer_prompt
 
         hits = await self.retrieve(question, session_id)
+        telemetry.record("rag.ask")
         if not hits:
+            telemetry.record("rag.refused")
             return AskResult(refused=True, answer="没有在群聊记录里找到相关消息。")
         messages = build_answer_prompt(
             datetime.now(UTC).astimezone(), question.strip(), hits, history or [],
@@ -750,6 +753,7 @@ class RagEngine:
         if not content:
             # 空 choices / 空答案：按拒答返回，不伪装成「已答但无引用」
             logger.warning("rag: 模型返回空响应（choices=%d），按拒答处理", len(choices))
+            telemetry.record("rag.refused")
             return AskResult(refused=True, answer="模型未返回内容，请稍后重试。")
         # 双态解析：deepseek 系强制 json_object 输出 → 优先 JSON 契约；
         # 其它供应商纯文本 → 回退 [n] 正则（兼容两路）
@@ -761,6 +765,7 @@ class RagEngine:
             answer = parsed["answer"].strip()
             if not answer:
                 logger.warning("rag: JSON 契约下 answer 为空，按拒答处理")
+                telemetry.record("rag.refused")
                 return AskResult(refused=True, answer="模型未返回内容，请稍后重试。")
             nums = parsed.get("citations")
             if isinstance(nums, list):
@@ -780,6 +785,13 @@ class RagEngine:
         else:
             nums = sorted(cited) if cited else list(range(1, len(hits) + 1))
         citations = [self._citation(n, hits[n - 1]) for n in nums]
+        telemetry.record("rag.answered")
+        # 引用维度单独分桶：answered 是两者的分母，「有引用的回答占比」
+        # 由 with/no_citation 两桶读出（空引用列表也是有效回答形态）
+        if citations:
+            telemetry.record("rag.answered_with_citation")
+        else:
+            telemetry.record("rag.answered_no_citation")
         return AskResult(refused=False, answer=answer, citations=citations)
 
 

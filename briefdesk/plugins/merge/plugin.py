@@ -12,6 +12,7 @@ import json
 import logging
 from typing import Any
 
+from briefdesk import ai_ports, telemetry
 from briefdesk.config import config
 from briefdesk.db import delete_items, get_merge_candidates, update_item_merged
 from briefdesk.masking import normalize_subject
@@ -43,6 +44,31 @@ def _images_from_db(raw: object) -> list[str]:
     if not isinstance(data, list):
         return []
     return [str(u) for u in data if u]
+
+
+def _record_cosine_truth(
+    ctx: PluginContext, row: Any, cand: Any, verdict: bool | None
+) -> None:
+    """判官返回后旁路记录候选对的（余弦, 判定真值）——预筛门限标定输入。
+
+    余弦取去重缓存中两侧条目的向量（标题+原文口径，查询与缓存同源对称；
+    须在合并改写缓存前调用）。任一侧无向量（嵌入未启用/缓存未就绪）静默
+    跳过——记录缺失只影响标定数据量，不影响判定。verdict 沿用判官语义：
+    True=SAME/应合并，False=DIFF/不合并，None=判官不可用（判定未知）。
+    """
+    get_emb = getattr(ctx.dedup, "cached_embedding", None)
+    if get_emb is None:
+        return
+    try:
+        new_emb = get_emb(row.item_id)
+        cand_emb = get_emb(cand["id"])
+        # 类型守卫：非 list（如测试桩的 Mock 返回值）按无向量跳过
+        if not isinstance(new_emb, list) or not isinstance(cand_emb, list):
+            return
+        cos = ai_ports.cosine_similarity(new_emb, cand_emb)
+        telemetry.record_cosine_truth(row.msg.source, cos, verdict)
+    except Exception:  # 标定记录缺失只影响数据量，绝不连坐合并判定
+        logger.debug("merge 余弦-真值记录失败（忽略）", exc_info=True)
 
 
 class MergePlugin(StagePlugin):
@@ -103,6 +129,9 @@ class MergePlugin(StagePlugin):
                 same = await judge_merge(
                     cand["title"] or "", cand_desc, row.title, new_desc
                 )
+                # 余弦-真值旁路记录（含 None=判官不可用；余弦须在合并改写
+                # 缓存前取，此处时点正确）
+                _record_cosine_truth(ctx, row, cand, same)
                 if same is None:
                     # 判官失败：保守不合并；失败不构成判定依据，不记录观察数据
                     continue
