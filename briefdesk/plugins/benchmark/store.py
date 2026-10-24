@@ -2,7 +2,7 @@
 
 用例不再写入数据库（原 benchmark_cases 表已移除；旧库遗留的同名空表无害），
 网页「导出当前列表为基准用例」直接把构造好的四类用例**导出**为
-用户用例目录下的 <feature>.fromweb.json（覆盖式，每功能一个文件），
+用户用例目录下的 <feature>.fromweb.json（合并写，每功能一个文件），
 Web 运行与 CLI 均从该目录加载（见 engine.load_web_cases）。
 
 - 文件为 DatasetFile 顶层结构（feature/description/cases），与手写数据集同构，
@@ -28,6 +28,7 @@ Web 运行与 CLI 均从该目录加载（见 engine.load_web_cases）。
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -83,7 +84,20 @@ def fromweb_path(feature: str, cases_dir: Path | None = None) -> Path:
 
 
 def new_case_id() -> str:
+    """随机用例 id（仅手工构造用例的场景使用；导出路径用 stable_case_id）。"""
     return f"bench-{uuid.uuid4().hex[:10]}"
+
+
+def stable_case_id(feature: str, identity: object) -> str:
+    """内容派生的稳定用例 id：sha256(feature|identity) 截 16 位。
+
+    导出路径统一用它替代随机 id：同一批数据重复导出（同内容）→ 同 id →
+    合并写「新覆盖旧」真正命中，重复导出不再堆积内容相同的副本；卡片
+    成员集合变化 → 新 id 追加；成员不变而卡片状态变化 → 同 id 就地更新
+    （旧期望被新状态覆盖，不会残留过期副本）。
+    """
+    material = f"{feature}|{json.dumps(identity, ensure_ascii=False, sort_keys=True, default=str)}"
+    return "case-" + hashlib.sha256(material.encode()).hexdigest()[:16]
 
 
 # ── 校验 ──
@@ -124,29 +138,97 @@ def parse_cases_with_errors(
 # ── 网页导出（写 cases/<feature>.fromweb.json）──
 
 
+def batch_fingerprint(source: str = "fromweb") -> str:
+    """导出批次指纹：sha256(来源标识 + uuid4) 截 16 位十六进制。
+
+    每次**调用**生成一个新指纹（uuid4，时间戳只进 description 不进指纹
+    ——秒级时间戳会把同秒多次导出合并成同指纹，粒度错配）；同一批数据
+    若会经两条路径导出（先 recorder 入训、再 cards 进评测），调用方必须
+    显式传同一 source 并自行做内容级互斥（指纹是调用级、不是内容级）。
+    训练数据构建侧按指纹做批次级互斥（与入训记录同指纹的用例出验收分母）。
+    """
+    material = f"{source}|{uuid.uuid4()}"
+    return hashlib.sha256(material.encode()).hexdigest()[:16]
+
+
 async def export_fromweb(
     feature: str,
     cases: list[dict[str, Any]],
     description: str | None = None,
+    *,
+    origin: str = "cards",
+    fingerprint: str | None = None,
 ) -> Path:
-    """把用例列表导出为 cases/<feature>.fromweb.json（原子写，覆盖）。
+    """把用例列表**合并**写入 cases/<feature>.fromweb.json（原子写）。
 
+    合并语义（替代旧覆盖式）：读现有文件 → 按 case id 合并（新覆盖旧、
+    文件独有的保留）→ 原子写回。导出路径的用例 id 内容派生（stable_case_id
+    ——同批数据重复导出同 id 就地更新，不堆积副本）；要删除用例请走
+    delete_all_fromweb 或手工编辑文件。
     逐条经 schema 模型校验，任一非法即抛 DatasetError（整批不落盘）；
-    空列表拒绝导出（防止误操作清掉已有用例文件）。
+    origin 受控枚举在写入前校验（单点写入处同样拦非法值）；空列表拒绝
+    导出（不改动已有文件）。本函数是用例来源字段（origin/batch_fingerprint）
+    的**单点写入处**：默认 origin=cards + 本调用新指纹；recorder 等其它
+    来源复用本函数时显式传 origin 与自己的指纹（不传则每调用生成）。
+    既有文件里的用例不再重新校验（历史数据原样保留，新入参为准）。
     """
-    from briefdesk.plugins.benchmark.schema import DatasetError
+    from briefdesk.plugins.benchmark.schema import CASE_ORIGINS, DatasetError
 
+    if origin not in CASE_ORIGINS:
+        # 受控枚举在写入前校验：绕开它会让非法 origin 落盘、再被 parse 层
+        # 静默丢弃（文件数据集路径才报错）——契约（见 architecture.md）是
+        # 单点写入处同样拦非法值
+        raise DatasetError(
+            f"非法 origin {origin!r}；可选：{'、'.join(CASE_ORIGINS)}"
+        )
     if not cases:
-        raise DatasetError("用例列表为空，未导出（不覆盖已有文件）")
-    validated = [validate_case(feature, case) for case in cases]
+        raise DatasetError("用例列表为空，未导出（不改动已有文件）")
+    stamped_fingerprint = fingerprint or batch_fingerprint(origin)
+    stamped: list[dict[str, Any]] = []
+    for case in cases:
+        validated = validate_case(feature, case)
+        validated["origin"] = origin
+        validated["batch_fingerprint"] = stamped_fingerprint
+        stamped.append(validated)
     path = fromweb_path(feature)
     path.parent.mkdir(parents=True, exist_ok=True)
+    existing_cases: list[dict[str, Any]] = []
+    if path.exists():
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8-sig"))
+        except (json.JSONDecodeError, UnicodeDecodeError, OSError) as e:
+            # 旧文件不可读（语法坏/编码坏）时拒绝整批覆盖：合并写的前提
+            # 是「不丢既有用例」，静默按空合并会换一种方式重犯覆盖式丢
+            # 数据的缺陷——宁可让用户手工处理该文件
+            raise DatasetError(
+                f"既有导出文件不可读，拒绝合并覆盖（请手工修复或删除后重试）："
+                f"{path.name}（{e}）"
+            ) from e
+        if not isinstance(raw, dict) or not isinstance(raw.get("cases"), list):
+            raise DatasetError(
+                f"既有导出文件结构非法（缺 cases 数组），拒绝合并覆盖：{path.name}"
+            )
+        dropped = 0
+        for entry in raw["cases"]:
+            if isinstance(entry, dict) and entry.get("id"):
+                existing_cases.append(entry)
+            else:
+                dropped += 1
+        if dropped:
+            logger.warning(
+                "既有导出文件中 %d 条无法识别的条目被丢弃（缺 id 或非对象）：%s",
+                dropped, path.name,
+            )
+    by_id = {c.get("id"): c for c in existing_cases}
+    for case in stamped:
+        by_id[case["id"]] = case
+    merged = list(by_id.values())
     payload = {
         "feature": feature,
         "description": description
         or f"网页「导出当前列表为基准用例」于 {time.strftime('%Y-%m-%d %H:%M:%S')}"
-        "导出（覆盖式，期望=卡片当前分类）",
-        "cases": validated,
+        "导出（合并写，期望=卡片当前分类）",
+        "cases": merged,
     }
     tmp = path.with_name(path.name + ".tmp")
     tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -157,13 +239,18 @@ async def export_fromweb(
 def _read_fromweb(
     feature: str, cases_dir: Path | None = None
 ) -> list[dict[str, Any]]:
-    """读取某功能的 fromweb 用例（文件缺失/非法 → 空列表 + WARNING）。"""
+    """读取某功能的 fromweb 用例（文件缺失/非法 → 空列表 + WARNING）。
+
+    编码兜底与写入侧同口径（utf-8-sig + UnicodeDecodeError）：坏编码文件
+    按空列表跳过而非抛穿——读取点在 Web 运行与 CLI 回落的公共路径上，
+    一个坏文件不该打崩整轮基准。
+    """
     path = fromweb_path(feature, cases_dir)
     if not path.exists():
         return []
     try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError) as e:
+        raw = json.loads(path.read_text(encoding="utf-8-sig"))
+    except (json.JSONDecodeError, UnicodeDecodeError, OSError) as e:
         logger.warning("网页导出用例文件不可读 %s: %s", path.name, e)
         return []
     cases = raw.get("cases") if isinstance(raw, dict) else None
@@ -299,7 +386,11 @@ def build_classify_cases_from_rows(rows: list[dict[str, Any]]) -> list[dict[str,
             note += f"，含 {batch_noise} 条噪声（已忽略）"
         cases.append(
             {
-                "id": new_case_id(),
+                # 批级用例的稳定身份 = 成员消息 id 集合：同批重复导出同 id
+                # （就地更新期望），成员变化（卡片状态变/筛选变）→ 新批
+                "id": stable_case_id(
+                    "classify", sorted(m["msg_id"] for m in batch_msgs)
+                ),
                 "note": note,
                 "messages": batch_msgs,
                 "expected": batch_expected,
@@ -378,11 +469,12 @@ def build_title_cases_from_rows(rows: list[dict[str, Any]]) -> list[dict[str, An
             note = "由设置导出：期望=卡片当前标题（无 key_info）"
         else:
             continue
+        msg = _card_to_message(row)
         cases.append(
             {
-                "id": new_case_id(),
+                "id": stable_case_id("title", msg["msg_id"]),
                 "note": note,
-                "message": _card_to_message(row),
+                "message": msg,
                 "old_title": title,
                 "key_info": row.get("key_info") or "",
                 "expected": expected,
@@ -402,12 +494,16 @@ def build_dedup_cases_from_rows(rows: list[dict[str, Any]]) -> list[dict[str, An
     cases: list[dict[str, Any]] = []
 
     def _case(item_row: dict[str, Any], query_row: dict[str, Any], same: bool, note: str) -> None:
+        item_msg = _card_to_message(item_row)
+        query_msg = _card_to_message(query_row)
         cases.append(
             {
-                "id": new_case_id(),
+                "id": stable_case_id(
+                    "dedup", [item_msg["msg_id"], query_msg["msg_id"]]
+                ),
                 "note": note,
-                "items": [_card_to_message(item_row)],
-                "query": _card_to_message(query_row),
+                "items": [item_msg],
+                "query": query_msg,
                 "expected": {"same": same},
             }
         )
@@ -474,22 +570,30 @@ def build_merge_cases_from_rows(rows: list[dict[str, Any]]) -> list[dict[str, An
             if h_subj and t_subj and h_subj == t_subj:
                 if (head.get("sender_name") or "") != (tail.get("sender_name") or ""):
                     continue  # 同主体不同发送者：可能一买一卖，歧义跳过
+                head_msg = _card_to_message(head)
+                tail_msg = _card_to_message(tail)
                 cases.append(
                     {
-                        "id": new_case_id(),
+                        "id": stable_case_id(
+                            "merge", [head_msg["msg_id"], tail_msg["msg_id"]]
+                        ),
                         "note": "由设置导出：同会话同主体同发送者的相邻片段 → 应合并",
-                        "head": _card_to_message(head),
-                        "tail": _card_to_message(tail),
+                        "head": head_msg,
+                        "tail": tail_msg,
                         "expected": {"merge": True},
                     }
                 )
             elif h_subj and t_subj:
+                head_msg = _card_to_message(head)
+                tail_msg = _card_to_message(tail)
                 cases.append(
                     {
-                        "id": new_case_id(),
+                        "id": stable_case_id(
+                            "merge", [head_msg["msg_id"], tail_msg["msg_id"]]
+                        ),
                         "note": "由设置导出：同会话不同主体的相邻卡片 → 不应合并",
-                        "head": _card_to_message(head),
-                        "tail": _card_to_message(tail),
+                        "head": head_msg,
+                        "tail": tail_msg,
                         "expected": {"merge": False},
                     }
                 )

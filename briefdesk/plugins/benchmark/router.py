@@ -2,11 +2,11 @@
 
 - 网页「导出当前列表为基准用例」把当前筛选的卡片构造成四类用例
   （classify/dedup/merge/title，推导口径见 store.CASE_BUILDERS）并逐功能
-  导出到**用户用例目录**的 <feature>.fromweb.json（覆盖式，见 store.py，不触碰数据库）；
+  导出到**用户用例目录**的 <feature>.fromweb.json（合并写，见 store.py，不触碰数据库）；
 - 网页「记录处理过程」打开 benchmark 阶段插件的采集（默认关闭）：管道真实
   处理时点的 dedup/merge 判定累积内存（recorder.py），经
   POST /api/benchmark/export-recorded 导出到用户用例目录的 <feature>.fromweb.json
-  （覆盖式，含判重/合并命中的正向用例——按卡片最终状态导出观察不到）；
+  （合并写，含判重/合并命中的正向用例——按卡片最终状态导出观察不到）；
 - Web 运行把包内示例与用户用例快照进运行目录（同名以用户文件为准）；
 - 运行生命周期交给 supervisor（见该模块）；本模块只做 HTTP 面：POST 启动、
   GET 轮询、DELETE 取消；
@@ -72,8 +72,9 @@ async def remove_all_cases(feature: str | None = None) -> dict[str, Any]:
     return {"deleted": deleted}
 
 
-# 本路由是插件内唯一的 get_items_page 调用点，并**覆盖式**写 cases/*.fromweb.json：
-# 它读的是生产库当前列表，用户的真实用例数据集就是被它覆盖的。改这里要格外小心——
+# 本路由是插件内唯一的 get_items_page 调用点，并**合并写** cases/*.fromweb.json：
+# 它读的是生产库当前列表，用例期望数据集就来自这里（同 id 用例被本次导出
+# 更新为新状态）。改这里要格外小心——
 # 一旦改成读别处（例如基准自己的 scratch 库），导出出来的会变成合成数据。
 @router.post("/api/benchmark/import-current")
 async def import_current_list(
@@ -94,8 +95,8 @@ async def import_current_list(
     **已忽略卡片（is_verified=-1）** 恒被纳入 classify 用例作为噪声样本
     （消息进入 messages、不写期望——AI 误分类上来的闲聊，模型不应输出
     分类结果），并在 title/dedup/merge 中排除。
-    每功能覆盖导出 cases/<feature>.fromweb.json；某功能无可导出用例时
-    保留其原文件（不触碰数据库）。
+    每功能合并写入 cases/<feature>.fromweb.json（同 id 更新、其余保留）；
+    某功能无可导出用例时保留其原文件（不触碰数据库）。
     """
     now_local = None
     if hide_expired:
@@ -187,7 +188,7 @@ async def clear_record() -> dict[str, Any]:
 
 @router.post("/api/benchmark/export-recorded")
 async def export_recorded() -> dict[str, Any]:
-    """把处理记录导出为基准用例（覆盖 cases/<feature>.fromweb.json），随后清空。
+    """把处理记录合并写入 cases/<feature>.fromweb.json（origin=recorder），随后清空。
 
     与「导出当前列表」互补：记录捕获管道处理时点的真实判定（判重命中/
     合并命中的正向用例、判官判定的负向用例、合并后重拟标题事件）；

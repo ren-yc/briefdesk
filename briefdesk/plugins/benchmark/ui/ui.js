@@ -3,8 +3,8 @@
  * 核心只提供通用加载器；本文件注入后自行构建：
  * - 「导出当前列表为基准用例」：把当前筛选条件下的卡片导出为四类基准用例
  *   （classify/dedup/merge/title，期望=卡片当前状态，与「导出卡片 CSV」
- *   同口径），逐功能覆盖写入用户用例目录的 cases/<feature>.fromweb.json
- *   （文件存储，不写数据库；无可导出用例的功能保留原文件）；
+ *   同口径），逐功能合并写入用户用例目录的 cases/<feature>.fromweb.json
+ *   （文件存储，不写数据库；同 id 用例更新、其余保留）；
  * - 「记录处理过程」：打开/关闭 benchmark 阶段插件（管道处理时点采集
  *   dedup/merge 判定观察记录，含判重/合并命中的正向用例——按卡片最终
  *   状态导出观察不到命中），「导出处理记录」写入同一 cases 文件；
@@ -40,8 +40,9 @@
       + '（期望 = 卡片当前状态：分类/标题/关键词；去重与合并按共存状态配对；'
       + '已忽略的卡片作为分类噪声样本——AI 误分类的闲聊，模型不应输出分类结果），'
       + '或开启「记录处理过程」在管道真实处理时点采集判定记录'
-      + '（含判重/合并命中的正向用例），逐功能覆盖写入用户用例目录'
-      + ' cases/*.fromweb.json，不写数据库。用例数与列表规模成正比，'
+      + '（含判重/合并命中的正向用例），逐功能合并写入用户用例目录'
+      + ' cases/*.fromweb.json（同 id 用例更新、其余保留；删除请走「清空基准用例」'
+      + '或手工编辑文件），不写数据库。用例数与列表规模成正比，'
       + '请先用筛选控制规模。运行会真实调用 AI，可能耗时数分钟；运行期间消息'
       + '处理会暂停（界面照常可用），结束后如未开启周期同步，请点一次同步补齐。</p>'
       + '<div class="about-sources settings-btn-row">'
@@ -176,7 +177,7 @@
     const $btn = document.getElementById("bench-import-btn");
     const $status = document.getElementById("bench-status");
     if (!$btn || !$status) return;
-    if (!window.confirm("导出会覆盖 cases/*.fromweb.json 中各功能的现有用例文件（无可导出用例的功能保留原文件），继续？")) return;
+    if (!window.confirm("导出将合并写入 cases/*.fromweb.json：同 id 用例更新为新状态，其余既有用例保留（要移除旧用例请先「清空基准用例」），继续？")) return;
     $btn.disabled = true;
     $status.textContent = "导出中…";
     try {
@@ -236,7 +237,7 @@
     const $btn = document.getElementById("bench-export-recorded-btn");
     const $status = document.getElementById("bench-status");
     if (!$btn || !$status) return;
-    if (!window.confirm("把已累积的处理记录导出为基准用例？会覆盖 cases/*.fromweb.json 中对应功能的现有用例文件（无记录的功能保留原文件），导出后清空记录。")) return;
+    if (!window.confirm("把已累积的处理记录合并写入 cases/*.fromweb.json（同 id 更新、其余保留，无记录的功能不动原文件），导出后清空记录。继续？")) return;
     $btn.disabled = true;
     $status.textContent = "导出记录中…";
     try {

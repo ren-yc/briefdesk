@@ -8,7 +8,7 @@
 本模块随 benchmark 插件注册为**阶段插件**（slot=post_insert，priority=1），
 在真实管道处理时点采集 dedup/merge 阶段写入 BatchContext 的判定观察记录
 （briefdesk.types 的 DedupCheck/MergeCheck），累积在内存（记录开关默认关闭，
-经 /api/benchmark/record 打开），导出时逐功能覆盖写入
+经 /api/benchmark/record 打开），导出时逐功能合并写入
 cases/<feature>.fromweb.json（复用 store.export_fromweb 的校验与原子写）。
 
 - 记录的是"判定时点"的事实：dedup 命中的 (query, 命中候选) → same=true；
@@ -26,7 +26,7 @@ import time
 from typing import Any
 
 from briefdesk.plugins.benchmark.schema import FEATURES
-from briefdesk.plugins.benchmark.store import _split_keywords, new_case_id
+from briefdesk.plugins.benchmark.store import _split_keywords, stable_case_id
 from briefdesk.types import BatchContext, DedupCheck, MergeCard, MergeCheck
 
 logger = logging.getLogger(__name__)
@@ -137,7 +137,7 @@ def build_dedup_case(check: DedupCheck) -> dict[str, Any] | None:
     cand = check.candidate
     msg = check.msg
     return {
-        "id": new_case_id(),
+        "id": stable_case_id("dedup", [cand.item_id, msg.msg_id]),
         "note": "由处理记录导出："
         + ("判重命中 → 同一信息" if check.is_duplicate else "候选判定不同 → 不同信息"),
         "items": [
@@ -185,7 +185,7 @@ def _merge_card_message(card: MergeCard) -> dict[str, Any]:
 def build_merge_case(check: MergeCheck) -> dict[str, Any]:
     """MergeCheck → merge 用例主体（head/tail 顺序与判官调用一致，期望=判定结论）。"""
     return {
-        "id": new_case_id(),
+        "id": stable_case_id("merge", [check.head.msg_id, check.tail.msg_id]),
         "note": "由处理记录导出："
         + ("合并判定命中 → 同话题片段" if check.same else "合并判定未命中 → 不同话题"),
         "head": _merge_card_message(check.head),
@@ -208,7 +208,7 @@ def build_title_case(check: MergeCheck) -> dict[str, Any] | None:
     if not keywords:
         return None
     return {
-        "id": new_case_id(),
+        "id": stable_case_id("title", [check.tail.msg_id, evt.old_title or ""]),
         "note": "由处理记录导出（合并后重拟标题）：期望=关键信息包含",
         "message": _message_dict(
             msg_id=check.tail.msg_id,
@@ -247,24 +247,33 @@ def record_batch(batch: BatchContext) -> None:
 
 
 async def export_recorded() -> dict[str, Any]:
-    """把累积记录逐功能导出为 cases/<feature>.fromweb.json（覆盖式），随后清空。
+    """把累积记录逐功能导出为 cases/<feature>.fromweb.json（合并写），随后清空。
 
     复用 store.export_fromweb 的逐条校验与原子写：任一功能校验失败即抛
-    DatasetError（该功能不落盘）；导出成功后清空累积器。
+    DatasetError（该功能不落盘）；导出成功后清空累积器。本函数显式声明
+    origin=recorder 与本次导出指纹——观察记录导出是「对照实验分母」的
+    载体，与卡片导出（origin=cards）在同文件内按来源字段区分。
     """
     from briefdesk.plugins.benchmark import store as bench_store
 
     exported: dict[str, int] = {}
     paths: dict[str, str] = {}
+    fingerprint = bench_store.batch_fingerprint("recorder")
     for feature in FEATURES:
         cases = _cases[feature]
         if not cases:
             continue  # 该功能无记录：保留已有文件
         description = (
             f"网页「导出处理记录为基准用例」于 {time.strftime('%Y-%m-%d %H:%M:%S')}"
-            "导出（覆盖式，期望=管道处理时点的判定）"
+            "导出（合并写，期望=管道处理时点的判定）"
         )
-        path = await bench_store.export_fromweb(feature, cases, description=description)
+        path = await bench_store.export_fromweb(
+            feature,
+            cases,
+            description=description,
+            origin="recorder",
+            fingerprint=fingerprint,
+        )
         exported[feature] = len(cases)
         paths[feature] = str(path)
     clear()

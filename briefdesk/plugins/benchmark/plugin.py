@@ -7,8 +7,9 @@
   最终状态导出观察不到命中），累积内存（记录开关默认关闭，经
   /api/benchmark/record 打开），导出为 cases/<feature>.fromweb.json；
 - 用例：文件存储（不触碰数据库）——网页「导出当前列表为基准用例」把当前
-  筛选的卡片逐功能覆盖导出到 cases/*.fromweb.json（classify/dedup/merge/
-  title 四类用例，期望=卡片当前状态），前端无需手动用例管理；
+  筛选的卡片逐功能合并写入 cases/*.fromweb.json（classify/dedup/merge/
+  title 四类用例，期望=卡片当前状态；同 id 更新、其余保留），前端无需
+  手动用例管理；
 - 运行：与生产同引擎同 AI 供应商（真实调用，耗时数分钟），交给独立子进程；
   父进程只负责生命周期与读盘，界面侧不受影响。运行期间经
   pipeline.set_processing_paused 暂停生产处理管道——实时消息延后到下一轮

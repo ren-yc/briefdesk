@@ -35,8 +35,10 @@
 
 1. **导出当前列表为基准用例**：把当前筛选条件下的卡片导出为**四类**基准用例
    （期望 = 卡片当前状态；无类别卡片跳过；与「导出卡片 CSV」同口径），
-   逐功能**覆盖写入**用户用例目录 `cases/<feature>.fromweb.json`（文件存储，
-   不写数据库；某功能无可导出用例时保留其原文件）。四类期望推导：
+   逐功能**合并写入**用户用例目录 `cases/<feature>.fromweb.json`（文件存储，
+   不写数据库；同 id 用例更新为新状态、其余既有用例保留——要移除旧用例请
+   先「清空基准用例」）。每条用例带来源标注：`origin=cards`（卡片导出）与
+   `batch_fingerprint`（本次导出批次指纹，训练数据侧按它做同源互斥）。四类期望推导：
    - **classify**：期望 = 卡片当前分类/主体/时间字段（按批上限拆分多例）；
      **已忽略卡片（is_verified=-1）作为噪声样本进入 messages、不写期望**——
      它们是 AI 误分类上来的闲聊（人工标记应丢弃），模型不应输出分类结果
@@ -59,8 +61,9 @@
    - **merge**：合并判定命中/未命中的 (head, tail) 对 → merge=true/false；
    - **title**：合并后重拟标题事件（old_title + 合并后 key_info/quote →
      期望 = key_info 关键词包含，与网页导出同口径）。
-   **导出处理记录**把累积记录逐功能覆盖写入用户用例目录的 `cases/<feature>.fromweb.json`
-   （无记录的功能保留原文件），导出后清空累积器；**丢弃记录**不清文件。
+   **导出处理记录**把累积记录逐功能合并写入用户用例目录的 `cases/<feature>.fromweb.json`
+   （`origin=recorder` 与本次导出指纹，与卡片导出按来源字段区分），导出后清空累积器；
+   **丢弃记录**不清文件。
    记录含真实聊天内容，导出文件已 gitignore，请勿长时间开启后忘记导出。
 3. **运行基准测试**：后台真实调用 AI（耗时数分钟），状态实时轮询；
    完成后显示各功能核心指标，可**打开图表报告**（自包含 HTML，可另存分享）。
@@ -191,5 +194,5 @@ python -m briefdesk.plugins.benchmark.cli --model deepseek-v4-flash --concurrenc
 - **dedup 大量"预筛跳过"**：标题重叠不足，未走到 AI；参考上文候选预筛注意。
 - **想测不同模型**：`--model` 覆盖模型名；同一测试集多跑几次可观察判定稳定性。
 - **Web 导出的用例去哪了**：用户用例目录 `cases/*.fromweb.json`（classify/dedup/
-  merge/title 四类，覆盖式文件，不写数据库；含真实聊天内容，已 gitignore，
+  merge/title 四类，合并式文件，不写数据库；含真实聊天内容，已 gitignore，
   禁止提交）；CLI 未找到 `<feature>.json` 时会自动回退使用它们。

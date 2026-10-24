@@ -28,6 +28,11 @@ from pydantic import BaseModel, Field, ValidationError, field_validator, model_v
 
 from briefdesk.types import InternalMessage
 
+# 用例来源受控枚举（对齐 ai_reasoning_effort 校验器风格：未知值响亮报错）。
+# manual=人工核对（唯一验收分母）/ recorder=观察记录导出 / cards=网页卡片
+# 导出 / synthetic=合成生成（永不入验收分母）。
+CASE_ORIGINS: tuple[str, ...] = ("manual", "recorder", "cards", "synthetic")
+
 FEATURES: tuple[str, ...] = ("classify", "dedup", "merge", "title")
 
 FeatureName = Literal["classify", "dedup", "merge", "title"]
@@ -164,6 +169,17 @@ class TitleExpected(BaseModel):
 class BaseCase(BaseModel):
     id: str
     note: str = ""  # 可选：用例说明/预期理由（便于人工复核）
+    origin: str = "manual"  # 用例来源（manual/recorder/cards/synthetic）
+    batch_fingerprint: str = ""  # 导出批次指纹（同源数据隔离的载体，空=未打）
+
+    @field_validator("origin")
+    @classmethod
+    def _validate_origin(cls, value: str) -> str:
+        if value not in CASE_ORIGINS:
+            raise ValueError(
+                f"非法 origin {value!r}；可选：{'、'.join(CASE_ORIGINS)}"
+            )
+        return value
 
 
 class ClassifyCase(BaseCase):
@@ -245,9 +261,18 @@ class DatasetFile(BaseModel):
 
 
 def load_dataset_file(path: str | Path) -> DatasetFile:
-    """加载并校验测试集文件顶层结构（feature/description/categories/cases）。"""
-    with open(path, encoding="utf-8") as f:
-        raw = json.load(f)
+    """加载并校验测试集文件顶层结构（feature/description/categories/cases）。
+
+    编码兜底与 store 读取侧同口径：非 UTF-8 文件抛 DatasetError（含原因）
+    而非裸 UnicodeDecodeError——CLI 面对坏文件应收到可操作的错误信息。
+    """
+    try:
+        with open(path, encoding="utf-8-sig") as f:
+            raw = json.load(f)
+    except UnicodeDecodeError as e:
+        raise DatasetError(f"数据集 {path} 不是合法 UTF-8 编码：{e}") from e
+    except json.JSONDecodeError as e:
+        raise DatasetError(f"数据集 {path} 不是合法 JSON：{e}") from e
     try:
         return DatasetFile.model_validate(raw)
     except ValidationError as e:
