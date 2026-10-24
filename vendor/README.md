@@ -106,3 +106,18 @@ powershell -File scripts/sync_vendor.ps1
   Trusted Publishing（OIDC）的首个实发验证：两仓四 crate 与两个 PyPI 包全部由 CI 自主发布
   成功，本仓 vendor 走既有 subtree 通道不受影响。同步经 `scripts/sync_vendor.ps1` 完成，
   本行两个 commit 取自 merge 提交的第二父。
+
+- SDK 0.9.3 发布同步：weflow `sdk-dist`（`70cd859`，源自 weflow-server master `3199da5`）、
+  qqflow `sdk-dist`（`e245b30`，源自 qqflow-server master `d481e2f`）。上游改动集中在 SDK
+  手写层：`wait_ready` 在账号清单成功到达但无此账号时快速失败（新错误类
+  `UnknownAccount`，附已注册清单，此前伪装成超时未注册）；`watch` 生成器被放弃时的
+  清理错误不再误报断线；生成层随版本串重生成（0.9.2 → 0.9.3）。镜像与上游逐 blob 相同
+  （`git ls-tree` 全量比对：weflow 60 项、qqflow 55 项，差异 0）。
+
+- SDK 0.10.0 发布同步：weflow `sdk-dist`（`70cd859`，同上——0.9.3 与 0.10.0 两次上游
+  发布间的 SDK 侧改动合并进了同一批 vendor 快进，镜像已含两版全部内容）、qqflow
+  `sdk-dist`（`e245b30`，同上）。上游 0.10.0 的破坏性变更（serve 日志通道、空会话语义、
+  群成员 404）全部在服务端，Python SDK 无行为变化；版本串随链到 0.10.0。镜像与上游
+  逐 blob 相同（`git ls-tree` 全量比对：weflow 60 项、qqflow 55 项，差异 0）。同步经
+  `scripts/sync_vendor.ps1` 完成，import smoke 通过（0.9.3 起 SDK 生成层依赖
+  `python-dateutil`，smoke 的解释器需已安装）。
