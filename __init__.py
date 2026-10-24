@@ -23,6 +23,7 @@ from .client import (
     StatusError,
     SyncClient,
     TransportError,
+    UnknownAccount,
 )
 
 __all__ = [
@@ -38,4 +39,5 @@ __all__ = [
     "StatusError",
     "SyncClient",
     "TransportError",
+    "UnknownAccount",
 ]

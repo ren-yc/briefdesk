@@ -124,6 +124,24 @@ class NotReady(ClientError):
         self.last_state = last_state
 
 
+class UnknownAccount(ClientError):
+    """``wait_ready``'s account id is not in the server's registered list.
+
+    Why fail fast: a session username (or any other identifier) passed here
+    used to look identical to ``not-registered`` and burn the whole timeout
+    before surfacing a misleading diagnosis. One successful listing that does
+    not contain the id is enough to know waiting cannot help.
+    """
+
+    def __init__(self, account: str, registered: list[str]) -> None:
+        shown = ", ".join(registered) if registered else "(no accounts registered)"
+        super().__init__(
+            f"account {account!r} is not in the registered list: {shown}"
+        )
+        self.account = account
+        self.registered = registered
+
+
 class BadDate(ClientError):
     """A time bound was neither ``YYYYMMDD`` nor unix seconds."""
 
@@ -435,7 +453,12 @@ class Client:
                 else:
                     last_state = str(mine.state.value)
             elif listing is not None:
-                last_state = "not-registered"
+                # A listing that came through names every registered account:
+                # the requested id not being in it can never be fixed by
+                # waiting (the usual wrong input is a session username). A
+                # dropped round stays "not-registered" - absence of evidence
+                # is not evidence of absence.
+                raise UnknownAccount(account, [a.qq for a in listing.accounts])
             if asyncio.get_running_loop().time() >= deadline:
                 # Naming the dropped rounds is the difference between "indexing, keep
                 # waiting" and "this server never answered once" - both end at the
@@ -981,7 +1004,16 @@ class Client:
                 # errors - the two other entry points raise, so raise here too.
                 raise TransportError(f"unusable base_url for SSE: {exc}") from exc
             except httpx.HTTPError as exc:
-                log.warning("SSE stream error, reconnecting: %s", exc)
+                if isinstance(exc.__context__, GeneratorExit):
+                    # Teardown of an abandoned stream (for-break, GC, task
+                    # cancel), not a disconnect: the httpx cleanup error's
+                    # message is empty and "reconnecting" would be a lie -
+                    # nobody is consuming anymore. End the stream quietly;
+                    # real disconnects keep their reconnect loop.
+                    return
+                # Naming the exception type keeps the tail visible when the
+                # message is empty.
+                log.warning("SSE stream error, reconnecting: %s: %s", type(exc).__name__, exc)
             if clean_exit:
                 backoff = 0.5
             await asyncio.sleep(backoff)
