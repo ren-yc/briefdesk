@@ -13,7 +13,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
+import time
 from typing import Any
 
 import numpy as np
@@ -47,6 +49,7 @@ async def chat(
     max_tokens: int = 4096,
     timeout: float | None = None,
     max_retries: int | None = None,
+    telemetry_kind: str = "",
 ) -> ChatResponse:
     """统一 AI 调用端口（模型/供应商由已注册插件决定）。
 
@@ -57,7 +60,17 @@ async def chat(
     max_retries：SDK 重试次数覆盖；判官类调用传 0——SDK 默认重试 2 次会把
     单次判官最坏耗时放大到 3 倍锁内占用。None 时不传该参数（保持既有端口
     契约，只接受旧参数的测试桩不受影响）。
+
+    telemetry_kind：遥测标注（如 "judge" / "classify" / "sysc" /
+    "summarize" / "title"），端口层计时并计数，**不透传给供应商**——
+    旧测试桩零感知。空串仍计时（归入空维度），只是没有任务维度的标注。
+    取消（CancelledError）单独计数且不进延迟分布（半程耗时混入会污染
+    分位数）；其余异常（含 TimeoutError——判官超时正是要观测的最坏
+    尾部）计入 .error 并保留延迟样本。
     """
+    from briefdesk import telemetry
+
+    start = time.perf_counter()
     kwargs: dict[str, Any] = {
         "temperature": temperature,
         "max_tokens": max_tokens,
@@ -65,7 +78,22 @@ async def chat(
     }
     if max_retries is not None:
         kwargs["max_retries"] = max_retries
-    return await _require_ai().chat(messages, **kwargs)
+    try:
+        resp = await _require_ai().chat(messages, **kwargs)
+    except asyncio.CancelledError:
+        telemetry.record(f"{telemetry_kind or 'chat'}.cancelled")
+        raise
+    except Exception:
+        elapsed = (time.perf_counter() - start) * 1000.0
+        telemetry.record(f"{telemetry_kind or 'chat'}.error")
+        telemetry.observe(f"{telemetry_kind or 'chat'}.latency", elapsed)
+        raise
+    telemetry.record(f"{telemetry_kind or 'chat'}.call")
+    telemetry.observe(
+        f"{telemetry_kind or 'chat'}.latency",
+        (time.perf_counter() - start) * 1000.0,
+    )
+    return resp
 
 
 async def rag_chat(

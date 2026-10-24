@@ -80,6 +80,7 @@ weflow-server :5033        WeFlow(legacy) :5031        qqflow-server :5032
 | `briefdesk/plugins/merge/engine.py` | 会话内同话题片段合并判官（与去重互补的第二个 AI 判定），判定字段与合并证据。[详见下文](#briefdeskpluginsmergeenginepy) |
 | `briefdesk/plugins/ocr/engine.py` | RapidOCR（基于 ONNX Runtime，CPU 推理）图片文字识别（懒加载、进程内单例）。[详见下文](#briefdeskpluginsocrenginepy) |
 | `briefdesk/announcements.py` | 应用级公告注册表——持续性条件的顶部横幅：置位/撤销契约与 SSE 下发。[详见下文](#briefdeskannouncementspy) |
+| `briefdesk/telemetry.py` | 最小遥测集（进程内、无依赖）：计数器 + 耗时样本窗口分位 + merge 余弦-真值明细；record/observe 永不抛错。落盘用户数据目录 `telemetry/`（latest.json + 每日 jsonl + cosine_truth 每日 jsonl），轮询周期尾部汇总与落盘。[详见下文](#briefdesktelemetrypy) |
 | `briefdesk/realtime.py` | 进程内发布/订阅：`publish_items_updated()`（列表刷新）与 `publish_sync_progress()`（同步进度事件）把事件推给所有订阅队列（队列项为 `(事件名, data JSON)` 二元组），由 server 的 `/api/stream` SSE 按事件名转发给前端。订阅队列满丢弃事件累计 `_dropped_count`（`get_dropped_count()` 只读诊断口）。 |
 | `briefdesk/status.py` | 应用运行时状态 + 消息源注册表：`set_status`/`is_syncing`/同步进度计数与源客户端注册。[详见下文](#briefdeskstatuspy) |
 | `briefdesk/sync.py` | 同步服务：`set_sync_callback` + `trigger_sync()`（fire-and-forget 全源轮询任务，syncing 互斥，结束后经 realtime 的 `items_updated` 事件广播 `{"synced": true}`——`synced` 是 payload 键，事件名是 `items_updated`）。main 启动（`startup`）/ 周期同步（`periodic`）与 `/api/sync`（`api`）共用。 |
@@ -298,8 +299,10 @@ RapidOCR（基于 ONNX Runtime，CPU 推理）图片文字识别。只接收图�
 应用级公告注册表——持续性条件的顶部横幅（如嵌入服务未启用/不可用）：`announce(code, level, message)`/`revoke(code)` 仅内容变化时发布
 `announcements_updated` SSE 事件（失败重试不刷屏），`get_announcements()` 返回 since 升序快照。快照同时经 `/api/status` 的
 `announcements` 字段下发。探测点：ai_provider setup（未配置 → `embedding_disabled`）与 `engine.embed_texts` 唯一咽喉（异常
-→ `embedding_unreachable`、成功 → 撤销）；vision 路由两个探测点——classify 含图请求级失败（`vision_fallback`，vision 成功撤销）与
-pipeline 入口「vision 开启但 enrich 槽为空」（`vision_without_ocr`，配置组合守卫，`pipeline._check_vision_without_ocr`）。「条件解除方撤销」
+→ `embedding_unreachable`、成功 → 撤销）；dedup 判重候选选取（等长失配或余弦计算异常/缓存混维 → `embedding_dim_mismatch`，
+余弦通道跑通的后续判重撤销——同步层置位标志、`check_dedup` 的 async 层统一 announce/revoke）；vision 路由两个探测点——classify
+含图请求级失败（`vision_fallback`，vision 成功撤销）与 pipeline 入口「vision 开启但 enrich 槽为空」（`vision_without_ocr`，
+配置组合守卫，`pipeline._check_vision_without_ocr`）。「条件解除方撤销」
 范式见 `vision_without_ocr`：`announce` 幂等（已置位且内容未变返回 False），WARNING 仅在首次置位分支输出，持续实时消息不逐批刷屏；
 enrich 阶段恢复或 vision 关闭时同函数走 `revoke` 撤销横幅，复发时自动重新置位——范式代码（逐字对应
 `pipeline._check_vision_without_ocr`）：
@@ -316,6 +319,18 @@ else:
 与 `lastWarning`（管道成功产出即清空的瞬态提示）互补；前端
 公
 告条 `#announcements` 复用 warning 横幅样式，× 关闭仅当次会话。
+
+#### briefdesk/telemetry.py
+
+最小遥测集（阶段 0 基线测量的基础设施）：进程内计数器（`record(kind, source)`）与耗时样本窗口
+（`observe(kind, ms, source)`，上限抽稀保窗口、全量 count/total 独立累计）+ merge 余弦-真值明细
+（`record_cosine_truth(source, cosine, verdict)`，预筛门限 ROC 标定输入）。全部记录入口与读路径
+（`snapshot`/`format_summary`）兜底吞异常——遥测故障绝不连坐判定路径。AI 调用计时在 `ai_ports.chat`
+统一挂（调用方传 `telemetry_kind` 标注任务维度，如 `judge.dedup`/`classify.sysb`；取消单列 `.cancelled`
+不进延迟分布，失败记 `.error`）。落盘用户数据目录 `telemetry/`：`latest.json`（验收门读数入口）、
+每日 `telemetry-YYYYMMDD.jsonl`（快照流）、每日 `cosine_truth-YYYYMMDD.jsonl`（标定明细，权威存储；
+内存只是待写缓冲，flush 增量追加）。写盘点只有轮询周期尾部（`poll_cycle` 汇总 + flush，30s 节流，
+失败后窗口内不重试防风暴）。
 
 #### briefdesk/status.py
 

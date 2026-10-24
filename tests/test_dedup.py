@@ -1643,6 +1643,14 @@ class DegradedChannelLogGateTest(unittest.IsolatedAsyncioTestCase):
 
     _LOGGER = "briefdesk.plugins.dedup.engine"
 
+    def setUp(self):
+        # 本组用例读/写全局公告注册表（维度不一致置位/撤销断言），
+        # 按仓库既有约定先清空、后清理，防用例间经全局态互染
+        from briefdesk import announcements as _ann
+
+        _ann.reset_announcements()
+        self.addCleanup(_ann.reset_announcements)
+
     @staticmethod
     def _engine(embedding):
         """构造只含一条缓存的引擎（embedding 决定走哪条降级分支）。"""
@@ -1672,13 +1680,28 @@ class DegradedChannelLogGateTest(unittest.IsolatedAsyncioTestCase):
         assert "query=3" in joined
         assert "缓存=2" in joined
         assert "需重建 item_embeddings" in joined, "文案须说清不会自愈"
+        # 维度不一致置位持续性公告（遥测/公告：去重降级的可恢复可见性）
+        from briefdesk import announcements as ann
 
-        # 第二条同状态消息：WARNING 不再出现，信息仍完整保留在 DEBUG
+        assert any(
+            a["code"] == "embedding_dim_mismatch"
+            for a in ann.get_announcements()
+        )
+
+        # 第二条同状态消息：WARNING 不再出现，信息仍完整保留在 DEBUG；
+        # 公告保持置位（条件未解除）
         with self.assertNoLogs(self._LOGGER, level="WARNING"):
             await self._check(engine, [0.1, 0.2, 0.3])
         with self.assertLogs(self._LOGGER, level="DEBUG") as logs2:
             await self._check(engine, [0.1, 0.2, 0.3])
         assert any("维度不一致" in m for m in logs2.output), logs2.output
+
+        # 维度恢复一致：公告撤销
+        await self._check(engine, [0.1, 0.2])
+        assert all(
+            a["code"] != "embedding_dim_mismatch"
+            for a in ann.get_announcements()
+        )
 
     async def test_cosine_failure_warns_once_with_stack_then_debug(self):
         """余弦异常：首条带栈（真 numpy 异常靠它定位），其后降 DEBUG。"""

@@ -25,6 +25,8 @@ from briefdesk.logger import fmt_dur
 from briefdesk.pipeline import process_all_batches
 from briefdesk.sources_base import SourceRuntime
 from briefdesk.status import set_status
+from briefdesk.telemetry import flush as telemetry_flush
+from briefdesk.telemetry import format_summary as telemetry_summary
 from briefdesk.types import SessionInfo
 
 logger = logging.getLogger(__name__)
@@ -150,6 +152,12 @@ async def run_poll_cycle(source: SourceRuntime) -> None:
             len(result.contacts),
             fmt_dur(time_module.perf_counter() - perf_start),
         )
+        # 轮询周期尾部的遥测汇总与落盘（有记录才打 INFO；落盘节流在
+        # telemetry.flush 内部）
+        summary = telemetry_summary()
+        if summary:
+            logger.info(summary)
+        telemetry_flush()
     except Exception as e:
         # exception 而非 error：这是整条轮询链路的唯一兜底出口（下游轮询器
         # 与客户端都只上抛、不重复记日志），异常可能来自任意深度，没有栈就

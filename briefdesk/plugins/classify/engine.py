@@ -778,6 +778,7 @@ async def summarize_results(
             ],
             temperature=0.1,
             max_tokens=_SUMMARY_MAX_TOKENS,
+            telemetry_kind="summarize.classify",
         )
     except Exception as e:  # noqa: BLE001 — 概括失败回退，不中断管道
         # 带原因（不带栈）：上游故障多为 401/额度/超时，异常文本已足够自助排查；
@@ -966,6 +967,7 @@ async def _extract_times_core(
             ],
             temperature=0.1,
             max_tokens=_TIME_MAX_TOKENS,
+            telemetry_kind="classify.sysc",
         )
     except Exception as e:  # noqa: BLE001 — 时间提取失败回退，不中断管道
         # 带原因，同 summarize_results：AI 侧故障需要在默认级别可自助定位。
@@ -1079,6 +1081,7 @@ async def _classify_once(
             ],
             temperature=0.1,
             max_tokens=config.max_classify_tokens,
+            telemetry_kind="classify.sysb",
         )
 
     async def _fallback_request(why: str) -> ChatResponse | None:
