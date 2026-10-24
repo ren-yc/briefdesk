@@ -18,12 +18,11 @@
 ## 定位
 
 简报台（Brief Desk）is a local web app that monitors group chat messages via pluggable message sources
-(default: WeFlow HTTP API), classifies them with AI, deduplicates across groups, optionally OCRs
-attached images (含图消息按模型能力路由：纯文本模型仅送 OCR 文本；`AI_VISION_ENABLED` 开启时把 OCR 文本连同图片一并送入视觉模型，见「图片与 OCR」陷阱小
-节), and displays structured, deduplicated information briefs (factory default categories: 13 — 活动通知/社
-团招新/学术/交易/实习 默认启用，另有 失物招领/求助互助/组队拼团/兼职家教/免费福利/房屋租售/志愿公益/奖助申报 出厂停用；空库播种全量，存量库由
-`_backfill_default_categories` 按 `PRAGMA user_version` 门控一次性补齐缺失项（不改写已有行）；均可在设置中自定义). Multiple
-sources can run concurrently (each source is an optional plugin, enabled via the `PLUGINS` list or the per-plugin toggles in 设置 → 插件).
+(weflow / weflow-legacy / qqflow — each an optional plugin, none enabled by default), classifies them with AI,
+deduplicates across groups, optionally OCRs attached images, and displays structured, deduplicated information
+briefs. 出厂分类与停用态、图片/视觉路由、存量库补种口径分散在下文对应小节（分类、图片与 OCR 陷阱、schema 迁移），
+此处不重复。Multiple sources can run concurrently (each source is an optional plugin, enabled via the
+`PLUGINS` list or the per-plugin toggles in 设置 → 插件).
 
 ## 总览与数据流
 
@@ -66,7 +65,7 @@ weflow-server :5033        WeFlow(legacy) :5031        qqflow-server :5032
 
 | Module | Role |
 |---|---|
-| `main.py` (root) | 3-line shim for `python main.py` backward compatibility. Delegates to `briefdesk.main:main`. |
+| `main.py` (root) | 5 行（2 行代码）的兼容 shim：`from briefdesk.main import main` + `main()`，撑起 `python main.py` 这条旧启动路径。 |
 | `briefdesk/main.py` | Real entry point — runtime lifecycle only（启动顺序、关停编排、信号处理）。[详见下文](#briefdeskmainpy) |
 | `briefdesk/__main__.py` | Enables `python -m briefdesk`. |
 | `briefdesk/poll_cycle.py` | 轮询周期业务编排（应用层控制流，不属源包）：`run_poll_cycle` 拉取→管道→水位推进。[详见下文](#briefdeskpoll_cyclepy) |
@@ -83,11 +82,12 @@ weflow-server :5033        WeFlow(legacy) :5031        qqflow-server :5032
 | `briefdesk/announcements.py` | 应用级公告注册表——持续性条件的顶部横幅：置位/撤销契约与 SSE 下发。[详见下文](#briefdeskannouncementspy) |
 | `briefdesk/realtime.py` | 进程内发布/订阅：`publish_items_updated()`（列表刷新）与 `publish_sync_progress()`（同步进度事件）把事件推给所有订阅队列（队列项为 `(事件名, data JSON)` 二元组），由 server 的 `/api/stream` SSE 按事件名转发给前端。订阅队列满丢弃事件累计 `_dropped_count`（`get_dropped_count()` 只读诊断口）。 |
 | `briefdesk/status.py` | 应用运行时状态 + 消息源注册表：`set_status`/`is_syncing`/同步进度计数与源客户端注册。[详见下文](#briefdeskstatuspy) |
-| `briefdesk/sync.py` | 同步服务：`set_sync_callback` + `trigger_sync()`（fire-and-forget 全源轮询任务，syncing 互斥，结束后经 realtime 广播 `synced`）。main 启动与 `/api/sync` 共用。 |
+| `briefdesk/sync.py` | 同步服务：`set_sync_callback` + `trigger_sync()`（fire-and-forget 全源轮询任务，syncing 互斥，结束后经 realtime 的 `items_updated` 事件广播 `{"synced": true}`——`synced` 是 payload 键，事件名是 `items_updated`）。main 启动（`startup`）/ 周期同步（`periodic`）与 `/api/sync`（`api`）共用。 |
+| `briefdesk/paths.py` | 路径计算（函数式，只算不建目录、每次调用求值）：`user_config_dir`/`user_data_dir`/`user_cache_dir`（platformdirs，**必须 `appauthor=False`**，否则 Windows 多一层 `briefdesk`）、`database_path`（用户数据目录 `data/briefdesk.sqlite`）、`benchmark_{cases,reports,runs}_dir`、`settings_file`、`project_dotenv_path`（源码/editable 判定）。`BRIEFDESK_DATA_DIR`/`BRIEFDESK_CACHE_DIR`/`BRIEFDESK_SETTINGS_FILE` **只读进程环境变量**，不读 `.env`。 |
 | `briefdesk/config.py` | `pydantic-settings` 配置（.env + UI 暂存文件；密钥 `SecretStr` 掩码；解析链见「配置」节）。[详见下文](#briefdeskconfigpy) |
-| `briefdesk/settings_env.py` | UI「启动配置」暂存层：`get_settings_file()`（`platformdirs.user_config_dir("briefdesk")/settings.env`，可经 `BRIEFDESK_SETTINGS_FILE` 覆盖）、`read_staged`/`write_staged`（`KEY=VALUE` 行、原子写、空则删文件）、`source_of`（override/env/dotenv/default 判定）。不 import config（config 在 import 期构造 env_file 列表）。 |
-| `briefdesk/settings_base.py` | `KeyringSettingsBase`——app 级与各源插件 Settings 的公共基类（密钥环解析链挂载）。[详见下文](#briefdesksettings_basepy) |
-| `briefdesk/settings_schema.py` | 从核心或插件 `BaseSettings` 模型生成 JSON 安全的设置 schema（字段类型、默认值、当前值、约束与密钥配置状态）；统一规范化/校验前端暂存值，密钥不回传明文。 |
+| `briefdesk/settings_env.py` | UI「启动配置」暂存层：`get_settings_file()`（委托 `paths.settings_file()`，可经 `BRIEFDESK_SETTINGS_FILE` 覆盖）、`read_staged`/`write_staged`（`KEY=VALUE` 行、原子写、空则删文件）、`dotenv_layers()`（**唯一的有序层定义**：项目 .env → 用户暂存，解析与展示共用）、`source_of`（env/dotenv/override/default；大小写不敏感、空串算已提供）、`field_env_key`（字段 → 环境变量键，与 settings_schema 共用）、值查询（`composed_value`：env > 项目 .env > 暂存，PUT 预检可按写后暂存态取值）、启动快照（**登记与计算分离**：`register_model` 登记运行快照（兼容入口 `capture_model_sources`），`model_source_snapshot` 纯计算不登记——渲染未登记模型时现算用后者，登记表只收生效时刻的模型；核心另有 `capture_startup_sources`/`startup_source`）。不 import config。 |
+| `briefdesk/settings_base.py` | `KeyringSettingsBase`——app 级与各源插件 Settings 的公共基类：密钥环源挂载 + 两个独立 dotenv 来源（项目 .env 高于暂存）+ 显式 `_env_file` 契约（ContextVar 捕获显式性，`model_config["env_file"]` 恒为 None）。[详见下文](#briefdesksettings_basepy) |
+| `briefdesk/settings_schema.py` | 从核心或插件 `BaseSettings` 模型生成 JSON 安全的设置 schema（字段类型、默认值、约束、密钥配置状态，以及**三个时点**的取值：运行快照 `current`/`source`、下次启动 `expected_value`/`expected_source`；每项另带 `applyWhen` 采用时点——`restart` 缺省 / `next_run` / `next_cleanup`，由调用方经 `apply_when` 参数按字段声明，前端按它显示采用时点文案）；统一规范化/校验前端暂存值，密钥不回传明文。 |
 | `briefdesk/plugins/weflow_legacy/normalize.py` | Two normalization paths: `normalize_sse` and `normalize_rest` both produce **lists** of `InternalMessage`。[详见下文](#briefdeskpluginsweflow_legacynormalizepy) |
 | `briefdesk/pipeline.py` | `process_all_batches()` — 管道**骨架**：入口过滤、raw 落库、批次编排与阶段调度（不 import 任何 AI/OCR 实现）。[详见下文](#briefdeskpipelinepy) |
 | `briefdesk/db.py` | All SQLite via `aiosqlite`（单连接单例、存储锁、schema 迁移与备份/恢复）。[详见下文](#briefdeskdbpy) |
@@ -130,11 +130,12 @@ expired ignored（`IGNORED_EXPIRY_HOURS` > 0 时）→ `PluginManager.setup_all(
 `ctx.register_source` 注册、阶段插件经 `ctx.register_stage` 注册、dedup 插件在 setup 内完成去重缓存预热、`ctx.dedup` 服务端口就绪、
 Web 插件经 `ctx.register_router`/`ctx.register_plugin_assets` 注册；按名注册到 server，零源降级启动（warning + UI 明示，不再
 中
-止——决策 ①=1B））→ Web 插件挂载（`include_plugin_router` 展开路由插到 SPA mount 前 + 静态资源注册 +
+止））→ Web 插件挂载（`include_plugin_router` 展开路由插到 SPA mount 前 + 静态资源注册 +
 `set_plugins_info_callback(manager.infos)` + `set_settings_schema_callback(manager.settings_schema)` +
 `set_plugin_meta_callback(manager.plugin_meta)` + `set_plugin_validation_callback(manager.validate_selection)`）
-→ start uvicorn → wait for `server.started` → `activate_all()` + 逐个 `source.start()`（启动实时监听）→
-background initial sync (`trigger_sync`). Registers SIGINT/SIGTERM graceful shutdown via
+→ start uvicorn（创建 `server.serve()` 任务）→ `activate_all()` + 逐个 `source.start()`（启动实时监听）→
+background initial sync (`trigger_sync`) → wait for `server.started`（随后才安装信号 handler，见下）.
+Registers SIGINT/SIGTERM graceful shutdown via
 `_install_signal_handlers` (Windows falls back to `signal.signal` + `call_soon_threadsafe`)，**安装在
 `server.started` 之后**——此前启动窗口期（DB 初始化/插件装配/去重预热）的 Ctrl+C 由 `asyncio.Runner` 自带的 SIGINT handler 取消主任务
 ，`_run` 的 finally（唯一清理点）照常跑完（finally 开头 `uncancel()` 吸收该取消请求，保证后续清理 await 不被打断）；清理 finally 开头再将
@@ -155,13 +156,19 @@ aiosqlite 线程挂死）。The Ctrl+C handler only does what must precede `shou
 轮询周期业务编排（应用层控制流，不属源包）。`run_poll_cycle(source: SourceRuntime)` (查启用会话 → `_compute_session_windows` 按会
 话
 算增量窗口 → `source.fetch_history(enabled_sessions, window_start_by_session=...)` → 结果 `contacts`（经
-`bulk_upsert_contacts` 单事务批量写——曾逐条 upsert + 逐条 commit，每行一次 fsync，实测 2.4w 联系人 18.98s vs 批量 0.06s）；`sessions` 经 `bulk_upsert_sessions` 批量单事务，同一动机——锁内
+`bulk_upsert_contacts` 单事务批量写——曾逐条 upsert + 逐条 commit，每行一次 fsync，实测同一库单事务批量写与逐行 commit 差两个数量级）；`sessions` 经 `bulk_upsert_sessions` 批量单事务，同一动机——锁内
 逐行 commit 拉长存储锁窗口）统一写库 → `process_all_batches` → 成功后按会话批量推进水位 `update_session_last_polls`（值为本轮 cycle 开始时刻；
 只
 推进不在 `result.failed_sessions` 中的会话——失败会话（如 qqflow 索引期 503 静默跳过）的消息未落 raw_messages、钉窗机制看不到，照常推进会永久漏拉）
 ，guarded by `_poll_lock`)，供 `/api/sync` 与首轮回填共用；周期内错误写入 status。窗口规则：会话水位
 `sessions.last_poll_ts`（NULL=待回填 → 按 `BACKFILL_HOURS` 回填一次）与该会话最早未处理消息取 min，再减
 `POLL_OVERLAP_SECONDS`；仅含未处理消息的会话被其最久远未处理消息钉住窗口，其余会话水位不受影响。
+
+**已知限制（钉窗死状态）**：`get_oldest_unprocessed_by_session` 以「已落 raw_messages 且未标
+processed」为准。若某行在任何路径上都不会再被标记 processed——典型序列：`IGNORE_SELF=false` 期间自消息落
+raw 且分类失败 → 之后开启 `IGNORE_SELF`，三个 poller 预滤与 pipeline 入口过滤都不再让它进管道——该会话
+窗口下界会被永久钉在该行时间戳，每轮从该时刻全窗重拉重滤。不丢消息，仅浪费拉取；停用/启用会话清水位也解
+不了钉。现阶段接受该限制（真库探测：当前无启用会话处于钉窗）。
 
 #### briefdesk/types.py
 
@@ -171,7 +178,7 @@ session_id, group_name, timestamp, `source`（源标识，由 pipeline 入口按
 跳
 转）; content 构造时即经 `mask_content` 脱敏), `PollResult` (单源一次轮询结果，含源无关的 `sessions`/`contacts` 产出数据与
 `failed_sessions: set[str]`——本轮未成功拉取的会话集合，poll_cycle 据此跳过这些会话的水位推进),
-`SessionInfo`（`is_group`/`is_official` 双维度：公众号为第三类会话，仅 weflow-legacy 产出）/`ContactInfo`（源产出、应用层写库的源无关
+`SessionInfo`（`is_group`/`is_official` 双维度：公众号为第三类会话，weflow 与 weflow-legacy 均产出）/`ContactInfo`（源产出、应用层写库的源无关
 描
 述）, and `ContextMsg` TypedDict. **管道跨插件契约**（`ClassifyResult`/`ClassifyOutcome`/`DedupResult`/`InsertedRow`/`BatchContext`）
 均定义在本模块；`CachedItem` 留在 `plugins/dedup/engine.py`（引擎内部）。`BatchContext.vision_images` 为 vision 路由的运行时
@@ -198,16 +205,18 @@ AI 供应商端口：ai_provider 插件在 setup 阶段把实例注册到 `ctx.a
 点/Key 以 override 参数由调用方传入（端口不认识 `RAG_` 前缀），供应商未实现时回退复用 `chat` 并**静默丢弃 override**。未注册时 chat/embed 抛
 RuntimeError（配置错误明示），`embed_model_name` 回退 config、`is_embedding_enabled` 安全返回 False（引擎/实验离线可用）。
 `loads_json`（JSON 修复解析）与 `top_k_similar`（余弦 Top-K）为供应商无关工具，亦收于本模块。模块级单例，测试用 `set_ai(None)` 复位。
+判官类调用额外传 `max_retries=0` 且许可等待纳入 `timeout`：锁内单次判官最坏持有 ≈ 2×45s（排队 + 请求），此前 SDK 默认 2 次重试且排队不计时，最坏可达数分钟。
+`AIProvider.chat` 的 `max_retries` 为可选参数，第三方供应商可忽略。
 
 #### briefdesk/plugins/ai_provider/engine.py
 
-OpenAI 兼容供应商实现：共享 `AsyncOpenAI` 客户端（`get_ai_client`）、`chat`（thinking 开关 `AI_DISABLE_THINKING`、**严格
+OpenAI 兼容供应商实现：共享 `AsyncOpenAI` 客户端（`get_ai_client`）、`chat`（推理强度 `AI_REASONING_EFFORT`、**严格
 JSON 输出**（`_use_json_object`：ollama api key 或 deepseek-v4-flash/pro 模型名命中时传
 `response_format={"type":"json_object"}`，配合各任务对象根输出）、`AI_MAX_CONCURRENCY` 并发预算）与嵌入（`EMBED_API_BASE`
 启
 用、按 `EMBED_BATCH_SIZE` 分批；每 chunk 校验返回向量数量、不符抛 ValueError——防向量错位被持久化进 item_embeddings 永久污染余弦通道，调用方整批
 回
-退字符重叠）。`Provider` 类显式实现 AIProvider 端口（薄封装委托）。`loads_json`/`top_k_similar` re-export（实验脚本兼容）。
+退字符重叠）。`Provider` 类显式实现 AIProvider 端口（薄封装委托）。`loads_json`/`top_k_similar` re-export（实验脚本兼容）。`close_clients()`：插件 teardown 关闭主/嵌入/备用三类惰性客户端（按对象身份去重）并复位缓存与信号量。
 
 #### briefdesk/plugins/classify/engine.py
 
@@ -222,7 +231,8 @@ sysc；解析失败/超长同样整段本轮抛弃，不标 processed）。两�
 `_parse_response` 对结构错误抛错（整段本轮抛弃）、对未知类别（AI 幻觉，不在 allowed 集合）逐条 defer 进 retry_indexes：均不标记 processed、
 由
 下一轮回填重试。`finish_reason=length` 输出截断按消息数拆半递归重试（不可再拆则本轮抛弃）；传输失败/空响应/解析失败同样整段本轮抛弃。整批字符预算
-`_MAX_BATCH_CHARS` 超限时超限消息**整条剔除**并并入 failed 重试（防"未分类却被标 processed"的静默丢失）。**多时间点**：prompt 要求含多个时间点的消
+`_MAX_BATCH_CHARS` 超限时超限消息**整条剔除**并并入 failed 重试（防"未分类却被标 processed"的静默丢失）。**时间提取截断 800 字**（`_TIME_MAX_MSG_CHARS`，与分类侧
+`_MAX_MSG_CHARS` 对齐）：真库中约 1/8 的超 300 字消息其时间线索落在 300 字之后。**多时间点**：prompt 要求含多个时间点的消
 息
 把全部时间点列入可选 `times` 数组（{type,time,label}），`_parse_extra_times` 逐项校验（脏项丢弃、与主字段 (type,time) 去重、上限 20 项、
 label 折叠截断 40 字）；key 中的时间必须写绝对日期（合并后相对时间失去锚点）。**无年份日期推断**：“X月X日/号”取与消息发送时刻**最接近**的那一次（无论已过还是未来）——任务清
@@ -244,7 +254,7 @@ pipeline 入口过滤共用——qqflow 同文异图消息防误判 SAME；本�
 程
 首批次一次性场景）→ 门禁分级（normal ≥ `DEDUP_EMBED_THRESHOLD` 走 strong 短路/加权多数票；weak 区间 [fallback, threshold) 仅当无
 normal 候选时参与，全员判 SAME 才判重）→ 同文本短路（≥ `DEDUP_STRONG_THRESHOLD` 候选 AI 判 SAME 即直接判重、判 DIFFERENT 只剔除该候选；
-strong 候选判定失败降级参与后续多数票（异常不抛穿、不构成短路命中——合并自远程审计 S1）→ 其余候选**并行**送 LLM（`gather(return_exceptions=True)`
+strong 候选判定失败降级参与后续多数票（异常不抛穿、不构成短路命中）→ 其余候选**并行**送 LLM（`gather(return_exceptions=True)`
 隔
 离：加权多数票中单候选 API 异常剔除出计权——既无 SAME 票也不占分母，全部失败退化为保守不判重——并打 WARNING，不中止整批；weak 复核中失败候选按反对票计；并行判定与异常整形单源
 于
@@ -271,7 +281,7 @@ strong 候选判定失败降级参与后续多数票（异常不抛穿、不构�
 （应合并为一张卡），输出裸对象 `{"merge": true\|false}`，失败保守返回 False（不合并）；`summarize_title` 在合并后依据「原标题+关键信息+原文引用」重拟
 概
 括性标题（输出裸对象 `{"title":"..."}`，失败/超长回退原标题）；两者解析器均兼容旧版 `{"task":"merge"\|"title","data":{...}}` 外壳。重拟标题
-user 消息为**单遍占位符替换**（`_fill_template` 正则单遍，数据值含 `{key_info}` 类字面量不会被二次替换，P6）。
+user 消息为**单遍占位符替换**（`_fill_template` 正则单遍，数据值含 `{key_info}` 类字面量不会被二次替换）。
 
 #### briefdesk/plugins/ocr/engine.py
 
@@ -321,10 +331,10 @@ else:
 
 #### briefdesk/config.py
 
-`pydantic-settings` from `[.env, UI 暂存文件]`（密钥型字段以 `SecretStr` 持有，repr/序列化自动掩码；密钥解析链见「配置解析链」小节）。含
+`pydantic-settings` 从两个独立来源读取（项目根 .env 高于 UI 暂存文件；密钥型字段以 `SecretStr` 持有，repr/序列化自动掩码；解析链见「配置解析链」小节）。含
 `plugins`（`PLUGINS`，默认 `[]`，JSON 数组，无通配语义，只过滤**可选插件**——不列出即禁用；核心插件恒装配，亦可在设置页
 「插件」面板逐个开关）、
-`plugins_required`/`plugin_path`、`db_path`（默认 `briefdesk.sqlite`）、
+`plugins_required`/`plugin_path`、`db_path`（`DB_PATH`，默认 `paths.database_path()`——用户数据目录 `data/briefdesk.sqlite`；相对路径按 cwd 解析、`~` 不展开）、
 `server_port`（3000）、`backfill_hours`（24）、`log_level`（`LOG_LEVEL`，默认 `"INFO"`，logger.py 读取）、
 `realtime_batch_max_count`/`realtime_batch_timeout_ms`（实时批缓冲，跨源公共）、`backfill_batch_max_count`（回填切批）、
 AI 模型等。插件专属配置（`WEFLOW_*`/`WEFLOW_LEGACY_*`/`QQFLOW_*`/`RAG_*`）在各插件包的 `config.py`，不占 app 级配置——前缀归插件所有
@@ -333,10 +343,15 @@ AI 模型等。插件专属配置（`WEFLOW_*`/`WEFLOW_LEGACY_*`/`QQFLOW_*`/`RAG
 
 #### briefdesk/settings_base.py
 
-`KeyringSettingsBase`——app 级与 weflow/weflow-legacy/qqflow/rag 五个 Settings 的公共基类：
-`settings_customise_sources` 单点实现（来源优先级 init > 密钥环 > 环境变量 > .env > 默认值）与统一 `env_file` 列表。子类以
+`KeyringSettingsBase`——六个 Settings（app 级与 weflow/weflow-legacy/qqflow/rag/benchmark）的公共基类：
+`settings_customise_sources` 单点实现（来源优先级 init > 密钥环 > 环境变量 > 项目根 .env > 用户暂存文件 > 默认值）。
+两个 dotenv 层是**独立来源**，顺序取自 `settings_env.dotenv_layers()`（解析、`source_of` 与启动快照共用同一份定义）；
+项目 .env 只在源码 / editable 模式存在，wheel 模式不读任何隐式 .env。显式传入 `_env_file`（含显式 `None`）时
+完全取代两层，其显式性由 `__init__` 的 ContextVar 捕获——`model_config["env_file"]` 恒为 `None`：pydantic-settings
+会**先**构造 DotEnvSettingsSource（构造即读文件）**再**调用来源钩子，「路径哨兵」写法会让文件在判定之前先被读一次
+（哨兵指向非法编码文件时直接抛错；wheel 模式下等于读 site-packages/.env）。子类以
 `ClassVar KEYRING_FIELDS`（字段名 → 环境变量名）声明密钥字段即自动挂 `KeyringSource`（非空才挂）；`model_config` 须注解
-`ClassVar[SettingsConfigDict]`（经中间基类继承时 ruff 对 pydantic 模型的 RUF012 豁免不再传导），其余键（env_file/extra 等）由
+`ClassVar[SettingsConfigDict]`（经中间基类继承时 ruff 对 pydantic 模型的 RUF012 豁免不再传导），其余键（env_file/encoding/extra）由
 pydantic 自动从基类合并、子类只需写 `env_prefix`。
 
 #### briefdesk/plugins/weflow_legacy/normalize.py
@@ -360,11 +375,11 @@ attachment-only messages — but **image messages are kept** (`[图片]` passes 
 等多片段拼接同样命中；不标记 processed（⚠️ 但不落 raw、钉窗看不到、水位照常推进——重新启用 OCR 并不会自动重拉，需重新停用/启用会话清水位或
 `BACKFILL_HOURS=-1` 全量回填才能找回）；图片+文字混合消息不受影响；vision 开启而 enrich 槽为空时置 `vision_without_ocr` 公告—
 —announce 幂等防刷屏）→ 启用会话（空启用集 → 全滤——upsert_session 默认 enabled=0，全新安装/全部停用即常态空集，保持原监听器语义）→ 已处理，替代源内查重）→
-raw_messages 批量落库（单事务）** → 切批 → 并行跑 enrich + classify 槽位（`asyncio.create_task` + `as_completed`，锁外）→
+raw_messages 批量落库（单事务）** → 切批 → 批间并行跑 enrich → classify 槽位（批内串行：先 enrich 后 classify；批与批之间经 `asyncio.create_task` + `as_completed` 并发，锁外）→
 串行（`_storage_lock` 内）：dedup 槽位（判重/入库/缓存）→ 跳过标记（未选中且非失败的消息标记 processed，含“无分类结果全批标记”路径）→ post_insert 槽
 位
 （会话内同话题合并）→ 批尾 dedup after_run（向量落库，内部自持 storage_lock）→ 计数/状态/实时通知。零产出（全部失败）不刷新 lastSync 且 `process_all_batches` 返回
-False——poll_cycle 据此跳过水位推进（实时路径忽略返回值）；零产出语义合并自远程审计 #1。被滤自消息不标记 processed（可恢复路径同纯占位符图片：重新停用/启用会话或全量回填
+False——poll_cycle 据此跳过水位推进（实时路径忽略返回值）；零产出语义以「返回值 False ⇒ 调用方跳过水位推进」表达。被滤自消息不标记 processed（可恢复路径同纯占位符图片：重新停用/启用会话或全量回填
 ，
 非自动重拉）。**benchmark 暂停门闸**：`set_processing_paused(paused)` 置位后本函数顶部直接返回 False（批次保留待回填，不触 DB/AI）
 ，benchmark 插件 Web/CLI 共用（见 `plugins/benchmark/` 行）。阶段实现见 `briefdesk/plugins/{ocr,classify,dedup,merge}/`。
@@ -373,7 +388,7 @@ False——poll_cycle 据此跳过水位推进（实时路径忽略返回值）�
 
 All SQLite via `aiosqlite`. **双连接 + WAL mode + foreign keys + busy_timeout（5000ms，双侧对称）**：连接初始化统一经
 `_init_connection`（aiosqlite 连接 + row_factory + 默认 PRAGMA（WAL/busy_timeout/synchronous=NORMAL）+
-schema 幂等初始化，异常路径关闭连接再上抛；主连接额外 `validate_schema` 与 `foreign_keys=ON`，向量连接免验证）——主连接（`get_db` 单例）+ 向量持
+schema 幂等初始化；`_init_connection` 自 connect 起全程受 try 保护并捕 `BaseException`（含取消）——PRAGMA 循环与 commit 也在 try 内，任一失败即关连接再上抛（aiosqlite 连接带非 daemon worker 线程，泄漏会让退出挂死）；主连接额外 `validate_schema` 与 `foreign_keys=ON`，向量连接免验证）——主连接（`get_db` 单例）+ 向量持
 久
 化专用连接（`get_embed_db`，`load_embeddings`/`upsert_embeddings` 走它，`_embed_lock` 语句级串行、游标先 close 再 commit、
 锁竞争指数退避重试 3 次——杜绝活动语句阻断 COMMIT 的 `cannot commit transaction - SQL statements in progress`）。DB path
@@ -397,7 +412,7 @@ sessions/contacts/processed_messages/raw_messages 以 `(source, id)` 复合主�
 close）；流式迭代（async for）用 `_cursor` 作用域，需 rowcount/lastrowid 的 DML 同样用 `_cursor`（须在 with 块内读取）
 ，executemany 后必须 `await cursor.close()`——未终结语句会残留连接并可能阻断后续 COMMIT。`close_db` 同时关闭主连接与向量连接（aiosqlite
 worker 线程非 daemon，漏关解释器退出挂死）；close 后置 `_db_closed` 终态门闩，`get_db`/`get_embed_db`
-一律抛 RuntimeError 拒绝重建——防关闭期残余任务复活连接（P3-3）。**多步写统一走 `atomic_transaction` 上下文管理器**（成功 commit、异常 rollback 后上抛——防悬挂事务
+一律抛 RuntimeError 拒绝重建——防关闭期残余任务复活连接。**多步写统一走 `atomic_transaction` 上下文管理器**（成功 commit、异常 rollback 后上抛——防悬挂事务
 被
 后续不相干 commit 收尾提交、部分写入提前可见；delete_items / update_item_merged / purge_expired_ignored /
 toggle_session / update_category / delete_category / bulk_insert_raw_messages / update_items_verify 八处）；IN 列表分块统一走
@@ -405,9 +420,7 @@ toggle_session / update_category / delete_category / bulk_insert_raw_messages / 
 SQLite 变量上限整批崩；用点：are_messages_processed / delete_category 级联 / get_item_texts_by_ids /
 get_items_verified_flags / get_session_last_polls，update_items_verify/delete_items 已迁（fetch=False 逐块
 累
-计返回 rowcount，overload 按 fetch 字面量区分返回类型）；临时隔离库（基准运行）经 `db_redirect`——进出同步换/还原主/向量单例、半程失败关已建连接，应用已有连接
-不
-动）。**默认分类迁移（PRAGMA user_version 门控）**：v0→1 补齐 5→13 类；v1→2（C3）活动通知口径追加「面向全群的多项任务/材料提交截止通知（含各项截止日期）按本类
+计返回 rowcount，overload 按 fetch 字面量区分返回类型）。**默认分类迁移（PRAGMA user_version 门控）**：v0→1 补齐 5→13 类；v1→2 活动通知口径追加「面向全群的多项任务/材料提交截止通知（含各项截止日期）按本类
 收
 录」，仅更新仍等于旧版原文的行（尊重用户编辑），一次性不覆盖。
 
@@ -415,13 +428,14 @@ get_items_verified_flags / get_session_last_polls，update_items_verify/delete_i
 
 FastAPI HTTP 服务子包（按职责分组的模块）：`app.py`（FastAPI 实例）、`middleware.py`（Host 白名单 + 同源校验 + CSP 头；CSRF 收口：
 /api 变更请求 Origin/Referer 双缺失直接 403，不再静默放行）、`web_plugins.py`（Web 插件注入点）、`routes_items.py`（核心数据路由）、
-`routes_categories.py`（类别管理）、`media.py`（媒体代理）、`static.py`（SPA 托管）、`callbacks.py`（会话刷新回调）。**组装顺序有语义**：
+`routes_categories.py`（类别管理）、`routes_settings_env.py`（启动配置与环境键的设置页路由：`GET/PUT /api/settings/env`、
+密钥的 `POST/DELETE /api/settings/secrets`）、`media.py`（媒体代理）、`static.py`（SPA 托管）、`callbacks.py`（会话刷新回调）。**组装顺序有语义**：
 `__init__.py` 按 中间件 → 插件路由 → 核心路由 → 类别路由 → 媒体代理 → SPA mount 依次导入（web_plugins 必须先于 static，否则被 SPA 兜底截
 胡
 ；`# ruff: noqa: I001` 豁免排序）。Routes: `GET /api/items`, `POST /api/items/:id/verify`,
 `POST /api/items/:id/recategorize`（手动修正分类，仅允许改到启用类别）, `POST /api/items/batch`（批量
-memo/ignore/unverify/delete；delete 在存储锁内删库并发布 `EVENT_ITEMS_DELETED` 清去重内存缓存，非 delete 分支同样持锁，批量
-ignore 亦锁内发布该事件清缓存）。**server 写路径统一持 pipeline 存储锁**：类别 create/update/toggle/delete 全端点、api_verify、
+memo/ignore/unverify/delete；delete 在存储锁内删库并发布 `EVENT_ITEMS_DELETED` 清去重内存缓存，非 delete 分支同样持锁；审核态变更统一经
+`_resync_dedup_cache`：进入忽略态发 `items_deleted` 清缓存，退出忽略态（unverify/memo，单卡与批量同口径）幂等回加缓存——此前单卡恢复与批量转备忘漏回加，相似新消息会重复建卡直到重启）。**server 写路径统一持 pipeline 存储锁**：类别 create/update/toggle/delete 全端点、api_verify、
 sessions toggle、recategorize（`update_item_category` 读-改-写多步事务）、上述 batch，以及 reminders 的 set_reminder
 与
  sessions/refresh 的落库段（后者回调内持锁、网络拉取在锁外）——单连接隐式事务下锁外 commit 会把管道未完成的多步写一并提交（部分写入提前可见）；verify(-1) 同样在锁内
@@ -429,7 +443,7 @@ sessions toggle、recategorize（`update_item_category` 读-改-写多步事务�
 `GET /api/export/recat-samples`（导出人工改类样本 jsonl/csv，内容已脱敏；两处导出均经 `_csv_cell` 公式注入转义—
 —`=`/`+`/`-`/`@`/TAB/CR/LF 前缀前置单引号）, `GET /api/backup`（SQLite 在线备份下载，WAL 安全可运行中执行）/
 `POST /api/restore`（上传校验后暂存 `{db_path}.restore-pending`，重启应用生效；临时文件必须落在库文件同目录——`os.replace` 不允许跨文件系统
-，mkstemp 缺省走系统 TEMP 时与 DB_PATH 跨盘（Windows 典型）必然 WinError 17 使恢复整体不可用）, `GET /api/sessions`,
+，mkstemp 缺省走系统 TEMP 时与 DB_PATH 跨盘（Windows 典型）必然 WinError 17 使恢复整体不可用；启动应用时原库先改名为 `{db_path}.pre-restore`（三件）再替换，替换失败自动改回并保留 pending（改回本身失败也不抛出：副本与 pending 都保留，下次启动检测到「主库缺失且存在副本」先补完回滚再重试恢复——否则下次启动会把这份唯一副本当上一代副本删掉）；副本只留最近一代、下次恢复覆盖，含隐私数据，与 `*.sqlite` 同口径 gitignore）, `GET /api/sessions`,
 `POST /api/sessions/:source/:session_id/toggle`, `POST /api/sessions/refresh`, `POST /api/sync`,
 `GET /api/context`（`source`+`session_id` 查询参数）, `GET /api/status`, `GET /api/stream` (SSE push
 channel), `GET /api/media/:source/:path` (媒体代理，经对应源的 `SourceClient.download_media` 转发；`MediaError` →
@@ -452,10 +466,10 @@ Content-Disposition attachment——扩展名不可信，封死伪装 SVG/HTML �
 查告警）、`GET /plugin-assets/{name}/{path}`（插件静态资源，目录穿越/非法路径一律 404，且 404 返回纯文本而非 JSON——本端点服务
 `<link>`/`<script>` 资源请求）、`register_plugin_assets`/`set_plugins_info_callback`/`set_settings_schema_callback`/`include_plugin_router`（
 展开 APIRoute 插到 SPA mount 之前——新版 Starlette 的惰性 `_IncludedRouter` 会被 SPA 兜底截胡；按 `id(router)` 幂等，重复挂载跳过）
-。日历/提醒路由位于 `plugins/{calendar,reminders}`。`/api/items` 接受 `sourceGroup`/`minMsgTime`/`hideExpired`/`filterNow`，
+日历/提醒路由位于 `plugins/{calendar,reminders}`。`/api/items` 接受 `sourceGroup`/`minMsgTime`/`hideExpired`/`filterNow`，
 并返回与完整过滤条件一致的 `totalCount`/`groupCount`/`sourceGroups`/`hasMore`/`nextOffset`/`filterNow`；启用隐藏截止时，客户
 端
-在同一分页链复用服务端首次返回的 `filterNow` 以固定时间边界。侧边栏计数仍为全局口径。Serves `ui/` with SPA fallback（三修：except 改捕
+在同一分页链复用服务端首次返回的 `filterNow` 以固定时间边界。侧边栏计数仍为全局口径。Serves `briefdesk/ui/` with SPA fallback（except 改捕
 `starlette.exceptions.HTTPException` 基类——原 fastapi 子类 except 恒不匹配、fallback 从未生效；path 反斜杠归一化后再判 api/
 前
 缀（Windows starlette>=1.3 行为）；带扩展名的资源请求 404 即 404、不回退 index.html——避免 200 + text/html 应答脚本/样式触发严格 MIME
@@ -469,7 +483,7 @@ Content-Disposition attachment——扩展名不可信，封死伪装 SVG/HTML �
 `briefdesk/db.py`；`asset_dir()` 返回插件包内 `ui/`（**日历完整前端**：`ui/ui.js` 自建侧边栏入口（核心 `index.html` 的
 `#nav-top` 工具容器首位——搜索框正下方、过滤条与分类导航之上，横线分隔，恒排问一问之前；旧核心无容器时回退「订阅」前）/视图容器/浮层并注册核心视图钩子、`ui/ui.css` 日历样式，
 经
- `/plugin-assets/calendar/` 由核心加载器注入，核心 `ui/` 无任何日历前端残留——由 tests/test_web_plugins.py 的核心前端边界守卫测试覆盖）；区
+ `/plugin-assets/calendar/` 由核心加载器注入，核心 `briefdesk/ui/` 无任何日历前端残留——由 tests/test_web_plugins.py 的核心前端边界守卫测试覆盖）；区
 间查询 LIMIT 后置——SQL 不截断、内存过滤后应用 `_MAX_CALENDAR_ITEMS = 1000`（防 NULL 时间 extra_times 干扰行把真命中卡片挤出结果集），路由参
 数
 经 `date.fromisoformat` 真实日期校验；卡片行相对时间由前端计算（后端不再附加）。
@@ -480,26 +494,50 @@ Content-Disposition attachment——扩展名不可信，封死伪装 SVG/HTML �
 `GET /api/reminders/due`（到期提醒轮询）；`asset_dir()` 返回插件包内 `ui/`（**提醒完整前端**：`ui/ui.js` 自建卡片「提醒」按钮/菜单、设置弹窗
 「
 通知」面板自动提醒控件与到期轮询定时器，经核心 `registerItemRowExtension` 行内扩展钩子接入 `renderItemRow`/`renderCard` 动作区与
-`handleRowAction`，`ui/ui.css` 提醒菜单样式，经 `/plugin-assets/reminders/` 由核心加载器注入；核心 `ui/` 无任何提醒前端残留——由
+`handleRowAction`，`ui/ui.css` 提醒菜单样式，经 `/plugin-assets/reminders/` 由核心加载器注入；核心 `briefdesk/ui/` 无任何提醒前端残留——由
 tests/test_web_plugins.py 的核心前端边界守卫测试覆盖）。`GET /api/reminders/due` 返回项经 `db.get_items_verified_flags`
 批量补查合并 `is_verified`（核心查询契约不变、游标纪律收口在 db.py；前端据此决定「查看」跳转目标）；`POST .../reminder` 清除分支限定
 `remind_at IS NOT NULL`——对无提醒卡片清除返回 False（多标签页「先清后通知」互斥判据）；前端首次设提醒申请桌面通知权限，到期「查看」定位跳转（备忘录卡进备忘录视图，其余卡
 定
-位主列表高亮）。
+位主列表高亮）。到期检查在页面隐藏且无桌面通知权限时**不清除**（否则提醒被静默消费），`visibilitychange` 回到前台立即补查；重设提醒会清掉本地「已通知」标记，同卡可再次触发。
 
 #### briefdesk/plugins/benchmark/
 
 实验性基准插件（可选插件，默认禁用，显式实现 WebPlugin + StagePlugin 双能力）：`/api/benchmark/*` 路由 + 自带前端（设置弹窗内运行，前端
-轮
-询门控——仅设置弹窗打开或基准运行中保活 3s 轮询）+ CLI 入口（`python -m briefdesk.plugins.benchmark.cli`）。运行环境
-`providers.bench_environment`（Web 与 CLI 共用同一套门闸）：进入即 `pipeline.set_processing_paused(True)` 暂停生产管道
-（process_all_batches 顶部直接返回 False，实时消息不入库不标 processed、延后下轮回填恢复）并发布 `benchmark_running` 公告——运行期间全部 UI
-写路由落在临时库、退出即丢，公告提示用户勿在此期间操作界面（退出 finally 撤销公告）、排空后经 `db.db_redirect(bench.sqlite)` 官方缝把主/向量连接重定向到临时库
-（
-窗口内 get_db/get_embed_db 调用均落临时库；缝内半程失败自动关闭已建连接）；DB 重定向退出时先同步还原单例再关临时连接（先于本 finally），finally 只做公告撤销→复
-位
-管道标志→AI 端口还原→删子目录。临时库落本次运行专属 uuid 子目录 `.tmp/bench-<hex>/bench.sqlite`（插件包内 `.tmp/`），退出只删该子目录——共享
-`.tmp` 根内其它内容（如并行 CLI 目录）不受影响。
+轮询门控——仅设置弹窗打开或基准运行中保活 3s 轮询）+ CLI 入口（`python -m briefdesk.plugins.benchmark.cli`）+ 插件自有配置
+`briefdesk/plugins/benchmark/config.py`（`BENCHMARK_` 前缀归插件所有，经 `settings_schema()` 自动出现在设置页）。
+
+**基准运行的进程级隔离**（`supervisor.py` 父进程侧 + `runner.py` 子进程侧）：
+
+1. **启动**：`supervisor.start()` 在「判定 → 登记」之间不留 await，两个并发 POST 只会起一个运行；
+   随后建运行目录 `paths.benchmark_runs_dir()/<时间戳>-<run_id 前 8 位>/`（用户缓存目录）、把 `meta.json` **先落盘**（被杀/崩溃的运行
+   也要能被识别成「历史结果」而不是残目录）、把用例快照进运行目录（包内示例在前、用户用例在后，同名以用户为准）、关闭父进程侧的 `run.log` 句柄，
+   再 spawn 子进程（`python -m briefdesk.plugins.benchmark.runner`）。父进程**生效中**的
+   benchmark 非密钥行为配置（模型、推理/JSON/视觉/分类输出、嵌入与去重参数）经环境变量下传：
+   设置页改动是「暂存、重启后生效」，子进程若自己读 `.env` 会拿到尚未生效的值；密钥不下传，
+   子进程走自己的钥匙串。报告记录这些配置的快照，但不记录 API 地址或密钥。
+2. **运行期**：父进程只做三件事——按 `progress.jsonl` 的**行数增长**判进展（阈值按
+   `BENCHMARK_RUN_STALL_SECONDS × --progress-every` 放大，因为进度是节流写入的；`--progress-every`
+   只在 CLI 直跑时由参数给出，Web 路径恒为 1、等于不放大）、终态行落盘后的宽限 kill、
+   可选的总时长上限；取消/超时/无进展一律经**本进程持有的句柄**终止。
+   **采用时点**：`start` 解析成功时把 `pause_pipeline` / `run_timeout_seconds` / `run_stall_seconds` 冻结进 `_Run`，
+   监控协程只消费这份快照——运行中改配置不影响已发布的运行（改的是「下次运行采用」，由 `expected_*` 表达，
+   设置页 `current` 显示「本次基准运行采用」）。`BENCHMARK_KEEP_RUNS` 不同：它在**每次运行目录轮转**时重新读取，
+   作用于下一次清理，不进运行快照。`_finish` 先撤销 `_current` 再轮转——轮转抛错也不让已结束的运行继续以
+   `current` 身份露出。子进程在自己的库上跑
+   （`--db` 就是它自己的路径，起进程时单例为空，不可能碰到生产库），产物写进运行目录：
+   `progress.jsonl` / `report.json` / `report.html` / `run.log`。
+3. **收尾**：判定三态——`completed`（终态行 + 两份报告齐全）/ `failed-recorded`（有 error 终态行，
+   报告可能缺失）/ `aborted`（没有终态行，父进程在 `meta.json` 里补记原因）。退出码只承诺
+   「0 成功 / 2 用法错误 / 非 0 其它」。报告端点只认最近一次 **completed** 的运行目录；轮转保留
+   `BENCHMARK_KEEP_RUNS` 个，但**最新一个已完成的永不删除**（报告页依赖它）。
+
+界面侧：运行期间父进程**不重定向自己的连接**、也没有任何闸门，界面照常可用；只是把生产管道暂停
+（`benchmark_paused` 公告）——实时消息延后到下轮回填，结束后如未开启周期同步需点一次同步。手工 CLI
+（`python -m briefdesk.plugins.benchmark.cli`）与子进程同口径：自建临时目录作库、改指 `config.db_path`、
+建表并按数据集换类别、注入 AI 端口，退出先关连接再还原路径与删目录。用例与产物落用户目录：网页导出与
+「记录导出」写 `BRIEFDESK_DATA_DIR/benchmark/cases/`、CLI 报告默认写 `benchmark/reports/`、运行目录在
+缓存目录；缺省用例查找为「用户用例目录 → 包内示例」，显式 `--cases-dir` 只查该目录、不回落包内示例。
 
 #### briefdesk/sources_base.py
 
@@ -511,10 +549,14 @@ getattr 探测调用）——server 只依赖它；`SourceRuntime`（`client`/`l
 实现 `SourceRuntime` 并以插件发布（`briefdesk/plugins/*`，entry point 组 `briefdesk.plugins`，启用走 `PLUGINS`）**。通
 用
 类型 `ConnectionStatus`、`BatchHandler`、`ProcessedQuery`、异常 `SourceError`/`MediaError`（`download_media`
-失败统一抛 `MediaError`，server 据此映射 404）；**`with_connect_retry`**（连接类失败短退避重试：捕获
-`httpx.ConnectError`/`ConnectTimeout`，0.5s/1s 共 2 次等待、3 次尝试，耗尽原样上抛；不重试 HTTP 状态错误与 503 门控、不用于 SSE 流（监听器已有退
-避
-重连））。**另提供共享 `BatchBuffer`（实时批缓冲）/`DrainableListenerMixin`（关停冲刷收尾）与 `make_sse_timeout`（SSE 读超时构造）
+失败统一抛 `MediaError`，server 据此映射 404）；**`with_connect_retry`**（连接类失败短退避重试：0.5s/1s 共 2 次等待、3 次尝试，耗尽上抛
+`request_fn` 抛出的那个异常对象；不重试 HTTP 状态错误与 503 门控、不用于 SSE 流（监听器已有退避重连））。**连接阶段的判定经
+`_connect_error` 顺 `__cause__` 链找 `httpx.ConnectError`/`ConnectTimeout`**，因为 vendor SDK 0.9.0 起把全部传输失败包进自己的错误树
+（`raise TransportError(...) from exc`）：只 except httpx 原类型时，「HTTP 由 SDK 承载」的两个源上重试会**静默失效**（第一次拒连即冒泡，
+重试次数 0，测试不红、日志不报错）；自持 httpx 的 weflow-legacy 仍直接抛原类型，故两条路径都要认。只认 `__cause__`、不认 `__context__`——
+后者是「处理期间又起异常」的偶然关系，按它判定会把无关失败误判成可重试、在轮询热路径白付退避延迟（回归见
+`tests/test_client_retry.py`）。**`iter_sse_data_events(resp, log=...)`：三源 SSE 帧解析的唯一实现**——按字节以 LF 切行（剥行尾 CR），空行分帧，逐 `data:` 行 JSON 解析；
+  **不用 `aiter_lines`**（其 `splitlines` 语义把 U+0085/U+2028/U+2029 当换行，会拆断含这些字符的 JSON——上游 serde_json 不转义它们）；解析失败 WARNING（只记字节数）；缓冲上限按**帧内累计字节**计量（已切出未成帧的行 + 未切行残留，帧结束归零）——只量未切行残留会漏掉「行连续但无空行」的畸形流（每行切出即归零，上限永远撞不到），超限记 WARNING 后结束流。**另提供共享 `BatchBuffer`（实时批缓冲）/`DrainableListenerMixin`（关停冲刷收尾）与 `make_sse_timeout`（SSE 读超时构造）
 ，weflow-legacy/qqflow 监听器共用**；`session_log_prefix(index, total, label)` 为会话级日志行首（`  [3/12] 群名: `）的单源
 定
 义，三个轮询器共 15 处日志共用（缩进宽度/分隔符改一处即全局生效，见「日志行格式与来源列」）。**列表端点分页**：`fetch_all_pages(get, path, key=...)` 按
@@ -558,7 +600,7 @@ WARNING 暴露根因——标量化后这是唯一的根因来源，诊断失败
 中止，监听器以 60s 固定长退避（`_MISMATCH_RETRY_SECONDS`，WARNING 无栈、不递增
 指数退避计数），解除占用或改配置后自动恢复、无需重启）、**503 就绪门控**（索引期瞬态，`WeFlowNotReadyError` 静默跳过不污染
 lastError；503 复位 `_ready_checked` 以自愈服务端重启导致的内存注册表丢失——不会引发注册风暴，因下轮先查 health 会命中 indexing 短路）、**密
-钥**（26 个库各自独立 SQLCipher enc_key，整份 JSON 映射拆两段存系统钥匙串，见 `config.py`）、**媒体**（图片经 `media=1&image=1` 触发上游
+钥**（26 个库各自独立 SQLCipher enc_key，整份 JSON 映射按 `DB_KEYS_SEGMENT_LIMIT`（1100B）在字符边界切成动态多段存系统钥匙串（段名规范名 + `_2`/`_3`…，读取时按序拼接），见 `config.py`）、**媒体**（图片经 `media=1&image=1` 触发上游
 导
 出，消息 `media` 对象回填完整 URL → `_extract_media_path` 取相对路径 → `GET /api/v1/media/{talker}/{type}/{file}` 取
 字
@@ -634,7 +676,8 @@ runtime.close() 按 stop → await listener.aclose（冲刷残余缓冲与 in-fl
 页
  miss）判定，命中在监听器层丢弃并计入 SSE 统计。`QQFLOW_API_TOKEN`/`QQFLOW_QQ`/`QQFLOW_KEY` 必填，缺失任一 →
 QqFlowPlugin.setup 抛 PluginDisabledError 自禁用。**REST 连接类失败短退避重试**：
-`_get`/`fetch_health`/`register_account` 经 `with_connect_retry` 包裹（连接拒绝/超时自动重试 3 次，耗尽原样上抛；503 门控语义不变）
+`_get`/`fetch_health`/`register_account` 经 `with_connect_retry` 包裹（连接拒绝/超时自动重试 3 次——SDK 把拒连包成 `TransportError`
+后仍生效，见上；耗尽上抛 `TransportError`，原 httpx 异常在其 `__cause__`；503 门控语义不变）
 。
 
 #### briefdesk/plugins/weflow_legacy/client.py
@@ -648,7 +691,8 @@ QqFlowPlugin.setup 抛 PluginDisabledError 自禁用。**REST 连接类失败短
 公众号）、`fetch_message_media()`（SSE rawid 回查 REST 获取 mediaUrl；limit 放宽至 `_LOOKUP_LIMIT`=200 且
 `retry_on_empty=False`——miss 是常见路径，不在热路径对空结果重试）、`download_media()`（带鉴权下载媒体文件字节，供 OCR）、
 `connection_status`、`close()`。**REST 连接类失败短退避重试**：`_get`（含 `retry_on_empty` 二次请求，重试响应非 2xx 走与主路径相同的
-RuntimeError 出口——静默保留首次空 data 会把上游错误伪装成正常空结果）经 `with_connect_retry` 包裹（连接拒绝/超时自动重试 3 次，耗尽原样上抛）；
+RuntimeError 出口——静默保留首次空 data 会把上游错误伪装成正常空结果）经 `with_connect_retry` 包裹（连接拒绝/超时自动重试 3 次，耗尽原样上抛；
+本源自持 httpx、不经 SDK 错误树，抛出的就是 `httpx` 原类型）；
 `fetch_messages` 查询参数经 `params=` 由 httpx 编码（防会话 ID 含保留字符时手拼查询串出错）。
 
 #### briefdesk/plugins/weflow_legacy/sse.py
@@ -671,7 +715,7 @@ ready 帧，复位挂在首个事件上会让空闲群每次成功重连后退�
 —
 —`before_run` 锁外预嵌入、`run` 锁内纯 SQLite 落库（骨架对两存储槽统一探测可选钩子；post_insert 全程持 `_storage_lock`，run 内严禁网络调用）；
 路由 `/api/rag/ask|status|reindex`（ask 支持 `history` 多轮上下文：仅接受 user/assistant 角色、逐条截断 2000 字、至多 20 条；注入
-prompt 前再裁剪——仅保留最近 6 轮、单条 200 字并注明省略条数，P7）与「问一问」右侧聊天侧边栏（侧边栏 `#nav-top` 工具容器入口——搜索框正下方、日历之后，打开才显示——布局
+prompt 前再裁剪——仅保留最近 6 轮、单条 200 字并注明省略条数）与「问一问」右侧聊天侧边栏（侧边栏 `#nav-top` 工具容器入口——搜索框正下方、日历之后，打开才显示——布局
 内
 第三列推开列表而非覆盖、sticky 顶栏下沿与左侧栏同款行为；纯状态开合；**不注册插件视图、不触碰头部按钮区**，与 calendar 视图零耦合；引用芯片复用核心上下文浮层）。库层
 `db.py` 自管五表：`rag_chunks`/`rag_chunk_embeddings`/`rag_fts`(FTS5 trigram——逐词 ≥3 字符才走 MATCH，含短词走 LIKE
@@ -684,7 +728,9 @@ prompt 前再裁剪——仅保留最近 6 轮、单条 200 字并注明省略�
 会
 话恒为前提（查询期现取，停用即时失效）；`RAG_GROUP_ONLY` 默认仅群聊；作用域 SQL 谓词由 `db.scope_sql(alias=...)` 单源提供——检索侧过滤 chunks（
 别
-名 c）、回填侧过滤 raw_messages（别名 r），隐私边界只有一处定义。**落库单一出口 `_persist_chunks`**：实时批次（`run`）与历史回填
+名 c）、回填侧过滤 raw_messages（别名 r），隐私边界只有一处定义。**回填 SELECT 以既有 chunk 内容优先**（`COALESCE(c.content, r.content)`）：
+raw_messages 在管道入口（OCR 之前）落库，实时索引写入的是 OCR 增强文本；换模型重嵌入时若用原文覆盖会抹掉 OCR 文本，
+纯图片消息的原文还是占位符（`_indexable` 为假 → 登记 `rag_skipped`），旧向量永不更新。**落库单一出口 `_persist_chunks`**：实时批次（`run`）与历史回填
 （`backfill_step`）共用同一串「`upsert_chunks` → `_fts_enabled` 时 `sync_fts` → 向量走专用连接 `upsert_embeddings`」，
 令
 「入了 chunks 却漏同步 FTS」在结构上不可能发生——那种漏同步不报任何错，只让 FTS 索引与 chunks 静默分叉、检索少一条腿，且维护循环的反连接补不回来（它只看向量缺失，不看 FTS）
@@ -697,9 +743,10 @@ prompt 前再裁剪——仅保留最近 6 轮、单条 200 字并注明省略�
 循
 环休眠期可被 reindex/降级自愈经 `_kick_event` 唤醒立即执行回填（而非等满一个维护间隔）。守卫：`tests/test_rag_plugin.py` 的
 `RagBackfillTest` 断言回填后 FTS 与 chunks 等同且关键词检索真能命中、占位符行不阻塞预算窗口。检索=向量缓存（created_at 水位增量填充、解析在工作线程、模型切
-换/GC 行数回退整表重建）+FTS 双路 RRF 融合→拒答门（无 FTS 命中且 top1 余弦 < min_score 即 None）；**查询嵌入失败降级（F4）**：嵌入端点故障时不再整体拒
+换/GC 行数回退整表重建）+FTS 双路 RRF 融合→拒答门（无 FTS 命中且 top1 余弦 < min_score 即 None）；**查询嵌入失败降级**：嵌入端点故障时不再整体拒
 答
 ，降级 FTS-only（关键词可命中的问题仍可回答，日志 WARNING 标注）；回答强制 `[n]` 引用（未标注回退全部证据）并按 JSON 契约输出
+（`ask` 的引用语义：JSON 契约给出 `citations` 列表即以其为准——空列表 = 无依据，不回退；仅无 JSON 契约的纯文本回答才回退 `[n]` 正则、再回退全部证据，此为有意的兼容行为；空 choices/空答案按拒答返回而非伪装成正常回答；编号只收 int（排除 bool）、整数值浮点（JSON 模式下部分供应商把整数输出为 1.0）与纯数字字符串）
 （`{"answer","citations"}`——deepseek 系 `json_object` 强制模式的兼容契约，引擎双态解析，纯文本供应商回退正则），证据块压平换行防伪造、单条超长截断
 （`RAG_EVIDENCE_CHARS`，默认 600，截断以「…」标注），system prompt 含防指令注入条款。向量表走专用连接（get_embed_db 同款隔离）；常驻维护循环=排空回
 填
@@ -721,7 +768,7 @@ REST 历史回填（**按会话窗口**：`window_start_by_session` 提供各会
 `poll_cycle` 统一完成；只轮询传入的已启用会话，`is_processed` 为应用层注入的已处理查询端口；每会话必打 INFO 汇总行（含 0 条，标注窗口=增量/回填/全量）。会话类型
 来
 自 chatlab 格式（`id`/`name`/`type`，channel→公众号）。**IGNORE_SELF 预滤**：`isSend==1` 的消息在候选循环直接丢弃并独立计数（`X 自己`）
-，不标记 processed；同时检测整轮是否含 isSend 字段，缺失打 WARNING（该 WeFlow 版本过滤未生效）。翻页仅首页（offset=0）保留 `retry_on_empty`
+，不标记 processed；同时检测整轮是否含 isSend 字段，缺失打 WARNING（该 WeFlow 版本过滤未生效）。占位符卡回查 XML 后的拆条已处理判定改为**一次批量 `is_processed`**（此前逐卡一次，N 张卡 N 次 DB 往返；首轮 `msg_ids` 批量查不变）。翻页仅首页（offset=0）保留 `retry_on_empty`
 竞
 态兜底，翻页空结果即末页不再重试（否则每个空闲会话每轮固定多付 500ms 串行延迟）。**文章占位符回查**：回填固定 `media=True`（图片 OCR），而 WeFlow 在
 media=True 时把文章卡片 XML 渲染成占位符（如 `[视频号] 标题`）——poller 对 localType=文章卡片且 content 非 XML 的候选调
@@ -779,8 +826,9 @@ WARNING）的日志噪音；`fmt_dur()` 统一耗时格式。
 - **生命周期**：`setup_all`（HTTP 启动前、DB 就绪后）→ `activate_all`（服务器就绪后）→ `teardown_all`（逆序幂等）。消息源预热（去重缓存等）与监听启动
   等顺序约束由该阶段划分承载。
 - **失败隔离**：单插件失败只降级 disabled/failed 并记日志；setup/activate 异常路径先 best-effort teardown 回收半装配副作用再标
-  failed（teardown 异常吞成 DEBUG 不掩盖原始错误；`PluginDisabledError` 自禁用不走此路径）；`PLUGINS_REQUIRED` 名单内的失败抛
-  `PluginError` 致命中止启动。
+  failed（teardown 异常吞成 DEBUG 不掩盖原始错误；`PluginDisabledError` 自禁用不走此路径）。`PLUGINS_REQUIRED` 校验贯穿**发现 → 装配 → 激活**：
+  名单内插件未发现、未列入 `PLUGINS`、互斥落选、未知依赖/依赖环、setup/activate 失败、**依赖插件 activate 失败**，任一情形都抛
+  `PluginError` 致命中止；可选插件的依赖 activate 失败时依赖方一并标 failed（`_verify_required` 在 `setup_all`/`activate_all` 末尾各核对一次）。
 - **setup 失败补偿契约（规范性）**：资源获取先于注册；任何注册行为（`ctx.ai`/`ctx.dedup`/`register_stage`/`subscribe_event`/
   `set_ai` 等）必须可被插件自身 teardown 幂等回收——setup 内所有可失败步骤完成后再做端口注册，失败窗口即不残留半装配端口
   （内置 ai_provider/dedup 已按此实现：注册后无可失败步骤，teardown 清 `ai_ports`/`ctx.ai`/`ctx.dedup`）；第三方插件同受此约束。
@@ -790,7 +838,9 @@ WARNING）的日志噪音；`fmt_dur()` 统一耗时格式。
   classify/dedup/merge 声明依赖 ai_provider，被禁用时随依赖降级，pipeline 骨架对“阶段缺失”整批保留不标记防消息丢失）/ `WebPlugin`（router +
    asset_dir；核心提供 `GET /api/plugins` 元数据与 `GET /plugin-assets/{name}/{path}` 静态资源
   ，`include_plugin_router` 展开 APIRoute 插到 SPA mount 之前——新版 Starlette 的惰性 `_IncludedRouter` 会被 SPA 兜底截胡）
-  / 可选 `SettingsSchemaPlugin`（实现 `settings_schema()` 即可按插件当前配置动态暴露设置字段，旧插件无需实现）。
+  / 可选 `SettingsSchemaPlugin`（实现 `settings_schema()` 即可按插件当前配置动态暴露设置字段；`PluginManager` 在插件
+  setup 成功后经可选的 `settings_instance()` 钩子保存运行实例并下发 `settings_schema(instance, running=...)`，
+  `running=False` 表示没有运行值——旧插件不实现这两个钩子也能工作，只是字段不带运行快照）。
 - **双能力插件**：同一插件类可显式继承多个能力协议并同时注册（先例：rag = StagePlugin[post_insert] + WebPlugin，setup 内既
   register_stage 又 register_router/register_plugin_assets）。
 - **PluginContext 服务端口**：config、事件总线（`event_bus`，核心删除卡片发布 `EVENT_ITEMS_DELETED`，去重插件订阅清内存缓存）、
@@ -800,26 +850,41 @@ WARNING）的日志噪音；`fmt_dur()` 统一耗时格式。
   留通用加载器与两类扩展钩子（详见下方「前端」节）。**图标不随插件分发**：插件前端复用核心 `/icons/` 路径或在 `ui.js` 内联 Lucide SVG（约定与守卫见「前端」节「插件图标通
   道」）。
 - **三源行为契约（weflow / weflow-legacy / qqflow）**：同构六文件分层，已统一——必填配置缺失/空值即装配期 `PluginDisabledError` 自禁用（零源降级
-  启动兜底，决策 ①=1B）、空发送者消息保留（归一化回退 sender_name="未知"，决策 ②）、会话级拉取失败记入
-  `PollResult.failed_sessions`/`session_errors` 不中止整轮、翻页 age 早停（`hit_old`）、脏会话 404→空信封
-  （`not_found_ok=True`）、SSE `(event, rawid)` FIFO 去重。**legacy REST/SSE 过滤口径统一**：`pre_filter_rest` 的附件占位符过滤
+  启动兜底）、空发送者消息保留（归一化回退 sender_name="未知"）、会话级拉取失败记入
+  `PollResult.failed_sessions`/`session_errors` 不中止整轮（翻页守卫触顶同样记入：水位不推进，保留尾部消息的可恢复性；但该状态**不会自愈**——翻页只能从最新向旧推进、窗口只增不减，下轮必再触顶，需调大翻页上限或停用再启用会话缩小回填窗口；`lastWarning` 附带首个会话的原因文案。真库最大会话 6 万条，上限 40 万）、翻页 age 早停（`hit_old`）、脏会话 404→空信封
+  （`not_found_ok=True`）、SSE `(event, rawid)` FIFO 去重、SSE 帧解析共用 `iter_sse_data_events`。**legacy REST/SSE 过滤口径统一**：`pre_filter_rest` 的附件占位符过滤
   （`_ATTACHMENT_RE`）与图片 `mediaType == "image"` 校验与 SSE 路径同口径——同一消息不因到达路径（实时 SSE/回填 REST）不同而入库结果不同。
   **URL 拼接契约**：`*_API_BASE`（base_url）必须是**服务根地址或反代
   子路径前缀**，不得携带查询串、不得填完整端点路径；三源 SSE/媒体经共享助手 `sources_base.build_endpoint_url` 按 base 的路径前缀拼接
   （保留 base 自带查询串），与 REST 的相对路径合并三路一致——反代子路径部署下不再 404。**刻意保留的上游契约差异**：SSE 心跳/读超时（weflow/qqflow 上游 25s
   ping→60s；legacy 上游无心跳→300s）、自消息检测（weflow/legacy 信任上游不推自消息；qqflow 每消息 REST 回查）、`retry_on_empty`（仅
   legacy 上游存在「刚入库查不到」竞态）、`WEFLOW_DB_KEYS` 存储层自动分片（Windows 凭据管理器单条上限，配置语义恒为一份完整 JSON）。
+- **消息源共享就绪门控与 vendor SDK**：weflow/qqflow 两客户端的「身份状态机」（健康检查驱动的记忆化、绑定账号身份闸门、
+  良性/被拒态注册分诊）收敛为 `briefdesk/plugins/_sdk_base.ReadinessGate`——HTTP 细节以**属性名**注入（调用时解析，
+  测试的实例级打桩对门控可见）；每次 SSE 实际建连交付消息前强制重检（周期轮询默认关闭，身份闸门不可移交 poller）；
+  绑定账号不符抛 Mismatch 并置 offline，禁止继续读流。force 重检在第一次 await 前就失效成功标志：任何一条
+  force 失败路径（被拒 / 网络错 / Mismatch / 取消）都不留过期记忆，否则「force 意为重新验证」恰好反转。
+  注册前的平台化 INFO（含 wxid/qq、db_path、keys 数）经 `register_desc_attr` 回调由 owner 供词——门控跨
+  平台拿不到这些身份上下文，丢了这行日志排查面即回退；结果日志按「有无 status」两种文案（qqflow 面的
+  回调不带 status，恒打会多一个 None）。`vendor/weflow_sdk` 与 `vendor/qqflow_sdk` 是两个上游 SDK 的
+  git subtree 纯镜像（`--squash`，供应分支 `sdk-dist`），随包分发且**运行期已被两插件消费**——REST / 分页 / 媒体 / 错误分类
+  都经 vendor Client（各插件 `self._api()`）；`scripts/wheel_smoke.py` 的
+  `assert_vendor_importable` 验证随包可达性与公共形状（运行期消费者是两插件，不是冒烟脚本）。SSE 是唯一例外：插件自持 `httpx.AsyncClient`——SDK 的 `watch` 没有「每次建连成功」的接缝，而身份闸门要求每次建连强制重检。分帧两处与 SDK 的刻意口径
+  差异（多 `data:` 行的拼接、上限是否约束单个完整帧）见 `sources_base.iter_sse_data_events` 文档串与
+  两仓 SDK 的 `watch` 文档串，两边各自成立、只记录不统一。**vendor 内禁改**——补丁一律上游先行再经
+  `scripts/sync_vendor.ps1` 同步；本地修改的失败模式是下次同步产生冲突、需人工解决（不是自动丢弃）。
 
 ## 数据库
 
-SQLite file: `briefdesk.sqlite` (configurable via `DB_PATH` in `.env`). Key tables:
+SQLite file: `<user data dir>/data/briefdesk.sqlite` (configurable via `DB_PATH`; relative paths resolve against the process cwd). Key tables:
 - **`items`**: Classified/deduped information cards with category, title, structured fields, source
   tracking (`source` + `UNIQUE(source, source_msg_id)`), verification status (`is_verified`: 0
   unverified / 1 memo / -1 ignored), `image_urls` (JSON), `article_url`（文章卡片原文链接，前端渲染可点跳转）,
   `content_hash`, `extra_times`（多时间点 JSON：每项 {"type":"start"|"end", "time":"YYYY-MM-DD[ HH:MM]",
   "label":"任务名"}——单条消息含多个截止/开始时间时，主字段取最早、其余全部结构化存此列，供卡片徽章与日历逐点渲染）
 - **`sessions`**: Discovered conversations, composite PK `(source, session_id)`, each with an
-  `enabled` flag; `is_group`/`is_official` 双维度区分群聊/私聊/公众号（公众号仅 weflow-legacy 产出，chatlab 格式的 channel 类型映
+  `enabled` flag; `is_group`/`is_official` 双维度区分群聊/私聊/公众号（公众号由 weflow 与 weflow-legacy 均产出：weflow 按原生格式
+  `sessionType==official` 判定，weflow-legacy 由 chatlab 格式的 channel 类型映
   射而来）；`last_poll_ts` 为按会话增量轮询水位（NULL=待回填，启用会话时由 toggle 清空 → 下轮按 BACKFILL_HOURS 回填一次）
 - **`processed_messages`**: Tracks processed message IDs to avoid re-processing; composite PK
   `(source, msg_id)`
@@ -846,7 +911,8 @@ SQLite file: `briefdesk.sqlite` (configurable via `DB_PATH` in `.env`). Key tabl
 
 ## 前端
 
-Vanilla JS SPA in `ui/` (`index.html`, `app.js`, `style.css`, `icons/`). No build step, no
+Vanilla JS SPA in `briefdesk/ui/` (`index.html`, `app.js`, `style.css`, `icons/`), shipped inside the package
+(`[tool.setuptools.package-data]`; `server/static.py` 以包内相对路径挂载). No build step, no
 framework.
 
 > **`app.js` 的形态约束**：插件前端以**同源 classic `<script>` 注入、与 `app.js` 共享全局作用域**（见下方「插件前端随插件包分发」）
@@ -859,7 +925,7 @@ framework.
 200+ 个顶层 `function` 不同口径）；② **`setupEvents` 里的调用顺序 = 注册顺序 = 同 target 同事件类型的触发顺序**，`document` 上有多个
 `click`/`keydown`（状态面板、引用折叠、「⋯」菜单、Esc、搜索历史 `mousedown`）彼此顺序敏感，新增区块只往后追加、不要插队；③ 区块局部的 `$元素`常量留在各自函数内（当
 前 19 个），跨区块引用就该报 `ReferenceError`——这是拆分换来的唯一结构性保证。**这一带没有任何自动化守卫**：`tests/ui_harness.mjs` 的
-`addEventListener` 是空函数、`querySelectorAll()` 返回 `[]`、`closest()` 返回 `null`，五个 `ui_*_test.mjs` 只取纯函数，
+`addEventListener` 是空函数、`querySelectorAll()` 返回 `[]`、`closest()` 返回 `null`，各 `ui_*_test.mjs` 只取纯函数，
 且**无任何测试调用 `setupEvents`**，pytest 也不启浏览器——搬错一个 handler 不会有任何 gate 报警，只在用户点到那个控件时现形。故再动这批函数时，务必用「按
 `setupEvents` 调用顺序拼接各函数体、逐字节比对改动前」的往返校验兜住顺序与内容，另查「深度 1 声明不被区间外引用」兜住作用域。
 
@@ -884,11 +950,12 @@ Key behaviors:
   `postVerify(id, value)` 收敛卡片标记的 4 处调用点）。错误形状唯一——非 2xx 抛 `HTTP <code>`；「失败静默降级」由调用点显式写
   `.catch(() => null)`，不藏进各自的 `res.ok` 分支。保留裸 `fetch` 的场景各自在注释注明原因：插件资源/favicon 非 JSON、`/api/restore` 是
    multipart、`/api/sync` 要按 409 分流状态码、CSV 导出要读响应头取文件名。**前端测试的 fetch 桩必须带 `ok`/`status`**——缺 `ok` 会被判成失败
-  请求，把契约缺口伪装成业务 bug（`tests/ui_harness.mjs` 是共用的 DOM/BOM 桩）
+  请求，把契约缺口伪装成业务 bug（`tests/ui_harness.mjs` 是共用的 DOM/BOM 桩）。**`fetchData` 的 `catch` 同样受 `fetchSeq` 守卫**：
+  过期请求的失败不覆盖最新连接状态（此前只有成功路径与 finally 有守卫，快速切换查询时旧请求晚失败会把状态胶囊改成「连接失败」并覆盖已渲染的新数据提示）
 - Category sidebar with counts + 备忘录 (memo) / 已忽略 (ignored) views (from `/api/items`)
 - Item cards with three-state verification: 加入备忘录 (1) / 忽略 (-1) / 未处理 (0)
 - Expandable quote section (fetches context via `/api/context`)
-- Settings modal: sync button (`/api/sync`), session enable/disable with select-all; 群聊列表支持类型筛选（全部/群聊/私
+- Top bar: sync button (`/api/sync`, `briefdesk/ui/index.html` 的 `#sync-btn`); Settings modal: session enable/disable with select-all; 群聊列表支持类型筛选（全部/群聊/私
   聊/公众号，多选）与消息源筛选（多选，芯片按 `/api/status` 的 `sources` 实际启用源动态渲染，单源部署整行隐藏），两者与名称搜索、按时间过滤叠加生效（仅显示层，不影响保存
   diff）；行标签「群/私/公」按 is_group/is_official 渲染。**会话筛选单源 `createSessionFilter`**：设置「群聊筛选」与首次使用向导 step2 是同一套
   筛选（`sessionRowMatches` 的四维 AND：类型多选 + 源多选 + 名称搜索 + `last_active` 时间窗口，各维空集/空值 = 不筛选），两侧均由该工厂产出实例
@@ -897,7 +964,7 @@ Key behaviors:
   `pruneSources`（源芯片重渲染时是否清理失效选中项——仅设置侧）。行为守卫见 `tests/ui_session_filter_test.mjs`。**「启动配置」分组**：
   `GET /api/settings/env` 渲染白名单表单（select/number/boolean/多选/文本；`PLUGINS` 项带 hidden 标记、由「插件」面板编辑），
   显示「已暂存 · 重启生效」与「环境变量优先」徽标与暂存文件路径；「恢复默认」PUT null 后由
-  写响应携带的该键最新 staged/source 做**行级贴片**（不整面重载，保住其它行未暂存编辑与「插件」面板开关草稿）；`DB_PATH`/`SERVER_PORT` 有警示确认；「密钥」区只显示 keyring 配置状态，未配置项输入后 POST 写入 keyring、可清除（
+  写响应携带的该键最新 staged/source 做**行级贴片**（不整面重载，保住其它行未暂存编辑与「插件」面板开关草稿）；`DB_PATH`/`SERVER_PORT` 有警示确认；「密钥」区显示两枚独立状态——`configured`（按当前解析链 keyring > 环境变量 > 项目 .env > 暂存是否有有效值，**每请求活判定**；keyring 与两层文件即时反映，环境变量是本进程 exec 时固定的那份——与非密钥项的 `expected_source` 完全同口径）与 `keyringConfigured`（仅钥匙串条目真值，决定输入框隐藏与「替换/清除」入口）；未配置项输入后 POST 写入 keyring、可清除（
   明文不回传、提交后按响应就地重绘该行）
 - **统一保存与脏检查**：底部全局「保存」对所有面板语义一致——一次点击提交
   全部未保存草稿（env/PLUGINS 暂存 PUT + 类别/会话 ops + 刷新间隔 localStorage；
@@ -912,11 +979,12 @@ Key behaviors:
   `env-switch` 开关改本地草稿集——启用被拒（互斥/缺依赖）、禁用被拒（被启用中可选插件或核心插件依赖）时 toast 点名原因，通过后
   仅更新本插件草稿；「保存」把草稿 diff 成单个 `PLUGINS` JSON 并入 PUT（服务端复检 409 时逐条 toast issues），重启生效。
 - **插件前端随插件包分发**：核心前端只留通用加载器 `loadPluginFrontends`——读取
-  `/api/plugins` 取 loaded 名单 → 隐藏所有 `[data-plugin-entry="<name>"]` 声明入口 → **仅对声明了前端资源的插
+  `/api/plugins` 取 loaded 名单 → 隐藏所有 `[data-plugin-entry="<name>"]` 声明入口（该约定**当前零实例**：核心页面与
+  内置插件都自行注入 DOM，选择器恒空转，仅为「插件往核心页面放静态入口」预留）→ **仅对声明了前端资源的插
   件**（`has_frontend`，`asset_dir()` 非 None）注入 `/plugin-assets/<name>/ui.css`（样式）与
   `/plugin-assets/<name>/ui.js`（脚本；无前端资源的插件不请求，避免 404 触发浏览器严格 MIME 检查告警）→ 调用
   `window.briefdeskPlugins.<name>.init({isLoaded})`（异常仅 console.warn）。**插件的完整前端（DOM/样式/交互/入口）随插件包分发**：
-  calendar 的按钮、视图容器、两个浮层全部由其 `ui/ui.js` 自建，核心 `ui/` 不写死任何插件功能入口（由 tests/test_web_plugins.py 的核心前端边界守卫测试
+  calendar 的按钮、视图容器、两个浮层全部由其 `ui/ui.js` 自建，核心 `briefdesk/ui/` 不写死任何插件功能入口（由 tests/test_web_plugins.py 的核心前端边界守卫测试
   覆盖）；核心提供两类插件扩展钩子——**视图钩子** `registerPluginView`（hash 路由 / fetchData 委派 / Esc 消费 / 侧边栏数据就绪通知，calendar
   视图 `#calendar` 据此接入）与**行内扩展** `registerItemRowExtension`（renderItemRow/renderCard 动作区按钮与行末菜单渲染、
   handleRowAction 委派、文档点击关闭菜单、verifyItem 成功后 onVerify 通知——reminders 的提醒按钮/菜单/自动提醒据此接入），另设
@@ -968,17 +1036,17 @@ Key behaviors:
   观察；`tests/ui_harness.mjs` 的 `loadAppJs` 支持可选注入 localStorage）
 - Real-time updates via `EventSource("/api/stream")` SSE channel (plus poll-based auto-refresh,
   settings persisted to `localStorage`)
-- **图标库**：使用 [Lucide](https://lucide.dev)（ISC 许可）的 vendored 子集，位于 `ui/icons/`（英文 kebab-case 扁平命名，经
+- **图标库**：使用 [Lucide](https://lucide.dev)（ISC 许可）的 vendored 子集，位于 `briefdesk/ui/icons/`（英文 kebab-case 扁平命名，经
   `/icons/<name>.svg` 引用；旧中文图标库 `ui/图标/` 已整体移除，历史版本在 git 中可回溯）。单一事实来源为
-  `ui/icon-manifest.txt`，`tests/test_icon_manifest.py` 双向守卫：代码引用 ⊆ 清单且文件存在、`ui/icons/` 文件集合 == 清单集合、旧路径
+  `briefdesk/ui/icon-manifest.txt`，`tests/test_icon_manifest.py` 双向守卫：代码引用 ⊆ 清单且文件存在、`briefdesk/ui/icons/` 文件集合 == 清单集合、旧路径
    `/图标/` 不得回流。**来源版本钉定**：`scripts/fetch_icons.py` 钉定 lucide-static 版本（`LUCIDE_STATIC_VERSION`，当前
   v1.34.0，现有文件头注释核对一致）；`add` 从钉定版本逐个拉取并自动登记清单、`check` 校验清单全部图标在钉定版本可拉取且格式可接受、`show` 显示版本；升级须先 `check` 再
-  改常量并更新 `ui/icons/README.md`「版本记录」。**插件图标通道**：插件前端不携带图标目录——复用核心 `/icons/` 路径（引用守卫自动覆盖插件文件），或在插件
+  改常量并更新 `briefdesk/ui/icons/README.md`「版本记录」。**插件图标通道**：插件前端不携带图标目录——复用核心 `/icons/` 路径（引用守卫自动覆盖插件文件），或在插件
   `ui.js` 内联 Lucide SVG（须 `currentColor` 跟随主题色、无 `on*` 事件属性、无 `<script>`，由
   `test_plugin_inline_svg_follows_theme_and_stays_safe` 覆盖）；新增图标一律走核心「新增图标流程」。**新增图标流程**：拷贝单个 Lucide
-  SVG 到 `ui/icons/`（或 `python scripts/fetch_icons.py add <name>`）→ manifest 登记 → 代码引用（动态渲染的图标须加入
+  SVG 到 `briefdesk/ui/icons/`（或 `python scripts/fetch_icons.py add <name>`）→ manifest 登记 → 代码引用（动态渲染的图标须加入
   `app.js` 的 `preloadSvgIcons` 预取集合或 `_CAT_ICONS`/`_CAT_PALETTE`/`_STATUS_ICONS` 映射）→ 守卫测试通过。禁止引入第二图标库或
-  整库拷贝；许可归属与流程见 `ui/icons/README.md`。图标由 JS fetch 后内联（`currentColor` 随 CSS color 着色），favicon 由
+  整库拷贝；许可归属与流程见 `briefdesk/ui/icons/README.md`。图标由 JS fetch 后内联（`currentColor` 随 CSS color 着色），favicon 由
   `layout-grid.svg` 加随机主题色动态生成
 
 ## 配置
@@ -1012,13 +1080,15 @@ required field of `weflow`/`qqflow` → that plugin self-disables via `PluginDis
 | `AI_MAX_CONCURRENCY` | `4` | Max concurrent AI API requests, `0` = unlimited; set `1` for local models with concurrency limit 1 |
 | `POLL_OVERLAP_SECONDS` | `300` | 增量轮询窗口与上次水位间的重叠秒数：吸收边界秒/时钟偏差/翻页偏移，重叠部分由 processed_messages 去重 |
 | `POLL_INTERVAL_SECONDS` | `0` (disabled) | Periodic sync interval in seconds: fallback to backfill messages missed during SSE outages; >0 triggers the same sync path as `/api/sync` periodically (mutually exclusive) |
-| `AI_DISABLE_THINKING` | `true`（.env.example 默认建议值，代码默认 `false`） | When `true`, chat requests pass `reasoning_effort="none"` to disable thinking mode。⚠️ DeepSeek/思考系模型建议开启：思考输出计入 max_tokens 预算，会挤压时间提取/分类 JSON 造成 length 截断整批丢失（2026-08-28 问题报告 §4）；`.env.example` 已注记 |
+| `AI_REASONING_EFFORT` | `auto` | 推理强度意图（取值见 `config.REASONING_EFFORT_VALUES`，必须全小写）：`auto` 不干预 / `off` 发送 `reasoning_effort="none"` 尽力关闭思考（端点明确拒收该参数时自动改为不发送并记忆）/ `omit` 永不发送 / `minimal`…`max` 固定强度；非法值启动期报错。⚠️ DeepSeek/思考系模型建议 `off`：思考输出计入 max_tokens 预算，会挤压时间提取/分类 JSON 造成 length 截断整批丢失 |
 | `AI_JSON_MODE` | `auto` | JSON 严格输出开关（`response_format={"type": "json_object"}`）：`auto`（默认，启发式：ollama 端点或 deepseek-v4 系列模型）/ `on`（强制开启）/ `off`（强制关闭）。非默认 key 的 ollama 端点或其它支持 json_object 的模型经 `on` 强制开启 |
 | `AI_VISION_ENABLED` | `false` | **视觉路由开关**：主模型（`AI_MODEL`）支持图片输入时开启——含图消息将 OCR 文本连同图片一并送入 classify（多模态 content parts）；关闭时维持纯文本 OCR 路径（现状）。**需启用 ocr 插件**（图片字节由 enrich 下载归一化后随批暂存；缺失时纯占位符图片被入口过滤并常驻 `vision_without_ocr` 公告）。请求级失败（异常/空 choices）自动同批降级纯文本重试并置 `vision_fallback` 公告 |
 | `AI_VISION_MAX_IMAGES` | `4` | 单条消息随分类请求附图上限（多图超出只发 OCR 文本）；单次请求另有总量预算兜底（classify 引擎内 `_MAX_IMAGES_PER_REQUEST=12`） |
 | `MAX_CLASSIFY_TOKENS` | `8192` | Max output tokens per classify call (DeepSeek cap 8192; truncation breaks JSON) |
 | `LOG_LEVEL` | `INFO` | 日志级别（DEBUG / INFO / WARNING / ERROR / CRITICAL，另接受 uvicorn 的 TRACE）。DEBUG 开启逐条细节（事件/请求/过滤决策），INFO 只保留阶段与汇总；同时驱动 uvicorn 自身 logger 的级别门，并决定 **uvicorn.access 请求日志是否输出（仅 DEBUG/TRACE）** |
-| `DB_PATH` | `briefdesk.sqlite` | SQLite file path |
+| `DB_PATH` | 用户数据目录 `data/briefdesk.sqlite`（Windows `%LOCALAPPDATA%\briefdesk\data\briefdesk.sqlite`） | SQLite file path；相对路径按进程 cwd 解析、`~` 不展开 |
+| `BRIEFDESK_DATA_DIR` / `BRIEFDESK_CACHE_DIR` | 平台用户数据/缓存目录（Windows `%LOCALAPPDATA%\briefdesk` 与 `%LOCALAPPDATA%\briefdesk\Cache`） | 数据/缓存目录覆盖（**只读进程环境变量**，写进 `.env` 无效）：数据库、Benchmark 用例与报告、运行目录都随之迁移 |
+| `BRIEFDESK_SETTINGS_FILE` | 用户配置目录下的 `settings.env` | UI 暂存配置文件覆盖（**只读进程环境变量**） |
 | `SERVER_PORT` | `3000` | FastAPI/uvicorn port |
 | `RAG_MODEL` / `RAG_API_BASE` / `RAG_API_KEY` | 全为空（分别回退 `AI_MODEL` / `AI_API_BASE` / `AI_API_KEY`） | rag 问答专用模型通道（read by `briefdesk/plugins/rag/config.py`）：主链路 `AI_MODEL` 常为分类/去重用的微调模型，引用式问答可单独指向另一模型（未微调通用版/云端）。三项留空 = 与主链路共用。**`RAG_API_KEY` 为 `SecretStr` 密钥项，建议只走系统钥匙串**（`briefdesk secrets set RAG_API_KEY` / UI 密钥区）。三项由插件配置域读取后经 `ai_ports.rag_chat` 的 override 参数下传，`ai_provider` 侧只提供机制、不认识 `RAG_` 前缀（否则供应商插件反向依赖 rag） |
 | `RAG_TOP_K` / `RAG_FTS_LIMIT` / `RAG_MAX_EVIDENCE` | `12` / `12` / `10` | rag 插件：向量召回条数 / 关键词召回条数 / 注入 prompt 的证据上限 |
@@ -1030,9 +1100,9 @@ required field of `weflow`/`qqflow` → that plugin self-disables via `PluginDis
 | `RAG_MAINTENANCE_INTERVAL_SECONDS` | `3600` | rag 维护循环空闲间隔（GC 对账 + 缓存预热周期） |
 | `BACKFILL_HOURS` | `24` | REST 回填窗口：会话启用/从未轮询时按该窗口回填一次，此后按会话增量；`-1` = pull all history (warns at startup, pages to hasMore end) |
 | `IGNORED_EXPIRY_HOURS` | `0` (disabled) | On startup, purge ignored items older than this many hours (deletes from `items` + `raw_messages`, keeps `processed_messages`) |
-| `IGNORE_SELF` | `true` | 过滤本账号自己发送的消息（所有消息入口：SSE 实时 + REST 回填）。weflow-legacy REST 按 `isSend` 判定（SSE 上游已不推送自消息）；qqflow REST 按自身 UID（`u_<QQFLOW_QQ>`）判定，SSE 事件无发送者标识、开启后按消息回查 REST（每消息 +1 次本机 HTTP）。**注意 qqflow 的 `self_uid` 由配置推导而非取自上游**：服务端若绑着别的账号，自过滤会静默失效（把对方的消息当别人发的收进来，同时漏掉真正的自消息）——这是账号身份闸门在 qqflow 侧比 weflow 更要紧的原因（weflow 用数据自带的 `isSend`，不受影响） |
+| `IGNORE_SELF` | `true` | 过滤本账号自己发送的消息（所有消息入口：SSE 实时 + REST 回填）。weflow / weflow-legacy REST 按 `isSend` 判定；两源 SSE 上游都不推自消息（weflow-server 推送端据 `isSend=1` 主动跳过，weflow-legacy 的 SSE 上游已不推送）；qqflow REST 先按 `isSend`（上游 40013 方向列归一化为 `{0,1}`）判，`isSend=0` 时再按自身 UID（`u_<QQFLOW_QQ>`）兜底（部分 QQ 版本缺该列），SSE 事件无发送者标识、开启后按消息回查 REST（每消息 +1 次本机 HTTP）。**注意 qqflow 的 `self_uid` 由配置推导而非取自上游**：服务端若绑着别的账号，自过滤会静默失效（把对方的消息当别人发的收进来，同时漏掉真正的自消息）——这是账号身份闸门在 qqflow 侧比 weflow 更要紧的原因（weflow 用数据自带的 `isSend`，不受影响） |
 | `REALTIME_BATCH_MAX_COUNT` / `REALTIME_BATCH_TIMEOUT_MS` | `1` / `180000` | Realtime batch buffer flush thresholds (跨源公共：监听器攒批 + 实时路径 pipeline 切批) |
-| `BACKFILL_BATCH_MAX_COUNT` | `10` | Backfill batch size per AI classify call (independent of SSE batching)。⚠️ 长批 + 多群易引发 AI 输出 index 漂移/漏回（2026-08-28 问题报告 §3），默认已由 20 调为 10 |
+| `BACKFILL_BATCH_MAX_COUNT` | `10` | Backfill batch size per AI classify call (independent of SSE batching)。⚠️ 长批 + 多群易引发 AI 输出 index 漂移/漏回，默认已由 20 调为 10 |
 | `DEDUP_SIMILARITY_THRESHOLD` | `0.3` | Dedup pre-filter: title character-overlap ratio that triggers AI semantic dedup（嵌入整体不可用时为主通道；嵌入模式下余弦零候选时作兜底通道） |
 | `EMBED_API_BASE` | `` (empty = disabled) | Embedding API base URL; non-empty enables embedding cosine pre-filter (falls back to `AI_API_BASE` if empty within enabled mode) |
 | `EMBED_MODEL` | `` (falls back to `AI_MODEL`) | Embedding model name |
@@ -1044,24 +1114,111 @@ required field of `weflow`/`qqflow` → that plugin self-disables via `PluginDis
 | `DEDUP_EMBED_FALLBACK_THRESHOLD` | `0.65` | 低置信复核阈值：余弦候选落在 [fallback, `DEDUP_EMBED_THRESHOLD`) 区间且无 normal 候选时，全员判 SAME 才判重（覆盖中段相似度、低于 normal 门禁但确实重复的情形，如余弦略低于阈值但标题逐字相同） |
 | `MERGE_WINDOW_MINUTES` | `10` | 会话内同话题片段合并窗口（分钟）：新卡与同会话同类别、msg_time 相差不超过该值的未核实卡进入 AI 合并判定；`0` = 禁用合并 |
 | `MERGE_MAX_CANDIDATES` | `3` | 每张新卡最多送合并判官判定的候选头卡数 |
+| `BENCHMARK_PAUSE_PIPELINE` | `true` | benchmark 插件：运行期间暂停消息处理管道（实时消息延后到下一轮回填窗口，不丢失；read by `briefdesk/plugins/benchmark/config.py`, only when the `benchmark` plugin is enabled） |
+| `BENCHMARK_KEEP_RUNS` | `5` | benchmark 插件：保留运行产物数，按启动时间从旧到新轮转删除，**最新一次已完成**的运行永不删除（报告页依赖它） |
+| `BENCHMARK_RUN_TIMEOUT_SECONDS` | `0`（不限） | benchmark 插件：单次运行总时长上限（秒），非零时仅作兜底，到点终止 |
+| `BENCHMARK_RUN_STALL_SECONDS` | `600` | benchmark 插件：无进展阈值（秒），以进度文件行数增长为信号；不应低于单用例最坏耗时（分类 120s×3 重试=360s）。放大只在 CLI 直跑传 `--progress-every` 时生效——Web 路径该值恒为 1、不放大 |
 
 ### 配置解析链（keyring + UI 暂存）
 
-配置按优先级解析：**系统密钥环（仅密钥）> 环境变量 > UI 暂存文件 > `.env` > 默认值**（实现：`briefdesk/secrets_store.py` +
-`briefdesk/settings_env.py` + `briefdesk/settings_base.py`；`KeyringSource` 由
-`KeyringSettingsBase.settings_customise_sources` 单点挂载，app 级与 weflow/weflow-legacy/qqflow/rag 五个
-Settings 经 `ClassVar KEYRING_FIELDS` 声明密钥字段继承之，位于 env 源之前；五个 Settings 的 `env_file` 均为
-`[项目根 .env, 暂存文件]`（基类统一声明、子类经 pydantic 自动合并继承），pydantic-settings 多文件**后加载优先**）。
+配置按优先级解析：**init 参数 > 系统密钥环（仅密钥）> 环境变量 > 项目根 `.env` > 用户暂存文件 > 默认值**（实现：
+`briefdesk/secrets_store.py` + `briefdesk/settings_env.py` + `briefdesk/settings_base.py`；`KeyringSource` 由
+`KeyringSettingsBase.settings_customise_sources` 单点挂载，六个 Settings（app 级与 weflow/weflow-legacy/qqflow/rag/benchmark）
+经 `ClassVar KEYRING_FIELDS` 声明密钥字段继承之，位于 env 源之前；两个 dotenv 层由 `settings_env.dotenv_layers()`
+统一给出顺序——解析、`source_of` 与启动快照**共用这一份定义**，避免「显示的来源」与「实际生效值」漂移：
+已复现的一例是小写键（解析按大小写不敏感采纳，判定若精确匹配就会误报 `default`）。
 
-- **UI 暂存文件**：`platformdirs.user_config_dir("briefdesk")/settings.env`（Windows
-  `%LOCALAPPDATA%\briefdesk\settings.env`；macOS `~/Library/Application Support/briefdesk/`；Linux
-  `~/.config/briefdesk/`），也可经 `BRIEFDESK_SETTINGS_FILE` 显式指定（测试/便携）；只存非密钥键值，不存在时静默跳过；原子写（临时文件 +
+- **三个时点必须分清**（设置页每行同时带这三组字段，混用会显示「已生效」而实际没有）：
+  `current`/`source` 是**运行快照**（本进程正在用的值；来源读按模型登记的快照——核心 Settings
+  在 `config` 构造后登记，插件模型在插件 setup 成功后由 PluginManager 登记；渲染**未登记**模型时按当前层序
+  现算、不登记，见 `settings_env.register_model`/`model_source_snapshot`）；`staged` 是草稿；
+  `expected_value`/`expected_source` 是**按当前文件重新解析**的「下次启动生效值/来源」（`source_of()` 实时判定）。
+  覆盖态 `overridden`/`override_source`/`override_value` 属**预期**语义（与 `expected_*` 同源）：草稿存在且下次启动
+  会被 env / 项目 .env 压住时为真；`override_value` 给的是压住它的那一层的值。插件未装配/无运行实例时字段带
+  `running: false` 且不下发 `current`/`source`——显式表达「没有运行值」，不拿下次启动值冒充。
+  **采用时点在运行期的插件**（benchmark）不走「setup 快照」：它声明 `settings_model()` 与 `settings_snapshot()`，
+  manager 只登记模型类型，三个运行参数由 supervisor 在**每次 start** 解析并冻结进 `_Run`，schema 组装时从内存现读
+  （`source` 下发 `run`，前端显示「本次基准运行采用」）；空闲时不给 `current`——空闲没有运行值，`expected_*` 表达的
+  才是「下次运行 / 下次清理采用」。旧插件的 `settings_instance()` 契约保留不变（见 docs/plugin-dev.md）。
+  **没有 `current` 的行仍可预配置**：前端 `_envControl` 把它渲染成空控件，`_collectEnvChanges` 必须用
+  同一套归一（`null/undefined → ""`）算基准——两侧不一致时「没动过」会被判成改动并提交空串，数字项必被
+  `normalize_setting` 以「须为数字（留空不等于恢复默认）」422 拦下，整次保存失败（界面只显示笼统的
+  「暂存失败，请检查输入后重试」）。清掉已暂存的值走行内「恢复默认」，不要靠清空输入框。
+- **全量 schema 每请求至多两份快照**（`routes_settings_env.py`）：一次 GET 恰好核心与插件 schema 各构建一遍
+  （非密钥项与密钥项共用同一份插件结果）；一次成功 PUT 恰好写前（白名单+规范化）、写后（行级贴片的
+  `expected_*` 要反映提交后的文件）各构建一遍，**与提交键数无关**。构建是同步读盘而路由是 `async def`，
+  旧实现按键重建（K 键 = 3K 次全量）会冻结事件循环、SSE 与全部 API 一起停摆——回归由
+  `tests/test_settings_env.py` 的 `SchemaRebuildCountTest` 计数钉住，改这两个路由前先想清楚新增的
+  `_all_schema()` 调用属于哪个时点。密钥路由（POST/DELETE）的回传判定走 `_secret_effective` 活链现读，
+  DELETE 不再需要删除后的第二次 schema 构建（旧口径「核心密钥 configured 来自 import 期常量、
+  删除后回传不反映本次删除」已被活判定取代；回归见 `tests/test_settings_env.py` 的
+  `SecretConfiguredLiveTest`）。
+- **密钥徽章 `configured` 的时点 = 「下次启动是否会生效」**（`_secret_effective`，每请求按
+  keyring > 环境变量 > 项目 .env > 暂存的**胜出值真值**现读；不是「本进程正在用」——密钥与非密钥
+  项一样无热应用，运行中删除钥匙串条目后进程内存仍有旧值，徽章表达的是重启后的生效性；与时点
+  小节的 `expected_*` 同一语义）。判定
+  只认胜出值真值、不认层存在性（env 留空串行时真实链采纳 `''`＝未配置，按层存在判会谎报）。成立
+  前提：各 Settings 模型零参构造且不传 `_env_file`（核心与全部插件均满足；`composed_value` 看不见
+  init/file_secret 层）；插件 `KEYRING_FIELDS` 值必须与 `field_env_key` 同串（活判定用 schema 键查
+  keyring，真实链用 KEYRING_FIELDS 值查，分叉即静默假未配置——parity 由 `SecretConfiguredLiveTest`
+  钉住）。成本：每密钥 +2 次 dotenv 解析（10 密钥实测 GET 68→88 次、均值 +16.5ms，相对
+  `_core_schema()` 基线属次要项——这是「不加缓存」的依据；密钥随插件增长线性放大，可见时再按请求
+  memo 层内容）。已知 exotic 边界：同一 dotenv 文件内大小写变体键并存时 `parse_env_vars`
+  （末个胜）与 `_lookup_value`（首个非 None 胜）口径不同，徽章可能与真实链不一致——与 `source_of`
+  共享该既有缺陷，未另修。隐私：判定经文件读取，只返回 bool，任何日志/异常 detail/响应都不得带出取值。
+
+- **环境变量会压住项目 `.env`**：同名键只要在进程环境里存在，`.env` 的改动就不生效（设置页会标
+  「已被环境变量覆盖」，但排查「改了没反应」时要先看 `Get-ChildItem env:<KEY>` / `printenv <KEY>`）。
+  已踩过的一例：shell 或启动脚本导出过旧的 `PLUGINS`，往 `.env` 里补插件后插件始终不启用。
+  插件装配完成后，启动期还会对「被环境变量压住**且取值不同**」的键打一条 WARNING（只列键名、
+  不回显取值；同值覆盖不报，避免噪音；密钥键跳过——它们还有 keyring 层，判据看不到。回归见
+  `tests/test_settings_env.py` 的 ShadowedEnv 用例）。
+- **项目根 `.env`**：仅源码 / editable 模式存在（`paths.project_dotenv_path()` 以文件系统判据识别；不用
+  `importlib.metadata`——源码树的 egg-info 会遮蔽 site-packages 的 dist-info，把 editable 误判成 wheel）；
+  wheel 安装不读用户目录、site-packages 或 cwd 的隐式 `.env`
+- **UI 暂存文件**：`briefdesk/paths.py` 的 `settings_file()`——platformdirs 用户配置目录下的
+  `settings.env`（Windows `%LOCALAPPDATA%\briefdesk\settings.env`；macOS `~/Library/Application
+  Support/briefdesk/`；Linux `~/.config/briefdesk/`）。⚠ Windows 必须传 `appauthor=False`：缺省
+  platformdirs 把 `appauthor` 回退为 appname，路径会多出一层 `briefdesk\briefdesk`。也可经
+  `BRIEFDESK_SETTINGS_FILE` 显式指定（测试/便携）；只存非密钥键值，不存在时静默跳过；原子写（临时文件 +
   `os.replace`）+ 单写锁
 - **UI「设置 → 启动配置」面板**：GET/PUT `/api/settings/env`（核心字段从 `Settings.model_fields` 自动生成，并合并全部已发现
-  插件实现的 `settings_schema()`；支持 select/number/boolean/multi/text 与约束校验
-  ，`null`=恢复默认；PUT 对 PLUGINS 变更先经 `validate_selection` 依赖/互斥复检，不合法 409）、POST/DELETE `/api/settings/secrets`（keyring 写入/清除，明文永不下发；密钥状态同时区分有效配置 `configured` 与钥匙串
-  条目 `keyringConfigured`）；写入后**重启生效**（配置在启动时快照，无热应用）；来源徽标区分 override/env/dotenv/default（环境变量级优先时 UI 提示「
-  暂存不生效」）。可选插件禁用后仍显示其配置入口，便于启用前预配置；未实现可选 schema 的旧插件不受影响
+  插件实现的 `settings_schema()`；支持 select/number/boolean/multi/text 与约束校验，`null`=恢复默认）、POST/DELETE `/api/settings/secrets`
+  （keyring 写入/清除，明文永不下发；密钥状态同时区分有效配置 `configured` 与钥匙串条目 `keyringConfigured`）；写入后**重启生效**
+  （配置在启动时快照，无热应用）。GET 每行给三组值（见「三个时点」）：实际生效徽章按 `override_source` 措辞（「已被「项目 .env」覆盖」），
+  并在有草稿时显示「下次启动生效」；`expectedAvailable=false` 表示按当前文件解析失败（坏配置不 500，仍给脱敏摘要与全部字段元数据）。
+  每项 schema 带 `applyWhen` 采用时点（`restart` 缺省 / `next_run` / `next_cleanup`，由插件 `settings_schema()` 经
+  `apply_when` 参数按字段声明；benchmark 三个运行参数为 `next_run`、`keep_runs` 为 `next_cleanup`）——前端暂存徽章、
+  草稿生效行与保存 toast 按它措辞，写死「重启生效」会把运行参数误标成要重启（与 `expected_*` 的「下次运行/清理采用」语义一致）。
+  PUT 的插件组合复检（`PLUGINS` / `PLUGINS_REQUIRED` 任一被写都要跑）按**候选字节**判定：先在写锁内严格读取现有暂存并合成
+  「提交后会落盘的那份字节」，再用与真实回读同一套 dotenv 规则解析（含 `${VAR}` 展开）——内存 dict 合并直接 `json.loads` 看到的是
+  展开前的原文，预检结论会与提交后的实际组合不一致。名单解析失败 / 元素非字符串**不是**「无冲突」：显式返回 409 + `unavailable` issue，
+  不写盘（旧实现回落 `config.plugins` 或过滤坏元素，会放行「保存成功、重启必失败」的组合）；所有层都未提供时按模型默认 `[]`，
+  不回落启动快照。`validate_selection` 未接入（无 manager）时同样以 409 报「无法完成组合校验」，不当作无问题放行。
+- **逐层解码判可用性、胜出值判类型**（`settings_env.resolve_alias_layers` 是层序的唯一定义，展示用的 `composed_value`
+  就是它的首层视图——两处各写一份判定必然漂移）：任一层提供了该键但 JSON 解码失败（含空串）就判不可用，因为真实
+  `Settings()` 构造时**每一层**都会解码，高层合法压不住低层的坏 JSON（实测：env 合法 + 项目 `.env` 写 `not-json`，
+  PUT 旧实现回 200 而下次启动必失败）；元素是否全为字符串**只对胜出值**判——低层是合法 JSON 但类型错（如 `[17]`）
+  且被高层覆盖时，pydantic 的最终合并结果不受影响，不得新增「每层类型都必须合法」的过严规则。回归见
+  `tests/test_settings_env_round2.py` 的 `PerLayerDecodeTest`。
+- **预检的键匹配与真实解析同口径**：dotenv 解析按大小写不敏感采纳键，暂存文件被外部编辑器写成小写
+  `plugins_required=` 时读盘命中；预检若用大小写敏感的精确查表就查不到该层，会放行「必选含 benchmark、启用列表不含」
+  的矛盾组合（写锁只串行化本进程 API，锁不住外部编辑器，所以这是常态路径）。因此 `staged_override` 分支走
+  `_lookup_value`；不要在 `read_staged_from_bytes` 里另做键归一化（那会引入第二份口径）。回归：`PrecheckCaseSensitivityTest`。
+- **整值模板草稿**：multi 字段允许「原文非 JSON、但 dotenv 展开后为合法字符串数组」的草稿进入预检（`normalize_setting`
+  只在 `json.loads` 失败且原文含 `${` 时放行**落盘原文**，不经 `json.dumps` 规范化，否则模板被改写、与回读口径不一致；
+  `json.loads` 成功但元素非全字符串不放宽）。放宽处必须自带通用 text 尾巴的两道拒绝（multi 分支走不到那里）：换行会把
+  `KEY=VALUE` 拆成伪键行，「 #」是 dotenv 行内注释起点（回读截断会写出与用户所见不同的名单）。回归：`WholeValueTemplateTest`。
+  暂存文件读不出来（权限/编码）时 PUT 直接拒绝写入（`StagedReadError` → 409；旧行为把读失败当空文件，下一次写入会抹掉整个
+  暂存态）。**写方向同样不得静默**：`commit_staged_write` 的写入/替换/删除失败抛 `StagedCommitError`（继承 `OSError`，
+  只忽略「文件本就不存在」），路由统一映射为 500 + `{type: "staged_commit_failed", stage: mkdir|write|replace|delete}`——
+  删除失败被吞成 `ok:true` 是静默丢写入（文件仍在磁盘、内容原样），而裸 `OSError` 穿出路由只会留下无 detail 的 500；
+  不用 409（那是「客户端可调整后重试」，OS 占用改多少次都一样）。写后回传状态用严格读取 `read_staged_strict()`：
+  吞异常的展示口径会把「已写入但读不出」变成 `ok:true` + 空明细（比报错更坏），此时返回 500 +
+  `{type: "staged_state_unknown"}` 并明确「已写入、状态未知」，不得谎报未保存。回归：`StagedCommitFailureTest`。GET 不 500，
+  改为把预期标为不可用：`pluginsExpectedError` 下发脱敏说明，插件项 `enabled` 置 `null`（显式未知，不是「关闭」），
+  前端停用开关并禁用「全关」推断——把未知折进空集合会凭空生成 `PLUGINS=[]` 的假更改。可选插件禁用后仍显示其配置入口，
+  便于启用前预配置；未实现可选 schema 的旧插件不受影响
 - 系统密钥环经 `keyring` 库（Windows=凭据管理器/DPAPI，随用户账号加密；macOS=钥匙串；Linux=Secret Service），由 CLI
   `briefdesk secrets set|get|rm|list` 或 UI 密钥区管理（白名单 `SECRET_NAMES`）；
 - 密钥环不可用（无桌面会话 / 无 Secret Service / 未安装 keyring）或 `BRIEFDESK_KEYRING=0` 时**静默回退**环境变量 → `.env` → 默认值（读路
@@ -1072,7 +1229,8 @@ Settings 经 `ClassVar KEYRING_FIELDS` 声明密钥字段继承之，位于 env 
   `KeyringSource._key_for_field` 按别名输出键规避此陷阱（守卫测试：`tests/test_secrets_store.py` 的优先级链用例）。
 - **预提交密钥扫描**：`scripts/secret_scan.py` 只扫描 staged 新增行中的密钥形态（`sk-`/`AKIA`/PEM 私钥块/本项目密钥环境变量非空赋值），命中即拒绝提交
   ；经 `scripts/install-hooks.ps1` 安装为 pre-commit 钩子（守卫测试：`tests/test_secret_scan.py`；Windows 控制台 cp1252
-  下 stdout 重配 utf-8/replace，中文输出不再 UnicodeEncodeError）。
+  下 stdout 重配 utf-8/replace，中文输出不再 UnicodeEncodeError）。git diff 失败以退出码 2 拒绝放行（不是静默通过——空 diff 不等于干净）；
+  命中输出只含行号/规则名与脱敏片段（首 4 字符 + 总长），CI 日志不回显密钥。
 
 ## 设计要点与陷阱
 
@@ -1132,13 +1290,18 @@ Settings 经 `ClassVar KEYRING_FIELDS` 声明密钥字段继承之，位于 env 
 - **`add_to_cache` 的向量登记对新建/更新同口径**：两条分支（新建条目、同 id 幂等更新）先合流到同一个 `target`，再统一做一次「`embedding` 非空且
   `_embed_cache_ok` → 写 embedding + 追加 `_pending_embeds`」。更新分支只在并发/唯一键冲突重试路径上走到，漏登记的后果是该条永远不落库向量、重启后才由
   `_ensure_cache` 补齐，期间静默不参与余弦候选
+- **已知限制（跨群判重 × 会话停用）**：卡片只有一个原始会话（`items.session_id`），后续来源仅以群名并入
+  `source_group`。`_items_where` 按原始会话的 `enabled` 过滤，因此「A 群产生卡片 → 停用 A → 启用中的 B
+  群转发同一消息」时判重命中并合并进 A 的卡，卡片对用户不可见。数据不丢，重新启用 A 即可见。根治需引入
+  `item_sources` 来源表并配套 schema 迁移入口，另行立项；立项前的本地探测未发现受影响行。
 
 ### 管道并行与锁
 
 - Batch classification runs in parallel (`asyncio.create_task` + `as_completed`, one task per batch,
   enrich+classify stages); DB writes are serialized under `_storage_lock` in the pipeline skeleton
   (dedup stage + skipped marking + merge stage as one atomic section)；server 写路径共用同一把锁（类别 CRUD 全端点、
-  api_verify、batch 非 delete 分支、sessions toggle），见「核心模块」server 行
+  api_verify、batch 非 delete 分支、sessions toggle），见「核心模块」server 行。**锁内判官的耗时有界**：dedup 判票/strong、merge 判官/标题均传
+  `max_retries=0`（关掉 SDK 默认 2 次重试）且 `timeout` 同时约束信号量排队与请求本身，单次判官最坏锁内持有 ≈ 2×45s
 - 启用会话过滤、已处理过滤与 raw_messages 落库统一在 pipeline 入口（`process_all_batches`）完成，每批实时查询（无缓存）；
   `RealtimeListener.invalidate_session_cache()` 保留为 no-op 兼容调用。`SourceRuntime.refresh_sessions()` 返回
   `list[SessionInfo]` 由应用层（main 的 `_refresh_all`）统一写库；`fetch_history(enabled_sessions)` 的启用会话由
@@ -1189,8 +1352,8 @@ Settings 经 `ClassVar KEYRING_FIELDS` 声明密钥字段继承之，位于 env 
 - **日志行格式与来源列**（跨模块契约，新增日志按此写）：行格式为 `时间戳 LEVEL: 来源 message`。
   - 「来源」由 `logger.short_logger_name()` 从真实 logger 名派生：剥掉 `briefdesk.`/`plugins.` 两段公共前缀（每行重复且零信息量）、按
     `_NAME_ALIASES` 把 `weflow_legacy` 归一为源名形态 `weflow-legacy`（模块名用下划线、插件名/`sessions.source`/`poll_cycle`
-    的 `[%s]` 用连字符，不归一则按源名 grep 会漏一半）、再 `ljust(_NAME_WIDTH=23)` 定宽补齐（取**建了 logger 的模块**中最长短名
-    `weflow-legacy.normalize`——没建 logger 的模块其名字永远不进该列，不参与定宽；超宽不截断，只让该行消息起点右移）。第三方
+    的 `[%s]` 用连字符，不归一则按源名 grep 会漏一半）、再 `ljust(_NAME_WIDTH=26)` 定宽补齐（取**建了 logger 的模块**中最长短名
+    `server.routes_settings_env`——没建 logger 的模块其名字永远不进该列，不参与定宽；该值随**建了 logger 的模块集合**变化，由 `tests/test_log_redaction.py` 的 `ShortLoggerNameTest` 从真实包树枚举兜住（列宽不足即红）；超宽不截断，只让该行消息起点右移）。第三方
     logger（uvicorn/httpx/PIL）原样保留。
   - 只改**显示**：真实 `record.name` 不变——大量 `assertLogs("briefdesk.plugins.<pkg>.<mod>")` 依赖它，`briefdesk.*` 也要能整
     树设级别。
@@ -1226,7 +1389,7 @@ Settings 经 `ClassVar KEYRING_FIELDS` 声明密钥字段继承之，位于 env 
 ### 启动期上游连接竞态
 
 - briefdesk 启动即发起「首轮回填（REST）+ SSE 首连」，若上游（qqflow-server / WeFlow）TCP 尚未监听，REST 侧由 `with_connect_retry`
-  短退避自愈（3 次尝试、2 次等待 ≈0.5s/1s，耗尽仍写 lastError）；SSE 侧由监听器退避重连自愈。上游就绪慢于重试窗口时仍会记一次 lastError——彻底消除需「启动回填前置探活」（暂未实
+  短退避自愈（3 次尝试、2 次等待 ≈0.5s/1s，耗尽仍写 lastError；判定顺 `__cause__`，故上游 SDK 的传输失败包装不影响它）；SSE 侧由监听器退避重连自愈。上游就绪慢于重试窗口时仍会记一次 lastError——彻底消除需「启动回填前置探活」（暂未实
   施）。
 
 ### `/health` 的标量阶段不含身份 → 「服务端就绪」≠「我的账号就绪」
@@ -1247,3 +1410,117 @@ Settings 经 `ClassVar KEYRING_FIELDS` 声明密钥字段继承之，位于 env 
 - 两源错钥的**可知时机**不同，别误以为是实现不一致：weflow 的 WCDB 有逐页 HMAC，`start_account` 内 `verify_page1` 能同步判错 → HTTP 400；
   SQLCipher 无等价的轻量页校验，qqflow 只能校验密钥**格式**（16 字节可打印 ASCII），真解密推迟到后台建索引 → 数分钟后异步转 `error`。各自都是在「能真正知道」的最早
   时刻报错。故格式合法但错的密钥在 qqflow 侧会先返回 `accepted`。
+
+### 冒烟命令的进程所有权（scripts/smoke_process.py）
+
+`wheel_smoke.py` 的全部外部命令（构建、建 venv、pip、探测、runner）与长驻应用都经 `SmokeCommands` 执行：
+许可包装进程 + **文件日志** + **原子状态文件**（`exit` / `error` 两态；文件存在但 JSON/schema 非法立即失败，
+缺失才按总期限等待）。为什么不用管道捕获：Windows 上 `subprocess.run(timeout)` 杀掉直接子进程后再读管道，
+孙进程若继承了管道写端，读取会挂到孙进程退出——冒烟进程树（console script → 应用 → 基准 runner）层层嵌套，
+一处挂住就拖死整个 job。
+
+- **Windows**：包装进程被指进 `KILL_ON_JOB_CLOSE` 的 Job，句柄取自 `Popen` **持有的**进程句柄（不按 PID 重新
+  `OpenProcess`——句柄已退出、PID 被复用时会把无关进程指进 Job）；清理先 `TerminateJobObject` 再等
+  `ActiveProcesses` 归零，最后关句柄并回收包装进程，确认计数之前不关句柄（关了就没有内核兜底的依据）。**归零确认才算清理成功**：查询失败（`None`）与等待超时都不算归零，按清理失败上抛（`close_all` 聚合），不静默放过。
+  嵌套 Job 被 runner 拒绝时显式失败，不绕开其管理。父进程硬死时由内核兜底。
+- **唯一规范顺序**（`run()` 与 `start_app()` 共用）：`_spawn_wrapper`（写 PENDING → Popen → 记组号，**不放行**）
+  → 立即 `proc.poll()`（此时还没放行，已退出只可能是 wrapper 自身启动失败 → 报「包装进程提前退出」并清理，
+  不得当成命令完成，也不得报成嵌套 Job 被拒）→ `_assign_to_job` → `_release`（写 GO）。**纳管成功后才释放许可**：
+  反过来写会让慢启动的实际命令（pip / venv / runner）在 `AssignProcessToJobObject` 之前就创建，它和它的后代全部
+  落在 Job 外，内核兜底整体旁路——`ActiveProcesses` 计数抓不到这种错序（只有 wrapper 在内也满足 ≥1），断言必须
+  **按实际命令的 PID** 查（`_process_in_job`，测试用哨兵文件取 PID）。纳管失败路径保持 PENDING，实际命令永不启动。
+- **命令成败只以状态文件为事实**：放行后不得用 wrapper 的退出码反推命令失败——发布完成状态后 wrapper 被
+  `TerminateJobObject` 收尾是正常路径（`_cleanup` 对此先等 `_WRAPPER_EXIT_GRACE` 让它自然退出，超时才升级），
+  而「句柄已回收」导致的纳管失败也与 runner 是否允许嵌套 Job 无关。误用反推会让 CI 随机假红并把排查引向错误方向。
+  回归：`tests/test_smoke_process.py` 的 `TestSpawnReleaseOrdering`。
+- **POSIX**：包装进程以 `start_new_session` 成为组长，实际命令与正常后代继承进程组；先对组发 SIGTERM、
+  宽限后最后一次 SIGKILL，之后才回收。这是**脚本级**所有权，不承诺父进程被 SIGKILL 后仍能执行清理——
+  不要当作 Windows Job 的等价物。
+- **收尾顺序**：全部所属进程确认退出 → 才做最终检查（真实用户目录前后快照、site-packages 无产物）→ 成功才删
+  临时目录。任何失败（含意外异常与超时）都保留现场并打印路径；成功路径的目录清理失败也算不通过。
+  现场保留覆盖**任意 `BaseException`**（脚本自身的 `ValueError`/`AttributeError`、`KeyboardInterrupt` 与
+  `TimeoutError`/`OSError`/`SubprocessError` 同等对待），并按原类型继续传播以保留 traceback 与中断语义；
+  「冒烟通过」只在 finally 的现场删除成功后打印——非成功路径绝不出现通过文案。回归：
+  `tests/test_wheel_smoke_isolation.py` 的异常参数化用例。
+- **路径探针只导入 `briefdesk.paths`**（模块常量 `RUNTIME_DIR_PROBE`）：算真实默认缓存目录时若导入
+  `supervisor`/`config`，会连带构造 `Settings`、访问真实钥匙串与 `.env`——探针本身就成了它要防的泄漏源。
+  形态守卫是文本断言（`tests/test_wheel_smoke_lifecycle.py::TestRuntimeDirProbeGuard`），行为面由前后快照对比覆盖。
+- **基准终态按 `run_id` 核对**（`wait_benchmark_terminal`）：状态获取为非 200 时**不得**当成「已收尾」——
+  连接失败与临时 5xx 在同一 monotonic 期限内重试，4xx 等确定错误立即失败，200 但 JSON 损坏 / 非 dict /
+  `running` 非 bool 属协议失败；只有 `running is False` 且 `run_id` 与 POST 一致、且按 `run_id`（不是名字最新的
+  目录）定位到 `meta.terminal` 三态与实际整数 `exit_code`（bool/None 不算）才算完成。`exit_code` 允许非零——
+  这一步验证的是「失败也能收尾」。回归：`tests/test_wheel_smoke_lifecycle.py`。
+
+### 发行脚本的两条硬契约
+
+- **版本改写按原始字节**（`scripts/release_check.py`）：`[project].version` 的瞬态改写与还原全程 `read_bytes` /
+  `write_bytes`，替换目标用 tomllib 定位静态值本身（不是「第一行 version」），替换后再做双断言——TOML 仍可解析、
+  且除该值外语义树逐项相等。为什么不能走文本模式：`read_text`/`write_text` 的 universal newlines 会把 LF 规范化成
+  CRLF，还原后 bytes 已变而文本比较相等，自校验检不出文件被动过；首次写入也在 `try` 内，部分写入同样走恢复。
+- **sdist 检查的现场留存**（`scripts/sdist_check.py`）：用显式成功状态而不是 `finally` 里的 `sys.exc_info()`——
+  `except` 分支 `return` 时该值已回到 `None`，用它判断会把检查失败的现场照常删掉，而提示同时声称「现场保留在 …」。
+  失败分两类：**检查类失败**（`CheckFailure`）打印说明、保留现场、返回 1；**意外异常/中断**打印现场路径后
+  **按原类型继续传播**（含 `KeyboardInterrupt`）——吞掉它落回 `return 1` 会让「保留现场后再传播」的说明与实现相反：
+  排查者按堆栈找线索却没有堆栈，也分不清是检查失败还是脚本自身的 bug。清理取消 `ignore_errors`，清理失败计入
+  退出码——「检查通过」包含「清理成功」。回归：`tests/test_sdist_check_entry.py`（其修正过程本身就是教训：
+  清理用例的 `build_sdist` 桩返回了错误类型，被旧实现的吞异常转成预期退出码，用例长期假通过、清理分支从未被
+  执行——桩必须返回 `Path`）。
+
+### Windows 控制台编码与 CI 门禁基线
+
+两个只在 CI 上暴露、本地全绿的坑（都属「验收自己出错」而不是代码出错）：
+
+- **入口必须把 stdout/stderr 重配为 UTF-8**：GitHub 的 Windows runner 控制台是 ANSI 代码页
+  （cp1252），入口脚本第一行 `print` 中文就抛 `UnicodeEncodeError`，验收会在第一步失败。
+  `benchmark/cli.py`、`benchmark/runner.py`、`scripts/wheel_smoke.py`、`scripts/fetch_icons.py` 都在入口
+  用 `stream.reconfigure(encoding="utf-8", errors="replace")` 兜底（`errors=replace` 保证即使流
+  不可重配也不会因日志字符崩掉验收）；**新增任何会打印非 ASCII 的入口都要照做**。
+  **读取侧是同一件事的另一半**：`subprocess` 的 `text=True` 缺省按 **locale** 解码，而子进程按上面的
+  约定输出 UTF-8——CI（cp1252）上解 UTF-8 续字节会在**读取线程**里抛 `UnicodeDecodeError`，该异常只被
+  `threading.excepthook` 打印、不冒泡：`subprocess.run` 照常返回、`stdout` 静默变成 `None`（解析输出的
+  调用点随后 `AttributeError`，宽松判断则直接漏判）。捕获型调用一律写
+  `encoding="utf-8", errors="replace"`，并让子进程也按 UTF-8 输出（注入 `PYTHONIOENCODING=utf-8`）；
+  守卫见 `tests/test_subprocess_encoding.py`。
+- **文件内容一律 UTF-8、不带 BOM**：上面的重配只管**流的编码**，文件本身另有一层约定——文本类文件必须是
+  UTF-8 且不带 BOM，守卫见 `tests/test_text_encoding.py`。「文本类」由 git 的内容判定给出
+  （`git ls-files --eol` 工作区侧 `w/` ≠ `-text`，含空文件与工作区缺失），不按后缀白名单，故新增扩展名
+  自动覆盖；git 判为二进制的文件（含 NUL 的 UTF-16、内容为二进制却挂文本后缀）豁免。编辑器侧见 `.editorconfig`。
+- **CI 扫描范围只认事件载荷里的固定 SHA**，由 `scripts/ci_scan.py` 单点解析与编排（workflow 里只有
+  一次 `python scripts/ci_scan.py`）。三个扫描器共用同一范围：**内容扫描比较两端树的差异**（双端
+  `--base/--head`，直接 `git diff base head`，不构造三点范围——三点会引入 merge-base 这个隐藏基线），
+  **提交信息扫描**比较 reachable 差集（`--commits`，逐条 `git show` 读取，不写临时文件）。
+  范围契约：PR 用 `pull_request.base.sha` / `head.sha` 的 merge-base 到事件 head（没有共同祖先或有多个
+  merge-base 即拒绝，不擅自选一个）；push 用 `before` / `after`；非零 `before` 本地缺失时先**精确 fetch
+  该 SHA**，仍取不到就返回 2 阻断（不做全历史兜底、不静默换范围）；全零 `before` 是首次推送的**已知空边界**
+  （空树 → after，提交集合取 head 全部祖先，含根提交）；`before == after` 是合法空范围；删除分支事件明确
+  无操作。旧实现用推送载荷 `commits` 数组的长度推算 `HEAD~N`——数组长度不等于第一父链步数（含合并会错位、
+  载荷截断会漏扫），首次推送的根提交会越界，数组为空时 HEAD~0 扫了个空 diff 还报成功。回归：
+  `tests/test_ci_scan.py` 用临时仓库构造真实 DAG 覆盖上述各分支与退出码承诺。
+- **「读不到」不等于「不存在」**（`scripts/forbidden_refs.py` 的双端内容扫描）：**有新增行就要求新端读得到**——
+  能走到读取这一步的路径都带着新增行，说明新端该有这个文件；读不到（git 异常、对象损坏、索引被改写）一律抛错并由
+  入口转退出码 2。不做存在性分流：纯删除在新端是 `+++ /dev/null`，根本不入新增行表，不需要「存在性判否即跳过」这个
+  分支，留着它只会掩盖「有新增行却读不到」。也不再按 `git cat-file -e` 的退出码或 stderr 英文文案判定——退出码不足以
+  区分「rev 非法」与「路径缺失」（同为 128），文案判定让结论随 git 的 locale 漂移，且与 `_git` 各写一份 subprocess
+  参数口径必然漂移。一律 continue 等于漏扫还打印「未发现编号引用」——门禁失守比扫不出来更糟。**已知限制**：git 的
+  `core.quotePath`（默认开）会给非 ASCII 路径加引号并转义，新增行表的 `b/` 前缀剥除随之错位、该路径读不到，扫描
+  于是按未执行退出 2——方向正确（宁可阻断不放过），彻底修法（按 `-z` 或 `--no-prefix` 解析）另立跟进。回归：
+  `tests/test_no_plan_refs.py` 的读取用例（桩返回 None 而非抛错——抛错在旧实现下同样得到退出码 2，零判别力）。
+- **编号扫描的采集面按「注释/文档在语法上的真实位置」切，而不是按后缀切一行扫一行**
+  （`scripts/forbidden_refs.py` 的 `iter_segments`）：Python 取 tokenize 的 COMMENT **加上所有字符串表达式
+  语句**（不止各节点首位 docstring——类体中部、fixture 之后的说明串同样入扫，旧实现用 `ast.get_docstring`
+  只收首位，测试类把规范写在中部就整段失明）；JS 走**逐字符状态机**，整行 `//`、行尾 `//` 与 `/* */` 一并收，
+  字符串与模板串里的 `//` `/*` 不算注释起点（旧实现按行找标记，`cases/*.fromweb.json` 这类**字符串内的 `/*`**
+  会被当成块注释开口，此后整段代码都按「注释正文」扫）；CSS 取 `/* */`、HTML 取 `<!-- -->`、`.example` 模板取
+  `#` 行注释（这三类此前整体在面外，`.env.example` 里的章外指针因此漏拦）；Markdown 取围栏外正文。
+  十六进制颜色在 `_EXEMPT` 剥离，要求至少含一位 A-F：纯数字的 `#` 编号仍归规则判定。**命中形态与豁免的口径以
+  AGENTS.md「注释、文档与提交信息规范」为准**（词表、条目码正反面、§ 指针、裸归因短语、量纲豁免）；两处任何一侧
+  改动都须同步另一侧与 `tests/test_no_plan_refs.py` 的 `_CASES`。
+- **两条规则刻意带语境限制，不是「漏了就补正则」**：反置条目码（数字在前）只在「见 / 决策 / 条目 / 序号 /
+  表」一类指针词邻近时判定——裸的「数字+字母」与 3D、5G、2FA 这类技术名词同形，按形状硬判会把正常注释
+  一起拦下，代价是孤立的「1B」不再命中（那种写法本身也没有可还原的上下文）；裸归因短语只认标签位
+  （后随冒号 / 括号 / 编号 / 行尾），动词连写（「审查修复了竞态」）不命中。同理，公开标准的章节号
+  （RFC / ISO / IEEE 等紧邻的 `§N`）与标准编号一起豁免，孤立章节指针照常命中。
+- **「点名的 `.md` 必须在树内」这条规则需要文件树**，因此只在全量扫描生效（`--tree` 与 pytest 守卫），
+  增量模式传 `known_paths=None` 让规则休眠：diff 侧没有稳定快照，当场判「不存在」会误伤同一次改动里
+  新增的文档。判定不猜文件名，只做可证伪的比对——路径或裸文件名能在 `git ls-files` 里找到即通过；带
+  URL 的行整体跳过（上游 API 文档以链接形式引用，文件名是链接标签而非仓内路径）。

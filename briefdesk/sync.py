@@ -29,7 +29,11 @@ def trigger_sync(reason: str = "manual") -> asyncio.Task[None] | None:
     已在同步中或未注册回调时返回 None，不触发。
 
         Args:
-            reason: 触发来源标识（"startup" / "api" / "manual"），仅用于日志
+            reason: 触发来源标识（"startup" 启动同步 / "periodic" 周期同步 /
+                "api" 经 /api/sync 手动触发），仅用于日志。默认值 "manual"
+                是省略参数时的兜底，当前没有调用点显式传它——新增来源时按
+                上面三种的命名风格补一个词，不要复用 "api" 掩盖真实来源
+                （日志里分不清谁触发的同步）。
 
         Returns:
             asyncio.Task: 同步任务，调用方（main）可持有并在关闭时取消

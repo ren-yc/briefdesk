@@ -38,7 +38,7 @@ class MaskContentTest(unittest.TestCase):
         self.assertEqual(mask_content(""), "")
 
     def test_api_key_token(self):
-        """【复核 P3】sk- 前缀密钥脱敏（群聊贴 key 的常见形态）。
+        """sk- 前缀密钥脱敏（群聊贴 key 的常见形态）。
 
         样例为虚构值且含下划线（`[A-Za-z0-9_\\-]` 字符类允许），避免命中
         pre-commit 密钥扫描器的纯字母数字连串形态。"""
@@ -47,7 +47,7 @@ class MaskContentTest(unittest.TestCase):
         self.assertNotIn("sk-abc", mask_content(text))
 
     def test_jwt_token(self):
-        """【复核 P3】三段式 JWT 整体脱敏：段内可能含 16-19 位数字（时间戳
+        """三段式 JWT 整体脱敏：段内可能含 16-19 位数字（时间戳
         形态 payload），须先于数字类规则整体命中。"""
         jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJVadQssw5c"
         self.assertIn(TOKEN_PLACEHOLDER, mask_content(f"token: {jwt}"))
@@ -63,7 +63,7 @@ class MaskContentTest(unittest.TestCase):
         once = mask_content("电话13800138000 邮箱 a@b.com")
         self.assertEqual(mask_content(once), once)
 
-    # ── 分隔符形态手机号 / 一代身份证 / 全角数字（P2 脱敏绕过修复）──
+    # ── 分隔符形态手机号 / 一代身份证 / 全角数字（脱敏绕过修复）──
 
     def test_phone_with_dashes(self):
         self.assertEqual(mask_content("联系138-0013-8000谢谢"), "联系[PHONE]谢谢")
@@ -139,7 +139,7 @@ class NormalizeSubjectTest(unittest.TestCase):
 
 
 class SeparatorRunEdgeTest(unittest.TestCase):
-    """二次扫描边界（审查 A1）：日期与分隔符手机号同段时空格/连字符混排，
+    """二次扫描边界：日期与分隔符手机号同段时空格/连字符混排，
     旧实现整段放弃导致段内真手机号漏脱敏；现按空白切分逐段独立分类。"""
 
     def test_date_and_separated_phone_same_run(self):
@@ -164,7 +164,7 @@ class SeparatorRunEdgeTest(unittest.TestCase):
 
 
 class SeparatorAggregationGuardTest(unittest.TestCase):
-    """段数守卫（审查回归）：数字列表/日期范围按总位数撞型的聚合误伤。
+    """段数守卫：数字列表/日期范围按总位数撞型的聚合误伤。
     旧实现按「去分隔符总位数」分类，8 段 16 位被判银行卡、12 段 15 位被判
     身份证且永久入库（types.py 构造即脱敏、原文不落盘，损坏不可逆）；
     现要求切段数 ≤ 5（真实 PII 分组至多 5 段）。"""
@@ -194,7 +194,7 @@ class SeparatorAggregationGuardTest(unittest.TestCase):
 
 
 class MixedSeparatorTest(unittest.TestCase):
-    """混合分隔符路径（审查回归）：旧实现 join 丢空白分隔符篡改文本且非幂等，
+    """混合分隔符路径：旧实现 join 丢空白分隔符篡改文本且非幂等，
     「138 0013-8000」首遍输出「1380013-8000」（手机号数字仍可见）、二遍才变占位符；
     现空白分隔符原样回填、整段「86+11 位」国家码形态可整体判定。"""
 
@@ -212,7 +212,7 @@ class MixedSeparatorTest(unittest.TestCase):
 
 
 class CountryCodePrefixTest(unittest.TestCase):
-    """+86/86 国家码前缀（审查回归）：旧实现 13 位串任何起点都因邻接数字
+    """+86/86 国家码前缀：旧实现 13 位串任何起点都因邻接数字
     断言失败而原样保留（PII 漏报）。"""
 
     def test_contiguous_plus86(self):
@@ -233,7 +233,7 @@ class CountryCodePrefixTest(unittest.TestCase):
         self.assertEqual(mask_content("861380013800"), "861380013800")
 
     def test_fullwidth_country_code_with_separator(self):
-        # 复核 P3-13：全角国家码「＋８６」＋全角/半角分隔符写法此前漏脱敏
+        # 全角国家码「＋８６」＋全角/半角分隔符写法此前漏脱敏
         # （digits 由 isdigit 收集保留全角字符，ASCII startswith("86") 失配）。
         # NFKC 归一半角后应整体命中 [PHONE]。
         self.assertEqual(

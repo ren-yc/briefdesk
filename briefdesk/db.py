@@ -21,21 +21,31 @@ from briefdesk.types import ContextMsg
 
 _db: aiosqlite.Connection | None = None
 _embed_db: aiosqlite.Connection | None = None
-# close_db 已执行的终态标志（P3-3）：close_db 之后任何 get_db/get_embed_db
+# close_db 已执行的终态标志：close_db 之后任何 get_db/get_embed_db
 # 都必须拒绝重建连接——应用关闭序列里 _cancel_pending_tasks 兜底在 close_db
 # 之后，残余任务的清理路径若经双检锁复活连接，其非 daemon aiosqlite worker
 # 线程会让解释器退出 join 挂死。进程内单生命周期（main._run 仅跑一次），
 # 该标志无需复位通道。
 _db_closed = False
 _lock = asyncio.Lock()
-# 向量专用连接的语句级互斥：load/upsert 在同一连接上串行执行，
-# 避免读游标活动期间另一协程 COMMIT 触发 "statements in progress"。
+# 向量专用连接的语句级互斥（动机与边界见 get_embed_db 的 docstring）：
 _embed_lock = asyncio.Lock()
 
-# pipeline 入库与 server 删除共用的存储锁。
-# server 删除必须在「DB 删除 → 去重缓存移除」之间持有此锁，
-# 否则 pipeline 的 check_dedup 可能命中已删除条目，把相似新消息
-# 判重后标记 processed，造成该消息在本回填窗口内永久丢失。
+# pipeline 入库与 server 删除共用的存储锁。本节是「为什么要跨模块持这把锁」的
+# 单点权威论证——其余调用点（main / pipeline / poll_cycle / routes_items 等）
+# 只写一行指针指回来，各自扩写会在下一次改动时漂移成互相矛盾的口径。
+# 两个失败模式：
+# 1) 删除侧不持锁：server 删除必须在「DB 删除 → 去重缓存移除」之间持有此锁，
+#    否则 pipeline 的 check_dedup 可能命中已删除条目，把相似新消息判重后标记
+#    processed，造成该消息在本回填窗口内永久丢失。
+# 2) 写入侧在锁外 commit：共享单连接 + 隐式事务下，任一协程的 commit 会连同
+#    别的协程**当前持锁段里尚未提交**的写一并提交（如 dedup 刚 insert、同段的
+#    post_insert 合并还没跑），部分写入提前可见——后续判重与合并都撞见半截状态。
+#    故约定：**进入并发阶段后**，共享连接上的 commit 必须发生在持有
+#    storage_lock 期间。启动期是例外——建库与过期清理（purge_expired_ignored）
+#    等单线程初始化不持锁，那时 pipeline 与实时路径都还没跑，不存在可被连带
+#    提交的他人多步写；一旦管道开始跑，就不再有这个例外。atomic_transaction
+#    只负责「成功提交/失败回滚」的原子性，不提供互斥，锁外用它同样击穿本不变量。
 #
 # 加锁顺序恒为 storage_lock → _embed_lock（dedup 向量落库、rag GC 均按此序）；
 # 禁止反向嵌套——两把锁跨连接，反向会与既有持锁路径形成环（死锁）。
@@ -44,7 +54,7 @@ storage_lock = asyncio.Lock()
 logger = logging.getLogger(__name__)
 
 # 默认分类类别（名称, 描述, 颜色, 出厂启用态），共 13 类。描述即各类别的默认 prompt；
-# 颜色与前端类别色板一致（ui/app.js _CAT_PALETTE 含同名色块+图标组合）。
+# 颜色与前端类别色板一致（briefdesk/ui/app.js _CAT_PALETTE 含同名色块+图标组合）。
 # 出厂启用态：仅原五类 enabled=1；新增八类入库即停用（enabled=0），在设置页开启后参与分类。
 # 存量库经 _backfill_default_categories 一次性补齐缺失的默认类（user_version 门控）。
 # 注意：描述为「自包含」写法——排除句只描述本类不收的消息特征，
@@ -234,7 +244,7 @@ class ItemInput(TypedDict):
 
 
 class ItemRow(ItemInput):
-    """Row from the `items` table — ItemInput 加 DB 生成的 id/created_at/
+    """`items` 表的一行 —— ItemInput 加上 DB 生成的 id/created_at/
     verified_at，另加仅查询行携带的 remind_at。"""
 
     id: str
@@ -244,7 +254,7 @@ class ItemRow(ItemInput):
 
 
 class ReminderRow(TypedDict):
-    """Row from `get_due_reminders` — 到期提醒所需最小字段。"""
+    """`get_due_reminders` 返回的一行 —— 到期提醒所需最小字段。"""
 
     id: str
     title: str
@@ -253,7 +263,7 @@ class ReminderRow(TypedDict):
 
 
 class SessionRow(TypedDict):
-    """Row from the `sessions` table."""
+    """`sessions` 表的一行。"""
 
     source: str
     session_id: str
@@ -267,7 +277,7 @@ class SessionRow(TypedDict):
 
 
 class CategoryCount(TypedDict):
-    """Row from `get_category_counts`."""
+    """`get_category_counts` 返回的一行（类别 + 计数）。"""
 
     key: str
     count: int
@@ -275,7 +285,7 @@ class CategoryCount(TypedDict):
 
 
 class CategoryRow(TypedDict):
-    """Row from the `categories` table."""
+    """`categories` 表的一行。"""
 
     id: int
     name: str
@@ -286,20 +296,20 @@ class CategoryRow(TypedDict):
 
 
 class CategoryDetail(CategoryRow):
-    """CategoryRow 加该类别下 items 卡片数（删除确认框显示用）。"""
+    """CategoryRow 加上该类别下的 items 卡片数（删除确认框显示用）。"""
 
     item_count: int
 
 
 class CategoryColor(TypedDict):
-    """Row from `get_enabled_category_colors` — 启用类别的名称与颜色。"""
+    """`get_enabled_category_colors` 返回的一行 —— 启用类别的名称与颜色。"""
 
     name: str
     color: str
 
 
 class RawMsgInput(TypedDict):
-    """Payload for `bulk_insert_raw_messages`."""
+    """`bulk_insert_raw_messages` 的入参形状。"""
 
     source: str
     msg_id: str
@@ -313,7 +323,7 @@ class RawMsgInput(TypedDict):
 
 
 class ItemText(TypedDict):
-    """Row from `get_all_item_texts`."""
+    """`get_all_item_texts` 返回的一行（id + 原文相关字段）。"""
 
     id: str
     source: str
@@ -324,7 +334,7 @@ class ItemText(TypedDict):
 
 
 class ItemsPage(TypedDict):
-    """A page of cards plus counts for the exact same filter set."""
+    """同一过滤条件下一页卡片 + 整份列表计数。"""
 
     items: list[ItemRow]
     total_count: int
@@ -341,7 +351,7 @@ _ITEM_TIME_RE = re.compile(
 
 
 def _parse_item_time(value: object) -> tuple[datetime, bool] | None:
-    """Parse stored local card time and report whether it is date-only."""
+    """解析库里存的卡片本地时间，并报告它是否只有日期。"""
     if not isinstance(value, str):
         return None
     value = value.strip()
@@ -371,10 +381,10 @@ def _stored_time_expired(value: object, now: datetime) -> bool:
 def item_is_expired(
     start: object, end: object, extra_times: object, now_local: object
 ) -> bool:
-    """Match the card-level expiry semantics used by the frontend.
+    """与前端一致的卡片级截止语义。
 
-    A card expires only when its primary end time is past and no main/extra
-    time point remains upcoming. Date-only deadlines stay active all day.
+    只有「主结束时间已过 且 再无主/附加时间点在未来」才算过期；只有日期的
+    截止当天全天有效。
     """
     if not isinstance(now_local, str):
         return False
@@ -435,23 +445,23 @@ async def _init_connection(
         SystemExit: schema 不匹配时拒绝启动
     """
     conn = await aiosqlite.connect(path)
-    conn.row_factory = aiosqlite.Row
-
-    # 默认 PRAGMA 设置
-    default_pragmas = {
-        "journal_mode": "WAL",
-        "busy_timeout": "5000",
-        "synchronous": "NORMAL",  # WAL 下 NORMAL 仅掉电丢最近一次提交
-    }
-    all_pragmas = {**default_pragmas, **(extra_pragmas or {})}
-
-    for key, value in all_pragmas.items():
-        cursor = await conn.execute(f"PRAGMA {key} = {value}")
-        await cursor.close()
-    await conn.commit()
-
-    # Schema 初始化/验证
     try:
+        conn.row_factory = aiosqlite.Row
+
+        # 默认 PRAGMA 设置
+        default_pragmas = {
+            "journal_mode": "WAL",
+            "busy_timeout": "5000",
+            "synchronous": "NORMAL",  # WAL 下 NORMAL 仅掉电丢最近一次提交
+        }
+        all_pragmas = {**default_pragmas, **(extra_pragmas or {})}
+
+        for key, value in all_pragmas.items():
+            cursor = await conn.execute(f"PRAGMA {key} = {value}")
+            await cursor.close()
+        await conn.commit()
+
+        # Schema 初始化/验证
         if validate_schema_flag:
             await validate_schema(conn)
         await init_schema(conn)  # 幂等：补建缺失的表
@@ -459,24 +469,46 @@ async def _init_connection(
         logger.critical("数据库 schema 不匹配，拒绝启动: %s", e)
         await conn.close()
         raise SystemExit(1) from e
-    except Exception:
-        # init 其余异常（磁盘满/库损坏等）：关闭本连接再上抛，
-        # 否则泄漏的 aiosqlite 连接（非 daemon worker 线程）滞留
+    except BaseException:
+        # 含 CancelledError（BaseException 子类，不被 except Exception 覆盖）：
+        # 取消/任何失败都不能泄漏连接——aiosqlite 连接带非 daemon worker 线程，
+        # 退出时会让解释器挂死。PRAGMA 循环与 commit 同样纳入 try。
         await conn.close()
         raise
 
     return conn
 
 
+def ensure_database_parent_dir(db_path: str) -> None:
+    """确保数据库文件的父目录存在；失败抛 RuntimeError（含路径与修复指引）。
+
+    为什么每个入口都要调：父目录不存在时 aiosqlite.connect 报
+    "unable to open database file"，而 main() 只捕 KeyboardInterrupt——栈里既看
+    不出该建哪个目录，也没有修复指引。备份/恢复的 mkstemp 也必须落在库同目录
+    （os.replace 跨盘在 Windows 报 WinError 17），同样不能假定目录已经在。
+
+    `~` 与 `%VAR%` 不展开：db_path 是裸 str，与 sqlite3 的解析口径保持一致
+    （相对路径按进程 cwd 解析）。
+    """
+    parent = Path(db_path).parent
+    try:
+        parent.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        raise RuntimeError(
+            f"无法创建数据库目录 {parent}（请检查 DB_PATH 或其父目录权限）: {e}"
+        ) from e
+
+
 async def get_db() -> aiosqlite.Connection:
     global _db
     if _db_closed:
-        # 关闭后拒绝重建（P3-3），见模块级 _db_closed 注释
+        # 关闭后拒绝重建，见模块级 _db_closed 注释
         raise RuntimeError("数据库已关闭（应用退出中），拒绝重建连接")
     if _db is None:
         async with _lock:
             if _db is None:
-                # 与向量连接对称（审计 B-1）：embed 连接持写锁落向量期间，
+                ensure_database_parent_dir(config.db_path)
+                # 与向量连接对称：embed 连接持写锁落向量期间，
                 # 主连接的写操作短暂等待而非立即抛 "database is locked"
                 _db = await _init_connection(
                     config.db_path,
@@ -487,7 +519,7 @@ async def get_db() -> aiosqlite.Connection:
 
 
 def get_embed_lock() -> asyncio.Lock:
-    """向量专用连接的语句级互斥锁（插件共享该连接约定时使用，如 rag）。"""
+    """向量专用连接的语句级互斥锁（插件共享该连接约定时使用，如 rag；动机见 get_embed_db）。"""
 
     return _embed_lock
 
@@ -495,71 +527,35 @@ def get_embed_lock() -> asyncio.Lock:
 async def get_embed_db() -> aiosqlite.Connection:
     """向量持久化专用连接（与主连接隔离，WAL + busy_timeout）。
 
-    动机：SQLite 的"活动语句"检查是 per-connection 的——主连接上并发读取
-    （pipeline 的 async-for 游标）可能让 COMMIT 报 "cannot commit
-    transaction - SQL statements in progress"。向量读写走独立连接后，
-    主连接的并发读不再影响落库；写写竞争由 WAL + busy_timeout 兜底。
+    **本节是「为什么向量读写要另开连接、再挂一把锁」的单点权威论证**，其余
+    调用点只写一行指针。
+
+    为什么另开连接：SQLite 的"活动语句"检查是 per-connection 的——主连接上
+    并发读取（pipeline 的 async-for 游标）可能让 COMMIT 报 "cannot commit
+    transaction - SQL statements in progress"。向量读写走独立连接后，主连接的
+    并发读不再影响落库；写写竞争由 WAL + busy_timeout 兜底。
+
+    为什么还要 _embed_lock：独立连接只隔离了「主连接 vs 向量连接」，向量连接
+    自身仍会被多个协程共享（dedup 向量落库、rag 回填/GC 都在用），同一连接上
+    的 load/upsert 游标与 commit 交错会重演同一类 OperationalError。锁只罩住
+    短临界区，不含任何网络等待——远程嵌入请求必须在锁外完成。
+
     表结构用 init_schema 幂等补建（同文件，正常启动时主连接已建好）。
-    语句级互斥由 _embed_lock 保证（load/upsert 短临界区，不含网络等待）。
     """
     global _embed_db
     if _db_closed:
-        # 关闭后拒绝重建（P3-3），与主连接同口径
+        # 关闭后拒绝重建，与主连接同口径
         raise RuntimeError("数据库已关闭（应用退出中），拒绝重建连接")
     if _embed_db is None:
         async with _lock:
             if _embed_db is None:
+                ensure_database_parent_dir(config.db_path)
                 # 与主连接同步语义一致（WAL + NORMAL）
                 _embed_db = await _init_connection(
                     config.db_path,
                     validate_schema_flag=False,  # 主连接已验证
                 )
     return _embed_db
-
-
-@asynccontextmanager
-async def db_redirect(
-    path: str | Path,
-) -> AsyncIterator[tuple[aiosqlite.Connection, aiosqlite.Connection]]:
-    """把主/向量连接整体重定向到 path 指向的独立库，退出时原样还原。
-
-    官方隔离缝（取代 benchmark 曾用的 get_db/get_embed_db 模块属性补丁）：
-    进入时按 get_db/get_embed_db 同口径在 path 上新建两条连接（主连接
-    validate_schema + foreign_keys=ON，向量连接免验证），并把模块级单例
-    指向它们——窗口内所有经 get_db()/get_embed_db() 的调用都落到临时库；
-    退出先同步还原单例（先于任何 await，取消路径也必达），再关闭临时
-    连接。应用已有连接不关闭、不改动，退出后继续使用。
-
-    调用方须自行保证窗口语义（benchmark 门闸：先暂停管道并排空在途批次
-    再进入；窗口内 UI 写操作会落到临时库并在退出后丢弃）。
-    """
-    global _db, _embed_db
-    main_conn = await _init_connection(
-        str(path), validate_schema_flag=True, extra_pragmas={"foreign_keys": "ON"}
-    )
-    try:
-        embed_conn = await _init_connection(str(path), validate_schema_flag=False)
-    except BaseException:
-        # 半程失败防护：第二条连接创建失败必须关闭第一条，
-        # 否则泄漏的 aiosqlite 连接（非 daemon worker 线程）滞留
-        await main_conn.close()
-        raise
-    saved_main, saved_embed = _db, _embed_db
-    _db, _embed_db = main_conn, embed_conn
-    try:
-        yield main_conn, embed_conn
-    finally:
-        _db, _embed_db = saved_main, saved_embed
-        try:
-            await embed_conn.close()
-        except Exception:  # 关闭失败不阻断另一连接与还原（ruff 0.16：记录日志的处理豁免 BLE001）
-            logger.debug("db_redirect: 临时向量连接关闭失败", exc_info=True)
-        try:
-            await main_conn.close()
-        except Exception:  # 同上
-            logger.debug("db_redirect: 临时主连接关闭失败", exc_info=True)
-
-
 async def close_db() -> None:
     """关闭数据库连接（主连接 + 向量专用连接），停止 aiosqlite 后台 worker 线程。
 
@@ -570,7 +566,7 @@ async def close_db() -> None:
     不阻断另一连接——否则残留的非 daemon worker 线程会让解释器退出挂死
     （与关闭路径要防的故障同源）。
 
-    入口即置 _db_closed 终态（P3-3）：先于任何连接 close，覆盖两连接先后
+    入口即置 _db_closed 终态：先于任何连接 close，覆盖两连接先后
     关闭的中间窗口——此后 get_db/get_embed_db 一律拒绝重建，防止关闭期
     残余任务的清理路径复活连接（挂死同源）。进程内单生命周期，标志不复位。
     """
@@ -648,7 +644,7 @@ async def atomic_transaction(db: aiosqlite.Connection) -> AsyncIterator[aiosqlit
     except BaseException:
         # 必须捕 BaseException：CancelledError（Python 3.8 起）继承 BaseException
         # 而非 Exception，只捕 Exception 会让取消逃逸、留下开启的悬挂事务，
-        # 被后续无关路径的 commit 收尾提交（半程写提前可见且不可回退，复核 P1-1）。
+        # 被后续无关路径的 commit 收尾提交（半程写提前可见且不可回退）。
         await db.rollback()
         raise
 
@@ -760,7 +756,10 @@ async def _cursor(
 
 
 async def backup_db_to(path: str) -> None:
-    """把当前数据库在线备份到指定文件（SQLite backup API，运行中安全）。"""
+    """把当前数据库在线备份到指定文件（SQLite backup API，运行中安全）。
+
+    开头取定源连接后全程使用它：中途换连接会让快照跨两个库，产物不可恢复。
+    """
     src = await get_db()
     dst = await aiosqlite.connect(path)
     try:
@@ -806,12 +805,14 @@ async def validate_restore_file(path: str) -> str | None:
 async def apply_pending_restore() -> bool:
     """启动时应用待恢复备份（{db_path}.restore-pending）→ 覆盖正式库。
 
-    校验通过才替换（并清理旧 -wal/-shm，避免旧 WAL 污染新文件）；
-    校验失败则删除 pending 并记录错误，不阻断启动。
-    返回是否发生了替换。
+    校验通过才替换：原库改名保留一代副本（{db_path}.pre-restore，三件）→ 替换；
+    替换失败回滚并保留 pending（下次启动重试）。校验失败则删除 pending 并记录
+    错误，不阻断启动。返回是否发生了替换。
     """
     import os
 
+    # 本函数在 get_db() 之前执行（main 的启动序），不能靠主连接兜底建目录
+    ensure_database_parent_dir(config.db_path)
     pending = f"{config.db_path}.restore-pending"
     if not os.path.exists(pending):
         return False
@@ -823,12 +824,51 @@ async def apply_pending_restore() -> bool:
         except OSError:
             pass
         return False
-    for suffix in ("", "-wal", "-shm"):
-        p = config.db_path + suffix
-        if os.path.exists(p):
-            os.remove(p)
-    os.replace(pending, config.db_path)
-    logger.info("已应用恢复备份: %s", config.db_path)
+    backup = f"{config.db_path}.pre-restore"
+    suffixes = ("", "-wal", "-shm")
+
+    def _rollback(moved_suffixes: list[str]) -> None:
+        """把已改名的原库件改回主库名；单件失败只记日志，继续其余件。"""
+        for suffix in moved_suffixes:
+            try:
+                os.replace(backup + suffix, config.db_path + suffix)
+            except OSError as e:
+                logger.error(
+                    "回滚原库失败: %s → %s（%s）；副本保留，下次启动自动补完",
+                    backup + suffix, config.db_path + suffix, e,
+                )
+
+    # 0) 上次恢复的回滚阶段失败会留下「主库缺失、原库只剩 .pre-restore」的状态。
+    #    此时若照常走第 1 步，会把这份唯一副本当上一代副本删掉——原库彻底丢失。
+    #    先把副本改回主库名补完回滚，再按正常流程重试恢复。只在主库缺失时触发：
+    #    主库存在时 .pre-restore 是上一代副本或已成功恢复后的原库，改回即错配。
+    if not os.path.exists(config.db_path) and os.path.exists(backup):
+        logger.warning("主库缺失但存在恢复前副本 %s：补完上次未完成的回滚后再重试恢复", backup)
+        _rollback([s for s in suffixes if os.path.exists(backup + s)])
+    # 1) 原库三件改名为 .pre-restore 三件（覆盖上一代副本；SQLite 以 <db>-wal/-shm
+    #    命名附属文件，副本沿用同规则，必要时可直接用 sqlite 打开 .pre-restore 检视）
+    moved: list[str] = []
+    for suffix in suffixes:
+        src, dst = config.db_path + suffix, backup + suffix
+        if os.path.exists(dst):
+            os.remove(dst)
+        if os.path.exists(src):
+            os.replace(src, dst)
+            moved.append(suffix)
+    # 2) 替换；失败则把三件改回去，pending 保留供下次启动重试。
+    #    此前先 os.remove 主库再 os.replace：替换失败（权限/杀软占用）时原库已删、
+    #    pending 仍在——下次启动没有可用数据库。回滚本身失败（同一占用往往波及
+    #    同目录其它文件）也不抛出：副本与 pending 都保留，由第 0 步在下次启动补完。
+    try:
+        os.replace(pending, config.db_path)
+    except OSError as e:
+        logger.error("应用恢复备份失败（%s），已回滚原库；待恢复文件保留，下次启动重试", e)
+        _rollback(moved)
+        return False
+    logger.info(
+        "已应用恢复备份: %s（原库保留为 %s，下次恢复时覆盖；含隐私数据）",
+        config.db_path, backup,
+    )
     return True
 
 
@@ -986,7 +1026,7 @@ async def _seed_default_categories(db: aiosqlite.Connection) -> None:
     await cursor.close()
 
 
-# C3：活动通知口径修订（user_version 1→2）。仅当现有行仍是旧版原文时更新——
+# 活动通知口径修订（user_version 1→2）。仅当现有行仍是旧版原文时更新——
 # 用户已自行编辑过该分类则尊重，绝不覆盖；幂等由 PRAGMA user_version 门控。
 _ACTIVITY_NOTICE_OLD_PROMPT = "宣布一场可到场参加的具体事件、教学日程或其变更声明。收录：①事件性内容（讲座、比赛、演出、聚会、社团活动、展览、运动会、课程安排、考试等）②具体时间③地点或线上平台④主题名称——①②必须满足，③④至少满足其一；原事件的改期、延期、取消声明即使新时间未定也收录。排除：各类找人召集（纳新成员、志愿者或工作人员、同伴拼团组队）、物品买卖转让求购、交材料申领资金的申报机会、零对价赠送领取、寻物寻主启事。判别：读者到场参与即完成参与→本类；比赛奖金只是诱因属性进关键词；含现场投递的宣讲会、义卖市集、招观众充场均按本类处理。"
 _ACTIVITY_NOTICE_NEW_PROMPT = "宣布一场可到场参加的具体事件、教学日程或其变更声明。收录：①事件性内容（讲座、比赛、演出、聚会、社团活动、展览、运动会、课程安排、考试等）②具体时间③地点或线上平台④主题名称——①②必须满足，③④至少满足其一；原事件的改期、延期、取消声明即使新时间未定也收录。排除：各类找人召集（纳新成员、志愿者或工作人员、同伴拼团组队）、物品买卖转让求购、交材料申领资金的申报机会、零对价赠送领取、寻物寻主启事。判别：读者到场参与即完成参与→本类；比赛奖金只是诱因属性进关键词；含现场投递的宣讲会、义卖市集、招观众充场均按本类处理。；面向全群的多项任务/材料提交截止通知（含各项截止日期）按本类收录。"
@@ -1087,7 +1127,9 @@ async def insert_item(item: ItemInput) -> str:
     await db.commit()
     if row is not None:
         return str(row["id"])
-    # 冲突路径：返回已存在的真实行 id（与幽灵 id 语义一致但指向真实数据）
+    # 冲突路径：返回冲突行的**真实 id**——这正是为了避免把未插入的新 uuid
+    # 当「幽灵 id」交给去重缓存/合并阶段（见上方 insert_item 的说明）；只有
+    # 冲突却查不到行（理论不可达）才落到末尾兜底。
     row2 = await _fetchone(
         db,
         "SELECT id FROM items WHERE source = ? AND source_msg_id = ?",
@@ -1252,7 +1294,7 @@ async def get_items_page(
     hide_expired: bool = False,
     now_local: str | None = None,
 ) -> ItemsPage:
-    """Return one stable page and full-list counts under identical filters."""
+    """在相同过滤条件下返回一页稳定结果与整份列表计数。"""
     db = await get_db()
     where, params = _items_where(
         category,
@@ -1886,7 +1928,7 @@ async def get_oldest_unprocessed_by_session(source: str) -> dict[str, int]:
 
 
 # 单行与批量共用的会话 UPSERT：enabled/last_poll_ts 不在 DO UPDATE 更新列中，
-# 保留用户启用状态与会话水位（语义锚点见 tests/test_db.py F2）
+# 保留用户启用状态与会话水位（语义锚点见 tests/test_db.py 的会话 UPSERT 用例）
 _SESSIONS_UPSERT_SQL = (
     "INSERT INTO sessions "
     "(source, session_id, name, is_group, is_official, enabled, last_seen, last_active) "
@@ -2241,8 +2283,9 @@ async def bulk_insert_raw_messages(messages: list[RawMsgInput]) -> None:
 
 _OCR_MARKER_LINE_RE = re.compile(r"^\[(?:OCR|图片 \d+ OCR 结果)\]$")
 
-# weflow-legacy 图片 raw 占位符为 [图片]，qqflow 为 [image]；两者都在上下文里
-# 回填 items.source_quote 的 OCR 正文，保持一致的展示行为。
+# 图片 raw 占位符：weflow 与 weflow-legacy 为 [图片]；qqflow 的图片占位符常量是
+# [image]（其附件判定另接受任意单段方括号，故 [图片] 也可能出现）。三源都在
+# 上下文里回填 items.source_quote 的 OCR 正文，保持一致的展示行为。
 _IMAGE_PLACEHOLDER_RE = re.compile(r"^\[(?:图片|image)\]$")
 
 
@@ -2339,7 +2382,7 @@ async def get_context_messages(
 async def merge_source_group(item_id: str, new_group: str) -> None:
     """把消息来源群名并入存活卡的 source_group（逗号分隔、精确匹配去重）。
 
-    精确去重而非子串匹配（C3）：群名互为子串（如"我们四个" vs "我们四个2"、
+    精确去重而非子串匹配：群名互为子串（如"我们四个" vs "我们四个2"、
     "篮球社" vs "篮球社团招新群"）时不再误判"已包含"而丢失来源记录。
     """
     db = await get_db()
@@ -2383,7 +2426,7 @@ async def get_all_item_texts() -> list[ItemText]:
 
 async def get_item_texts_by_ids(item_ids: list[str]) -> list[ItemText]:
     """按 id 取卡片文本（形状同 get_all_item_texts），供 unverify 后回加
-    去重缓存（复核 P2-18）。IN 列表按 900 分块防 SQLite 变量上限。"""
+    去重缓存。IN 列表按 900 分块防 SQLite 变量上限。"""
     if not item_ids:
         return []
     db = await get_db()
@@ -2401,7 +2444,7 @@ async def get_item_texts_by_ids(item_ids: list[str]) -> list[ItemText]:
 
 
 async def get_existing_item_ids(item_ids: list[str]) -> set[str]:
-    """按 id 批量查仍存在的卡片 id 集合（复核 P1-3）。
+    """按 id 批量查仍存在的卡片 id 集合。
 
     供 merge.after_run 锁外复查：锁释放后用户可能已删卡，add_to_cache
     之前按此过滤掉已删除 id，防止复活幽灵缓存条目。IN 列表分块防变量上限。
@@ -2422,8 +2465,8 @@ async def get_existing_item_ids(item_ids: list[str]) -> set[str]:
 async def load_embeddings(model: str) -> dict[str, list[float]]:
     """读取指定模型的全部已存向量，返回 {item_id: embedding}。
 
-    走向量专用连接（_embed_lock 串行）：不占用主连接，也不与
-    向量写入交错产生活动语句。
+    走向量专用连接并用 _embed_lock 串行（连接与锁的动机见 get_embed_db）：
+    不占用主连接，也不与向量写入交错产生活动语句。
     """
     db = await get_embed_db()
     async with _embed_lock:
@@ -2440,9 +2483,8 @@ async def load_embeddings(model: str) -> dict[str, list[float]]:
 async def upsert_embeddings(rows: list[tuple[str, str, list[float]]]) -> None:
     """批量写入向量（INSERT OR REPLACE，按 item_id 覆盖旧模型的向量）。
 
-    独立 embed 连接 + _embed_lock 串行 + 游标先 close 再 commit：
-    杜绝"活动语句未终结就 COMMIT"导致的 OperationalError
-    （cannot commit transaction - SQL statements in progress）。
+    独立 embed 连接 + _embed_lock（动机见 get_embed_db）+ 游标先 close 再
+    commit：杜绝"活动语句未终结就 COMMIT"导致的 OperationalError。
     跨连接写锁竞争（database is locked）按线性退避重试（0.1s 逐次递增，
     最多 3 次）。
     """

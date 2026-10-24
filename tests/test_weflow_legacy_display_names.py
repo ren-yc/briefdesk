@@ -352,7 +352,7 @@ class TestPollerDisplayName:
         assert "wxid_nonfriend" not in {c.sender_id for c in result.contacts}
 
     async def test_group_members_failure_isolated_to_session(self):
-        """【复核 P2-5】群成员解析失败只隔离该会话：该会话消息不入库
+        """群成员解析失败只隔离该会话：该会话消息不入库
         （防 wxid 裸名进 contacts/显示名），其余会话照常，不再整轮 raise。"""
         client = _FailingGroupMembersClient(
             contacts={},
@@ -378,7 +378,7 @@ class TestPollerDisplayName:
         result = await poll(client, enabled, no_processed)
         assert result.messages == [], "失败会话的消息不得入库"
         assert result.failed_sessions == {"g1"}
-        # session_errors 以 session_id 为键（同名群互不覆盖，核验 C2）
+        # session_errors 以 session_id 为键（同名群互不覆盖）
         assert "group members down" in result.session_errors["g1"]
 
 

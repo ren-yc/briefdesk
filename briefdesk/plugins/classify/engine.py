@@ -241,7 +241,7 @@ def _build_image_parts(groups: list[dict], excluded: set[int] | None = None) -> 
     的消息该轮只发 OCR 文本）。`excluded` 为字符预算剔除的消息 index 集合：
     这些消息不在文本数据区里，附图并标注「消息 N 附图」会邀请 AI 对一个
     不存在的输入行分类——该 index 已在调用方并入 failed 重试，图文同发会
-    产生 index 同时出现在 results 与 failed 的矛盾结果（审查回归），必须
+    产生 index 同时出现在 results 与 failed 的矛盾结果，必须
     一并跳过。全批无可用图片返回空列表，调用方据此维持纯文本 str 请求
     （字节级行为不变）。
     """
@@ -381,7 +381,7 @@ def _slice_json_root(text: str) -> str:
     return text
 
 
-# ── F2 索引漂移守卫（两道关）──
+# ── 索引漂移守卫（两道关）──
 # 第一关（字面，同步）：quote 归一化后在全批消息上做包含率相对比较——
 # 自己必须明显第一（领先 _CHAR_ALIGN_MARGIN 才确认），明显落后判漂移，
 # 接近/平票记入 ambiguous_out 交第二关。不做绝对阈值：摘录天然短于原文，
@@ -603,13 +603,13 @@ def _parse_response(
             retry_indexes.append(msg_index)
             continue
 
-        # F2 索引漂移守卫（第一关·字面）：quote 与自己内容明显不符而与
+        # 索引漂移守卫（第一关·字面）：quote 与自己内容明显不符而与
         # 其他消息更吻合 → 转重试；平票模糊条目记入 ambiguous_out，
         # 由 _classify_once 调第二关（语义裁判）复核
         if contents is not None:
             quote_raw = item.get("quote", "") or ""
             if not isinstance(quote_raw, str):
-                # 复核 P3-10：AI 脏输出可能给数字/dict 型 quote，直接传给
+                # AI 脏输出可能给数字/dict 型 quote，直接传给
                 # _norm_align_text（re.sub）会抛 TypeError → 整批本轮抛弃，
                 # 模型持续脏输出时会话陷入重试循环。收敛为 str 后走正常判定。
                 quote_raw = str(quote_raw)
@@ -648,7 +648,7 @@ def _parse_response(
         if time_flag in (True, "true", "True", 1, "1"):
             time_indexes.append(msg_index)
 
-    # F1 覆盖校验：重复 index 属结构错误（整批重试）；AI 漏回的 index
+    # 覆盖校验：重复 index 属结构错误（整批重试）；AI 漏回的 index
     # 并入 retry——否则调用方会把它当闲聊静默标 processed（永久丢失）。
     seen: list[int] = []
     for item in data:
@@ -805,8 +805,12 @@ async def summarize_results(
     logger.info("标题概括: %d/%d 条", filled, len(results))
 
 
-# ── 时间提取（sysb+sysc 两阶段：分类只标记 time，本阶段按 sysc 提取 start/end/times）──
-# 模板与 experiments/prompts/sysc.md 逐字一致（无注入防御段/OCR 规则/当前日期锚定）。
+# ── 时间提取（第二阶段：分类只标记 time 布尔，本阶段对 time=true 的消息提取
+#    start/end/times）──
+# 与分类系统 prompt 刻意不同：不含类别清单、不含 OCR 规则、不做当前日期锚定——
+# 相对时间以每条消息自带的发送时刻为基准（分类侧锚定的是「今天」）。注入防御段
+# 保留，且与分类同口径写成「唯一规则权威」：正文里任何「忽略本提示词」都只当数据。
+# 丢掉注入防御段会让时间提取成为全管道唯一可被消息正文改写输出的环节。
 
 _TIME_PROMPT_TEMPLATE = """你是一个时间信息解析器。输入为一组消息记录。
 
@@ -828,11 +832,16 @@ data 为数组，与输入记录一一对应；没有明确时间点的消息输
 
 
 def _build_time_system_prompt() -> str:
-    """时间提取 system prompt：sysc.md 原样模板，无注入项。"""
+    """时间提取 system prompt：套用 _TIME_PROMPT_TEMPLATE。
+
+    含注入防御段（**不要**为了「贴模板」删掉它），不含日期锚定与 OCR 规则。
+    """
     return _TIME_PROMPT_TEMPLATE
 
 
-_TIME_MAX_MSG_CHARS = 300  # 每条消息送入时间提取的内容截断长度
+# 时间提取的内容截断长度，与 _MAX_MSG_CHARS 对齐：真库探测显示超 300 字的
+# 消息中约 1/8 的时间线索落在 300 字之后（仅此一项成本作用于 0.23% 的消息）
+_TIME_MAX_MSG_CHARS = 800
 
 
 def _build_time_user_message(
@@ -933,7 +942,7 @@ def _apply_times_to_results(
     return filled
 
 
-# F3 韧性：时间提取独立预算（不再与标题概括共享 2048；思考模式挤压时
+# 时间提取独立预算（不再与标题概括共享 2048；思考模式挤压时
 # max_tokens 硬截断会把整批 start/end/times 丢弃）；截断时拆半重试并记录片段。
 _TIME_MAX_TOKENS = 4096
 _TIME_SPLIT_DEPTH = 2
@@ -1135,7 +1144,7 @@ async def _classify_once(
         logger.warning("AI 响应解析失败（本轮抛弃，下轮回填）: %s", e)
         return ClassifyOutcome([], [offset + i for i in range(len(messages))])
 
-    # F2 索引漂移守卫（第二关·语义）：字面模糊条目交嵌入余弦复核。
+    # 索引漂移守卫（第二关·语义）：字面模糊条目交嵌入余弦复核。
     # 置于 offset 合并前：ambiguous/contents 均为批内局部 index。
     if ambiguous:
         results, retry_indexes, time_indexes = await _semantic_refine(
@@ -1150,7 +1159,7 @@ async def _classify_once(
         retry_indexes = [i + offset for i in retry_indexes]
         time_indexes = [i + offset for i in time_indexes]
     if budget_dropped:
-        # S2 防静默丢失：被预算剔除的消息未送分类，必须并入 failed 由
+        # 防静默丢失：被预算剔除的消息未送分类，必须并入 failed 由
         # 回填重试——否则会被 _mark_skipped 当闲聊标记 processed
         logger.warning(
             "分类输入超出单批字符预算（%d），%d 条消息整条剔除待回填"

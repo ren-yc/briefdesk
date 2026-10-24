@@ -5,7 +5,7 @@
 编排，不 import 任何具体 AI/OCR 实现：
 
   盖章 → 过滤（自消息/纯占位符图片（OCR 未启用）/启用会话/已处理）→ raw 落库 → 切批
-  → 并行：enrich + classify（锁外）
+  → 批间并行：每批内先 enrich 再 classify（锁外，批与批之间并发）
   → 串行（_storage_lock 内）：dedup（判重/入库/缓存）→ 跳过标记 → post_insert（合并）
   → 批尾：dedup/post_insert 的 after_run（收尾；dedup 向量落库内部自持
     storage_lock，见 engine.flush_pending_embeddings）→ 计数 → 状态 → 实时通知
@@ -49,20 +49,21 @@ _processing_paused = False
 # 暂停门闸的首次 INFO 已落日志标志：暂停期间后续批次降级 DEBUG，防刷屏；
 # 恢复时复位，保证下一轮暂停仍有一条 INFO。
 _paused_logged_once = False
-# 活动批次计数（复核 P1-5）：process_all_batches 执行期间 +1、退出 -1。
-# benchmark 排空门闸以「pendingCount==0 且 active_batches==0」为排空信号——
-# 否则暂停置位后「已过暂停检查、尚未 note_sync_batch_start 计数」的批次
-# 不反映在 pendingCount 里，被误判排空（存储相写进临时库、去重缓存留幽灵）。
+# 活动批次计数：进入 process_all_batches 即 +1、退出 -1（装饰器包裹整个函数，
+# 含暂停门闸早退路径——计数口径是「已调用、尚未返回」，不代表已过暂停检查）。
+# **当前只有测试读它**（tests/test_pipeline.py 用它验证装饰器在早退路径上也归零）；
+# 生产代码没有消费者（曾服务于 benchmark 的排空门闸，该门闸已移除）。保留是因为
+# 它是「装饰器覆盖整个函数体」这一口径的可观测证据，不要顺手删掉测试里的断言。
 _active_batches = 0
 
 
 def get_active_batches() -> int:
-    """返回当前活动批次计数（benchmark 排空门闸只读诊断口径）。"""
+    """返回当前活动批次计数（只读诊断口径：暂停/排空排查时看这段在途批次）。"""
     return _active_batches
 
 
 def _track_active_batches(fn):
-    """process_all_batches 装饰器：执行期间维护活动批次计数（复核 P1-5）。"""
+    """process_all_batches 装饰器：执行期间维护活动批次计数。"""
 
     @functools.wraps(fn)
     async def wrapper(*args, **kwargs):
@@ -94,8 +95,8 @@ def _split_batches(
 async def _mark_skipped(bctx: BatchContext, failed_set: set[int]) -> None:
     """未选中且非失败的消息批量标记 processed（闲聊跳过）。
 
-    被滤自消息不标记 processed（与纯占位符图片同语义，见下方入口过滤注释
-    ——可恢复需重新停用/启用会话清水位或调大回填窗口，而非"自动重拉"）。
+    被滤自消息不标记 processed（与纯占位符图片同语义；可恢复路径与「为何
+    不是自动重拉」见下方入口过滤处的说明）。
     outcome is None（classify 阶段运行了但未写 outcomes，属契约违约）不与
     「模型明确全排除」同语义：未知结果整批不标记，本批零产出使 process_all_
     batches 返回 False、poll_cycle 跳过水位推进，由钉窗机制找回——防不合规
@@ -166,7 +167,7 @@ async def process_all_batches(
     返回 bool：True = 消息已处理或无需处理（调用方可推进会话水位）；
     False = 调用方必须跳过本轮水位推进——包括存在未落 raw 的保留消息
     （无启用类别/阶段插件缺失早退），以及零产出（全部消息分类失败，
-    审计 #1：失败消息由"最早未处理消息钉窗"在后续轮次找回）。
+    失败消息由"最早未处理消息钉窗"在后续轮次找回）。
 
         Args:
             messages: 待处理消息
@@ -204,10 +205,11 @@ async def process_all_batches(
     for m in messages:
         m.source = source
 
-    # ── 入口统一过滤 + raw 落库（替代源内实现；源不触碰 DB）──
+    # ── 入口统一过滤 + raw 落库（源不触碰 DB）──
     # 单遍过滤：自己发送（IGNORE_SELF）→ 纯占位符图片（OCR 未启用）→ 启用会话
-    # → 已处理 → raw 批量落库，均无锁。空启用集 → 全滤（保持原监听器语义）；
-    # INSERT OR IGNORE 幂等。
+    # → 已处理；本篇的读查询（启用会话 / 已处理，以及过滤后才查的启用类别）与
+    # 过滤本身都在锁外，raw 批量落库在 storage_lock 内（原因见下方落库处注释）。
+    # 空启用集 → 全滤（保持原监听器语义）；INSERT OR IGNORE 幂等。
 
     # OCR 配置检查（在遍历前执行）：置位/撤销公告 + 条件性 WARNING
     enrich_stages = get_stages("enrich")
@@ -270,9 +272,9 @@ async def process_all_batches(
             filter_stats['images']
         )
 
-    # 计数日志：仅自消息/纯占位符图片过滤后的数量——启用会话与已处理过滤
-    # 随后执行（过滤量在末尾 summary 单独汇总），故「处理 N 条」是进入
-    # 分类的上界而非精确值（非最终进入 classify 的条数）
+    # 计数日志：四道过滤在同一遍循环内完成，但此处只扣除自消息与纯占位符
+    # 图片两项——「处理 N 条」因此是进入分类的上界（未扣启用会话与已处理
+    # 过滤量）；这两项仅在整批滤空的 DEBUG 汇总里单独给出。
     logger.info(
         "%s 处理: %d 条 (源 %s)",
         origin,
@@ -295,11 +297,11 @@ async def process_all_batches(
         return False
     # raw 落库（过滤后的消息）
     if to_store:
-        # 纳入 storage_lock：bulk_insert_raw_messages 内部 atomic_transaction
-        # 会 commit，锁外 commit 会把锁内其它多步写（如 delete_items 级联、
-        # update_item_merged 的 UPDATE→DELETE）提前提交，击穿「单连接 + 隐式
-        # 事务 + 存储锁」不变量（复核 P1-2）。读路径（get_enabled_sessions /
-        # are_messages_processed）保持锁外，不扩大锁范围。
+        # 必须持锁：bulk_insert_raw_messages 内部 atomic_transaction 会 commit，
+        # 这次 commit 会顺带提交其它协程进行中的多步写（如 delete_items 级联、
+        # update_item_merged 的 UPDATE→DELETE）——不变量论证见 db.storage_lock。
+        # 读路径（get_enabled_sessions / are_messages_processed）保持锁外，
+        # 不扩大锁范围。
         async with _storage_lock:
             await bulk_insert_raw_messages(
                 [
@@ -460,9 +462,11 @@ async def process_all_batches(
         for t in classify_tasks:
             if not t.done():
                 t.cancel()
-        # 异常/取消路径兜底：清掉尚未完成批次的 pending，避免进度指示器卡死
-        # （正常完成时 completed_in_batch == len(messages），此分支不触发）
-        remaining = len(messages) - completed_in_batch
+        # 异常/取消路径兜底：清掉尚未完成批次的 pending，避免进度指示器卡死。
+        # 以 to_store（入口实际计入 note_sync_batch_start 的集合）为准：正常完成时
+        # completed_in_batch == len(to_store)，此分支不触发；用 messages（过滤前）
+        # 会把入口过滤掉的条数也扣一遍，正常完成路径也提前把 pending 减到 0。
+        remaining = len(to_store) - completed_in_batch
         if remaining > 0:
             note_sync_batch_done(remaining)
             await publish_sync_progress(get_sync_progress())
@@ -490,8 +494,8 @@ async def process_all_batches(
         )
     else:
         logger.warning("本轮零产出：%d 条失败待回填，不刷新 lastSync", total_failed)
-    # 返回值语义（审计 #1）：零产出（全部消息分类失败）返回 False——
-    # poll_cycle 据此跳过本轮水位推进，失败待回填的消息由
-    # "最早未处理消息钉窗"机制在后续轮次找回；实时路径忽略返回值。
+    # True/False 的返回契约见本函数 docstring；此处 False 的成因是「本轮零产出
+    # （全部消息分类失败）」——poll_cycle 据此跳过水位推进，失败消息由"最早未处理
+    # 消息钉窗"在后续轮次找回；实时路径忽略返回值。
     processed_any = total_inserted + total_dupes + total_skipped > 0
     return processed_any

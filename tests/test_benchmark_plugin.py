@@ -1,7 +1,7 @@
 """benchmark 插件测试：装配、用例文件导出/列举/清空、四类用例推导、处理记录、运行编排（不调用 AI）。
 
-用例存储为插件包内 cases/*.fromweb.json（文件态，不触碰数据库）；文件测试经
-patch store.CASES_DIR 指向临时目录，导出读取 items 表经 patch("briefdesk.db.get_db")
+用例存储为**用户用例目录**下的 *.fromweb.json（文件态，不触碰数据库）；文件测试经
+patch paths.benchmark_cases_dir 指向临时目录，导出读取 items 表经 patch("briefdesk.db.get_db")
 指向内存连接（与基准环境补丁同机制）；运行测试用"零用例"路径（不触发任何 AI 调用）。
 """
 
@@ -17,6 +17,7 @@ import aiosqlite
 import pytest
 
 import briefdesk.db as briefdesk_db
+from briefdesk import paths
 from briefdesk.config import Settings, config
 from briefdesk.db import init_schema, insert_item
 from briefdesk.plugin.base import PluginContext
@@ -165,7 +166,7 @@ class TestStore:
     async def _autouse_setup(self):
         self._tmp = tempfile.TemporaryDirectory()
         self.cases_dir = Path(self._tmp.name)
-        patcher = patch.object(bench_store, "CASES_DIR", self.cases_dir)
+        patcher = patch.object(paths, "benchmark_cases_dir", return_value=self.cases_dir)
         patcher.start()
         yield
         patcher.stop()
@@ -276,7 +277,7 @@ class TestRecorder:
     async def _autouse_setup(self):
         bench_recorder.reset()
         self._tmp = tempfile.TemporaryDirectory()
-        store_patcher = patch.object(bench_store, "CASES_DIR", Path(self._tmp.name))
+        store_patcher = patch.object(paths, "benchmark_cases_dir", return_value=Path(self._tmp.name))
         store_patcher.start()
         yield
         bench_recorder.reset()
@@ -412,7 +413,7 @@ class TestRecordEndpoints:
     async def _autouse_setup(self):
         bench_recorder.reset()
         self._tmp = tempfile.TemporaryDirectory()
-        store_patcher = patch.object(bench_store, "CASES_DIR", Path(self._tmp.name))
+        store_patcher = patch.object(paths, "benchmark_cases_dir", return_value=Path(self._tmp.name))
         store_patcher.start()
         yield
         bench_recorder.reset()
@@ -702,7 +703,7 @@ class TestImportCurrent:
     async def _autouse_setup(self):
         self._tmp = tempfile.TemporaryDirectory()
         self.cases_dir = Path(self._tmp.name)
-        store_patcher = patch.object(bench_store, "CASES_DIR", self.cases_dir)
+        store_patcher = patch.object(paths, "benchmark_cases_dir", return_value=self.cases_dir)
         store_patcher.start()
         self.conn = await aiosqlite.connect(":memory:")
         self.conn.row_factory = aiosqlite.Row
@@ -795,52 +796,77 @@ class TestRunFlow:
 
     @pytest.fixture(autouse=True)
     async def _autouse_setup(self):
-        self._tmp = tempfile.TemporaryDirectory()
-        store_patcher = patch.object(
-            bench_store, "CASES_DIR", Path(self._tmp.name)
-        )
+        from types import SimpleNamespace
+
+        from briefdesk.plugins.benchmark import supervisor
+
+        self._tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        cases_dir = Path(self._tmp.name) / "cases"
+        cases_dir.mkdir()
+        run_root = Path(self._tmp.name) / "runs"
+        run_root.mkdir()
+        store_patcher = patch.object(paths, "benchmark_cases_dir", return_value=cases_dir)
         store_patcher.start()
+        # 快照源与运行根都必须钉住：默认值分别指向用户用例目录与用户缓存目录，
+        # 前者会快照用户导出的真实用例（真发 AI 请求），后者会把产物写进真实用户目录
+        cases_patcher = patch.object(supervisor, "_cases_sources", return_value=(cases_dir,))
+        run_root_patcher = patch.object(supervisor, "_runs_root", return_value=run_root)
+        cases_patcher.start()
+        run_root_patcher.start()
+        settings_patcher = patch.object(
+            supervisor,
+            "_settings",
+            lambda: SimpleNamespace(
+                pause_pipeline=False,
+                keep_runs=5,
+                run_timeout_seconds=0,
+                run_stall_seconds=600,
+            ),
+        )
+        settings_patcher.start()
+        self.supervisor = supervisor
+        supervisor._current = None
+        supervisor._last = None
         self.conn = await aiosqlite.connect(":memory:")
         self.conn.row_factory = aiosqlite.Row
         await init_schema(self.conn)
         self.patcher = patch.object(briefdesk_db, "get_db", new=AsyncMock(return_value=self.conn))
         self.patcher.start()
-        bench_router._running_task = None
-        bench_router._last_result = None
         yield
-        import contextlib
-
-        if bench_router._running_task is not None and not bench_router._running_task.done():
-            bench_router._running_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await bench_router._running_task
-        bench_router._running_task = None
-        bench_router._last_result = None
+        await supervisor.stop_all()
+        supervisor._current = None
+        supervisor._last = None
         self.patcher.stop()
         await self.conn.close()
+        settings_patcher.stop()
+        run_root_patcher.stop()
+        cases_patcher.stop()
         store_patcher.stop()
         self._tmp.cleanup()
     async def test_start_run_with_no_cases_completes(self):
+        from fastapi import HTTPException
+
         resp = await bench_router.start_run(None)
         assert resp["started"]
-        # 等待后台任务完成（零用例 → 无 AI 调用，立即完成）
-        for _ in range(50):
+        assert resp["run_id"]
+        # 等待子进程跑完（零用例 → 无 AI 调用，只剩启动开销）
+        for _ in range(400):
             state = await bench_router.run_status()
             if not state["running"]:
                 break
-            await asyncio.sleep(0.02)
+            await asyncio.sleep(0.05)
         assert not state["running"]
         assert "run_id" in state
-        assert state["summary"] == {}
         assert isinstance(state["elapsed_sec"], float)
+        # 子进程运行天然落盘：零用例也产出报告（features 为空），/report 可读
         report = await bench_router.latest_json_report()
-        payload = json.loads(report.body)
-        assert payload["features"] == {}
-        assert "run_id" in payload
-        assert isinstance(payload["elapsed_sec"], float)
+        assert json.loads(report.body)["features"] == {}
+        # 取消是幂等的：没在跑就如实说没在跑
+        assert await bench_router.cancel_run() == {
+            "cancelled": False,
+            "reason": "not_running",
+        }
         # 未知功能拒绝
-        from fastapi import HTTPException
-
         with pytest.raises(HTTPException):
             await bench_router.start_run(RunBody(features=["nope"]))
 
@@ -855,6 +881,70 @@ class TestCasesEndpoint:
             await bench_router.list_cases(feature="nope")
         with pytest.raises(HTTPException):
             await bench_router.remove_all_cases(feature="nope")
+
+
+class _FakeProc:
+    """假子进程句柄：只提供监控与取消会用到的成员（terminate 后立刻置退出码）。"""
+
+    def __init__(self) -> None:
+        self.returncode: int | None = None
+
+    def terminate(self) -> None:
+        self.returncode = 1
+
+    def kill(self) -> None:
+        self.terminate()
+
+    async def wait(self) -> int | None:
+        return self.returncode
+
+
+class TestTeardownStopsRun:
+    """关闭期收口：插件 teardown 必须把运行先停下来（两种模式都要管）。
+
+    Web benchmark 由 supervisor 管理独立 runner 子进程；CLI benchmark 则在自身进程
+    内使用临时库。两条路径共享 benchmark engine，但隔离机制不同。
+    """
+
+    async def test_teardown_stops_running_benchmark(self):
+        """teardown → stop_all → cancel → 等收尾。
+
+        运行用假句柄钉在「已起、未退出」上：空用例的真子进程不到一秒就跑完，
+        等不到 teardown 就已经不在跑了，断言会退化成恒真。
+        """
+        from types import SimpleNamespace
+
+        from briefdesk.plugins.benchmark import supervisor
+
+        plugin = BenchmarkPlugin()
+
+        async def _spawn(run) -> None:
+            run.proc = _FakeProc()
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            settings = patch.object(
+                supervisor,
+                "_settings",
+                lambda: SimpleNamespace(
+                    pause_pipeline=False,
+                    keep_runs=5,
+                    run_timeout_seconds=0,
+                    run_stall_seconds=600,
+                ),
+            )
+            root = patch.object(supervisor, "_runs_root", return_value=Path(tmp))
+            spawn = patch.object(supervisor, "_spawn", new=_spawn)
+            with settings, root, spawn:
+                supervisor._current = None
+                await supervisor.start(["dedup"])
+                assert supervisor.is_running()
+                await plugin.teardown()
+                assert not supervisor.is_running(), "teardown 必须取消并等待运行终结"
+    async def test_teardown_is_noop_without_running_benchmark(self):
+        from briefdesk.plugins.benchmark import supervisor
+
+        supervisor._current = None
+        await BenchmarkPlugin().teardown()  # 不得抛错
 
 
 if __name__ == "__main__":

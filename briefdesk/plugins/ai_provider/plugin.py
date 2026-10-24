@@ -44,6 +44,11 @@ class AiProviderPlugin(Plugin, AIProvider):
         from briefdesk import ai_ports
 
         ai_ports.set_ai(None)
+        # 关闭惰性缓存的 OpenAI 客户端（含备用通道），释放 http 连接池；
+        # 幂等：close_clients 内部清空全部缓存并复位信号量
+        from briefdesk.plugins.ai_provider import engine as ai_engine
+
+        await ai_engine.close_clients()
         if self._ctx is not None:
             # 清掉自己注册的端口（teardown 幂等回收义务）
             self._ctx.ai = None
@@ -58,10 +63,16 @@ class AiProviderPlugin(Plugin, AIProvider):
             raise RuntimeError("ai_provider 未完成 setup")
         return self._provider
 
-    async def chat(self, messages, *, temperature, max_tokens, timeout=None):
+    async def chat(
+        self, messages, *, temperature, max_tokens, timeout=None, max_retries=None
+    ):
         provider = self._require_provider()
         return await provider.chat(
-            messages, temperature=temperature, max_tokens=max_tokens, timeout=timeout
+            messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            timeout=timeout,
+            max_retries=max_retries,
         )
 
     async def rag_chat(

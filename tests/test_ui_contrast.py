@@ -1,6 +1,6 @@
 """前端配色对比度守卫测试（WCAG AA）。
 
-背景：本项目的深浅两套配色都写在 ``ui/style.css`` 的 ``:root`` 与
+背景：本项目的深浅两套配色都写在 ``briefdesk/ui/style.css`` 的 ``:root`` 与
 ``[data-theme="dark"]`` 两个令牌块里。历史上出现过两类回归：
 
 1. 文本令牌（``--text-2`` / ``--text-3``）为了"更淡一点"被逐步调浅，
@@ -18,7 +18,7 @@ import re
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
-STYLE = REPO / "ui" / "style.css"
+STYLE = REPO / "briefdesk" / "ui" / "style.css"
 
 AA_TEXT = 4.5
 AA_UI = 3.0
@@ -280,7 +280,7 @@ def test_category_foreground_chain_meets_aa() -> None:
     （.cat-link.active .cat-count）上的对比度。改派生比例或色板时必须保持
     ≥ 4.5:1。
     """
-    app = REPO / "ui" / "app.js"
+    app = REPO / "briefdesk" / "ui" / "app.js"
     palette = re.findall(r'color:\s*"(#[0-9A-Fa-f]{6})"',
                          app.read_text(encoding="utf-8"))
     assert palette, "未能从 app.js 解析到类别色板（--cat-fg 链路失去数据源）"

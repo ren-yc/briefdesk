@@ -82,7 +82,7 @@
     try {
       // 首次设提醒前同步申请桌面通知权限（页面后台时的到期提醒依赖它）：
       // Firefox 要求权限弹窗绑定 user activation，放到 await fetch 之后
-      // 激活态可能已被消费而静默不弹（审查 A4）。仅 default 态请求；点击
+      // 激活态可能已被消费而静默不弹。仅 default 态请求；点击
       // 菜单已是强意图信号，设置失败多弹一次可接受。拒绝/失败静默降级——
       // 前台 toast 提醒始终可用。
       if ("Notification" in window && Notification.permission === "default") {
@@ -93,8 +93,13 @@
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ at: atOrNull }),
       });
-      if (!res.ok) throw new Error("HTTP " + res.status);
+      if (!res.ok) {
+        throw new Error("HTTP " + res.status);
+      }
       const data = await res.json();
+      // 重设 = 新一次提醒：清掉本地「已通知」标记，否则同卡在本页会话内
+      // 永不再触发（此前只增不删）
+      if (atOrNull) notifiedReminders.delete(String(id));
       const it = currentItems.find(x => String(x.id) === id);
       if (it) it.remind_at = data.remind_at || null;
       document.querySelectorAll(".card-remind-menu").forEach(m => m.classList.add("hidden"));
@@ -109,7 +114,8 @@
       return true;
     } catch (err) {
       console.error("Reminder error:", err);
-      if (!silent) showToast("提醒设置失败，请重试", { type: "error", duration: 4000 });
+      // showWriteError 是核心 app.js 的全局助手（同源 classic script 共享作用域）
+      if (!silent) showWriteError(err, "提醒设置失败，请重试");
       return false;
     }
   }
@@ -239,6 +245,11 @@
       if (notifiedReminders.has(String(it.id))) continue;
       const at = parseLocalTime(it.remind_at);
       if (!at || at.getTime() > now.getTime()) continue;
+      // 无法投递就不消费：页面隐藏且没有桌面通知权限时，清除会把提醒静默吞掉；
+      // 留到页面可见（visibilitychange 立即补查）再清除并展示
+      const canDeliver = !document.hidden
+        || ("Notification" in window && Notification.permission === "granted");
+      if (!canDeliver) continue;
       // 先清后通知：多标签页同时到点时，只有抢到清除权的那个负责通知
       try {
         const res = await fetch("/api/items/" + encodeURIComponent(it.id) + "/reminder", {
@@ -246,7 +257,7 @@
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ at: null }),
         });
-        // 复核 P2-4：互斥判据改为响应体 cleared 字段——后端清除已无提醒的卡
+        // 互斥判据改为响应体 cleared 字段——后端清除已无提醒的卡
         // 返回 200 {"cleared": false}（而非 404），只有真正抢到清除权的标签页
         // 才通知，避免多标签页重复通知。
         if (!res.ok) continue;
@@ -294,6 +305,10 @@
       },
     });
     document.addEventListener("keydown", onEscCapture, true);
+    // 回到前台立即补查：隐藏期间不可投递的到期提醒在此清除并展示
+    document.addEventListener("visibilitychange", () => {
+      if (!document.hidden) checkDueReminders();
+    });
     startReminderTimer();
   }
 

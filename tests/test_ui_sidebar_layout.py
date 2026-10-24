@@ -8,15 +8,15 @@
 不与相邻元素撞车（日历/活动通知、问一问/搜索框两次历史撞车）。
 
 插件前端随插件包分发（核心 ``ui/`` 不写死插件入口，见
-``tests/test_web_plugins.py`` 的 ``CoreFrontendBoundaryTest``），故对插件
+``tests/test_web_plugins.py`` 的 ``TestCoreFrontendBoundary``），故对插件
 文件只做「锚点指向 #nav-top」与图标引用的文本断言，不解析其行为。
 """
 
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
-INDEX = REPO / "ui" / "index.html"
-STYLE = REPO / "ui" / "style.css"
+INDEX = REPO / "briefdesk" / "ui" / "index.html"
+STYLE = REPO / "briefdesk" / "ui" / "style.css"
 CALENDAR_UI = REPO / "briefdesk" / "plugins" / "calendar" / "ui" / "ui.js"
 RAG_UI = REPO / "briefdesk" / "plugins" / "rag" / "ui" / "ui.js"
 

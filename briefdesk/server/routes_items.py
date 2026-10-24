@@ -1,5 +1,5 @@
 """核心数据路由（server 子包）：items / verify / sessions / sync / context /
-status / stream 等。从原 server.py 拆出（P5 子包化），导入即注册路由。
+status / stream 等。导入即注册路由。
 """
 
 import asyncio
@@ -29,6 +29,7 @@ from briefdesk.db import (
     backup_db_to,
     category_exists,
     delete_items,
+    ensure_database_parent_dir,
     get_all_category_count,
     get_all_sessions,
     get_category_counts,
@@ -147,6 +148,11 @@ _ITEM_EXPORT_COLS = [
 ]
 
 def _export_attachment(content: str, media_type: str, filename: str) -> Response:
+    """导出产出的唯一出口：统一挂 Content-Disposition 供浏览器另存。
+
+    单点收口，便于审计「会把内容落成用户可保存文件」的响应：新增导出路由
+    一律经它返回。
+    """
     return Response(
         content=content,
         media_type=media_type,
@@ -155,7 +161,7 @@ def _export_attachment(content: str, media_type: str, filename: str) -> Response
 
 
 # 公式注入前缀：Excel/LibreOffice 会把以此开头的单元格当公式执行（CSV injection；
-# 审计 #9 补充：\r 开头同样可能被表格应用解释，一并纳入）
+# \r 开头同样可能被表格应用解释，一并纳入）
 _CSV_FORMULA_PREFIXES = ("=", "+", "-", "@", "\t", "\r", "\n")
 
 
@@ -277,6 +283,18 @@ def _backup_tmp_dir() -> str:
     return os.path.dirname(os.path.abspath(str(config.db_path)))
 
 
+def _ensure_db_dir_or_500() -> None:
+    """备份/恢复前确保库目录存在；失败以 500 携带修复指引。
+
+    两条路由都要在 mkstemp(dir=库目录) 之前调用：目标目录不存在时 mkstemp 抛
+    FileNotFoundError，响应只剩通用 500，用户看不到「该建哪个目录」。
+    """
+    try:
+        ensure_database_parent_dir(str(config.db_path))
+    except RuntimeError as e:
+        raise HTTPException(500, str(e)) from e
+
+
 def _remove_backup_tmp(path: str) -> None:
     """删除备份临时文件并解除登记（后台任务/异常路径共用；OSError 静默）。"""
     try:
@@ -327,6 +345,7 @@ def cleanup_stale_backup_temps() -> int:
 @app.get("/api/backup")
 async def api_backup():
     """下载数据库在线备份（SQLite backup API，WAL 安全，可运行中执行）。"""
+    _ensure_db_dir_or_500()
     fd, tmp = tempfile.mkstemp(
         prefix=_BACKUP_TMP_PREFIX,
         suffix=_BACKUP_TMP_SUFFIX,
@@ -343,7 +362,7 @@ async def api_backup():
         _remove_backup_tmp(tmp)
         raise
     filename = f"briefdesk-backup-{time.strftime('%Y%m%d-%H%M%S')}.sqlite"
-    # 流式下发（复核 P2-10）：整库读入内存改为 FileResponse，响应完成后
+    # 流式下发：整库读入内存改为 FileResponse，响应完成后
     # 由后台任务删除临时文件并解除登记
     return FileResponse(
         tmp,
@@ -363,13 +382,14 @@ async def api_restore(file: Annotated[UploadFile, File()]):
     """
     # 临时文件必须落在库文件同目录：os.replace 不允许跨文件系统，系统临时目录
     # 与 DB_PATH 跨盘（Windows 上典型）时必然 WinError 17，恢复功能整体不可用
+    _ensure_db_dir_or_500()
     fd, tmp = tempfile.mkstemp(
         suffix=".sqlite", dir=os.path.dirname(os.path.abspath(str(config.db_path)))
     )
     os.close(fd)
     total = 0
     try:
-        # 逐块落盘（复核 P2-10）：不再整体攒 chunks 列表，内存占用恒定 chunk 级；
+        # 逐块落盘：不再整体攒 chunks 列表，内存占用恒定 chunk 级；
         # open/close/write 均走 to_thread，避免事件循环线程做阻塞文件操作
         f = await asyncio.to_thread(open, tmp, "wb")
         try:
@@ -397,26 +417,56 @@ async def api_restore(file: Annotated[UploadFile, File()]):
     }
 
 
+async def _resync_dedup_cache(ids: list[str], verified: int) -> None:
+    """卡片审核态变更后同步去重内存缓存；调用方须持 storage_lock。
+
+    忽略（-1）→ 发布 items_deleted 让 dedup 插件清缓存（预热口径 is_verified >= 0）；
+    未处理/备忘（0/1）→ 幂等回加（add_to_cache 同 id 更新不叠加；不带向量，与
+    merge 登记口径一致，重启由预热补齐）。dedup 未装配时静默跳过。
+
+    此前只有单卡 verified == -1 与批量 ignore/unverify 三条路径各自处理，单卡
+    恢复与批量转备忘漏回加——退出忽略态的卡不在缓存里，相似新消息会再建一张卡
+    直到重启。
+    """
+    if verified == -1:
+        await event_bus.publish(EVENT_ITEMS_DELETED, ids)
+        return
+    svc_ctx = _stage_context()
+    if svc_ctx is None or svc_ctx.dedup is None:
+        return
+    for row in await get_item_texts_by_ids(ids):
+        try:
+            imgs = json.loads(row["image_urls"]) if row["image_urls"] else None
+        except json.JSONDecodeError:
+            imgs = None
+        svc_ctx.dedup.add_to_cache(
+            row["id"],
+            row["title"],
+            image_urls=imgs,
+            source=row["source"] or "",
+            source_quote=row["source_quote"] or "",
+        )
+
+
 @app.post("/api/items/{item_id}/verify")
 async def api_verify(item_id: str, body: dict):
     verified = body.get("verified")
-    # 严格类型判定（对齐 routes_categories._parse_flag）：JSON 布尔 true 在
-    # Python 里 == 1，宽松的 in 判定会把 true 按 1 吸收落库
+    # 严格类型判定（与 routes_categories._parse_flag 同一精神：拒绝宽松 in 判定）：
+    # JSON 布尔 true 在 Python 里 == 1，`in (0,1,-1)` 会把 true 按 1 吸收落库。
+    # 与 _parse_flag 的差异是刻意的：那边是二态开关、bool 合法被归一为 0/1；这里
+    # verified 是 0/1/-1 三态，bool 表达不了 -1（撤销核实），必须拒绝而不是映射。
     if (
         not isinstance(verified, int)
         or isinstance(verified, bool)
         or verified not in (0, 1, -1)
     ):
         raise HTTPException(400, "verified must be 0, 1, or -1")
-    # 与 pipeline 共用存储锁：单连接隐式事务下，锁外 commit 会把管道
-    # 未完成的多步写一并提交（部分写入提前可见）
+    # 与 pipeline 共用存储锁（不变量见 db.storage_lock 的权威论证）
     async with storage_lock:
         if not await update_item_verify(item_id, verified):
             raise HTTPException(404, "Item not found")
-        if verified == -1:
-            # 忽略后卡片退出去重缓存的预热口径（is_verified >= 0）：
-            # 同步清缓存，否则被忽略卡仍参与判重，相似新消息被永久跳过
-            await event_bus.publish(EVENT_ITEMS_DELETED, [item_id])
+        # 忽略（-1）清缓存；恢复/备忘（0/1）回加缓存，见 _resync_dedup_cache
+        await _resync_dedup_cache([item_id], verified)
     cat_counts = await get_category_counts()
     all_count = await get_all_category_count()
     ignored_count = await get_ignored_count()
@@ -443,8 +493,7 @@ async def api_recategorize(item_id: str, body: dict):
     if not await category_exists(category):
         raise HTTPException(400, f"未知或未启用的类别: {category}")
     # 与 pipeline 共用存储锁：update_item_category 是读-改-写多步事务
-    # （UPDATE items + INSERT recat_log），锁外 commit 会把管道未完成的
-    # 多步写一并提交（部分写入提前可见）——与 api_verify 同理由
+    # （UPDATE items + INSERT recat_log），不变量见 db.storage_lock 的权威论证
     async with storage_lock:
         row = await update_item_category(item_id, category)
     if row is None:
@@ -473,41 +522,23 @@ async def api_items_batch(body: dict):
         async with storage_lock:
             affected = await delete_items(ids)
             # 发布 items_deleted：去重插件订阅后同步清理内存缓存
-            # （同步处理器，发布期间仍持有存储锁，保持原子）
-            await event_bus.publish(EVENT_ITEMS_DELETED, ids)
+            # （同步处理器，发布期间仍持有存储锁，保持原子）。
+            # 仅在确有删除时发布：affected == 0 表示没有任何行被删，
+            # 无条件发布会把卡片从生产去重缓存里清掉——此后相似新消息
+            # 重复建卡直到重启。
+            if affected:
+                await event_bus.publish(EVENT_ITEMS_DELETED, ids)
     else:
         verified = {"memo": 1, "ignore": -1, "unverify": 0}[action]
         # 非 delete 分支同样持存储锁：写库与 pipeline 串行化，
         # 防止单连接隐式事务被并发 commit 交叉提交
         async with storage_lock:
             affected = await update_items_verify(ids, verified)
-            if action == "ignore":
-                # 忽略后卡片退出 is_verified >= 0 口径：同步清去重内存
-                # 缓存，否则被忽略卡继续参与判重、相似新消息不再显示
-                # （直到重启重预热），与 delete 的清缓存语义对齐
-                await event_bus.publish(EVENT_ITEMS_DELETED, ids)
-            elif action == "unverify":
-                # 恢复的卡片回归 is_verified >= 0 判重口径：回加去重内存
-                # 缓存，否则相似新消息不再与它判重、重复卡片持续到重启
-                # （复核 P2-18；不带向量，与 merge 登记口径一致，重启补齐）
-                svc_ctx = _stage_context()
-                if svc_ctx is not None and svc_ctx.dedup is not None:
-                    for row in await get_item_texts_by_ids(ids):
-                        try:
-                            imgs = (
-                                json.loads(row["image_urls"])
-                                if row["image_urls"]
-                                else None
-                            )
-                        except json.JSONDecodeError:
-                            imgs = None
-                        svc_ctx.dedup.add_to_cache(
-                            row["id"],
-                            row["title"],
-                            image_urls=imgs,
-                            source=row["source"] or "",
-                            source_quote=row["source_quote"] or "",
-                        )
+            # 忽略（-1）清缓存；恢复/备忘（0/1）回加缓存，见 _resync_dedup_cache。
+            # 仅在确有变更时同步：affected == 0 表示这些 id 不在库里，
+            # 此时 resync 会拿并不存在的文本去改缓存，制造幽灵条目。
+            if affected:
+                await _resync_dedup_cache(ids, verified)
     return {"success": True, "affected": affected}
 
 
@@ -523,8 +554,8 @@ async def api_sessions():
 
 @app.post("/api/sessions/{source}/{session_id}/toggle")
 async def api_toggle_session(source: str, session_id: str):
-    # 与 pipeline 共用存储锁：toggle 是「翻转 enabled → 清水位」两步写，
-    # 单连接隐式事务下锁外 commit 可能被并发写交叉提交
+    # 与 pipeline 共用存储锁：toggle 是「翻转 enabled → 清水位」两步写
+    # （不变量见 db.storage_lock 的权威论证）
     async with storage_lock:
         updated = await toggle_session(source, session_id)
     if updated is None:
@@ -553,9 +584,11 @@ async def api_refresh_sessions():
     }
 
 
-# API 触发的同步任务句柄（覆盖写即可：trigger_sync 内部已防并发重复）。
-# 官方文档要求对 create_task 结果保存引用，否则任务执行中可能被 GC；
-# 同时为关闭路径保留显式句柄（_cancel_pending_tasks 兜底之外的正通道）。
+# API 触发的同步任务句柄。**唯一用途是保引用防 GC**：asyncio 事件循环只持有
+# task 的弱引用，fire-and-forget 的任务若不在这里留一个强引用，可能在执行中被
+# 回收（官方 create_task 文档明示）。关闭路径不读它——进程关停由
+# main 的 _cancel_pending_tasks 统一兜底，本句柄不是取消通道（覆盖写即可，
+# trigger_sync 内部已防并发重复）。
 _last_sync_task: asyncio.Task[None] | None = None
 
 

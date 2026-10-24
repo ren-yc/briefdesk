@@ -1,8 +1,9 @@
 """AI 客户端统一调用的思考模式开关测试（不触发真实网络请求）。"""
 
+import asyncio
 import unittest
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 from pydantic import SecretStr
@@ -35,7 +36,7 @@ class TestChatThinkingSwitch:
     async def test_default_does_not_pass_reasoning_effort(self):
         client, create = _fake_client()
         with patch("briefdesk.plugins.ai_provider.engine.get_ai_client", return_value=client), patch.object(
-            config, "ai_disable_thinking", False
+            config, "ai_reasoning_effort", "auto"
         ), patch.object(config, "ai_api_key", SecretStr("deepseek")), patch.object(
             config, "ai_model", "qwen3.5"
         ):
@@ -47,10 +48,10 @@ class TestChatThinkingSwitch:
         assert kwargs["temperature"] == 0.1
         assert kwargs["max_tokens"] == 64
 
-    async def test_disabled_passes_reasoning_effort_none(self):
+    async def test_off_passes_reasoning_effort_none(self):
         client, create = _fake_client()
         with patch("briefdesk.plugins.ai_provider.engine.get_ai_client", return_value=client), patch.object(
-            config, "ai_disable_thinking", True
+            config, "ai_reasoning_effort", "off"
         ), patch.object(config, "ai_api_key", SecretStr("deepseek")), patch.object(
             config, "ai_model", "qwen3.5"
         ):
@@ -58,6 +59,32 @@ class TestChatThinkingSwitch:
 
         _, kwargs = create.call_args
         assert kwargs["reasoning_effort"] == "none"
+
+    async def test_omit_never_passes_reasoning_effort(self):
+        """omit：永不发送该参数（用于已知端点拒收、且不想付一次探测的场合）。"""
+        client, create = _fake_client()
+        with patch("briefdesk.plugins.ai_provider.engine.get_ai_client", return_value=client), patch.object(
+            config, "ai_reasoning_effort", "omit"
+        ), patch.object(config, "ai_api_key", SecretStr("deepseek")), patch.object(
+            config, "ai_model", "qwen3.5"
+        ):
+            await chat([], temperature=0.1, max_tokens=64)
+
+        _, kwargs = create.call_args
+        assert "reasoning_effort" not in kwargs
+
+    async def test_explicit_effort_passed_through(self):
+        """显式强度原样透传（顺带提供「不关思考但降低强度」的能力）。"""
+        client, create = _fake_client()
+        with patch("briefdesk.plugins.ai_provider.engine.get_ai_client", return_value=client), patch.object(
+            config, "ai_reasoning_effort", "low"
+        ), patch.object(config, "ai_api_key", SecretStr("deepseek")), patch.object(
+            config, "ai_model", "qwen3.5"
+        ):
+            await chat([], temperature=0.1, max_tokens=64)
+
+        _, kwargs = create.call_args
+        assert kwargs["reasoning_effort"] == "low"
         assert "response_format" not in kwargs
         assert kwargs["temperature"] == 0.1
         assert kwargs["max_tokens"] == 64
@@ -136,7 +163,7 @@ class ClientRequestDefaultsTest(unittest.TestCase):
 
 
 class TestChatTimeoutPassThrough:
-    """【复核 P1-1】判官类调用（锁内执行）经 chat 端口下传单请求短超时，
+    """判官类调用（锁内执行）经 chat 端口下传单请求短超时，
     限制存储锁的最坏持有时间；不传时不得附带 timeout（用客户端默认）。"""
 
     async def test_chat_forwards_per_request_timeout(self):
@@ -156,6 +183,105 @@ class TestChatTimeoutPassThrough:
         assert "timeout" not in create.call_args.kwargs
 
 
+class TestClientLifecycle:
+    """teardown 关闭三类惰性客户端并复位缓存/信号量。"""
+
+    def setup_method(self):
+        from briefdesk.plugins.ai_provider import engine
+
+        self.engine = engine
+        engine._client = None
+        engine._embed_client = None
+        engine._alt_clients.clear()
+        engine._ai_semaphore = None
+
+    async def test_close_clients_closes_all_and_resets(self):
+        engine = self.engine
+        main = SimpleNamespace(close=AsyncMock())
+        embed = SimpleNamespace(close=AsyncMock())
+        alt = SimpleNamespace(close=AsyncMock())
+        engine._client = main
+        engine._embed_client = embed
+        engine._alt_clients[("https://alt.invalid/v1", "k")] = alt
+        engine._ai_semaphore = asyncio.Semaphore(1)
+
+        await engine.close_clients()
+
+        for c in (main, embed, alt):
+            c.close.assert_awaited_once()
+        assert engine._client is None
+        assert engine._embed_client is None
+        assert engine._alt_clients == {}
+        assert engine._ai_semaphore is None
+
+    async def test_close_clients_dedups_same_instance(self):
+        engine = self.engine
+        main = SimpleNamespace(close=AsyncMock())
+        engine._client = main
+        # 备用通道缓存里放了与主客户端同一对象（默认 base/key 时即如此）
+        engine._alt_clients[("https://main.invalid/v1", "k")] = main
+
+        await engine.close_clients()
+
+        main.close.assert_awaited_once()
+
+
+class TestChatRetryOverride:
+    """判官类调用的 SDK 重试覆盖：with_options(max_retries=0) 走独立客户端，
+    默认调用不得引入 with_options（保持既有客户端直接调用路径）。"""
+
+    async def test_max_retries_zero_uses_with_options(self):
+        client, _ = _fake_client()
+        client2, create2 = _fake_client()
+        client.with_options = Mock(return_value=client2)
+        with patch(
+            "briefdesk.plugins.ai_provider.engine.get_ai_client", return_value=client
+        ):
+            await chat([{"role": "user", "content": "x"}], timeout=45.0, max_retries=0)
+        client.with_options.assert_called_once_with(max_retries=0)
+        assert create2.await_count == 1
+
+    async def test_default_does_not_call_with_options(self):
+        client, create = _fake_client()
+        client.with_options = Mock()
+        with patch(
+            "briefdesk.plugins.ai_provider.engine.get_ai_client", return_value=client
+        ):
+            await chat([{"role": "user", "content": "x"}])
+        client.with_options.assert_not_called()
+        assert create.await_count == 1
+
+
+class TestChatSemaphoreWait:
+    """判官类调用的许可等待计入 timeout：锁内最坏持有 = 排队 + 请求。"""
+
+    async def test_acquire_bounded_by_timeout(self):
+        client, create = _fake_client()
+        sem = asyncio.Semaphore(1)
+        await sem.acquire()  # 预先占满，后续 acquire 只能等待
+        with patch(
+            "briefdesk.plugins.ai_provider.engine.get_ai_client", return_value=client
+        ), patch(
+            "briefdesk.plugins.ai_provider.engine.get_ai_semaphore", return_value=sem
+        ), pytest.raises(TimeoutError):
+            await chat([{"role": "user", "content": "x"}], timeout=0.05)
+        assert create.await_count == 0
+
+    async def test_release_after_create(self):
+        client, create = _fake_client()
+        sem = asyncio.Semaphore(1)
+        with patch(
+            "briefdesk.plugins.ai_provider.engine.get_ai_client", return_value=client
+        ), patch(
+            "briefdesk.plugins.ai_provider.engine.get_ai_semaphore", return_value=sem
+        ):
+            await chat([{"role": "user", "content": "x"}], timeout=5.0)
+        # 许可已归还：可立即再次 acquire
+        assert await asyncio.wait_for(sem.acquire(), 0.1) is True
+        sem.release()
+        assert create.await_count == 1
+
+
 class TestRagChatModelFallback:
     """rag_chat 的 model override：留空回退 ai_model，给值则原样使用。"""
 
@@ -163,7 +289,7 @@ class TestRagChatModelFallback:
         client, create = _fake_client()
         with patch(
             "briefdesk.plugins.ai_provider.engine.get_alt_client", return_value=client
-        ), patch.object(config, "ai_disable_thinking", False), patch.object(
+        ), patch.object(config, "ai_reasoning_effort", "auto"), patch.object(
             config, "ai_model", "deepseek-v4-flash"
         ):
             await rag_chat([], temperature=0.2, max_tokens=128)
@@ -175,7 +301,7 @@ class TestRagChatModelFallback:
         client, create = _fake_client()
         with patch(
             "briefdesk.plugins.ai_provider.engine.get_alt_client", return_value=client
-        ), patch.object(config, "ai_disable_thinking", False), patch.object(
+        ), patch.object(config, "ai_reasoning_effort", "auto"), patch.object(
             config, "ai_model", "deepseek-v4-flash"
         ):
             await rag_chat([], temperature=0.2, max_tokens=128, model="qwen-plus")
@@ -189,10 +315,10 @@ class TestRagChatModelFallback:
 class TestChatJsonObject:
     """严格 JSON 输出开关：ollama api key / deepseek-v4 模型传 response_format。"""
 
-    async def _call(self, *, api_key: str, model: str, disable_thinking: bool):
+    async def _call(self, *, api_key: str, model: str, reasoning_effort: str = "auto"):
         client, create = _fake_client()
         with patch("briefdesk.plugins.ai_provider.engine.get_ai_client", return_value=client), patch.object(
-            config, "ai_disable_thinking", disable_thinking
+            config, "ai_reasoning_effort", reasoning_effort
         ), patch.object(config, "ai_api_key", SecretStr(api_key)), patch.object(
             config, "ai_model", model
         ):
@@ -201,32 +327,32 @@ class TestChatJsonObject:
 
     async def test_ollama_api_key_passes_response_format(self):
         kwargs = await self._call(
-            api_key="ollama", model="qwen2.5:7b", disable_thinking=False
+            api_key="ollama", model="qwen2.5:7b", reasoning_effort="auto"
         )
         assert kwargs["response_format"] == {"type": "json_object"}
 
-    async def test_ollama_with_thinking_disabled_still_passes(self):
+    async def test_ollama_with_off_still_passes(self):
         kwargs = await self._call(
-            api_key="ollama", model="qwen2.5:7b", disable_thinking=True
+            api_key="ollama", model="qwen2.5:7b", reasoning_effort="off"
         )
         assert kwargs["response_format"] == {"type": "json_object"}
         assert kwargs["reasoning_effort"] == "none"
 
     async def test_deepseek_v4_flash_passes_response_format(self):
         kwargs = await self._call(
-            api_key="deepseek", model="deepseek-v4-flash", disable_thinking=False
+            api_key="deepseek", model="deepseek-v4-flash", reasoning_effort="auto"
         )
         assert kwargs["response_format"] == {"type": "json_object"}
 
     async def test_vendor_prefixed_v4_model_passes(self):
         kwargs = await self._call(
-            api_key="deepseek", model="vendor/deepseek-v4-pro", disable_thinking=False
+            api_key="deepseek", model="vendor/deepseek-v4-pro", reasoning_effort="auto"
         )
         assert kwargs["response_format"] == {"type": "json_object"}
 
     async def test_other_model_does_not_pass_response_format(self):
         kwargs = await self._call(
-            api_key="deepseek", model="qwen3.5", disable_thinking=False
+            api_key="deepseek", model="qwen3.5", reasoning_effort="auto"
         )
         assert "response_format" not in kwargs
 
@@ -273,7 +399,7 @@ class TestChatJsonModeOverride:
 
 
 class TestEmbedBatchCount:
-    """P2 修复：embed_texts 每 chunk 校验返回向量数量——供应商少返即抛错，
+    """embed_texts 每 chunk 校验返回向量数量——供应商少返即抛错，
     绝不产生错位结果（错位向量会持久化进 item_embeddings，永久污染余弦通道）。"""
 
     def _client(self, data):
@@ -313,7 +439,7 @@ class TestEmbedBatchCount:
         assert got == [[0.1], [0.2]]
 
     async def test_duplicate_index_raises_value_error(self):
-        # 复核 P3-9：数量相符但 index 重复（如 [0,0,1]），排序后 index 序列
+        # 数量相符但 index 重复（如 [0,0,1]），排序后 index 序列
         # 非 0..n-1 连续，向量仍整体错位——必须整批失败防余弦通道污染。
         client, _ = self._client(
             [

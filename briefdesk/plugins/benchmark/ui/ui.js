@@ -3,7 +3,7 @@
  * 核心只提供通用加载器；本文件注入后自行构建：
  * - 「导出当前列表为基准用例」：把当前筛选条件下的卡片导出为四类基准用例
  *   （classify/dedup/merge/title，期望=卡片当前状态，与「导出卡片 CSV」
- *   同口径），逐功能覆盖写入插件目录 cases/<feature>.fromweb.json
+ *   同口径），逐功能覆盖写入用户用例目录的 cases/<feature>.fromweb.json
  *   （文件存储，不写数据库；无可导出用例的功能保留原文件）；
  * - 「记录处理过程」：打开/关闭 benchmark 阶段插件（管道处理时点采集
  *   dedup/merge 判定观察记录，含判重/合并命中的正向用例——按卡片最终
@@ -20,6 +20,14 @@
   let pollTimer = null;
   let runActive = false; // 最近一次状态轮询的运行中标记（驱动轮询保活）
 
+  // 错误体里的 detail 可能是 {code, message} 对象；直接拼接对象会得到
+  // "[object Object]"，因此优先取 message，缺省回退到 HTTP 状态码。
+  function detailText(data, status) {
+    const d = data && data.detail;
+    if (d && typeof d === "object") return d.message || ("HTTP " + status);
+    return d || ("HTTP " + status);
+  }
+
   // ── 设置弹窗「关于」面板注入基准区块 ──
   function buildSection() {
     const about = document.querySelector('.settings-panel[data-panel="about"]');
@@ -32,9 +40,10 @@
       + '（期望 = 卡片当前状态：分类/标题/关键词；去重与合并按共存状态配对；'
       + '已忽略的卡片作为分类噪声样本——AI 误分类的闲聊，模型不应输出分类结果），'
       + '或开启「记录处理过程」在管道真实处理时点采集判定记录'
-      + '（含判重/合并命中的正向用例），逐功能覆盖写入插件目录'
+      + '（含判重/合并命中的正向用例），逐功能覆盖写入用户用例目录'
       + ' cases/*.fromweb.json，不写数据库。用例数与列表规模成正比，'
-      + '请先用筛选控制规模。运行会真实调用 AI，期间请勿触发同步。</p>'
+      + '请先用筛选控制规模。运行会真实调用 AI，可能耗时数分钟；运行期间消息'
+      + '处理会暂停（界面照常可用），结束后如未开启周期同步，请点一次同步补齐。</p>'
       + '<div class="about-sources settings-btn-row">'
       + '<button id="bench-import-btn" class="settings-outline-btn">导出当前列表为基准用例</button>'
       + '<button id="bench-record-btn" class="settings-outline-btn">记录处理过程</button>'
@@ -90,7 +99,15 @@
         const st = await res.json();
         if (st.running) {
           runActive = true;
-          $status.innerHTML = "运行中（用例：" + esc(casesText) + "）…请勿触发同步"
+          // progress 来自进度文件，是「当前正在评估的那个功能」的计数；
+          // 无进度（尚未开始）时退回只显示用例数
+          let progText = "";
+          const p = st.progress;
+          if (p && typeof p.done === "number") {
+            progText = "（" + esc(String(p.feature || "")) + " " + p.done + "/" + p.total
+              + (p.failed ? "，失败 " + p.failed : "") + "）";
+          }
+          $status.innerHTML = "运行中" + progText + "（用例：" + esc(casesText) + "）"
             + (recordText ? "；" + esc(recordText) : "");
           return;
         }
@@ -171,7 +188,7 @@
       });
       const data = await res.json().catch(() => ({}));
       if (!res.ok) {
-        showToast("导出失败：" + (data.detail || ("HTTP " + res.status)), { type: "error", duration: 5000 });
+        showToast("导出失败：" + detailText(data, res.status), { type: "error", duration: 5000 });
         $status.textContent = "导出失败";
         return;
       }
@@ -226,7 +243,7 @@
       const res = await fetch("/api/benchmark/export-recorded", { method: "POST" });
       const data = await res.json().catch(() => ({}));
       if (!res.ok) {
-        showToast("导出失败：" + (data.detail || ("HTTP " + res.status)), { type: "error", duration: 5000 });
+        showToast("导出失败：" + detailText(data, res.status), { type: "error", duration: 5000 });
         $status.textContent = "导出失败";
         return;
       }
@@ -270,10 +287,10 @@
       });
       if (!res.ok) {
         const data = await res.json().catch(() => ({}));
-        showToast("启动失败：" + (data.detail || ("HTTP " + res.status)), { type: "error", duration: 4000 });
+        showToast("启动失败：" + detailText(data, res.status), { type: "error", duration: 4000 });
         return;
       }
-      $status.textContent = "运行中…请勿触发同步";
+      $status.textContent = "运行中…";
       runActive = true;
       syncPolling(true);
     } catch (err) {

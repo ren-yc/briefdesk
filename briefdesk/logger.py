@@ -52,9 +52,9 @@ _NAME_STRIP_PREFIXES = ("briefdesk.", "plugins.")
 # 会漏掉一半。
 _NAME_ALIASES = {"weflow_legacy": "weflow-legacy"}
 
-# 短名列宽：取全项目最长短名（weflow-legacy.normalize = 23）。超宽不截断
+# 短名列宽：取全项目最长短名（server.routes_settings_env = 26）。超宽不截断
 # （截断会毁掉 grep），只是那一行的消息起点右移。
-_NAME_WIDTH = 23
+_NAME_WIDTH = 26
 
 # 行格式：来源列用 %(shortname)s（本模块在 format() 里注入）而非 %(name)s。
 # 提为模块常量供测试钉住，防止重构时退回不定宽的全限定名。
@@ -92,7 +92,7 @@ _STATUS_CODE_COLORS = {
 # （如 weflow-legacy SSE 的 ?access_token=）会出现在 uvicorn access log 请求行中。
 # 按参数键名判定：键名按 [_-] 分段，任一分段命中敏感词即掩码——覆盖
 # auth_token / session_token / secret_key / access_key / api_secret /
-# refresh_token / signature 等常见变体（审查回归），同时不误伤
+# refresh_token / signature 等常见变体，同时不误伤
 # keyword / tokenizer 等整词含敏感词子串的普通参数。
 _QUERY_SECRET_PARAM_RE = re.compile(r"([?&])([a-z0-9_-]+)=([^&\s]*)", re.IGNORECASE)
 _SECRET_KEY_SEGMENTS = frozenset(

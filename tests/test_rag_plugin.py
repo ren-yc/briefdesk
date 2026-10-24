@@ -1,8 +1,9 @@
-"""RAG 插件测试：装配自禁用、库层、索引、回填、检索、问答路由与审查回归。"""
+"""RAG 插件测试：装配自禁用、库层、索引、回填、检索与问答路由。"""
 
 import asyncio
 import unittest
 from datetime import UTC
+from types import SimpleNamespace
 from typing import ClassVar
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -180,7 +181,7 @@ class TestRagDb:
         assert row["item_id"] == "i9"
 
     async def test_upsert_chunks_backfill_empty_item_id_preserves_existing(self):
-        """复核 P0-1：回填重建的 ChunkRow 不带 item_id（空串），冲突覆盖不得
+        """回填重建的 ChunkRow 不带 item_id（空串），冲突覆盖不得
         清空运行期已写入的「消息→卡片」引用（否则引用→卡片跳转永久丢失）。"""
         from briefdesk.plugins.rag.db import upsert_chunks
 
@@ -301,7 +302,7 @@ class TestRagDb:
         assert [c.msg_id for c, _ in entries] == ["m1", "m2"]
         assert [round(x, 5) for x in entries[0][1].tolist()] == [0.1, 0.2]
         assert watermark == "t0"
-        # 闭区间 >=：同秒提交的新行不会被严格大于漏掉（W1/N3）
+        # 闭区间 >=：同秒提交的新行不会被严格大于漏掉
         await upsert_chunks(self.db, [self._row("m3")])
         await upsert_embeddings(self.db, [("weflow-legacy", "m3")], [[0.5]], "old-model", "t0")
         raw_same, _ = await fetch_new_embeddings(self.db, "old-model", watermark)
@@ -580,7 +581,7 @@ class TestRagBackfill(_MemoryEngineBase):
         assert sorted(await self._chunk_ids()) == ["d1", "d3"]
 
     async def test_placeholder_rows_do_not_starve_budget_window(self):
-        """审查回归：纯占位符行不可索引却永远满足反连接——旧实现中它们每轮
+        """回归防线：纯占位符行不可索引却永远满足反连接——旧实现中它们每轮
         占满 LIMIT 预算窗口、rows 为空时 return 0 被当作「回填完成」，比它们
         更早的真实消息永远得不到索引且无任何告警。现登记 rag_skipped 消费
         出队，预算窗口逐轮推进到真实消息。"""
@@ -677,6 +678,53 @@ class TestRagBackfill(_MemoryEngineBase):
         assert await self._chunk_ids() == ["n1"]
         assert await self._embed_count_by_model() == {"test-model": 1}
 
+    async def test_model_switch_backfill_keeps_enriched_chunk_content(self):
+        """换模型回填不得用 raw 原文覆盖实时索引写入的 OCR 增强文本。"""
+        from briefdesk.plugins.rag.config import RagSettings as RS
+
+        await self._seed("m1", 1, content="通知正文")
+        # 实时索引写入带 OCR 的 chunk（+ test-model 向量）
+        await self._index([_msg("m1", "通知正文\n[OCR]\n海报文字")])
+        self.provider.embed_model_name = Mock(return_value="model-b")
+        self.engine.settings = RS(backfill_days=-1)
+
+        assert await self.engine.backfill_step(self.now) == 1
+        cursor = await self.db.execute(
+            "SELECT content FROM rag_chunks WHERE msg_id='m1'"
+        )
+        try:
+            content = (await cursor.fetchone())["content"]
+        finally:
+            await cursor.close()
+        assert "[OCR]" in content, "回填不得以原文覆盖 OCR 增强文本"
+        assert await self._embed_count_by_model() == {"model-b": 1}
+
+    async def test_model_switch_backfill_placeholder_raw_uses_chunk(self):
+        """纯图片消息：raw 是占位符但 chunk 有 OCR 文本，回填须沿用 chunk。"""
+        from briefdesk.plugins.rag.config import RagSettings as RS
+
+        await self._seed("m1", 1, content="[图片]")
+        await self._index([_msg("m1", "[OCR]\n海报文字")])
+        cursor = await self.db.execute(
+            "SELECT COUNT(*) AS c FROM rag_chunks WHERE msg_id='m1'"
+        )
+        try:
+            assert (await cursor.fetchone())["c"] == 1, "前置：chunk 已由实时索引写入"
+        finally:
+            await cursor.close()
+        self.provider.embed_model_name = Mock(return_value="model-b")
+        self.engine.settings = RS(backfill_days=-1)
+
+        assert await self.engine.backfill_step(self.now) == 1
+        cursor = await self.db.execute(
+            "SELECT msg_id FROM rag_skipped WHERE msg_id='m1'"
+        )
+        try:
+            assert await cursor.fetchone() is None, "已有可索引 chunk 的不得登记 skipped"
+        finally:
+            await cursor.close()
+        assert await self._embed_count_by_model() == {"model-b": 1}
+
     async def test_full_off_and_model_switch(self):
         from briefdesk.plugins.rag.config import RagSettings as RS
 
@@ -737,7 +785,7 @@ class TestRagRetrieve(_MemoryEngineBase):
         assert hits[0].has_fts
 
     async def test_query_embed_failure_degrades_to_fts_only(self):
-        # F4：查询嵌入失败不再整体拒答——降级 FTS-only，可命中问题仍可回答
+        # 查询嵌入失败不再整体拒答——降级 FTS-only，可命中问题仍可回答
         self.provider.embed_texts = AsyncMock(side_effect=RuntimeError("端点不可达"))
         hits = await self.engine.retrieve("开会有通知")
         assert hits is not None
@@ -826,6 +874,58 @@ class TestRagAsk(_MemoryEngineBase):
         with pytest.raises(RuntimeError):
             await self.engine.ask("周六6点开会有通知")
 
+    async def test_explicit_empty_citations_not_backfilled(self):
+        # JSON 契约显式给出 citations: [] = 模型声明「无依据」，不得回退全部证据
+        self.provider.chat = AsyncMock(
+            return_value=_chat_response('{"answer":"没有相关依据。","citations":[]}')
+        )
+        result = await self.engine.ask("周六6点开会有通知")
+        assert not result.refused
+        assert result.citations == []
+
+    async def test_empty_choices_is_refused(self):
+        self.provider.chat = AsyncMock(return_value=SimpleNamespace(choices=[]))
+        result = await self.engine.ask("周六6点开会有通知")
+        assert result.refused
+        assert result.citations == []
+        assert result.answer
+
+    async def test_blank_answer_is_refused(self):
+        self.provider.chat = AsyncMock(
+            return_value=_chat_response('{"answer":"  ","citations":[1]}')
+        )
+        result = await self.engine.ask("周六6点开会有通知")
+        assert result.refused
+        assert result.citations == []
+
+    async def test_integral_float_citation_accepted(self):
+        """JSON 模式下部分供应商把整数输出为浮点：1.0 须按 1 接受，1.5 拒绝。"""
+        self.provider.chat = AsyncMock(
+            return_value=_chat_response('{"answer":"x","citations":[1.0]}')
+        )
+        result = await self.engine.ask("周六6点开会有通知")
+        assert [c["msg_id"] for c in result.citations] == ["m1"]
+
+        self.provider.chat = AsyncMock(
+            return_value=_chat_response('{"answer":"x","citations":[1.5]}')
+        )
+        result = await self.engine.ask("周六6点开会有通知")
+        assert result.citations == []
+
+    async def test_bool_citation_rejected(self):
+        self.provider.chat = AsyncMock(
+            return_value=_chat_response('{"answer":"x","citations":[true]}')
+        )
+        result = await self.engine.ask("周六6点开会有通知")
+        # True 是 bool 不是编号；显式列表令其不回退（无有效引用即空）
+        assert result.citations == []
+
+        self.provider.chat = AsyncMock(
+            return_value=_chat_response('{"answer":"x","citations":["1"]}')
+        )
+        result = await self.engine.ask("周六6点开会有通知")
+        assert [c["msg_id"] for c in result.citations] == ["m1"]
+
 
     async def test_evidence_chars_setting_truncates_prompt(self):
         # RAG_EVIDENCE_CHARS 传入证据构造：超长消息在 prompt 内被截断并标注
@@ -892,7 +992,7 @@ class TestPromptFlatten(unittest.TestCase):
         assert "周六6点 [1]。" in user
 
     def test_history_trimmed_over_cap(self):
-        # P7：长历史裁剪——只保留最近 6 轮，并标注省略条数
+        # 长历史裁剪——只保留最近 6 轮，并标注省略条数
         from datetime import UTC, datetime
 
         from briefdesk.plugins.rag.prompts import build_answer_prompt
@@ -1152,7 +1252,7 @@ class TestRagCrossSourceScope(_MemoryEngineBase):
 
 
 class TestRagWarmVectorsForceFull(_MemoryEngineBase):
-    """复核 P1-4：warm_vectors(force_full=True) 必须按 key 差集剔除已删条目，
+    """warm_vectors(force_full=True) 必须按 key 差集剔除已删条目，
     否则「行数回退→整表重建」信号被归零计数吞掉，已删内容持续可检索。"""
 
     async def test_force_full_purges_deleted_keys_from_cache(self):
@@ -1345,7 +1445,7 @@ class TestRagChatRouting:
 
 
 class TestDeleteEventGc:
-    """【复核 P2-24】卡片删除事件触发即时孤儿对账（此前最长滞留一个维护
+    """卡片删除事件触发即时孤儿对账（此前最长滞留一个维护
     周期，已删内容仍可被 /api/rag/ask 引用——与停用会话即时生效不对齐）。"""
 
     async def test_setup_subscribes_and_handler_runs_gc(self, fake_embed_provider):

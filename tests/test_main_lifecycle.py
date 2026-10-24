@@ -1,6 +1,6 @@
 """main 启动/关停生命周期回归测试。
 
-- _run 启动段清理保护（P1）：PLUGINS_REQUIRED 插件 setup 失败抛 PluginError
+- _run 启动段清理保护：PLUGINS_REQUIRED 插件 setup 失败抛 PluginError
   中止启动时，teardown_all / close_db 仍必须执行——否则 aiosqlite 非 daemon
   worker 线程不关闭，解释器退出时 join 挂死，只能强杀进程。
 - _reap_task 关停收尾四态：done 直返 / pending 取消等待 / 超时留 pending
@@ -19,7 +19,7 @@ from briefdesk.plugin.base import PluginError
 
 
 class TestPeriodicSyncLoop:
-    """【复核 P1-4】POLL_INTERVAL_SECONDS > 0 时周期触发 trigger_sync（与
+    """POLL_INTERVAL_SECONDS > 0 时周期触发 trigger_sync（与
     /api/sync 同路径；互斥由其返回 None 保证，不叠加触发）。"""
 
     async def test_loop_triggers_sync_periodically_and_exits_on_cancel(self):
@@ -44,15 +44,16 @@ class TestPeriodicSyncLoop:
 
 
 class TestZeroSourceDegradedStartup:
+    """零源不再中止启动：降级运行（UI 可用、采集不可用），清理路径照常执行
+    ——这是三源统一「缺配置自禁用」语义的前提（否则唯一启用的源自禁用会触发
+    零源中止）。"""
+
     @pytest.fixture(autouse=True)
     def _finalizer_collector(self):
         self._finalizers = []
         yield
         for fn in reversed(self._finalizers):
             fn()
-
-    """【复核 4a】零源不再中止启动：降级运行（UI 可用、采集不可用），
-    清理路径照常执行——三源统一「缺配置自禁用」语义的前提（决策 ①=1B）。"""
 
     async def test_zero_sources_starts_degraded_and_cleans_up(self):
         from briefdesk import main as main_mod
@@ -137,16 +138,16 @@ class TestMainRunCleanupOnSetupFailure:
 
 
 class TestMainRunServerStartFailure:
+    """server 启动失败（如端口占用）时等待循环不得白等满 10s——
+    server_task.done() 为真即提前退出等待，随后 await server_task 抛出、
+    finally 统一清理。"""
+
     @pytest.fixture(autouse=True)
     def _finalizer_collector(self):
         self._finalizers = []
         yield
         for fn in reversed(self._finalizers):
             fn()
-
-    """复核 P3-4：server 启动失败（如端口占用）时等待循环不得白等满 10s——
-    server_task.done() 为真即提前退出等待，随后 await server_task 抛出、
-    finally 统一清理。"""
 
     async def test_server_start_failure_breaks_wait_early_and_cleans_up(self):
         import time as time_module
@@ -283,7 +284,7 @@ class ReapTaskTest(unittest.IsolatedAsyncioTestCase):
 
 
 class StartupInterruptCleanupTest(unittest.TestCase):
-    """启动窗口期 Ctrl+C（审查回归）：信号 handler 在 server.started 之后才
+    """启动窗口期 Ctrl+C：信号 handler 在 server.started 之后才
     安装，此前的 Ctrl+C 以 KeyboardInterrupt 从 run_until_complete 逃逸——
     旧实现直接退出，_run 的 finally（teardown/close_db 唯一清理点）不执行，
     aiosqlite 非 daemon worker 线程令解释器退出挂死。现由 main() 取消

@@ -90,7 +90,7 @@ class MergePlugin(StagePlugin):
                     for x in (cand["title"], cand["key_info"], cand["source_quote"])
                     if x
                 )
-                # 复核 P3-8：新卡判官证据改用 row.msg.content（完整原文），
+                # 新卡判官证据改用 row.msg.content（完整原文），
                 # 与头卡 cand["source_quote"]（完整原文）对称——此前用
                 # row.result.quote（AI 摘录，可为空/与原文不同），判官两侧
                 # 证据不对称，且观察记录 tail.source_quote 记的是 msg.content，
@@ -274,7 +274,7 @@ class MergePlugin(StagePlugin):
                         source=survive["source"],
                         source_quote=merged_quote,
                     )
-                    # 补嵌请求锁内登记、after_run 锁外消化（复核 P2-20）：
+                    # 补嵌请求锁内登记、after_run 锁外消化：
                     # 合并后文本未嵌入，存活卡否则退出余弦候选直到重启
                     batch.reembed_queue.append(
                         (survive["id"], merged_title, merged_quote,
@@ -294,8 +294,8 @@ class MergePlugin(StagePlugin):
         """锁外：对合并后的存活卡补嵌入（网络调用不得在存储锁内）。
 
         run 的 add_to_cache 未带向量（合并后文本尚未嵌入）；此处补嵌后带
-        向量重新登记，存活卡立即回归余弦候选集，不必等重启重预热（复核
-        P2-20）。嵌入失败静默——不劣于旧行为（重启后由缓存加载补齐）。
+        向量重新登记，存活卡立即回归余弦候选集，不必等重启重预热。
+        嵌入失败静默——不劣于旧行为（重启后由缓存加载补齐）。
         add_to_cache 幂等更新为全字段覆盖，须带上 run 时登记的完整参数，
         否则图片短路/来源字段会被默认值清空。
         """
@@ -315,7 +315,7 @@ class MergePlugin(StagePlugin):
         from briefdesk.db import get_existing_item_ids
         from briefdesk.plugins.dedup.engine import _embedding_text
 
-        # 锁外复查存在性（复核 P1-3）：run 释放存储锁后、本 after_run 嵌入
+        # 锁外复查存在性：run 释放存储锁后、本 after_run 嵌入
         # 返回前，用户可能已删除该卡（缓存经 EVENT_ITEMS_DELETED 同步清空）。
         # 若不加过滤，add_to_cache 会走「新建分支」重建幽灵条目，后续相似
         # 消息被判重、标记 processed 却无卡片，静默丢失直到重启。

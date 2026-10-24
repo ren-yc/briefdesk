@@ -1,23 +1,27 @@
 """应用配置 — pydantic-settings 从 .env 读取，含默认值。"""
 
-from pathlib import Path
 from typing import ClassVar
 
-from pydantic import Field, SecretStr
+from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import SettingsConfigDict
 
+from briefdesk import paths, settings_env
 from briefdesk.settings_base import KeyringSettingsBase
 
-# 项目根目录（briefdesk/config.py 上溯两级）：.env 与默认 DB 路径均以此为基准，
-# 保证从任意工作目录启动（python main.py / python -m briefdesk / briefdesk）读到同一份配置，
-# 避免 console script 在其它目录运行时静默丢失 .env 或把数据库建到错误位置。
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
+# 推理强度取值：CLI（--reasoning-effort 的 choices）与设置页下拉共用这一份清单，
+# 避免两处手抄漂移；新增取值只改这里。
+REASONING_EFFORT_VALUES: tuple[str, ...] = (
+    "auto",   # 不干预：不发送该参数，交给服务端/模型默认
+    "off",    # 尽力关闭思考：发送 "none"
+    "omit",   # 永不发送该参数（零探测）
+    "minimal", "low", "medium", "high", "xhigh", "max",   # 固定强度
+)
 
 
 class Settings(KeyringSettingsBase):
     """应用配置，从 .env 读取，密钥字段支持系统密钥环。"""
 
-    # 密钥解析链（keyring > 环境变量 > .env > 默认值）：
+    # 密钥解析链（keyring > 环境变量 > 项目 .env > 用户暂存文件 > 默认值）：
     # 系统密钥环由 CLI `briefdesk secrets set` 写入，见 briefdesk/secrets_store.py
     KEYRING_FIELDS: ClassVar[dict[str, str]] = {
         "ai_api_key": "AI_API_KEY",
@@ -45,9 +49,23 @@ class Settings(KeyringSettingsBase):
     """AI 请求最大并发（chat 与嵌入共用），0 = 不限制。默认 4：不设限时大回填
     会一次性放行全部批次形成请求风暴（429 → 整批 failed → 钉窗重拉放大）。"""
 
-    ai_disable_thinking: bool = Field(default=False, alias="AI_DISABLE_THINKING")
-    """设为 true 时，AI 请求会附带 reasoning_effort="none"，
-    用于关闭 Qwen3 / Qwen3.5 等模型的思考模式。"""
+    ai_reasoning_effort: str = Field(default="auto", alias="AI_REASONING_EFFORT")
+    """推理强度意图（取值见 REASONING_EFFORT_VALUES）。
+
+    auto：不发送 reasoning_effort，交给服务端/模型默认（改造前 AI_DISABLE_THINKING
+    为 false 时的行为）；off：发送 "none" 尽力关闭思考——该参数在 OpenAI 规范里是
+    Optional、取值又是 model-dependent，第三方兼容端点差异更大，故端点明确拒收时由
+    ai_provider 改为不发送（见 engine 的降级路径）；omit：永不发送；其余固定发送。
+    非法值在启动期报错（响亮失败，避免拼错后静默按 auto 处理）。"""
+
+    @field_validator("ai_reasoning_effort")
+    @classmethod
+    def _validate_reasoning_effort(cls, value: str) -> str:
+        if value not in REASONING_EFFORT_VALUES:
+            raise ValueError(
+                f"非法取值 {value!r}；可选：{'、'.join(REASONING_EFFORT_VALUES)}"
+            )
+        return value
 
     ai_json_mode: str = Field(default="auto", alias="AI_JSON_MODE")
     """JSON 严格输出模式（response_format={"type": "json_object"}）：
@@ -82,8 +100,11 @@ class Settings(KeyringSettingsBase):
 
     ignore_self: bool = Field(default=True, alias="IGNORE_SELF")
     """过滤本账号自己发送的消息（所有消息入口：SSE 实时 + REST 回填）。
-    weflow-legacy REST 按 isSend 判定、SSE 上游已不推送自消息；qqflow REST 按
-    自身 UID（u_<QQFLOW_QQ>）判定、SSE 事件无发送者标识需按消息回查 REST。"""
+    weflow / weflow-legacy REST 按 isSend 判定；两源的 SSE 上游都不推自消息
+    （weflow-server 推送端据 isSend=1 主动跳过，weflow-legacy 的 SSE 上游已不
+    推送）。qqflow REST 先按 isSend（上游 40013 方向列归一化为 {0,1}）判，
+    isSend=0 时再按自身 UID（u_<QQFLOW_QQ>）兜底——部分 QQ 版本缺该列；
+    SSE 事件无发送者标识，需按消息回查 REST。"""
 
     realtime_batch_max_count: int = Field(
         default=1, alias="REALTIME_BATCH_MAX_COUNT", gt=0
@@ -136,8 +157,13 @@ class Settings(KeyringSettingsBase):
     的相邻卡片经 AI 判官判定合并；0 = 禁用合并。"""
     merge_max_candidates: int = Field(default=3, alias="MERGE_MAX_CANDIDATES", gt=0)
 
-    db_path: str = Field(default=str(PROJECT_ROOT / "briefdesk.sqlite"), alias="DB_PATH")
-    """SQLite 文件路径；默认落在项目根目录（用户显式配置的相对路径仍按 cwd 解析）。"""
+    db_path: str = Field(default_factory=lambda: str(paths.database_path()), alias="DB_PATH")
+    """SQLite 文件路径；默认在平台用户数据目录（`paths.database_path()`，Windows
+    `%LOCALAPPDATA%\\briefdesk\\data\\briefdesk.sqlite`）。必须是 `str(...)` 包装：
+    字段类型是 str 且 pydantic-settings 对默认值开启 validate_default，工厂直接返回
+    Path 会在实例化期抛 ValidationError；也不得写成 `default=str(...)`——那会在类定义
+    期冻结，令 `BRIEFDESK_DATA_DIR` 只能在 import 前生效。显式 `DB_PATH` 完全覆盖默认值
+    （相对路径按 cwd 解析、`~` 不展开）。"""
     server_port: int = Field(default=3000, alias="SERVER_PORT", ge=1, le=65535)
     log_level: str = Field(default="INFO", alias="LOG_LEVEL")
     """日志级别（DEBUG / INFO / WARNING / ERROR / CRITICAL），由 logger.py 读取。"""
@@ -161,3 +187,8 @@ def _load_config() -> Settings:
 
 
 config = _load_config()
+
+# 启动快照来源：与 config 同时点反推并缓存，供设置页展示。
+# 运行期改文件不会改变本进程实际生效的值（配置无热应用），
+# 「下次启动生效」由设置页的 expected_* 单独表达。
+settings_env.capture_startup_sources(Settings)

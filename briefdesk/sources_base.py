@@ -12,9 +12,10 @@ entry point 组 briefdesk.plugins；消息源为可选插件，启用走 PLUGINS
 """
 
 import asyncio
+import json
 import logging
 import time as time_module
-from collections.abc import Awaitable, Callable, Coroutine
+from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine
 from typing import Any, Literal, Protocol
 
 import httpx
@@ -34,6 +35,35 @@ type BatchHandler = Callable[[list[InternalMessage]], Coroutine[Any, Any, None]]
 # 应用层提供的已处理查询端口:输入候选 msg_ids,返回其中已处理的子集
 type ProcessedQuery = Callable[[list[str]], Coroutine[Any, Any, set[str]]]
 
+#: 连接阶段失败的判据：拒连与连接超时在 httpx 中平级（不是父子），必须并列列出。
+_CONNECT_ERRORS = (httpx.ConnectError, httpx.ConnectTimeout)
+
+
+def _connect_error(exc: BaseException) -> httpx.TransportError | None:
+    """在异常链里找连接类失败：找到返回它，否则返回 None。
+
+    为什么顺链查找而不是直接 except：vendor SDK 从 0.9.0 起把所有传输失败
+    包进自己的错误树（raise TransportError(...) from exc）。于是
+    except (httpx.ConnectError, httpx.ConnectTimeout) 在「HTTP 由 SDK 承载」
+    的源（weflow / qqflow）上**永不命中**：连接级重试静默失效——失败模式是
+    上游重启窗口里第一次拒连直接冒泡成 lastError，重试次数为 0，测试不红、
+    日志不报错，只是少了几次本该发生的重试。自持 httpx 的旧源
+    （weflow-legacy）仍直接抛 httpx 异常，两条路径都必须认。
+
+    只沿 __cause__（显式 raise ... from）走，不走 __context__：后者是「处理某
+    异常期间又起了另一个异常」的偶然关系，会把无关失败误判成可重试，在轮询
+    热路径上白付退避延迟。id 集合防自引用环。
+    """
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, _CONNECT_ERRORS):
+            return current
+        current = current.__cause__
+    return None
+
+
 async def with_connect_retry[T](
     request_fn: Callable[[], Awaitable[T]],
     *,
@@ -49,17 +79,22 @@ async def with_connect_retry[T](
       qqflow 503 就绪门控走 QqFlowNotReadyError，语义保持不变）；
     - 不用于 SSE 流（stream_events 已有监听器级退避重连）；
     - 每次重试新建请求调用（request_fn 无参工厂），天然重放。
-    耗尽后原样上抛最后一次异常（错误对象与堆栈保留，
-    poll_cycle 的 lastError 行为不变）。
+    连接阶段的判定经 _connect_error 顺 __cause__ 链，因此 SDK 把拒连包进
+    自己的错误树后重试照旧生效（回归见 tests/test_client_retry.py）。
+    耗尽后原样上抛最后一次异常对象（即出 request_fn 的那个：SDK 承载 HTTP
+    的源上是包好的 TransportError，其 __cause__ 仍是原 httpx 异常——错误对象
+    与堆栈保留，poll_cycle 的 lastError 行为不变）。
     """
     if attempts < 1:
         raise ValueError("attempts must be >= 1")
     delay = base_delay
-    last_error: httpx.TransportError | None = None
+    last_error: BaseException | None = None
     for attempt in range(1, attempts + 1):
         try:
             return await request_fn()
-        except (httpx.ConnectError, httpx.ConnectTimeout) as e:
+        except Exception as e:  # 只拦连接类失败（判定见 _connect_error），其余原样上抛
+            if _connect_error(e) is None:
+                raise
             last_error = e
             if attempt < attempts:
                 logger.debug(
@@ -98,16 +133,98 @@ def make_sse_timeout(read_timeout_s: float) -> httpx.Timeout:
 MAX_SSE_BUFFER_BYTES = 1 << 20
 
 
+async def iter_sse_data_events(
+    resp: httpx.Response,
+    *,
+    log: logging.Logger,
+    max_buffer_bytes: int = MAX_SSE_BUFFER_BYTES,
+) -> AsyncIterator[dict[str, Any]]:
+    """按 SSE 规范切帧并产出 `data:` 行的 JSON 对象（三源共用）。
+
+    - 只把 LF 当行结束符，行尾多余的 CR 剥掉（兼容 CRLF）；U+0085/U+2028/U+2029
+      等 `str.splitlines` 会当作换行的字符不再拆行——httpx 的 aiter_lines 走
+      splitlines 语义，会把含这些字符的 JSON 拆断（上游 serde_json 不转义非 ASCII，
+      真库复现：两条事件只收到一条）。
+    - 空行为事件边界；`id:` / `event:` / `:` 注释行忽略；每个 `data:` 行单独
+      解析并逐个产出（与此前行为一致，上游每帧恰一行 data）。
+      **与 vendor SDK 的口径差异（刻意保留）**：`weflow_sdk`/`qqflow_sdk` 的
+      `_parse_sse_block` 把同帧多条 `data:` 行按 SSE 规范以 LF 拼接成**一个**
+      载荷再解析；本函数逐行解析并**逐个产出**事件。上游每帧恰一行 data，
+      今日三种实现（含 SDK 旧版「只留末行」）等价；若上游改为多行 data，
+      这里产出多个事件、SDK 产出一个，届时须先裁定统一口径再改——本层服务
+      三个消息源（含不在改造范围的老面），不可顺手统一。
+    - 缓冲超过 max_buffer_bytes → 记 WARNING「SSE 缓冲超限」并结束生成器，交给
+      监听器的退避重连。计量口径是**帧内累计字节**（已切出、尚未成帧的行 +
+      未切行的残留），帧结束即归零：只量未切行的残留会漏掉「行连续但始终不
+      出现空行」的畸形流——每行切出后缓冲就归零，上限永远撞不到（基线按累计
+      喂入量计量，能抓到这一类）。代价是帧内累计超限的**合法**大帧同样会被
+      掐断（真库实测正文最大 335 B，比 1 MiB 低三个数量级，实际不可达）。
+      **与 vendor SDK 的口径差异（刻意保留）**：SDK 的 `watch` 上限**同时**约束
+      单个完整帧（超限帧不交付、结束本次流退避重连）；本层维持既有口径——
+      完整帧先产出、只对未成帧部分判超限。改本层会动三源共用实现，SDK 侧
+      更严是给「上限」一个确定语义，两边理由各自成立，故只记录不统一。
+    - JSON 解析失败记 WARNING（不打印内容，只打字节数）并跳过；非对象 JSON 同样跳过。
+
+    产出类型为通用 dict：各源的 TypedDict 事件类型由调用点 cast 收敛
+    （载荷就是上游 data 行的 JSON 对象）。
+    """
+    buffer = bytearray()
+    pending_lines: list[bytes] = []
+    pending_bytes = 0  # 帧内累计字节（含行尾 LF）；帧结束归零
+    async for chunk in resp.aiter_bytes():
+        buffer.extend(chunk)
+        while True:
+            nl = buffer.find(b"\n")
+            if nl < 0:
+                break
+            # 按字节切行不会撕裂多字节 UTF-8：0x0A 不会出现在多字节序列内部
+            line = bytes(buffer[:nl]).rstrip(b"\r")
+            del buffer[: nl + 1]
+            if line:
+                pending_lines.append(line)
+                pending_bytes += len(line) + 1
+                continue
+            # 空行 = 帧结束
+            for raw_line in pending_lines:
+                if not raw_line.startswith(b"data:"):
+                    continue
+                payload = raw_line[5:]
+                if payload.startswith(b" "):
+                    payload = payload[1:]
+                try:
+                    event = json.loads(payload.decode("utf-8"))
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    log.warning("SSE 数据行 JSON 解析失败，跳过（%d 字节）", len(payload))
+                    continue
+                if isinstance(event, dict):
+                    yield event
+                else:
+                    log.warning("SSE 数据行不是 JSON 对象，跳过")
+            pending_lines.clear()
+            pending_bytes = 0
+        # 超限判定放在切帧之后：完整帧先产出，再对尚未成帧的部分判超限
+        # （畸形流才会走到这里），与此前 aiter_lines 版本语义一致。
+        # 必须把 pending_lines 的累计字节一并计入：只量 buffer 时，「行连续但
+        # 无空行」的畸形流每行切出即归零、永远撞不到上限（基线能抓到）。
+        if pending_bytes + len(buffer) > max_buffer_bytes:
+            log.warning(
+                "SSE 缓冲超限（>%d 字节，疑似畸形流），结束本次流等待重连",
+                max_buffer_bytes,
+            )
+            return
+
+
 def build_endpoint_url(base_url: str, path: str) -> str:
     """按 base_url 的路径前缀拼接端点（三源共享，REST/SSE/媒体同源语义）。
 
-    保留 scheme/host/port 与 base 自带的查询串，base 的路径前缀（反代
-    子路径部署）原样保留——区别于 `httpx.URL.join` 的绝对路径 join 语义
-    （后者会替换掉 base 的路径前缀，曾导致 REST 走相对路径合并而
+    行为：保留 scheme/host/port；base 的路径前缀（反代子路径部署）原样保留，
+    base 若带查询串也原样保留（区别于 `httpx.URL.join` 的绝对路径 join 语义——
+    后者会替换掉 base 的路径前缀，曾导致 REST 走相对路径合并而
     SSE/媒体 404 的三路口径分叉）。
 
-    契约：base_url 必须是服务根地址或反代子路径前缀，不得携带查询串、
-    不得填完整端点路径（误配完整端点会产出坏 URL，由文档约束兜住）。
+    调用方契约：base_url 应是服务根地址或反代子路径前缀，**不要**填查询串
+    （配置文档均按此约束）或完整端点路径——保留查询串是实现行为，不是鼓励
+    上游配置携带它；误配完整端点会产出坏 URL，由文档约束兜住。
     """
     base = httpx.URL(base_url)
     prefix = base.path.rstrip("/")
@@ -313,7 +430,7 @@ class BatchBuffer:
                 # 与 _safe_flush 同口径：异常记日志不上抛（残余消息未标
                 # processed，由回填窗口重试恢复）。若上抛，下方 in-flight
                 # 等待会被跳过——teardown 继续推进（close_db 等），先前
-                # in-flight 批可能撞上已关闭的 DB（审查回归）
+                # in-flight 批可能撞上已关闭的 DB
                 logger.exception("关停冲刷失败（%d 条，下轮回填重试）", len(batch))
         pending = [t for t in self._inflight if not t.done()]
         if pending:

@@ -7,12 +7,15 @@ import shutil
 import tempfile
 import unittest
 import uuid
+from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, cast
 from unittest.mock import AsyncMock, patch
 
 import aiosqlite
 import pytest
 
+from briefdesk import paths
 from briefdesk.config import config
 from briefdesk.db import (
     ItemInput,
@@ -22,6 +25,7 @@ from briefdesk.db import (
     SchemaMismatchError,
     SessionRow,
     _escape_like,
+    _init_connection,
     apply_pending_restore,
     are_messages_processed,
     atomic_transaction,
@@ -29,9 +33,9 @@ from briefdesk.db import (
     bulk_insert_raw_messages,
     bulk_upsert_sessions,
     close_db,
-    db_redirect,
     delete_category,
     delete_items,
+    ensure_database_parent_dir,
     get_all_item_texts,
     get_all_sessions,
     get_category_counts,
@@ -649,7 +653,7 @@ class TestItemsPage:
 
 
 class TestReminderAndCalendar:
-    """#3A/#13：到期提醒查询 + 已忽略卡片不提醒/不进日历但保留数据。"""
+    """到期提醒查询 + 已忽略卡片不提醒/不进日历但保留数据。"""
 
     @pytest.fixture(autouse=True)
     async def _autouse_setup(self):
@@ -744,7 +748,7 @@ class TestReminderAndCalendar:
         assert [d["id"] for d in in_cal] == [item]
 
     async def test_update_item_verify_missing_returns_false(self):
-        # F3：不存在的卡片应返回 False（server 层据此转 404），而非静默成功
+        # 不存在的卡片应返回 False（server 层据此转 404），而非静默成功
         with patch("briefdesk.db.get_db", new=AsyncMock(return_value=self.db)):
             assert not await update_item_verify("no-such-id", 1)
 
@@ -778,7 +782,7 @@ class TestReminderAndCalendar:
 
 
 class TestSubjectTimelineNormalization:
-    """#9B（修正版）：subject 写时归一化，时间线按归一化键跨写法聚合。"""
+    """subject 写时归一化，时间线按归一化键跨写法聚合。"""
 
     @pytest.fixture(autouse=True)
     async def _autouse_setup(self):
@@ -914,7 +918,7 @@ class TestGetGroupCount:
 
 
 class TestUpsertSession:
-    """F2：upsert_session 单语句 UPSERT 的插入/更新语义与并发原子性。"""
+    """upsert_session 单语句 UPSERT 的插入/更新语义与并发原子性。"""
 
     @pytest.fixture(autouse=True)
     async def _autouse_setup(self):
@@ -966,7 +970,7 @@ class TestUpsertSession:
 
 
 class TestBulkUpsertSessions:
-    """【H2】bulk_upsert_sessions 单事务批量 UPSERT，语义与单行版一致。
+    """bulk_upsert_sessions 单事务批量 UPSERT，语义与单行版一致。
 
     曾经由 poll_cycle 逐行调 upsert_session（每行一次 commit），会话数百级
     时 N×fsync 拉长调用方持有的存储锁窗口。
@@ -1028,7 +1032,7 @@ class TestBulkUpsertSessions:
 
 
 class TestCloseDbLatch:
-    """【P3-3】close_db 置终态门闩：此后 get_db/get_embed_db 拒绝重建连接。
+    """close_db 置终态门闩：此后 get_db/get_embed_db 拒绝重建连接。
 
     应用关闭序列里 _cancel_pending_tasks 兜底排在 close_db 之后，残余任务
     的清理路径若经 get_db 双检锁复活连接，其非 daemon aiosqlite worker
@@ -1062,7 +1066,7 @@ class TestCloseDbLatch:
 
 
 class TestGetItemTextsByIds:
-    """【复核 P2-18】按 id 取卡片文本（unverify 回加去重缓存的数据源）。"""
+    """按 id 取卡片文本（unverify 回加去重缓存的数据源）。"""
 
     @pytest.fixture(autouse=True)
     async def _autouse_setup(self):
@@ -1303,7 +1307,7 @@ class TestMergeHelpers:
 
 
 class TestBulkRawInsert:
-    """H1 回归：大批量 raw 落库不得触发 SQLite 变量上限。"""
+    """大批量 raw 落库不得触发 SQLite 变量上限。"""
 
     @pytest.fixture(autouse=True)
     async def _autouse_setup(self):
@@ -1343,7 +1347,7 @@ class TestBulkRawInsert:
 
 
 class TestInsertItemConflict:
-    """H2 回归：insert_item 唯一键冲突时返回已存在行的真实 id（非幽灵 id）。"""
+    """insert_item 唯一键冲突时返回已存在行的真实 id（非幽灵 id）。"""
 
     @pytest.fixture(autouse=True)
     async def _autouse_setup(self):
@@ -1493,25 +1497,119 @@ class TestBackupRestore:
         finally:
             await conn.close()
 
+    async def _titles(self, path: str) -> list[str]:
+        conn = await aiosqlite.connect(path)
+        try:
+            conn.row_factory = aiosqlite.Row
+            cursor = await conn.execute("SELECT title FROM items")
+            return [r["title"] for r in await cursor.fetchall()]
+        finally:
+            await conn.close()
+
     async def test_apply_pending_restore_replaces_main(self):
         await self._build_db(self.main_path, "主库A")
         await self._build_db(self.bak_path, "备份B")
 
-        async def _titles(path: str) -> list[str]:
-            conn = await aiosqlite.connect(path)
-            try:
-                conn.row_factory = aiosqlite.Row
-                cursor = await conn.execute("SELECT title FROM items")
-                return [r["title"] for r in await cursor.fetchall()]
-            finally:
-                await conn.close()
-
-        assert await _titles(self.main_path) == ["主库A"]
+        assert await self._titles(self.main_path) == ["主库A"]
         shutil.copyfile(self.bak_path, self.main_path + ".restore-pending")
         config.db_path = self.main_path
         assert await apply_pending_restore()
         assert not os.path.exists(self.main_path + ".restore-pending")
-        assert await _titles(self.main_path) == ["备份B"]
+        assert await self._titles(self.main_path) == ["备份B"]
+
+    async def test_apply_pending_restore_keeps_pre_restore_copy(self):
+        """替换成功后原库保留为 .pre-restore，供人工回退。"""
+        await self._build_db(self.main_path, "主库A")
+        await self._build_db(self.bak_path, "备份B")
+        shutil.copyfile(self.bak_path, self.main_path + ".restore-pending")
+        config.db_path = self.main_path
+
+        assert await apply_pending_restore()
+        assert await self._titles(self.main_path) == ["备份B"]
+        assert os.path.exists(self.main_path + ".pre-restore")
+        assert await self._titles(self.main_path + ".pre-restore") == ["主库A"]
+
+    async def test_apply_pending_restore_rolls_back_when_replace_fails(self):
+        """替换失败必须回滚原库并保留 pending，不能留下无可用数据库的状态。"""
+        await self._build_db(self.main_path, "主库A")
+        await self._build_db(self.bak_path, "备份B")
+        shutil.copyfile(self.bak_path, self.main_path + ".restore-pending")
+        config.db_path = self.main_path
+
+        real_replace = os.replace
+
+        def failing_replace(src, dst):
+            if str(src).endswith(".restore-pending"):
+                raise OSError("locked")
+            return real_replace(src, dst)
+
+        with patch("os.replace", side_effect=failing_replace):
+            assert not await apply_pending_restore()
+        assert await self._titles(self.main_path) == ["主库A"]
+        assert os.path.exists(self.main_path + ".restore-pending")
+        assert not os.path.exists(self.main_path + ".pre-restore")
+
+    async def test_rollback_failure_keeps_copy_and_next_start_completes_it(self):
+        """回滚本身也失败时不抛出、不丢原库；下次启动先补完回滚再重试恢复。
+
+        此前回滚的 os.replace 无保护：抛出后进程退出，磁盘上主库缺失、原库只剩
+        .pre-restore；下次启动第 1 步会把这份唯一副本当上一代副本删掉。
+        """
+        await self._build_db(self.main_path, "主库A")
+        await self._build_db(self.bak_path, "备份B")
+        shutil.copyfile(self.bak_path, self.main_path + ".restore-pending")
+        config.db_path = self.main_path
+
+        real_replace = os.replace
+
+        def failing_replace(src, dst):
+            # 替换与回滚都被「占用」：模拟杀软/备份工具锁住整个目录
+            if str(src).endswith((".restore-pending", ".pre-restore")):
+                raise OSError("locked")
+            return real_replace(src, dst)
+
+        with patch("os.replace", side_effect=failing_replace):
+            assert not await apply_pending_restore()
+        assert not os.path.exists(self.main_path), "前置：回滚失败后主库缺失"
+        assert await self._titles(self.main_path + ".pre-restore") == ["主库A"]
+        assert os.path.exists(self.main_path + ".restore-pending")
+
+        # 下次启动（占用解除）：先补完回滚，再正常恢复；原库仍以副本形态保留
+        assert await apply_pending_restore()
+        assert await self._titles(self.main_path) == ["备份B"]
+        assert await self._titles(self.main_path + ".pre-restore") == ["主库A"]
+        assert not os.path.exists(self.main_path + ".restore-pending")
+
+    async def test_stale_copy_not_moved_back_when_main_exists(self):
+        """主库存在时 .pre-restore 只是上一代副本，绝不能改回覆盖主库。"""
+        await self._build_db(self.main_path, "主库A")
+        await self._build_db(self.main_path + ".pre-restore", "旧副本")
+        await self._build_db(self.bak_path, "备份B")
+        shutil.copyfile(self.bak_path, self.main_path + ".restore-pending")
+        config.db_path = self.main_path
+
+        assert await apply_pending_restore()
+        assert await self._titles(self.main_path) == ["备份B"]
+        assert await self._titles(self.main_path + ".pre-restore") == ["主库A"]
+
+    async def test_second_restore_overwrites_previous_copy(self):
+        """副本只保留最近一代：第二次恢复覆盖第一次的副本。"""
+        await self._build_db(self.main_path, "第一代")
+        await self._build_db(self.bak_path, "备份一")
+        config.db_path = self.main_path
+
+        shutil.copyfile(self.bak_path, self.main_path + ".restore-pending")
+        assert await apply_pending_restore()
+        assert await self._titles(self.main_path) == ["备份一"]
+        assert await self._titles(self.main_path + ".pre-restore") == ["第一代"]
+
+        # 第二次备份在独立文件上构建（bak_path 复用会把上一次的条目带进来）
+        second = os.path.join(self.tmpdir, "bak2.sqlite")
+        await self._build_db(second, "备份二")
+        shutil.copyfile(second, self.main_path + ".restore-pending")
+        assert await apply_pending_restore()
+        assert await self._titles(self.main_path) == ["备份二"]
+        assert await self._titles(self.main_path + ".pre-restore") == ["备份一"]
 
     async def test_invalid_pending_ignored(self):
         await self._build_db(self.main_path, "主库A")
@@ -1679,7 +1777,7 @@ class TestSourceGroupsSplit:
 
 
 class TestMergeSourceGroup:
-    """merge_source_group：逗号分隔、精确匹配去重（C3：群名互为子串不误判）。"""
+    """merge_source_group：逗号分隔、精确匹配去重（群名互为子串不误判）。"""
 
     @pytest.fixture(autouse=True)
     async def _autouse_setup(self):
@@ -1706,7 +1804,7 @@ class TestMergeSourceGroup:
         return row["source_group"]
 
     async def test_substring_names_are_not_treated_as_present(self):
-        """C3：群名互为子串（"我们四个" vs "我们四个2"）→ 追加而非跳过。"""
+        """群名互为子串（"我们四个" vs "我们四个2"）→ 追加而非跳过。"""
         await self._insert("a", "我们四个")
         with patch("briefdesk.db.get_db", new=AsyncMock(return_value=self.db)):
             await merge_source_group("a", "我们四个2")
@@ -1746,7 +1844,7 @@ class TestEmbeddingsDb:
         self.tmpdir = tempfile.mkdtemp()
         self.old_db_path = config.db_path
         config.db_path = os.path.join(self.tmpdir, "embed.sqlite")
-        # 复位模块级单例与关闭门闩（P3-3），确保真实走临时库：本类每个用例
+        # 复位模块级单例与关闭门闩，确保真实走临时库：本类每个用例
         # 都在 tearDown 经 close_db 收尾，下个用例须可重新建库
         self._old_db = db_module._db
         self._old_embed_db = db_module._embed_db
@@ -1809,7 +1907,7 @@ class TestEmbeddingsDb:
         assert len(await load_embeddings("m")) == 150
 
     async def test_close_db_closes_main_even_if_embed_close_fails(self):
-        """【核验 H3】_embed_db.close 抛错不得阻断 _db.close：残留的非 daemon
+        """_embed_db.close 抛错不得阻断 _db.close：残留的非 daemon
         worker 线程会让解释器退出挂死（与关闭路径要防的故障同源），且两个
         全局引用都必须置 None，保证后续按需重建不悬挂旧连接。"""
         import briefdesk.db as db_module
@@ -1841,7 +1939,7 @@ class TestEmbeddingsDb:
         await main_db.close()
 
 
-# ── 审查修复回归测试（内存库，不触碰应用数据库文件）──
+# ── 数据库写路径回归测试（内存库，不触碰应用数据库文件）──
 
 
 class _InMemoryDbTest:
@@ -1880,7 +1978,7 @@ class _InMemoryDbTest:
 
 
 class TestCategoryRenameSync(_InMemoryDbTest):
-    """审查修复 #1 回归保护：类别改名必须在同一事务内同步 items.category。"""
+    """类别改名必须在同一事务内同步 items.category——否则旧名卡片失联。"""
 
     async def test_rename_updates_items_category_in_same_transaction(self):
         p1, p2 = self._patch_db()
@@ -1901,7 +1999,8 @@ class TestCategoryRenameSync(_InMemoryDbTest):
 
 
 class TestDeleteCategoryPurgeCascade(_InMemoryDbTest):
-    """审查修复 #1 回归保护：purge 级联删三表且 processed_messages 保留。"""
+    """purge 类别必须级联删 items/raw_messages/rag embeddings 三表且 processed_messages 保留——
+    残留行会让已删卡片继续出现在检索与回填判定中。"""
 
     async def test_purge_deletes_items_raw_embeddings_keeps_processed(self):
         p1, p2 = self._patch_db()
@@ -1966,68 +2065,60 @@ class TestChunkedWritePath(_InMemoryDbTest):
         assert (await cur.fetchone())["cnt"] == 0
 
 
-class TestDbRedirect:
-    """db_redirect 官方缝：窗口内单例指向临时库，退出原样还原。"""
+class TestInitConnectionCleanup:
+    """_init_connection 自 connect 起全程受 try 保护，失败即关连接。"""
 
-    async def test_redirect_swaps_and_restores_singletons(self):
+    async def test_closes_on_pragma_failure(self):
         import briefdesk.db as db_mod
 
-        saved_main, saved_embed = db_mod._db, db_mod._embed_db
-        with tempfile.TemporaryDirectory() as d:
-            async with db_redirect(os.path.join(d, "bench.sqlite")) as (
-                main_conn,
-                embed_conn,
-            ):
-                assert db_mod._db is main_conn
-                assert db_mod._embed_db is embed_conn
-                # 两条连接已按各自口径初始化 schema（空库可查）
-                cur = await main_conn.execute("SELECT COUNT(*) AS cnt FROM items")
-                assert (await cur.fetchone())["cnt"] == 0
-                assert embed_conn is not None
-            assert db_mod._db is saved_main, "退出必须还原主连接单例"
-            assert db_mod._embed_db is saved_embed, "退出必须还原向量连接单例"
+        conn = SimpleNamespace(
+            execute=AsyncMock(side_effect=RuntimeError("pragma")),
+            close=AsyncMock(),
+        )
+        with (
+            patch.object(db_mod.aiosqlite, "connect", AsyncMock(return_value=conn)),
+            patch.object(db_mod, "init_schema", AsyncMock()),
+            patch.object(db_mod, "validate_schema", AsyncMock()),
+            pytest.raises(RuntimeError),
+        ):
+            await db_mod._init_connection(":memory:")
+        conn.close.assert_awaited_once()
 
-    async def test_second_connection_failure_closes_first(self):
+    async def test_closes_on_cancel_during_schema(self):
+        """schema 初始化期间被取消同样不得泄漏连接（CancelledError 是
+        BaseException，except Exception 覆盖不到）。"""
         import briefdesk.db as db_mod
 
-        real_init = db_mod._init_connection
-        created: list = []
-        closed = {"v": False}
-        calls = {"n": 0}
-
-        async def flaky_init(path, **kwargs):
-            calls["n"] += 1
-            if calls["n"] >= 2:
-                raise RuntimeError("disk full")
-            conn = await real_init(path, **kwargs)
-            orig_close = conn.close
-
-            async def spy_close():
-                closed["v"] = True
-                await orig_close()
-
-            conn.close = spy_close
-            created.append(conn)
-            return conn
-
-        saved_main, saved_embed = db_mod._db, db_mod._embed_db
         with tempfile.TemporaryDirectory() as d:
+            real_init = db_mod._init_connection
+            closed = {"v": False}
+
+            real_connect = aiosqlite.connect
+
+            async def spy_connect(path):
+                conn = await real_connect(path)
+                orig_close = conn.close
+
+                async def spy_close():
+                    closed["v"] = True
+                    await orig_close()
+
+                conn.close = spy_close
+                return conn
+
             with (
-                patch.object(db_mod, "_init_connection", new=flaky_init),
-                pytest.raises(RuntimeError),
+                patch.object(db_mod.aiosqlite, "connect", spy_connect),
+                patch.object(
+                    db_mod, "init_schema", AsyncMock(side_effect=asyncio.CancelledError())
+                ),
+                pytest.raises(asyncio.CancelledError),
             ):
-                async with db_redirect(os.path.join(d, "bench.sqlite")):
-                    pass  # 不可达：进入即失败
-            # 半程失败：第一条连接已关闭（不留非 daemon worker 线程）、
-            # 模块单例未被换入
-            assert calls["n"] == 2
-            assert closed["v"], "半程失败的 main_conn 未被关闭"
-            assert db_mod._db is saved_main
-            assert db_mod._embed_db is saved_embed
+                await real_init(os.path.join(d, "cancel.sqlite"))
+            assert closed["v"], "取消路径未关闭连接"
 
 
 class TestDeleteItemsRollback(_InMemoryDbTest):
-    """审查修复 #1a：多步写异常路径必须 rollback，不留悬挂事务。
+    """多步写异常路径必须 rollback，不留悬挂事务。
 
     悬挂事务会被下一个不相干写操作的 commit 收尾提交（部分写入提前可见），
     因此异常路径 rollback 后连接必须回到无事务状态。
@@ -2185,7 +2276,7 @@ class TestDeleteItemsRollback(_InMemoryDbTest):
 
 
 class TestAtomicTransactionCancel(_InMemoryDbTest):
-    """复核 P1-1：atomic_transaction 必须捕 CancelledError（BaseException 子类），
+    """atomic_transaction 必须捕 CancelledError（BaseException 子类），
     否则取消逃逸留下悬挂事务，被后续无关 commit 收尾提交。"""
 
     async def test_cancel_inside_transaction_rolls_back(self):
@@ -2217,7 +2308,8 @@ class TestAtomicTransactionCancel(_InMemoryDbTest):
 
 
 class TestAreMessagesProcessedChunk:
-    """审查修复 #6：are_messages_processed 按 900 条分块防 SQLite 变量上限。
+    """are_messages_processed 必须按 900 条分块查询——单条 IN 列表超过 SQLite
+    SQLITE_MAX_VARIABLE_NUMBER 时整条 SQL 直接报错，回填大批量会全轮失败。
 
     本机 SQLite 3.51 变量上限为 32766（>=3.32），1100 个 id 单次查询不会崩，
     崩溃路径的 RED 无法在本机复现；故直接对分块行为做参数化断言。
@@ -2259,7 +2351,7 @@ class TestAreMessagesProcessedChunk:
 
 
 class TestAreMessagesProcessedLargeSet(_InMemoryDbTest):
-    """审查修复 #6 端到端：1100 个 id 全部已处理 → 返回全集（首跑即绿的保护性测试）。"""
+    """端到端：1100 个 id 全部已处理 → 分块查询必须返回全集（超单语句变量上限的形态）。"""
 
     async def test_1100_processed_ids_all_found(self):
         with patch("briefdesk.db.get_db", new=AsyncMock(return_value=self.db)):
@@ -2270,7 +2362,8 @@ class TestAreMessagesProcessedLargeSet(_InMemoryDbTest):
 
 
 class TestSetItemReminderClearMutex(_InMemoryDbTest):
-    """审查修复 #7：清除提醒仅在已有提醒时命中——rowcount 才能当多标签页互斥判据。"""
+    """清除提醒必须仅在已有提醒时命中——否则无提醒行也返回成功，
+    rowcount 就不能当多标签页互斥判据（重复设提醒会互相覆盖）。"""
 
     async def test_clear_when_no_reminder_returns_false(self):
         with patch("briefdesk.db.get_db", new=AsyncMock(return_value=self.db)):
@@ -2335,7 +2428,7 @@ class TestDefaultCategoriesUpgrade(_InMemoryDbTest):
         assert row["cnt"] == 0, "迁移完成后用户的删除必须被尊重"
 
     async def test_activity_notice_prompt_migrates_once_respecting_edits(self):
-        # C3：活动通知口径 v1→v2——旧版原文才更新、已编辑行不动、只跑一次
+        # 活动通知口径 v1→v2——旧版原文才更新、已编辑行不动、只跑一次
         from briefdesk.db import (
             _ACTIVITY_NOTICE_NEW_PROMPT,
             _ACTIVITY_NOTICE_OLD_PROMPT,
@@ -2365,6 +2458,114 @@ class TestDefaultCategoriesUpgrade(_InMemoryDbTest):
         await self.db.commit()
         await init_schema(self.db)
         assert await _notice_prompt() == _ACTIVITY_NOTICE_OLD_PROMPT
+
+
+class TestDatabaseParentDir:
+    """父目录创建契约：默认库迁到用户数据目录后，首启必须能自建目录。"""
+
+    def test_creates_missing_parent_dir(self, tmp_path):
+        target = tmp_path / "fresh" / "data" / "briefdesk.sqlite"
+        ensure_database_parent_dir(str(target))
+        assert target.parent.is_dir()
+        assert not target.exists(), '只建目录，不建库文件'
+
+    def test_existing_parent_dir_is_noop(self, tmp_path):
+        target = str(tmp_path / "briefdesk.sqlite")
+        ensure_database_parent_dir(target)
+        ensure_database_parent_dir(target)
+
+    def test_failure_raises_runtime_error_with_guidance(self, tmp_path, monkeypatch):
+        def boom(self, parents=False, exist_ok=False):
+            raise OSError("denied")
+
+        monkeypatch.setattr(Path, "mkdir", boom)
+        with pytest.raises(RuntimeError) as exc:
+            ensure_database_parent_dir(str(tmp_path / "blocked" / "briefdesk.sqlite"))
+        message = str(exc.value)
+        assert "blocked" in message
+        assert "DB_PATH" in message
+
+    def test_relative_db_path_resolves_against_cwd(self, tmp_path, monkeypatch):
+        """相对 DB_PATH 不被归一化，父目录按进程 cwd 解析（config 不加绝对化）。"""
+        from briefdesk.config import Settings
+
+        monkeypatch.chdir(tmp_path)
+        relative = str(Path("rel") / "briefdesk.sqlite")
+        settings = Settings(_env_file=None, DB_PATH=relative)
+        assert settings.db_path == relative, "config 把相对路径绝对化了"
+        ensure_database_parent_dir(settings.db_path)
+        assert (tmp_path / "rel").is_dir(), "相对路径未按 cwd 解析"
+
+    def test_tilde_db_path_is_not_expanded(self, tmp_path, monkeypatch):
+        """`~` 与 `%VAR%` 都不展开：原样交给 sqlite3，与文档口径一致。
+
+        展开会静默换库位——`~` 落到用户主目录、`%VAR%` 落到环境变量
+        指向处，而设置页显示的仍是字面值。
+        """
+        from briefdesk.config import Settings
+
+        monkeypatch.chdir(tmp_path)
+        paths = (str(Path("~") / "briefdesk.sqlite"), r"%TEMP%\briefdesk.sqlite")
+        for literal in paths:
+            settings = Settings(_env_file=None, DB_PATH=literal)
+            assert settings.db_path == literal, f"config 展开了 {literal}"
+            ensure_database_parent_dir(settings.db_path)
+        assert (tmp_path / "~").is_dir(), "`~` 被展开成用户主目录了"
+        assert (tmp_path / "%TEMP%").is_dir(), "`%VAR%` 被展开成环境变量值了"
+
+    async def test_get_db_creates_parent_dir_on_first_start(self, tmp_path):
+        """走真实入口：目录不存在时 get_db 自建目录并建库（首启唯一必炸点）。"""
+        import briefdesk.db as db_module
+
+        target = tmp_path / "fresh" / "data" / "briefdesk.sqlite"
+        saved_db = db_module._db
+        saved_path = config.db_path
+        db_module._db = None
+        config.db_path = str(target)
+        try:
+            conn = await get_db()
+            assert conn is db_module._db
+            assert target.exists()
+        finally:
+            live = db_module._db
+            if live is not None and live is not saved_db:
+                await live.close()
+            db_module._db = saved_db
+            config.db_path = saved_path
+
+
+class TestLegacyDatabaseUntouched:
+    """旧库（旧版本落在项目根的 briefdesk.sqlite）不被发现、复制、移动或重命名。
+
+    断言 mtime_ns + size：不碰 atime（读操作会改它，且它不是本用例关心的事实），
+    也不用 st_ino（非 NTFS / 网络盘上不稳）。
+    """
+
+    async def test_default_db_lands_in_user_dir_and_leaves_old_file_alone(
+        self, tmp_path, monkeypatch
+    ):
+        old_root = tmp_path / "old-project-root"
+        old_root.mkdir()
+        old_db = old_root / "briefdesk.sqlite"
+        old_db.write_text("legacy-bytes", encoding="utf-8")
+        before = (old_db.stat().st_mtime_ns, old_db.stat().st_size)
+
+        monkeypatch.setenv("BRIEFDESK_DATA_DIR", str(tmp_path / "user-data"))
+        new_db = paths.database_path()
+        assert new_db != old_db
+        assert "user-data" in str(new_db)
+
+        # 走真实入口建库：默认库必须落在用户数据目录，旧库文件一个字节都不动
+        ensure_database_parent_dir(str(new_db))
+        conn = await _init_connection(str(new_db), validate_schema_flag=False)
+        await conn.close()
+
+        after = (old_db.stat().st_mtime_ns, old_db.stat().st_size)
+        assert after == before, "旧库的 mtime/size 被改动（出现迁移副作用）"
+        assert old_db.read_text(encoding="utf-8") == "legacy-bytes"
+        assert sorted(p.name for p in old_root.iterdir()) == [
+            "briefdesk.sqlite"
+        ], "旧库目录被写入新文件（迁移标记/副本？）"
 
 
 if __name__ == "__main__":

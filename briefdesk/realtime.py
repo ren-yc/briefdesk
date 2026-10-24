@@ -86,7 +86,7 @@ async def _publish(name: str, payload: dict | None = None) -> None:
 
 
 async def publish_items_updated(payload: dict | None = None) -> None:
-    """新入库卡片/同步完成等列表变化事件（原名与签名保持，兼容现有调用）。"""
+    """新入库卡片/同步完成等列表变化事件（事件名 `items_updated`，payload 由调用方决定）。"""
     await _publish("items_updated", payload)
 
 

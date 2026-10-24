@@ -11,7 +11,6 @@
 """
 
 import asyncio
-import json
 import logging
 import time as time_module
 from collections.abc import AsyncIterator, Callable
@@ -25,11 +24,11 @@ from briefdesk.masking import clean_display_name
 from briefdesk.plugins.weflow_legacy.config import WeFlowLegacySettings
 from briefdesk.sources_base import (
     LIST_MAX_LIMIT,
-    MAX_SSE_BUFFER_BYTES,
     ConnectionStatus,
     MediaError,
     SourceClient,
     build_endpoint_url,
+    iter_sse_data_events,
     make_sse_timeout,
     with_connect_retry,
 )
@@ -154,7 +153,7 @@ _MAX_MEDIA_BYTES = 20 * 1024 * 1024
 
 # 按消息回查 REST（SSE 图片 mediaUrl / 文章卡片原始 XML）的单页条数：
 # 倒序响应下目标消息之后 120s 窗口内的新消息会把它挤出首页，
-# 50 条在刷屏场景不够，放宽到 200（审查报告【5·P2】）
+# 50 条在刷屏场景不够，放宽到 200
 _LOOKUP_LIMIT = 200
 
 
@@ -191,8 +190,10 @@ class WeFlowLegacyClient(SourceClient):
         """获取共享的 httpx 客户端（懒初始化）。"""
         if self._client is None:
             # base_url 原样使用 _base_url：httpx 的 base_url 合并规则会正确处理
-            # 绝对路径请求；媒体/SSE 的 URL 统一走 URL.join（见 _build_media_url
-            # 与 stream_events），不再依赖 base 的形态。
+            # 绝对路径请求；媒体/SSE 的 URL 统一走共享助手 build_endpoint_url
+            # （按 base 的路径前缀拼接、保留 base 自带查询串，见 _build_media_url
+            # 与 stream_events）——httpx 原生 URL.join 会丢弃 base 路径前缀，
+            # 反代子路径部署下必 404，故不使用。
             self._client = httpx.AsyncClient(
                 base_url=self._base_url,
                 timeout=httpx.Timeout(30.0),
@@ -265,8 +266,8 @@ class WeFlowLegacyClient(SourceClient):
                 if not resp.is_success:
                     # 重试响应失败必须走与主路径相同的错误出口：静默保留
                     # 首次的空 data 会让调用方拿到"成功"的空结果，把上游
-                    # 4xx/5xx 伪装成正常翻页终止（审查回归）。
-                    # 复核 P3-16：not_found_ok 的 404 降级同样适用于重试分支，
+                    # 4xx/5xx 伪装成正常翻页终止。
+                    # not_found_ok 的 404 降级同样适用于重试分支，
                     # 否则脏会话重试遇 404 本可降级空信封却令整会话失败。
                     if not_found_ok and resp.status_code == 404:
                         return None
@@ -288,7 +289,7 @@ class WeFlowLegacyClient(SourceClient):
         ——注意 WeFlow 在 media=True 时会把文章卡片 XML 渲染成占位符
         （如 "[视频号] 标题"），需要原始 XML 时必须用 media=False 回查。
         回查显式 retry_on_empty=False：miss 是常见路径，不应在监听/回填
-        热路径上为空结果白付 500ms 重试（审查报告【7·P2】）。
+        热路径上为空结果白付 500ms 重试。
         """
         start_ts = int((datetime.fromtimestamp(ts, tz=UTC) - timedelta(seconds=120)).timestamp())
 
@@ -532,7 +533,7 @@ class WeFlowLegacyClient(SourceClient):
             retry_on_empty: 空结果是否 500ms 后重试一次（回查链路应传 False；
                 轮询首页保留默认 True 以维持既有「刚入库查不到」竞态兜底）
             not_found_ok: 会话不存在（404）时返回空信封而非抛错；轮询路径应
-                传 True（对齐 weflow/qqflow 的脏会话容错，复核 U1-1）
+                传 True（对齐 weflow/qqflow 的脏会话容错）
 
         查询参数经 params= 由 httpx 编码（与 weflow/qqflow 客户端一致）：
         会话 ID 拼进查询串时若含保留字符（&、=、# 等）手拼会产生错误请求。
@@ -603,35 +604,13 @@ class WeFlowLegacyClient(SourceClient):
                     if on_connected is not None:
                         on_connected()
 
-                    buffer = ""
-                    buffer_bytes = 0
-                    async for line in resp.aiter_lines():
-                        chunk = line + "\n"
-                        buffer += chunk
-                        buffer_bytes += len(chunk.encode())
-                        if buffer_bytes > MAX_SSE_BUFFER_BYTES:
-                            # 预防性：畸形无换行流会让缓冲无限膨胀，
-                            # 超限结束本次流，交给既有重连退避自愈
-                            logger.warning(
-                                "SSE 缓冲超限（>%d 字节，疑似畸形流），结束本次流等待重连",
-                                MAX_SSE_BUFFER_BYTES,
-                            )
-                            break
-                        while "\n\n" in buffer:
-                            event_text, buffer = buffer.split("\n\n", 1)
-                            buffer_bytes -= len(event_text.encode()) + 2
-                            for event_line in event_text.split("\n"):
-                                if event_line.startswith("data: "):
-                                    try:
-                                        event = json.loads(event_line[6:])
-                                        logger.debug(
-                                            "SSE 事件: %s rawid=%s",
-                                            event.get("event"),
-                                            event.get("rawid"),
-                                        )
-                                        yield event
-                                    except json.JSONDecodeError:
-                                        logger.debug("SSE 数据行 JSON 解析失败，跳过")
+                    async for event in iter_sse_data_events(resp, log=logger):
+                        logger.debug(
+                            "SSE 事件: %s rawid=%s",
+                            event.get("event"),
+                            event.get("rawid"),
+                        )
+                        yield cast(WeFlowLegacyEvent, event)
 
             except httpx.RequestError as e:
                 logger.warning("SSE 连接错误: %s", e)

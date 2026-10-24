@@ -1,4 +1,4 @@
-// 前端测试共用的最小 DOM/BOM 桩：把真实的 ui/app.js 加载进 Node vm。
+// 前端测试共用的最小 DOM/BOM 桩：把真实的 briefdesk/ui/app.js 加载进 Node vm。
 //
 // app.js 是同源 classic script（不能 ESM 化、不能 IIFE 包裹，见 docs/architecture.md），
 // 顶层就会 document.getElementById(...) 一大批常量，因此桩只需"任何 id 都返回一个
@@ -22,6 +22,7 @@ const ESC_MAP = { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&
 // 测试用；不传时 querySelector 恒为 null，与此前行为一致。
 export function makeElement(selectorMap = null) {
   const classes = new Set();
+  const listeners = new Map();
   return {
     innerHTML: "",
     textContent: "",
@@ -31,6 +32,7 @@ export function makeElement(selectorMap = null) {
     dataset: {},
     hidden: false,
     checked: false,
+    disabled: false,
     indeterminate: false,
     // classList 真实记账：app.js 大量使用 add("hidden") 后再 contains("hidden") 判定
     // 幂等（如"已展开就不重复请求上下文"）。恒返回 false 的桩会让这类分支永远走
@@ -45,8 +47,17 @@ export function makeElement(selectorMap = null) {
         return on;
       },
     },
-    addEventListener() {},
+    addEventListener(type, fn) {
+      if (!listeners.has(type)) listeners.set(type, []);
+      listeners.get(type).push(fn);
+    },
     removeEventListener() {},
+    // 派发真实监听器：按钮的点击流用例（确认→请求→toast→刷新）依赖
+    // bindSettingsFormEvents 挂的 handler 真的会跑，no-op 监听会把整条
+    // 路径测成通过。事件对象只带用例需要的字段。
+    async click() {
+      for (const fn of listeners.get("click") || []) await fn({ target: this });
+    },
     querySelector(sel) { return (selectorMap && selectorMap[sel]) || null; },
     querySelectorAll() { return []; },
     closest() { return null; },
@@ -58,7 +69,7 @@ export function makeElement(selectorMap = null) {
   };
 }
 
-// 建立 sandbox 并执行 ui/app.js；返回的 sandbox 即 window，其上是 app.js 的全局符号。
+// 建立 sandbox 并执行 briefdesk/ui/app.js；返回的 sandbox 即 window，其上是 app.js 的全局符号。
 // localStorage 可选注入：需要测试「localStorage 初始态 → 模块级初始化」（如 listMode
 // 迁移读取）时传入受控实现；默认桩恒返回 null（首次使用）。
 export function loadAppJs({ localStorage: localStorageStub } = {}) {
@@ -119,8 +130,8 @@ export function loadAppJs({ localStorage: localStorageStub } = {}) {
   sandbox.self = sandbox;
 
   vm.createContext(sandbox);
-  vm.runInContext(fs.readFileSync(path.join(ROOT, "ui", "app.js"), "utf8"), sandbox, {
-    filename: "ui/app.js",
+  vm.runInContext(fs.readFileSync(path.join(ROOT, "briefdesk", "ui", "app.js"), "utf8"), sandbox, {
+    filename: "briefdesk/ui/app.js",
   });
   return { sandbox, document, getElement };
 }

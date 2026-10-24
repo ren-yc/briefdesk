@@ -11,12 +11,20 @@ import json
 import math
 import re
 import types
+from collections.abc import Callable
 from decimal import Decimal, InvalidOperation
-from typing import Annotated, Any, Union, get_args, get_origin
+from typing import Annotated, Any, Union, cast, get_args, get_origin
 
 from pydantic import SecretStr
 from pydantic.fields import PydanticUndefined
 from pydantic_settings import BaseSettings
+
+from briefdesk.settings_env import (
+    field_env_key,
+    model_source_snapshot,
+    model_sources,
+    source_of,
+)
 
 
 def _label_from_name(name: str) -> str:
@@ -25,11 +33,8 @@ def _label_from_name(name: str) -> str:
 
 
 def _field_key(model: type[BaseSettings], name: str) -> str:
-    field = model.model_fields[name]
-    if field.alias:
-        return str(field.alias)
-    prefix = str(model.model_config.get("env_prefix", ""))
-    return f"{prefix}{name}".upper()
+    """字段 → 环境变量键；规则与解析侧共用（见 settings_env.field_env_key）。"""
+    return field_env_key(model, name)
 
 
 def _unwrap_annotation(annotation: Any) -> Any:
@@ -90,32 +95,97 @@ def _constraints(field: Any) -> dict[str, Any]:
     return result
 
 
+def _render_default(value: Any) -> dict[str, Any]:
+    """把字段默认值转成可下发的 JSON 值；不可下发（字典/Decimal 等）时返回空 dict。"""
+    if isinstance(value, (list, tuple)):
+        return {"default": list(value)}
+    if isinstance(value, (str, int, float, bool)):
+        return {"default": value}
+    return {}
+
+
+def render_value(value: Any) -> Any:
+    """把字段值转成可下发的 JSON 值；列表保序、标量原样、其余转字符串。"""
+    if isinstance(value, (list, tuple)):
+        return list(value)
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return str(value)
+
+
+def _sanitize_error(text: str) -> str:
+    """脱敏并截断校验错误：pydantic 会把出错的值回显在 input_value 里。"""
+    head = text.split(" [input_value=")[0]
+    lines = [line.strip() for line in head.splitlines() if line.strip()]
+    return (lines[-1][:200] if lines else "") or "配置解析失败"
+
+
+def _expected_instance(model: type[BaseSettings]) -> tuple[BaseSettings | None, str]:
+    """构造「下次启动生效值」用的全新实例；坏配置返回 (None, 脱敏摘要)。
+
+    为什么单独构造：`expected_*` 是「按当前文件重新解析」的语义，与运行实例
+    （`current`）无关；坏配置只影响这一路，字段元数据与运行值仍要照常下发。
+    """
+    try:
+        return model(), ""
+    except Exception as e:  # noqa: BLE001 — 坏配置不得让设置页 500
+        return None, _sanitize_error(str(e))
+
+
 def build_settings_schema(
     model: type[BaseSettings],
     instance: BaseSettings | None = None,
     *,
+    running: bool = True,
     plugin: str = "",
     labels: dict[str, str] | None = None,
     hints: dict[str, str] | None = None,
     warnings: dict[str, str] | None = None,
     options: dict[str, list[str]] | None = None,
+    apply_when: dict[str, str] | None = None,
 ) -> list[dict[str, Any]]:
     """从 Settings 模型生成设置字段描述。
 
-    返回值只包含可 JSON 序列化内容，密钥字段不包含明文 ``current``。
-    ``instance`` 可由插件传入；为空时为展示配置创建一次模型实例。
+    三个时点必须分清（混用会让设置页显示「已生效」而实际没有）：
+
+    - `current` / `source`：**运行快照**——本进程正在用的值，以及它来自哪一层
+      （来源读按模型登记的快照，见 settings_env.register_model；渲染时未登记的
+      模型按当前层序现算、**不登记**——登记只发生在生效时刻）。
+      `running=False`（插件未装配/装配失败/无运行实例）时不展示这两项，item 带
+      `running: False`，由前端显示「无运行值」，而不是拿下次启动值冒充。
+    - `expected_value` / `expected_source`：按**当前文件与环境**重新解析得到的
+      「下次启动生效值/来源」；解析失败时置 `expectedAvailable=False` + 脱敏摘要。
+    - 密钥字段：下发 `configured`（**面板不再消费**——routes_settings_env 的徽章走
+      `_secret_effective` 按当前解析链活判定；此字段按运行实例快照取值，正是当年
+      「冻结在 import 期」病灶的形状。**不要**把它接回密钥面板：那会让删除后谎报
+      复活。保留仅为插件自描述用途。）
+
+    返回值只包含可 JSON 序列化内容，密钥字段不包含明文。
+
+    `apply_when`（字段名 → 采用时点）：声明该字段暂存后的采用时点语义，
+    未声明的字段回落 `"restart"`。取值约定：`restart`（重启进程生效，缺省）/
+    `next_run`（下次基准运行开始解析并冻结）/ `next_cleanup`（下次运行目录
+    清理时重读）。语义归属在模型侧——核心不认识插件字段，硬编码映射会让
+    每个非重启字段都得改核心；与 labels/hints 同形经参数传入是既有扩展面。
+
+    传参的键名口径必须记清：`labels` / `hints` / `warnings` / `apply_when` 按
+    **字段名**（log_level）查，`options` 按**环境键名**（LOG_LEVEL）查。调用方
+    以键名建前四张字典会恒落空且不报错（静默失去文案，字段仍正常渲染）。
     """
     settings: BaseSettings | None = instance
-    if settings is None:
+    if settings is None and running:
         try:
             settings = model()
         except Exception:  # noqa: BLE001 — schema 不应被无效配置阻断
             # 必填字段缺失或环境变量格式错误时，字段元数据仍可用于修复配置。
             settings = None
+    sources = model_sources(model) or model_source_snapshot(model)
+    expected, expected_error = _expected_instance(model)
     labels = labels or {}
     hints = hints or {}
     warnings = warnings or {}
     options = options or {}
+    apply_when = apply_when or {}
     result: list[dict[str, Any]] = []
     for name, field in model.model_fields.items():
         key = _field_key(model, name)
@@ -129,7 +199,12 @@ def build_settings_schema(
             "label": labels.get(name, _label_from_name(name)),
             "plugin": plugin,
             "secret": secret,
-            "restart": True,
+            # 采用时点：旧字段只有「重启生效」一义，静态 restart 改为可声明的
+            # applyWhen——benchmark 三参数是「下次运行采用」、keep_runs 是
+            # 「下次清理重读」，前端按它显示采用时点文案（写死「重启生效」会把
+            # 暂存的运行参数误标成要重启）。
+            "applyWhen": apply_when.get(name, "restart"),
+            "running": running,
         }
         if number_kind is not None:
             item["numberKind"] = number_kind
@@ -140,13 +215,26 @@ def build_settings_schema(
         if key in options:
             item["options"] = list(options[key])
         item.update(_constraints(field))
+        if running:
+            item["source"] = sources.get(key) or source_of(key)
         if field.default is not PydanticUndefined:
-            default = field.default
-            if not secret and default is not None:
-                if isinstance(default, (list, tuple)):
-                    item["default"] = list(default)
-                elif isinstance(default, (str, int, float, bool)):
-                    item["default"] = default
+            if not secret and field.default is not None:
+                item.update(_render_default(field.default))
+        elif field.default_factory is not None and not secret:
+            # 工厂字段（如 DB_PATH）：field.default 是 PydanticUndefined，默认值只有
+            # 调用工厂才知道——漏读会让设置页丢掉这一个键的默认值展示。工厂抛错或
+            # 返回不可下发值时只省略该键，不阻断整份 schema（与上面实例化失败仍保留
+            # 字段元数据同口径）。
+            try:
+                # 工厂签名是 Callable[[], Any] | Callable[[dict], Any] 的联合，联合调用
+                # mypy 无法判定实参个数，这里显式取零参形态：需要 validated_data 的工厂
+                # 会走下面的异常分支省略该键（schema 期拿不到实例数据）。
+                factory = cast(Callable[[], Any], field.default_factory)
+                factory_default = factory()
+            except Exception:  # noqa: BLE001 — 默认值展示失败不应阻断 schema
+                factory_default = None
+            if factory_default is not None:
+                item.update(_render_default(factory_default))
         if secret:
             # 只下发是否配置，不下发密钥内容；模型会按完整解析链读取值。
             if settings is None:
@@ -159,19 +247,19 @@ def build_settings_schema(
                     else secret_value
                 )
         else:
-            if settings is None:
-                item["current"] = None
+            if running:
+                item["current"] = (
+                    None if settings is None else render_value(getattr(settings, name))
+                )
+            if expected is None:
+                item["expectedAvailable"] = False
+                item["expectedError"] = expected_error or "配置解析失败"
             else:
-                value = getattr(settings, name)
-                if isinstance(value, (list, tuple)):
-                    item["current"] = list(value)
-                elif isinstance(value, (str, int, float, bool)) or value is None:
-                    item["current"] = value
-                else:
-                    item["current"] = str(value)
+                item["expectedAvailable"] = True
+                item["expected_source"] = source_of(key)
+                item["expected_value"] = render_value(getattr(expected, name))
         result.append(item)
     return result
-
 
 def staged_value(raw: str, setting_type: str) -> object:
     """把暂存文件中的字符串转换成前端控件可识别的值。"""
@@ -187,7 +275,26 @@ def normalize_setting(meta: dict[str, Any], raw: str) -> str:
     """按 schema 元数据校验并规范化一个暂存值。"""
     setting_type = meta.get("type")
     if setting_type == "multi":
-        parsed = json.loads(raw)
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            if "${" not in raw:
+                raise
+            # 整值模板草稿：原文不是 JSON，但 dotenv 回读会展开 ${VAR}，展开后
+            # 可能是合法数组——落盘原文（不做 json.dumps 规范化，否则模板被改写、
+            # 与回读的展开口径不一致），最终合法性由候选字节回读判定：展开后
+            # 非法在组合预检 409 且不落盘。json.loads 成功但元素非全字符串时不
+            # 放宽（类型仍按「须为 JSON 字符串数组」拒），与逐层解码只对胜出值
+            # 判类型同口径。
+            # 放宽不等于放行注入：multi 分支走不到通用 text 尾巴，两道拒绝必须
+            # 在此补上——换行会把 KEY=VALUE 行拆出伪键（可注入任意配置行，含
+            # 密钥名）；「 #」是 dotenv 行内注释起点，回读截断会写出与用户所见
+            # 不同的名单。
+            if "\n" in raw or "\r" in raw:
+                raise ValueError("值不能包含换行符")
+            if " #" in raw:
+                raise ValueError("值不能包含「 #」（dotenv 行内注释起点）")
+            return raw
         if not isinstance(parsed, list) or not all(
             isinstance(value, str) for value in parsed
         ):
@@ -209,7 +316,9 @@ def normalize_setting(meta: dict[str, Any], raw: str) -> str:
             else:
                 number_value = float(raw)
         except (TypeError, ValueError) as exc:
-            raise ValueError("须为数字") from exc
+            # 空串也走这条：前端可能把「没有运行值」的空输入框当成改动提交，报错要
+            # 直接点明正确路径（行内「恢复默认」），否则用户只会看到笼统的保存失败
+            raise ValueError("须为数字（留空不等于恢复默认；清空请用「恢复默认」）") from exc
         if not math.isfinite(float(number_value)):
             raise ValueError("须为有限数字")
         if "min" in meta and number_value < meta["min"]:

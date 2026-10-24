@@ -9,6 +9,7 @@
   /api/benchmark/export-recorded 导出为 cases/<feature>.fromweb.json；
 - CLI：python -m briefdesk.plugins.benchmark.cli（文件数据集，含网页导出的
   *.fromweb.json 自动回退）；
-- 运行：与生产同引擎同 AI 供应商，临时库经补丁 get_db/get_embed_db 隔离，
-  不触碰运行中应用的数据库连接。
+- 运行：与生产同引擎同 AI 供应商；隔离靠独立子进程——它自带 scratch 库与运行目录，
+  父进程的连接与内存派生状态（去重缓存、RAG 向量缓存）全程不受影响，界面侧也因此
+  不需要闸门或挂起。
 """

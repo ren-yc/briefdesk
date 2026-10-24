@@ -19,9 +19,11 @@
 #   and type-checking test-stub idioms is signature-level noise
 #   (see the [tool.mypy] comments in pyproject.toml); AGENTS.md notes the
 #   local gate additionally runs mypy over tests/
-# - secret scan runs on both event types, mirroring the pre-commit hook (which
-#   scans staged content only): PRs diff against origin/master, pushes against
-#   the pre-push commit. Guarding PRs alone would leave the direct-to-master
+# - secret / plan-reference / commit-message scans run on both event types via
+#   one scripts/ci_scan.py call (see the step's comment): PRs resolve the range
+#   from base.sha/head.sha's merge-base to the event head, pushes from the
+#   payload's before/after SHAs — never origin/master and never a HEAD~N guess.
+#   Guarding PRs alone would leave the direct-to-master
 #   path — the one this repo actually uses — unchecked.
 name: CI
 
@@ -48,12 +50,12 @@ jobs:
         python-version: ["3.12", "3.13", "3.14"]
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
       - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.python-version }}
           cache: pip
@@ -64,32 +66,23 @@ jobs:
           pip install -r requirements-dev.txt
           pip install -e . --no-deps
 
-      - name: Secret scan (PR diff)
-        if: github.event_name == 'pull_request'
-        run: |
-          git fetch origin master
-          python scripts/secret_scan.py --ref origin/master
+      # 事件范围扫描：范围只认事件载荷里的固定 SHA（PR 用 base/head，push 用
+      # before/after），由 scripts/ci_scan.py 解析并统一编排三项扫描。
+      # 旧实现用推送载荷的 commits 数组长度推算 HEAD~N——数组长度不等于第一父链
+      # 步数（含合并会错位、载荷截断会漏扫、根提交会越界），且取不到基线时会静默
+      # 换成别的范围。现改为：取不到基线先精确 fetch 该 SHA，仍失败即退出 2 阻断，
+      # 不静默改成全量或空范围（首次推送的全零 before 是已知空边界，照常扫描）。
+      - name: Event-range scans (secret / plan-reference / commit messages)
+        run: python scripts/ci_scan.py
 
-      # github.event.before is the all-zeros SHA on a branch's first push;
-      # fall back to origin/master there rather than scanning an empty diff.
-      - name: Secret scan (push diff)
-        if: github.event_name == 'push'
-        shell: bash
-        run: |
-          before="${{ github.event.before }}"
-          if [ -z "$before" ] || [ "$before" = "0000000000000000000000000000000000000000" ]; then
-            git fetch origin master
-            before="origin/master"
-          fi
-          python scripts/secret_scan.py --ref "$before"
-
-      # AGENTS.md's 4th gate. The pre-commit hook only runs the secret scan, so
-      # without this step the check rests on the author remembering it.
+      # AGENTS.md's 4th gate. The local hooks cover staged content (pre-commit)
+      # and the commit message (commit-msg), but a working-tree-only whitespace
+      # check goes blind once the problem is committed — so this step owns the
+      # committed-history side.
       # Diffing against the empty-tree SHA covers every tracked file instead of
       # a push range: same behaviour on push and PR, and no all-zeros base to
       # special-case. Verified clean at this baseline. AGENTS.md's local gates
-      # mirror this command, so committed whitespace issues surface before push
-      # (a working-tree-only check goes blind once the problem is committed).
+      # mirror this command, so committed whitespace issues surface before push.
       - name: Whitespace / conflict marker check
         run: git diff --check 4b825dc642cb6eb9a060e54bf8d69288fbee4904..HEAD
 
@@ -101,3 +94,86 @@ jobs:
 
       - name: Test (pytest)
         run: python -m pytest tests/
+
+  # 独立的 Linux 冒烟 job：只覆盖 POSIX 侧的子进程与终止语义（Windows job 跑不到
+  # 这些差异），不扩全量矩阵——全量仍只在 windows-latest 跑。选中的三个文件是纯
+  # Python（不需要 Node），也不跑 ruff/mypy：那两项与平台无关，Windows job 已覆盖。
+  # 进程所有权脚本的真实 spawn / 进程组信号清理只在 POSIX 上有行为级覆盖价值，
+  # 其协议用例随本 job 在真 Linux 上执行（Windows 上这些用例多数只能 skip）。
+  isolation-smoke:
+    name: Isolation smoke (linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      # headless runner 没有 Secret Service：让密钥层走「未配置」分支，避免与
+      # Windows 行为不同的 keyring 后端把冒烟 job 弄红
+      BRIEFDESK_KEYRING: "0"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+
+      # 依赖口径：先用锁文件（与全量 job 一致）——它顺带验证「锁文件在 3.12 + Linux
+      # 上也能装」。锁文件由 3.12（requires-python 下限）解析生成（见文件头部
+      # pip-compile 那行与 AGENTS 锁文件节：用高版本解析可能钉入排除低版本的 pin）；
+      # 若这里因 rapidocr/onnxruntime 之类重包在 3.12/Ubuntu 上缺轮子而装不上，
+      # 收窄为 pip install -e ".[dev]"（本 job 不跑 OCR
+      # 用例，装 [ocr] 重包是纯风险），并在本注释里记录原因与适用范围，不要默默改回去。
+      - name: Install dependencies (lockfile + editable package)
+        run: |
+          pip install -r requirements-dev.txt
+          pip install -e . --no-deps
+
+      # 只跑进程监管与隔离这一组：直接给路径而不是 -k 选择器——避免随将来新增文件
+      # 意外扩缩，也不依赖 nodeid 子串匹配。进程所有权用例在此获得真实的 POSIX
+      # 行为覆盖（真 spawn / 真进程组信号），Windows 全量矩阵只跑得到其协议部分。
+      - name: Test (benchmark runner contract + isolation + process ownership)
+        run: |
+          python -m pytest tests/test_benchmark_runner_contract.py tests/test_benchmark_isolation.py tests/test_smoke_process.py
+
+  # 独立 wheel 冒烟 job：构建 → wheel 资源清单断言 → 全新 venv 非 editable 安装 →
+  # 真进程启动（console script）+ HTTP 探活 + 真实写入（配置保存 / 用例导出 /
+  # 基准 runner / Web 基准运行与收尾）。形态对齐 isolation-smoke（单开 job、单版本、
+  # 直接跑入口），但 OS 与版本按需选择：主平台是 Windows，进程清理契约（terminate →
+  # 等待 → kill、文件占用导致删不掉）也是 Windows 特有的；Python 取 requires-python 下限。
+  wheel-smoke:
+    name: Wheel smoke (windows, py3.12)
+    runs-on: windows-latest
+    timeout-minutes: 30
+    env:
+      # headless runner 没有凭据管理器会话：密钥层走「未配置」分支
+      BRIEFDESK_KEYRING: "0"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+
+      # 只装锁文件：脚本需要的构建器（build）在锁里；被测应用装进脚本自建的
+      # 临时 venv，刻意不在本环境做 editable 安装——否则「装的是 wheel」会被掩盖。
+      - name: Install build tooling (lockfile)
+        run: pip install -r requirements-dev.txt
+
+      - name: Wheel smoke
+        run: python scripts/wheel_smoke.py
+
+      # sdist 与 wheel 的运行时资源必须同源：断言 sdist 成员集合、从 sdist 重建的 wheel
+      # 与直接构建的 wheel 数据成员一致，并对两件产物跑 twine check。构建全在脚本自建的
+      # 临时目录里，不碰 dist/，因此与本 job 的 wheel 构建互不干扰。
+      - name: sdist check
+        run: python scripts/sdist_check.py

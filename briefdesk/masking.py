@@ -90,7 +90,7 @@ _RUN_WS_SPLIT_RE = re.compile(r"([ －　]+)")
 def _classify_digits(digits: str) -> str | None:
     """去分隔符后的纯数字串 → 占位符；非已知 PII 形态返回 None。
 
-    NFKC 归一（复核 P3-13）：全角数字（０-９）与全角国家码「８６」经 NFKC
+    NFKC 归一：全角数字（０-９）与全角国家码「８６」经 NFKC
     转半角后参与长度与「86」前缀判定，否则「＋８６－１３８－...」这类全角
     国家码＋分隔符写法会漏脱敏（`digits` 由 isdigit 收集保留全角字符，
     ASCII `startswith("86")` 失配）。占位符不含数字，幂等性不受影响。
@@ -175,7 +175,7 @@ _SPACE_RE = re.compile(r"\s+")
 
 
 def normalize_subject(name: str | None) -> str:
-    """NFKC + 空白折叠/trip + 小写的主体名归一化；空输入返回 ""。
+    """NFKC + 空白折叠/strip + 小写的主体名归一化；空输入返回 ""。
 
     写入（dedup/merge 插件入库侧）与查询（db.get_items_by_subject/
     get_subject_count）共用同一规则，保证双向一致。
@@ -189,8 +189,15 @@ def normalize_subject(name: str | None) -> str:
 
 # ── 纯附件占位符判定（单源）──
 # 整条内容仅由方括号片段构成：[图片]/[image]/[语音]/[视频]… 及多片段拼接
-# "[图片][图片]"（重复形），与源侧 normalize 的占位符判定语义一致。
+# "[图片][图片]"（重复形）。与源侧判定是**两个方向都有差集**，不是包含关系：
+#   · 源侧更宽的一侧——weflow / weflow-legacy 有一条**前缀**分支
+#     `^\[(16 项附件词表)\]`，"[文件] 报告.pdf" 这类「占位符+正文」在源侧即按
+#     附件丢弃，而本正则要求**整条**都由方括号片段构成，不匹配它；
+#   · 本正则更宽的一侧——额外接受**多段拼接**（覆盖「一条消息连发多张图」）；
+#   · qqflow 侧最窄：`^\s*\[[^\]]+\]\s*$`（任意单段方括号，不依赖词表）。
+# 两侧都宁可多认：让占位符原文尽量不参与判重。
 # 消费方：pipeline 入口过滤（OCR 未启用时屏蔽纯占位符带图消息，不标
 # processed、可经回填窗口恢复）；dedup 原文哈希短路的排除项（占位符原文
-# 可对应不同图，防 qqflow 同文异图误判 SAME）。
+# 可对应不同图，防 qqflow 同文异图误判 SAME）；ocr 插件按它区分「整体替换」
+# 与「追加」两种改写形态。
 PLACEHOLDER_ONLY_RE = re.compile(r"^(?:\s*\[[^\]]+\])+\s*$")

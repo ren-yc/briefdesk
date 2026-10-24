@@ -6,7 +6,8 @@
 
 执行与生产同引擎路径：classify_batch / DedupEngine.check_dedup /
 judge_merge / summarize_title，经 briefdesk.ai_ports 端口调用真实供应商；
-运行环境见 providers.bench_environment（补丁式临时库，不动应用连接）。
+运行环境由**调用方**负责：runner 子进程经 providers.prepare_scratch 备好自己的
+scratch 库与 AI 端口；CLI 手工运行同样自建临时库（见 cli.run_benchmark）。
 """
 
 from __future__ import annotations
@@ -30,7 +31,6 @@ from briefdesk.plugins.benchmark.metrics import (
     aggregate_title,
     evaluate_classify_case,
 )
-from briefdesk.plugins.benchmark.providers import bench_environment
 from briefdesk.plugins.benchmark.schema import (
     BaseCase,
     CategoryDef,
@@ -53,6 +53,26 @@ logger = logging.getLogger(__name__)
 FEATURES: tuple[str, ...] = ("classify", "dedup", "merge", "title")
 
 FROMWEB_SOURCE_LABEL = "cases/*.fromweb.json"  # 网页导出用例的 dataset 标识（报告/JSON 溯源）
+
+
+def benchmark_config_snapshot() -> dict[str, Any]:
+    """返回不含密钥和 API 地址的实验配置快照。"""
+    return {
+        "max_concurrency": config.ai_max_concurrency,
+        "reasoning_effort": config.ai_reasoning_effort,
+        "json_mode": config.ai_json_mode,
+        "max_classify_tokens": config.max_classify_tokens,
+        "vision_enabled": config.ai_vision_enabled,
+        "vision_max_images": config.ai_vision_max_images,
+        "embedding_enabled": bool(config.embed_api_base),
+        "embedding_model": config.embed_model,
+        "embedding_batch_size": config.embed_batch_size,
+        "dedup_similarity_threshold": config.dedup_similarity_threshold,
+        "dedup_embed_threshold": config.dedup_embed_threshold,
+        "dedup_embed_top_k": config.dedup_embed_top_k,
+        "dedup_embed_fallback_threshold": config.dedup_embed_fallback_threshold,
+        "dedup_strong_threshold": config.dedup_strong_threshold,
+    }
 
 
 # ── 用例运行器 ──
@@ -229,14 +249,19 @@ def load_file_dataset(path: str | Path) -> DatasetFile:
     return load_dataset_file(path)
 
 
-async def load_web_cases(feature: str) -> list[BaseCase]:
+async def load_web_cases(
+    feature: str, cases_dir: str | Path | None = None
+) -> list[BaseCase]:
     """从 cases/<feature>.fromweb.json（网页导出）加载某功能全部用例。
 
     逐条校验，非法项跳过并告警；文件缺失/不可读返回空列表（见 store.list_fromweb）。
+    cases_dir 覆盖包内默认目录，见 store.fromweb_path。
     """
     from briefdesk.plugins.benchmark import store as bench_store
 
-    raw_cases = await bench_store.list_fromweb(feature)
+    raw_cases = await bench_store.list_fromweb(
+        feature, None if cases_dir is None else Path(cases_dir)
+    )
     cases, errors = bench_store.parse_cases_with_errors(feature, raw_cases)
     for err in errors:
         logger.warning("网页导出用例跳过: %s", err)
@@ -253,6 +278,7 @@ async def run_benchmark_cases(
     concurrency: int = 1,
     dataset_label: str | dict[str, str] = FROMWEB_SOURCE_LABEL,
     progress: Callable[[CaseProgress], None] | None = None,
+    run_id: str | None = None,
 ) -> tuple[dict[str, Any], dict[str, list[Any]]]:
     """在基准环境内运行指定功能用例。
 
@@ -262,9 +288,13 @@ async def run_benchmark_cases(
     CLI 传各数据集文件路径），写入报告供溯源。
     progress（可选）：每条用例 settle 后回调一次（成功/失败都算），
     CLI 据此输出评估进度；缺省无进度输出。
+    run_id：结果标识，缺省落回本地时间戳（父进程给定时以它为准）。
     """
     started = time.monotonic()
-    async with bench_environment(categories=category_defs):
+
+    async def _run_all() -> tuple[
+        dict[str, dict[str, float | int]], dict[str, list[Any]], dict[str, float]
+    ]:
         summaries: dict[str, dict[str, float | int]] = {}
         evals_by_feature: dict[str, list[Any]] = {}
         elapsed: dict[str, float] = {}
@@ -276,6 +306,9 @@ async def run_benchmark_cases(
             elapsed[feature] = round(time.monotonic() - f_start, 3)
             summaries[feature] = _aggregate(feature, evals)
             evals_by_feature[feature] = evals
+        return summaries, evals_by_feature, elapsed
+
+    summaries, evals_by_feature, elapsed = await _run_all()
     payload = _build_payload(
         summaries,
         evals_by_feature,
@@ -283,6 +316,7 @@ async def run_benchmark_cases(
         dataset_label,
         elapsed=elapsed,
         total_elapsed=round(time.monotonic() - started, 3),
+        run_id=run_id,
     )
     return payload, evals_by_feature
 
@@ -295,8 +329,9 @@ def _build_payload(
     *,
     elapsed: dict[str, float] | None = None,
     total_elapsed: float | None = None,
+    run_id: str | None = None,
 ) -> dict[str, Any]:
-    """结果 payload（run_id/模型信息/逐功能 summary+逐用例明细/测试用时）。
+    """结果 payload（run_id/模型信息/配置快照/逐功能明细/测试用时）。
 
     elapsed_sec 为墙钟耗时（秒）：顶层 = 整轮总用时；features[f] 内 =
     该功能用例执行用时（不含聚合）。
@@ -308,10 +343,15 @@ def _build_payload(
         return dataset_label
 
     return {
-        "run_id": time.strftime("%Y%m%d-%H%M%S"),
+        # run_id 由调用方给定时以它为准（父进程生成 → POST 响应、目录名与报告三处同源）；
+        # 缺省（手工/独立运行）才落回本地时间戳。
+        "run_id": run_id or time.strftime("%Y%m%d-%H%M%S"),
         "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         "model": config.ai_model,
-        "ai_api_base": config.ai_api_base,
+        # 推理强度与模型、端点同级记录：同一模型在不同强度下的结果不可互比，
+        # 报告必须自带这一项，否则事后无法判断某次运行到底发了什么参数
+        "reasoning_effort": config.ai_reasoning_effort,
+        "config": benchmark_config_snapshot(),
         "concurrency": max(1, concurrency),
         "elapsed_sec": total_elapsed,
         "features": {

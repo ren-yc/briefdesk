@@ -6,6 +6,7 @@ setup/activate/teardown 的顺序约束（对齐 main 启动顺序）、PLUGINS 
 
 import importlib.metadata
 import importlib.util
+import inspect
 import logging
 import sys
 from collections.abc import Iterable
@@ -13,6 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, cast
 
+from briefdesk import settings_env
 from briefdesk.config import Settings, config
 from briefdesk.plugin.base import (
     PLUGIN_GROUP,
@@ -23,6 +25,14 @@ from briefdesk.plugin.base import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _accepts_instance(callback: Any) -> bool:
+    """插件 settings_schema 是否接受 instance 形参（旧版第三方插件可能不接受）。"""
+    try:
+        return "instance" in inspect.signature(callback).parameters
+    except (TypeError, ValueError):  # 内建/不可内省的可调用对象
+        return False
 
 
 @dataclass
@@ -68,11 +78,12 @@ class PluginManager:
 
     def __init__(self, settings: Settings | None = None) -> None:
         self._settings = settings if settings is not None else config
-        self._records: dict[str, PluginRecord] = {}
-        """全部获取到的插件记录（含失败/禁用）"""
+        self._records: dict[str, PluginRecord] = {}  # 全部获取到的插件记录（含失败/禁用）
         self._discovered = False
         self._load_order: list[str] = []  # setup 成功顺序，teardown 逆序
         self._initialized: set[str] = set()
+        # 插件运行中的设置实例（运行快照来源）；由 _capture_settings 在 setup 后登记
+        self._plugin_settings: dict[str, Any] = {}
 
     # ── 发现 ──
 
@@ -231,9 +242,13 @@ class PluginManager:
                 self._fail_if_required(name)
                 continue
             self._mark(name, "loaded")
+            self._capture_settings(name, plugin)
             self._initialized.add(name)
             self._load_order.append(name)
             logger.info("插件已加载: %s %s", name, rec.version)
+        # 收口核对：PLUGINS_REQUIRED 名单内未发现/未列入 PLUGINS/互斥落选/未知
+        # 依赖/依赖环都不会走到上面的四个分支，只有这里能拦住
+        self._verify_required("装配")
 
     async def activate_all(self, ctx: PluginContext) -> None:
         """按加载序 activate；失败插件降级 failed（required 致命）。"""
@@ -242,15 +257,30 @@ class PluginManager:
             plugin = rec.plugin
             if plugin is None:
                 continue
+            # 依赖插件 activate 失败时依赖方不可用：_load_order 是拓扑序，检查时
+            # 依赖状态已定。继续 activate 会让依赖方在残缺环境里保持 loaded。
+            failed_deps = [
+                d
+                for d in rec.dependencies
+                if self._records.get(d) is not None
+                and self._records[d].status == "failed"
+            ]
+            if failed_deps:
+                await self._best_effort_teardown(name, plugin)
+                self._mark(name, "failed", f"依赖激活失败: {', '.join(failed_deps)}")
+                logger.error("插件 %s 因依赖激活失败而不可用: %s", name, rec.reason)
+                self._fail_if_required(name)
+                continue
             try:
                 await plugin.activate(ctx)
             except Exception as e:
-                # P2 修复：activate 失败同样 best-effort 回滚（该插件仍在
+                # activate 失败同样 best-effort 回滚（该插件仍在
                 # _load_order，关闭时 teardown_all 会按幂等契约再调一次）
                 await self._best_effort_teardown(name, plugin)
                 self._mark(name, "failed", f"activate 失败: {e!r}")
                 logger.exception("插件 %s activate 失败", name)
                 self._fail_if_required(name)
+        self._verify_required("激活")
 
     async def teardown_all(self) -> None:
         """按 setup 逆序 teardown（幂等）；单插件失败不影响其余。"""
@@ -370,11 +400,48 @@ class PluginManager:
             for n in sorted(active - ordered)
         ]
 
+    def _capture_settings(self, name: str, plugin: Plugin) -> None:
+        """登记插件运行中的设置实例（运行快照来源）；失败不影响装配。
+
+        为什么由 manager 统一保存：设置页要展示「本进程正在用的值」，而插件每次
+        `settings_schema()` 现场构造实例展示的是「按当前文件解析的值」——运行中
+        改过文件后两者不一致（配置无热应用，后者其实是下次启动值）。
+
+        动态运行配置插件（settings_model）：采用时点在每次运行开始，setup 期
+        缓存实例必然过期——只登记模型类型，运行值经 settings_snapshot() 在
+        schema 组装时从插件内存现读，不缓存实例。
+        """
+        model_getter = getattr(plugin, "settings_model", None)
+        if callable(model_getter):
+            try:
+                model = model_getter()
+            except Exception:
+                logger.exception("读取插件 %s 设置模型失败", name)
+                return
+            if model is not None:
+                settings_env.capture_model_sources(model)
+            return
+        getter = getattr(plugin, "settings_instance", None)
+        if not callable(getter):
+            return
+        try:
+            instance = getter()
+        except Exception:
+            logger.exception("读取插件 %s 运行设置实例失败", name)
+            return
+        if instance is None:
+            return
+        self._plugin_settings[name] = instance
+        settings_env.capture_model_sources(type(instance))
+
     def settings_schema(self) -> list[dict[str, Any]]:
         """返回插件的设置描述（核心 + 全部已发现的可选插件）。
 
-        不按启用状态筛选：可选插件禁用时用户仍需能预配置（启用前先填
-        必填项），自禁用（缺必填配置）时亦然；UI 对未加载插件组折叠展示。
+        不按启用状态筛选：可选插件禁用时用户仍需能预配置（启用前先填必填项），
+        自禁用（缺必填配置）时亦然；UI 对未加载插件组折叠展示。
+        已装配且登记了运行实例的插件，字段带的是**运行快照**（`current`/`source`）；
+        未装配/无运行实例的插件显式置 `running=False` 并抹掉 `current`/`source`，
+        避免把「按当前文件解析的下次启动值」冒充成运行值。
         """
         self.discover()
         result: list[dict[str, Any]] = []
@@ -384,8 +451,36 @@ class PluginManager:
             callback = getattr(rec.plugin, "settings_schema", None)
             if not callable(callback):
                 continue
+            instance = self._plugin_settings.get(name)
+            running = rec.status == "loaded" and instance is not None
+            # 动态运行配置：运行值来自插件内存快照（每次运行开始采用），不是 setup 缓存。
+            # 快照以字段名为键，这里翻译成环境键（schema item 的 key 口径）。
+            snapshot: dict[str, Any] | None = None
+            if rec.status == "loaded":
+                snap_getter = getattr(rec.plugin, "settings_snapshot", None)
+                if callable(snap_getter):
+                    try:
+                        snap = snap_getter()
+                        if isinstance(snap, dict):
+                            snapshot = {}
+                            model_getter2 = getattr(rec.plugin, "settings_model", None)
+                            model = model_getter2() if callable(model_getter2) else None
+                            if model is not None:
+                                for field_name, value in snap.items():
+                                    if field_name in model.model_fields:
+                                        snapshot[settings_env.field_env_key(model, field_name)] = value
+                        else:
+                            snapshot = None
+                    except Exception:
+                        logger.exception("读取插件 %s 运行快照失败", name)
+                        snapshot = None
             try:
-                fields = callback()
+                if _accepts_instance(callback):
+                    fields = callback(instance=instance, running=running)
+                else:
+                    # 第三方插件可能仍是旧的无参签名：退回调用并声明无运行值
+                    fields = callback()
+                    running = False
             except Exception:
                 logger.exception("读取插件 %s 设置 schema 失败", name)
                 continue
@@ -398,6 +493,16 @@ class PluginManager:
                 item = dict(field)
                 item["plugin"] = name
                 item["pluginStatus"] = rec.status
+                if not running:
+                    item.pop("current", None)
+                    item.pop("source", None)
+                    item["running"] = False
+                if snapshot is not None and item["key"] in snapshot:
+                    # 覆盖为本次运行真实采用的值：只动该键的 current（expected_*
+                    # 仍由 schema 侧按当前文件解析——「下次运行采用」语义不变）
+                    item["current"] = snapshot[item["key"]]
+                    item["source"] = "run"
+                    item["running"] = True
                 result.append(item)
         return result
 
@@ -414,7 +519,7 @@ class PluginManager:
         name = getattr(obj, "name", None)
         version = str(getattr(obj, "version", ""))
 
-        # 检查obj是不是一个有效的插件实例
+        # 最小契约校验：name 必须是非空字符串（插件其余能力各自按需探测）
         if not isinstance(name, str) or not name:
             self._record_failure(origin, "缺少有效的 name")
             return
@@ -522,3 +627,23 @@ class PluginManager:
     def _fail_if_required(self, name: str) -> None:
         if name in self._settings.plugins_required:
             raise PluginError(f"必选插件 {name} 装配失败: {self._records[name].reason}")
+
+    def _verify_required(self, phase: str) -> None:
+        """PLUGINS_REQUIRED 逐项核对（setup_all / activate_all 末尾各一次）。
+
+        未发现（entry point 缺失/ PLUGIN_PATH 未指到）或最终状态非 loaded
+        （未列入 PLUGINS 的自禁用、互斥落选、未知依赖、依赖环、setup/activate
+        失败、依赖激活失败）都在此致命中止——这些分支的既有 _fail_if_required
+        调用只在「名字确实在记录里且恰好走到该分支」时才触发。
+        """
+        for name in self._settings.plugins_required:
+            rec = self._records.get(name)
+            if rec is None:
+                raise PluginError(
+                    f"必选插件 {name} 未发现（{phase}）：检查 entry point 或 PLUGIN_PATH"
+                )
+            if rec.status != "loaded":
+                raise PluginError(
+                    f"必选插件 {name} 在{phase}后未就绪（{rec.status}）: "
+                    f"{rec.reason or '未启用'}"
+                )

@@ -7,7 +7,7 @@
 
 嵌入为硬依赖：ctx.ai 缺失或未启用嵌入（EMBED_* 未配置）时 setup 抛
 PluginDisabledError 自禁用——同 ocr 缺可选依赖、qqflow 缺必填配置的自禁用
-语义。raw_messages 仍是唯一事实源，rag 四表（chunks/embeddings/fts/skipped，另有 rag_meta）只是派生索引。
+语义。raw_messages 仍是唯一事实源，rag 五表（chunks/embeddings/fts/meta/skipped）只是派生索引。
 """
 
 from __future__ import annotations
@@ -40,6 +40,7 @@ from briefdesk.types import BatchContext
 logger = logging.getLogger(__name__)
 
 
+
 class RagPlugin(StagePlugin, WebPlugin):
     """检索问答插件（入口见模块底部 plugin 实例）。"""
 
@@ -61,12 +62,22 @@ class RagPlugin(StagePlugin, WebPlugin):
         # 维护循环的唤醒事件：reindex/降级自愈在循环休眠期踢一脚时立即
         # 执行回填，而不是干等一个维护间隔（默认 1h）后才生效
         self._kick_event = asyncio.Event()
+        self._settings: Any = None  # 运行中的设置实例（manager 登记运行快照）
 
-    def settings_schema(self) -> list[dict[str, Any]]:
+    def settings_instance(self) -> Any:
+        """运行中的设置实例（未装配时为 None）；PluginManager 据此下发运行快照。"""
+        return self._settings
+
+    def settings_schema(
+        self, instance: Any = None, *, running: bool = True
+    ) -> list[dict[str, Any]]:
+        """字段描述；instance/running 由 PluginManager 下发（时点语义见 settings_schema.py）。"""
         from briefdesk.plugins.rag.config import RagSettings
 
         return build_settings_schema(
             RagSettings,
+            instance,
+            running=running,
             plugin=self.name,
             labels={
                 "top_k": "向量召回条数",
@@ -106,7 +117,9 @@ class RagPlugin(StagePlugin, WebPlugin):
             )
         from briefdesk.plugins.rag.config import RagSettings
 
-        engine = RagEngine(RagSettings())
+        settings = RagSettings()
+        self._settings = settings
+        engine = RagEngine(settings)
         try:
             self._engine = engine
             set_engine(engine)
@@ -213,7 +226,7 @@ class RagPlugin(StagePlugin, WebPlugin):
 
         delete_items 会级联删 raw_messages → rag_chunks/FTS/向量随之孤儿化，
         gc_orphans 对账即清。事件驱动让删除秒级生效（此前最长滞留一个维护
-        周期，已删内容仍可被 /api/rag/ask 引用——复核 P2-24）。
+        周期，已删内容仍可被 /api/rag/ask 引用）。
         """
         if self._gc_task is not None and not self._gc_task.done():
             # 已有待跑/在跑的 GC：置脏由其收尾时再调度一轮，新删除不滞留
@@ -226,7 +239,7 @@ class RagPlugin(StagePlugin, WebPlugin):
 
     async def _run_gc(self) -> None:
         # handler 在存储锁内被调用：先让出执行权待发布方释放锁，
-        # maintenance_gc 自取存储锁（复核 P2-23）
+        # maintenance_gc 自取存储锁
         await asyncio.sleep(0)
         if self._engine is None:
             return

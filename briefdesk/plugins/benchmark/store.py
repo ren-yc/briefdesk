@@ -2,14 +2,14 @@
 
 用例不再写入数据库（原 benchmark_cases 表已移除；旧库遗留的同名空表无害），
 网页「导出当前列表为基准用例」直接把构造好的四类用例**导出**为
-cases/<feature>.fromweb.json（覆盖式，每功能一个文件），Web 运行与 CLI
-均从 cases/*.fromweb.json 加载（见 engine.load_web_cases）。
+用户用例目录下的 <feature>.fromweb.json（覆盖式，每功能一个文件），
+Web 运行与 CLI 均从该目录加载（见 engine.load_web_cases）。
 
 - 文件为 DatasetFile 顶层结构（feature/description/cases），与手写数据集同构，
   导出前逐条经 schema 模型校验（非法整批拒绝，不落盘）；
 - 原子写（同目录 .tmp + os.replace）；*.fromweb.json 已 gitignore
   （含真实群聊内容，禁止入 commit）；
-- 列举/清空只动插件包内 cases/ 目录，不触碰应用数据库。
+- 列举/清空只动**用户用例目录**，既不触碰应用数据库，也不写包里那份只读示例。
 
 四类用例的期望推导（build_*_cases_from_rows，期望=卡片当前状态这一
 「人工确认后」的事实）：
@@ -40,6 +40,7 @@ from typing import Any
 
 from pydantic import ValidationError
 
+from briefdesk import paths
 from briefdesk.config import config
 from briefdesk.plugins.benchmark.schema import (
     ClassifyCase,
@@ -50,9 +51,16 @@ from briefdesk.plugins.benchmark.schema import (
 
 logger = logging.getLogger(__name__)
 
-# 插件包内 cases/ 目录：网页导出的用例文件落在其中（*.fromweb.json，已 gitignore）
-CASES_DIR = Path(__file__).resolve().parent / "cases"
+# 插件包内 cases/ 目录：**只读**示例与夹具（随 wheel 分发）。
+# 网页导出的用例不写这里——安装包目录可能只读，示例也不该被用户数据覆盖。
+PACKAGE_CASES_DIR = Path(__file__).resolve().parent / "cases"
 FROMWEB_SUFFIX = ".fromweb.json"
+
+
+def user_cases_dir() -> Path:
+    """用户用例目录（网页导出 *.fromweb.json 与手写数据集）；每次调用求值。"""
+    return paths.benchmark_cases_dir()
+
 
 _CASE_MODELS: dict[str, Any] = {
     "classify": ClassifyCase,
@@ -62,9 +70,16 @@ _CASE_MODELS: dict[str, Any] = {
 }
 
 
-def fromweb_path(feature: str) -> Path:
-    """某功能的网页导出文件路径：cases/<feature>.fromweb.json。"""
-    return CASES_DIR / f"{feature}{FROMWEB_SUFFIX}"
+def fromweb_path(feature: str, cases_dir: Path | None = None) -> Path:
+    """某功能的网页导出文件路径：<cases_dir>/<feature>.fromweb.json。
+
+    缺省目录是**用户用例目录**而不是包内示例目录：导出与清空都只吃模块全局，
+    写回安装包目录在 wheel 下会失败，在源码树里则会用真实聊天内容覆盖只读示例。
+    cases_dir 显式传入时覆盖缺省：基准子进程读父进程给的用例快照，测试喂夹具
+    而不是覆盖用户导出的真实用例。
+    """
+    base = user_cases_dir() if cases_dir is None else Path(cases_dir)
+    return base / f"{feature}{FROMWEB_SUFFIX}"
 
 
 def new_case_id() -> str:
@@ -139,9 +154,11 @@ async def export_fromweb(
     return path
 
 
-def _read_fromweb(feature: str) -> list[dict[str, Any]]:
+def _read_fromweb(
+    feature: str, cases_dir: Path | None = None
+) -> list[dict[str, Any]]:
     """读取某功能的 fromweb 用例（文件缺失/非法 → 空列表 + WARNING）。"""
-    path = fromweb_path(feature)
+    path = fromweb_path(feature, cases_dir)
     if not path.exists():
         return []
     try:
@@ -162,12 +179,14 @@ def _read_fromweb(feature: str) -> list[dict[str, Any]]:
     return out
 
 
-async def list_fromweb(feature: str | None = None) -> list[dict[str, Any]]:
+async def list_fromweb(
+    feature: str | None = None, cases_dir: Path | None = None
+) -> list[dict[str, Any]]:
     """列出 cases/*.fromweb.json 中的用例（每项含 feature 字段；缺失/非法文件跳过）。"""
     features = [feature] if feature else list(_CASE_MODELS)
     out: list[dict[str, Any]] = []
     for f in features:
-        out.extend(_read_fromweb(f))
+        out.extend(_read_fromweb(f, cases_dir))
     return out
 
 
@@ -263,8 +282,7 @@ def build_classify_cases_from_rows(rows: list[dict[str, Any]]) -> list[dict[str,
     期望分类为空的卡片跳过（无有效 ground truth）；**已忽略卡片**
     （is_verified=-1）作为噪声样本进入 messages、不写期望——它们是 AI
     误分类上来的闲聊/噪声（人工标记应丢弃），模型不应输出分类结果
-    （输出即计为误报）。返回用例主体列表，由调用方导出为
-    cases/classify.fromweb.json。
+    （输出即计为误报）。返回用例主体列表，由调用方导出到用户用例目录。
     """
     cases: list[dict[str, Any]] = []
     batch_msgs: list[dict[str, Any]] = []

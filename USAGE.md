@@ -22,6 +22,14 @@ python main.py                   # 或 python -m briefdesk / briefdesk
 
 浏览器打开 `http://localhost:3000`。
 
+**从索引安装（发布版）**：`pip install briefdesk`（可选图片 OCR：`pip install "briefdesk[ocr]"`），
+用 `briefdesk` 启动；配置与数据目录位置同源码安装（只有源码/editable 模式才读项目根 `.env`）。
+
+**试用预发布版（TestPyPI）**：试发版本（`0.1.0.devN`）必须两段式装，每段只对一个索引——
+先 `pip install --no-deps --index-url https://test.pypi.org/simple/ briefdesk==0.1.0.devN`，
+再把依赖从正式 PyPI 装上（清单见 `pip show briefdesk` 的 Requires）。不要用
+`--extra-index-url` 一步装：pip 跨索引取最高版本，会被 TestPyPI 上别人试传的同名依赖影子化。
+
 ## 2. 首次使用（3 步向导）
 
 首次打开页面会弹出向导（仅当从未完成且未启用任何群聊时）：
@@ -55,7 +63,7 @@ python main.py                   # 或 python -m briefdesk / briefdesk
 ### 状态与同步
 
 - 顶部状态胶囊显示消息源连接状态与同步进度（新增条数、处理中/已完成）。
-- 手动触发：**设置 → 同步消息** 或向导中的 **开始同步**。
+- 手动触发：顶栏 **同步消息** 按钮，或向导中的 **开始同步**。
 - 周期同步：配置 `POLL_INTERVAL_SECONDS > 0` 后自动按间隔补齐 SSE 断连窗口的消息。
 
 ## 4. 设置
@@ -106,5 +114,12 @@ A: 需同时满足：`AI_VISION_ENABLED=true`、`ocr` 插件已启用、模型�
 
 ## 7. 数据与隐私
 
-- 所有数据存于本地 SQLite（`briefdesk.sqlite`，可经 `DB_PATH` 配置）；消息内容经脱敏后处理，密钥走系统钥匙串不落明文。
+- 所有数据存于本地 SQLite，默认落在平台用户数据目录（Windows `%LOCALAPPDATA%\briefdesk\data\briefdesk.sqlite`，
+  可经 `DB_PATH` 覆盖）；消息内容经脱敏后处理，密钥走系统钥匙串不落明文。
+- 配置文件（UI 暂存）在 `%LOCALAPPDATA%\briefdesk\settings.env`；基准用例/报告在 `…\briefdesk\benchmark\`、
+  运行目录在 `…\briefdesk\Cache\benchmark\runs\`（可用 `BRIEFDESK_DATA_DIR` / `BRIEFDESK_CACHE_DIR` /
+  `BRIEFDESK_SETTINGS_FILE` 重定向，这三个变量只读进程环境变量）。
+- **旧版本的数据不会被自动发现或迁移**：默认库路径与配置文件位置都变了，旧位置的文件保持原样、不再被读取；
+  本版本不提供旧库的迁移、导入或兼容转换指引。
 - 导出与备份：`GET /api/export/items`（CSV）、`GET /api/backup`（SQLite 备份下载）、`POST /api/restore`（上传恢复，重启生效）。
+  恢复时原库会保留为 `{DB_PATH}.pre-restore`（只留最近一代，含隐私数据，已在 `.gitignore` 中排除），替换失败会自动回滚并保留待恢复文件。

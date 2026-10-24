@@ -1,11 +1,11 @@
 """SPA 静态托管（server 子包）：/ 与 ui/ 静态文件 + SPA 兜底。
 
-从原 server.py 拆出（P5 子包化）：本模块导入即向 `briefdesk.server.app`
-注册 / 路由并挂载兜底 mount（必须位于插件路由之后——include_plugin_router
+导入即向 `briefdesk.server.app` 注册 / 路由并挂载兜底 mount（必须位于插件路由之后——include_plugin_router
 会把插件路由插到本 mount 之前）。
 """
 
 import os
+from pathlib import Path
 
 from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
@@ -13,7 +13,10 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from briefdesk.server.app import app
 
-_UI_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "ui")
+# 包内相对路径：本文件 → briefdesk/server，上溯两层到包根 briefdesk/，再进 ui/。
+# 绝不用 importlib.resources.as_file()：它是上下文管理器，退出即删临时目录，
+# 撑不住长生命周期的 StaticFiles mount；wheel 是解压安装，包目录天然是磁盘路径。
+_UI_DIR = str(Path(__file__).resolve().parent.parent / "ui")
 
 
 @app.get("/")

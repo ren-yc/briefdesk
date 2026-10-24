@@ -79,8 +79,10 @@ async def ocr_image_bytes(content: bytes) -> str:
         logger.debug("图片无文字，返回空结果 (%d bytes)", len(content))
         return ""
     except Exception as e:
-        # 仅 DEBUG：唯一调用方（ocr 插件 enrich）按"跳过 OCR、卡片仍以原文入库"
-        # 记 WARNING。此处再打 ERROR 既重复又抬高了严重度——OCR 失败不阻断管道。
+        # 仅 DEBUG：调用方 ocr_images_bytes 已逐图捕获（该图跳过、继续同消息
+        # 其余图片），整批全失败也只返回空串、不冒泡——ocr 插件那侧的 WARNING
+        # 兜的是批量入口自身的非预期异常，不是单图失败。此处再打 ERROR 既重复
+        # 又抬高了严重度——OCR 失败不阻断管道。
         logger.debug("OCR 识别失败 (%d bytes): %s", len(content), e)
         raise
 
@@ -104,7 +106,7 @@ async def ocr_images_bytes(contents: list[bytes]) -> str:
         try:
             text = await ocr_image_bytes(content)
         except Exception:  # noqa: BLE001 — 单图失败跳过继续，不放弃后续图
-            # 复核 P3-7：此前循环内无逐图 try，第 N 张图非 RapidOCRError 异常
+            # 此前循环内无逐图 try，第 N 张图非 RapidOCRError 异常
             # 会使同消息后续图片的 OCR 全部放弃。单图失败只丢该图，其余照常。
             logger.debug("第 %d 张图片 OCR 失败，跳过继续", i)
             continue

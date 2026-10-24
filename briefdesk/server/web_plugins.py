@@ -4,8 +4,7 @@
 - `/plugin-assets/{name}/{path}`：插件静态资源（浏览器直连）
 - `include_plugin_router`：把插件路由展开插到 SPA mount 之前
 
-从原 server.py 拆出（P5 子包化）：本模块导入即向 `briefdesk.server.app`
-注册插件相关路由。
+导入即向 `briefdesk.server.app` 注册插件相关路由（装配顺序见 server/__init__.py）。
 """
 
 from collections.abc import Callable
@@ -116,7 +115,7 @@ def include_plugin_router(router: APIRouter) -> None:
     key = id(router)
     if key in _included_router_ids:
         return
-    # 同源校验契约（复核 P2-11）：middleware 仅对 /api/ 前缀的变更方法做
+    # 同源校验契约：middleware 仅对 /api/ 前缀的变更方法做
     # CSRF 校验——插件路由挂在其它前缀会静默失去防线，装配期硬失败
     for r in router.routes:
         if isinstance(r, APIRoute) and not r.path.startswith("/api/"):
@@ -155,7 +154,8 @@ async def plugin_assets(name: str, path: str):
 
 
 def _no_cache_file(file):
-    """插件资源随插随改：响应带 no-cache，浏览器每次向服务端校验证书。"""
+    """插件资源随插随改：响应带 no-cache，浏览器每次用前都要向服务端重新验证
+    （revalidate）缓存是否新鲜——不验证就直接复用会拿到改前的旧 ui.js/ui.css。"""
 
     response = FileResponse(file)
     response.headers["Cache-Control"] = "no-cache"

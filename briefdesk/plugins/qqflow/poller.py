@@ -146,8 +146,8 @@ async def poll(
     total_self = 0  # IGNORE_SELF 预滤的自消息数（不进管道、不标记 processed）
     not_ready_skips = 0
     session_idx = 0
-    # 不再查 /api/v1/group-members：其 groupNickname 与消息自带的 senderName
-    # 是上游同一条 display_sender 链的产物，纯冗余（每个启用群省一次请求）。
+    # 不再查 /api/v1/group-members：每群省一次请求。理由（display_sender 链
+    # 单一来源）见 client.fetch_contacts 上方的说明，不在此复述。
 
     for session in enabled_sessions:
         session_idx += 1
@@ -238,9 +238,20 @@ async def poll(
                     break
             else:
                 logger.warning(
-                    "%s达到翻页守卫上限 %d 页，可能未拉完窗口内消息",
+                    "%s达到翻页守卫上限 %d 页，窗口未拉完；水位保持不推进（该状态不会自愈："
+                    "窗口只增不减，下轮必再触顶；需调大上限或停用再启用会话缩小窗口）",
                     log_prefix,
                     max_pages,
+                )
+                # 记入 failed_sessions：poll_cycle 据此跳过该会话水位推进
+                # （否则窗口内未拉到的更早消息永久漏拉，且无法再找回）。代价是该
+                # 会话不会自愈：翻页只能从最新向旧推进，窗口起点不变、新消息又
+                # 持续到达，下轮必再触顶。保留水位换取可恢复性——调大上限后尾部
+                # 仍可拉到；若照常推进，尾部消息就永久丢失。
+                result.failed_sessions.add(session_id)
+                result.session_errors[session_id] = (
+                    f"翻页达到守卫上限 {max_pages} 页，窗口未拉完；水位不推进且不会自愈，"
+                    "需调大翻页上限或停用再启用该会话缩小回填窗口"
                 )
 
             session_new = session_processed = 0

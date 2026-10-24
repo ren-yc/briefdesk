@@ -1,8 +1,8 @@
-"""Lucide 图标拉取脚本（ui/icons/ vendored 子集的唯一来源通道）。
+"""Lucide 图标拉取脚本（briefdesk/ui/icons/ vendored 子集的唯一来源通道）。
 
 - 钉定 lucide-static 版本（``LUCIDE_STATIC_VERSION``），禁止整库拷贝、
-  禁止引入第二图标库（约定见 ui/icons/README.md）；
-- ``add`` 逐个拉取并自动登记 ui/icon-manifest.txt（单一事实来源）；
+  禁止引入第二图标库（约定见 briefdesk/ui/icons/README.md）；
+- ``add`` 逐个拉取并自动登记 briefdesk/ui/icon-manifest.txt（单一事实来源）；
 - ``check`` 校验清单全部图标在钉定版本可拉取且格式能被前端内联管线接受；
 - ``show`` 打印当前钉定版本。
 
@@ -23,16 +23,16 @@ import urllib.request
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-ICONS_DIR = REPO_ROOT / "ui" / "icons"
-MANIFEST = REPO_ROOT / "ui" / "icon-manifest.txt"
+ICONS_DIR = REPO_ROOT / "briefdesk" / "ui" / "icons"
+MANIFEST = REPO_ROOT / "briefdesk" / "ui" / "icon-manifest.txt"
 
 # 钉定的 lucide-static 版本。升级流程：先 `python scripts/fetch_icons.py check`
 # 确认清单全部图标在新版本仍可拉取（未被改名/移除），再改本常量并同步更新
-# ui/icons/README.md 的「版本记录」，最后跑 tests/test_icon_manifest.py 与
+# briefdesk/ui/icons/README.md 的「版本记录」，最后跑 tests/test_icon_manifest.py 与
 # tests/test_fetch_icons_script.py。
 LUCIDE_STATIC_VERSION = "1.34.0"
 
-# 与 ui/app.js 的 _SVG_CONTENT_RE / tests/test_icon_manifest.py 保持一致：
+# 与 briefdesk/ui/app.js 的 _SVG_CONTENT_RE / tests/test_icon_manifest.py 保持一致：
 # 可选前置 XML 注释 + <svg> 根标签；不满足的文件会被前端内联管线静默拒绝，
 # 退回 <img> 形态、深色模式恒黑。
 _SVG_CONTENT_RE = re.compile(r"^\s*(?:<!--[\s\S]*?-->\s*)*<svg[\s>]")
@@ -117,6 +117,15 @@ def check_icons(
 
 
 def _main(argv: list[str] | None = None) -> int:
+    # 输出统一 UTF-8：Windows 控制台默认 ANSI 代码页，直接打印中文（可用/错误）
+    # 会抛 UnicodeEncodeError，把一条可读的失败信息变成栈回溯（与 benchmark CLI 同约定）。
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            try:
+                reconfigure(encoding="utf-8", errors="replace")
+            except (OSError, ValueError):
+                pass
     parser = argparse.ArgumentParser(
         description="从钉定版本的 lucide-static 拉取单个图标并登记清单。"
     )

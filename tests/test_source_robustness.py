@@ -1,4 +1,4 @@
-"""消息源健壮性修复测试（审查报告 P1/P2/P3 项）。
+"""消息源健壮性修复测试：翻页穷尽、SSE 读超时、注册拒绝不记忆化、事件去重等。
 
 覆盖：
 - qqflow fetch_sessions 大 limit（会话发现截断坑，对齐 weflow-legacy 同接口）
@@ -14,12 +14,14 @@
 """
 
 import asyncio
+import json
 import os
 import unittest
 from unittest.mock import AsyncMock, Mock, patch
 
 import httpx
 import pytest
+import qqflow_sdk
 
 from briefdesk.config import config
 from briefdesk.plugins.qqflow.client import (
@@ -75,7 +77,7 @@ def _qq_message_new_event(rawid: str = "r1") -> dict:
 
 
 class TestQqFlowFetchSessionsLimit:
-    """【1·P1】fetch_sessions 必须按大页大小翻页取尽，否则被上游默认 100 截断。
+    """fetch_sessions 必须按大页大小翻页取尽，否则被上游默认 100 截断。
 
     page_size=10000 = 上游 limit 硬上限：典型规模一个请求即取尽（与旧
     「显式大 limit」实现请求数相同）；旧上游若忽略 offset，共享「本页无
@@ -83,22 +85,28 @@ class TestQqFlowFetchSessionsLimit:
     """
 
     async def test_fetch_sessions_pages_with_max_page_size(self):
-        client = QqFlowClient("http://127.0.0.1:5032", "tok")
-        captured: dict = {}
+        """断言落在真实请求上：首页带 limit=10000 与 offset=0。
 
-        async def fake_get(path, *, params=None, not_found_ok=False):
-            captured["path"] = path
-            captured["params"] = params
-            return {"sessions": []}
+        翻页与终止条件由 SDK 负责（该面没有 hasMore，以空页终止），因此这里
+        只钉「请求形状」——它正是「被上游默认 100 截断」那个坑的入口。
+        """
+        seen: list[httpx.Request] = []
 
-        client._get = fake_get  # type: ignore[method-assign]
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen.append(request)
+            return httpx.Response(
+                200, json={"success": True, "count": 0, "sessions": []}
+            )
+
+        client = TestRegisterConflictHttp._client_with(handler)
         await client.fetch_sessions()
-        assert captured["path"] == "/api/v1/sessions"
-        assert captured["params"] == {"limit": 10000, "offset": 0}
+        assert str(seen[0].url).split("?")[0].endswith("/api/v1/sessions")
+        assert seen[0].url.params["limit"] == "10000"
+        assert seen[0].url.params["offset"] == "0"
 
 
 class SseReadTimeoutTest(unittest.TestCase):
-    """【2·P1】两源 SSE 读超时：config 字段默认值 + 客户端 Timeout 构造。
+    """两源 SSE 读超时：config 字段默认值 + 客户端 Timeout 构造。
 
     默认值断言与进程环境隔离：patch.dict 下 pop 两个 READ_TIMEOUT 环境变量
     并以 `_env_file=None` 跳过 .env，只验证字段默认值；客户端级换算改为
@@ -161,7 +169,7 @@ class SseReadTimeoutTest(unittest.TestCase):
 
 
 class EnsureReadyRejectedStateTest(unittest.IsolatedAsyncioTestCase):
-    """【4·P2】ensure_ready 注册被拒（invalid_key 等）不得记忆化，下轮须重试。"""
+    """ensure_ready 注册被拒（invalid_key 等）不得记忆化，下轮须重试。"""
 
     def _make_client(
         self,
@@ -232,9 +240,9 @@ class EnsureReadyRejectedStateTest(unittest.IsolatedAsyncioTestCase):
     async def test_mismatch_error_is_not_a_not_ready_error(self):
         """最关键的防回归：账号不符**不能**被当成瞬态未就绪。
 
-        QqFlowNotReadyError 会被 poller/runtime 静默跳过本轮（poller.py:120 等），
-        若不符错误继承了它，这个修复就完全失效 —— 用户看不到 lastError，
-        他人消息继续静默入库。
+        QqFlowNotReadyError 会被 poller/runtime 静默跳过本轮（如 qqflow poller 的
+        `except QqFlowNotReadyError` 分支），若不符错误继承了它，这个修复就完全失效
+        —— 用户看不到 lastError，他人消息继续静默入库。
         """
         assert issubclass(QqFlowAccountMismatchError, SourceError)
         assert not issubclass(QqFlowAccountMismatchError, QqFlowNotReadyError), "不符是稳态故障，必须冒泡，不能走瞬态静默跳过的路径"
@@ -434,13 +442,20 @@ class TestRegisterConflictHttp:
 
     @staticmethod
     def _client_with(handler) -> QqFlowClient:
+        """把插件的 vendor SDK 客户端接到 MockTransport 上。
+
+        HTTP 现在由 SDK 承载（插件不再自持 REST 客户端），注入点是 SDK 内部的
+        httpx 客户端——那正是发出真实请求的一层；断言因此落在真实请求形状上。
+        """
         client = QqFlowClient(
             "http://127.0.0.1:5032", "tok", qq="123", key="k" * 16
         )
-        client._client = httpx.AsyncClient(
+        sdk = qqflow_sdk.Client("http://127.0.0.1:5032", "tok", timeout=30.0)
+        sdk._http = httpx.AsyncClient(
             base_url="http://127.0.0.1:5032",
             transport=httpx.MockTransport(handler),
         )
+        client._sdk = sdk
         return client
 
     async def test_register_conflict_raises_with_occupied_by(self):
@@ -466,7 +481,7 @@ class TestRegisterConflictHttp:
             await client.close()
 
     async def test_benign_state_still_returned_plainly(self):
-        """良性态返回值形状不变（D6 只加抛出，不改签名）。"""
+        """良性态返回值形状不变（只加抛出，不改签名）。"""
 
         def handler(request: httpx.Request) -> httpx.Response:
             return httpx.Response(200, json={"state": "accepted"})
@@ -493,7 +508,7 @@ class TestRegisterConflictHttp:
 
 
 class TestLookupLimit:
-    """【5·P2】回查链路 limit 提升为 _LOOKUP_LIMIT=200 且显式关闭空结果重试。"""
+    """回查链路 limit 提升为 _LOOKUP_LIMIT=200 且显式关闭空结果重试。"""
 
     async def test_weflow_lookup_uses_limit_and_no_retry(self):
         client = WeFlowLegacyClient("http://127.0.0.1:5031", "tok")
@@ -526,7 +541,7 @@ class TestLookupLimit:
 
 
 class TestWeflowSseDedup:
-    """【6·P2】weflow-legacy 监听器按 (event, rawid) 去重：同一事件重投只消费一次。"""
+    """weflow-legacy 监听器按 (event, rawid) 去重：同一事件重投只消费一次。"""
 
     async def test_duplicate_event_consumed_once(self):
         received: list = []
@@ -562,7 +577,7 @@ class TestWeflowSseDedup:
 
 
 class QqFlowEmptySenderKeptTest(unittest.TestCase):
-    """【决策 ②=保留未知】qqflow 空发送者不再入口丢弃（与 weflow/legacy
+    """qqflow 空发送者不再入口丢弃（与 weflow/legacy
     统一）：归一化阶段回退 sender_name="未知"。"""
 
     def test_pre_filter_sse_keeps_empty_sender(self):
@@ -578,7 +593,7 @@ class QqFlowEmptySenderKeptTest(unittest.TestCase):
 
 
 class TestLegacyMessagesNotFound:
-    """【复核 U1-1】legacy fetch_messages 暴露 not_found_ok：404 → 空信封
+    """legacy fetch_messages 暴露 not_found_ok：404 → 空信封
     （对齐 weflow/qqflow 的脏会话容错），轮询路径传 True。"""
 
     async def test_not_found_ok_returns_empty_envelope_and_propagates(self):
@@ -590,7 +605,7 @@ class TestLegacyMessagesNotFound:
         assert get_mock.call_args.kwargs.get("not_found_ok")
 
     async def test_retry_on_empty_404_with_not_found_ok_returns_none(self):
-        """复核 P3-16：retry_on_empty 的重试分支遇 404 且 not_found_ok=True
+        """retry_on_empty 的重试分支遇 404 且 not_found_ok=True
         应降级返回 None（与主路径同口径），而非 raise 令整会话失败。"""
 
         class _Empty:
@@ -627,7 +642,7 @@ class TestLegacyMessagesNotFound:
 
 
 class TestSseConnectLoopSurvivesGenericError:
-    """【复核 P1】_connect_loop 对非取消异常必须自愈：带栈记日志后退避重连。
+    """_connect_loop 对非取消异常必须自愈：带栈记日志后退避重连。
 
     此前只捕 CancelledError，畸形事件（如 data 帧为合法 JSON 但非对象时
     event.get 抛 AttributeError）会穿透 _listen 终结监听任务——实时通道
@@ -677,7 +692,7 @@ class TestSseConnectLoopSurvivesGenericError:
 
 
 class SseConnectLoopMismatchBackoffTest(unittest.IsolatedAsyncioTestCase):
-    """【P3-2】账号不符走 _connect_loop 专属长退避，不走通用指数退避。
+    """账号不符走 _connect_loop 专属长退避，不走通用指数退避。
 
     mismatch 是配置/运营问题（server 已绑定其他账号），指数退避的快速重试
     只会每轮重复 /health+/accounts 并刷 ERROR 栈。专属分支固定长退避、
@@ -748,7 +763,7 @@ class SseConnectLoopMismatchBackoffTest(unittest.IsolatedAsyncioTestCase):
 
 
 class TestStopDrainsBuffer:
-    """【8·P3】stop() 后冲刷批缓冲残余消息，aclose() 等待 in-flight 收尾。"""
+    """stop() 后冲刷批缓冲残余消息，aclose() 等待 in-flight 收尾。"""
 
     async def test_stop_flushes_buffered_message(self):
         received: list = []
@@ -869,7 +884,7 @@ class TestDrainTaskReset:
 
 
 class TestQqFlowControlEventStats:
-    """【9·P3】sync/ping 心跳不计入事件数与预过滤丢弃数。"""
+    """sync/ping 心跳不计入事件数与预过滤丢弃数。"""
 
     async def test_sync_and_ping_not_counted_as_events(self):
         """ping 喂的是手工构造帧：上游保活为注释行 `:ping`，而
@@ -937,7 +952,7 @@ class EndpointUrlPrefixTest(unittest.TestCase):
 
 
 class TestWeflowErrorBodySafeDecode:
-    """【10·P3】非 UTF-8 错误体不应让 UnicodeDecodeError 掩盖原始 API 错误。"""
+    """非 UTF-8 错误体不应让 UnicodeDecodeError 掩盖原始 API 错误。"""
 
     async def test_non_utf8_error_body_raises_runtime_error(self):
         def handler(request: httpx.Request) -> httpx.Response:
@@ -971,7 +986,7 @@ class _RecordingListener:
 
 
 class TestRuntimeCloseOrdering:
-    """【增量·P3】runtime.close()：stop → await listener.aclose → client.close。"""
+    """runtime.close()：stop → await listener.aclose → client.close。"""
 
     async def test_weflow_close_ordering_and_idempotent(self):
         from briefdesk.plugins.weflow_legacy.runtime import WeFlowLegacySource
@@ -1054,7 +1069,7 @@ class TestRuntimeCloseOrdering:
 
 
 class SseRawidGuardTest(unittest.TestCase):
-    """message.new 缺 rawid 的就地拦截（审查 A5）。
+    """message.new 缺 rawid 的就地拦截。
 
     rawid/serverId 是 msg_id 与 processed 标记的根基：缺失消息放行只会在
     去重键 ("message.new","") 碰撞与回填间反复投递，必须在 pre_filter 拦下。"""
@@ -1090,7 +1105,7 @@ class SseRawidGuardTest(unittest.TestCase):
 
 
 class TestSseSelfHealMismatch:
-    """SSE 自愈检查遇账号不符时必须冒泡中止本轮监听（D5 止漏）。
+    """SSE 自愈检查遇账号不符时必须冒泡中止本轮监听。
 
     这里跑的是 stream_events 真身：它自建 AsyncClient，故按 MockTransport 注入
     一个假的构造器，才能覆盖到「HTTP 200 之后」那段自愈逻辑。
@@ -1121,7 +1136,7 @@ class TestSseSelfHealMismatch:
         )
         with pytest.raises(QqFlowAccountMismatchError):
             await self._collect(client)
-        # 【P3-2】raise 绕过 stream_events 尾部收尾，状态必须已前置落 offline
+        # raise 绕过 stream_events 尾部收尾，状态必须已前置落 offline
         assert client.connection_status == "offline"
 
     async def test_other_self_heal_failure_still_swallowed(self):
@@ -1184,3 +1199,51 @@ class SseBufferCapTest(unittest.IsolatedAsyncioTestCase):
                     events = await self._collect(module_name, client)
                 # 超限前的合法事件照常产出，随后流被掐断
                 assert [e.get("rawid") for e in events] == ["r1"]
+
+
+class SseLineSeparatorRegressionTest(unittest.IsolatedAsyncioTestCase):
+    """data 行内的 U+2028 不得拆断事件（三源共用 iter_sse_data_events）。
+
+    httpx 的 aiter_lines 走 str.splitlines 语义（U+0085/U+2028/U+2029 均当换行），
+    上游 serde_json 不转义非 ASCII——真库复现：两条事件只收到一条。
+    """
+
+    async def _collect(self, module_name, client, ensure_ready=None):
+        def handler(request: httpx.Request) -> httpx.Response:
+            frames = "".join(
+                "data: " + json.dumps(payload, ensure_ascii=False) + "\n\n"
+                for payload in (
+                    {"event": "message.new", "rawid": "r1", "content": "a\u2028b"},
+                    {"event": "message.new", "rawid": "r2", "content": "c"},
+                )
+            )
+            return httpx.Response(
+                200,
+                headers={"content-type": "text/event-stream"},
+                content=frames.encode("utf-8"),
+            )
+
+        real_cls = httpx.AsyncClient
+        patch_target = f"briefdesk.plugins.{module_name}.client.httpx.AsyncClient"
+        if ensure_ready is not None:
+            client.ensure_ready = AsyncMock()  # type: ignore[method-assign]
+        with patch(
+            patch_target,
+            lambda **_kw: real_cls(transport=httpx.MockTransport(handler)),
+        ):
+            return [event async for event in client.stream_events()]
+
+    async def test_weflow_keeps_event_with_line_separator(self):
+        client = WeFlowClient("http://127.0.0.1:5033", "tok", wxid="wx")
+        events = await self._collect("weflow", client)
+        self.assertEqual([e["rawid"] for e in events], ["r1", "r2"])
+
+    async def test_legacy_keeps_event_with_line_separator(self):
+        client = WeFlowLegacyClient("http://127.0.0.1:5031", "tok")
+        events = await self._collect("weflow_legacy", client)
+        self.assertEqual([e["rawid"] for e in events], ["r1", "r2"])
+
+    async def test_qqflow_keeps_event_with_line_separator(self):
+        client = QqFlowClient("http://127.0.0.1:5032", "tok", qq="1", key="k" * 16)
+        events = await self._collect("qqflow", client, ensure_ready=True)
+        self.assertEqual([e["rawid"] for e in events], ["r1", "r2"])

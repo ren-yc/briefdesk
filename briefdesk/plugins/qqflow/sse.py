@@ -187,12 +187,9 @@ class QqFlowSseClient(DrainableListenerMixin, RealtimeListener[QqFlowClient]):
         # 与 weflow 监听器同一兜底）与 sync（水位对齐）都不是消息，计进统计会
         # 让「预过滤丢弃」虚增——每次重连这两类帧都会出现。
         #
-        # ping 当前不可达，列在这里是为对称与前瞻：上游保活是
-        # `KeepAlive::new().interval(25s).text("ping")`，线上字节为注释行
-        # `:ping`，而 client.stream_events 只解析 `data: ` 行，故心跳永不成为
-        # 事件。若上游哪天把保活改成 data 帧，缺这一项会让每 25s 一次的心跳
-        # 同时虚增「事件」与「预过滤丢弃」（+144/小时），"无消息即静默"的统计
-        # 行随之常亮——那才是这个统计最有用的性质。与 weflow 监听器一致。
+        # ping 与上面 ready/sync 同处理：「为何 ping 当前不可达、为何仍要列
+        # 进来」的完整说明见 weflow/sse.py 同位置（weflow 与 qqflow 同构、上游
+        # 同一套保活形态）；weflow-legacy 无此分支——那个源的上游不发心跳。
         etype = event.get("event", "")
         if etype in ("ready", "sync", "ping") or not etype:
             return

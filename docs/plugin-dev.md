@@ -65,7 +65,7 @@ plugin = MyPlugin()  # 模块底部必须暴露名为 plugin 的实例（entry p
 ```
 
 前端约定：`asset_dir` 目录下的文件经 `/plugin-assets/myplug/<path>` 服务（浏览器直连，可引用
-`/ui/app.js` 导出的助手）；`app.js` 提供的公共助手清单见 `tests/test_web_plugins.py` 的对账表
+`briefdesk/ui/app.js` 导出的助手）；`app.js` 提供的公共助手清单见 `tests/test_web_plugins.py` 的对账表
 （`esc`/`escAttr`/`showToast`/`registerPluginView` 等）。
 
 ## 2. StagePlugin 槽位契约
@@ -75,16 +75,21 @@ StagePlugin 参与消息处理管道。管道骨架 `briefdesk/pipeline.py` 按�
 
 | 槽位 | 调用时机 | 锁纪律 | 失败/早退语义 |
 |------|----------|--------|----------------|
-| `enrich` | 入口过滤后、分类前（OCR 等输入增强）；`before_run` 锁外、`run` 锁内 | `before_run` 锁外（网络调用只允许在这里）；`run` 锁内 | 可选插件缺失/禁用时 enrich 槽为空：纯占位符图片消息被入口过滤，混合消息降级纯文本；置位 `vision_without_ocr` 公告 |
-| `classify` | enrich 之后；对每批消息调 AI 并把 `ClassifyOutcome` 写入 `batch.outcomes` | `run` 锁内（严禁网络调用——预计算放 `before_run`） | 引擎抛错 → 整批进 `failed` 保留待回填；`outcomes` 缺失按契约违约整批保留 |
-| `dedup` | classify 之后；判重/入库/缓存 | `run` 锁内；`after_run` 向量落库内部持 `storage_lock`（含写锁重试退避，见 `engine.flush_pending_embeddings` 的锁内代价说明） | 判重失败的消息保留待回填；`processed` 标记只给确定终态的行 |
-| `post_insert` | 入库后的派生处理（合并、rag 索引） | `run` 锁内 | 单阶段异常只记日志，不回滚已入库卡片 |
+| `enrich` | 入口过滤后、分类前（OCR 等输入增强）；管道对每批在**锁外**直接调 `run` | **前段相：`run` 在 storage_lock 外**——取图字节等网络调用就是这里的正常工作；管道**不探测**本槽位的 `before_run`/`after_run`，写了不会执行 | 可选插件缺失/禁用时 enrich 槽为空：纯占位符图片消息被入口过滤，混合消息降级纯文本；置位 `vision_without_ocr` 公告 |
+| `classify` | enrich 之后；对每批消息调 AI 并把 `ClassifyOutcome` 写入 `batch.outcomes` | **前段相：`run` 锁外**——AI 请求即本阶段的核心工作；同样不探测 `before_run`/`after_run` | 引擎抛错 → 整批进 `failed` 保留待回填；`outcomes` 缺失按契约违约整批保留 |
+| `dedup` | classify 之后；判重/入库/缓存 | **存储相：`run` 在 storage_lock 内**；`before_run` 由管道在**锁外**调用（行规划/批内预嵌入等重活放这里）；`after_run` 批尾锁外执行，向量落库内部自持 `storage_lock`（含写锁重试退避，见 `engine.flush_pending_embeddings` 的锁内代价说明） | 判重失败的消息保留待回填；`processed` 标记只给确定终态的行 |
+| `post_insert` | 入库后的派生处理（合并、rag 索引） | **存储相：`run` 锁内**；`before_run`/`after_run` 与 dedup 同口径（锁外预计算、批尾锁外收尾） | 单阶段异常只记日志，不回滚已入库卡片 |
 
 通用规则：
 
-- **锁纪律**：`run` 在全局 `storage_lock`（`briefdesk.db`）内执行——单连接 + 隐式事务下，
-  锁外 commit 会把管道未完成的多步写一并提交。**任何远程/网络调用必须在 `before_run`
-  （锁外）完成**，`run` 内只有本地 SQLite。
+- **锁纪律**：管道分两套相位。**前段相**（enrich/classify 的 `run`）在
+  `storage_lock` 外执行，网络调用是这两个槽位的正常工作；**存储相**
+  （dedup/post_insert 的 `run` 与入口 raw 落库）在 `storage_lock` 内执行——
+  单连接 + 隐式事务下，锁外的 commit 会把锁内未完成的多步写提前提交。
+  存储相插件的网络调用与重活放 `before_run`（仅 dedup/post_insert 两个槽位
+  被管道探测）。锁内唯一允许的网络调用是判官类 chat（dedup 判票/strong、
+  merge 判官/标题）：判定与入库有批内顺序依赖（先行消息入库后后续判定要能
+  看到），不能移出锁；以 `_JUDGE_TIMEOUT`（45s）单请求超时约束最坏持锁时间。
 - **早退语义**：`process_all_batches` 在「无启用类别 / classify 或 dedup 阶段缺失 / 分类全失败」
   时返回 False——整批不标记 processed，回填窗口内自动重试；阶段插件不得自行标记
   processed 之外的行。
@@ -128,7 +133,8 @@ StagePlugin 参与消息处理管道。管道骨架 `briefdesk/pipeline.py` 按�
 2. **PLUGIN_PATH**：环境变量 `PLUGIN_PATH` 指向一个含插件模块的目录（本地开发用），
    框架按同样约定发现 `plugin` 实例。
 
-**启用**：`PLUGINS` 环境变量为可选插件的显式白名单（逗号分隔，无通配语义）——
+**启用**：`PLUGINS` 环境变量为可选插件的显式白名单（JSON 数组，如
+`PLUGINS=["weflow","qqflow"]`；无通配语义）——
 
 - 不在列表中的可选插件被禁用（disabled，原因「未启用」）；未知名打 WARNING。
 - `core = True` 的核心插件**恒装配**，不受 PLUGINS 过滤。
@@ -136,14 +142,17 @@ StagePlugin 参与消息处理管道。管道骨架 `briefdesk/pipeline.py` 按�
 - `conflicts` 声明互斥（如 weflow 与 weflow-legacy 二选一）：互斥对同时入选时按
   PLUGINS 列表位置先列者保留，落选者 disabled 并注明原因；**与核心插件互斥时可选侧
   让位**（核心恒胜）。
-- `PLUGINS_REQUIRED` 名单内的插件装配失败会抛 `PluginError` 致命中止启动（默认为空，
-  全部失败隔离降级）。
+- `PLUGINS_REQUIRED` 名单内的插件**未发现、未列入 `PLUGINS`、互斥落选、未知依赖/依赖环、
+  setup/activate 失败、依赖插件 activate 失败**都会抛 `PluginError` 致命中止启动（默认为空，
+  全部失败隔离降级）；可选插件自身失败不额外连坐依赖方，但依赖方会因「依赖激活失败」标 failed。
 
 ## 5. 事件订阅与端口获取
 
 **事件订阅**：核心事件总线 `briefdesk.events`（模块级单例 `event_bus`，main 注入
 PluginContext）。插件在 setup 里经 `ctx.subscribe_event(event, handler)` 订阅；
-handler 为**同步**函数（发布方在持锁路径上同步调用，处理器异常只记日志不传播）。
+handler 同步/异步均可：`events.py` 的 `publish` 对协程函数与返回 awaitable 的同步函数都会
+await；处理器异常只记日志不传播。发布方可能持存储锁调用（如删除卡片），需要与锁内写入保持原子
+的处理器（如 dedup 清缓存）应实现为同步函数，避免锁内 await。
 
 ```python
 from briefdesk.events import EVENT_ITEMS_DELETED
@@ -163,7 +172,8 @@ def _on_items_deleted(self, item_ids: list[str]) -> None:
 
 - `ctx.dedup`：`DedupService` 端口（dedup 插件 setup 注册）——同进程内共享去重缓存，
   merge 等后置阶段经此查询。
-- `ctx.ai`：`AIProvider` 端口（ai_provider 插件 setup 注册）——`chat`/`embed_texts` 等。
+- `ctx.ai`：`AIProvider` 端口（ai_provider 插件 setup 注册）——`chat`/`embed_texts` 等
+  （`chat` 可选 `timeout`/`max_retries`）。
   **引擎代码不要直接 import 供应商插件**：`briefdesk.ai_ports` 提供函数式端口
   （`ai_ports.chat(...)` 等），插件未装配时结构化报错。
 
@@ -175,12 +185,45 @@ def _on_items_deleted(self, item_ids: list[str]) -> None:
 - **配置类**：继承 `briefdesk.settings_base.KeyringSettingsBase`（pydantic-settings），
   用 `model_config` 设 `env_prefix`；字段注释写清对应环境变量与默认值。
 - **密钥字段**：`SecretStr` 类型 + 类级 `KEYRING_FIELDS` 映射（字段名 → 环境变量名）。
-  解析链：**系统密钥环（keyring）→ 环境变量 → .env → 默认值**；`repr`/序列化自动掩码。
-- **密钥写入**：`briefdesk secrets set <NAME>`（CLI）或 UI「设置 → 密钥」密钥区；
+  解析链：**init 参数 > 系统密钥环（keyring）> 环境变量 > 项目 .env > 用户暂存文件
+  （UI「设置」写入的 settings.env）> 默认值**；`repr`/序列化自动掩码。完整口径见
+  `briefdesk/settings_base.py` 的 `KeyringSettingsBase` docstring 与
+  `briefdesk/secrets_store.py` 的模块说明——漏掉「用户暂存文件」这层会让读者误以为
+  设置页保存的密钥不参与解析。
+- **密钥写入**：`briefdesk secrets set <NAME>`（CLI）或 UI「设置 → 启动配置」面板底部的
+  「密钥（系统钥匙串）」区；
   **禁止把真实密钥写进 .env 之外的任何仓库文件、日志或示例**。
-- **设置面板**：在插件 setup 里把 schema 注册给设置页（参考 rag 插件的
-  `build_settings_schema(RagSettings, plugin=...)`），字段类型/默认值/约束/密钥状态
-  由框架统一生成，密钥不回传明文。
+- **设置面板**：实现 `settings_schema(self, instance=None, *, running=True)` 并转调
+  `build_settings_schema(<你的 Settings>, instance, running=running, plugin=self.name, ...)`
+  （参考 rag 插件）——`instance`/`running` 由 `PluginManager` 下发：它在你的 setup 成功后
+  经可选的 `settings_instance()` 钩子取运行实例并登记来源快照，设置页展示的 `current`/`source`
+  才是「本进程正在用的值」；不实现这两个钩子的旧插件仍可用，只是字段不带运行快照
+  （框架按 `running=False` 展示「无运行值」）。字段类型/默认值/约束/密钥状态由框架统一生成，
+  密钥不回传明文。**文案参数按字段名传**：`labels` / `hints` / `warnings` / `apply_when`
+  的键是**字段名**（如 `top_k`），只有 `options` 按**环境键名**（如 `LOG_LEVEL`）——按环境
+  键名建前四张字典会恒落空且不报错（字段照常渲染，只是没有你的中文文案）。
+
+  **运行期才采用配置的插件**（采用时点晚于 setup，如 benchmark 的三个运行参数）应改声明两个可选钩子，
+  而不是 `settings_instance()`：
+
+  ```python
+  def settings_model(self) -> type[BaseSettings]:
+      """动态运行配置：manager 只登记模型类型，不缓存 setup 期实例。"""
+      from myplug.config import MySettings
+
+      return MySettings
+
+  def settings_snapshot(self) -> dict[str, Any]:
+      """当前活动运行的采用值（**字段名**为键）；没有活动运行返回 {}。
+
+      只读内存：不得读文件、不得构造新实例、不得访问网络——设置页与前端轮询都会调它。
+      """
+      return {...}
+  ```
+
+  manager 会把这些键翻译成环境键并覆盖对应行的 `current`（`source` 下发 `run`），`expected_*` 仍按当前文件
+  解析——于是「本次运行采用」与「下次运行采用」是两个可分辨的答案。没有活动运行时不要给 `current`：
+  拿「按当前文件解析的值」冒充运行值，正是运行中改配置后页面与实际不一致的成因。
 - **必填校验**：`briefdesk.plugin.config_helpers.validate_required_config(settings, {...})`
   统一检查必填项（缺失时一次性列出全部环境变量名），在 setup 抛 `PluginDisabledError`。
 

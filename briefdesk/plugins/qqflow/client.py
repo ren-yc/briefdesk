@@ -11,25 +11,27 @@
 """
 
 import asyncio
-import json
 import logging
 import time as time_module
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Any, Literal, TypedDict, cast
 
 import httpx
+import qqflow_sdk
+from qqflow_sdk import Client as QqFlowSdkClient
 
 from briefdesk.logger import fmt_dur
 from briefdesk.masking import clean_display_name
+from briefdesk.plugins._sdk_base import ReadinessGate
 from briefdesk.plugins.qqflow.config import QqFlowSettings
 from briefdesk.sources_base import (
-    MAX_SSE_BUFFER_BYTES,
     ConnectionStatus,
     MediaError,
     SourceClient,
     SourceError,
     build_endpoint_url,
     fetch_all_pages,
+    iter_sse_data_events,
     make_sse_timeout,
     with_connect_retry,
 )
@@ -124,24 +126,9 @@ logger = logging.getLogger(__name__)
 # 媒体下载大小上限：防止异常/恶意上游返回超大文件造成内存放大
 _MAX_MEDIA_BYTES = 20 * 1024 * 1024
 
-# 注册接口（POST /api/v1/accounts）返回的良性 state：已受理/引导中，视为可
-# 记忆，索引期内不重复注册。这是**注册结果**的词表，与 /health 的 account
-# 阶段值（unregistered/indexing/ready/error）是两套不相交的枚举 —— 曾经把它
-# 拿去比对健康状态，那个分支恒为假，"索引中不重复注册"的优化从未生效。
-_BENIGN_STATES = ("accepted", "in_progress", "already_ready")
-
-# /health 的 account 阶段值中，代表"服务端已在引导、无需再注册"的那些。
-_BOOTSTRAPPING_PHASES = ("indexing",)
-
-# /health 的 account 阶段值中，代表"服务端已被某个账号占用"的那些。上游
-# AccountPhase 恰好四值（unregistered/indexing/ready/error，snake_case 序列化），
-# 且刻意没有 awaiting_key 变体 —— 启动扫描发现但无人注册的账号一律折叠成
-# unregistered，所以这三个就是"有绑定"的全部取值。
-_BOUND_PHASES = ("indexing", "ready", "error")
-
 # 按消息回查 REST（IGNORE_SELF 方向判定）的单页条数：倒序响应下目标消息
 # 之后 120s 窗口内的新消息会把它挤出首页，50 条在刷屏场景不够，
-# 放宽到 200（审查报告【5·P2】）
+# 放宽到 200：50 条在刷屏场景下不够用
 _LOOKUP_LIMIT = 200
 
 
@@ -188,14 +175,27 @@ class QqFlowClient(SourceClient):
         if sse_read_timeout_ms is None:
             sse_read_timeout_ms = QqFlowSettings().sse_read_timeout_ms
         self._sse_read_timeout_s = sse_read_timeout_ms / 1000
-        self._client: httpx.AsyncClient | None = None
-        self._ready_checked = False
-        # 首次见到的上游版本号（/health 的 version 字段）：仅用于版本日志与
-        # 「上游可能不支持 offset」告警的文案（sources_base 的 upstream_version），
-        # 不参与任何行为判定
-        self._logged_version: str | None = None
-        # 串行化健康检查 + 引导注册（SSE 强制重检与轮询检查并发竞争时避免重复注册）
-        self._ready_lock = asyncio.Lock()
+        # 运行期消费 vendor SDK（随包分发的镜像，见 vendor/README.md）：
+        # REST / 分页 / 媒体 / 错误分类都由 SDK 负责，插件只保留业务逻辑
+        # （身份闸门、去重、归一化）。**SSE 是个例外**：SDK 的 watch() 自带
+        # 重连循环，没有「每次建连成功」的接缝，而本插件的身份闸门要求每次
+        # 建连强制重检（POLL_INTERVAL_SECONDS=0 时那是唯一一道闸门）——
+        # 换掉它只会弱化安全属性，因此 SSE 仍由本类自持。
+        self._sdk: QqFlowSdkClient | None = None
+        # 共享就绪门控：状态机本体（健康分诊/身份闸门/注册分诊）在
+        # _sdk_base.ReadinessGate；HTTP 细节以属性名注入（调用时解析，
+        # 测试的实例级打桩可见）。
+        self._gate = ReadinessGate(
+            owner=self,
+            health_attr="fetch_health",
+            accounts_attr="fetch_accounts",
+            register_attr="_register_via_gate",
+            log_errors_attr="_log_account_errors",
+            identity_attr="_check_bound_identity",
+            register_desc_attr="_register_desc",
+            version_label="qqflow-server",
+            log=logger,
+        )
         self.connection_status = "offline"
 
     def sse_timeout(self) -> httpx.Timeout:
@@ -211,79 +211,57 @@ class QqFlowClient(SourceClient):
 
     # ── 内部 ──
 
-    def _get_client(self) -> httpx.AsyncClient:
-        """获取共享的 httpx 客户端（懒初始化）。"""
-        if self._client is None:
-            self._client = httpx.AsyncClient(
-                base_url=self._base_url,
-                timeout=httpx.Timeout(30.0),
-            )
-        return self._client
+    def _api(self) -> QqFlowSdkClient:
+        """共享的 vendor SDK 客户端（懒初始化）。"""
+        if self._sdk is None:
+            self._sdk = QqFlowSdkClient(self._base_url, self._api_token, timeout=30.0)
+        return self._sdk
 
     def _auth_headers(self) -> dict[str, str]:
         return {"Authorization": f"Bearer {self._api_token}"}
 
-    async def _get(
+    async def _sdk_call(
         self,
-        path: str,
+        fn: Callable[[], Awaitable[Any]],
         *,
-        params: dict[str, Any] | None = None,
+        what: str,
         not_found_ok: bool = False,
     ) -> Any:
-        """通用 GET 请求，带错误处理。
+        """调 SDK，并把它抛出的错误翻译回本插件既有的分类。
 
-        Args:
-            path: API 路径，如 "/api/v1/sessions"
-            params: 查询参数
-            not_found_ok: 为 True 时，404 返回 None（由调用方降级处理）
+        SDK 的错误面是 (status, url)，插件的调用方（poller/runtime）按
+        「503 = 瞬态、静默跳过本轮」与「其余 = 错误」两档处理：503 → 复位
+        共享门控 + QqFlowNotReadyError；404 且 not_found_ok → None；其余
+        非成功状态 → RuntimeError。
 
-        Returns:
-            JSON 响应；not_found_ok 且上游返回 404 时为 None
-
-        Raises:
-            QqFlowNotReadyError: 服务端正在建索引（503 就绪门控，瞬态）
-            RuntimeError: 其他非成功状态
+        ``with_connect_retry`` 仍包一层：连接级重试是三源共享的 briefdesk
+        策略，不属于 SDK 的协议语义。
         """
-        client = self._get_client()
         start = time_module.perf_counter()
-        resp = await with_connect_retry(
-            lambda: client.get(path, params=params, headers=self._auth_headers())
-        )
-        logger.debug(
-            "GET %s%s → %s (%s)",
-            path,
-            f"?{resp.url.query.decode()}" if resp.url.query else "",
-            resp.status_code,
-            fmt_dur(time_module.perf_counter() - start),
-        )
-        # 先判状态码再解析 JSON：503 信封是合法 JSON，但需走瞬态语义
-        if resp.status_code == 503:
-            # 就绪门控（瞬态）：失效记忆化标志——服务端重启（内存态注册表丢失）
-            # 后，下一轮 ensure_ready 会重新健康检查 + 引导注册（自愈）
-            logger.debug("GET %s → 503（服务端索引期，瞬态）", path)
-            self._ready_checked = False
-            raise QqFlowNotReadyError(
-                f"qqflow-server 尚未就绪（503）: {resp.text[:200]}"
-            )
-        if not resp.is_success:
-            if not_found_ok and resp.status_code == 404:
+        try:
+            result = await with_connect_retry(fn)
+        except qqflow_sdk.StatusError as exc:
+            if exc.status == 503:
+                # 就绪门控（瞬态）：复位共享门控的记忆化标志（下轮重检）。
+                logger.debug("%s → 503（服务端索引期，瞬态）", what)
+                self._gate.reset()
+                raise QqFlowNotReadyError(
+                    f"qqflow-server 尚未就绪（503）: {exc}"
+                ) from exc
+            if not_found_ok and exc.status == 404:
                 return None
-            raise RuntimeError(
-                f"QqFlow API error: {resp.status_code} on {path} — {resp.text[:200]}"
-            )
-        return resp.json()
+            raise RuntimeError(f"QqFlow API error: {exc.status} on {what}") from exc
+        logger.debug(
+            "%s → ok (%s)", what, fmt_dur(time_module.perf_counter() - start)
+        )
+        return result
 
     # ── 账号引导 ──
 
     async def fetch_health(self) -> dict[str, Any]:
         """健康检查（免鉴权）。"""
-        client = self._get_client()
-        resp = await with_connect_retry(lambda: client.get("/health"))
-        if not resp.is_success:
-            raise RuntimeError(
-                f"QqFlow API error: {resp.status_code} on /health — {resp.text[:200]}"
-            )
-        return resp.json()
+        health = await self._sdk_call(self._api().health, what="/health")
+        return health.model_dump(by_alias=True)
 
     async def register_account(self, qq: str, key: str, db_path: str) -> str:
         """POST /api/v1/accounts 注册账号，返回 state。
@@ -295,22 +273,13 @@ class QqFlowClient(SourceClient):
         QqFlowAccountMismatchError —— 这里本来就持有整个响应 JSON，能把
         occupied_by 一并带进错误消息；返回值形状保持不变。
         """
-        client = self._get_client()
-        resp = await with_connect_retry(
-            lambda: client.post(
-                "/api/v1/accounts",
-                json={"qq": qq, "key": key, "db_path": db_path},
-                headers=self._auth_headers(),
-            )
+        outcome = await self._sdk_call(
+            lambda: self._api().register({"qq": qq, "key": key, "db_path": db_path}),
+            what="/api/v1/accounts",
         )
-        if not resp.is_success:
-            raise RuntimeError(
-                f"QqFlow API error: {resp.status_code} on /api/v1/accounts — "
-                f"{resp.text[:200]}"
-            )
-        data = resp.json()
-        state = data.get("state", "unknown")
+        state = outcome.state or "unknown"
         if state == "account_conflict":
+            data = outcome.body
             # 上游内存索引没有账号维度，同时只能绑定一个账号；重试不会自愈，
             # 得由人去注销占用方或改配置。
             raise QqFlowAccountMismatchError(
@@ -353,95 +322,50 @@ class QqFlowClient(SourceClient):
             f"请修正 QQFLOW_QQ，或注销占用方后重启服务端"
         )
 
+    @property
+    def _logged_version(self) -> str | None:
+        """白盒兼容面：已记录版本的真身在共享门控上。"""
+        return self._gate.logged_version
+    @_logged_version.setter
+    def _logged_version(self, value: str | None) -> None:
+        """白盒兼容面：版本号的真身在门控上（当前无生产写入路径，写入只
+        为测试复位观测面；门控自身在首次记录时赋值）。"""
+        self._gate._logged_version = value
+
+    @property
+    def _ready_checked(self) -> bool:
+        """白盒兼容面：记忆化标志的真身在共享门控上。"""
+        return self._gate.checked
+
+    @_ready_checked.setter
+    def _ready_checked(self, value: bool) -> None:
+        self._gate.checked = value
+
     async def ensure_ready(self, force: bool = False) -> None:
-        """确保服务端有就绪账号（记忆化，可强制重检）。
+        """确保服务端有就绪账号（健康检查驱动，记忆化，可强制重检）。
 
-        force=True 时忽略记忆化标志重新健康检查（SSE 重连后服务端可能已重启，
-        内存态账号注册表丢失，需重新引导注册）。
-        无 ready/引导中账号时用配置的 qq/key/db_path 自动注册；注册后进入
-        索引期，业务接口的 503 由 QqFlowNotReadyError 瞬态处理兜底，不在此
-        阻塞等待。引导中（_BENIGN_STATES）视为良性状态并记忆，索引期内不
-        重复注册；网络失败不记忆，下轮重试。
-
-        `/health` 只给一个标量 `account` 阶段（`unregistered` / `indexing` /
-        `ready` / `error`），不再列出账号 —— 该接口免鉴权，账号清单会向任何
-        调用方泄露本机存在哪些账号。明细在需鉴权的 `GET /api/v1/accounts`
-        （见 fetch_accounts）。
-
-        **正因为标量阶段不含身份，「服务端 ready」≠「我的账号 ready」**：上游
-        强制单账号绑定，若绑的是别人的账号，阶段一样报 ready。所以短路前必须
-        先确认身份 —— 双层判定：
-        1. 快路：从鉴权明细端点比对绑定账号（`_check_bound_identity`）；
-        2. 兜底：明细取不到（401/抖动）时不硬失败，照常走注册，由上游的
-           `account_conflict` 定夺（该守卫在密钥校验**之前**，是可靠的身份预言机）。
-        确认不符即抛 QqFlowAccountMismatchError，不记忆化。
+        状态机本体在共享基座（_sdk_base.ReadinessGate）：健康阶段分诊、绑定
+        账号身份闸门、良性/被拒态的注册分诊两平台同构；本类构造时把 HTTP
+        细节以属性名注入（fetch_health / fetch_accounts / _register_via_gate
+        / _log_account_errors / _check_bound_identity / _register_desc），
+        调用时解析，测试的实例级打桩对门控可见。
         """
-        if self._ready_checked and not force:
-            return
-        async with self._ready_lock:
-            # 锁内双检：并发调用（SSE 强制检查 vs 轮询检查）先到者注册并置位，
-            # 后到者在此短路，避免重复注册
-            if self._ready_checked and not force:
-                return
-            try:
-                health = await self.fetch_health()
-            except Exception:
-                self._ready_checked = False
-                raise
-            version = health.get("version")
-            if version and version != self._logged_version:
-                logger.info("qqflow-server 版本: %s", version)
-                self._logged_version = str(version)
-            phase = health.get("account", "unregistered")
-            logger.debug("健康检查: 账号阶段 %s", phase)
+        await self._gate.ensure_ready(force=force)
 
-            # 身份闸门：阶段说"有绑定"时，先确认绑的是不是自己的账号。
-            accounts: list[dict] = []
-            identity_ok = False
-            if phase in _BOUND_PHASES:
-                try:
-                    accounts = await self.fetch_accounts()
-                except Exception as e:  # noqa: BLE001 —— 取不到身份不硬失败
-                    logger.warning("账号明细不可用（%s），改由注册结果判定身份", e)
-                else:
-                    # 比对必须留在 else：else 不受上面 except 保护，
-                    # _check_bound_identity 的不符错误才能原样冒泡。挪进 try
-                    # 就会被那条宽 except 吞成一行 warning —— 正是本次要修的病。
-                    identity_ok = self._check_bound_identity(accounts)
+    async def _register_via_gate(self) -> tuple[str, str | None]:
+        """自持注册：register_account 返回 state；conflict 就地抛 Mismatch。
+        门控只要 (state, status) 元组分诊，这里把 str 适配成元组。
+        """
+        state = await self.register_account(self._qq, self._key, self._db_path)
+        return state, None
 
-            if identity_ok and phase == "ready":
-                self._ready_checked = True
-                logger.debug("已确认自有账号就绪，跳过注册")
-                return
-            if identity_ok and phase in _BOOTSTRAPPING_PHASES:
-                self._ready_checked = True
-                logger.debug("自有账号建索引中（%s），不再重复注册", phase)
-                return
-            if phase == "error":
-                # /health 只给标量，根因（密钥/路径填错的 error 字符串）只在需
-                # 鉴权的明细接口里。仍显式告警——否则用户只能看到业务接口持续
-                # 503，看不到原因。诊断失败不能挡住下面的注册重试。
-                # 明细已在上面取过就复用，避免对同一个 GET 打两次。
-                await self._log_account_errors(accounts)
-            # `error` 落到这里是有意的：服务端的 error 状态不释放绑定，但同一
-            # 账号可以直接重试注册来恢复（密钥修正后即生效）。
-            logger.info(
-                "无就绪账号（阶段 %s），注册账号 qq=%s (db_path=%s)",
-                phase,
-                self._qq,
-                self._db_path or "<默认>",
-            )
-            # account_conflict 由 register_account 就地抛 QqFlowAccountMismatchError
-            # （D6），不在此处分支。
-            state = await self.register_account(self._qq, self._key, self._db_path)
-            if state in _BENIGN_STATES:
-                self._ready_checked = True
-                logger.info("账号注册: state=%s", state)
-            else:
-                # 被拒态（invalid_key/invalid_db_path/unknown_qq 等）不记忆化：
-                # 保持未检查标志让下一轮 poll 的 ensure_ready 再次尝试注册；
-                # 否则零账号部署下没有业务 503 兜底复位标志，引导失败后永不自愈
-                logger.warning("账号注册被拒: state=%s（下轮重试）", state)
+    def _register_desc(self) -> str:
+        """门控「注册前 INFO」的平台描述（迁移前本插件自己打的原文案）。
+
+        身份上下文只有插件有（门控跨平台），以回调供词；纯字符串拼接，
+        不做 IO，不可能失败。
+        """
+        return f"注册账号 qq={self._qq} (db_path={self._db_path or '<默认>'})"
 
     async def _log_account_errors(self, accounts: list[dict] | None = None) -> None:
         """把 error 根因打出来（诊断专用，失败仅降级为 debug）。
@@ -473,16 +397,12 @@ class QqFlowClient(SourceClient):
         不是本地配置的账号，只能靠这里的 `qq` 字段（见 ensure_ready 的身份闸门）。
         取不到时不阻断，退化为由注册结果判定。
         """
-        client = self._get_client()
-        resp = await with_connect_retry(
-            lambda: client.get("/api/v1/accounts", headers=self._auth_headers())
+        accounts = await self._sdk_call(
+            self._api().accounts, what="/api/v1/accounts"
         )
-        if not resp.is_success:
-            raise RuntimeError(
-                f"QqFlow API error: {resp.status_code} on /api/v1/accounts — "
-                f"{resp.text[:200]}"
-            )
-        return resp.json().get("accounts", [])
+        # 转回 dict：门控与下游（_bound_account / _check_bound_identity /
+        # _log_account_errors）按 .get(...) 取值，且这是插件的既有契约。
+        return [a.model_dump(by_alias=True) for a in accounts]
 
     # ── REST API ──
 
@@ -498,8 +418,22 @@ class QqFlowClient(SourceClient):
         退化成 UID。传大 limit 只是把天花板抬到上游硬上限 10000，仍是猜值；
         翻页才是取尽。
         """
+        async def _page(_path: str, params: dict[str, Any]) -> dict[str, Any]:
+            """一页联系人（SDK 只做单页；翻页策略与「本页无新增」防御留在
+            briefdesk 共享层 fetch_all_pages，三源同规）。"""
+            limit = params.get("limit")
+            offset = params.get("offset")
+            page = await self._sdk_call(
+                lambda: self._api().contacts(
+                    limit=int(limit) if limit is not None else None,
+                    offset=int(offset) if offset is not None else None,
+                ),
+                what="/api/v1/contacts",
+            )
+            return page.model_dump(by_alias=True)
+
         rows = await fetch_all_pages(
-            lambda path, params: self._get(path, params=params),
+            _page,
             "/api/v1/contacts",
             key="contacts",
             dedup_key="username",
@@ -517,26 +451,28 @@ class QqFlowClient(SourceClient):
 
     # 不再有 fetch_group_members：/api/v1/group-members 的 groupNickname 与
     # 消息自带的 senderName 出自上游同一条 display_sender 链（本群群名片 >
-    # 备注 > 最新消息昵称 > 档案昵称 > UID），逐群再查一次纯属冗余。
+    # 备注 > 最新消息昵称 > 档案昵称 > UID），逐群再查一次纯属冗余。本节是
+    # qqflow 侧这份理由的权威版（poller 只写指针）；weflow 的结论相同但理由
+    # 不同（其 groupNickname 出自恒空的 group_cards），见 weflow/poller.py。
 
     async def fetch_sessions(self) -> list[QqFlowSession]:
         """获取所有会话列表（按 offset 翻页取尽，与 fetch_contacts 同模式）。
 
-        上游 limit 默认 100 且按最后消息时间倒序（上游 API 文档 §4：
-        https://github.com/ren-yc/qqflow-server/blob/v0.5.2/docs/qqflow-server-api.md），
+        上游 limit 默认 100 且按最后消息时间倒序（上游 API 文档 §4 allow-plan-ref，
+        指向下一行那个版本钉定的上游文档、非仓外一次性材料，属可回查引用）：
+        https://github.com/ren-yc/qqflow-server/blob/v0.5.2/docs/qqflow-server-api.md
         不翻页只会发现最近活跃的 100 个会话，更早的会话将永远无法被
         发现/启用/轮询。page_size=10000 = 上游 limit 硬上限：典型规模一个
         请求即取尽（与旧「显式大 limit」实现请求数相同）；旧上游若忽略
         offset，共享「本页无新增」防御立即告警终止，停在 10000 条——零回退。
         """
-        return await fetch_all_pages(
-            lambda path, params: self._get(path, params=params),
-            "/api/v1/sessions",
-            key="sessions",
-            dedup_key="username",
-            page_size=10000,
-            upstream_version=self._logged_version,
+        # 翻页与跨页重复折叠都由 SDK 负责（list_all_sessions 取尽到空页）；
+        # page_size=10000 = 上游 limit 硬上限，典型规模一个请求取尽。
+        sessions = await self._sdk_call(
+            lambda: self._api().list_all_sessions(page_size=10000),
+            what="/api/v1/sessions",
         )
+        return [s.model_dump(by_alias=True) for s in sessions]
 
     async def fetch_messages(
         self,
@@ -563,12 +499,17 @@ class QqFlowClient(SourceClient):
         Returns:
             QqFlowMessagesResponse: 含 messages 与 hasMore，翻页由调用方驱动
         """
-        params: dict[str, Any] = {"talker": talker, "limit": limit, "offset": offset}
-        if start is not None:
-            params["start"] = start
-        data = await self._get(
-            "/api/v1/messages", params=params, not_found_ok=not_found_ok
+        page = await self._sdk_call(
+            lambda: self._api().list_messages(
+                talker,
+                start=str(start) if start is not None else None,
+                limit=limit,
+                offset=offset,
+            ),
+            what="/api/v1/messages",
+            not_found_ok=not_found_ok,
         )
+        data = None if page is None else page.model_dump(by_alias=True)
         if data is None:
             return {
                 "success": True,
@@ -654,8 +595,8 @@ class QqFlowClient(SourceClient):
 
                     # 服务端重启后账号注册表（内存态）丢失；SSE HTTP 200 是服务端
                     # 已恢复的可靠信号，强制重做一次就绪检查 + 引导注册（幂等）。
-                    # 失败仅告警不阻断流：业务 503 由 _get 自愈、重连由监听器
-                    # 退避循环兜底。
+                    # 失败仅告警不阻断流：业务 503 由 _sdk_call 复位就绪门控、下轮
+                    # ensure_ready 自愈，重连由监听器退避循环兜底。
                     try:
                         await self.ensure_ready(force=True)
                     except QqFlowAccountMismatchError:
@@ -668,35 +609,13 @@ class QqFlowClient(SourceClient):
                     except Exception as e:  # noqa: BLE001 — 自愈尽力而为，失败不阻断流
                         logger.warning("SSE 就绪自愈检查失败: %s", e)
 
-                    buffer = ""
-                    buffer_bytes = 0
-                    async for line in resp.aiter_lines():
-                        chunk = line + "\n"
-                        buffer += chunk
-                        buffer_bytes += len(chunk.encode())
-                        if buffer_bytes > MAX_SSE_BUFFER_BYTES:
-                            # 预防性：畸形无换行流会让缓冲无限膨胀，
-                            # 超限结束本次流，交给既有重连退避自愈
-                            logger.warning(
-                                "SSE 缓冲超限（>%d 字节，疑似畸形流），结束本次流等待重连",
-                                MAX_SSE_BUFFER_BYTES,
-                            )
-                            break
-                        while "\n\n" in buffer:
-                            event_text, buffer = buffer.split("\n\n", 1)
-                            buffer_bytes -= len(event_text.encode()) + 2
-                            for event_line in event_text.split("\n"):
-                                if event_line.startswith("data: "):
-                                    try:
-                                        event = json.loads(event_line[6:])
-                                        logger.debug(
-                                            "SSE 事件: %s rawid=%s",
-                                            event.get("event"),
-                                            event.get("rawid"),
-                                        )
-                                        yield event
-                                    except json.JSONDecodeError:
-                                        logger.debug("SSE 数据行 JSON 解析失败，跳过")
+                    async for event in iter_sse_data_events(resp, log=logger):
+                        logger.debug(
+                            "SSE 事件: %s rawid=%s",
+                            event.get("event"),
+                            event.get("rawid"),
+                        )
+                        yield cast(QqFlowEvent, event)
 
             except httpx.RequestError as e:
                 logger.warning("SSE 连接错误: %s", e)
@@ -731,35 +650,30 @@ class QqFlowClient(SourceClient):
         Raises:
             MediaError: 网络错误或 qqflow-server 返回非成功状态（cause 保留原异常）
         """
-        client = self._get_client()
         start = time_module.perf_counter()
         try:
-            async with client.stream(
-                "GET", self._build_media_url(path), headers=self._auth_headers()
-            ) as resp:
-                if not resp.is_success:
-                    raise MediaError(
-                        f"QqFlow media error: {resp.status_code} on {path}"
-                    )
-                chunks: list[bytes] = []
-                total = 0
-                async for chunk in resp.aiter_bytes():
-                    total += len(chunk)
-                    if total > _MAX_MEDIA_BYTES:
-                        raise MediaError(f"QqFlow media too large: {path}")
-                    chunks.append(chunk)
-                logger.debug(
-                    "媒体下载完成: %s (%d bytes, %s)",
-                    path,
-                    total,
-                    fmt_dur(time_module.perf_counter() - start),
-                )
-                return b"".join(chunks)
-        except httpx.RequestError as e:
+            data = await with_connect_retry(
+                lambda: self._api().media_bytes_by_id(path)
+            )
+        except (qqflow_sdk.ClientError, httpx.HTTPError) as e:
+            # 非成功状态（缓存被清理 404 / 就绪门控 503）与传输错误统一映射为
+            # MediaError：pipeline 跳过 OCR，server 代理映射为 404 兜底。
             raise MediaError(f"media fetch failed: {path}") from e
+        if len(data) > _MAX_MEDIA_BYTES:
+            # 上限语义保留（防异常/恶意上游造成内存放大）。SDK 目前不接收上限
+            # 参数，因此这是**事后**判定而不是边读边停；真正的提前中止需要在
+            # SDK 上加 max_bytes（与 weflow 侧同一处待补能力）。
+            raise MediaError(f"QqFlow media too large: {path}")
+        logger.debug(
+            "媒体下载完成: %s (%d bytes, %s)",
+            path,
+            len(data),
+            fmt_dur(time_module.perf_counter() - start),
+        )
+        return data
 
     async def close(self) -> None:
         """关闭 HTTP 客户端。"""
-        if self._client is not None:
-            await self._client.aclose()
-            self._client = None
+        if self._sdk is not None:
+            await self._sdk.aclose()
+            self._sdk = None

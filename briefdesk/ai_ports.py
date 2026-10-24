@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import json
+from typing import Any
 
 import numpy as np
 from json_repair import loads as json_repair_loads
@@ -45,16 +46,26 @@ async def chat(
     temperature: float = 0.3,
     max_tokens: int = 4096,
     timeout: float | None = None,
+    max_retries: int | None = None,
 ) -> ChatResponse:
     """统一 AI 调用端口（模型/供应商由已注册插件决定）。
 
     timeout：单请求超时覆盖（秒）。判官类调用（dedup 判票/strong、merge
     判官/标题）在存储锁内执行，传短超时限制锁的最坏持有时间，防上游挂起
     冻结整条管道；None 用客户端默认。
+
+    max_retries：SDK 重试次数覆盖；判官类调用传 0——SDK 默认重试 2 次会把
+    单次判官最坏耗时放大到 3 倍锁内占用。None 时不传该参数（保持既有端口
+    契约，只接受旧参数的测试桩不受影响）。
     """
-    return await _require_ai().chat(
-        messages, temperature=temperature, max_tokens=max_tokens, timeout=timeout
-    )
+    kwargs: dict[str, Any] = {
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+        "timeout": timeout,
+    }
+    if max_retries is not None:
+        kwargs["max_retries"] = max_retries
+    return await _require_ai().chat(messages, **kwargs)
 
 
 async def rag_chat(
@@ -117,7 +128,7 @@ def embed_model_name() -> str:
 
 
 def loads_json(text: str, *, repair: bool = True) -> object | None:
-    """标准解析优先，失败后用 json_repair 修复兜底（原 ai/client.py）。
+    """标准解析优先，失败后用 json_repair 修复兜底。
 
     json_repair 可修复常见模型输出瑕疵：缺引号/单引号/尾随逗号、
     markdown 围栏残留、前后叙述文本混排、截断补全等。
@@ -141,7 +152,7 @@ def loads_json(text: str, *, repair: bool = True) -> object | None:
 
 def cosine_similarity(a: list[float], b: list[float]) -> float:
     """标量余弦相似度（单对向量，非矩阵批量）：语义对齐裁判等单对比较的
-    共享实现（原 classify 本地 _cosine 与判官数学重复，改一漏一）。
+    共享实现——各引擎若各留一份本地拷贝，改一漏一必然造成判定口径漂移。
 
     numpy 可用走向量化快路径（float64，与纯 Python 同精度）；导入失败时
     回退纯 Python（数值一致，测试随机向量对拍保证）。任一侧范数为 0 →

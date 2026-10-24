@@ -44,7 +44,7 @@ class JudgeUserMessageTest(unittest.TestCase):
         assert "{特殊}" in p
 
     def test_message_does_not_rescan_data_values(self):
-        # P6 同款缺陷守卫：数据值含模板占位符字面量时不得被二次替换
+        # 数据值含模板占位符字面量时不得被二次替换
         # （旧顺序 replace 链会把 desc_a 里的 "{desc_b}" 换成卡片B 内容）
         p = _build_judge_user_message("甲", "原文含 {desc_b} 字面量", "乙", "丙")
         assert "原文含 {desc_b} 字面量" in p
@@ -146,6 +146,18 @@ class TestJudgeMerge:
         assert "运费aa" in msgs[1]["content"]
         assert "面交" in msgs[1]["content"]
 
+    async def test_judge_disables_sdk_retry(self):
+        """判官在存储锁内执行：SDK 重试必须关（否则最坏 3×45s 锁占用）。"""
+        from briefdesk.plugins.merge.engine import _JUDGE_TIMEOUT
+
+        chat_mock = AsyncMock(
+            return_value=_resp('{"task":"merge","data":{"merge": true}}')
+        )
+        with patch("briefdesk.plugins.merge.engine.chat", new=chat_mock):
+            await judge_merge("a", "b", "c", "d")
+        assert chat_mock.call_args.kwargs["max_retries"] == 0
+        assert chat_mock.call_args.kwargs["timeout"] == _JUDGE_TIMEOUT
+
     async def test_long_desc_is_clipped_before_send(self):
         # 超长描述在判官 user 消息里被截断，尾部不再送入
         long_desc = "x" * 1000
@@ -175,7 +187,7 @@ class TitleRegenerationTest(unittest.TestCase):
         assert "团购\n面交" in p
 
     def test_title_data_with_literal_placeholder_not_double_replaced(self):
-        # P6：数据值的占位符字面量不得被后续 replace 二次替换（单遍填充）
+        # 数据值的占位符字面量不得被后续 replace 二次替换（单遍填充）
         p = _build_title_user_message("{key_info}", "{quote}", "旧标题 {old_title}")
         assert "原标题：{key_info}" in p
         assert "关键信息：{quote}" in p
@@ -236,6 +248,15 @@ class TitleRegenerationTest(unittest.TestCase):
 
 
 class TestSummarizeTitle:
+    async def test_title_disables_sdk_retry(self):
+        """标题重拟同样在锁内执行：SDK 重试必须关。"""
+        chat_mock = AsyncMock(
+            return_value=_resp('{"task":"title","data":{"title":"新标题"}}')
+        )
+        with patch("briefdesk.plugins.merge.engine.chat", new=chat_mock):
+            await summarize_title("旧", "k", "q")
+        assert chat_mock.call_args.kwargs["max_retries"] == 0
+
     async def test_success(self):
         with patch(
             "briefdesk.plugins.merge.engine.chat",
@@ -270,7 +291,7 @@ class TestSummarizeTitle:
 
 
 class TestAfterRunEmbeddingGate:
-    """【P3-11】after_run 补嵌入必须按 is_embedding_enabled 门控。
+    """after_run 补嵌入必须按 is_embedding_enabled 门控。
 
     EMBED_API_BASE 留空（默认配置）时 embed_api_base 回退 chat 端点，
     embed_texts 会打出一发注定失败的 /embeddings——每个含合并的批白发

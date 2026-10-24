@@ -1,4 +1,13 @@
-"""系统密钥环存储 — 秘密解析链的第一层（keyring > 环境变量 > .env > 默认值）。
+"""系统密钥环存储 — 秘密解析链的第一层。
+
+密钥字段的解析链是**单点权威**（其余模块只写一行枚举 + 指针指回这里）：
+keyring > 环境变量 > 项目 .env > 用户暂存文件（UI「设置」写入的 settings.env）
+> 字段默认值。两个 dotenv 来源由 settings_base 挂载、项目 .env 高于暂存
+（口径见 settings_env.dotenv_layers）；非密钥字段没有 keyring 层，其余顺序相同。
+**不入链的一层**：`model(init 参数)` 比 keyring 更高，但那是调用方显式覆盖，
+不是配置来源——完整优先级以 settings_base.KeyringSettingsBase 的 docstring 为准。
+漏掉「用户暂存文件」这一层是此前多处注释的共同错误——漏了它等于宣称「设置页
+保存的值按默认值算」，而实际它高于默认值、低于环境变量。
 
 Windows 下 keyring 走凭据管理器（DPAPI 加密，随用户账号）；macOS=钥匙串；
 Linux=Secret Service。密钥环不可用（无桌面会话 / 无 Secret Service）或显式
@@ -240,7 +249,8 @@ class KeyringSource(PydanticBaseSettingsSource):
     """pydantic-settings 自定义源：按字段映射从系统密钥环读取秘密。
 
     优先级由 settings_customise_sources 的返回顺序决定（本方案位于环境
-    变量之前）：keyring > 环境变量 > .env > 默认值。
+    变量之前）：keyring 最高；其后的环境变量 > 项目 .env > 用户暂存文件 >
+    默认值即本模块 docstring 里的完整解析链。
     """
 
     def __init__(self, settings_cls: type[BaseSettings], field_map: dict[str, str]):

@@ -1,7 +1,7 @@
 """基准测试插件单元测试（不调用 AI，不触碰应用库）。
 
-覆盖：测试集 schema 校验、指标计算、dry-run 文件解析、基准环境的
-临时数据库隔离（补丁式）与 dedup 预筛跳过路径（离线可测部分）。
+覆盖：测试集 schema 校验、指标计算、dry-run 文件解析、临时 scratch 库的准备
+（与 CLI 手工运行同口径）与 dedup 预筛跳过路径（离线可测部分）。
 """
 
 import contextlib
@@ -28,7 +28,6 @@ from briefdesk.plugins.benchmark.metrics import (
     aggregate_title,
     evaluate_classify_case,
 )
-from briefdesk.plugins.benchmark.providers import bench_environment
 from briefdesk.plugins.benchmark.schema import (
     FEATURES,
     CategoryDef,
@@ -47,7 +46,7 @@ from briefdesk.plugins.benchmark.schema import (
 )
 from briefdesk.types import ClassifyOutcome, ClassifyResult
 
-CASES_DIR = (
+PACKAGE_CASES_DIR = (
     Path(__file__).resolve().parents[1] / "briefdesk" / "plugins" / "benchmark" / "cases"
 )
 
@@ -188,7 +187,7 @@ class ParseCasesTest(unittest.TestCase):
 class DatasetFileTest(unittest.TestCase):
     def test_example_datasets_load(self):
         for feature in FEATURES:
-            path = CASES_DIR / f"{feature}.example.json"
+            path = PACKAGE_CASES_DIR / f"{feature}.example.json"
             ds = load_dataset_file(path)
             assert ds.feature == feature
             cases = parse_cases(ds)
@@ -196,7 +195,7 @@ class DatasetFileTest(unittest.TestCase):
 
     def test_missing_file(self):
         with pytest.raises(FileNotFoundError):
-            load_dataset_file(CASES_DIR / "不存在.json")
+            load_dataset_file(PACKAGE_CASES_DIR / "不存在.json")
 
 
 class BinaryMetricsTest(unittest.TestCase):
@@ -363,6 +362,36 @@ class TitleMetricsTest(unittest.TestCase):
         assert ev.too_long
 
 
+class CliReasoningEffortTest(unittest.TestCase):
+    """CLI 的 --reasoning-effort：给了才覆盖配置，不给不动（与 --model 同风格）。"""
+
+    def _args(self, *, model=None, reasoning_effort=None):
+        from types import SimpleNamespace
+
+        return SimpleNamespace(model=model, reasoning_effort=reasoning_effort)
+
+    def test_flag_overrides_config(self):
+        with patch.object(config, "ai_reasoning_effort", "auto"):
+            cli._apply_ai_overrides(self._args(reasoning_effort="low"))
+            assert config.ai_reasoning_effort == "low"
+
+    def test_absent_flag_keeps_config(self):
+        with patch.object(config, "ai_reasoning_effort", "auto"):
+            cli._apply_ai_overrides(self._args())
+            assert config.ai_reasoning_effort == "auto"
+
+    def test_model_flag_still_applies(self):
+        with patch.object(config, "ai_model", "old-model"):
+            cli._apply_ai_overrides(self._args(model="new-model"))
+            assert config.ai_model == "new-model"
+
+    def test_unknown_value_rejected_by_argparse(self):
+        """取值清单与配置共用：非法值由 argparse 以用法错误（退出码 2）拒绝。"""
+        with self.assertRaises(SystemExit) as ctx:
+            cli.main(["--reasoning-effort", "bogus"])
+        assert ctx.exception.code == 2
+
+
 class DryRunTest(unittest.TestCase):
     def test_dry_run_example_datasets(self):
         # 隔离到只含示例文件的临时目录，避免本机网页导出的 *.fromweb.json 干扰
@@ -370,9 +399,9 @@ class DryRunTest(unittest.TestCase):
             cases_dir = Path(tmp)
             for f in FEATURES:
                 shutil.copyfile(
-                    CASES_DIR / f"{f}.example.json", cases_dir / f"{f}.example.json"
+                    PACKAGE_CASES_DIR / f"{f}.example.json", cases_dir / f"{f}.example.json"
                 )
-            payload = cli.run_dry_run(list(FEATURES), cases_dir, None)
+            payload = cli.run_dry_run(list(FEATURES), [cases_dir], None)
             assert set(payload["features"]) == set(FEATURES)
             for f in FEATURES:
                 assert "cases" in payload["features"][f]
@@ -381,9 +410,9 @@ class DryRunTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             cases_dir = Path(tmp)
             shutil.copyfile(
-                CASES_DIR / "classify.example.json", cases_dir / "classify.example.json"
+                PACKAGE_CASES_DIR / "classify.example.json", cases_dir / "classify.example.json"
             )
-            path = cli._resolve_dataset("classify", cases_dir, None)
+            path = cli._resolve_dataset("classify", [cases_dir], None)
             assert path.name == "classify.example.json"
 
     def test_resolve_dataset_falls_back_to_fromweb(self):
@@ -392,36 +421,69 @@ class DryRunTest(unittest.TestCase):
             (cases_dir / "classify.fromweb.json").write_text(
                 json.dumps({"feature": "classify", "cases": []}), encoding="utf-8"
             )
-            path = cli._resolve_dataset("classify", cases_dir, None)
+            path = cli._resolve_dataset("classify", [cases_dir], None)
             assert path.name == "classify.fromweb.json"
             # fromweb 优先于示例数据集
             (cases_dir / "classify.example.json").write_text(
                 json.dumps({"feature": "classify", "cases": []}), encoding="utf-8"
             )
-            path = cli._resolve_dataset("classify", cases_dir, None)
+            path = cli._resolve_dataset("classify", [cases_dir], None)
             assert path.name == "classify.fromweb.json"
 
 
-class TestBenchEnvironment:
-    async def test_env_redirects_db_and_restores(self):
-        """官方缝重定向：不改 config.db_path、不动应用连接，窗口内调用落
-        临时库（含类别替换生效），退出即还原模块级单例。"""
+@contextlib.asynccontextmanager
+async def _scratch_db(categories: list[CategoryDef] | None = None):
+    """临时 scratch 库：config.db_path 指到临时文件、建表、按需换类别，退出还原。
+
+    进程内运行时的隔离缝（providers.bench_environment：暂停管道 + 排空 + 库重定向）
+    已随进程级隔离删除，测试改为自建，与 CLI 手工运行同口径（见 cli._run_isolated）：
+    换连接前先把模块级单例清空，退出时**先关连接再删目录**（Windows 上文件仍被占用
+    会让 TemporaryDirectory 清理报 WinError 32）。
+    """
+    import briefdesk.db as briefdesk_db
+    from briefdesk.plugins.benchmark.providers import prepare_scratch
+
+    old_main, old_embed = briefdesk_db._db, briefdesk_db._embed_db
+    old_path = config.db_path
+    with tempfile.TemporaryDirectory() as d:
+        briefdesk_db._db = briefdesk_db._embed_db = None
+        config.db_path = str(Path(d) / "bench.sqlite")
+        try:
+            await prepare_scratch(categories)
+            yield
+        finally:
+            # 两条连接都要关：只用主连接（get_db）时向量连接可能已被 dedup 惰性打开，
+            # 漏关会让 aiosqlite 的非 daemon 线程把 pytest 卡在退出阶段
+            for conn in (briefdesk_db._db, briefdesk_db._embed_db):
+                if conn is not None:
+                    await conn.close()
+            briefdesk_db._db = old_main
+            briefdesk_db._embed_db = old_embed
+            config.db_path = old_path
+
+
+class TestScratchPreparation:
+    async def test_prepare_scratch_replaces_categories(self):
+        """scratch 库准备：建表 + 按数据集声明替换类别（默认类别被整份换掉）。"""
         import briefdesk.db as briefdesk_db
 
-        old_main, old_embed = briefdesk_db._db, briefdesk_db._embed_db
-        old_path = config.db_path
-        async with bench_environment(
-            [CategoryDef(name="自定义类别", prompt="测试说明")], register_ai=False
-        ):
-            assert briefdesk_db._db is not old_main  # 已重定向
+        async with _scratch_db([CategoryDef(name="自定义类别", prompt="测试说明")]):
             conn = await briefdesk_db.get_db()
             cursor = await conn.execute("SELECT name FROM categories ORDER BY id")
             rows = await cursor.fetchall()
             await cursor.close()
             assert [r["name"] for r in rows] == ["自定义类别"]
-        assert briefdesk_db._db is old_main  # 已还原
-        assert briefdesk_db._embed_db is old_embed
-        assert config.db_path == old_path
+
+    async def test_prepare_scratch_keeps_default_categories_without_dataset(self):
+        """数据集没声明类别时保留 init_schema 播下的默认类别（空表会让分类直接抛错）。"""
+        import briefdesk.db as briefdesk_db
+
+        async with _scratch_db():
+            conn = await briefdesk_db.get_db()
+            cursor = await conn.execute("SELECT COUNT(*) FROM categories")
+            row = await cursor.fetchone()
+            await cursor.close()
+            assert row[0] > 0
 
     async def test_dedup_disjoint_pair_skips_ai_offline(self):
         """预筛跳过路径离线可测：标题无重叠 → 不触发 AI，保守判 false。"""
@@ -431,18 +493,25 @@ class TestBenchEnvironment:
             query=MessageIn(msg_id="q1", content="求购考研数学书", title="求购考研数学书"),
             expected=SameExpected(same=False),
         )
-        async with bench_environment(register_ai=False):
+        async with _scratch_db():
             ev = await engine._run_dedup(case)
         assert not ev.predicted
         assert ev.skipped
 
     async def test_run_benchmark_cases_empty_records_elapsed(self):
         """零用例运行不触发 AI，但 payload 仍带测试用时（顶层 + 逐功能）。"""
-        payload, evals = await engine.run_benchmark_cases({})
+        async with _scratch_db():
+            payload, evals = await engine.run_benchmark_cases({})
         assert payload["features"] == {}
         assert evals == {}
         assert isinstance(payload["elapsed_sec"], float)
         assert payload["elapsed_sec"] >= 0
+        # 报告自描述：推理强度与模型同级落盘，便于对账同一模型的不同强度
+        assert payload["reasoning_effort"] == config.ai_reasoning_effort
+        assert payload["config"]["reasoning_effort"] == config.ai_reasoning_effort
+        assert "ai_api_base" not in payload
+        assert "api_base" not in payload["config"]
+        assert "api_key" not in json.dumps(payload)
 
 
 class TestProgress:
@@ -487,9 +556,12 @@ class TestProgress:
             expected=SameExpected(same=False),
         )
         events: list[engine.CaseProgress] = []
-        payload, evals = await engine.run_benchmark_cases(
-            {"dedup": [case]}, progress=events.append
-        )
+        # 判重引擎会经 get_db 惰性建缓存：没有 scratch 库就会打到真实生产库
+        # （进程内运行时由已删的 bench_environment 兜着，现在必须自带）
+        async with _scratch_db():
+            payload, evals = await engine.run_benchmark_cases(
+                {"dedup": [case]}, progress=events.append
+            )
         assert len(events) == 1
         assert events[0].feature == "dedup"
         assert (events[0].done, events[0].total, events[0].failed) == (1, 1, 0)
@@ -579,8 +651,24 @@ class ChartsTest(unittest.TestCase):
             "run_id": "20260821-000000",
             "generated_at": "2026-08-21 00:00:00",
             "model": "test-model",
-            "ai_api_base": "http://localhost:11434/v1",
             "concurrency": 1,
+            "reasoning_effort": "auto",
+            "config": {
+                "max_concurrency": 1,
+                "reasoning_effort": "auto",
+                "json_mode": "auto",
+                "max_classify_tokens": 8192,
+                "vision_enabled": False,
+                "vision_max_images": 4,
+                "embedding_enabled": False,
+                "embedding_model": "",
+                "embedding_batch_size": 20,
+                "dedup_similarity_threshold": 0.3,
+                "dedup_embed_threshold": 0.8,
+                "dedup_embed_top_k": 3,
+                "dedup_embed_fallback_threshold": 0.65,
+                "dedup_strong_threshold": 0.99,
+            },
             "features": {
                 "classify": {
                     "dataset": "cases/classify.json",
@@ -625,6 +713,9 @@ class ChartsTest(unittest.TestCase):
         assert "混淆矩阵（行=预测，列=期望）" in html_text
         assert "100.0%" in html_text
         assert "dd-001" in html_text
+        assert "JSON 模式" in html_text
+        assert "分类最大输出" in html_text
+        assert "API" not in html_text
         assert "</html>" in html_text
         # 用例 id 注入应被转义
         payload = self._payload()
@@ -689,17 +780,42 @@ class ChartsTest(unittest.TestCase):
         lines = render_feature_block("dedup", [], summary)
         assert not any("测试用时" in ln for ln in lines)
 
+    def test_title_metrics_render_avg_len_as_length_not_ratio(self):
+        """平均长度是**字数**，不是比例。
+
+        按比例渲染会把它乘 100 再加百分号：实测一轮真实基准里 avg_len=23.79
+        被打印成「平均长度(字) 2379.0%」。同一张表里的比例项（命中率/准确率）
+        必须照旧带百分号，所以两者要走同一个格式化入口、用键名分流。
+        """
+        from briefdesk.plugins.benchmark.report import render_metrics
+
+        lines = render_metrics(
+            "title",
+            {
+                "cases": 63,
+                "error_cases": 0,
+                "exact_match_rate": 0.0,
+                "exact_match_cases": 63,
+                "keyword_hit_rate": 0.6607,
+                "keyword_hit_cases": 56,
+                "avg_len": 23.79,
+                "too_long_count": 9,
+                "fallback_count": 1,
+            },
+        )
+        text = "\n".join(lines)
+        assert "23.8 字" in text, text
+        assert "2379" not in text, text
+        assert "66.1%" in text, text
+        assert "平均长度(字)" in text, text
+
     def test_save_html_report(self):
         from briefdesk.plugins.benchmark.html_report import save_html_report
 
-        out_dir = Path(__file__).resolve().parents[1] / "briefdesk" / "plugins" / "benchmark" / ".tmp"
-        out_dir.mkdir(parents=True, exist_ok=True)
-        try:
-            path = save_html_report(out_dir, "test-run-1", "<html></html>")
+        with tempfile.TemporaryDirectory() as tmp:
+            path = save_html_report(Path(tmp), "test-run-1", "<html></html>")
             assert path.exists()
             assert path.read_text(encoding="utf-8") == "<html></html>"
-        finally:
-            path.unlink(missing_ok=True)
 
 
 if __name__ == "__main__":

@@ -54,12 +54,30 @@ _FEATURE_METRIC_LABELS: dict[str, list[tuple[str, str]]] = {
 }
 
 
-def _pct(value: float | None) -> str:
+# 比例类指标：乘 100 加百分号。其余是计数或**字数**，不能按比例渲染。
+_RATE_KEYS = {
+    "category_accuracy", "category_precision", "category_recall", "category_f1",
+    "time_msg_accuracy", "time_point_recall", "time_point_precision",
+    "failure_rate", "summary_fill_rate",
+    "accuracy", "precision", "recall", "f1",
+    "exact_match_rate", "keyword_hit_rate",
+}
+
+
+def format_metric(key: str, value: float | None) -> str:
+    """单个指标的展示文本（终端与 HTML 共用，避免两处口径漂移）。
+
+    平均长度是**字数**而不是比例：照比例渲染过，会把「平均长度 23.8 字」显示成
+    「2379.0%」（回归见 tests/test_benchmark.py 的 title 指标渲染用例）。计数类是
+    整数，原样输出；缺失值统一显示「-」。
+    """
+    if key in _RATE_KEYS:
+        return f"{float(value or 0) * 100:.1f}%"
+    if key == "avg_len":
+        return f"{float(value or 0):.1f} 字"
     if value is None:
         return "-"
-    if isinstance(value, int):
-        return str(value)
-    return f"{value * 100:.1f}%"
+    return str(value)
 
 
 def format_float(value: float | None) -> str:
@@ -113,7 +131,7 @@ def render_metrics(feature: str, summary: dict[str, float | int]) -> list[str]:
     lines: list[str] = []
     for key, label in _FEATURE_METRIC_LABELS.get(feature, []):
         value = summary.get(key, 0)
-        lines.append(f"  {label:<14} {_pct(value)}")
+        lines.append(f"  {label:<14} {format_metric(key, value)}")
     extra: list[str] = []
     if feature == "classify":
         extra = [

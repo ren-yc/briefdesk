@@ -105,7 +105,7 @@ class TestOcrImageBytes:
 @unittest.skipUnless(_OCR_DEPS_AVAILABLE, "OCR 依赖未安装（pip install briefdesk[ocr]）")
 class TestOcrImagesBytesPerImageTolerance:
     async def test_single_image_failure_does_not_abandon_later_images(self):
-        # 复核 P3-7：循环内逐图容错——第 2 张失败（非 RapidOCRError），
+        # 循环内逐图容错——第 2 张失败（非 RapidOCRError），
         # 第 1/3 张仍识别；此前无逐图 try，第 2 张失败使后续全部放弃。
         async def fake_single(content: bytes) -> str:
             if content == b"img2":

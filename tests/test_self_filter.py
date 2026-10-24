@@ -2,7 +2,7 @@
 
 weflow-legacy REST 按 isSend 判定（缺失 fail-open）；qqflow REST 按自身 UID
 （u_<QQFLOW_QQ>）判定；qqflow SSE 事件无发送者标识，按消息回查 REST。
-管道入口的过滤行为见 tests/test_pipeline.py 的 IgnoreSelfFilterTest。
+管道入口的过滤行为见 tests/test_pipeline.py 的 TestIgnoreSelfFilter。
 """
 
 import unittest

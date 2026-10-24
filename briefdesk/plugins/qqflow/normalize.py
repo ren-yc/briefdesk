@@ -101,7 +101,7 @@ def pre_filter_sse(event: QqFlowEvent) -> bool:
     sync（基线水位，无消息载荷，pipeline 幂等已兜底）/ ping（KeepAlive）
     一律拒绝；空/短内容、QQ 富媒体 XML 残片
     （m_fileName/m_resid）与占位符消息拒绝。发送者为空/缺失不再丢弃
-    （决策 ②=保留未知，与 weflow/legacy 统一），归一化阶段回退
+    （保留未知，与 weflow/legacy 统一），归一化阶段回退
     sender_name="未知"。
     """
     if event.get("event") != "message.new":
@@ -113,10 +113,10 @@ def pre_filter_sse(event: QqFlowEvent) -> bool:
         return False
     if not event.get("rawid"):
         # 无 rawid 无法生成 msg_id/标记 processed——就地丢弃，防去重键
-        # ("message.new","") 碰撞误吞后续正常事件（审查 A5）
+        # ("message.new","") 碰撞误吞后续正常事件
         logger.debug("丢弃 SSE: message.new 缺 rawid")
         return False
-    # 发送者为空不再丢弃（决策 ②=保留未知，与 weflow/legacy 统一）：
+    # 发送者为空不再丢弃（保留未知，与 weflow/legacy 统一）：
     # 归一化阶段回退 sender_name="未知"。此前按「无发送者=系统事件」整类
     # 丢弃，但也会误伤确实无发送者名而内容有效的消息。
     c: str = event.get("content", "")
@@ -234,7 +234,7 @@ def pre_filter_rest(msg: QqFlowMessage) -> bool:
     拒绝：撤回（6）/ 系统消息（7）；空/短内容；附件占位符
     （4/5 语音视频无下游消费方，3 图片无 mediaId 时无媒体可 OCR）；QQ 富媒体
     XML 残片（m_fileName/m_resid 属性对，图片/文件卡片解析失败的原始 XML）。
-    发送者为空/缺失不再丢弃（决策 ②=保留未知，与 weflow/legacy 统一）。
+    发送者为空/缺失不再丢弃（保留未知，与 weflow/legacy 统一）。
     图片消息（localType=3）带 mediaId（上游保证可获取）时放行，交由
     normalize_rest 提取并 OCR。
     localType=1（"其他"）不直接拒绝——其 content 为解析后文本，可能含
@@ -248,7 +248,7 @@ def pre_filter_rest(msg: QqFlowMessage) -> bool:
             local_type,
         )
         return False
-    # 发送者为空不再丢弃（决策 ②=保留未知，与 weflow/legacy 统一，见
+    # 发送者为空不再丢弃（保留未知，与 weflow/legacy 统一，见
     # pre_filter_sse 同款注释）。
     # 入群/名片/撤回等系统事件：上游可能以“纯 UID 内容”呈现，
     # 没有可展示/可分类的信息价值，入口直接丢弃。

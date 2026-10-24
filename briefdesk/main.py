@@ -17,8 +17,8 @@ from collections.abc import Callable
 import uvicorn
 from fastapi import APIRouter
 
-from briefdesk import stages
-from briefdesk.config import config
+from briefdesk import settings_env, stages
+from briefdesk.config import Settings, config
 from briefdesk.db import (
     apply_pending_restore,
     close_db,
@@ -70,8 +70,7 @@ async def _refresh_all(sources: list[SourceRuntime]) -> None:
 
     单个源刷新失败不影响其它源的会话结果落库。
     网络拉取（refresh_sessions）在存储锁外；会话落库与全应用写路径共用
-    storage_lock 串行化——单连接隐式事务下锁外 commit 会把管道未完成的
-    多步写一并提交（部分写入提前可见），见 db.storage_lock 注释。
+    storage_lock 串行化（为什么必须串行：见 db.storage_lock 的权威论证）。
     """
     results = await asyncio.gather(
         *(s.refresh_sessions() for s in sources), return_exceptions=True
@@ -246,6 +245,8 @@ async def _run() -> None:
         )
         stages.set_context(ctx)  # 管道骨架（pipeline）经此读取阶段与服务端口
         await manager.setup_all(ctx)
+        # 装配完成即报「.env 被环境变量压住」——插件模型的来源快照此刻才登记齐全
+        _warn_shadowed_env_keys()
         # 2.1 Web 插件挂载（HTTP 服务启动前）：路由 + 静态资源 + 插件元数据
         for r in routers:
             include_plugin_router(r)
@@ -256,7 +257,7 @@ async def _run() -> None:
         set_plugin_meta_callback(manager.plugin_meta)
         set_plugin_validation_callback(manager.validate_selection)
         if not runtimes:
-            # 零源降级启动（决策 ①=1B）：不再中止——UI/设置/向导可用，
+            # 零源降级启动：不再中止——UI/设置/向导可用，
             # 消息采集不可用，状态栏明示；这也是三源统一「缺配置自禁用」
             # 语义的前提（否则唯一启用的源自禁用会触发零源中止）
             logger.warning(
@@ -298,9 +299,9 @@ async def _run() -> None:
         )
         server_task = asyncio.create_task(server.serve())
 
-        # 4. 插件激活（当前各内置插件 activate 均无副作用；消息源实时监听须在
-        #    uvicorn serve 任务创建后启动，避免事件循环被 SSE 长连接独占阻塞）→
-        #    逐个启动实时监听
+        # 4. 插件激活（benchmark 清残目录+轮转、rag 持锁建表+拉起回填，均为有意的
+        #    启动兜底；消息源实时监听须在 activate 之后、且 uvicorn serve 任务已
+        #    创建后启动，避免事件循环被 SSE 长连接独占阻塞）→ 逐个启动实时监听
         phase_start = time_module.perf_counter()
         await manager.activate_all(ctx)
         for s in runtimes:
@@ -405,6 +406,37 @@ async def _periodic_sync_loop() -> None:
         task = trigger_sync(reason="periodic")
         if task is not None:
             await task
+
+
+def _warn_shadowed_env_keys() -> list[str]:
+    """启动期提示：项目 .env 里被进程环境变量压住、且取值不同的键（只列键名）。
+
+    为什么在插件装配之后调用：插件模型的字段要等各自 setup 成功后才登记来源，之前聚合
+    不到它们；这里对「核心 + 已登记模型」一次报完。
+
+    为什么惰性计算而不是 import 期暂存：import 期取值会随宿主环境（开发机 / CI）分叉，
+    测试也无法归一；放在这里则取值与「本进程正在用的配置」同一时点。
+    """
+    models = settings_env.registered_models() or [Settings]
+    seen: set[str] = set()
+    shadowed: list[str] = []
+    for model in models:
+        for key in settings_env.env_shadowed_dotenv_keys(model):
+            if key not in seen:
+                seen.add(key)
+                shadowed.append(key)
+    if not shadowed:
+        return []
+    head = "、".join(shadowed[:8])
+    suffix = f" 等 {len(shadowed)} 项" if len(shadowed) > 8 else ""
+    logger.warning(
+        "检测到 %d 个配置项被进程环境变量覆盖（项目 .env 中的同名行不生效）：%s%s；"
+        "排查：Get-ChildItem env:<KEY>（Windows）或 printenv <KEY>",
+        len(shadowed),
+        head,
+        suffix,
+    )
+    return shadowed
 
 
 def main() -> None:

@@ -164,7 +164,7 @@
         chip.className = "rag-cite-chip";
         chip.dataset.n = String(c.n);
         // .title 是属性赋值（不走 HTML 解析）：escAttr 的实体会按字面显示，
-        // 直接用原始字符串（复核 P3）
+        // 直接用原始字符串
         chip.title = (c.group_name ? c.group_name + " · " : "") + c.sender_name;
         chip.textContent = "[" + c.n + "] " + c.sender_name;
         chip.addEventListener("click", () => openCtx(c));
@@ -197,7 +197,9 @@
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ question, history: turnHistory }),
       });
-      if (!res.ok) throw new Error("HTTP " + res.status);
+      if (!res.ok) {
+        throw new Error("HTTP " + res.status);
+      }
       const data = await res.json();
       thinking.remove();
       if (data.refused) {
@@ -206,7 +208,7 @@
         addMsg("assistant", data.answer, data);
         history.push({ role: "assistant", content: data.answer });
       }
-    } catch {
+    } catch (err) {
       thinking.remove();
       // 失败不回填输入框：问题已作为气泡在对话区可见，回填会与已入列的
       // user 气泡/history 重复，重试时产生重复消息；重试点气泡旁复制或重打即可
@@ -225,7 +227,7 @@
     const body = document.getElementById("rag-ctx-body");
     body.innerHTML = '<p class="text-muted">加载中…</p>';
     $ctxModal.classList.remove("hidden");
-    pushModalFocus($ctxModal); // 与核心模态同一焦点栈（复核 P2-25）
+    pushModalFocus($ctxModal); // 与核心模态同一焦点栈：挡快捷键/圈闭 Tab
     fetchContext(body, cite.source, cite.session_id, cite.time, cite.msg_id);
   }
   function hideCtxModal() {

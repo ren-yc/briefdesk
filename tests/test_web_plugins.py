@@ -86,7 +86,7 @@ class TestPluginAssets(unittest.TestCase):
 
 
 class TestPluginRouterPrefixGuard(unittest.TestCase):
-    """【复核 P2-11】插件路由必须挂在 /api/ 下：middleware 仅对 /api/ 前缀
+    """插件路由必须挂在 /api/ 下：middleware 仅对 /api/ 前缀
     的变更方法做同源校验，其它前缀会静默绕过 CSRF 防线——装配期硬失败。"""
 
     def test_non_api_prefix_rejected(self):
@@ -238,7 +238,7 @@ class TestCoreFrontendBoundary(unittest.TestCase):
     }
 
     def test_core_ui_has_no_plugin_frontend(self):
-        ui_dir = Path(__file__).resolve().parents[1] / "ui"
+        ui_dir = Path(__file__).resolve().parents[1] / "briefdesk" / "ui"
         for fname, markers in self.CORE_FILES.items():
             text = (ui_dir / fname).read_text(encoding="utf-8")
             for marker in markers:
@@ -256,7 +256,7 @@ class TestPluginFrontendCoreHelper(unittest.TestCase):
 
     def test_helpers_used_by_plugins_are_declared_in_app_js(self):
         root = Path(__file__).resolve().parents[1]
-        app_js = (root / "ui" / "app.js").read_text(encoding="utf-8")
+        app_js = (root / "briefdesk" / "ui" / "app.js").read_text(encoding="utf-8")
         plugin_js = sorted((root / "briefdesk" / "plugins").glob("*/ui/ui.js"))
         assert plugin_js, "未找到任何插件前端，守卫失效"
 
@@ -264,6 +264,7 @@ class TestPluginFrontendCoreHelper(unittest.TestCase):
         exported = [
             "esc", "escAttr", "showToast", "reqJson", "getJson", "postJson", "putJson",
             "deleteJson", "postVerify", "lsGet", "lsSet", "lsGetJson", "lsSetJson",
+            "showWriteError",
             "makeItemQuery", "catColor", "renderItemRow", "registerPluginView",
             "registerItemRowExtension", "gotoCategory",
         ]
@@ -311,7 +312,7 @@ class TestPluginFrontendCoreHelper(unittest.TestCase):
         菜单就会锚到更外层祖先——位置错到别处，但核心测试与插件测试都全绿。
         """
         root = Path(__file__).resolve().parents[1]
-        css = (root / "ui" / "style.css").read_text(encoding="utf-8")
+        css = (root / "briefdesk" / "ui" / "style.css").read_text(encoding="utf-8")
         for selector in (".ov-row", ".item-card"):
             blocks = re.findall(
                 rf"(?m)^{re.escape(selector)}\s*\{{(.*?)\}}", css, re.DOTALL
@@ -339,7 +340,7 @@ class TestPluginFrontendCoreHelper(unittest.TestCase):
 
 
 class TestIncludeRouterIdempotent(unittest.TestCase):
-    """审查修复 #10：include_plugin_router 对同一 router 重复调用幂等。"""
+    """include_plugin_router 对同一 router 重复调用必须幂等——否则重复挂载让路由表出现同路径多份。"""
 
     def test_double_include_inserts_routes_once(self):
         from fastapi import APIRouter

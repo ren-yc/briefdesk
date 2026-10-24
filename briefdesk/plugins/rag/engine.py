@@ -7,7 +7,7 @@
 
 作用域语义（隐私边界，见 architecture.md）：启用会话恒为前提；
 RAG_GROUP_ONLY（默认开）进一步限定群聊——停用会话即时不可问出。
-rag 四表（chunks/embeddings/fts/skipped）是 raw_messages 的派生索引；向量表
+rag 五表（chunks/embeddings/fts/meta/skipped）是 raw_messages 的派生索引；向量表
 走专用连接（get_embed_db 同款隔离约定），脏行删除不与主连接上的管道事务
 互相提交；共享连接上的写统一持 db.get_embed_lock()/pipeline 存储锁。
 """
@@ -93,6 +93,24 @@ class _FusionEntry:
     cos: float = 0.0
     rrf: float = 0.0
     has_fts: bool = False
+
+
+def _citation_index(n: object) -> int | None:
+    """引用编号：接受 int（排除 bool）、整数值浮点与纯数字字符串；其它一律拒绝。
+
+    此前 int(n) 把 True 当 1、把 "1" 当 1、任意异常类型静默跳过，语义不明确。
+    整数值浮点（1.0）必须接受：JSON 模式下部分供应商把整数输出为浮点，拒绝
+    会让显式引用列表整个落空、回答显示为无依据。
+    """
+    if isinstance(n, bool):
+        return None
+    if isinstance(n, int):
+        return n
+    if isinstance(n, float) and n.is_integer():
+        return int(n)
+    if isinstance(n, str) and n.strip().isdigit():
+        return int(n.strip())
+    return None
 
 
 @dataclass
@@ -227,7 +245,7 @@ class RagEngine:
 
         向量写入 batch.preembeddings（批上下文级，每批新建天然隔离）——
         引擎级共享字典会在并发批次（实时批 flush 与回填同时跑）下互相
-        clear 丢向量（复核 P1-5）。
+        clear 丢向量。
         """
         candidates = [m for m in batch.messages if _indexable(m.content)]
         if not candidates:
@@ -303,8 +321,8 @@ class RagEngine:
         0 关闭，-1 全量。last_cycle_embed_failed 供维护循环做失败退避。
 
         写路径持 pipeline 存储锁（本方法运行于维护循环、不在锁内）：
-        chunks/FTS/skipped 落主连接，锁外 commit 会把管道未完成的多步写
-        提前提交——与 db.py 事务纪律一致；嵌入（网络）在锁外。
+        chunks/FTS/skipped 落主连接，不变量见 db.storage_lock 的权威论证；
+        嵌入（网络）在锁外。
         """
 
         self.last_cycle_embed_failed = False
@@ -316,17 +334,22 @@ class RagEngine:
         # 作用域谓词与检索侧共用单源（这里过滤 raw_messages，别名 r）；
         # NOT EXISTS 排除已登记 skipped 的「永不入索引」行——占位符消息永远
         # 满足反连接却永远不被消费，不排除会每轮占满预算窗口，令更早的
-        # 真实消息饿死（审查回归）
+        # 真实消息饿死
         scope, scope_params = scope_sql(self.settings.group_only, alias="r")
+        # 内容以既有 chunk 优先：raw_messages 在管道入口（OCR 之前）落库，而实时
+        # 索引写入的是 OCR 增强后的文本；换嵌入模型回填时若用原文覆盖，会把 OCR
+        # 文本从索引里抹掉，纯图片消息的原文还是占位符（_indexable 为假 → 登记
+        # rag_skipped），旧向量永不更新。
         sql = (
             "SELECT r.source, r.msg_id, r.session_id, r.group_name, "
-            "r.sender_name, r.timestamp AS msg_time, r.content "
+            "r.sender_name, r.timestamp AS msg_time, "
+            "COALESCE(c.content, r.content) AS content "
             "FROM raw_messages r "
             "LEFT JOIN rag_chunks c ON c.source = r.source AND c.msg_id = r.msg_id "
             "LEFT JOIN rag_chunk_embeddings e ON e.source = r.source "
             "AND e.msg_id = r.msg_id "
             "WHERE (c.msg_id IS NULL OR e.msg_id IS NULL OR e.model <> ?)"
-            " AND trim(r.content, ' ' || char(9)) <> ''"
+            " AND trim(COALESCE(c.content, r.content), ' ' || char(9)) <> ''"
             " AND NOT EXISTS (SELECT 1 FROM rag_skipped k "
             "WHERE k.source = r.source AND k.msg_id = r.msg_id)"
             + scope
@@ -406,7 +429,7 @@ class RagEngine:
         写库持 pipeline 存储锁 + 共享 embed 连接互斥锁（与 backfill_step
         同一纪律；reindex 端点同样经此方法，锁语义单点收口）。存储锁的必要性：
         主连接上的 DELETE+commit 若与管道/删除路径的隐式多语句事务交叉，
-        会把对方半程写入提前提交（复核 P2-23）；embed 锁的必要性：
+        会把对方半程写入提前提交；embed 锁的必要性：
         gc_orphans 直接在专用连接上写而不自持锁，互斥须由调用方给出。
         """
 
@@ -425,14 +448,15 @@ class RagEngine:
         水位/整表重建不交错（交错当前是良性的，但锁纪律名存实亡会诱使
         后续在 _refresh_vector_cache 中加入非幂等步骤）。
 
-        force_full 语义（复核 P1-4）：整表重建 = 拉全表后按 key 差集剔除
+        force_full 语义：整表重建 = 拉全表后按 key 差集剔除
         缓存内本次未 fetch 到的条目——否则「删除信号」被归零计数吞掉，
         已删内容持续可被检索。
+
+        水位归零发生在 _refresh_vector_cache 内、行数回退守卫之前：force_full
+        轮次守卫恒不触发（count_seen 已归零），删除检测完全由 fetch 后的 key
+        差集剔除承担——该剔除位于 raw_rows 判空之前，全表删光也收敛。
         """
 
-        if force_full:
-            self._vec_watermark = ""
-            self._vec_count_seen = 0
         async with self._refresh_lock:
             await self._refresh_vector_cache(force_full=force_full)
 
@@ -471,6 +495,9 @@ class RagEngine:
             self._vec_cache_clear()
             self._vec_model = model
         edb = await self._embed_factory()
+        if force_full:
+            self._vec_watermark = ""
+            self._vec_count_seen = 0
         # 共享 embed 连接上的读也持互斥锁：本方法结尾的 bad-key 删除会 commit，
         # 不持锁的 commit 可能把 dedup 未完成的批量向量写入提前提交
         async with get_embed_lock():
@@ -484,7 +511,7 @@ class RagEngine:
                 edb, model, self._vec_watermark, self.settings.group_only
             )
         if force_full:
-            # 整表重建（复核 P1-4）：本次 fetch 到的 key 集合之外，缓存内其余
+            # 整表重建：本次 fetch 到的 key 集合之外，缓存内其余
             # key 一律剔除——等价整表重建但省一次全量重嵌，且空表（全删）时
             # 也能清空残留。放在 raw_rows 判空之前，保证「删光了」也能收敛。
             # _vec_count_seen 由本方法末尾 self._vec_count_seen = total 统一
@@ -500,7 +527,7 @@ class RagEngine:
                 self._rebuild_matrix()
             return
         entries, bad_keys = await asyncio.to_thread(parse_embedding_rows, raw_rows)
-        # 维度对账（审查回归）：同模型名下供应商原地换维度或历史脏行会让
+        # 维度对账：同模型名下供应商原地换维度或历史脏行会让
         # float32 矩阵重组抛 inhomogeneous shape、/api/rag/ask 持续 500 直到
         # 人工清表。以现有缓存维度为基准（无缓存取批内多数维度），不一致的
         # 行按脏行同款删除（回填反连接重嵌入，产出当前模型维度，全表收敛）；
@@ -597,7 +624,7 @@ class RagEngine:
         try:
             q_vec = (await ai_ports.embed_texts([cleaned]))[0]
         except Exception:
-            # F4：嵌入端点故障不应连坐关键词问答——降级 FTS-only，仍可回答可命中问题
+            # 嵌入端点故障不应连坐关键词问答——降级 FTS-only，仍可回答可命中问题
             logger.warning(
                 "rag: 查询嵌入失败，降级为 FTS-only 检索（仅关键词可命中）",
                 exc_info=True,
@@ -717,31 +744,41 @@ class RagEngine:
             api_key=self.settings.api_key.get_secret_value(),
         )
         content = ""
-        if getattr(resp, "choices", None):
-            content = (resp.choices[0].message.content or "").strip()
+        choices = getattr(resp, "choices", None) or []
+        if choices:
+            content = (choices[0].message.content or "").strip()
+        if not content:
+            # 空 choices / 空答案：按拒答返回，不伪装成「已答但无引用」
+            logger.warning("rag: 模型返回空响应（choices=%d），按拒答处理", len(choices))
+            return AskResult(refused=True, answer="模型未返回内容，请稍后重试。")
         # 双态解析：deepseek 系强制 json_object 输出 → 优先 JSON 契约；
         # 其它供应商纯文本 → 回退 [n] 正则（兼容两路）
         answer = content
         cited: set[int] = set()
+        explicit = False  # 模型给出了 citations 列表（含空列表）→ 不再回退全部证据
         parsed = ai_ports.loads_json(content)
         if isinstance(parsed, dict) and isinstance(parsed.get("answer"), str):
             answer = parsed["answer"].strip()
+            if not answer:
+                logger.warning("rag: JSON 契约下 answer 为空，按拒答处理")
+                return AskResult(refused=True, answer="模型未返回内容，请稍后重试。")
             nums = parsed.get("citations")
             if isinstance(nums, list):
+                explicit = True
                 for n in nums:
-                    try:
-                        v = int(n)
-                    except (TypeError, ValueError):
-                        continue
-                    if 1 <= v <= len(hits):
+                    v = _citation_index(n)
+                    if v is not None and 1 <= v <= len(hits):
                         cited.add(v)
-        if not cited:
+        if not cited and not explicit:
             cited = {
                 int(m.group(1))
                 for m in self._CITE_RE.finditer(content)
                 if 1 <= int(m.group(1)) <= len(hits)
             }
-        nums = sorted(cited) if cited else list(range(1, len(hits) + 1))
+        if explicit:
+            nums = sorted(cited)
+        else:
+            nums = sorted(cited) if cited else list(range(1, len(hits) + 1))
         citations = [self._citation(n, hits[n - 1]) for n in nums]
         return AskResult(refused=False, answer=answer, citations=citations)
 

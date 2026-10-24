@@ -2,6 +2,7 @@
 
 import asyncio
 import os
+import re
 import shutil
 import tempfile
 import time
@@ -19,6 +20,8 @@ from briefdesk.events import EVENT_ITEMS_DELETED
 from briefdesk.plugins.calendar import router as calendar_router
 from briefdesk.plugins.reminders import router as reminders_router
 from briefdesk.server import routes_items as srv_routes
+
+_ROOT = Path(__file__).resolve().parents[1]
 
 
 def _client(**kwargs):
@@ -112,7 +115,7 @@ class LocalSecurityGuardTest(unittest.TestCase):
         self.assertEqual(resp.status_code, 400)
 
     def test_malformed_host_port_returns_400_not_500(self):
-        # 复核 P2-2：request.url.port 对「数字但超范围」端口（如 99999）抛
+        # request.url.port 对「数字但超范围」端口（如 99999）抛
         # ValueError，此前未被捕获导致 500；应统一 400（识别为非法 Host）。
         # 非数字端口（notaport 等）被 starlette 静默忽略（回退 scope server），
         # 不会抛异常，故不在本用例范围。
@@ -125,7 +128,7 @@ class LocalSecurityGuardTest(unittest.TestCase):
         self.assertEqual(resp.status_code, 403)
 
     def test_rejects_post_without_origin_and_referer(self):
-        # 审查修复 #3：Origin/Referer 双缺失不得静默放行变更接口（旧浏览器/
+        # Origin/Referer 双缺失不得静默放行变更接口（旧浏览器/
         # 隐私扩展剥离 Referer 后 CSRF 防护失效）——裸 client 不带默认头
         with TestClient(srv.app, base_url="http://localhost") as bare:
             resp = bare.post("/api/sync")
@@ -163,7 +166,7 @@ class LocalSecurityGuardTest(unittest.TestCase):
 
 
 class RestoreTempDirTest(unittest.TestCase):
-    """审查回归：restore 临时文件必须落在库文件同目录——os.replace 不允许
+    """回归防线：restore 临时文件必须落在库文件同目录——os.replace 不允许
     跨文件系统，mkstemp 缺省走系统 TEMP 时与 DB_PATH 跨盘（Windows 典型布局）
     必然 WinError 17，恢复功能整体不可用。"""
 
@@ -305,7 +308,7 @@ class ParseFlagTest(unittest.TestCase):
 
 
 class ReminderApiTest(unittest.TestCase):
-    """提醒端点（reminders Web 插件）：#10 aware→本地换算、参数校验，以及 #3A 到期查询路由。"""
+    """提醒端点（reminders Web 插件）：aware 时间→本地换算、参数校验，以及到期/已忽略卡片的查询路由。"""
 
     def setUp(self):
         self.client = _client()
@@ -344,7 +347,7 @@ class ReminderApiTest(unittest.TestCase):
         mock.assert_awaited_once_with("i1", None)
 
     def test_clear_no_reminder_returns_200_cleared_false(self):
-        # 复核 P2-4：清除已无提醒的卡（卡片存在但 remind_at 已为 NULL）应返回
+        # 清除已无提醒的卡（卡片存在但 remind_at 已为 NULL）应返回
         # 200 {"cleared": false}，而非 404（此前两者同为 404，手动清除误导报错）。
         with patch(
             "briefdesk.plugins.reminders.router.set_item_reminder",
@@ -384,7 +387,7 @@ class ReminderApiTest(unittest.TestCase):
     def test_missing_item_returns_404(self):
         mock = AsyncMock(return_value=False)
         with patch("briefdesk.plugins.reminders.router.set_item_reminder", new=mock), patch(
-            # 复核 P2-4：清除未命中后复查存在性（卡片不存在 → 404）
+            # 清除未命中后复查存在性（卡片不存在 → 404）
             "briefdesk.db.get_existing_item_ids",
             new=AsyncMock(return_value=set()),
         ):
@@ -416,7 +419,7 @@ class ReminderApiTest(unittest.TestCase):
 
 
 class VerifyApiTest(unittest.TestCase):
-    """F3：/api/items/:id/verify 对不存在的卡片返回 404（不再静默成功）。"""
+    """/api/items/:id/verify 对不存在的卡片返回 404（不再静默成功）。"""
 
     def setUp(self):
         self.client = _client()
@@ -547,7 +550,7 @@ class GroupCountFieldTest(unittest.TestCase):
 
 
 class MediaContentTypeTest(unittest.TestCase):
-    """审查修复 #2：媒体代理 Content-Type 白名单，掐断同源文档渲染 XSS 面。
+    """媒体代理必须做 Content-Type 白名单，掐断同源文档渲染 XSS 面。
 
     最终类型必须是安全位图（png/jpeg/gif/webp/bmp）；SVG/HTML 等可承载
     脚本的类型一律降级 application/octet-stream + attachment 强制下载。
@@ -626,7 +629,7 @@ class MediaContentTypeTest(unittest.TestCase):
 
 
 class SpaFallbackExtensionTest(unittest.TestCase):
-    """审查修复 #8：带扩展名的未知静态资源 404，不回退 SPA 首页。
+    """带扩展名的未知静态资源必须 404，不回退 SPA 首页。
 
     回退 index.html 会以 200 + text/html 应答 .js/.css 等资源请求，
     触发浏览器严格 MIME 检查告警；SPA 路由（无扩展名）仍回退首页。
@@ -659,7 +662,7 @@ class SpaFallbackExtensionTest(unittest.TestCase):
 
 
 class CsvExportFormulaInjectionTest(unittest.TestCase):
-    """审查修复 #4：CSV 导出对公式前缀（=/+/-/@/Tab）单元格前置单引号转义。"""
+    """CSV 导出必须对公式前缀（=/+/-/@/Tab）单元格前置单引号转义——否则表格软件打开即执行公式。"""
 
     def test_items_export_escapes_formula_prefixes(self):
         client = _client()
@@ -750,7 +753,7 @@ class CsvExportFormulaInjectionTest(unittest.TestCase):
 
 
 class IgnoreClearsDedupCacheEventTest(unittest.TestCase):
-    """审查修复 #5：忽略卡片后发布 items_deleted，使去重缓存与预热口径一致。
+    """忽略卡片后必须发布 items_deleted，使去重缓存与预热口径一致。
 
     去重缓存预热只载入 is_verified >= 0 的条目；忽略后若不清内存缓存，
     被忽略卡仍参与判重，相似新消息被永久跳过不显示（直到重启）。
@@ -826,13 +829,191 @@ class IgnoreClearsDedupCacheEventTest(unittest.TestCase):
         self.assertEqual(resp.status_code, 200)
         publish.assert_not_awaited()
 
+    def _patch_verify(self, verified, dedup):
+        """单卡 verify 的公共 patch：返回 (client, publish, add_to_cache)。"""
+        publish = AsyncMock()
+        add_to_cache = Mock()
+        svc_ctx = None if dedup is None else SimpleNamespace(dedup=dedup)
+        patches = patch.multiple(
+            "briefdesk.server.routes_items",
+            event_bus=SimpleNamespace(publish=publish),
+            update_item_verify=AsyncMock(return_value=True),
+            get_category_counts=AsyncMock(return_value=[]),
+            get_all_category_count=AsyncMock(return_value=0),
+            get_ignored_count=AsyncMock(return_value=0),
+            get_memo_count=AsyncMock(return_value=0),
+            _stage_context=Mock(return_value=svc_ctx),
+            get_item_texts_by_ids=AsyncMock(
+                return_value=[
+                    {
+                        "id": "i1",
+                        "title": "t",
+                        "image_urls": "",
+                        "source": "weflow",
+                        "source_quote": "q",
+                    }
+                ]
+            ),
+        )
+        client = _client()
+        with patches:
+            resp = client.post("/api/items/i1/verify", json={"verified": verified})
+        client.close()
+        self.assertEqual(resp.status_code, 200)
+        return publish, add_to_cache
+
+    def test_single_verify_unverify_readds_to_dedup_cache(self):
+        """恢复（0）的卡片必须回到去重缓存，否则相似新消息再建一张卡。"""
+        dedup = SimpleNamespace(add_to_cache=Mock())
+        publish, _ = self._patch_verify(0, dedup)
+        dedup.add_to_cache.assert_called_once()
+        self.assertEqual(dedup.add_to_cache.call_args.args[0], "i1")
+        publish.assert_not_awaited()
+
+    def test_single_verify_memo_readds_to_dedup_cache(self):
+        dedup = SimpleNamespace(add_to_cache=Mock())
+        publish, _ = self._patch_verify(1, dedup)
+        dedup.add_to_cache.assert_called_once()
+        publish.assert_not_awaited()
+
+    def test_resync_without_dedup_service_is_noop(self):
+        """dedup 插件未装配（_stage_context 为 None）时静默跳过，不抛错。"""
+        publish, _ = self._patch_verify(0, None)
+        publish.assert_not_awaited()
+
+    def test_batch_memo_readds_to_dedup_cache(self):
+        dedup = SimpleNamespace(add_to_cache=Mock())
+        with patch.multiple(
+            "briefdesk.server.routes_items",
+            event_bus=SimpleNamespace(publish=AsyncMock()),
+            update_items_verify=AsyncMock(return_value=1),
+            storage_lock=asyncio.Lock(),
+            _stage_context=Mock(return_value=SimpleNamespace(dedup=dedup)),
+            get_item_texts_by_ids=AsyncMock(
+                return_value=[
+                    {
+                        "id": "i1",
+                        "title": "t",
+                        "image_urls": "",
+                        "source": "weflow",
+                        "source_quote": "q",
+                    }
+                ]
+            ),
+        ):
+            client = _client()
+            resp = client.post(
+                "/api/items/batch", json={"ids": ["i1"], "action": "memo"}
+            )
+            client.close()
+        self.assertEqual(resp.status_code, 200)
+        dedup.add_to_cache.assert_called_once()
+
+
+class EventPublishFollowsActualEffectTest(unittest.TestCase):
+    """批量/级联操作只在确有变更时发布事件或回写去重缓存。
+
+    无条件发布时，affected == 0 的操作会把订阅方按「这些 id 已被删除」处理：
+    去重缓存是进程级内存态——照常清掉卡片后，相似新消息会重复建卡直到重启；
+    备忘/恢复则会把并不存在于库里的文本灌成缓存中的幽灵条目。
+    """
+
+    def _batch(self, action, affected):
+        publish = AsyncMock()
+        dedup = SimpleNamespace(add_to_cache=Mock())
+        with patch.multiple(
+            "briefdesk.server.routes_items",
+            event_bus=SimpleNamespace(publish=publish),
+            delete_items=AsyncMock(return_value=affected),
+            update_items_verify=AsyncMock(return_value=affected),
+            storage_lock=asyncio.Lock(),
+            _stage_context=Mock(return_value=SimpleNamespace(dedup=dedup)),
+            get_item_texts_by_ids=AsyncMock(
+                return_value=[
+                    {
+                        "id": "i1",
+                        "title": "t",
+                        "image_urls": "",
+                        "source": "weflow",
+                        "source_quote": "q",
+                    }
+                ]
+            ),
+        ):
+            client = _client()
+            resp = client.post(
+                "/api/items/batch", json={"ids": ["i1"], "action": action}
+            )
+            client.close()
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()["affected"], affected)
+        return publish, dedup
+
+    def test_delete_without_effect_publishes_nothing(self):
+        publish, _ = self._batch("delete", 0)
+        publish.assert_not_awaited()
+
+    def test_delete_with_effect_publishes(self):
+        publish, _ = self._batch("delete", 1)
+        publish.assert_awaited_once_with(EVENT_ITEMS_DELETED, ["i1"])
+
+    def test_ignore_without_effect_publishes_nothing(self):
+        publish, _ = self._batch("ignore", 0)
+        publish.assert_not_awaited()
+
+    def test_memo_without_effect_skips_dedup_resync(self):
+        _, dedup = self._batch("memo", 0)
+        dedup.add_to_cache.assert_not_called()
+
+    def test_memo_with_effect_readds_to_dedup_cache(self):
+        _, dedup = self._batch("memo", 1)
+        dedup.add_to_cache.assert_called_once()
+
+    def test_category_cascade_delete_without_items_publishes_nothing(self):
+        publish = AsyncMock()
+        with patch.multiple(
+            "briefdesk.server.routes_categories",
+            delete_category=AsyncMock(return_value=({"id": 3, "name": "虚构类别"}, [])),
+            event_bus=SimpleNamespace(publish=publish),
+            storage_lock=asyncio.Lock(),
+            publish_items_updated=AsyncMock(),
+        ):
+            client = _client()
+            resp = client.post(
+                "/api/categories/3/delete", json={"purgeItems": True}
+            )
+            client.close()
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()["deletedItems"], 0)
+        publish.assert_not_awaited()
+
+    def test_category_cascade_delete_with_items_publishes(self):
+        publish = AsyncMock()
+        with patch.multiple(
+            "briefdesk.server.routes_categories",
+            delete_category=AsyncMock(
+                return_value=({"id": 3, "name": "虚构类别"}, ["a", "b"])
+            ),
+            event_bus=SimpleNamespace(publish=publish),
+            storage_lock=asyncio.Lock(),
+            publish_items_updated=AsyncMock(),
+        ):
+            client = _client()
+            resp = client.post(
+                "/api/categories/3/delete", json={"purgeItems": True}
+            )
+            client.close()
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()["deletedItems"], 2)
+        publish.assert_awaited_once_with(EVENT_ITEMS_DELETED, ["a", "b"])
+
 
 if __name__ == "__main__":
     unittest.main()
 
 
 class RecategorizeRouteTest(unittest.TestCase):
-    """【复核 P2-30/P2-6】recategorize 路由编排：存储锁内两步写、输入校验、404。"""
+    """recategorize 路由编排：存储锁内两步写、输入校验、404。"""
 
     def setUp(self):
         self.client = _client()
@@ -897,7 +1078,7 @@ class RecategorizeRouteTest(unittest.TestCase):
 
 
 class CategoryDeleteRouteTest(unittest.TestCase):
-    """【复核 P2-30】类别删除路由编排：purge 分支在存储锁内发布 items_deleted。"""
+    """类别删除路由编排：purge 分支在存储锁内发布 items_deleted。"""
 
     def setUp(self):
         self.client = _client()
@@ -940,8 +1121,65 @@ class CategoryDeleteRouteTest(unittest.TestCase):
         publish.assert_not_awaited()
 
 
+class CategoryPromptLimitTest(unittest.TestCase):
+    """类别提示词上限三处一致（后端常量、新建框、编辑框）。
+
+    上限 200 而后端 maxlength 50 的年代表述已过时：13 个默认提示词全部超过
+    50 字，编辑框无法插入字符，其中 5 类保存必 400。此处用静态比对钉住
+    后端常量与前端两处 maxlength 不再漂移。
+    """
+
+    def setUp(self):
+        self.client = _client()
+
+    def tearDown(self):
+        self.client.close()
+
+    def _post_prompt(self, prompt):
+        with patch.multiple(
+            "briefdesk.server.routes_categories",
+            storage_lock=asyncio.Lock(),
+            insert_category=AsyncMock(return_value={"id": 1, "name": "x"}),
+            publish_items_updated=AsyncMock(),
+        ):
+            return self.client.post(
+                "/api/categories",
+                json={"name": "x", "prompt": prompt, "color": "#123456"},
+            )
+
+    def test_prompt_at_limit_accepted(self):
+        from briefdesk.server.routes_categories import _PROMPT_MAX
+
+        resp = self._post_prompt("提" * _PROMPT_MAX)
+        self.assertEqual(resp.status_code, 200, resp.text)
+
+    def test_prompt_over_limit_rejected(self):
+        from briefdesk.server.routes_categories import _PROMPT_MAX
+
+        resp = self._post_prompt("提" * (_PROMPT_MAX + 1))
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn(f"<= {_PROMPT_MAX}", resp.text)
+
+    def test_frontend_maxlength_matches_backend(self):
+        from briefdesk.server.routes_categories import _PROMPT_MAX
+
+        index = (_ROOT / "briefdesk" / "ui" / "index.html").read_text(encoding="utf-8")
+        app = (_ROOT / "briefdesk" / "ui" / "app.js").read_text(encoding="utf-8")
+        add = re.search(
+            r'id="cat-add-prompt"[^>]*maxlength="(\d+)"', index
+        )
+        edit = re.search(
+            r'class="cat-edit-prompt"[^>]*maxlength="(\d+)"', app
+        )
+        self.assertIsNotNone(add, "index.html 的 cat-add-prompt 应有 maxlength")
+        self.assertIsNotNone(edit, "app.js 的 cat-edit-prompt 应有 maxlength")
+        self.assertEqual(int(add.group(1)), _PROMPT_MAX)
+        self.assertEqual(int(edit.group(1)), _PROMPT_MAX)
+        self.assertIn(f"（≤{_PROMPT_MAX} 字）", index, "placeholder 应标注同一上限")
+
+
 class BackupRestoreRouteTest(unittest.TestCase):
-    """【复核 P2-30/P2-10】备份流式下发与恢复校验路由编排。"""
+    """备份流式下发与恢复校验路由编排。"""
 
     def test_backup_streams_file(self):
         client = _client()
@@ -1087,9 +1325,17 @@ class BackupTempFileLifecycleTest(unittest.TestCase):
             rules = f.read()
         self.assertIn("*.restore-pending", rules)
 
+    def test_gitignore_covers_pre_restore(self):
+        """恢复前原库副本（含 PII）同样不得入库。"""
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(root, ".gitignore"), encoding="utf-8") as f:
+            rules = f.read()
+        for pattern in ("*.pre-restore", "*.pre-restore-wal", "*.pre-restore-shm"):
+            self.assertIn(pattern, rules)
+
 
 class SessionToggleRouteTest(unittest.TestCase):
-    """【复核 P2-30】会话开关路由：锁内两步写、404、监听缓存失效。"""
+    """会话开关路由：锁内两步写、404、监听缓存失效。"""
 
     def setUp(self):
         self.client = _client()

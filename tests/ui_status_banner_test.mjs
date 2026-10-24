@@ -1,4 +1,4 @@
-// 状态横幅（#error-banner）回归测试（Node vm 加载真实 ui/app.js）。
+// 状态横幅（#error-banner）回归测试（Node vm 加载真实 briefdesk/ui/app.js）。
 //
 // 守三件事：
 // 1. 零源降级（/api/status.sources 为空）→ 显示「未启用任何消息源」警示横幅

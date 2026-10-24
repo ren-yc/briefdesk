@@ -28,7 +28,7 @@ logger = logging.getLogger(__name__)
 class WeFlowSettings(KeyringSettingsBase):
     """WeFlow 消息源配置，密钥字段支持系统密钥环。"""
 
-    # 密钥解析链（keyring > 环境变量 > .env > 默认值），见 briefdesk/secrets_store.py。
+    # 密钥解析链（keyring > 环境变量 > 项目 .env > 用户暂存文件 > 默认值），见 briefdesk/secrets_store.py。
     # WEFLOW_DB_KEYS 由 KeyringSource 特判读取合并后的完整 JSON（存储层切段，
     # 配置层只见一份）。
     KEYRING_FIELDS: ClassVar[dict[str, str]] = {
@@ -53,7 +53,7 @@ class WeFlowSettings(KeyringSettingsBase):
     # ── SSE 参数（.env） ──
     sse_reconnect_initial_ms: int = Field(
         default=1000,
-        gt=0,  # env: WEFLOW_SSE_RECONNECT_INITIAL_MS（复核 P3-17：0 会退化为热重连风暴）
+        gt=0,  # env: WEFLOW_SSE_RECONNECT_INITIAL_MS（0 会退化为热重连风暴，故要求 >0）
     )
     sse_reconnect_max_ms: int = Field(
         default=60000,

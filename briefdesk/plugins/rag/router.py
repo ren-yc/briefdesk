@@ -100,6 +100,7 @@ async def rag_status() -> dict:
         "fts_tokenizer": st["fts_tokenizer"],
         "model": ai_ports.embed_model_name(),
         "backfill_days": engine.settings.backfill_days,
+        "available": True,
     }
 
 

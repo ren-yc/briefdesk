@@ -1,6 +1,6 @@
-// 启动配置（设置 → 启动配置/插件）面板逻辑回归（Node vm 加载真实 ui/app.js）。
+// 启动配置（设置 → 启动配置/插件）面板逻辑回归（Node vm 加载真实 briefdesk/ui/app.js）。
 //
-// 守七件事：
+// 守十二件事：
 // 1. _collectEnvChanges 的布尔分支必须跳过未变化项——此前缺失相等性检查，
 //    每次「暂存更改」都会把所有布尔项重写进暂存文件，「没有需要暂存的更改」
 //    永不触发，差异计数常驻虚高；
@@ -16,6 +16,12 @@
 //    本插件草稿态；_pluginChanges 把草稿 diff 成单个 PLUGINS JSON 值。
 // 7. 行内动作（恢复默认/密钥写清）行级贴片：不整面重载 loadEnvConfig——
 //    整面重载会丢其它行的未暂存编辑、「插件」面板开关草稿与搜索过滤态。
+// 8. 无运行值条目（未装配插件不下发 current）不得产生假差异，且仍可预配置；
+//    select 的当前值不在选项内时必须渲染为选中项。
+// 9. 插件预期未知（enabled===null）不得折进空集合，恢复出口按钮随坏值显隐。
+// 10-11. 恢复出口按钮：点击即一次 PUT 双 null 原子清除；取消确认不发请求、
+//        失败逐条明示并复位按钮。
+// 12. 密钥行「取消」是纯前端态还原：不发请求、不整面重绘、不碰其它行。
 //
 // 数据一律虚构（见 AGENTS.md）。
 
@@ -25,6 +31,10 @@ import vm from "node:vm";
 import { loadAppJs, makeElement } from "./ui_harness.mjs";
 
 const { sandbox, getElement } = loadAppJs();
+
+// setupEvents 挂在 DOMContentLoaded 回调里，vm 永远不触发——需要按钮点击流的
+// 用例手动执行绑定（幂等性由各 listener 只挂一次保证）。
+sandbox.bindSettingsFormEvents();
 
 // envData 是 app.js 顶层 let（全局词法绑定，不在 globalThis 上），
 // 但同一 context 的后续 script 可以对它赋值——借此注入测试夹具。
@@ -336,9 +346,9 @@ sandbox.renderPluginToggles();
   sandbox._pluginSets();
 }
 
-// ── 8a. pluginsSource==="env" → 顶部警示「重启不生效」（开关保持可用） ──
-// 来源链 env > 暂存 > .env > 默认；env 覆盖时面板开关写入暂存文件无效，
-// 须告知用户。env 之外的来源（override/dotenv/default）不显示警示。
+// ── 8a. PLUGINS 被更高层压住（env / 项目 .env）→ 顶部警示 + 开关置灰 ──
+// 来源链 env > 项目 .env > 暂存 > 默认；被压住时面板开关写入的是暂存文件，
+// 重启不生效。开关仍渲染（保留核对当前生效组合的入口），但置灰。
 {
   const savedEnv = vm.runInContext("envData", sandbox);
   const base = {
@@ -352,25 +362,28 @@ sandbox.renderPluginToggles();
     ],
   };
 
-  setEnvData({ ...base, pluginsSource: "env" });
+  setEnvData({ ...base, pluginsSource: "env", pluginsOverridden: true });
   sandbox._pluginSets();
   sandbox.renderPluginToggles();
   let html = getElement("plugins-list").innerHTML;
-  assert.ok(html.includes("PLUGINS 由环境变量控制"), "env 来源应显示优先警示");
+  assert.ok(html.includes("PLUGINS 当前由「环境变量」控制"), "env 来源应显示覆盖警示");
   assert.ok(html.includes("重启后不会生效"), "警示应说明开关不生效");
-  assert.ok(html.includes('data-plugin-toggle="weflow"'), "env 来源下开关仍渲染（不禁用）");
+  assert.ok(html.includes('data-plugin-toggle="weflow"'), "被覆盖时开关仍渲染（可核对生效组合）");
+  assert.ok(html.includes("disabled"), "被 env 覆盖时开关置灰");
+
+  setEnvData({ ...base, pluginsSource: "dotenv", pluginsOverridden: true });
+  sandbox._pluginSets();
+  sandbox.renderPluginToggles();
+  html = getElement("plugins-list").innerHTML;
+  assert.ok(html.includes("PLUGINS 当前由「项目 .env」控制"), "项目 .env 高于暂存：同样警示");
+  assert.ok(html.includes("disabled"), "被项目 .env 覆盖时开关置灰");
 
   setEnvData({ ...base, pluginsSource: "override" });
   sandbox._pluginSets();
   sandbox.renderPluginToggles();
   html = getElement("plugins-list").innerHTML;
-  assert.ok(!html.includes("PLUGINS 由环境变量控制"), "override（暂存）来源不应显示警示");
-
-  setEnvData({ ...base, pluginsSource: "dotenv" });
-  sandbox._pluginSets();
-  sandbox.renderPluginToggles();
-  html = getElement("plugins-list").innerHTML;
-  assert.ok(!html.includes("PLUGINS 由环境变量控制"), "dotenv 来源不应显示警示（暂存优先于 .env）");
+  assert.ok(!html.includes("PLUGINS 当前由"), "暂存来源不显示覆盖警示");
+  assert.ok(!html.includes("disabled"), "暂存来源下开关可用");
 
   vm.runInContext(`envData = ${JSON.stringify(savedEnv)};`, sandbox);
   sandbox._pluginSets();
@@ -695,4 +708,327 @@ sandbox.renderPluginToggles();
   delete sandbox.confirm;
 }
 
+// ── 12. 覆盖态渲染：草稿被更高层压住时报覆盖来源，未装配插件报「无运行值」 ──
+setEnvData({
+  filePath: "C:/tmp/settings.env",
+  pluginOptions: [],
+  items: [
+    {
+      key: "LOG_LEVEL", type: "select", label: "日志级别", plugin: "", staged: "DEBUG",
+      current: "INFO", source: "default", overridden: true, override_source: "dotenv",
+      override_value: "INFO", expected_value: "INFO", expected_source: "dotenv",
+      expectedAvailable: true, expectedError: "", running: true,
+    },
+    {
+      key: "SERVER_PORT", type: "number", label: "服务端口", plugin: "", staged: null,
+      current: 3000, source: "default", overridden: false, override_source: null,
+      override_value: null, expected_value: 3000, expected_source: "default",
+      expectedAvailable: true, expectedError: "", running: true,
+    },
+    {
+      key: "WEFLOW_API_BASE", type: "text", label: "weflow API 基址", plugin: "weflow",
+      pluginStatus: "disabled", staged: null, source: null, overridden: false,
+      override_source: null, override_value: null, expected_value: "http://127.0.0.1:5033",
+      expected_source: "default", expectedAvailable: true, expectedError: "", running: false,
+    },
+  ],
+  secrets: [],
+});
+{
+  const [overridden, plain, notRunning] = vm.runInContext("envData.items", sandbox);
+  const overriddenHtml = sandbox._envRowHtml(overridden, false);
+  assert.ok(overriddenHtml.includes("已被「项目 .env」覆盖"), "被覆盖的草稿必须标注覆盖来源");
+  assert.ok(overriddenHtml.includes("实际生效：INFO"), "被覆盖时必须显示实际生效值");
+  assert.ok(!overriddenHtml.includes("下次启动生效"), "被覆盖时不再重复报下次启动值");
+
+  const plainHtml = sandbox._envRowHtml(plain, false);
+  assert.ok(!plainHtml.includes("已被"), "未被覆盖的行不得出现覆盖徽章");
+  assert.ok(!plainHtml.includes("实际生效"), "无草稿且未覆盖的行不得出现生效值提示");
+
+  const notRunningHtml = sandbox._envRowHtml(notRunning, false);
+  assert.ok(notRunningHtml.includes("无运行值"), "未装配插件必须显式标注「无运行值」");
+  assert.ok(!notRunningHtml.includes("实际生效"), "无运行值不得显示生效值");
+}
+
+// ── 13. 无运行值条目：服务端不下发 current（running:false），渲染成空输入 ──
+// 收集侧若拿 String(undefined) 当基准，就会把「没动过」判成改动并提交空串：
+// 数字项被服务端按「须为数字（留空不等于恢复默认）」422 拦下，整次保存失败。
+setEnvData({
+  filePath: "C:/tmp/settings.env",
+  pluginOptions: [],
+  items: [
+    { key: "OFF_NUM", type: "number", label: "未启用插件的数字项", plugin: "off", staged: null, running: false, numberKind: "integer", min: 1 },
+    { key: "OFF_TEXT", type: "text", label: "未启用插件的文本项", plugin: "off", staged: null, running: false },
+    { key: "OFF_FLAG", type: "boolean", label: "未启用插件的开关", plugin: "off", staged: null, running: false },
+    { key: "OFF_MULTI", type: "multi", label: "未启用插件的多选", plugin: "off", staged: null, running: false },
+  ],
+  secrets: [],
+});
+{
+  const multiRow = makeRow("OFF_MULTI", {});
+  multiRow.querySelectorAll = () => [];
+  const rows = [
+    makeRow("OFF_NUM", { control: { value: "" } }),
+    makeRow("OFF_TEXT", { control: { value: "" } }),
+    makeRow("OFF_FLAG", { checkbox: { checked: false } }),
+    multiRow,
+  ];
+  getElement("env-items").querySelectorAll = () => rows;
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(sandbox._collectEnvChanges())),
+    {},
+    "无运行值且未改动时必须无差异（否则每次保存都提交空串 → 422）",
+  );
+
+  // 无运行值不等于不可配置：用户填了值仍要提交（下次启动生效）
+  rows[0].querySelector("[data-env-key]").value = "3";
+  rows[1].querySelector("[data-env-key]").value = "http://127.0.0.1:5031";
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(sandbox._collectEnvChanges())),
+    { OFF_NUM: "3", OFF_TEXT: "http://127.0.0.1:5031" },
+    "无运行值条目填了值必须进入差异集",
+  );
+
+  // 清空数字项不入 payload（空串必 422）；恢复默认走行内按钮
+  rows[0].querySelector("[data-env-key]").value = "";
+  assert.deepEqual(
+    Object.keys(sandbox._collectEnvChanges()),
+    ["OFF_TEXT"],
+    "空数字项不得进入差异集",
+  );
+
+  // select 兜底：当前值不在选项内时补同值 option，否则浏览器回落到第一项，
+  // 收集侧比对 el.value 会把「显示的那一项」当成用户改动写回
+  assert.match(
+    sandbox._envControl({ key: "LOG_LEVEL", type: "select", options: ["DEBUG", "INFO"], current: "info" }),
+    /value="info" selected/,
+    "不在选项内的当前值必须渲染为选中项",
+  );
+  assert.match(
+    sandbox._envControl({ key: "LOG_LEVEL", type: "select", options: ["DEBUG", "INFO"], current: "INFO" }),
+    /value="INFO" selected/,
+    "在选项内的当前值照常选中",
+  );
+}
+
 console.log("ui_env_panel_test: all assertions passed");
+
+// ── 9. 插件预期未知（enabled===null）：开关禁用、不产生 PLUGINS 假更改 ──
+// 名单解析失败时服务端把可选插件 enabled 置 null（显式未知，不是关闭）：
+// UI 若把未知折进空集合，会把「未知」自动提交成 PLUGINS=[] 清空名单。
+setEnvData({
+  filePath: "C:/tmp/settings.env",
+  pluginOptions: [],
+  pluginsExpectedError: "PLUGINS 不是合法 JSON",
+  pluginsSource: "default",
+  pluginsOverridden: false,
+  items: [],
+  secrets: [],
+  plugins: [
+    { name: "alpha", core: false, enabled: null, dependencies: [], conflicts: [], status: "disabled", reason: "" },
+    { name: "core-a", core: true, enabled: true, dependencies: [], conflicts: [], status: "loaded", reason: "" },
+  ],
+});
+sandbox._pluginSets(); // 与 loadEnvConfig 同序：先算期望集再渲染
+sandbox.renderPluginToggles();
+{
+  const html = getElement("plugins-list").innerHTML;
+  assert.match(html, /无法解析/, "预期未知必须显示错误说明，不能显示「全关」引导");
+  assert.doesNotMatch(html, /当前未启用任何可选插件/, "不得做「全部关闭」的推断");
+  assert.ok(html.includes("C:/tmp/settings.env"), "错误说明必须给出本机配置的文件路径");
+  assert.ok(
+    html.includes("清除本机插件启用与必选"),
+    "坏值可能在本机暂存层：指引必须指向专用恢复按钮，不再让用户手拼 PUT 载荷",
+  );
+  // 恢复出口按钮：预期未知时解除隐藏、坏值排除后重新隐藏（renderPluginToggles 收口）
+  const clearBtn = getElement("plugins-clear-staged");
+  assert.ok(!clearBtn.classList.contains("hidden"), "预期未知时恢复按钮必须可见");
+  // 防御断言：未知时 _pluginChanges 不得产出 PLUGINS 假更改
+  vm.runInContext("pluginDraftSet = new Set();", sandbox);
+  assert.deepEqual(JSON.parse(JSON.stringify(sandbox._pluginChanges())), {}, "预期未知不得提交清空名单的假更改");
+}
+
+// ── 10. 恢复出口按钮：坏值排除后隐藏；点击即一次 PUT 双 null 原子清除 ──
+{
+  setEnvData({
+    filePath: "C:/tmp/settings.env",
+    pluginOptions: [],
+    pluginsSource: "default",
+    pluginsOverridden: false,
+    items: [],
+    secrets: [],
+    plugins: [
+      { name: "alpha", core: false, enabled: false, dependencies: [], conflicts: [], status: "disabled", reason: "" },
+    ],
+  });
+  sandbox._pluginSets();
+  sandbox.renderPluginToggles();
+  const clearBtn = getElement("plugins-clear-staged");
+  assert.ok(clearBtn.classList.contains("hidden"), "坏值排除后恢复按钮必须重新隐藏");
+
+  // 点击流：确认 → PUT 双 null → 成功 toast → loadEnvConfig 重取
+  setEnvData({
+    filePath: "C:/tmp/settings.env",
+    pluginOptions: [],
+    pluginsExpectedError: "PLUGINS 不是合法 JSON",
+    pluginsSource: "default",
+    pluginsOverridden: false,
+    items: [],
+    secrets: [],
+    plugins: [],
+  });
+  sandbox._pluginSets();
+  sandbox.renderPluginToggles();
+  assert.ok(!clearBtn.classList.contains("hidden"), "重新渲染后按钮再次解除隐藏");
+
+  const calls = [];
+  sandbox.confirm = () => true;
+  sandbox.putJson = async (url, payload) => {
+    calls.push({ url, payload });
+    return { items: {} };
+  };
+  const reloads = [];
+  sandbox.loadEnvConfig = async () => reloads.push(true);
+  const toasts = [];
+  sandbox.showToast = (msg, opts) => toasts.push({ msg, opts });
+  await clearBtn.click();
+  assert.equal(calls.length, 1, "清除必须恰好发一次 PUT");
+  assert.equal(calls[0].url, "/api/settings/env");
+  // 不用 deepEqual：跨 vm 实例的对象原型不同，deepStrictEqual 会误报。
+  // 改断言两键存在且值恰为 null——「原子双 null」的实质是键集与值。
+  assert.deepEqual(
+    Object.keys(calls[0].payload.items).sort(),
+    ["PLUGINS", "PLUGINS_REQUIRED"],
+    "载荷必须恰好只清这两键",
+  );
+  assert.ok(
+    calls[0].payload.items.PLUGINS === null && calls[0].payload.items.PLUGINS_REQUIRED === null,
+    "两键值必须都是 null（服务端语义：null = 移除暂存项）",
+  );
+  assert.ok(toasts.some(t => t.msg.includes("已清除")), "成功后必须明示已清除");
+  assert.equal(reloads.length, 1, "清除后必须重取面板数据");
+  assert.ok(!clearBtn.disabled, "完成后按钮必须恢复可用");
+}
+// ── 11. 恢复出口按钮：用户取消确认不发请求；PUT 失败显式报错且按钮复位 ──
+{
+  const calls = [];
+  sandbox.confirm = () => false;
+  sandbox.putJson = async (url, payload) => {
+    calls.push({ url, payload });
+    return { items: {} };
+  };
+  const clearBtn = getElement("plugins-clear-staged");
+  await clearBtn.click();
+  assert.equal(calls.length, 0, "取消确认不得发出清除请求");
+
+  sandbox.confirm = () => true;
+  sandbox.putJson = async () => {
+    const err = new Error("409");
+    err.payload = { detail: { issues: [{ plugin: "weflow", detail: "必选但未启用" }] } };
+    throw err;
+  };
+  const toasts = [];
+  sandbox.showToast = (msg, opts) => toasts.push({ msg, opts });
+  await clearBtn.click();
+  assert.ok(
+    toasts.some(t => t.opts && t.opts.type === "error" && t.msg.includes("weflow")),
+    "409 明细必须逐条明示（与暂存失败同一套文案模式）",
+  );
+  assert.ok(!clearBtn.disabled, "失败后按钮必须恢复可用，允许重试");
+}
+
+// ── 12. 密钥行「取消」：纯前端态还原（不发请求、不整面重绘、不碰其它行）──
+// 「取消」只随钥匙串托管行渲染：它把「替换」展开的输入框收回、清掉半输入、
+// 还原「替换」入口。任一步走偏都会让该行既无输入框也无入口（行内再无配置
+// 门路）；把它实现成「清掉该键暂存值」而走 PUT，语义上是很容易犯的误解——
+// 用户点「取消」绝不该产生任何写入。
+{
+  setEnvData({
+    filePath: "C:/tmp/settings.env",
+    pluginOptions: [],
+    items: [],
+    secrets: [
+      { name: "ALPHA_TOKEN", label: "Alpha 令牌", plugin: "", configured: true, keyringConfigured: true },
+      { name: "BETA_TOKEN", label: "Beta 令牌", plugin: "", configured: true, keyringConfigured: true },
+    ],
+  });
+  sandbox.renderEnvConfig();
+
+  // harness 不解析 innerHTML，点击流的行树只能手工搭——树与渲染结果之间没有
+  // 解析器做桥，「取消按钮是否真渲染在含输入框的 .env-row 内」这类结构回归
+  // 本用例看不见，渲染面由第 4 节的字符串断言钉住。
+  const mkSecretRow = () => {
+    const input = makeElement();
+    const box = makeElement();
+    box.classList.add("hidden"); // 钥匙串托管行：输入框初始收起
+    box.querySelector = (sel) => (sel === "input" ? input : null);
+    const replace = makeElement(); // 「替换」入口初始可见
+    const cancel = makeElement();
+    const row = makeElement();
+    row.querySelector = (sel) => {
+      if (sel === ".env-secret-input") return box;
+      if (sel === "[data-sec-replace]") return replace;
+      return null;
+    };
+    replace.closest = (sel) => (sel === ".env-row" ? row : null);
+    cancel.closest = (sel) => (sel === ".env-row" ? row : null);
+    return { row, box, input, replace, cancel };
+  };
+  const alpha = mkSecretRow();
+  const beta = mkSecretRow();
+
+  // 「取消」的 handler 是委托在 #env-secrets 上的（靠 e.target.closest 分流
+  // set→clear→replace→cancel），harness 的 click() 以 {target: this} 派发——
+  // 因此把「命中哪个按钮」表达成容器 closest 的路由表。非目标选择器一律返回
+  // null：否则会顺带命中 set/clear（它们发请求）或 replace（把刚展开的又收起）。
+  const secRoot = getElement("env-secrets");
+  const route = (spec) => { secRoot.closest = (sel) => spec[sel] || null; };
+  secRoot.querySelectorAll = (sel) => (sel === ".env-row" ? [alpha.row, beta.row] : []);
+
+  const calls = [];
+  sandbox.fetch = async (url, opts = {}) => {
+    calls.push({ url: String(url), method: opts.method || "GET" });
+    return { ok: true, json: async () => ({}) };
+  };
+  const toasts = [];
+  const realToast = sandbox.showToast;
+  sandbox.showToast = (msg) => toasts.push(msg);
+  const renders = [];
+  const realRender = sandbox.renderEnvConfig;
+  sandbox.renderEnvConfig = (...a) => { renders.push(1); return realRender(...a); };
+  const reloads = [];
+  const realLoad = sandbox.loadEnvConfig;
+  sandbox.loadEnvConfig = async (...a) => { reloads.push(1); return realLoad(...a); };
+
+  // 前置：走真实「替换」分支展开（不手工置态——顺带钉住展开/取消互逆）
+  route({ "[data-sec-replace]": alpha.replace });
+  await secRoot.click();
+  assert.equal(alpha.box.classList.contains("hidden"), false, "「替换」应展开输入框");
+  assert.equal(alpha.replace.classList.contains("hidden"), true, "展开后「替换」入口应隐藏");
+
+  alpha.input.value = "半截输入";
+  beta.box.classList.remove("hidden");
+  beta.input.value = "另一行的半截输入";
+  calls.length = 0; renders.length = 0; reloads.length = 0;
+
+  route({ "[data-sec-cancel]": alpha.cancel });
+  await secRoot.click();
+
+  assert.deepEqual(calls, [], "「取消」是纯前端态还原：不得发出任何请求（含 PUT /api/settings/env）");
+  assert.equal(alpha.input.value, "", "「取消」应清掉本行半输入值");
+  assert.equal(alpha.box.classList.contains("hidden"), true, "「取消」应收起本行输入框");
+  assert.equal(alpha.replace.classList.contains("hidden"), false, "「取消」应还原本行「替换」入口");
+  assert.deepEqual(renders, [], "「取消」不得整面重绘（renderEnvConfig 重绘会丢其它行的编辑态）");
+  assert.deepEqual(reloads, [], "「取消」不得重取面板数据（loadEnvConfig 整面重载同害）");
+  assert.equal(beta.input.value, "另一行的半截输入", "「取消」不得清其它行的半输入");
+  assert.equal(beta.box.classList.contains("hidden"), false, "「取消」不得收起其它行的输入框");
+  assert.deepEqual(toasts, [], "「取消」不得提示成功/失败");
+
+  // 还原共享桩，后续块不受本块的容器覆写影响
+  delete sandbox.fetch;
+  sandbox.showToast = realToast;
+  sandbox.renderEnvConfig = realRender;
+  sandbox.loadEnvConfig = realLoad;
+  secRoot.closest = () => null;
+  secRoot.querySelectorAll = () => [];
+}

@@ -1,22 +1,29 @@
-"""OpenAI 兼容 AI 供应商引擎 — chat（共享客户端 / thinking 与 JSON 开关 / 并发预算）与嵌入。
+"""OpenAI 兼容 AI 供应商引擎 — chat（共享客户端 / 推理强度与 JSON 开关 / 并发预算）与嵌入。
 
 由 ai_provider 插件持有本引擎；引擎模块（classify/dedup/merge）不直接
-import 本模块，统一经 core 的 briefdesk.ai_ports 端口函数调用。
-loads_json / top_k_similar 为供应商无关工具，定义收归 briefdesk.ai_ports，
-此处 re-export 供实验脚本与测试路径兼容。
+import 本模块，统一经 core 的 briefdesk.ai_ports 端口函数调用。供应商无关的
+工具（JSON 修复解析、余弦相似度）定义在 briefdesk.ai_ports，本模块不 re-export
+——需要它们的一方直接 import 端口模块，避免同一符号两处来源。
 """
 
 import asyncio
-from typing import cast
+import logging
+from typing import Any, cast
 
-from openai import AsyncOpenAI
+from openai import (
+    APIStatusError,
+    AsyncOpenAI,
+    BadRequestError,
+    UnprocessableEntityError,
+)
 from openai.types import CreateEmbeddingResponse
 from openai.types.chat import ChatCompletion, ChatCompletionMessageParam
 
 from briefdesk import announcements
-from briefdesk.ai_ports import loads_json, top_k_similar  # noqa: F401 — re-export
 from briefdesk.config import config
 from briefdesk.plugin.base import AIProvider, ChatResponse
+
+logger = logging.getLogger(__name__)
 
 _client: AsyncOpenAI | None = None
 _ai_semaphore: asyncio.Semaphore | None = None
@@ -105,63 +112,170 @@ def _use_json_object() -> bool:
     return "deepseek-v4-flash" in config.ai_model or "deepseek-v4-pro" in config.ai_model
 
 
+def _norm_base(base: str) -> str:
+    """端点归一化：去尾斜杠并小写——同一端点的两种写法不应各记一份能力。"""
+    return (base or "").strip().rstrip("/").lower()
+
+
+def _effort_key(base: str, model: str) -> tuple[str, str]:
+    """推理强度的「端点 + 模型」标识。
+
+    用**生效值**而不是原始入参：rag_chat 的 override 留空会回退到主客户端与
+    config.ai_model（见 get_alt_client 与 chat_model），否则主通道与 RAG 会被当成
+    两个端点；自适应降级的能力记忆也以它为键。
+    """
+    return (_norm_base(base or config.ai_api_base), (model or config.ai_model).strip())
+
+
+def _reasoning_kwargs(key: tuple[str, str]) -> dict[str, Any]:
+    """按 AI_REASONING_EFFORT 给出要发送的推理强度参数（{} = 不发送）。
+
+    auto / omit：不发送；off：发送 "none" 尽力关闭思考——但**命中能力记忆**（该端点
+    曾明确拒收过该参数）时改为不发送，省略即交给服务端默认；其余取值固定发送该强度。
+    """
+    mode = config.ai_reasoning_effort
+    if mode in ("auto", "omit"):
+        return {}
+    if mode == "off":
+        return {} if key in _effort_rejected else {"reasoning_effort": "none"}
+    return {"reasoning_effort": mode}
+
+
+# 端点能力记忆：键 = (归一化端点, 生效模型)，命中即不再发送该参数。
+# 进程内不落盘：这是「一次请求就能确认」的端点事实，落盘会因换 provider、走代理或改
+# API_BASE 而过期；重启后多付一次探测即可。
+_effort_rejected: set[tuple[str, str]] = set()
+
+
+def _names_reasoning_effort(exc: APIStatusError) -> bool:
+    """报错是否点名 reasoning_effort。
+
+    结构化优先（error.param == "reasoning_effort"），退化为整串匹配——真实 SDK 会把
+    整个 error body 拼进 str(exc)，形如
+    Error code: 400 - {'error': {..., 'param': 'reasoning_effort'}}。
+    **刻意不放宽到裸 "reasoning"**：那会把「reasoning_tokens 超限」一类无关 400 误判成
+    参数不兼容，进而让好端点在后续调用里静默不关思考。代价是「既不点名、body 里也不给
+    param」的端点不会被自动降级——那种情况请显式设 AI_REASONING_EFFORT=omit。
+    """
+    if exc.status_code not in (400, 422):
+        return False
+    try:
+        param = str((exc.response.json().get("error") or {}).get("param") or "").lower()
+    except Exception:  # noqa: BLE001 — 响应不是 JSON：直接退回字符串匹配，无需记录
+        return "reasoning_effort" in str(exc).lower()
+    if param == "reasoning_effort":
+        return True
+    return "reasoning_effort" in str(exc).lower()
+
+
+async def _create_with_effort_fallback(key: tuple[str, str], call: Any) -> ChatCompletion:
+    """带一次能力降级的调用（**必须在已持有并发许可处调用**，内部不再取许可）。
+
+    只对「端点明确拒收 reasoning_effort」降级：改为不发送该参数并记住，避免后续
+    每次调用都撞一次 400（记忆的键设计与不落盘理由见 _effort_rejected 上方）。
+    其它错误原样抛出——把无关 400 也吞成重试会掩盖真配置错误。
+    并发首撞时各请求都会各重试一次（可接受的启动成本），但记忆与告警只落一次：
+    check 与 add 之间没有 await，事件循环内原子。
+    """
+    effort = _reasoning_kwargs(key)
+    try:
+        return await call(effort)
+    except (BadRequestError, UnprocessableEntityError) as e:
+        if (
+            # 只有 off 是「尽力关思考」，可以降级；显式强度是用户给出的契约——端点拒收
+            # 就让它响亮报错，既不静默省略，也不把该端点记进 off 的能力记忆
+            config.ai_reasoning_effort != "off"
+            or not effort
+            or not _names_reasoning_effort(e)
+        ):
+            raise
+        if key not in _effort_rejected:
+            _effort_rejected.add(key)
+            logger.warning(
+                "端点 %s 不接受 reasoning_effort=%r（模型 %s）：本进程起省略该参数，"
+                "改由服务端默认；要固定取值请设 AI_REASONING_EFFORT。原始错误：%s",
+                key[0], effort["reasoning_effort"], key[1], e,
+            )
+        return await call({})
+
+
 async def chat(
     messages: list[ChatCompletionMessageParam],
     *,
     temperature: float = 0.3,
     max_tokens: int = 4096,
     timeout: float | None = None,
+    max_retries: int | None = None,
 ) -> ChatCompletion:
     """统一 AI 调用入口，模型名从 config.ai_model 读取。
 
     timeout：单请求超时覆盖（秒），None 用客户端默认（_REQUEST_TIMEOUT）。
+    max_retries：重试次数覆盖（None 用客户端默认 _REQUEST_MAX_RETRIES）；
+    判官类调用传 0——SDK 默认重试 2 次会把锁内单次判官的最坏耗时放大 3 倍。
     """
     client = get_ai_client()
+    if max_retries is not None:
+        # 共享底层 http 连接池，仅覆盖该次调用的重试策略
+        client = client.with_options(max_retries=max_retries)
     per_request: dict = {"timeout": timeout} if timeout is not None else {}
+
+    key = _effort_key(config.ai_api_base, config.ai_model)
 
     async def _create() -> ChatCompletion:
         json_object = _use_json_object()
-        if config.ai_disable_thinking:
-            if json_object:
-                return await client.chat.completions.create(
-                    model=config.ai_model,
-                    messages=messages,
-                    temperature=temperature,
-                    max_tokens=max_tokens,
-                    reasoning_effort="none",
-                    response_format={"type": "json_object"},
-                    **per_request,
-                )
-            return await client.chat.completions.create(
+        extra: dict = {"response_format": {"type": "json_object"}} if json_object else {}
+        return await _create_with_effort_fallback(
+            key,
+            lambda effort: client.chat.completions.create(
                 model=config.ai_model,
                 messages=messages,
                 temperature=temperature,
                 max_tokens=max_tokens,
-                reasoning_effort="none",
+                # SDK 的 create() 把 reasoning_effort 声明成字面量联合，动态拼参数会让
+                # mypy 判定「没有匹配的重载」；这里显式放宽为 Any，语义不变
+                **cast(Any, effort),
+                **extra,
                 **per_request,
-            )
-        if json_object:
-            return await client.chat.completions.create(
-                model=config.ai_model,
-                messages=messages,
-                temperature=temperature,
-                max_tokens=max_tokens,
-                response_format={"type": "json_object"},
-                **per_request,
-            )
-        return await client.chat.completions.create(
-            model=config.ai_model,
-            messages=messages,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            **per_request,
+            ),
         )
 
     sem = get_ai_semaphore()
     if sem is None:
         return await _create()
-    async with sem:
+    if timeout is None:
+        async with sem:
+            return await _create()
+    # 判官类调用：许可等待也计入 timeout，锁内最坏持有 = timeout（请求）+ timeout（排队）。
+    # 此前 async with sem 的排队等待不在任何超时之内。
+    await asyncio.wait_for(sem.acquire(), timeout)
+    try:
         return await _create()
+    finally:
+        sem.release()
+
+
+async def close_clients() -> None:
+    """关闭并清空全部惰性缓存的 OpenAI 客户端（插件 teardown 调用；同一实例只关一次）。
+
+    AsyncOpenAI 持有底层 http 连接池，进程内不复用却继续存活会让退出时残留
+    连接；_alt_clients 按 (base_url, api_key) 去重，同一实例可能同时在主缓存
+    与备用缓存里，按对象身份去重后再关。
+    """
+    global _client, _embed_client, _ai_semaphore
+    targets = {
+        id(c): c
+        for c in (_client, _embed_client, *_alt_clients.values())
+        if c is not None
+    }
+    _client = None
+    _embed_client = None
+    _alt_clients.clear()
+    _ai_semaphore = None
+    for c in targets.values():
+        try:
+            await c.close()
+        except Exception as e:  # noqa: BLE001 — 关闭失败不阻断 teardown
+            logger.debug("关闭 AI 客户端失败（忽略）: %r", e)
 
 
 async def rag_chat(
@@ -179,25 +293,23 @@ async def rag_chat(
     ——避免 ai_provider 反向依赖依赖它的插件。
 
     与 chat 的差异：不强制 JSON 外壳（问答为正文；引用由 RAG prompt 约束）；
-    仍遵守 ai_disable_thinking 与并发信号量。
+    仍遵守 AI_REASONING_EFFORT 与并发信号量。
     """
     client = get_alt_client(api_base, api_key)
     chat_model = model or config.ai_model
 
+    key = _effort_key(api_base or config.ai_api_base, chat_model)
+
     async def _create() -> ChatCompletion:
-        if config.ai_disable_thinking:
-            return await client.chat.completions.create(
+        return await _create_with_effort_fallback(
+            key,
+            lambda effort: client.chat.completions.create(
                 model=chat_model,
                 messages=messages,
                 temperature=temperature,
                 max_tokens=max_tokens,
-                reasoning_effort="none",
-            )
-        return await client.chat.completions.create(
-            model=chat_model,
-            messages=messages,
-            temperature=temperature,
-            max_tokens=max_tokens,
+                **cast(Any, effort),
+            ),
         )
 
     sem = get_ai_semaphore()
@@ -315,7 +427,7 @@ async def embed_texts(texts: list[str]) -> list[list[float]]:
                 raise ValueError(
                     f"嵌入返回数量不符：请求 {len(chunk)} 条，实际 {len(ordered)} 条"
                 )
-            # 复核 P3-9：数量相符但 index 序列非 0..n-1 连续（端点返回重复/错乱
+            # 数量相符但 index 序列非 0..n-1 连续（端点返回重复/错乱
             # index）时，排序无法纠偏，向量仍整体错位——同样整批失败防污染。
             if any(d.index != i for i, d in enumerate(ordered)):
                 raise ValueError(
@@ -343,6 +455,7 @@ class Provider(AIProvider):
         temperature: float,
         max_tokens: int,
         timeout: float | None = None,
+        max_retries: int | None = None,
     ) -> ChatResponse:
         return cast(
             ChatResponse,
@@ -351,6 +464,7 @@ class Provider(AIProvider):
                 temperature=temperature,
                 max_tokens=max_tokens,
                 timeout=timeout,
+                max_retries=max_retries,
             ),
         )
 

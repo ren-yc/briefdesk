@@ -110,7 +110,7 @@
     calYear = now.getFullYear();
     calMonth = now.getMonth() + 1;
     loadCalendar();
-    fetchSidebarData(); // 侧边栏/颜色数据只随 /api/items 下发：进入日历即补拉（覆盖 F5 刷新）
+    fetchSidebarData(); // 侧边栏/颜色数据只随 /api/items 下发：进入日历即补拉（覆盖浏览器刷新）
   }
 
   function exitCalendarMode({ syncHash: sh = true } = {}) {
@@ -121,7 +121,7 @@
     $calendarView.classList.add("hidden");
     if (sh) syncHash("push");
     // 仅日历真正激活过才补拉（进入时已拉取）：未激活的退出不再发请求，
-    // 消除每次导航/搜索的双倍 /api/items 请求（复核 P2-26）
+    // 消除每次导航/搜索的双倍 /api/items 请求
     if (wasActive) fetchData();
   }
 
@@ -275,7 +275,7 @@
     $calDetailBody.innerHTML = renderItemRow(item, { cls: "cal-detail-row", showSubject: true, collapsible: false, showArticleLink: false });
     $calDetailModal.classList.remove("hidden");
     syncBodyScrollLock();
-    pushModalFocus($calDetailModal); // 与核心模态同一焦点栈：挡快捷键/圈闭 Tab（复核 P2-25）
+    pushModalFocus($calDetailModal); // 与核心模态同一焦点栈：挡快捷键/圈闭 Tab
     const row = $calDetailBody.querySelector(".cal-detail-row");
     if (row) {
       const ctxDiv = row.querySelector(".card-quote-context");
@@ -450,7 +450,7 @@
     bindEvents();
     registerViewHook();
     inlineSvgIcons(); // 内联按钮图标（与核心图标一致）
-    // F5 刷新 #calendar：加载器注入晚于核心 hash 初始化，此处自查补进入
+    // 刷新 #calendar：加载器注入晚于核心 hash 初始化，此处自查补进入
     const v = parseHash();
     if (v && v.view === PLUGIN) enterCalendarMode({ syncHash: false });
   }

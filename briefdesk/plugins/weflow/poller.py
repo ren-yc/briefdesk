@@ -167,8 +167,10 @@ async def poll(
     total_self = 0  # IGNORE_SELF 预滤的自消息数（不进管道、不标记 processed）
     not_ready_skips = 0
     session_idx = 0
-    # IGNORE_SELF 开启时检测 isSend 字段是否可得（微信 DB 原义字段，
-    # 个别版本可能不返回；缺失则自消息过滤实际未生效，需告警）
+    # IGNORE_SELF 开启时跟踪 isSend 字段是否出现过。vendor SDK 对 native 面
+    # 做形状校验（is_send 是必需字段，缺失整页即校验失败），正常不会走到
+    # 「有消息却从未见过 isSend」；本跟踪仅防契约回退（如取数面切换到会丢弃
+    # isSend 的 ChatLab 形状），届时自消息过滤静默失效需告警而非无声。
     saw_is_send_field = False
     # 不再查 /api/v1/group-members：其 groupNickname 出自上游从未被写入的
     # group_cards（恒空），displayName 与消息自带 senderName 同出
@@ -220,7 +222,7 @@ async def poll(
                     break
                 for idx, m in enumerate(page_msgs):
                     # 响应按时间倒序：一旦碰到早于窗口的消息，本页其余只会更旧
-                    # ——对齐 qqflow 的 hit_old 早停（复核 P2-12）：防上游无视
+                    # ——对齐 qqflow 的 hit_old 早停：防上游无视
                     # start 参数时深翻历史（上限 40 万条全量驻留内存）
                     if m.get("createTime", 0) < cutoff:
                         session_old += len(page_msgs) - idx
@@ -240,9 +242,20 @@ async def poll(
                     break
             else:
                 logger.warning(
-                    "%s达到翻页守卫上限 %d 页，可能未拉完窗口内消息",
+                    "%s达到翻页守卫上限 %d 页，窗口未拉完；水位保持不推进（该状态不会自愈："
+                    "窗口只增不减，下轮必再触顶；需调大上限或停用再启用会话缩小窗口）",
                     log_prefix,
                     _MAX_PAGES,
+                )
+                # 记入 failed_sessions：poll_cycle 据此跳过该会话水位推进
+                # （否则窗口内未拉到的更早消息永久漏拉，且无法再找回）。代价是该
+                # 会话不会自愈：翻页只能从最新向旧推进，窗口起点不变、新消息又
+                # 持续到达，下轮必再触顶。保留水位换取可恢复性——调大上限后尾部
+                # 仍可拉到；若照常推进，尾部消息就永久丢失。
+                result.failed_sessions.add(session_id)
+                result.session_errors[session_id] = (
+                    f"翻页达到守卫上限 {_MAX_PAGES} 页，窗口未拉完；水位不推进且不会自愈，"
+                    "需调大翻页上限或停用再启用该会话缩小回填窗口"
                 )
             total_raw += len(messages)
 
@@ -366,8 +379,8 @@ async def poll(
 
     if config.ignore_self and total_raw and not saw_is_send_field:
         logger.warning(
-            "IGNORE_SELF=true 但本轮消息均无 isSend 字段：当前 weflow-server "
-            "版本可能不提供该字段，自己发送的消息过滤未生效"
+            "IGNORE_SELF=true 但本轮消息均无 isSend 字段：与 vendor SDK 的 native "
+            "面形状校验不符（可能是取数面契约回退），自己发送的消息过滤未生效"
         )
 
     summary = (

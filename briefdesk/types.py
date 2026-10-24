@@ -62,7 +62,7 @@ class SessionInfo:
     session_id: str
     name: str
     is_group: bool
-    is_official: bool = False  # 公众号会话（与群聊/私聊并列的第三类，仅 weflow-legacy 产出）
+    is_official: bool = False  # 公众号会话（与群聊/私聊并列的第三类，weflow 与 weflow-legacy 均产出）
     last_active_at: int = 0  # 会话内最后一条消息时间（秒级 epoch；0 = 未知）
 
     def __post_init__(self) -> None:
@@ -100,7 +100,9 @@ class PollResult:
     # 索引期 503）。poll_cycle 对这些会话跳过水位推进：它们的消息未落
     # raw_messages，钉窗机制看不到，若照常推进水位会造成窗口内消息永久漏拉。
     # 单会话拉取失败（非 503）同样走此集合 + session_errors 记原因，不再整轮
-    # 上抛——否则一个持续失败的坏会话会饿死同源其它会话。
+    # 上抛——否则一个持续失败的坏会话会饿死同源其它会话。翻页守卫触顶也记入：
+    # 该状态不会自愈（翻页只能从最新向旧推进，窗口只增不减），session_errors
+    # 的文案须说明解法；poll_cycle 把首个原因带进 lastWarning。
     session_errors: dict[str, str] = field(default_factory=dict)
 
 
@@ -262,10 +264,10 @@ class BatchContext:
     preembeddings: dict[tuple[str, str], list[float]] = field(default_factory=dict)
     # 锁外阶段（before_run）写入的本批预嵌入向量，存储相按 (source, msg_id)
     # 消费。挂批上下文而非引擎实例：BatchContext 每批新建、天然隔离——
-    # rag 曾用引擎级共享字典，实时批与回填并发时互相 clear 丢向量（复核 P1-5）
+    # rag 曾用引擎级共享字典，实时批与回填并发时互相 clear 丢向量
     reembed_queue: list[tuple[str, str, str, list[str] | None, str]] = field(
         default_factory=list
     )
     # 阶段插件锁内登记、锁外 after_run 消化的补嵌请求
     # (item_id, title, quote, image_urls, source)：merge 合并后存活卡文本
-    # 已变需补嵌入回归余弦候选（复核 P2-20）；挂批上下文与 preembeddings 同理
+    # 已变需补嵌入回归余弦候选；挂批上下文与 preembeddings 同理

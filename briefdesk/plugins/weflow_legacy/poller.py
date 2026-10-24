@@ -198,7 +198,7 @@ async def poll(
                     limit=_PAGE_LIMIT,
                     offset=offset,
                     media=True,
-                    # 脏会话 404 → 空信封，对齐 weflow/qqflow（复核 U1-1）
+                    # 脏会话 404 → 空信封，对齐 weflow/qqflow
                     not_found_ok=True,
                     # 首页保留「刚入库查不到」竞态兜底；翻页空结果即末页，
                     # 再重试只会给每个空闲会话固定加 500ms 串行延迟
@@ -209,7 +209,7 @@ async def poll(
                     break
                 for idx, m in enumerate(page_msgs):
                     # 响应按时间倒序：一旦碰到早于窗口的消息，本页其余只会更旧
-                    # ——对齐 qqflow 的 hit_old 早停（复核 P2-12）：防上游无视
+                    # ——对齐 qqflow 的 hit_old 早停：防上游无视
                     # start 参数时深翻历史（上限 100 万条全量驻留内存）
                     if m.get("createTime", 0) < cutoff:
                         session_old += len(page_msgs) - idx
@@ -229,9 +229,20 @@ async def poll(
                     break
             else:
                 logger.warning(
-                    "%s达到翻页守卫上限 %d 页，可能未拉完窗口内消息",
+                    "%s达到翻页守卫上限 %d 页，窗口未拉完；水位保持不推进（该状态不会自愈："
+                    "窗口只增不减，下轮必再触顶；需调大上限或停用再启用会话缩小窗口）",
                     log_prefix,
                     _MAX_PAGES,
+                )
+                # 记入 failed_sessions：poll_cycle 据此跳过该会话水位推进
+                # （否则窗口内未拉到的更早消息永久漏拉，且无法再找回）。代价是该
+                # 会话不会自愈：翻页只能从最新向旧推进，窗口起点不变、新消息又
+                # 持续到达，下轮必再触顶。保留水位换取可恢复性——调大上限后尾部
+                # 仍可拉到；若照常推进，尾部消息就永久丢失。
+                result.failed_sessions.add(session_id)
+                result.session_errors[session_id] = (
+                    f"翻页达到守卫上限 {_MAX_PAGES} 页，窗口未拉完；水位不推进且不会自愈，"
+                    "需调大翻页上限或停用再启用该会话缩小回填窗口"
                 )
             total_raw += len(messages)
 
@@ -299,6 +310,8 @@ async def poll(
                     logger.debug("%s群成员命中本轮缓存", log_prefix)
                 group_members = group_members_cache[session_id]
 
+            # 第一段：占位符卡回查 XML（逐卡网络调用不可避免），收集全部拆条 id
+            split_ids_by_msg: dict[str, list[str]] = {}
             for msg in candidates:
                 # media=True 回填时 WeFlow 会把文章卡片 XML 渲染成占位符
                 # （如 "[视频号] 标题"）；内容非 XML 时回查 media=False 的
@@ -322,20 +335,27 @@ async def poll(
                             "文章卡片占位符回查未命中: %s（按原文处理）",
                             msg["serverId"],
                         )
-                # 占位符回查后的文章卡片：拆条全部已处理 → 计"已处理"并跳过
-                # （此时才拿到 XML、可知拆条数；部分处理仍走 normalize，
-                # 由 pipeline 入口按拆条过滤）
                 if msg.get("localType") == _APPMSG_LOCAL_TYPE:
                     articles = parse_appmsg_xml(msg.get("content", ""))
                     if articles:
-                        split_ids = [
+                        split_ids_by_msg[msg["serverId"]] = [
                             f"{msg['serverId']}_{i}"
                             for i in range(1, len(articles) + 1)
                         ]
-                        split_processed = await is_processed(split_ids)
-                        if all(pid in split_processed for pid in split_ids):
-                            session_processed += 1
-                            continue
+            # 一次批量查（此前逐卡一次 is_processed：N 张占位符卡 N 次 DB 往返）
+            split_processed: set[str] = set()
+            if split_ids_by_msg:
+                split_processed = await is_processed(
+                    [pid for ids in split_ids_by_msg.values() for pid in ids]
+                )
+            # 第二段：判定与归一化。占位符回查后的文章卡片拆条全部已处理 →
+            # 计"已处理"并跳过（此时才拿到 XML、可知拆条数；部分处理仍走
+            # normalize，由 pipeline 入口按拆条过滤）
+            for msg in candidates:
+                ids = split_ids_by_msg.get(msg["serverId"])
+                if ids and all(pid in split_processed for pid in ids):
+                    session_processed += 1
+                    continue
                 # 文章卡片拆条后返回多条；解析失败返回空列表（维持丢弃语义）
                 normalized_list = normalize_rest(
                     msg, session_id, label, contacts, group_members

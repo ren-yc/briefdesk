@@ -153,7 +153,7 @@ class WeFlowLegacySseClient(
     def _on_connected(self) -> None:
         # 退避计数在连接成功时复位（经 stream_events 的 on_connected 回调）：
         # legacy 上游无 ready 帧，复位挂在首个事件上会让空闲群每次成功重连
-        # 后退避再翻倍，实时恢复延迟逐次爬到 reconnect_max（审查回归）
+        # 后退避再翻倍，实时恢复延迟逐次爬到 reconnect_max
         self._reconnect_attempt = 0
 
     async def _handle_event(self, event: WeFlowLegacyEvent) -> None:

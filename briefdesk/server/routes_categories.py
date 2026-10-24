@@ -1,6 +1,6 @@
 """类别管理路由（server 子包）：categories CRUD + 级联删除 + 事件通知。
 
-从原 server.py 拆出（P5 子包化），导入即注册路由。
+导入即注册路由（装配顺序见 server/__init__.py）。
 """
 
 import re
@@ -21,17 +21,18 @@ from briefdesk.realtime import publish_items_updated
 from briefdesk.server.app import app
 
 _NAME_MAX = 20
-# F5: 50 字上限与默认类别 prompt（均 >50 字，含"①…②…"细则）矛盾，导致现有类别
-# 无法经 UI 编辑（任何整句重写要么超限被拒、要么丢失细则）。放宽为 200。
-_PROMPT_MAX = 200
+# 提示词上限 400：最长默认提示词 293 字（活动通知），前端两处 maxlength 与此常量
+# 保持一致（静态守卫测试钉住）。此前上限 200 而前端 maxlength=50——13 个默认提示词
+# 全部超过 50 字，编辑框无法插入任何字符，其中 5 类（活动通知/交易/实习/兼职家教/
+# 求助互助）保存必 400。
+_PROMPT_MAX = 400
 _COLOR_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
 
 
 def _validate_category_fields(body: dict, *, name_required: bool = False) -> str | None:
     """校验类别字段，非法时返回错误消息（None 表示通过）。
 
-    名称 strip 后非空、≤20 字；提示词 ≤200 字；颜色匹配 #RRGGBB。
-    名称上限与前端 maxlength 一致；提示词 200 为后端放宽（前端仍 50，见 ui/index.html）。
+    名称 strip 后非空、≤20 字；提示词 ≤400 字，与前端 maxlength 一致；颜色匹配 #RRGGBB。
     """
     name_raw = body.get("name")
     prompt = body.get("prompt")
@@ -132,9 +133,11 @@ async def api_delete_category(cat_id: int, body: dict):
     # 同样锁内执行，与 pipeline 写路径串行化（单连接隐式事务防交叉提交）
     async with storage_lock:
         row, deleted_ids = await delete_category(cat_id, purge_items=purge_items)
-        if row is not None and purge_items:
+        if row is not None and purge_items and deleted_ids:
             # 发布 items_deleted：去重插件订阅后同步清理内存缓存，
-            # 避免相似新消息被误判重复而永久不显示
+            # 避免相似新消息被误判重复而永久不显示。
+            # deleted_ids 为空时无删除发生（如空类别），空列表发布只会让
+            # 订阅方白跑一轮对账
             await event_bus.publish(EVENT_ITEMS_DELETED, deleted_ids)
     if row is None:
         raise HTTPException(404, "Category not found")

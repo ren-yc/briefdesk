@@ -30,6 +30,8 @@ venv/
 # Dependencies
 *.egg-info/
 dist/
+# setuptools 就地重建的构建暂存目录（python -m build 的中间产物，不是 dist/）
+build/
 
 # Database
 *.sqlite
@@ -38,6 +40,10 @@ dist/
 # /api/restore 暂存的整库副本（{db_path}.restore-pending，重启生效前常驻
 # 项目根目录）——整库含 PII，与 *.sqlite 同口径禁止入库
 *.restore-pending
+# 恢复前的原库副本（apply_pending_restore 改名保留一代，整库含 PII）
+*.pre-restore
+*.pre-restore-wal
+*.pre-restore-shm
 
 # Environment secrets
 .env

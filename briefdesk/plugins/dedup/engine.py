@@ -7,7 +7,7 @@ briefdesk/types.py。模块级单例与包装函数保留（实验脚本兼容�
 
 批量判定容错：`_collect_verdicts` 是唯一的并行判定入口，异常整形为 None 并打
 WARNING、不中止整批；策略差异留在调用点——加权多数票把 None 剔除出计权
-（既无 SAME 票也不占分母，全部失败退化为保守不判重——远程审计 S1 语义），
+（既无 SAME 票也不占分母，全部失败退化为保守不判重），
 weak 全员一致复核把 None 当反对票（语义等效）。判重命中统一走 `_hit`，
 「判 SAME 却漏合并 source_group」在结构上不可能发生。
 """
@@ -146,7 +146,7 @@ JUDGE_PROMPT = """你是一个信息去重助手。本提示词是唯一的规�
 def _embedding_text(title: str, quote: str) -> str:
     """嵌入用文本：标题 + 原文，查询与缓存加载共用同一格式，保证可比性。
 
-    截断至 2000 字符（复核 P2-17）：嵌入语义集中在前部，截断不影响判重
+    截断至 2000 字符：嵌入语义集中在前部，截断不影响判重
     可比性；不设上限时一条超长文本（如长截图 OCR）会让 embed API 抛错 →
     _ensure_cache 整体降级且每次重启确定性复现。单点截断，查询/缓存口径
     自动一致。存量超长文本的旧向量按全文计算，与新口径有一次性偏差
@@ -157,7 +157,9 @@ def _embedding_text(title: str, quote: str) -> str:
 
 # 判定请求超时（秒）：判定在存储锁内执行——与入库/add_to_cache 有批内顺序
 # 依赖（先行消息入库后后续判定要能看到）、并发批次也靠锁串行化，不能移出
-# 锁外；以短超时限制锁的最坏持有时间，防上游挂起冻结管道与卡片管理路由
+# 锁外；以短超时限制锁的最坏持有时间，防上游挂起冻结管道与卡片管理路由。
+# SDK 重试已关（max_retries=0），信号量等待亦受本超时约束，单次判官最坏
+# 锁内持有 ≈ 2×45s（排队 + 请求）。
 _JUDGE_TIMEOUT = 45.0
 
 
@@ -199,6 +201,11 @@ class DedupEngine(DedupService):
             await self._ensure_cache()
 
     async def _ensure_cache(self) -> None:
+        """从当前连接加载全量卡片与嵌入，重建缓存。
+
+        缓存只从**当前连接**加载：基准判重用例经 _ProbeDedupEngine（本类子类）走
+        check_dedup → ensure_cache → 本方法，从基准自己的 scratch 库取卡片。
+        """
         items = await get_all_item_texts()
         self._cache = [
             CachedItem(
@@ -461,7 +468,7 @@ class DedupEngine(DedupService):
         无法解析返回 None——None 语义 = 「判定未知」，与 `_parse_same` 的
         None 及 `_collect_verdicts` 的异常整形一致。绝不能返回 False 冒充
         明确 DIFF 判定：strong 短路路径会据此剔除候选，把"最强证据从未
-        成立"伪装成"已否证"，令多数票的分母悄然变小（审查回归）。"""
+        成立"伪装成"已否证"，令多数票的分母悄然变小。"""
         for attempt in (1, 2):
             try:
                 resp = await chat(
@@ -475,6 +482,7 @@ class DedupEngine(DedupService):
                     temperature=0.1,
                     max_tokens=128,
                     timeout=_JUDGE_TIMEOUT,
+                    max_retries=0,  # SDK 重试会把锁内单次判官最坏耗时放大 3 倍
                 )
             except Exception as e:
                 # 仅 DEBUG：判定失败是被容错的（调用方 _judge_* 按"该候选降级/
@@ -619,7 +627,7 @@ class DedupEngine(DedupService):
         source_quote: str = "",
     ) -> DedupResult:
         """判重检查。q_emb 由调用方在锁外预计算（批内一次 API 调用）；
-        None 时不再锁内补嵌（P1 修复），直接降级字符重叠通道。image_urls 参与
+        None 时不再锁内补嵌，直接降级字符重叠通道。image_urls 参与
         图片精确短路，仅当查询与缓存条目同属 _IMAGE_SHORTCUT_SOURCES
         （当前仅 weflow-legacy）时生效；source_quote 参与原文哈希精确短路
         （非空且非纯占位符原文，哈希全等时生效）。"""
@@ -660,11 +668,11 @@ class DedupEngine(DedupService):
         """候选选取：嵌入余弦 Top-K（启用且加载成功）或字符重叠单候选（回退/兜底）。
 
         返回 (候选列表, 度量名)；空列表表示已打无候选 DEBUG 诊断、调用方直接
-        判不重复。纯内存计算，不触网（理由见下方 P1 注释）。
+        判不重复。纯内存计算，不触网（理由见下方分级注释）。
         """
         # 余弦以 fallback 阈值召回（含弱候选区间 [fallback, threshold)），
         # normal/weak 分层在判定前拆分；字符重叠在余弦零候选时兜底。
-        # P1 修复：check_dedup 运行于 pipeline 存储锁内，此处严禁远程嵌入——
+        # check_dedup 运行于 pipeline 存储锁内，此处严禁远程嵌入——
         # q_emb 缺失（批内 preembed_batch 失败或调用方未预嵌）一律降级字符重叠
         # 通道，绝不在此 await embed_texts（否则嵌入端点挂起会以"行数 × SDK
         # 超时"串行放大锁持有时间，阻塞管道与卡片删除路由）。
@@ -876,7 +884,7 @@ class DedupEngine(DedupService):
             strong_cand, strong_score = strong[0]
             try:
                 verdict = await self._ask_ai(strong_cand, title, source_quote)
-            except Exception as e:  # noqa: BLE001 — S1 容错：短路判定失败降级参与多数票
+            except Exception as e:  # noqa: BLE001 — 容错：短路判定失败降级参与多数票
                 logger.warning(
                     '  [strong] "%s" 判定失败（%s），该候选保留参与后续多数票',
                     strong_cand.title,
@@ -924,7 +932,7 @@ class DedupEngine(DedupService):
         # 判定更可信——SAME 权重和 > 总权重一半才命中，抑制低置信票的干扰
         # （实验：串行「任一候选 same 即命中」会把相似但不同信息的噪声放大成
         # 误判）；等权时退化为原 >K/2 规则，单候选退化为一次判定。
-        # S1 容错：失败候选剔除出计权（既无 SAME 票也不占分母），
+        # 失败候选剔除出计权（既无 SAME 票也不占分母），
         # 全部失败时退化为保守不判重——异常绝不抛穿中止整轮管道
         verdicts = await self._collect_verdicts(
             candidates, title, source_quote, "剔除该候选票"

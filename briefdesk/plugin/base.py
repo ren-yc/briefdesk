@@ -161,6 +161,7 @@ class AIProvider(Protocol):
         temperature: float,
         max_tokens: int,
         timeout: float | None = None,
+        max_retries: int | None = None,
     ) -> ChatResponse: ...
     async def rag_chat(
         self,

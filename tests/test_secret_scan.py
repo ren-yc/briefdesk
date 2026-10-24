@@ -5,9 +5,13 @@
 - 防误报：空值环境变量（模板）、普通代码不命中
 """
 
+import contextlib
+import io
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
-from scripts.secret_scan import scan_text
+from scripts.secret_scan import _git_diff, main, scan_text
 
 
 class SecretScanTest(unittest.TestCase):
@@ -59,5 +63,71 @@ class SecretScanTest(unittest.TestCase):
         self.assertEqual(scan_text(diff), [])
 
 
+class SecretScanFailClosedTest(unittest.TestCase):
+    """扫描未执行必须拒绝放行，且命中值不得回显到日志。"""
+
+    def test_git_failure_returns_2(self) -> None:
+        with patch(
+            "scripts.secret_scan.subprocess.run",
+            return_value=SimpleNamespace(
+                returncode=128, stdout="", stderr="fatal: bad revision"
+            ),
+        ):
+            self.assertIsNone(_git_diff(["nope"]))
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                self.assertEqual(main(["--ref", "nope"]), 2)
+        self.assertIn("拒绝放行", stderr.getvalue())
+
+    def test_hit_output_does_not_echo_secret(self) -> None:
+        # 运行期拼接，避免字面量命中扫描规则（钩子会扫本文件自身的新增行）
+        secret = "sk-" + "a" * 32
+        stdout = io.StringIO()
+        with patch(
+            "scripts.secret_scan._git_diff", return_value="+" + secret + "\n"
+        ), contextlib.redirect_stdout(stdout):
+            code = main([])
+        out = stdout.getvalue()
+        self.assertEqual(code, 1)
+        self.assertNotIn(secret, out)
+        self.assertIn("sk-a…", out)
+        self.assertIn("OpenAI", out)
+
+
 if __name__ == "__main__":
     unittest.main()
+
+class SecretScanDualEndpointTest(unittest.TestCase):
+    """双端模式：直接比较事件给定的两个端点（不引入 merge-base 隐藏基线）。"""
+
+    def test_base_and_head_must_come_in_pairs(self) -> None:
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            self.assertEqual(main(["--base", "a" * 40]), 2)
+        self.assertIn("成对", stderr.getvalue())
+
+    def test_dual_endpoint_uses_two_dot_diff(self) -> None:
+        captured: list[list[str]] = []
+
+        def fake_run(cmd, **_kwargs):
+            captured.append(list(cmd))
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        with patch("scripts.secret_scan.subprocess.run", side_effect=fake_run):
+            code = main(["--base", "1" * 40, "--head", "2" * 40])
+        self.assertEqual(code, 0)
+        self.assertEqual(len(captured), 1)
+        args = captured[0]
+        self.assertIn("1" * 40, args)
+        self.assertIn("2" * 40, args)
+        self.assertNotIn("1" * 40 + "..." + "2" * 40, args, "不得构造三点范围")
+
+    def test_git_failure_in_dual_mode_returns_2(self) -> None:
+        with patch(
+            "scripts.secret_scan.subprocess.run",
+            return_value=SimpleNamespace(returncode=128, stdout="", stderr="fatal"),
+        ):
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                self.assertEqual(main(["--base", "1" * 40, "--head", "2" * 40]), 2)
+        self.assertIn("拒绝放行", stderr.getvalue())
