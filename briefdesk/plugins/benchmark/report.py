@@ -110,7 +110,10 @@ def render_case_lines(feature: str, evals: list[Any]) -> list[str]:
         elif feature == "merge":
             assert isinstance(e, BinaryCaseEval)
             mark = "✔" if e.predicted == e.expected else "✘"
-            detail = f"判定 {e.predicted}，期望 {e.expected}"
+            # 预筛门（MERGE_PREFILTER_THRESHOLD）开启时门拦用例也记 skipped：
+            # 指标归因需要区分「判官判不合并」与「门直接拦下」两种不合并
+            skip = "（预筛跳过，未触发 AI）" if e.skipped else ""
+            detail = f"判定 {e.predicted}，期望 {e.expected}{skip}"
         elif feature == "title":
             assert isinstance(e, TitleCaseEval)
             if e.output is None:
@@ -146,7 +149,8 @@ def render_metrics(feature: str, summary: dict[str, float | int]) -> list[str]:
             f"  TP {summary['tp']} / FP {summary['fp']} / TN {summary['tn']} / FN {summary['fn']}",
             f"  用例 {summary['cases']} 条（出错 {summary['error_cases']}）",
         ]
-        if feature == "dedup" and summary.get("skipped"):
+        # dedup 的「预筛跳过」= 候选门禁未触发 AI；merge 的 = 余弦预筛门拦下
+        if summary.get("skipped"):
             extra.append(f"  预筛跳过（未触发 AI 判定）: {summary['skipped']} 条")
     elif feature == "title":
         extra = [

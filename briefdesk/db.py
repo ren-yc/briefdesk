@@ -1795,6 +1795,17 @@ async def purge_expired_ignored(expiry_hours: int) -> int:
     db = await get_db()
     cutoff = (datetime.now(UTC) - timedelta(hours=expiry_hours)).isoformat()
     async with atomic_transaction(db):
+        # 将被删除的 ids 先于 DELETE 取出（行删后按同条件查不回来）：
+        # 取 id 与删除同事务，删除失败整体回滚、事件也不会发出（发布点在
+        # 事务提交之后），无「事件报了已删、库里还在」的窗口。
+        doomed = [
+            row["id"]
+            for row in await _fetchall(
+                db,
+                "SELECT id FROM items WHERE is_verified = -1 AND verified_at <= ?",
+                (cutoff,),
+            )
+        ]
         await db.execute(
             "DELETE FROM item_embeddings WHERE item_id IN ("
             "SELECT id FROM items WHERE is_verified = -1 AND verified_at <= ?"
@@ -1813,6 +1824,17 @@ async def purge_expired_ignored(expiry_hours: int) -> int:
             (cutoff,),
         ) as cursor:
             purged = cursor.rowcount
+    # 事务提交、行确实删除后才发事件；无将删行时不发（与路由删除口径
+    # 一致：无删除发生的事件只会让订阅方白跑一轮对账；purged 与 doomed
+    # 同源同事务，一个判断即可）。发布在事务外，事件处理器不延长事务窗口。
+    # 注意：当前唯一生产调用点在 main 启动序列（先于插件装配，此刻 dedup
+    # 插件尚未订阅、负缓存也为空），事件实际为「未来运行期调用本函数」的
+    # 失效通路预留；purge 是 main 直调 db 的路径、历史不发删除事件——忽略
+    # 态条目清理后去重负缓存仍记着其 DIFFERENT 对子，属失效盲区，故补发。
+    if doomed:
+        from briefdesk.events import EVENT_ITEMS_PURGED, event_bus
+
+        await event_bus.publish(EVENT_ITEMS_PURGED, doomed)
     return purged
 
 

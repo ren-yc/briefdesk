@@ -115,7 +115,11 @@ _CORE_UI: dict[str, dict[str, Any]] = {
         "hint": "0 = 禁用；>0 时按该间隔补齐 SSE 断连窗口的消息（与「同步消息」同路径，进行中互斥）",
     },
     "POLL_OVERLAP_SECONDS": {"label": "轮询重叠窗口（秒）", "hint": "吸收增量轮询边界偏差；重叠部分去重无 AI 开销"},
-    "DEDUP_SIMILARITY_THRESHOLD": {"label": "去重字符重叠阈值"},
+    "DEDUP_SIMILARITY_THRESHOLD": {
+        "label": "去重标题重叠阈值（bigram Jaccard）",
+        "hint": "共同字符相邻对占比口径；换度量后 0.3 为旧口径经验值，"
+        "调整前先跑 scripts/recalibrate_similarity.py 重标定",
+    },
     "EMBED_API_BASE": {"label": "嵌入 API 地址", "hint": "留空则禁用嵌入向量去重与相关功能"},
     "EMBED_MODEL": {"label": "嵌入模型"},
     "EMBED_API_KEY": {"label": "嵌入 API Key"},
@@ -126,6 +130,10 @@ _CORE_UI: dict[str, dict[str, Any]] = {
     "DEDUP_EMBED_FALLBACK_THRESHOLD": {"label": "低置信复核阈值"},
     "MERGE_WINDOW_MINUTES": {"label": "同话题合并窗口（分钟）", "hint": "0 = 禁用合并"},
     "MERGE_MAX_CANDIDATES": {"label": "合并候选上限"},
+    "MERGE_PREFILTER_THRESHOLD": {
+        "label": "合并余弦预筛阈值",
+        "hint": "-1 = 关闭（默认）；门限须由余弦-真值数据标定产生，未标定前保持关闭",
+    },
     "DB_PATH": {"label": "数据库文件路径", "warn": "重启后数据库将使用新路径；旧库不会被自动发现或迁移"},
     "SERVER_PORT": {"label": "服务端口", "warn": "重启后访问地址将变为新端口"},
     "LOG_LEVEL": {"label": "日志级别", "hint": "DEBUG 开启逐条细节；INFO 只保留阶段与汇总"},

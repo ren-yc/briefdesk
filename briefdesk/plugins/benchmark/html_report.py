@@ -159,7 +159,8 @@ def _metric_table(feature: str, summary: dict[str, Any], elapsed_sec: float | No
         extras = [
             ("混淆矩阵", f"TP {summary.get('tp', 0)} / FP {summary.get('fp', 0)} / TN {summary.get('tn', 0)} / FN {summary.get('fn', 0)}"),
         ]
-        if feature == "dedup" and summary.get("skipped"):
+        # dedup 的「预筛跳过」= 候选门禁未触发 AI；merge 的 = 余弦预筛门拦下
+        if summary.get("skipped"):
             extras.append(("预筛跳过", f"{summary['skipped']} 条（未触发 AI 判定）"))
     elif feature == "title":
         extras = [
@@ -267,7 +268,8 @@ def _case_rows(feature: str, cases: list[dict[str, Any]]) -> str:
         headers = ["用例", "结论", "判定", "期望", "预筛跳过", "说明"]
         rows = []
         for c in cases:
-            skipped = "是" if feature == "dedup" and c.get("skipped") else ""
+            # dedup 的「预筛跳过」= 候选门禁未触发 AI；merge 的 = 余弦预筛门拦下
+            skipped = "是" if c.get("skipped") else ""
             rows.append(
                 "<tr>"
                 f"<td>{_esc(c.get('case_id'))}</td>"

@@ -16,7 +16,7 @@ import logging
 from typing import TYPE_CHECKING
 
 from briefdesk.db import insert_item, mark_message_processed
-from briefdesk.events import EVENT_ITEMS_DELETED
+from briefdesk.events import EVENT_ITEMS_DELETED, EVENT_ITEMS_PURGED
 from briefdesk.plugin.base import PluginContext, StagePlugin
 from briefdesk.plugins.dedup.engine import build_item_input
 from briefdesk.types import (
@@ -62,9 +62,14 @@ class DedupPlugin(StagePlugin):
         # 事件订阅放注册序列最后（契约：可失败步骤先于全部注册）
         ctx.register_stage(self)
         ctx.subscribe_event(EVENT_ITEMS_DELETED, self._on_items_deleted)
+        ctx.subscribe_event(EVENT_ITEMS_PURGED, self._on_items_deleted)
 
     def _on_items_deleted(self, item_ids: list[str]) -> None:
-        """核心删除卡片后同步清理缓存（同步处理器：发布方持锁时仍保持原子）。"""
+        """核心删除/清理卡片后同步清理缓存（同步处理器：发布方持锁时仍保持原子）。
+
+        两个事件（路由删除 items_deleted、忽略态过期清理 items_purged）
+        同载荷语义同口径处理：remove_items 内部统一挂钩负缓存失效。
+        """
         if self._engine is not None:
             self._engine.remove_items(item_ids)
 

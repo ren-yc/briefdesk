@@ -272,6 +272,7 @@ def _child_env() -> dict[str, str]:
                 config.dedup_embed_fallback_threshold
             ),
             "DEDUP_STRONG_THRESHOLD": str(config.dedup_strong_threshold),
+            "MERGE_PREFILTER_THRESHOLD": str(config.merge_prefilter_threshold),
         }
     )
     return env

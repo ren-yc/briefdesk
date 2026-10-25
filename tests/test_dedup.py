@@ -213,6 +213,12 @@ class ParseSameTest(unittest.TestCase):
 
 
 class TitleOverlapTest(unittest.TestCase):
+    """字符 bigram Jaccard 口径（度量换轨后）。
+
+    该分数同时是重叠通道召回门禁与加权多数票票权，换度量 = 改判定行为；
+    阈值重标定流程见 scripts/recalibrate_similarity.py。
+    """
+
     def test_identical(self):
         assert DedupEngine._title_overlap("摄影社招新", "摄影社招新") == 1.0
 
@@ -221,6 +227,134 @@ class TitleOverlapTest(unittest.TestCase):
 
     def test_empty(self):
         assert DedupEngine._title_overlap("", "abc") == 0.0
+
+    def test_single_char_titles(self):
+        # 无 bigram 可言的单字标题退回字符集 Jaccard：同字 1.0、异字 0.0
+        assert DedupEngine._title_overlap("好", "好") == 1.0
+        assert DedupEngine._title_overlap("好", "坏") == 0.0
+
+    def test_bigram_separates_shared_function_chars(self):
+        # 换度量的动机：共享高频字的短标题在单字符交/min 口径下打到 0.6+，
+        # bigram 把共同部分压到低位——不同话题不再擦边门禁
+        a, b = "摄影社招新", "篮球社招新"
+        single = len(set(a) & set(b)) / min(len(set(a)), len(set(b)))
+        bigram = DedupEngine._title_overlap(a, b)
+        assert bigram < single
+        assert bigram < 0.5
+
+    def test_jaccard_conservative_on_substring(self):
+        # 交/min 口径下「短串嵌在长串」直接高分；Jaccard 对假相似更保守
+        a, b = "团购", "塔卡沙a6方格40页团购进行中"
+        assert DedupEngine._title_overlap(a, b) < 0.4
+
+    def test_symmetry(self):
+        assert DedupEngine._title_overlap("abc 123", "123 abc") == \
+            DedupEngine._title_overlap("123 abc", "abc 123")
+
+
+class NegCacheEngineIntegrationTest(unittest.IsolatedAsyncioTestCase):
+    """负缓存在引擎内部路径上的挂钩：remove_items / add_to_cache 全路径失效。"""
+
+    def test_remove_items_invalidates_negcache(self):
+        engine = DedupEngine()
+        engine._negcache.record("q1", "i1")
+        engine.remove_items(["i1"])
+        assert engine._negcache.lookup("q1", "i1") is False
+
+    def test_add_to_cache_invalidates_negcache_on_update(self):
+        """条目文本变更（合并重写/标题补写）时旧 DIFFERENT 结论必须失效。
+
+        回归点：标题补写后置（after_run 全字段覆盖）不经过 remove_items，
+        若 add_to_cache 不挂钩，旧对子会带着旧文本的结论误命中。
+        """
+        engine = DedupEngine()
+        engine._negcache.record("q1", "i1")
+        engine.add_to_cache("i1", "新标题", source_quote="新原文")
+        assert engine._negcache.lookup("q1", "i1") is False
+
+    def test_invalidate_negcache_public_entry(self):
+        engine = DedupEngine()
+        engine._negcache.record("q1", "i1")
+        engine.invalidate_negcache(["i1"])
+        assert engine._negcache.lookup("q1", "i1") is False
+
+    async def test_verdict_wrapper_hits_cache_without_ai(self):
+        """负缓存命中直接回 False，不触 AI；DIFFERENT 结论回填缓存。"""
+        engine = DedupEngine()
+        from briefdesk.negcache import query_key
+
+        qkey = query_key("标题B", "原文B")
+        engine._negcache.record(qkey, "c1")
+        chat = AsyncMock()
+        with patch("briefdesk.plugins.dedup.engine.chat", new=chat):
+            verdict = await engine._verdict_with_negcache(
+                SimpleNamespace(id="c1", title="标题A", source_quote="原文A"),
+                qkey,
+                "标题B",
+                "原文B",
+            )
+        assert verdict is False
+        chat.assert_not_called()
+
+    async def test_verdict_wrapper_caches_false_only(self):
+        """只缓存 False：None（判定未知）与 True 不是可复用的确定性结论。"""
+        engine = DedupEngine()
+        from briefdesk.negcache import query_key
+
+        cases = [
+            ('{"same": false}', True),   # False → 入缓存
+            ('{"same": true}', False),   # True → 不入
+            ("垃圾输出两次", False),      # None（两次解析均失败）→ 不入
+        ]
+        for content, should_cache in cases:
+            engine._negcache.clear()
+            qkey = query_key("TB", "QB")
+            chat = AsyncMock(
+                return_value=SimpleNamespace(
+                    choices=[SimpleNamespace(
+                        message=SimpleNamespace(content=content),
+                        finish_reason="stop",
+                    )]
+                )
+            )
+            with patch("briefdesk.plugins.dedup.engine.chat", new=chat):
+                verdict = await engine._verdict_with_negcache(
+                    SimpleNamespace(id="c1", title="TA", source_quote="QA"),
+                    qkey,
+                    "TB",
+                    "QB",
+                )
+            assert engine._negcache.lookup(qkey, "c1") is should_cache
+            if content == "垃圾输出两次":
+                assert verdict is None
+            else:
+                # 判定结论与输入一致：false 输入 → False，true 输入 → True
+                assert verdict is (content == '{"same": true}')
+
+    async def test_verdict_wrapper_passes_through_without_id(self):
+        """候选缺 id（测试桩/异常形状）降级直通判官：不写脏键、不命中。"""
+        engine = DedupEngine()
+        from briefdesk.negcache import query_key
+
+        qkey = query_key("TB", "QB")
+        engine._negcache.record(qkey, "some-id")
+        chat = AsyncMock(
+            return_value=SimpleNamespace(
+                choices=[SimpleNamespace(
+                    message=SimpleNamespace(content='{"same": false}'),
+                    finish_reason="stop",
+                )]
+            )
+        )
+        with patch("briefdesk.plugins.dedup.engine.chat", new=chat):
+            verdict = await engine._verdict_with_negcache(
+                SimpleNamespace(title="TA", source_quote="QA"),  # 无 id
+                qkey,
+                "TB",
+                "QB",
+            )
+        assert verdict is False
+        chat.assert_awaited_once(), "无 id 必须真实调用判官"
 
 
 class RemoveItemsTest(unittest.TestCase):
@@ -288,6 +422,13 @@ class RemoveItemsTest(unittest.TestCase):
         assert engine._cache == before_cache
         assert engine._pending_embeds == before_pending
         assert len(engine._cache) == 1
+
+    def test_remove_items_negcache_harmless_noop(self):
+        """负缓存失效同样幂等无害：缺失/空 id 不抛错。"""
+        engine = DedupEngine()
+        engine._negcache.record("q", "keep")
+        engine.remove_items(["ghost"])  # 不抛错
+        assert engine._negcache.lookup("q", "keep") is True
 
 
 class EmbeddingTextTest(unittest.TestCase):
@@ -1005,18 +1146,18 @@ class DedupTieredCandidateTest(unittest.IsolatedAsyncioTestCase):
             # 无候选是常规路径，诊断记在 DEBUG（不占 WARNING，见 _select_candidates）
             self.assertLogs("briefdesk.plugins.dedup.engine", level="DEBUG") as logs,
         ):
-            # 与缓存共 1 字（"新"），overlap = 1/5 = 0.20 < 阈值 0.30：
+            # 与缓存标题共 1 个 bigram（"篮球"），overlap ≈ 0.15 < 阈值 0.30：
             # 落在"有候选但不够格"分支，诊断才报得出差距
             result = await engine.check_dedup(
-                "转让一台全新自行车", "新生2群", q_emb=[0.5, 0.6]
+                "转让一辆二手篮球社自行车", "新生2群", q_emb=[0.5, 0.6]
             )
         assert not result.is_duplicate
         merge_mock.assert_not_awaited()
         assert any("判重无候选" in line for line in logs.output)
         assert any("cosine top-1=" in line for line in logs.output)
         # 诊断里仍要报出重叠差距（复用的是兜底那次扫描的结果，不是省掉了信息）
-        assert any("overlap top-1=0.20" in line for line in logs.output)
-        assert overlap_calls == ["转让一台全新自行车"]
+        assert any("overlap top-1=0.15" in line for line in logs.output)
+        assert overlap_calls == ["转让一辆二手篮球社自行车"]
 
     async def test_zero_overlap_diagnosed_apart_from_empty_cache(self):
         """重叠全零（缓存非空但无共同字符）不得归因为「缓存为空」。

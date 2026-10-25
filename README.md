@@ -152,11 +152,11 @@ OCR 依赖为**可选**（`pip install -e ".[ocr]"`）：
 | `REALTIME_BATCH_MAX_COUNT` / `REALTIME_BATCH_TIMEOUT_MS` | `1` / `180000` | 实时批缓冲（攒够条数 / 超时毫秒触发处理） |
 | `BACKFILL_BATCH_MAX_COUNT` | `10` | 回填时单批 AI 分类的消息条数（默认已由 20 调为 10：批越大 AI 返回 index 漂移的绝对误差面越大） |
 | `IGNORED_EXPIRY_HOURS` | `0`（禁用） | 启动时清理超过该时长的已忽略条目 |
-| `MERGE_WINDOW_MINUTES` / `MERGE_MAX_CANDIDATES` | `10` / `3` | 会话内同话题片段合并窗口（分钟）/ 候选上限；`0` = 禁用合并 |
+| `MERGE_WINDOW_MINUTES` / `MERGE_MAX_CANDIDATES` / `MERGE_PREFILTER_THRESHOLD` | `10` / `3` / `-1`（关闭） | 会话内同话题片段合并窗口（分钟）/ 候选上限 / 合并判官余弦预筛门（`-1` 关闭；门限须由余弦-真值数据标定产生，未标定前保持关闭）；`0` = 禁用合并 |
 | `BENCHMARK_PAUSE_PIPELINE` / `BENCHMARK_KEEP_RUNS` / `BENCHMARK_RUN_TIMEOUT_SECONDS` / `BENCHMARK_RUN_STALL_SECONDS` | `true` / `5` / `0`（不限）/ `600` | benchmark 插件专属（需启用 benchmark 插件）：运行期暂停管道 / 保留运行产物数 / 单次运行总时长上限 / 无进展终止阈值 |
 | `EMBED_API_BASE` / `EMBED_MODEL` / `EMBED_API_KEY` | 空（禁用） | 嵌入向量去重：填入嵌入服务地址后启用余弦预筛（留空回退字符重叠预过滤） |
 | `EMBED_BATCH_SIZE` | `20` | 单次嵌入请求的批量条数（历史缓存加载 + 逐批预嵌入共用） |
-| `DEDUP_SIMILARITY_THRESHOLD` / `DEDUP_EMBED_THRESHOLD` / `DEDUP_EMBED_TOP_K` / `DEDUP_EMBED_FALLBACK_THRESHOLD` / `DEDUP_STRONG_THRESHOLD` | `0.3` / `0.80` / `3` / `0.65` / `0.99` | 去重预筛与 AI 判重门禁阈值 |
+| `DEDUP_SIMILARITY_THRESHOLD` / `DEDUP_EMBED_THRESHOLD` / `DEDUP_EMBED_TOP_K` / `DEDUP_EMBED_FALLBACK_THRESHOLD` / `DEDUP_STRONG_THRESHOLD` | `0.3` / `0.80` / `3` / `0.65` / `0.99` | 去重预筛与 AI 判重门禁阈值（`DEDUP_SIMILARITY_THRESHOLD` 为标题 bigram Jaccard 口径，换度量后调整前先跑 `scripts/recalibrate_similarity.py` 重标定） |
 | `LOG_LEVEL` | `INFO` | 日志级别（DEBUG 开逐条细节，并放出 uvicorn 的 HTTP 请求日志——默认静默以免逐请求刷屏） |
 | `DB_PATH` / `SERVER_PORT` | 用户数据目录 `data/briefdesk.sqlite` / `3000` | SQLite 路径 / Web 端口 |
 
