@@ -1207,6 +1207,7 @@ required field of `weflow`/`qqflow` → that plugin self-disables via `PluginDis
 | `BENCHMARK_KEEP_RUNS` | `5` | benchmark 插件：保留运行产物数，按启动时间从旧到新轮转删除，**最新一次已完成**的运行永不删除（报告页依赖它） |
 | `BENCHMARK_RUN_TIMEOUT_SECONDS` | `0`（不限） | benchmark 插件：单次运行总时长上限（秒），非零时仅作兜底，到点终止 |
 | `BENCHMARK_RUN_STALL_SECONDS` | `600` | benchmark 插件：无进展阈值（秒），以进度文件行数增长为信号；不应低于单用例最坏耗时（分类 120s×3 重试=360s）。放大只在 CLI 直跑传 `--progress-every` 时生效——Web 路径该值恒为 1、不放大 |
+| `TEMPORAL_SHADOW` | `off` | 时间解析器影子采集开关，仅 `on` 开启；**只读进程环境变量，写 `.env` 无效**（不经 Settings 解析链）。sysc 各出口（成功与失败形态）采集「sysc 产出 vs 影子解析器产出」逐字段差异，追加到用户数据目录 `temporal_shadow/` 每日 jsonl（只记录、不影响判定）。为切规则包积累离线对照数据，未积累前不切换 |
 
 ### 配置解析链（keyring + UI 暂存）
 
@@ -1362,7 +1363,11 @@ required field of `weflow`/`qqflow` → that plugin self-disables via `PluginDis
   `load_embeddings` 按模型名取向量，模型名不变而维度变了（代理换实现 / 供应商原地升级 / 改维度参数）时旧向量每次重启都照样读出、`missing` 为空、永不重嵌 → 该进程判重全
   程退化为字符重叠。告警文案因此显式写明「需重建 `item_embeddings` 向量」——只打一次的 WARNING 若读起来像瞬态抖动就会被放过去。自动重建（检测维度变化即丢弃旧向量全量重嵌）未实
   现：检测点在锁外的 `_ensure_cache`，而可观察到不一致的 `_select_candidates` 在锁内且禁远程嵌入；且触发一次等于全历史重嵌，成本与用户显式改
-  `EMBED_MODEL` 等价，不宜静默发生。 Embedding pre-computation (`ensure_cache` / `preembed_batch`) and vector
+  `EMBED_MODEL` 等价，不宜静默发生。换模型/换维度的人工步骤收口在
+  `scripts/migrate_embed_model.py`：`--check` 只读盘点向量分组，`--execute` 前置校验（目标模型已知、端点探测、
+  库内分组核对——一切已一致时拒绝执行防误清）后在线备份库文件（SQLite 备份 API 单文件一致快照）再清空
+  向量表；重启后去重向量按新模型全量重嵌，rag 向量默认窗口回填只覆盖近 7 天、需临时 `RAG_BACKFILL_DAYS=-1`
+  全量回填（脚本收尾有提示）。应用停机窗口内人工执行，脚本只做校验与准备、不自动改配置。 Embedding pre-computation (`ensure_cache` / `preembed_batch`) and vector
   persistence (`flush_pending_embeddings`) all run **outside** `_storage_lock`; inside the lock only
   dedup judgment and DB writes remain. **存储锁内禁止远程嵌入**：check_dedup 的 q_emb 缺失一律降级字符重叠通道；`ensure_cache` 懒
   加载兜底仅限「进程首个批次」的一次性场景（生产由 dedup 插件 setup 预热覆盖，不会在锁内触发）
