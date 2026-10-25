@@ -25,9 +25,15 @@ import logging
 import time
 from typing import Any
 
+from briefdesk import telemetry
 from briefdesk.plugins.benchmark.schema import FEATURES
 from briefdesk.plugins.benchmark.store import _split_keywords, stable_case_id
-from briefdesk.types import BatchContext, DedupCheck, MergeCard, MergeCheck
+from briefdesk.types import (
+    BatchContext,
+    DedupCheck,
+    MergeCard,
+    MergeCheck,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -44,11 +50,12 @@ _cap_warned: set[str] = set()
 
 def reset() -> None:
     """复位记录器（测试隔离用）：关闭记录并清空累积。"""
-    global _enabled
+    global _enabled, _last_scheduled_export
     _enabled = False
     for f in FEATURES:
         _cases[f] = []
     _cap_warned.clear()
+    _last_scheduled_export = 0.0
 
 
 def set_enabled(enabled: bool) -> None:
@@ -241,6 +248,103 @@ def record_batch(batch: BatchContext) -> None:
         tcase = build_title_case(mcheck)
         if tcase is not None:
             _add("title", tcase)
+    build_classify_cases(batch)
+
+
+def build_classify_cases(batch: BatchContext) -> int:
+    """classify per-instance 观察记录 → 批级 ClassifyCase（返回累计入用例数）。
+
+    per-instance 观察按**批**聚合：classify 判定本来就是整批一次请求，
+    per-instance 期望挂在同一用例的 expected 列表上（index = 批内全局
+    index），与文件形态的 ClassifyCase 契约一致——导出后可直接进 benchmark
+    跑分与训练数据导出。uncertain/error 条目进 expected 会污染评分
+    （它们没有类别真值），只入 expected 的 include 条目；uncertain/error
+    的存在与形态（retry 证据）随 batch_fingerprint 进训练导出侧（导出
+    脚本的责任），这里不丢失——未入 expected 的观察仍由遥测计数。
+    """
+    obs = batch.classify_checks
+    if not obs:
+        return 0
+    # 消息字段与 classify 判官实际输入对齐（sysb 只消费 content）：不携带
+    # sender_id/session_id 等身份字段——缩小用例文件的 PII 面与训练导出面
+    messages = [
+        _message_dict(
+            msg_id=m.msg_id,
+            content=m.content,
+            title=None,
+            sender_name=m.sender_name,
+            group_name=m.group_name,
+            timestamp=m.timestamp,
+            source=m.source,
+        )
+        for m in batch.messages
+    ]
+    expected = [
+        {"index": o.msg_index, "category": o.category}
+        for o in obs
+        if o.outcome == "include" and o.category
+    ]
+    included = sum(1 for o in obs if o.outcome == "include")
+    uncertain = sum(1 for o in obs if o.outcome in ("uncertain", "error"))
+    # 第三态结构化遥测（按 outcome 分档，不只在 note 文案里）：uncertain
+    # 终态不入训、只入遥测与校准——无此计数则「第三态自我强化」防护无读数
+    for outcome_kind in ("include", "exclude", "uncertain", "error"):
+        n = sum(1 for o in obs if o.outcome == outcome_kind)
+        if n:
+            telemetry.record(f"classify.obs.{outcome_kind}")
+    case = {
+        # 排序后取 id：同一批消息集合的不同到达顺序导出同一 id（与卡片
+        # 路径的 sorted 口径一致），重复导出就地更新而非堆积副本
+        "id": stable_case_id(
+            "classify",
+            sorted(str(m.get("msg_id") or "") for m in messages),
+        ),
+        "note": (
+            f"由处理记录导出：{len(batch.messages)} 条批级判定"
+            f"（include {included} / uncertain+error {uncertain}）"
+        ),
+        "messages": messages,
+        "expected": expected,
+    }
+    _add("classify", case)
+    return included
+
+
+# 定节律导出（显式条目——纯内存记录重启归零，无节律导出则长时间开记录的
+# 观察数据随进程退出丢失）：批尾检查，距上次导出超过 _EXPORT_INTERVAL_SECONDS
+# 且有累积时自动导出一次。失败静默（下个节律重试），不连坐管道。
+_EXPORT_INTERVAL_SECONDS = 24 * 3600.0
+_last_scheduled_export = 0.0
+
+
+async def scheduled_export() -> dict[str, Any] | None:
+    """批尾节律导出：有累积且距上次导出超阈值时执行一次（返回导出摘要或 None）。
+
+    首见调用只锚定时间不导出（否则进程启动后的头一批记录会立即被导出
+    清空——节律语义是「周期性落盘」，不是「有记录就落盘」）。
+    """
+    global _last_scheduled_export
+    import time as _time
+
+    now = _time.monotonic()
+    if not _last_scheduled_export:
+        _last_scheduled_export = now
+        return None
+    if now - _last_scheduled_export < _EXPORT_INTERVAL_SECONDS:
+        return None
+    total = sum(len(c) for c in _cases.values())
+    if not total:
+        return None
+    _last_scheduled_export = now
+    try:
+        return await export_recorded()
+    except Exception:
+        # 导出失败（校验/磁盘）：锚点回拨一个周期，下个批尾立即重试——
+        # 若回退为 0 会命中「首见锚定」分支再等一个完整周期，记录在内存
+        # 多滞留 24h，进程退出即丢（恰是节律导出要防的场景）
+        _last_scheduled_export = now - _EXPORT_INTERVAL_SECONDS
+        logger.warning("基准记录节律导出失败（记录保留，下个批尾重试）", exc_info=True)
+        return None
 
 
 # ── 导出 ──

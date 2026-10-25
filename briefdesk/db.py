@@ -998,6 +998,21 @@ async def init_schema(db: aiosqlite.Connection) -> None:
     await db.execute(
         "CREATE INDEX IF NOT EXISTS idx_recat_log_created ON recat_log(created_at)"
     )
+    # 筛选判定器第三态计数（可选表，同 recat_log 模式）：uncertain 连续计数
+    # 的唯一落点（processed_messages 无计数字段且受 EXPECTED_SCHEMA 纪律约束）。
+    # adapter_version 溯源「该计数由哪代判定器累积」——判定器切换后按版本
+    # 定向重放历史误排除的依据。开关（解耦链路）来回拨不重置本表：计数一旦
+    # 累积就保持，防「拨开关洗计数」绕过连续排除终态。
+    await db.execute("""
+        CREATE TABLE IF NOT EXISTS filter_state (
+            source          TEXT NOT NULL,
+            msg_id          TEXT NOT NULL,
+            uncertain_count INTEGER NOT NULL DEFAULT 0,
+            adapter_version TEXT NOT NULL DEFAULT '',
+            updated_at      TEXT NOT NULL,
+            PRIMARY KEY (source, msg_id)
+        )
+    """)
 
     await _seed_default_categories(db)
     await _backfill_default_categories(db)
@@ -1588,6 +1603,145 @@ async def get_recat_samples(limit: int = 10000) -> list[dict]:
         (limit,),
     )
     return [dict(row) for row in rows]
+
+
+async def note_filter_uncertain(
+    source: str, msg_id: str, adapter_version: str = ""
+) -> int:
+    """筛选判定器 uncertain 计数 +1（返回累积值；连续排除终态的判定输入）。
+
+    行不存在时插入（初始 1）。adapter_version 只在**首次建行**时落——
+    同一条消息的后续 uncertain 沿用建行时的版本（计数语义 = 该条由哪代
+    判定器首次判 uncertain），覆写会把多代判定器的计数混在一个版本名下，
+    破坏按版本定向重放的溯源性。开关（解耦链路）关闭时调用方不进本函数；
+    本函数自身不做开关判断——计数纪律（只在 ON 时递增、拨动不重置）由
+    调用方与「无 reset 入口」共同保证。
+    """
+    db = await get_db()
+    now = datetime.now(UTC).isoformat()
+    await db.execute(
+        "INSERT INTO filter_state (source, msg_id, uncertain_count, adapter_version, updated_at) "
+        "VALUES (?, ?, 1, ?, ?) "
+        "ON CONFLICT(source, msg_id) DO UPDATE SET "
+        "uncertain_count = uncertain_count + 1, updated_at = excluded.updated_at",
+        (source, msg_id, adapter_version, now),
+    )
+    await db.commit()
+    row = await _fetchone(
+        db,
+        "SELECT uncertain_count FROM filter_state WHERE source = ? AND msg_id = ?",
+        (source, msg_id),
+    )
+    return row["uncertain_count"] if row else 1
+
+
+async def get_filter_state(
+    source: str, msg_id: str
+) -> dict | None:
+    """读单条筛选计数（分类判定前查询「是否已达连续排除终态」）。"""
+    db = await get_db()
+    row = await _fetchone(
+        db,
+        "SELECT source, msg_id, uncertain_count, adapter_version, updated_at "
+        "FROM filter_state WHERE source = ? AND msg_id = ?",
+        (source, msg_id),
+    )
+    return dict(row) if row else None
+
+
+async def clear_filter_state(source: str, msg_ids: list[str]) -> int:
+    """删除指定消息的筛选计数行（判定通过正常入库后调用；返回删除行数）。
+
+    判定翻案（uncertain 后重试通过、或重放器判定通过）即清行：计数是
+    「连续 uncertain」语义，中间夹一次成功就该归零，删行等价归零且不留
+    陈旧 adapter_version。
+    """
+    if not msg_ids:
+        return 0
+    db = await get_db()
+    removed = await _execute_chunked(
+        db,
+        "DELETE FROM filter_state WHERE source = ? AND msg_id IN ({placeholders})",
+        msg_ids,
+        chunk_size=_SQL_VARS_CHUNK,
+        extra_params=(source,),
+        fetch=False,
+    )
+    await db.commit()
+    return removed
+
+
+async def count_filter_state() -> int:
+    """全表计数（采集量盘点用）。"""
+    db = await get_db()
+    row = await _fetchone(db, "SELECT COUNT(*) AS cnt FROM filter_state")
+    return row["cnt"] if row else 0
+
+
+async def get_category_sample_contents(
+    per_category_limit: int, window_days: int
+) -> list[dict]:
+    """类别分配器样本：每类近 N 天最新 limit 条 (category, title+quote)。
+
+    只取 is_verified >= 0（与去重缓存预热同口径：忽略态不是有效分布样本）；
+    「title + 空格 + quote」与嵌入文本口径一致（_embedding_text 同构，向量
+    可比）。created_at DESC 即最新优先——近 M 天 Top-N 的在线估计，完整
+    的窗口截断由 SQL 的时间过滤承担。
+    """
+    db = await get_db()
+    rows = await _fetchall(
+        db,
+        "SELECT category, title, source_quote FROM items "
+        "WHERE is_verified >= 0 AND created_at >= datetime('now', ?) "
+        "ORDER BY created_at DESC",
+        (f"-{window_days} days",),
+    )
+    per_cat: dict[str, int] = {}
+    out: list[dict] = []
+    for row in rows:
+        cat = row["category"]
+        if per_cat.get(cat, 0) >= per_category_limit:
+            continue
+        per_cat[cat] = per_cat.get(cat, 0) + 1
+        text = f"{row['title'] or ''} {row['source_quote'] or ''}".strip()
+        if text:
+            out.append({"category": cat, "content": text, "weight": 1})
+    return out
+
+
+async def get_recat_overlay_samples(window_days: int) -> list[dict]:
+    """recat 纠错样本覆盖层：category_after 计入新类（weight=2）。
+
+    content 口径与普通样本严格一致（`title + " " + source_quote`，经
+    recat_log.item_id 回查 items 现行 title）：覆盖层的 weight=2 去重胜出
+    依赖「同一张卡在两侧产出同一 content 字符串」——recat_log.content 只存
+    quote，直接用它当键时（title 非空的卡）两侧文本不同、同源去重永不命中，
+    「从原类剔除同源」退化为摆设（同一文本双锚震荡，恰是要消解的情形）。
+    卡片已被删（items 无行）时跳过——无处取 title，且孤样本无锚定价值。
+    「从原类剔除」不在本查询落地：合成后由分配器按 content 去重
+    （recat=2 必胜出普通样本的 weight=1），等价实现且单一收口。
+    """
+    db = await get_db()
+    rows = await _fetchall(
+        db,
+        "SELECT r.category_after, r.content, r.item_id, "
+        "i.title AS live_title, i.source_quote AS live_quote "
+        "FROM recat_log r LEFT JOIN items i ON i.id = r.item_id "
+        "WHERE r.category_before != r.category_after "
+        "AND r.created_at >= datetime('now', ?) "
+        "ORDER BY r.id DESC",
+        (f"-{window_days} days",),
+    )
+    out: list[dict] = []
+    for row in rows:
+        quote = row["live_quote"] if row["live_quote"] is not None else row["content"]
+        title = row["live_title"] or ""
+        text = f"{title} {quote or ''}".strip()
+        if text:
+            out.append(
+                {"category": row["category_after"], "content": text, "weight": 2}
+            )
+    return out
 
 
 async def category_exists(name: str) -> bool:

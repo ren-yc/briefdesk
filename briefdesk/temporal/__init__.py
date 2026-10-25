@@ -42,7 +42,7 @@ class LexicalHint:
     hint 级别：strong=明确时间词（漏检代价=永久丢时间，升级 sysc）；
     weak=裸数字日期模式（误检代价=一次 LLM 调用，门向误检倾斜）。
     pattern_id：强线索的词表序号（弱线索恒 -1）——线索级漏检归因到模式，
-    阶段 2 按它定向扩表。
+    影子数据定词表时按它定向扩表。
     """
 
     kind: str  # "strong" | "weak"
@@ -102,7 +102,7 @@ class TemporalParser(Protocol):
         表示无合法锚点（对齐 `_local_datetime` 回退语义——非法/0 时间戳
         的消息跳过解析，仅保留词法线索供升级判定）。
         返回ParsedTime 列表（可能为空）。label 首期恒空（规则抽 label
-        质量不可控且无自动验收门，见计划裁决 R）。
+        质量不可控、无自动验收门，保留给 LLM 兜底产出）。
         """
         ...
 

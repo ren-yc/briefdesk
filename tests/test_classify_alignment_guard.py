@@ -201,7 +201,7 @@ class TestParseResponseAmbiguousOut(unittest.TestCase):
 
     def test_ambiguous_recorded_and_result_kept(self):
         ambiguous = []
-        results, retry, _times = _parse_response(
+        results, retry, _times, _obs = _parse_response(
             '[{"index":0,"include":true,"category":"活动通知","quote":"摄影社招新"},'
             '{"index":1,"include":false}]',
             {"活动通知"},
@@ -215,7 +215,7 @@ class TestParseResponseAmbiguousOut(unittest.TestCase):
 
     def test_no_ambiguous_without_contents(self):
         ambiguous = []
-        results, _retry, _times = _parse_response(
+        results, _retry, _times, _obs = _parse_response(
             '[{"index":0,"include":true,"category":"活动通知","quote":"任意"}]',
             {"活动通知"},
             1,
