@@ -294,6 +294,19 @@ RapidOCR（基于 ONNX Runtime，CPU 推理）图片文字识别。只接收图�
 自
 禁用。
 
+#### briefdesk/temporal/
+
+时间解析器（语言无关内核 + 按语言规则包的分层架构）：协议与数据类型在包根
+（`TemporalParser` 协议、`ParsedTime`/`LexicalHint`/`ParseResult`——产出形状与
+classify 的 sysc 时间提取对齐，date-only 或分钟级两种合法粒度）；语言相关物
+（词法模式、相对表达、词表、触发线索）只住规则包（现 `rules_zh.py`），新语言 =
+新规则包。**影子运行**（`shadow.py`，`TEMPORAL_SHADOW=on` 开启）：解析器只记录
+不生效——sysc 完成后（classify 引擎 `_record_temporal_shadow`）把「sysc 产出 vs
+规则解析产出」的逐字段 diff（missing/extra、粒度分布、强/弱词法线索、强线索
+漏检标志）追加到用户数据目录 `temporal_shadow/` 每日 jsonl；`summarize_shadow_file`
+汇总覆盖率/漏检/误检，作为解析器切生效前定词表的数据依据。影子采集全部吞异常，
+绝不连坐管道。
+
 #### briefdesk/announcements.py
 
 应用级公告注册表——持续性条件的顶部横幅（如嵌入服务未启用/不可用）：`announce(code, level, message)`/`revoke(code)` 仅内容变化时发布
