@@ -23,7 +23,12 @@ from briefdesk.ai_ports import (
 from briefdesk.config import config
 from briefdesk.db import CategoryRow, get_enabled_categories
 from briefdesk.plugin.base import ChatResponse
-from briefdesk.types import ClassifyOutcome, ClassifyResult, InternalMessage
+from briefdesk.types import (
+    ClassifyObservation,
+    ClassifyOutcome,
+    ClassifyResult,
+    InternalMessage,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -519,14 +524,32 @@ async def _semantic_refine(
     return results, retry_indexes, time_indexes
 
 
+def _error_observations(
+    messages: list[InternalMessage], offset: int
+) -> list[ClassifyObservation]:
+    """整请求失败路径的观察记录（全批 error）——采集口径与成功路径对称。"""
+    return [
+        ClassifyObservation(
+            msg_index=offset + i,
+            outcome="error",
+            input_digest=(m.content[:80] if m.content else ""),
+        )
+        for i, m in enumerate(messages)
+    ]
+
+
 def _parse_response(
-    content: str, allowed: set[str], count: int,
+    content: str,
+    allowed: set[str],
+    count: int,
     contents: list[str] | None = None,
     ambiguous_out: list[int] | None = None,
-) -> tuple[list[ClassifyResult], list[int], list[int]]:
+) -> tuple[
+    list[ClassifyResult], list[int], list[int], list[ClassifyObservation]
+]:
     """解析 AI 分类 JSON（sysb 紧凑格式，支持显式 include 判定）。
 
-    返回 `(results, retry_indexes, time_indexes)`：
+    返回 `(results, retry_indexes, time_indexes, observations)`：
     - results：include=true 且类别合法的分类结果（include=false 的行直接跳过，
       不产生 result、不校验 category——排除行的 category 可能为空/脏值，
       校验会误报未知类别拖累整批；该条由调用方按"未选中"路径标记 processed）；
@@ -534,6 +557,8 @@ def _parse_response(
       保留待下轮重试，但不阻塞同批次其它正常消息入库；
     - time_indexes：include=true 且分类标记 time=true 的消息 index（含明确时间），
       供第二阶段 sysc 时间提取使用。
+    - observations：per-instance 判定观察记录（include/exclude/uncertain），
+      供观察型阶段插件（benchmark recorder）在真实处理时点采集微调数据。
     结构错误/越界 index 仍会抛异常，由调用方按整批失败处理。
     """
     json_text = content.strip()
@@ -553,9 +578,20 @@ def _parse_response(
         raise TypeError("AI response JSON is not an array")
     data = raw
 
+    # 输入摘要截断：观察记录只服务微调数据盘点（人看得到「这条判了什么」），
+    # 不需要完整原文——长 OCR 文本按头 80 字截断防内存/导出膨胀。
+    # contents 缺失（部分调用方只做解析）时摘要留空：观察记录缺失只影响
+    # 盘点信息量，不连坐判定。
+    def digest(index: int) -> str:
+        if contents is None or not (0 <= index < len(contents)):
+            return ""
+        return contents[index][:80]
+
     results: list[ClassifyResult] = []
     retry_indexes: list[int] = []
     time_indexes: list[int] = []
+    # per-instance 观察记录（观察型插件消费；本函数只收集，开关过滤在调用方）
+    observations: list[ClassifyObservation] = []
     for idx, item in enumerate(data):
         if not isinstance(item, dict):
             raise TypeError(f"AI response item #{idx} is not an object")
@@ -579,6 +615,13 @@ def _parse_response(
             logger.debug(
                 "AI 判定 index %s 排除（include=false）", msg_index
             )
+            observations.append(
+                ClassifyObservation(
+                    msg_index=msg_index,
+                    outcome="exclude",
+                    input_digest=digest(msg_index),
+                )
+            )
             continue
         category = item.get("category", "")
         # 类型守卫：AI 幻觉可能把 category 输出为 dict/list 等不可哈希类型，
@@ -591,6 +634,13 @@ def _parse_response(
                 msg_index,
             )
             retry_indexes.append(msg_index)
+            observations.append(
+                ClassifyObservation(
+                    msg_index=msg_index,
+                    outcome="uncertain",
+                    input_digest=digest(msg_index),
+                )
+            )
             continue
         if category not in allowed:
             # AI 的 allowed 集合已在 prompt 中显式给出，集合外类别是幻觉/漂移。
@@ -601,6 +651,13 @@ def _parse_response(
                 msg_index,
             )
             retry_indexes.append(msg_index)
+            observations.append(
+                ClassifyObservation(
+                    msg_index=msg_index,
+                    outcome="uncertain",
+                    input_digest=digest(msg_index),
+                )
+            )
             continue
 
         # 索引漂移守卫（第一关·字面）：quote 与自己内容明显不符而与
@@ -621,6 +678,13 @@ def _parse_response(
                     msg_index,
                 )
                 retry_indexes.append(msg_index)
+                observations.append(
+                    ClassifyObservation(
+                        msg_index=msg_index,
+                        outcome="uncertain",
+                        input_digest=digest(msg_index),
+                    )
+                )
                 continue
             if verdict is None and ambiguous_out is not None:
                 ambiguous_out.append(msg_index)
@@ -633,14 +697,25 @@ def _parse_response(
             key_info = key_raw.strip()
         else:
             key_info = ""
+        quote_val = item.get("quote", "")
         results.append(
             ClassifyResult(
                 msg_index=msg_index,
                 category=category,
                 key_info=key_info,
-                quote=item.get("quote", ""),
+                quote=quote_val,
                 # subject 已平移到 summarize 阶段提取（本阶段输出格式不含该字段，
                 # 不在此读取——单一来源，避免 summarize 失败时残留旧值入库）
+            )
+        )
+        observations.append(
+            ClassifyObservation(
+                msg_index=msg_index,
+                outcome="include",
+                category=category,
+                input_digest=digest(msg_index),
+                quote=str(quote_val)[:120],
+                key=key_info[:120],
             )
         )
         # time 标记（布尔或字符串 true/false 均接受）
@@ -665,7 +740,13 @@ def _parse_response(
             missing,
         )
         retry_indexes.extend(missing)
-    return results, retry_indexes, time_indexes
+        observations.extend(
+            ClassifyObservation(
+                msg_index=i, outcome="uncertain", input_digest=digest(i)
+            )
+            for i in missing
+        )
+    return results, retry_indexes, time_indexes, observations
 
 
 # length 截断拆半重试的深度上限：2^6=64 ≥ 常见批大小上限，防病态输入无限递归
@@ -1009,7 +1090,7 @@ async def _extract_times_core(
         "时间提取: %d/%d 条（深度剩余 %d）", filled, len(time_indexes), depth
     )
     # 影子采集：规则解析器只记录不生效（TEMPORAL_SHADOW=on 开启），与 sysc
-    # 现产出逐字段 diff——真实分布定词表与覆盖率后，阶段 2 才切生效
+    # 现产出逐字段 diff——真实分布定词表与覆盖率达标后才切生效
     _record_temporal_shadow(results, time_indexes, messages)
 
 
@@ -1141,7 +1222,11 @@ async def _classify_once(
     )
 
     system_prompt = build_system_prompt(cats)
-    all_failed = ClassifyOutcome([], [offset + i for i in range(len(messages))])
+    all_failed = ClassifyOutcome(
+        [],
+        [offset + i for i in range(len(messages))],
+        observations=_error_observations(messages, offset),
+    )
 
     async def _request(with_images: bool) -> ChatResponse:
         # vision 路由：有图时 user content 从 str 换成多模态 content parts
@@ -1209,26 +1294,47 @@ async def _classify_once(
 
     if not content:
         logger.warning("AI 返回空响应（本轮抛弃，下轮回填）")
-        return ClassifyOutcome([], [offset + i for i in range(len(messages))])
+        return ClassifyOutcome(
+            [],
+            [offset + i for i in range(len(messages))],
+            observations=_error_observations(messages, offset),
+        )
 
     ambiguous: list[int] = []
     try:
-        results, retry_indexes, time_indexes = _parse_response(
+        results, retry_indexes, time_indexes, observations = _parse_response(
             content, {c["name"] for c in cats}, len(messages),
             [m.content for m in messages], ambiguous,
         )
     except (RuntimeError, TypeError) as e:
         # 结构错误/越界 index 等：拆半无益，本轮抛弃，下轮回填
         logger.warning("AI 响应解析失败（本轮抛弃，下轮回填）: %s", e)
-        return ClassifyOutcome([], [offset + i for i in range(len(messages))])
+        return ClassifyOutcome(
+            [],
+            [offset + i for i in range(len(messages))],
+            observations=_error_observations(messages, offset),
+        )
 
     # 索引漂移守卫（第二关·语义）：字面模糊条目交嵌入余弦复核。
     # 置于 offset 合并前：ambiguous/contents 均为批内局部 index。
     if ambiguous:
+        prev_retry = set(retry_indexes)
         results, retry_indexes, time_indexes = await _semantic_refine(
             ambiguous, results, retry_indexes, time_indexes,
             [m.content for m in messages],
         )
+        # 语义裁判否决的条目（字面模糊、进 _semantic_refine 前已记 include）
+        # 观察必须改记 uncertain——这批恰是行内错位最严重的样本（quote 标到
+        # 别人头上，category 同样可能错位），带着旧 category 进采集数据会
+        # 注入伪真值。裁判放行的条目保持 include（守卫已确认对齐）。
+        demoted = set(retry_indexes) - prev_retry
+        if demoted:
+            observations = [
+                replace(o, outcome="uncertain", category="")
+                if o.msg_index in demoted and o.outcome == "include"
+                else o
+                for o in observations
+            ]
 
     # 合并回原批：子请求的 index 是相对本段列表的，需加 offset
     # （pipeline 用 batch[msg_index] 把结果映射回原消息）。
@@ -1236,6 +1342,9 @@ async def _classify_once(
         results = [replace(r, msg_index=r.msg_index + offset) for r in results]
         retry_indexes = [i + offset for i in retry_indexes]
         time_indexes = [i + offset for i in time_indexes]
+        observations = [
+            replace(o, msg_index=o.msg_index + offset) for o in observations
+        ]
     if budget_dropped:
         # 防静默丢失：被预算剔除的消息未送分类，必须并入 failed 由
         # 回填重试——否则会被 _mark_skipped 当闲聊标记 processed
@@ -1248,7 +1357,12 @@ async def _classify_once(
         )
         retry_indexes = sorted(set(retry_indexes) | {offset + i for i in budget_dropped})
     logger.info("Got %d relevant, %d retry", len(results), len(retry_indexes))
-    return ClassifyOutcome(results, retry_indexes, time_indexes)
+    return ClassifyOutcome(
+        results,
+        retry_indexes,
+        time_indexes,
+        observations=observations,
+    )
 
 
 async def _split_retry(
@@ -1269,7 +1383,11 @@ async def _split_retry(
             "AI response truncated (finish_reason=length) 且不可再拆分"
             "（单条/深度上限），本轮抛弃，下轮回填"
         )
-        return ClassifyOutcome([], [offset + i for i in range(len(messages))])
+        return ClassifyOutcome(
+            [],
+            [offset + i for i in range(len(messages))],
+            observations=_error_observations(messages, offset),
+        )
 
     mid = len(messages) // 2
     logger.info(
@@ -1286,4 +1404,5 @@ async def _split_retry(
         left.results + right.results,
         left.failed + right.failed,
         left.time_indexes + right.time_indexes,
+        observations=left.observations + right.observations,
     )

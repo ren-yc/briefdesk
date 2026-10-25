@@ -16,9 +16,24 @@ from briefdesk.db import (
     toggle_category,
     update_category,
 )
-from briefdesk.events import EVENT_ITEMS_DELETED, event_bus
+from briefdesk.events import (
+    EVENT_CATEGORIES_CHANGED,
+    EVENT_ITEMS_DELETED,
+    event_bus,
+)
 from briefdesk.realtime import publish_items_updated
 from briefdesk.server.app import app
+
+
+def _publish_categories_changed() -> None:
+    """锁内/锁外均可调：fire-and-forget 结构变更信号（失败不连坐主流程）。"""
+    import asyncio
+
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    loop.create_task(event_bus.publish(EVENT_CATEGORIES_CHANGED, None))
 
 _NAME_MAX = 20
 # 提示词上限 400：最长默认提示词 293 字（活动通知），前端两处 maxlength 与此常量
@@ -91,6 +106,7 @@ async def api_create_category(body: dict):
     except aiosqlite.IntegrityError:
         raise HTTPException(409, f"类别已存在: {name}")
     await publish_items_updated({"categoriesChanged": True})
+    _publish_categories_changed()
     return {"success": True, "category": row}
 
 
@@ -112,6 +128,7 @@ async def api_update_category(cat_id: int, body: dict):
     if row is None:
         raise HTTPException(404, "Category not found")
     await publish_items_updated({"categoriesChanged": True})
+    _publish_categories_changed()
     return {"success": True, "category": row}
 
 
@@ -122,6 +139,7 @@ async def api_toggle_category(cat_id: int):
     if row is None:
         raise HTTPException(404, "Category not found")
     await publish_items_updated({"categoriesChanged": True})
+    _publish_categories_changed()
     return {"success": True, "category": row}
 
 
@@ -142,6 +160,7 @@ async def api_delete_category(cat_id: int, body: dict):
     if row is None:
         raise HTTPException(404, "Category not found")
     await publish_items_updated({"categoriesChanged": True})
+    _publish_categories_changed()
     return {
         "success": True,
         "category": row,

@@ -76,6 +76,7 @@ weflow-server :5033        WeFlow(legacy) :5031        qqflow-server :5032
 | `briefdesk/plugins/ai_provider/engine.py` | OpenAI 兼容供应商实现：共享 `AsyncOpenAI` 客户端、`chat`（thinking 开关）与嵌入端点封装。[详见下文](#briefdeskpluginsai_providerenginepy) |
 | `briefdesk/plugins/ai_provider/plugin.py` | `AiProviderPlugin`（显式实现 Plugin + AIProvider）：setup 构造 `Provider` 并注册到 `ctx.ai` 与 `briefdesk.ai_ports`；teardown 清除注册（幂等）。classify/dedup/merge 依赖本插件（拓扑序保证其先就绪）。 |
 | `briefdesk/plugins/classify/engine.py` | AI 分类引擎：sysb/sysc 两阶段 prompt、截断与边界、解析容错。[详见下文](#briefdeskpluginsclassifyenginepy) |
+| `briefdesk/plugins/classify/allocator.py` | 类别分配器（就绪+待校准组件）：实例锚定的零训练分类——每类原型向量集 + max/mean-of-top-k 聚合 + 逐类 p5 阈值 + recat 覆盖层；嵌入未启用/缓存空时回退 API 链路。[详见下文](#briefdeskpluginsclassifyallocatorpy) |
 | `briefdesk/plugins/dedup/engine.py` | `DedupEngine`（实现 DedupService 端口）语义去重判定管线：精确短路→字符重叠→嵌入→AI 判官。[详见下文](#briefdeskpluginsdedupenginepy) |
 | `briefdesk/plugins/merge/engine.py` | 会话内同话题片段合并判官（与去重互补的第二个 AI 判定），判定字段与合并证据。[详见下文](#briefdeskpluginsmergeenginepy) |
 | `briefdesk/plugins/ocr/engine.py` | RapidOCR（基于 ONNX Runtime，CPU 推理）图片文字识别（懒加载、进程内单例）。[详见下文](#briefdeskpluginsocrenginepy) |
@@ -109,7 +110,7 @@ weflow-server :5033        WeFlow(legacy) :5031        qqflow-server :5032
 | `briefdesk/plugins/rag/*` | `RagPlugin`（**双能力插件先例**：StagePlugin + WebPlugin）：检索问答的路由、库层与维护循环。[详见下文](#briefdeskpluginsrag) |
 | `briefdesk/plugins/weflow_legacy/poller.py` | REST 历史回填（**按会话窗口**：水位下界 + BACKFILL_HOURS 回退 + 翻页早停）。[详见下文](#briefdeskpluginsweflow_legacypollerpy) |
 | `briefdesk/logger.py` | 标准 logging 配置（根 handler、查询串掩码、access 日志门控）。[详见下文](#briefdeskloggerpy) |
-| `briefdesk/events.py` | 内部事件总线（topic pub/sub）：核心与插件间的通用解耦通道（realtime 只管前端 SSE）。同步/异步处理器均支持，处理器异常只记日志不向发布方传播。模块级单例 `event_bus` 由 main 注入 PluginContext。核心删除卡片后发布 `EVENT_ITEMS_DELETED`（"items_deleted"），去重插件订阅后同步清理内存缓存；`purge_expired_ignored`（main 直调 db、不经路由）提交后发布 `EVENT_ITEMS_PURGED`（"items_purged"，同载荷语义），dedup 插件同口径订阅。 |
+| `briefdesk/events.py` | 内部事件总线（topic pub/sub）：核心与插件间的通用解耦通道（realtime 只管前端 SSE）。同步/异步处理器均支持，处理器异常只记日志不向发布方传播。模块级单例 `event_bus` 由 main 注入 PluginContext。核心删除卡片后发布 `EVENT_ITEMS_DELETED`（"items_deleted"），去重插件订阅后同步清理内存缓存；`purge_expired_ignored`（main 直调 db、不经路由）提交后发布 `EVENT_ITEMS_PURGED`（"items_purged"，同载荷语义），dedup 插件同口径订阅；类别路由增删改名/停用后发布 `categories_changed`（fire-and-forget 信号），classify 插件订阅重建分配器原型。 |
 | `briefdesk/stages.py` | 管道阶段注册表与装配期上下文：StagePlugin 经 `ctx.register_stage` 注册（main 把端口接到本模块），pipeline 骨架按槽位（enrich → classify → dedup → post_insert）读取，同槽按 priority 升序；`set_context` 注入装配期 PluginContext（阶段 run(batch, ctx) 经此获得 `ctx.dedup` 等服务端口）。模块级单例，测试用 `reset()` 隔离。 |
 | `briefdesk/plugins/ocr/plugin.py` | `OcrPlugin`（实现 StagePlugin，slot=enrich）：懒加载引擎、逐图下载容错与 vision stash。[详见下文](#briefdeskpluginsocrpluginpy) |
 | `briefdesk/plugins/classify/plugin.py` | `ClassifyPlugin`（显式实现 StagePlugin，slot=classify）：run 调引擎 `classify_batch` 并把 `ClassifyOutcome` 写入 `batch.outcomes`。 |
@@ -239,7 +240,23 @@ sysc；解析失败/超长同样整段本轮抛弃，不标 processed）。两�
 把全部时间点列入可选 `times` 数组（{type,time,label}），`_parse_extra_times` 逐项校验（脏项丢弃、与主字段 (type,time) 去重、上限 20 项、
 label 折叠截断 40 字）；key 中的时间必须写绝对日期（合并后相对时间失去锚点）。**无年份日期推断**：“X月X日/号”取与消息发送时刻**最接近**的那一次（无论已过还是未来）——任务清
 单
-里已过的截止日仍取当年（严禁滚动次年），明显更接近次年才取次年。
+里已过的截止日仍取当年（严禁滚动次年），明显更接近次年才取次年。**per-instance 观察记录**：`_parse_response` 返回四元组（多带
+`observations`）——每条参与分类的消息一条 `ClassifyObservation`（include/exclude/uncertain/error + 输入摘要截断 80 字），挂
+`ClassifyOutcome.observations`、由 classify 插件转入 `batch.classify_checks` 供观察型插件（benchmark recorder）在真实处理时点
+采集微调数据；全部失败路径（传输失败/空响应/解析失败/不可拆截断）同口径产出全批 error 记录。
+
+#### briefdesk/plugins/classify/allocator.py
+
+类别分配器（实例锚定的零训练分类，「就绪 + 待校准」组件）：类别指纹 = **原型向量集**（每类近 90 天最新 100 条样本的
+「title + quote」逐条嵌入，与去重嵌入文本同口径）而非规则文本——默认 prompt 是规则程序（含互斥排除句），余弦不建模否定/前置条件；
+分配 = 查询向量对每类原型取 max/mean-of-top-3 余弦，达到该类阈值才接受，多类达标取最高分；逐类阈值 = p5 覆盖 > 类内两两自相似
+p5（`_p5_self_similarity`）> 全局默认 0.60，校准建议经 `scripts/calibrate_allocator.py`（recat_log 留一，输出 p25 建议表）
+回填 `THRESHOLD_OVERRIDES`。**recat 覆盖层**：纠错样本按 category_after 计入（weight=2）、与普通样本同 content 去重时胜出
+（等价「计入新类 + 从原类剔除同源」）。**冷启动回退**：嵌入未启用 / 样本为空 / 缓存空 / 查询嵌入失败 → `allocate_with_vector`
+返回 None，调用方回退 API 链路。重建（`rebuild`）从 items 主源 + recat_log 覆盖层合成样本（db 层 `get_category_sample_contents`
+/`get_recat_overlay_samples`），300s 节流合并（`force` 跳过）；类别改名/新增/停用经 `categories_changed` 事件（类别路由
+fire-and-forget 发布、classify 插件订阅转锁外任务）触发重建。遥测：`allocator.rebuild/allocate/unmatched`。**本阶段不接入
+判定主链路**（旧 sysb 链路全程保留），消费方式 = 影子打分与留一校准。
 
 #### briefdesk/plugins/dedup/engine.py
 
@@ -339,7 +356,7 @@ else:
 
 #### briefdesk/telemetry.py
 
-最小遥测集（阶段 0 基线测量的基础设施）：进程内计数器（`record(kind, source)`）与耗时样本窗口
+最小遥测集（验收门基线测量的基础设施）：进程内计数器（`record(kind, source)`）与耗时样本窗口
 （`observe(kind, ms, source)`，上限抽稀保窗口、全量 count/total 独立累计）+ merge 余弦-真值明细
 （`record_cosine_truth(source, cosine, verdict)`，预筛门限 ROC 标定输入）。全部记录入口与读路径
 （`snapshot`/`format_summary`）兜底吞异常——遥测故障绝不连坐判定路径。AI 调用计时在 `ai_ports.chat`
@@ -441,7 +458,11 @@ schema 幂等初始化；`_init_connection` 自 connect 起全程受 try 保护�
 化专用连接（`get_embed_db`，`load_embeddings`/`upsert_embeddings` 走它，`_embed_lock` 语句级串行、游标先 close 再 commit、
 锁竞争指数退避重试 3 次——杜绝活动语句阻断 COMMIT 的 `cannot commit transaction - SQL statements in progress`）。DB path
 from `config.db_path`. Schema: `items`, `sessions`, `processed_messages`, `raw_messages`, `contacts`,
- `item_embeddings`, `categories`, `recat_log`（人工改类样本：item_id/改类前后/时间，供导出微调）. 多源命名空间：
+ `item_embeddings`, `categories`, `recat_log`（人工改类样本：item_id/改类前后/时间，供导出微调）, `filter_state`（筛选判定器
+第三态计数可选表：`(source, msg_id)` 主键 + uncertain_count/adapter_version/updated_at；CREATE IF NOT EXISTS 幂等补建、不进
+EXPECTED_SCHEMA。助手 `note_filter_uncertain`（+1，adapter_version 只在建行时落——同条消息的计数溯源自首次判 uncertain 的
+判定器）、`get_filter_state`/`clear_filter_state`（判定翻案清行 = 连续计数归零）/`count_filter_state`（采集量盘点）；计数只在
+解耦链路开关 ON 时递增、开关拨动不重置。多源命名空间：
 sessions/contacts/processed_messages/raw_messages 以 `(source, id)` 复合主键，items 以
 `UNIQUE(source, source_msg_id)` 区分；所有相关函数签名首参为 `source`。schema 单一来源为 `init_schema` 的 CREATE TABLE；启动
 时
@@ -594,6 +615,12 @@ synthetic 合成，受控枚举、未知值校验报错）与 `batch_fingerprint
 结构非法时拒绝合并覆盖而非静默按空）。消费侧：验收分母只认 `origin=manual`（卡片/记录导出的期望来自
 管道自身判定，混入会让指标虚高）；与入训记录同指纹的用例按批次级互斥出验收分母（只读工具
 `scripts/eval_denominators.py`：分组汇总 + 指纹互斥校验 + 双口径分开统计）。
+**classify 处理记录采集**：recorder 经 `build_classify_cases` 把批级
+`ClassifyObservation`（classify 引擎产出、`batch.classify_checks` 携带）聚合为一条 ClassifyCase
+（per-instance 期望挂 expected 列表，**只收 include**——uncertain/error 无类别真值不入评分，
+其存在记入 note 供训练导出侧盘点）。**节律导出**：`scheduled_export` 批尾检查，24h 间隔且有
+累积才自动导出（首见调用只锚定不导出——防首批记录立即清空）；失败回退时间戳下个节律重试。
+纯内存记录重启即丢是已知语义（定节律导出为显式缓解）。
 
 #### briefdesk/sources_base.py
 

@@ -141,6 +141,28 @@ class ClassifyOutcome:
     # 分类阶段标记"含明确时间"的消息 index（相对原批全局 index），供
     # 第二阶段 sysc 时间提取使用（只对 time=true 的消息提取 start/end/times）。
     time_indexes: list[int] = field(default_factory=list)
+    # per-instance 判定观察记录（拆半重试时子请求合并；观察型插件消费）。
+    # 挂 outcome 而非另走通道：观察记录与判定结果同生命周期、同成功口径。
+    observations: list[ClassifyObservation] = field(default_factory=list)
+
+
+@dataclass
+class ClassifyObservation:
+    """分类单条判定的观察记录（classify 阶段产出，观察型插件如 recorder 消费）。
+
+    per-instance 粒度：每条参与分类的消息一条记录。outcome 语义——
+    "include"：AI 判定入选；"exclude"：AI 判定排除；"uncertain"：解析失败/
+    越界/漂移等计入 failed 待重试的条目；"error"：整请求失败（本条随批
+    全部计入 failed）。输入摘要在构造点做截断（防长消息膨胀内存/导出）。
+    """
+
+    msg_index: int  # 相对原批的全局 index
+    outcome: str  # "include" | "exclude" | "uncertain" | "error"
+    category: str = ""  # include 时的类别
+    input_digest: str = ""  # 判定输入摘要（消息原文截断）
+    quote: str = ""  # include 时的 AI 摘录（截断）
+    key: str = ""  # include 时的关键词串（逗号分隔）
+
 
 
 @dataclass
@@ -261,6 +283,10 @@ class BatchContext:
     merged: int = 0  # 合并次数（merge 阶段累加）
     dedup_checks: list[DedupCheck] = field(default_factory=list)
     merge_checks: list[MergeCheck] = field(default_factory=list)
+    classify_checks: list[ClassifyObservation] = field(default_factory=list)
+    # classify 阶段的 per-instance 判定观察记录（观察型插件消费；classify
+    # 阶段锁外写入、post_insert 锁内消费，批对象单线程传递无竞争，批结束
+    # 即弃——与 dedup_checks/merge_checks 同生命周期）
     preembeddings: dict[tuple[str, str], list[float]] = field(default_factory=dict)
     # 锁外阶段（before_run）写入的本批预嵌入向量，存储相按 (source, msg_id)
     # 消费。挂批上下文而非引擎实例：BatchContext 每批新建、天然隔离——

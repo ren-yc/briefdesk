@@ -126,12 +126,22 @@ class BenchmarkPlugin(WebPlugin, StagePlugin):
     async def run(self, batch: BatchContext, ctx: PluginContext) -> None:
         """锁内（骨架持有 _storage_lock）：记录开关开启时采集本批判定记录。
 
-        只做内存追加（无 AI/DB/文件 IO），不拖累存储锁。
+        采集只做内存追加（无 AI/DB/文件 IO）；节律导出是 pydantic 校验 +
+        同步 JSON 落盘，量大时（4×5000 条）会以秒计——冻结存储管道不可
+        接受，经 create_task 转锁外执行（fire-and-forget，失败已静默）。
         """
+        import asyncio
+
         from briefdesk.plugins.benchmark import recorder as bench_recorder
 
         if bench_recorder.is_enabled():
             bench_recorder.record_batch(batch)
+            try:
+                asyncio.get_running_loop().create_task(
+                    bench_recorder.scheduled_export()
+                )
+            except RuntimeError:
+                pass  # 无运行中循环（测试/关闭序列）：跳过节律检查
 
     async def activate(self, ctx: PluginContext) -> None:
         """启动兜底：清掉上次异常退出留下的残目录，并做一次轮转。

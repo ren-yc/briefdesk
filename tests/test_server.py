@@ -16,7 +16,7 @@ from fastapi import HTTPException
 from starlette.testclient import TestClient
 
 import briefdesk.server as srv
-from briefdesk.events import EVENT_ITEMS_DELETED
+from briefdesk.events import EVENT_CATEGORIES_CHANGED, EVENT_ITEMS_DELETED
 from briefdesk.plugins.calendar import router as calendar_router
 from briefdesk.plugins.reminders import router as reminders_router
 from briefdesk.server import routes_items as srv_routes
@@ -969,7 +969,7 @@ class EventPublishFollowsActualEffectTest(unittest.TestCase):
         _, dedup = self._batch("memo", 1)
         dedup.add_to_cache.assert_called_once()
 
-    def test_category_cascade_delete_without_items_publishes_nothing(self):
+    def test_category_cascade_delete_without_items_publishes_no_delete_event(self):
         publish = AsyncMock()
         with patch.multiple(
             "briefdesk.server.routes_categories",
@@ -985,7 +985,14 @@ class EventPublishFollowsActualEffectTest(unittest.TestCase):
             client.close()
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(resp.json()["deletedItems"], 0)
-        publish.assert_not_awaited()
+        # categories_changed 信号照常发（结构变更与是否级联删除无关）；
+        # 删除事件必须为零——无删除发生的事件只会让订阅方白跑
+        delete_calls = [
+            c
+            for c in publish.await_args_list
+            if c.args and c.args[0] == EVENT_ITEMS_DELETED
+        ]
+        self.assertEqual(delete_calls, [])
 
     def test_category_cascade_delete_with_items_publishes(self):
         publish = AsyncMock()
@@ -1005,7 +1012,11 @@ class EventPublishFollowsActualEffectTest(unittest.TestCase):
             client.close()
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(resp.json()["deletedItems"], 2)
-        publish.assert_awaited_once_with(EVENT_ITEMS_DELETED, ["a", "b"])
+        # 删除与 categories_changed（分配器重建信号）都经同一总线：
+        # 精确断言 items_deleted 载荷，信号调用存在但不占次数
+        publish.assert_any_await(EVENT_ITEMS_DELETED, ["a", "b"])
+        publish.assert_any_await(EVENT_CATEGORIES_CHANGED, None)
+        self.assertEqual(publish.await_count, 2)
 
 
 if __name__ == "__main__":
@@ -1102,7 +1113,11 @@ class CategoryDeleteRouteTest(unittest.TestCase):
             resp = self.client.post("/api/categories/3/delete", json={"purgeItems": True})
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(resp.json()["deletedItems"], 2)
-        publish.assert_awaited_once_with(EVENT_ITEMS_DELETED, ["a", "b"])
+        # 删除与 categories_changed（分配器重建信号）都经同一总线：
+        # 精确断言 items_deleted 载荷，信号调用存在但不占次数
+        publish.assert_any_await(EVENT_ITEMS_DELETED, ["a", "b"])
+        publish.assert_any_await(EVENT_CATEGORIES_CHANGED, None)
+        self.assertEqual(publish.await_count, 2)
         lock.__aenter__.assert_awaited_once()
 
     def test_no_purge_skips_event(self):
@@ -1118,7 +1133,14 @@ class CategoryDeleteRouteTest(unittest.TestCase):
             resp = self.client.post("/api/categories/3/delete", json={"purgeItems": False})
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(resp.json()["deletedItems"], 0)
-        publish.assert_not_awaited()
+        # categories_changed 信号照常发（结构变更与是否级联删除无关）；
+        # 删除事件必须为零——无删除发生的事件只会让订阅方白跑
+        delete_calls = [
+            c
+            for c in publish.await_args_list
+            if c.args and c.args[0] == EVENT_ITEMS_DELETED
+        ]
+        self.assertEqual(delete_calls, [])
 
 
 class CategoryPromptLimitTest(unittest.TestCase):

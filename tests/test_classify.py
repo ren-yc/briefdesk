@@ -54,7 +54,7 @@ class ParseResponseTest(unittest.TestCase):
 
     def test_valid(self):
         # 主路径：标准外壳 {"task":"classify","data":[...]}
-        results, retry, times = _parse_response(
+        results, retry, times, _obs = _parse_response(
             '{"task":"classify","data":[{"index":0,"category":"活动通知","time":true,"quote":"讲座","key":["讲座","报告厅"]},'
             '{"index":1,"include":false},{"index":2,"include":false}]}',
             self.ALLOWED,
@@ -69,7 +69,7 @@ class ParseResponseTest(unittest.TestCase):
 
     def test_legacy_bare_array_tolerated(self):
         # 兼容旧版裸数组输出（模型未按外壳格式作答时仍可解析）
-        results, retry, times = _parse_response(
+        results, retry, times, _obs = _parse_response(
             '[{"index":0,"category":"活动通知","time":true,"quote":"讲座","key":["讲座","报告厅"]}]',
             self.ALLOWED,
             1,
@@ -82,7 +82,7 @@ class ParseResponseTest(unittest.TestCase):
 
     def test_key_string_tolerated(self):
         # 兼容旧格式：key 是字符串也接受
-        results, _retry, times = _parse_response(
+        results, _retry, times, _obs = _parse_response(
             '[{"index":0,"category":"活动通知","time":false,"key":"讲座,报告厅"}]',
             self.ALLOWED,
             1,
@@ -91,7 +91,7 @@ class ParseResponseTest(unittest.TestCase):
         assert times == []
 
     def test_time_missing_defaults_false(self):
-        results, _retry, times = _parse_response(
+        results, _retry, times, _obs = _parse_response(
             '{"task":"classify","data":[{"index":0,"category":"活动通知"}]}',
             self.ALLOWED,
             1,
@@ -116,7 +116,7 @@ class ParseResponseTest(unittest.TestCase):
             _parse_response('{"task":"classify","data":[{"index":"0","category":"活动通知"}]}', self.ALLOWED, 3)
 
     def test_unknown_category_kept_for_retry(self):
-        results, retry, times = _parse_response(
+        results, retry, times, _obs = _parse_response(
             '{"task":"classify","data":[{"index":0,"category":"不存在的类别"}]}',
             self.ALLOWED,
             1,
@@ -128,7 +128,7 @@ class ParseResponseTest(unittest.TestCase):
     def test_non_string_category_kept_for_retry(self):
         # AI 幻觉把 category 输出为 dict/list 等不可哈希类型时，
         # 不能抛 TypeError 拖垮整批——按未知类别同路径保留待重试
-        results, retry, times = _parse_response(
+        results, retry, times, _obs = _parse_response(
             '{"task":"classify","data":[{"index":0,"category":{"name":"活动通知"}},'
             '{"index":1,"category":["学术"]}]}',
             self.ALLOWED,
@@ -141,7 +141,7 @@ class ParseResponseTest(unittest.TestCase):
     def test_subject_never_read_from_classify(self):
         # subject 由 summarize 阶段提取（单一来源）：classify 响应即使带
         # subject 字段也忽略，避免 summarize 失败时残留旧值入库
-        results, _retry, _times = _parse_response(
+        results, _retry, _times, _obs = _parse_response(
             '{"task":"classify","data":[{"index":0,"category":"活动通知","subject":"编程社"}]}',
             self.ALLOWED,
             3,
@@ -149,7 +149,7 @@ class ParseResponseTest(unittest.TestCase):
         assert results[0].subject == ""
 
     def test_unknown_category_does_not_block_valid_results(self):
-        results, retry, times = _parse_response(
+        results, retry, times, _obs = _parse_response(
             '{"task":"classify","data":['
             '{"index":0,"category":"不存在的类别"},'
             '{"index":1,"category":"活动通知","time":true}'
@@ -162,7 +162,7 @@ class ParseResponseTest(unittest.TestCase):
         assert times == [1]
 
     def test_markdown_fence_tolerated(self):
-        results, _, times = _parse_response(
+        results, _, times, _obs = _parse_response(
             '```json\n{"task":"classify","data":[{"index":1,"category":"学术","time":true}]}\n```', self.ALLOWED, 2
         )
         assert results[0].msg_index == 1
@@ -176,7 +176,7 @@ class ParseResponseTest(unittest.TestCase):
             '{"task":"classify","data":[{"index":0,"category":"活动通知","time":true}',
         ]
         for payload in cases:
-            results, retry, _ = _parse_response(payload, self.ALLOWED, 1)
+            results, retry, _, _obs = _parse_response(payload, self.ALLOWED, 1)
             assert retry == []
             assert len(results) == 1
             assert results[0].category == "活动通知"
@@ -189,7 +189,7 @@ class ParseResponseTest(unittest.TestCase):
 
     def test_task_field_ignored_any_dict_shell_tolerated(self):
         # task 字段不再校验：任意 dict 外壳均按 data 取值，data 非数组才抛错
-        results, retry, times = _parse_response(
+        results, retry, times, _obs = _parse_response(
             '{"task":"other","data":[]}', self.ALLOWED, 0
         )
         assert (results, retry, times) == ([], [], [])
@@ -206,7 +206,7 @@ class ParseResponseTest(unittest.TestCase):
 
     def test_include_false_skipped(self):
         # include:false 的消息不产生 result、不进 time_indexes
-        results, retry, times = _parse_response(
+        results, retry, times, _obs = _parse_response(
             '[{"index":0,"include":false},'
             '{"index":1,"include":true,"category":"活动通知","time":true}]',
             self.ALLOWED,
@@ -218,7 +218,7 @@ class ParseResponseTest(unittest.TestCase):
 
     def test_include_missing_defaults_true(self):
         # 旧格式无 include 字段：缺省视为选中，兼容迁移期旧模型输出
-        results, _retry, _times = _parse_response(
+        results, _retry, _times, _obs = _parse_response(
             '[{"index":0,"category":"活动通知","time":true}]',
             self.ALLOWED,
             1,
@@ -228,7 +228,7 @@ class ParseResponseTest(unittest.TestCase):
 
     def test_include_string_false_tolerated(self):
         # 字符串形态 "false" 同样认（AI 输出宽容解析）
-        results, retry, _times = _parse_response(
+        results, retry, _times, _obs = _parse_response(
             '[{"index":0,"include":"false"},'
             '{"index":1,"include":"true","category":"学术"}]',
             self.ALLOWED,
@@ -240,7 +240,7 @@ class ParseResponseTest(unittest.TestCase):
     def test_include_false_unknown_category_not_retried(self):
         # include:false 的行不校验 category：排除行 category 可能为空/脏值，
         # 若走未知类别路径会误把"显式排除"当"分类失败"拖入下轮重试
-        results, retry, times = _parse_response(
+        results, retry, times, _obs = _parse_response(
             '[{"index":0,"include":false,"category":"不存在的类别"}]',
             self.ALLOWED,
             1,
@@ -250,7 +250,7 @@ class ParseResponseTest(unittest.TestCase):
         assert times == []
 
     def test_all_include_false_empty(self):
-        results, retry, times = _parse_response(
+        results, retry, times, _obs = _parse_response(
             '[{"index":0,"include":false},{"index":1,"include":false}]',
             self.ALLOWED,
             2,
@@ -259,7 +259,7 @@ class ParseResponseTest(unittest.TestCase):
 
     def test_mixed_include_and_unknown_category(self):
         # 混合批：include:false + 未知类别(true) + 合法 交错，各走各的路径
-        results, retry, times = _parse_response(
+        results, retry, times, _obs = _parse_response(
             '[{"index":0,"include":false},'
             '{"index":1,"category":"不存在的类别"},'
             '{"index":2,"include":true,"category":"活动通知","time":true}]',
@@ -272,7 +272,7 @@ class ParseResponseTest(unittest.TestCase):
 
     def test_missing_index_moved_to_retry(self):
         # 覆盖校验：AI 漏回 index 2 → 并入 retry（防 _mark_skipped 静默标 processed）
-        results, retry, times = _parse_response(
+        results, retry, times, _obs = _parse_response(
             '[{"index":0,"include":true,"category":"活动通知","quote":"讲座","time":true},'
             '{"index":1,"include":false}]',
             self.ALLOWED, 3,
@@ -292,7 +292,7 @@ class ParseResponseTest(unittest.TestCase):
 
     def test_quote_mismatch_moved_to_retry(self):
         # 索引漂移守卫：quote 与内容不对齐 → 该条转重试
-        results, retry, _times = _parse_response(
+        results, retry, _times, _obs = _parse_response(
             '[{"index":0,"include":true,"category":"活动通知",'
             '"quote":"出二手自行车九成新两百块"}]',
             self.ALLOWED, 1,
@@ -303,7 +303,7 @@ class ParseResponseTest(unittest.TestCase):
 
     def test_quote_aligning_kept(self):
         # 字面关：quote 与内容一致（含标点/改写少许）→ 正常入库
-        results, retry, _times = _parse_response(
+        results, retry, _times, _obs = _parse_response(
             '[{"index":0,"include":true,"category":"活动通知",'
             '"quote":"摄影社下周三面试"}]',
             self.ALLOWED, 1,
@@ -314,7 +314,7 @@ class ParseResponseTest(unittest.TestCase):
 
     def test_quote_empty_skips_guard(self):
         # 字面关：无 quote（未提供）不触发守卫，避免过度拒收
-        results, retry, _times = _parse_response(
+        results, retry, _times, _obs = _parse_response(
             '[{"index":0,"include":true,"category":"活动通知","quote":""}]',
             self.ALLOWED, 1,
             contents=["摄影社下周三下午3点面试"],
@@ -326,13 +326,13 @@ class ParseResponseTest(unittest.TestCase):
         # AI 脏输出给数字/dict 型 quote，此前 _norm_align_text
         # （re.sub）抛 TypeError → 整批本轮抛弃；现收敛为 str 走正常判定。
         # 核心断言：不抛 TypeError、正常产出（具体 retry/results 取决于对齐判定）。
-        results, retry, _times = _parse_response(
+        results, retry, _times, _obs = _parse_response(
             '[{"index":0,"include":true,"category":"活动通知","quote":123}]',
             self.ALLOWED, 1,
             contents=["摄影社下周三下午3点面试"],
         )
         assert len(results) + len(retry) == 1, "数字 quote 应收敛并正常判定"
-        results2, retry2, _times2 = _parse_response(
+        results2, retry2, _times2, _obs2 = _parse_response(
             '[{"index":0,"include":true,"category":"活动通知","quote":{"a":1}}]',
             self.ALLOWED, 1,
             contents=["摄影社下周三下午3点面试"],
@@ -341,7 +341,7 @@ class ParseResponseTest(unittest.TestCase):
 
     def test_missing_index_covered_by_all_false_response(self):
         # 覆盖校验：include:false 也算覆盖该 index
-        results, retry, _times = _parse_response(
+        results, retry, _times, _obs = _parse_response(
             '[{"index":0,"include":false},{"index":1,"include":false},'
             '{"index":2,"include":false}]',
             self.ALLOWED, 3,
@@ -351,7 +351,7 @@ class ParseResponseTest(unittest.TestCase):
 
     def test_task_field_missing_inside_shell_with_missing_index(self):
         # 旧格式兼容 × 覆盖校验：裸数组 + 缺 index 同样并入 retry
-        results, retry, _times = _parse_response(
+        results, retry, _times, _obs = _parse_response(
             '[{"index":0,"include":true,"category":"活动通知"}]',
             self.ALLOWED, 3,
         )

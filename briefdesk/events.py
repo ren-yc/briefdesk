@@ -21,6 +21,10 @@ EVENT_ITEMS_DELETED = "items_deleted"  # payload: list[str] item_ids（核心删
 # （负向结论只影响判官调用次数不影响正确性，但失效纪律按「任一侧状态变更
 # 即失效」执行）。新事件与 EVENT_ITEMS_DELETED 同载荷语义，订阅方同口径处理。
 EVENT_ITEMS_PURGED = "items_purged"  # payload: list[str] item_ids（忽略态过期清理后发布）
+# 类别结构变更信号（categories 增删/改名/停用时由类别路由发布，payload 恒
+# None）：classify 分配器的原型缓存以类名/类集为键，订阅方据此触发重建。
+# 发布与订阅两侧共用本常量——同名字符串各自定义会让改名静默断线。
+EVENT_CATEGORIES_CHANGED = "categories_changed"  # payload: None（仅作信号）
 
 # 处理器可为同步或异步函数；同步函数返回 awaitable 时同样会被 await
 EventHandler = Callable[[Any], Any]
