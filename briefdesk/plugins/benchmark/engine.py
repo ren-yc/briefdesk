@@ -20,6 +20,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+from briefdesk import ai_ports, telemetry
 from briefdesk.config import config
 from briefdesk.db import insert_item
 from briefdesk.plugins.benchmark.metrics import (
@@ -44,7 +45,12 @@ from briefdesk.plugins.benchmark.schema import (
     parse_cases,
 )
 from briefdesk.plugins.classify.engine import classify_batch
-from briefdesk.plugins.dedup.engine import CachedItem, DedupEngine, build_item_input
+from briefdesk.plugins.dedup.engine import (
+    CachedItem,
+    DedupEngine,
+    _embedding_text,
+    build_item_input,
+)
 from briefdesk.plugins.merge.engine import judge_merge, summarize_title
 from briefdesk.types import ClassifyResult
 
@@ -72,6 +78,7 @@ def benchmark_config_snapshot() -> dict[str, Any]:
         "dedup_embed_top_k": config.dedup_embed_top_k,
         "dedup_embed_fallback_threshold": config.dedup_embed_fallback_threshold,
         "dedup_strong_threshold": config.dedup_strong_threshold,
+        "merge_prefilter_threshold": config.merge_prefilter_threshold,
     }
 
 
@@ -141,6 +148,33 @@ async def _run_dedup(case: DedupCase) -> BinaryCaseEval:
 async def _run_merge(case: MergeCase) -> BinaryCaseEval:
     head_title, head_content = card_fields(case.head)
     tail_title, tail_content = card_fields(case.tail)
+    # 余弦预筛门与生产同口径：嵌入启用时对两侧判官输入文本嵌入后算余弦
+    # （生产走去重缓存向量，同一 `_embedding_text` 产出），低于阈值的用例
+    # 直接判不合并、不经 AI——预筛是判定行为的一部分，跳过的用例按
+    # predicted=False 计入混淆矩阵（预筛漏真合并会打低 F1，硬门如实反映）；
+    # skipped 仅作提示计数。嵌入未启用/失败 → 预筛跳过，全部用例走判官
+    # （与生产「向量缺失不预筛」同语义）。
+    if config.merge_prefilter_threshold >= 0 and ai_ports.is_embedding_enabled():
+        vectors: list[list[float]] | None = None
+        try:
+            vectors = await ai_ports.embed_texts(
+                [
+                    _embedding_text(head_title, head_content),
+                    _embedding_text(tail_title, tail_content),
+                ]
+            )
+        except Exception:
+            logger.debug("merge 基准预筛嵌入失败，本用例跳过预筛", exc_info=True)
+        if vectors is not None and len(vectors) == 2:
+            cos = ai_ports.cosine_similarity(vectors[0], vectors[1])
+            if cos < config.merge_prefilter_threshold:
+                telemetry.record("merge.prefilter_skip")
+                return BinaryCaseEval(
+                    case_id=case.id,
+                    predicted=False,
+                    expected=case.expected.merge,
+                    skipped=True,
+                )
     merged = await judge_merge(head_title, head_content, tail_title, tail_content)
     if merged is None:
         return BinaryCaseEval(

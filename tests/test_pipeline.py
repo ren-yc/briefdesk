@@ -1375,6 +1375,108 @@ class TestConversationMergeStage:
         assert merged == 0
         judge_mock.assert_not_called()
 
+    # ── 余弦预筛门（判官减负；默认关闭，门开后按余弦跳过判官） ──
+
+    def _dedup_with_vectors(self, vectors: dict[str, list[float]]):
+        stub = Mock(
+            remove_items=Mock(),
+            add_to_cache=Mock(),
+        )
+        stub.cached_embedding = lambda item_id: vectors.get(item_id)
+        return stub
+
+    async def test_prefilter_closed_by_default_calls_judge(self):
+        """阈值未标定（默认 -1）时门不生效：有向量也照常走判官。"""
+        await self._seed_cand("c1", 100, title="塔卡沙a6方格40页团购")
+        msg = self._msg("m2", 180, "5本小红书现拍，45")
+        result = ClassifyResult(
+            msg_index=0, category="交易", summary="5本小红书现拍",
+            key_info="45", quote="5本小红书现拍，45",
+        )
+        self.dedup = self._dedup_with_vectors(
+            {"c1": [0.0, 1.0], "new-m2": [1.0, 0.0]}  # 余弦 0，远低于任何正阈值
+        )
+        self.ctx = PluginContext(
+            config=config,
+            publish_event=_noop_async,
+            subscribe_event=_noop_sync,
+            register_source=_noop_sync,
+            register_stage=_noop_sync,
+            dedup=self.dedup,
+        )
+        merged, judge_mock = await self._store(msg, result, True)
+        assert merged == 1, "默认关闭时余弦 0 也必须走判官"
+        judge_mock.assert_awaited_once()
+
+    async def test_prefilter_skips_low_cosine_candidate(self):
+        """门开后：低于阈值的候选不经判官直接跳过，不产生合并。"""
+        await self._seed_cand("c1", 100, title="完全无关的话题标题")
+        msg = self._msg("m2", 180, "5本小红书现拍，45")
+        result = ClassifyResult(
+            msg_index=0, category="交易", summary="5本小红书现拍",
+            key_info="45", quote="5本小红书现拍，45",
+        )
+        self.dedup = self._dedup_with_vectors(
+            {"c1": [0.0, 1.0], "new-m2": [1.0, 0.0]}  # 正交向量 → 余弦 0
+        )
+        self.ctx = PluginContext(
+            config=config,
+            publish_event=_noop_async,
+            subscribe_event=_noop_sync,
+            register_source=_noop_sync,
+            register_stage=_noop_sync,
+            dedup=self.dedup,
+        )
+        with patch.object(config, "merge_prefilter_threshold", 0.3):
+            merged, judge_mock = await self._store(msg, result, True)
+        assert merged == 0
+        judge_mock.assert_not_called(), "低于门限的候选不得触达判官"
+
+    async def test_prefilter_passes_high_cosine_candidate(self):
+        """门开后：高于阈值的候选照常走判官，判定结果照常生效。"""
+        await self._seed_cand("c1", 100, title="塔卡沙a6方格40页团购")
+        msg = self._msg("m2", 180, "5本小红书现拍，45")
+        result = ClassifyResult(
+            msg_index=0, category="交易", summary="5本小红书现拍",
+            key_info="45", quote="5本小红书现拍，45",
+        )
+        vec = [1.0, 0.0]
+        self.dedup = self._dedup_with_vectors({"c1": vec, "new-m2": vec})  # 余弦 1
+        self.ctx = PluginContext(
+            config=config,
+            publish_event=_noop_async,
+            subscribe_event=_noop_sync,
+            register_source=_noop_sync,
+            register_stage=_noop_sync,
+            dedup=self.dedup,
+        )
+        with patch.object(config, "merge_prefilter_threshold", 0.3):
+            merged, judge_mock = await self._store(msg, result, True, new_title="新标题")
+        assert merged == 1
+        judge_mock.assert_awaited_once()
+
+    async def test_prefilter_skips_when_vectors_missing(self):
+        """任一侧无向量（嵌入未启用/缓存未就绪）时门不拦：照常走判官。"""
+        await self._seed_cand("c1", 100, title="塔卡沙a6方格40页团购")
+        msg = self._msg("m2", 180, "5本小红书现拍，45")
+        result = ClassifyResult(
+            msg_index=0, category="交易", summary="5本小红书现拍",
+            key_info="45", quote="5本小红书现拍，45",
+        )
+        self.dedup = self._dedup_with_vectors({})  # 无任何向量
+        self.ctx = PluginContext(
+            config=config,
+            publish_event=_noop_async,
+            subscribe_event=_noop_sync,
+            register_source=_noop_sync,
+            register_stage=_noop_sync,
+            dedup=self.dedup,
+        )
+        with patch.object(config, "merge_prefilter_threshold", 0.99):
+            merged, judge_mock = await self._store(msg, result, True)
+        assert merged == 1, "向量缺失必须跳过预筛（与生产降级语义一致）"
+        judge_mock.assert_awaited_once()
+
 
 class TestProcessingPausedGate:
     """benchmark 门闸（契约 E）：set_processing_paused(True) 后

@@ -46,28 +46,47 @@ def _images_from_db(raw: object) -> list[str]:
     return [str(u) for u in data if u]
 
 
-def _record_cosine_truth(
-    ctx: PluginContext, row: Any, cand: Any, verdict: bool | None
-) -> None:
-    """判官返回后旁路记录候选对的（余弦, 判定真值）——预筛门限标定输入。
+def _candidate_cosine(
+    ctx: PluginContext, row: Any, cand: Any
+) -> float | None:
+    """候选对余弦（预筛门与真值记录共用单点）：去重缓存中两侧条目的向量。
 
-    余弦取去重缓存中两侧条目的向量（标题+原文口径，查询与缓存同源对称；
-    须在合并改写缓存前调用）。任一侧无向量（嵌入未启用/缓存未就绪）静默
-    跳过——记录缺失只影响标定数据量，不影响判定。verdict 沿用判官语义：
-    True=SAME/应合并，False=DIFF/不合并，None=判官不可用（判定未知）。
+    标题+原文口径，查询与缓存同源对称（与去重预嵌入同一 `_embedding_text`
+    产出，不重写口径）；须在合并改写缓存前调用。任一侧无向量（嵌入未
+    启用/缓存未就绪/条目缺失）返回 None——预筛门与记录各按自身语义降级。
     """
     get_emb = getattr(ctx.dedup, "cached_embedding", None)
     if get_emb is None:
-        return
+        return None
     try:
         new_emb = get_emb(row.item_id)
         cand_emb = get_emb(cand["id"])
-        # 类型守卫：非 list（如测试桩的 Mock 返回值）按无向量跳过
+        # 类型守卫：非 list（如测试桩的 Mock 返回值）按无向量处理
         if not isinstance(new_emb, list) or not isinstance(cand_emb, list):
-            return
-        cos = ai_ports.cosine_similarity(new_emb, cand_emb)
+            return None
+        return ai_ports.cosine_similarity(new_emb, cand_emb)
+    except Exception:
+        logger.debug("merge 候选对余弦计算失败（忽略）", exc_info=True)
+        return None
+
+
+def _record_cosine_truth(
+    ctx: PluginContext, row: Any, cand: Any, verdict: bool | None, cos: float | None = None
+) -> None:
+    """判官返回后旁路记录候选对的（余弦, 判定真值）——预筛门限标定输入。
+
+    verdict 沿用判官语义：True=SAME/应合并，False=DIFF/不合并，None=判官
+    不可用（判定未知）。余弦默认经 `_candidate_cosine` 现算（保持旧调用
+    形态）；预筛门已算过时经 cos 参数传入复用，不重复取向量。记录缺失只
+    影响标定数据量，绝不连坐合并判定。
+    """
+    if cos is None:
+        cos = _candidate_cosine(ctx, row, cand)
+    if cos is None:
+        return
+    try:
         telemetry.record_cosine_truth(row.msg.source, cos, verdict)
-    except Exception:  # 标定记录缺失只影响数据量，绝不连坐合并判定
+    except Exception:
         logger.debug("merge 余弦-真值记录失败（忽略）", exc_info=True)
 
 
@@ -126,12 +145,28 @@ class MergePlugin(StagePlugin):
                     for x in (row.title, row.result.key_info, row.msg.content)
                     if x
                 )
+                # 余弦预筛门（判官减负，与 dedup 阈值体系独立）：候选对余弦
+                # 低于 MERGE_PREFILTER_THRESHOLD 直接判不合并，不经 AI。
+                # 仅嵌入向量齐备时生效；未启用/向量缺失/阈值未标定（默认
+                # -1 关闭）时全部候选照常走判官。门限须由余弦-真值记录的
+                # ROC 标定产生（保 99.5% 真阳性的安全下限）——互补片段余弦
+                # 天然低，预筛漏掉的真合并会拉低合并判定质量（merge 基准
+                # 指标不降是开启前提）。
+                cos = _candidate_cosine(ctx, row, cand)
+                if (
+                    config.merge_prefilter_threshold >= 0
+                    and cos is not None
+                    and cos < config.merge_prefilter_threshold
+                ):
+                    telemetry.record("merge.prefilter_skip", row.msg.source)
+                    continue
                 same = await judge_merge(
                     cand["title"] or "", cand_desc, row.title, new_desc
                 )
                 # 余弦-真值旁路记录（含 None=判官不可用；余弦须在合并改写
-                # 缓存前取，此处时点正确）
-                _record_cosine_truth(ctx, row, cand, same)
+                # 缓存前取，此处时点正确）。预筛门放行后才记录：被门挡下的
+                # 候选没有判定真值，且门限标定分布应反映判官实际所见。
+                _record_cosine_truth(ctx, row, cand, same, cos)
                 if same is None:
                     # 判官失败：保守不合并；失败不构成判定依据，不记录观察数据
                     continue

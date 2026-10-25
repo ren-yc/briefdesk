@@ -16,6 +16,11 @@ logger = logging.getLogger(__name__)
 # ── 核心 → 插件通用事件主题 ──
 # 核心只发布 topic，订阅者（插件）在 setup 阶段经 PluginContext 接入。
 EVENT_ITEMS_DELETED = "items_deleted"  # payload: list[str] item_ids（核心删除卡片后发布，去重缓存等订阅清理）
+# purge_expired_ignored 直调 db 不经路由，历史上不发删除事件——忽略态过期
+# 清理后，去重负缓存若仍记着这些 item 的 DIFFERENT 对子，属过期失效盲区
+# （负向结论只影响判官调用次数不影响正确性，但失效纪律按「任一侧状态变更
+# 即失效」执行）。新事件与 EVENT_ITEMS_DELETED 同载荷语义，订阅方同口径处理。
+EVENT_ITEMS_PURGED = "items_purged"  # payload: list[str] item_ids（忽略态过期清理后发布）
 
 # 处理器可为同步或异步函数；同步函数返回 awaitable 时同样会被 await
 EventHandler = Callable[[Any], Any]

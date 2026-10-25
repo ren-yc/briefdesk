@@ -157,6 +157,19 @@ class Settings(KeyringSettingsBase):
     的相邻卡片经 AI 判官判定合并；0 = 禁用合并。"""
     merge_max_candidates: int = Field(default=3, alias="MERGE_MAX_CANDIDATES", gt=0)
 
+    merge_prefilter_threshold: float = Field(
+        default=-1.0, alias="MERGE_PREFILTER_THRESHOLD", ge=-1.0, le=1.0
+    )
+    """合并判官余弦预筛门（判官减负，与 dedup 阈值体系独立命名/取值）。
+
+    候选对余弦（嵌入未启用/向量缺失时跳过预筛、照常判官）低于该阈值的
+    直接判不合并，不经 AI——门限须由余弦-真值记录的 ROC 标定产生（保
+    99.5% 真阳性的安全下限；互补片段余弦天然低，不可拍脑袋或借用 dedup
+    体系数值）。默认 -1 = 关闭（预筛不生效，全部候选照常走判官）：阈值
+    未标定前显式关闭，benchmark merge 指标不降是开启前提（漏掉真合并
+    会拉低合并判定质量，跑基准对照后才能定）。
+    """
+
     db_path: str = Field(default_factory=lambda: str(paths.database_path()), alias="DB_PATH")
     """SQLite 文件路径；默认在平台用户数据目录（`paths.database_path()`，Windows
     `%LOCALAPPDATA%\\briefdesk\\data\\briefdesk.sqlite`）。必须是 `str(...)` 包装：

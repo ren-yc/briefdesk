@@ -110,7 +110,9 @@ async def _release_db_singletons() -> None:
             setattr(db_mod, name, None)
 
 
-# 标题有明显重叠 → 预筛给候选，必然触发 AI 判定（走 --ai-provider stub）
+# 标题有明显重叠 → 预筛给候选，必然触发 AI 判定（走 --ai-provider stub）。
+# 标题对须在字符 bigram Jaccard 口径下仍 ≥ DEDUP_SIMILARITY_THRESHOLD（0.3）：
+# 度量换轨后共同词稀疏的长标题会跌破门禁、AI 替身不被触发（skipped=1）。
 _AI_DATASET = {
     "feature": "dedup",
     "description": "契约测试夹具（虚构数据，触发 AI 判定）",
@@ -132,14 +134,14 @@ _AI_DATASET = {
             ],
             "query": {
                 "msg_id": "q1",
-                "content": "摄影社周三下午三点在体育馆招新面试",
+                "content": "摄影社招新面试安排在体育馆",
                 "sender_name": "虚构乙",
                 "sender_id": "u2",
                 "session_id": "s1",
                 "group_name": "虚构群",
                 "timestamp": "2026-04-02 09:30",
                 "source": "bench",
-                "title": "摄影社周三下午三点在体育馆招新",
+                "title": "摄影社招新面试安排",
             },
             "expected": {"same": True},
         }

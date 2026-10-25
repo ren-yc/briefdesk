@@ -498,6 +498,13 @@ async def api_recategorize(item_id: str, body: dict):
         row = await update_item_category(item_id, category)
     if row is None:
         raise HTTPException(404, "Item not found")
+    # recat 失效钩子：判官负缓存的对子键只含 (查询文本, item_id)，改类后
+    # 条目 id 与文本都不变、不会经过任何缓存内部失效点——按「任一侧 category
+    # 变更即失效」的保守契约显式失效（过度失效只损失缓存不损正确性）。
+    # 放锁外：失效是纯内存操作，且事件处理器约定不延长锁窗口。
+    svc_ctx = _stage_context()
+    if svc_ctx is not None and svc_ctx.dedup is not None:
+        svc_ctx.dedup.invalidate_negcache([item_id])
     return {"success": True, "item": row}
 
 

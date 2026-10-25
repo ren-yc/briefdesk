@@ -38,6 +38,7 @@ from briefdesk.db import (
     upsert_embeddings,
 )
 from briefdesk.masking import PLACEHOLDER_ONLY_RE, normalize_subject
+from briefdesk.negcache import NegativeCache, query_key
 from briefdesk.plugin.base import DedupService
 from briefdesk.types import (
     ClassifyResult,
@@ -175,6 +176,10 @@ class DedupEngine(DedupService):
         self._cache_loaded = False
         self._embed_cache_ok = False  # 嵌入启用且缓存向量加载成功
         self._warm_lock = asyncio.Lock()  # 预热与首次判重的并发保护
+        # 判官负向缓存（判官减负）：本引擎实例私有——基准引擎每用例新建
+        # 即天然隔离，生产实例与进程同生命周期；失效钩子挂在 remove_items
+        # / add_to_cache 两条引擎内部路径（见各方法注释）。
+        self._negcache = NegativeCache()
         # 检索通道降级的三个降噪闸门。三者都是**配置/数据态**（对进程内每条
         # 消息恒成立），首次值得在默认级别看见一次，其后只打 DEBUG——否则每
         # 条消息一行，批次里的阶段行和真正的告警全被挤出屏幕。与 weflow
@@ -299,6 +304,13 @@ class DedupEngine(DedupService):
                 source_quote=source_quote,
             )
             self._cache.append(target)
+        # 负缓存失效钩子（全路径，含新建）：条目文本可能已变（合并重写/
+        # 标题补写），旧 DIFFERENT 结论对新文本不再成立；新建失效则兜住
+        # 「删除后 id 被复用」的陈旧对子。同文本重复失效只损失缓存不损
+        # 正确性。失效点覆盖：merge 重写（run 内 add_to_cache）、标题
+        # 补写后置（after_run add_to_cache 全字段覆盖）、删除路径经
+        # remove_items。
+        self._negcache.invalidate_items([item_id])
         # 向量登记对新建/更新同口径：合成一处，令「更新分支忘记登记待落库向量」
         # 这类只在并发重试路径上才现形的漏登记在结构上不可能发生
         if embedding is not None and self._embed_cache_ok:
@@ -320,6 +332,10 @@ class DedupEngine(DedupService):
         self._pending_embeds = [
             row for row in self._pending_embeds if row[0] not in ids
         ]
+        # 负缓存失效钩子：删除卡片的全部路径（路由删除/忽略清理/类别级联/
+        # merge 删除被吸收卡）最终都经本方法清内存缓存，负缓存对子随条目
+        # 一并失效——「item 侧状态变更即失效」在此单点收口。
+        self._negcache.invalidate_items(ids)
 
     async def flush_pending_embeddings(self) -> None:
         """把待落库向量一次性写入 item_embeddings（持 storage_lock，每批一次）。
@@ -381,6 +397,16 @@ class DedupEngine(DedupService):
                 return it.embedding
         return None
 
+    def invalidate_negcache(self, item_ids: list[str]) -> None:
+        """负缓存的外部失效入口（引擎内部路径之外的触发源用）。
+
+        引擎内部路径（remove_items / add_to_cache）已自动挂钩；本方法服务
+        「库行状态变了但缓存条目本身不变」的触发源——recat 改类：merge
+        候选查询按 category 过滤，改类使既有对子失配，而条目文本与 id
+        都没变、不会走到任何内部失效点，须显式失效。
+        """
+        self._negcache.invalidate_items(item_ids)
+
     @staticmethod
     def _content_hash(quote: str) -> str:
         """原文内容哈希，与 build_item_input 的 content_hash 同公式（精确匹配短路用）。
@@ -392,12 +418,33 @@ class DedupEngine(DedupService):
 
     @staticmethod
     def _title_overlap(a: str, b: str) -> float:
-        set_a = set(a.replace(" ", ""))
-        set_b = set(b.replace(" ", ""))
-        if not set_a or not set_b:
+        """标题字符 bigram Jaccard（此前为单字符集合交/min 口径）。
+
+        字符 bigram 对短中文标题的区分度显著优于单字符集合：单字重叠度量
+        把「摄影社招新」与「篮球社招新」这类共享高频字的标题打到 0.6+，
+        bigram 把共同词「社招新」压到 0.25 量级——同文本重复（逐字相同）
+        仍恒为 1.0，阈值语义不变。Jaccard（交/并）而非交/min：对称且对
+        「短串嵌在长串里」的假相似更保守（min 口径下一字不差的两字标题
+        即满分）。
+
+        该分数同时是重叠通道的召回门禁与加权多数票的票权，换度量 = 改
+        判定行为：DEDUP_SIMILARITY_THRESHOLD 默认 0.3 维持在字符集口径下
+        的取值，重标定流程见 scripts/recalibrate_similarity.py（附交付）。
+        """
+        a = a.replace(" ", "")
+        b = b.replace(" ", "")
+        if len(a) < 2 or len(b) < 2:
+            # 单字符（或空）标题无 bigram 可言：退回单字符集比较，
+            # 保持「单字标题彼此相同 → 1.0、不同 → 0.0」的旧语义可辨
+            set_a, set_b = set(a), set(b)
+            if not set_a or not set_b:
+                return 0.0
+            return len(set_a & set_b) / len(set_a | set_b)
+        grams_a = {a[i : i + 2] for i in range(len(a) - 1)}
+        grams_b = {b[i : i + 2] for i in range(len(b) - 1)}
+        if not grams_a or not grams_b:
             return 0.0
-        intersect = len(set_a & set_b)
-        return intersect / min(len(set_a), len(set_b))
+        return len(grams_a & grams_b) / len(grams_a | grams_b)
 
     def _best_overlap_candidate(
         self, title: str
@@ -417,6 +464,34 @@ class DedupEngine(DedupService):
         if best_candidate is None:
             return None
         return (best_candidate, best_score)
+
+    async def _verdict_with_negcache(
+        self, cand: CachedItem, qkey: str, title: str, source_quote: str
+    ) -> bool | None:
+        """单候选判定的唯一入口：负缓存命中直接回 False（判官减负）。
+
+        负向缓存记录的是「完全相同的判官输入 → DIFFERENT」的确定性结论：
+        命中等价于判官本次返回 False（该候选照常按 DIFFERENT 参与各自
+        门禁计权），只是省掉一次 AI 调用。仅缓存 False——None（判定未知）
+        与 True（SAME 命中后通常触发合并、缓存随之改写）都不是可复用的
+        确定性结论。传输异常向上抛（调用方按既有降级语义处置），不写缓存。
+        候选缺 id 属性（测试桩/异常形状）降级直通判官——缓存键依赖稳定
+        id，缺失时宁可多调一次判官也不写脏键。await 判官期间 item 可能被
+        并发删除（失效钩子先于本方法收尾的 record 到达）：会留下已删 item
+        的对子——该键此后不可达（item 已不在候选缓存）只占内存，id 复用
+        场景由 add_to_cache 的失效钩兜住，故不为此加同步措施。
+        """
+        cand_id = getattr(cand, "id", None)
+        if not cand_id:
+            return await self._ask_ai(cand, title, source_quote)
+        if self._negcache.lookup(qkey, cand_id):
+            telemetry.record("negcache.hit")
+            return False
+        verdict = await self._ask_ai(cand, title, source_quote)
+        telemetry.record("negcache.miss")
+        if verdict is False:
+            self._negcache.record(qkey, cand_id)
+        return verdict
 
     @staticmethod
     def _parse_same(content: str, *, repair: bool = True) -> bool | None:
@@ -454,9 +529,19 @@ class DedupEngine(DedupService):
         weak 复核把 None 当反对票（要求全员 SAME），加权多数票把 None 剔除
         出计权（既无 SAME 票也不占分母）。两条策略差异保留在调用点，收集与
         异常整形只有这一处，fail_note 说明本次的降级口径。
+
+        单候选判定走 `_verdict_with_negcache`（负向缓存命中回 False、判官
+        减负）；`_ask_ai` 直调入口仍保留给探针类子类覆写计数——探针通过
+        重写 `_verdict_with_negcache` 同样能拦截到负缓存命中路径，`skipped`
+        口径 = 判官（含缓存层）是否真的被消费。
         """
         raw = await asyncio.gather(
-            *[self._ask_ai(cand, title, source_quote) for cand, _ in candidates],
+            *[
+                self._verdict_with_negcache(
+                    cand, query_key(title, source_quote), title, source_quote
+                )
+                for cand, _ in candidates
+            ],
             return_exceptions=True,
         )
         out: list[bool | None] = []
@@ -936,7 +1021,12 @@ class DedupEngine(DedupService):
         if strong:
             strong_cand, strong_score = strong[0]
             try:
-                verdict = await self._ask_ai(strong_cand, title, source_quote)
+                verdict = await self._verdict_with_negcache(
+                    strong_cand,
+                    query_key(title, source_quote),
+                    title,
+                    source_quote,
+                )
             except Exception as e:  # noqa: BLE001 — 容错：短路判定失败降级参与多数票
                 logger.warning(
                     '  [strong] "%s" 判定失败（%s），该候选保留参与后续多数票',

@@ -25,7 +25,7 @@ class BinaryCaseEval:
     case_id: str
     predicted: bool
     expected: bool
-    skipped: bool = False  # dedup：候选预筛未触发 AI 判定（非 AI 结论）
+    skipped: bool = False  # dedup 候选门禁 / merge 余弦预筛门：未触发 AI 判定（非 AI 结论）
     error: str | None = None
 
 

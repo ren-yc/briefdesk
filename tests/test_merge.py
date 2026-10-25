@@ -177,6 +177,55 @@ class ClipDescTest(unittest.TestCase):
         assert len(_clip_desc("x" * 1000)) == 400
 
 
+class CandidateCosineTest(unittest.TestCase):
+    """`_candidate_cosine`（预筛门与真值记录共用单点）的桩防御与降级。"""
+
+    def _plugin(self):
+        import importlib
+
+        return importlib.import_module("briefdesk.plugins.merge.plugin")
+
+    def _row(self, item_id="new1", source="weflow"):
+        return SimpleNamespace(item_id=item_id, msg=SimpleNamespace(source=source))
+
+    def test_missing_vectors_return_none(self):
+        mod = self._plugin()
+        stub = SimpleNamespace(cached_embedding=lambda _id: None)
+        assert mod._candidate_cosine(SimpleNamespace(dedup=stub), self._row(), {"id": "c1"}) is None
+
+    def test_vectors_return_cosine(self):
+        mod = self._plugin()
+        stub = SimpleNamespace(
+            cached_embedding=lambda _id: [1.0, 0.0] if _id == "new1" else [0.0, 1.0]
+        )
+        cos = mod._candidate_cosine(SimpleNamespace(dedup=stub), self._row(), {"id": "c1"})
+        assert cos is not None and cos == 0.0
+
+    def test_error_swallowed_returns_none(self):
+        mod = self._plugin()
+
+        def _boom(_id):
+            raise RuntimeError("cache gone")
+
+        stub = SimpleNamespace(cached_embedding=_boom)
+        assert mod._candidate_cosine(SimpleNamespace(dedup=stub), self._row(), {"id": "c1"}) is None
+
+    def test_no_dedup_port_returns_none(self):
+        mod = self._plugin()
+        assert mod._candidate_cosine(SimpleNamespace(dedup=None), self._row(), {"id": "c1"}) is None
+
+
+class MergePrefilterGateTest(unittest.TestCase):
+    """预筛门判定行为（独立于 run 编排，run 级回归在 test_pipeline）。"""
+
+    def test_threshold_default_closed(self):
+        from briefdesk.config import config
+
+        assert config.merge_prefilter_threshold < 0, (
+            "默认必须关闭：门限须由余弦-真值 ROC 标定产生，未标定前不许开"
+        )
+
+
 class TitleRegenerationTest(unittest.TestCase):
     """合并后重拟标题：user 消息填充、system 规则、JSON 解析与回退语义。"""
 

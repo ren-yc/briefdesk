@@ -74,6 +74,7 @@ from briefdesk.db import (
     validate_restore_file,
     validate_schema,
 )
+from briefdesk.events import EVENT_ITEMS_PURGED
 from briefdesk.masking import normalize_subject
 from briefdesk.plugins.calendar.db import get_calendar_items
 
@@ -2305,6 +2306,73 @@ class TestAtomicTransactionCancel(_InMemoryDbTest):
         assert not self.db.in_transaction, "取消后必须 rollback，不得残留悬挂事务"
         cur = await self.db.execute("SELECT COUNT(*) AS cnt FROM items")
         assert (await cur.fetchone())["cnt"] == 0, "取消路径的半程写必须被回滚"
+
+
+class TestPurgeExpiredIgnoredEvent(_InMemoryDbTest):
+    """purge_expired_ignored 补发 items_purged 事件：该路径经 main 直调 db，
+    历史不发删除事件——去重负缓存等订阅方对忽略态条目的失效会漏。"""
+
+    async def test_purge_publishes_event_with_doomed_ids(self):
+        p1, p2 = self._patch_db()
+        with p1, p2:
+            item_id = await insert_item(self._item("活动通知"))
+            await self.db.execute(
+                "UPDATE items SET is_verified = -1, verified_at = ? WHERE id = ?",
+                ("2000-01-01T00:00:00+00:00", item_id),
+            )
+            await self.db.commit()
+            # db.purge 函数内延迟导入 event_bus（避免模块加载期循环依赖），
+            # patch 须落在源模块属性 briefdesk.events.event_bus.publish
+            with patch(
+                "briefdesk.events.event_bus.publish", new=AsyncMock()
+            ) as pub:
+                purged = await purge_expired_ignored(24)
+        assert purged == 1
+        pub.assert_awaited_once()
+        event, payload = pub.await_args.args
+        assert event == EVENT_ITEMS_PURGED
+        assert payload == [item_id]
+        # 事件在事务提交后发布：此刻行已删
+        cur = await self.db.execute("SELECT COUNT(*) AS cnt FROM items")
+        assert (await cur.fetchone())["cnt"] == 0
+
+    async def test_purge_without_deleted_rows_publishes_nothing(self):
+        p1, p2 = self._patch_db()
+        with p1, p2, patch(
+            "briefdesk.events.event_bus.publish", new=AsyncMock()
+        ) as pub:
+            purged = await purge_expired_ignored(24)
+        assert purged == 0
+        pub.assert_not_awaited(), "无删除发生的事件只会让订阅方白跑"
+
+    async def test_purge_failure_publishes_nothing(self):
+        """删除步失败回滚 → 不发事件（发布点在事务提交之后，天然覆盖）。"""
+        p1, p2 = self._patch_db()
+        with p1, p2:
+            item_id = await insert_item(self._item("活动通知"))
+            await self.db.execute(
+                "UPDATE items SET is_verified = -1, verified_at = ? WHERE id = ?",
+                ("2000-01-01T00:00:00+00:00", item_id),
+            )
+            await self.db.commit()
+            orig_execute = self.db.execute
+
+            async def failing_execute(sql, params=()):
+                if "DELETE FROM items WHERE is_verified" in sql:
+                    raise RuntimeError("injected: final delete failed")
+                return await orig_execute(sql, params)
+
+            with (
+                patch.object(self.db, "execute", new=failing_execute),
+                pytest.raises(RuntimeError),
+                patch(
+                    "briefdesk.events.event_bus.publish", new=AsyncMock()
+                ) as pub,
+            ):
+                await purge_expired_ignored(24)
+        pub.assert_not_awaited(), "回滚后不得报「已清理」"
+        cur = await self.db.execute("SELECT COUNT(*) AS cnt FROM items")
+        assert (await cur.fetchone())["cnt"] == 1
 
 
 class TestAreMessagesProcessedChunk:

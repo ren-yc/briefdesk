@@ -81,6 +81,7 @@ weflow-server :5033        WeFlow(legacy) :5031        qqflow-server :5032
 | `briefdesk/plugins/ocr/engine.py` | RapidOCR（基于 ONNX Runtime，CPU 推理）图片文字识别（懒加载、进程内单例）。[详见下文](#briefdeskpluginsocrenginepy) |
 | `briefdesk/announcements.py` | 应用级公告注册表——持续性条件的顶部横幅：置位/撤销契约与 SSE 下发。[详见下文](#briefdeskannouncementspy) |
 | `briefdesk/telemetry.py` | 最小遥测集（进程内、无依赖）：计数器 + 耗时样本窗口分位 + merge 余弦-真值明细；record/observe 永不抛错。落盘用户数据目录 `telemetry/`（latest.json + 每日 jsonl + cosine_truth 每日 jsonl），轮询周期尾部汇总与落盘。[详见下文](#briefdesktelemetrypy) |
+| `briefdesk/negcache.py` | 去重判官负向缓存（判官减负）：`(查询侧键, item_id)` 对子级 DIFFERENT 结论的有界 LRU + item 侧反向索引；查询侧键 = 判官输入文本哈希 `query_key(title, quote)`。实例归 `DedupEngine` 所有，失效挂在引擎 `remove_items`/`add_to_cache` 内部路径 + recat 路由显式失效（`invalidate_negcache`）。命中率/失效计数进遥测（`negcache.hit/miss/evict/invalidate`）。[详见下文](#briefdesknegcachepy) |
 | `briefdesk/realtime.py` | 进程内发布/订阅：`publish_items_updated()`（列表刷新）与 `publish_sync_progress()`（同步进度事件）把事件推给所有订阅队列（队列项为 `(事件名, data JSON)` 二元组），由 server 的 `/api/stream` SSE 按事件名转发给前端。订阅队列满丢弃事件累计 `_dropped_count`（`get_dropped_count()` 只读诊断口）。 |
 | `briefdesk/status.py` | 应用运行时状态 + 消息源注册表：`set_status`/`is_syncing`/同步进度计数与源客户端注册。[详见下文](#briefdeskstatuspy) |
 | `briefdesk/sync.py` | 同步服务：`set_sync_callback` + `trigger_sync()`（fire-and-forget 全源轮询任务，syncing 互斥，结束后经 realtime 的 `items_updated` 事件广播 `{"synced": true}`——`synced` 是 payload 键，事件名是 `items_updated`）。main 启动（`startup`）/ 周期同步（`periodic`）与 `/api/sync`（`api`）共用。 |
@@ -108,11 +109,11 @@ weflow-server :5033        WeFlow(legacy) :5031        qqflow-server :5032
 | `briefdesk/plugins/rag/*` | `RagPlugin`（**双能力插件先例**：StagePlugin + WebPlugin）：检索问答的路由、库层与维护循环。[详见下文](#briefdeskpluginsrag) |
 | `briefdesk/plugins/weflow_legacy/poller.py` | REST 历史回填（**按会话窗口**：水位下界 + BACKFILL_HOURS 回退 + 翻页早停）。[详见下文](#briefdeskpluginsweflow_legacypollerpy) |
 | `briefdesk/logger.py` | 标准 logging 配置（根 handler、查询串掩码、access 日志门控）。[详见下文](#briefdeskloggerpy) |
-| `briefdesk/events.py` | 内部事件总线（topic pub/sub）：核心与插件间的通用解耦通道（realtime 只管前端 SSE）。同步/异步处理器均支持，处理器异常只记日志不向发布方传播。模块级单例 `event_bus` 由 main 注入 PluginContext。核心删除卡片后发布 `EVENT_ITEMS_DELETED`（"items_deleted"），去重插件订阅后同步清理内存缓存。 |
+| `briefdesk/events.py` | 内部事件总线（topic pub/sub）：核心与插件间的通用解耦通道（realtime 只管前端 SSE）。同步/异步处理器均支持，处理器异常只记日志不向发布方传播。模块级单例 `event_bus` 由 main 注入 PluginContext。核心删除卡片后发布 `EVENT_ITEMS_DELETED`（"items_deleted"），去重插件订阅后同步清理内存缓存；`purge_expired_ignored`（main 直调 db、不经路由）提交后发布 `EVENT_ITEMS_PURGED`（"items_purged"，同载荷语义），dedup 插件同口径订阅。 |
 | `briefdesk/stages.py` | 管道阶段注册表与装配期上下文：StagePlugin 经 `ctx.register_stage` 注册（main 把端口接到本模块），pipeline 骨架按槽位（enrich → classify → dedup → post_insert）读取，同槽按 priority 升序；`set_context` 注入装配期 PluginContext（阶段 run(batch, ctx) 经此获得 `ctx.dedup` 等服务端口）。模块级单例，测试用 `reset()` 隔离。 |
 | `briefdesk/plugins/ocr/plugin.py` | `OcrPlugin`（实现 StagePlugin，slot=enrich）：懒加载引擎、逐图下载容错与 vision stash。[详见下文](#briefdeskpluginsocrpluginpy) |
 | `briefdesk/plugins/classify/plugin.py` | `ClassifyPlugin`（显式实现 StagePlugin，slot=classify）：run 调引擎 `classify_batch` 并把 `ClassifyOutcome` 写入 `batch.outcomes`。 |
-| `briefdesk/plugins/dedup/plugin.py` | `DedupPlugin`（显式实现 StagePlugin，slot=dedup）：setup 构造 `DedupEngine` + **预热去重缓存**（HTTP 服务启动前、源监听启动前），注册为 `ctx.dedup` 服务端口并订阅 `EVENT_ITEMS_DELETED`（同步处理器，发布方持锁时保持原子）；`before_run`（锁外）行规划 + 批内预嵌入，`run`（锁内）判重/入库/缓存，`after_run`（批尾）向量落库——内部自持 `storage_lock` 过滤已删条目后再 upsert。 |
+| `briefdesk/plugins/dedup/plugin.py` | `DedupPlugin`（显式实现 StagePlugin，slot=dedup）：setup 构造 `DedupEngine` + **预热去重缓存**（HTTP 服务启动前、源监听启动前），注册为 `ctx.dedup` 服务端口并订阅 `EVENT_ITEMS_DELETED` 与 `EVENT_ITEMS_PURGED`（同步处理器，发布方持锁时保持原子）；`before_run`（锁外）行规划 + 批内预嵌入，`run`（锁内）判重/入库/缓存，`after_run`（批尾）向量落库——内部自持 `storage_lock` 过滤已删条目后再 upsert。 |
 | `briefdesk/plugins/merge/plugin.py` | `MergePlugin`（实现 StagePlugin，slot=post_insert，依赖 dedup）：锁内 AI 合并判定与卡片更新。[详见下文](#briefdeskpluginsmergepluginpy) |
 | `briefdesk/plugin/__init__.py` | 插件框架包（核心侧）：导出协议与 PluginManager。实现层在 `briefdesk/plugins/`。 |
 | `briefdesk/plugin/base.py` | 插件最小契约：`Plugin` Protocol（name/version/dependencies + setup/activate/teardown 生命周期）、`PluginContext`（核心注入给插件的服务端口集合，见下「插件框架」）、异常 `PluginError`（致命）/`PluginDisabledError`（自禁用，非致命）。内置插件类显式继承对应能力协议（mypy 强制实现完整性；第三方插件亦可鸭子实现，manager 只做结构校验）。详见下方「插件框架」。 |
@@ -251,7 +252,9 @@ sha256(source_quote)[:16]，**仅对原文取哈希**：原文非空且非纯占
 pipeline 入口过滤共用——qqflow 同文异图消息防误判 SAME；本项目超出上游的本地修正）时哈希全等 → 直接判重、零 AI，同时覆盖原文逐字节等价与标题+描述哈希等价两类精确判定）→
 候
 选选取（嵌入余弦 Top-K 以 `DEDUP_EMBED_FALLBACK_THRESHOLD` 召回，或余弦零候选时字符重叠单候选兜底，阈值
-`config.dedup_similarity_threshold`；q_emb 由调用方锁外预计算，缺失一律降级字符重叠通道——存储锁内禁止远程嵌入，`ensure_cache` 懒加载兜底仅限进
+`config.dedup_similarity_threshold`——重叠度量为**字符 bigram Jaccard**（`_title_overlap`；单字符标题退回字符集
+Jaccard。换度量 = 改判定行为：该分数同时是召回门禁与加权多数票票权，重标定流程见
+`scripts/recalibrate_similarity.py`）；q_emb 由调用方锁外预计算，缺失一律降级字符重叠通道——存储锁内禁止远程嵌入，`ensure_cache` 懒加载兜底仅限进
 程
 首批次一次性场景）→ 门禁分级（normal ≥ `DEDUP_EMBED_THRESHOLD` 走 strong 短路/加权多数票；weak 区间 [fallback, threshold) 仅当无
 normal 候选时参与，全员判 SAME 才判重）→ 同文本短路（≥ `DEDUP_STRONG_THRESHOLD` 候选 AI 判 SAME 即直接判重、判 DIFFERENT 只剔除该候选；
@@ -259,7 +262,8 @@ strong 候选判定失败降级参与后续多数票（异常不抛穿、不构�
 隔
 离：加权多数票中单候选 API 异常剔除出计权——既无 SAME 票也不占分母，全部失败退化为保守不判重——并打 WARNING，不中止整批；weak 复核中失败候选按反对票计；并行判定与异常整形单源
 于
- `_collect_verdicts`（异常整形为 None + WARNING），两条容错策略差异留在各自调用点）、**加权多数票**（票权 = 候选相似度，SAME 权重和 > 总权重一半才命中；
+ `_collect_verdicts`（异常整形为 None + WARNING），两条容错策略差异留在各自调用点）。**判官单候选判定统一走 `_verdict_with_negcache`**：
+负向缓存（`briefdesk/negcache.py`）命中直接回 False 省掉 AI 调用，DIFFERENT 结论回填缓存——判定语义与直调判官完全等价；**加权多数票**（票权 = 候选相似度，SAME 权重和 > 总权重一半才命中；
 等权时等价原 >K/2 规则，单候选退化为一次判定）；AI 输出裸对象 `{"same": true\|false}`（解析器兼容旧版
 `{"task":"dedup","data":{"same":...}}` 外壳）；`_ask_ai` 两次输出均无法解析返回 **None（判定未知）而非 False**——与
 `_parse_same` 的 None 及 `_collect_verdicts` 异常整形语义一致，False 会把「最强证据从未成立」伪装成「已否证」令 strong 短路剔除候选、多数票分母悄
@@ -344,6 +348,22 @@ else:
 每日 `telemetry-YYYYMMDD.jsonl`（快照流）、每日 `cosine_truth-YYYYMMDD.jsonl`（标定明细，权威存储；
 内存只是待写缓冲，flush 增量追加）。写盘点只有轮询周期尾部（`poll_cycle` 汇总 + flush，30s 节流，
 失败后窗口内不重试防风暴）。
+
+#### briefdesk/negcache.py
+
+去重判官负向缓存（判官减负）：记录「完全相同的判官输入 → DIFFERENT」的确定性结论，
+命中时判官直接返回 False（该候选照常按 DIFFERENT 参与各自门禁计权），省掉一次 AI 调用。
+对子键 = `(query_key(title, quote), item_id)`——查询侧取判官输入文本哈希而非消息 id：
+判定是两段文本的函数，文本相同判定即相同；且查询消息在判定时点还没有 item_id。
+**只缓存 False**：None（判定未知）与 True（SAME 后通常触发合并改写）都不是可复用的确定性结论；
+候选缺 id（测试桩/异常形状）降级直通判官不写脏键。`NegativeCache` 实例归 `DedupEngine` 所有
+（基准引擎每用例新建即天然隔离），OrderedDict LRU 上限 `DEFAULT_NEGCACHE_CAPACITY`（5 万对量级）+
+item 侧反向索引（item_id → 对子键集），失效统一「使该 item 全部对子失效」。**失效钩子**：
+引擎内部两路径自动挂钩——`remove_items`（删除卡片全部路径单点收口）与 `add_to_cache`（条目文本
+变更/新建，覆盖合并重写与标题补写后置的批尾覆盖）；引擎外部触发源走 `invalidate_negcache`——
+recat 改类（merge 候选查询按 category 过滤而条目 id/文本不变，不会经过任何内部失效点）。过期忽略
+清理（`purge_expired_ignored`）经 `EVENT_ITEMS_PURGED` 事件 → dedup 插件订阅 → `remove_items` 收口。
+遥测：`negcache.hit/miss`（引擎判定入口）、`negcache.evict/invalidate`（类内）。
 
 #### briefdesk/status.py
 
@@ -442,7 +462,8 @@ close）；流式迭代（async for）用 `_cursor` 作用域，需 rowcount/las
 worker 线程非 daemon，漏关解释器退出挂死）；close 后置 `_db_closed` 终态门闩，`get_db`/`get_embed_db`
 一律抛 RuntimeError 拒绝重建——防关闭期残余任务复活连接。**多步写统一走 `atomic_transaction` 上下文管理器**（成功 commit、异常 rollback 后上抛——防悬挂事务
 被
-后续不相干 commit 收尾提交、部分写入提前可见；delete_items / update_item_merged / purge_expired_ignored /
+后续不相干 commit 收尾提交、部分写入提前可见；delete_items / update_item_merged / purge_expired_ignored（提交后对将删 ids 发布
+`EVENT_ITEMS_PURGED`——直调 db 路径历史不发删除事件，订阅方失效去重负缓存等派生态）/
 toggle_session / update_category / delete_category / bulk_insert_raw_messages / update_items_verify 八处）；IN 列表分块统一走
 `_execute_chunked`（`{placeholders}` 模板 + 可选 `extra_params` 前置参数，chunk 口径 `_SQL_VARS_CHUNK = 900`，防超
 SQLite 变量上限整批崩；用点：are_messages_processed / delete_category 级联 / get_item_texts_by_ids /
@@ -461,7 +482,7 @@ FastAPI HTTP 服务子包（按职责分组的模块）：`app.py`（FastAPI 实
 `__init__.py` 按 中间件 → 插件路由 → 核心路由 → 类别路由 → 媒体代理 → SPA mount 依次导入（web_plugins 必须先于 static，否则被 SPA 兜底截
 胡
 ；`# ruff: noqa: I001` 豁免排序）。Routes: `GET /api/items`, `POST /api/items/:id/verify`,
-`POST /api/items/:id/recategorize`（手动修正分类，仅允许改到启用类别）, `POST /api/items/batch`（批量
+`POST /api/items/:id/recategorize`（手动修正分类，仅允许改到启用类别；锁外调 `ctx.dedup.invalidate_negcache`——改类使 merge 候选按 category 失配而条目 id/文本不变，须经外部失效口清判官负缓存）, `POST /api/items/batch`（批量
 memo/ignore/unverify/delete；delete 在存储锁内删库并发布 `EVENT_ITEMS_DELETED` 清去重内存缓存，非 delete 分支同样持锁；审核态变更统一经
 `_resync_dedup_cache`：进入忽略态发 `items_deleted` 清缓存，退出忽略态（unverify/memo，单卡与批量同口径）幂等回加缓存——此前单卡恢复与批量转备忘漏回加，相似新消息会重复建卡直到重启）。**server 写路径统一持 pipeline 存储锁**：类别 create/update/toggle/delete 全端点、api_verify、
 sessions toggle、recategorize（`update_item_category` 读-改-写多步事务）、上述 batch，以及 reminders 的 set_reminder
@@ -833,7 +854,12 @@ WARNING）的日志噪音；`fmt_dur()` 统一耗时格式。
 #### briefdesk/plugins/merge/plugin.py
 
 `MergePlugin`（显式实现 StagePlugin，slot=post_insert，依赖 dedup）：run（锁内）把 `batch.inserted` 新卡与同会话近期未核实卡经 AI
-判官合并（折入最早头卡、多时间点集合化、重拟标题、保留片段 raw 行、已设提醒卡不参与）；去重缓存同步走 `ctx.dedup` 服务端口；after_run（锁外，本插件不取存储锁）对存活卡补嵌回归余弦
+判官合并（折入最早头卡、多时间点集合化、重拟标题、保留片段 raw 行、已设提醒卡不参与）；**余弦预筛门**：`MERGE_PREFILTER_THRESHOLD` ≥ 0
+且候选对两侧向量齐备时，余弦低于阈值的候选直接判不合并不经 AI（判官减负；
+被拦候选记遥测 `merge.prefilter_skip`，按消息源分维度；默认 -1 关闭——门限须由余弦-真值记录的 ROC 标定产生，
+benchmark merge 指标不降是开启前提；未启用嵌入/向量缺失时整门跳过，照常判官）；判官返回后旁路记录余弦-真值
+（`_candidate_cosine` 单点计算，预筛门与标定记录共用；仅记录预筛放行的候选——被门挡下的候选没有判定真值）；去重缓存同步走 `ctx.dedup` 服务端口；
+after_run（锁外，本插件不取存储锁）对存活卡补嵌回归余弦
 候选集（`is_embedding_enabled` 门控，嵌入禁用时静默跳过）。合并继承 `article_url`（存活卡优先、缺失则继
 承
 被吸收卡——文章拆条同话题多卡合并后原文链接不从卡片上消失）；合并纯函数（`_merge_quote`/`_merge_key_info`/`_merge_time_points` 等）在
@@ -869,7 +895,7 @@ WARNING）的日志噪音；`fmt_dur()` 统一耗时格式。
   （内置 ai_provider/dedup 已按此实现：注册后无可失败步骤，teardown 清 `ai_ports`/`ctx.ai`/`ctx.dedup`）；第三方插件同受此约束。
 - **能力协议**：`SourcePlugin`（消息源，经 `ctx.register_source` 注册 `SourceRuntime`；零源降级启动）/ `StagePlugin`（管道槽位
   enrich → classify → dedup → post_insert，注册表 `briefdesk/stages.py`，骨架 `briefdesk/pipeline.py` 只做编排）/
-  `DedupService`（`ctx.dedup` 服务端口，供 merge 阶段同步缓存）/ `AIProvider`（`briefdesk/ai_ports.py` 端口；
+  `DedupService`（`ctx.dedup` 服务端口，供 merge 阶段同步缓存与 recat 失效钩子（`invalidate_negcache`））/ `AIProvider`（`briefdesk/ai_ports.py` 端口；
   classify/dedup/merge 声明依赖 ai_provider，被禁用时随依赖降级，pipeline 骨架对“阶段缺失”整批保留不标记防消息丢失）/ `WebPlugin`（router +
    asset_dir；核心提供 `GET /api/plugins` 元数据与 `GET /plugin-assets/{name}/{path}` 静态资源
   ，`include_plugin_router` 展开 APIRoute 插到 SPA mount 之前——新版 Starlette 的惰性 `_IncludedRouter` 会被 SPA 兜底截胡）
@@ -878,7 +904,7 @@ WARNING）的日志噪音；`fmt_dur()` 统一耗时格式。
   `running=False` 表示没有运行值——旧插件不实现这两个钩子也能工作，只是字段不带运行快照）。
 - **双能力插件**：同一插件类可显式继承多个能力协议并同时注册（先例：rag = StagePlugin[post_insert] + WebPlugin，setup 内既
   register_stage 又 register_router/register_plugin_assets）。
-- **PluginContext 服务端口**：config、事件总线（`event_bus`，核心删除卡片发布 `EVENT_ITEMS_DELETED`，去重插件订阅清内存缓存）、
+- **PluginContext 服务端口**：config、事件总线（`event_bus`，核心删除卡片发布 `EVENT_ITEMS_DELETED`（`purge_expired_ignored` 发布同载荷的 `EVENT_ITEMS_PURGED`），去重插件订阅清内存缓存）、
   `register_source`、`register_stage`、`dedup`、`ai`、`register_router`/`register_plugin_assets`（默认 noop，未注
   入时静默丢弃）。
 - **插件前端随插件包分发**：约定 `ui/ui.js` 以 IIFE 暴露 `window.briefdeskPlugins.<name>.init(api)`，DOM/样式/交互全在插件包内；核心只
@@ -1138,7 +1164,7 @@ required field of `weflow`/`qqflow` → that plugin self-disables via `PluginDis
 | `IGNORE_SELF` | `true` | 过滤本账号自己发送的消息（所有消息入口：SSE 实时 + REST 回填）。weflow / weflow-legacy REST 按 `isSend` 判定；两源 SSE 上游都不推自消息（weflow-server 推送端据 `isSend=1` 主动跳过，weflow-legacy 的 SSE 上游已不推送）；qqflow REST 先按 `isSend`（上游 40013 方向列归一化为 `{0,1}`）判，`isSend=0` 时再按自身 UID（`u_<QQFLOW_QQ>`）兜底（部分 QQ 版本缺该列），SSE 事件无发送者标识、开启后按消息回查 REST（每消息 +1 次本机 HTTP）。**注意 qqflow 的 `self_uid` 由配置推导而非取自上游**：服务端若绑着别的账号，自过滤会静默失效（把对方的消息当别人发的收进来，同时漏掉真正的自消息）——这是账号身份闸门在 qqflow 侧比 weflow 更要紧的原因（weflow 用数据自带的 `isSend`，不受影响） |
 | `REALTIME_BATCH_MAX_COUNT` / `REALTIME_BATCH_TIMEOUT_MS` | `1` / `180000` | Realtime batch buffer flush thresholds (跨源公共：监听器攒批 + 实时路径 pipeline 切批) |
 | `BACKFILL_BATCH_MAX_COUNT` | `10` | Backfill batch size per AI classify call (independent of SSE batching)。⚠️ 长批 + 多群易引发 AI 输出 index 漂移/漏回，默认已由 20 调为 10 |
-| `DEDUP_SIMILARITY_THRESHOLD` | `0.3` | Dedup pre-filter: title character-overlap ratio that triggers AI semantic dedup（嵌入整体不可用时为主通道；嵌入模式下余弦零候选时作兜底通道） |
+| `DEDUP_SIMILARITY_THRESHOLD` | `0.3` | Dedup pre-filter: title overlap (character bigram Jaccard; 单字符标题退回字符集) ratio that triggers AI semantic dedup（嵌入整体不可用时为主通道；嵌入模式下余弦零候选时作兜底通道）。⚠️ 度量已由单字符交/min 换为 bigram Jaccard（分布整体左移），0.3 沿用旧口径取值、重标定流程见 `scripts/recalibrate_similarity.py` |
 | `EMBED_API_BASE` | `` (empty = disabled) | Embedding API base URL; non-empty enables embedding cosine pre-filter (falls back to `AI_API_BASE` if empty within enabled mode) |
 | `EMBED_MODEL` | `` (falls back to `AI_MODEL`) | Embedding model name |
 | `EMBED_API_KEY` | `` (falls back to `AI_API_KEY`) | Embedding API key（SecretStr 持有） |
@@ -1149,6 +1175,7 @@ required field of `weflow`/`qqflow` → that plugin self-disables via `PluginDis
 | `DEDUP_EMBED_FALLBACK_THRESHOLD` | `0.65` | 低置信复核阈值：余弦候选落在 [fallback, `DEDUP_EMBED_THRESHOLD`) 区间且无 normal 候选时，全员判 SAME 才判重（覆盖中段相似度、低于 normal 门禁但确实重复的情形，如余弦略低于阈值但标题逐字相同） |
 | `MERGE_WINDOW_MINUTES` | `10` | 会话内同话题片段合并窗口（分钟）：新卡与同会话同类别、msg_time 相差不超过该值的未核实卡进入 AI 合并判定；`0` = 禁用合并 |
 | `MERGE_MAX_CANDIDATES` | `3` | 每张新卡最多送合并判官判定的候选头卡数 |
+| `MERGE_PREFILTER_THRESHOLD` | `-1`（关闭） | 合并判官余弦预筛门：候选对余弦低于该阈值直接判不合并、不经 AI（仅嵌入向量齐备时生效；与 dedup 阈值体系独立）。默认 -1 = 关闭——门限须由余弦-真值记录（telemetry cosine_truth jsonl）的 ROC 标定产生（保 99.5% 真阳性的安全下限），未标定前不许拍脑袋设值 |
 | `BENCHMARK_PAUSE_PIPELINE` | `true` | benchmark 插件：运行期间暂停消息处理管道（实时消息延后到下一轮回填窗口，不丢失；read by `briefdesk/plugins/benchmark/config.py`, only when the `benchmark` plugin is enabled） |
 | `BENCHMARK_KEEP_RUNS` | `5` | benchmark 插件：保留运行产物数，按启动时间从旧到新轮转删除，**最新一次已完成**的运行永不删除（报告页依赖它） |
 | `BENCHMARK_RUN_TIMEOUT_SECONDS` | `0`（不限） | benchmark 插件：单次运行总时长上限（秒），非零时仅作兜底，到点终止 |
