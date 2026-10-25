@@ -955,7 +955,11 @@ async def _extract_times_core(
     messages: list[InternalMessage],
     depth: int,
 ) -> None:
-    """时间提取单次尝试；length 截断时按时间索引拆半递归重试（尽力而为）。"""
+    """时间提取单次尝试；length 截断时按时间索引拆半递归重试（尽力而为）。
+
+    影子采集覆盖全部出口（成功/异常/空响应/截断到底）：sysc 失败样本正是
+    解析器最该顶上的分母，只采成功路径会系统性高估解析器的替换收益。
+    """
     user_message = _build_time_user_message(results, time_indexes, messages)
     if not user_message.strip():
         return
@@ -972,9 +976,13 @@ async def _extract_times_core(
     except Exception as e:  # noqa: BLE001 — 时间提取失败回退，不中断管道
         # 带原因，同 summarize_results：AI 侧故障需要在默认级别可自助定位。
         logger.warning("时间提取请求失败（start/end/times 留空）: %s", e)
+        _record_temporal_shadow(results, time_indexes, messages, sysc_failed="error")
         return
     if not resp.choices:  # 异常响应（空 choices）防御
         logger.warning("时间提取返回空 choices（start/end/times 留空）")
+        _record_temporal_shadow(
+            results, time_indexes, messages, sysc_failed="empty_choices"
+        )
         return
     content = resp.choices[0].message.content or ""
     if resp.choices[0].finish_reason == "length":
@@ -987,6 +995,9 @@ async def _extract_times_core(
             logger.warning(
                 "时间提取截断且不可再拆分（单条/深度上限），start/end/times 留空"
             )
+            _record_temporal_shadow(
+                results, time_indexes, messages, sysc_failed="truncated"
+            )
             return
         mid = len(time_indexes) // 2
         await _extract_times_core(results, time_indexes[:mid], messages, depth - 1)
@@ -997,6 +1008,70 @@ async def _extract_times_core(
     logger.info(
         "时间提取: %d/%d 条（深度剩余 %d）", filled, len(time_indexes), depth
     )
+    # 影子采集：规则解析器只记录不生效（TEMPORAL_SHADOW=on 开启），与 sysc
+    # 现产出逐字段 diff——真实分布定词表与覆盖率后，阶段 2 才切生效
+    _record_temporal_shadow(results, time_indexes, messages)
+
+
+def _record_temporal_shadow(
+    results: list[ClassifyResult],
+    time_indexes: list[int],
+    messages: list[InternalMessage],
+    sysc_failed: str = "",
+) -> None:
+    """sysc 各出口的影子 diff 采集（尽力而为；关闭时零开销直接返回）。
+
+    sysc_failed 非空表示该批 sysc 未产出（失败样本：times 按空采集）。
+    """
+    from briefdesk.temporal import rules_zh
+    from briefdesk.temporal import shadow as temporal_shadow
+
+    if not temporal_shadow.shadow_enabled():
+        return
+    for r in results:
+        if r.msg_index not in time_indexes:
+            continue
+        msg = (
+            messages[r.msg_index]
+            if 0 <= r.msg_index < len(messages)
+            else None
+        )
+        if msg is None:
+            continue
+        anchor_epoch = _anchor_epoch(msg.timestamp)
+        parser_result = rules_zh.make_result(msg.content, anchor_epoch)
+        if sysc_failed:
+            sysc_times: list[dict] = []
+        else:
+            sysc_times = []
+            if r.start:
+                sysc_times.append({"type": "start", "time": r.start})
+            if r.end:
+                sysc_times.append({"type": "end", "time": r.end})
+            sysc_times.extend(r.extra_times or [])
+        temporal_shadow.record_diff(
+            msg.source,
+            msg.msg_id,
+            anchor_epoch,
+            sysc_times,
+            parser_result,
+            sysc_failed=sysc_failed,
+        )
+
+
+def _anchor_epoch(ts: object) -> int | None:
+    """消息时间戳 → 影子锚点（UNIX 秒；非法/0 → None）。
+
+    与 _local_datetime 同一守卫口径（timestamp 类型契约声明 int，但源侧
+    normalize 存在透传字符串/None 的路径）；独立小函数防两处守卫漂移。
+    """
+    if not isinstance(ts, (int, float)):
+        return None
+    try:
+        ts_i = int(ts)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return ts_i or None
 
 
 async def extract_times(
