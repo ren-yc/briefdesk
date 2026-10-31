@@ -13,8 +13,14 @@
      指标会虚高，属硬性失败）。
 
 用例来源字段（origin/batch_fingerprint）由 export_fromweb 单点写入
-（origin=cards）；人工核对数据集手工维护 origin=manual；recorder 导出
-脚本（训练数据侧）负责打自己的指纹。
+（origin=cards；指纹按批内容派生——同一构造路径的同批用例重导同指纹，
+与入训记录共享指纹的用例即判泄漏）。跨构造路径（recorder 构造 vs cards
+构造同一底层数据）按功能分界：classify/merge 的 id 都以消息 id 集为材料、
+同源共享指纹；dedup/title 两侧 id 口径不同、不共享——这两类的跨路径
+同源互斥请用入训时的 id 清单做 id 级对撞。人工核对数据集手工维护
+origin=manual；训练数据构建侧记录入训批次的指纹清单。
+注意指纹是整批口径：批次增删用例后指纹改变，新旧批次交集成员不再共享
+旧批指纹——成员级互斥同样以入训 id 清单对撞。
 """
 
 from __future__ import annotations

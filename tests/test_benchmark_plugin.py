@@ -29,6 +29,7 @@ from briefdesk.plugins.benchmark.plugin import BenchmarkPlugin
 from briefdesk.plugins.benchmark.router import RecordBody, RunBody
 from briefdesk.types import (
     BatchContext,
+    ClassifyObservation,
     DedupCandidate,
     DedupCheck,
     InternalMessage,
@@ -226,7 +227,7 @@ class TestStore:
             await bench_store.export_fromweb("classify", [])
 
     async def test_export_merges_and_stamps_single_point(self):
-        # 合并写 + 来源盖章单点：同 id 覆盖、指纹同批共享、显式参数可换来源
+        # 合并写 + 来源盖章单点：同 id 覆盖、指纹内容派生、显式参数可换来源
         base = {
             "id": "s1",
             "messages": [{"msg_id": "m", "content": "活动"}],
@@ -238,12 +239,44 @@ class TestStore:
         fp1 = raw["cases"][0]["batch_fingerprint"]
         assert raw["cases"][0]["origin"] == "cards"
 
-        # 指纹按调用生成：两次导出指纹不同（uuid4，秒级时间戳不复用）
+        # 不同批（id 集不同）→ 不同指纹
         await bench_store.export_fromweb("classify", [{**base, "id": "s2"}])
         raw = json.loads(path.read_text(encoding="utf-8"))
         fps = {c["batch_fingerprint"] for c in raw["cases"]}
         assert len(fps) == 2
         assert fp1 in fps
+
+        # 回归：同批内容重导**同指纹**（旧调用级 uuid4 每导一次换一个值，
+        # 同源数据永不互斥，泄漏校验形同虚设）
+        before = {
+            c["id"]: c["batch_fingerprint"]
+            for c in json.loads(path.read_text(encoding="utf-8"))["cases"]
+        }
+        await bench_store.export_fromweb("classify", [{**base, "id": "s2"}])
+        after = {
+            c["id"]: c["batch_fingerprint"]
+            for c in json.loads(path.read_text(encoding="utf-8"))["cases"]
+        }
+        assert after == before
+
+        # 指纹材料不掺 origin：同 id 的同一批用例跨 origin 导出共享指纹。
+        # 注意这只证明「同 id 集 ⇒ 同指纹」；跨构造器是否同 id 是另一层
+        # 问题，由 TestCrossPathIdentity 按功能钉死（旧 uuid4 口径下本断言
+        # 必红：同 dict 两次导出也会换指纹）
+        cross = {**base, "id": "x1"}
+        await bench_store.export_fromweb("classify", [cross], origin="recorder")
+        fp_recorder = next(
+            c["batch_fingerprint"]
+            for c in json.loads(path.read_text(encoding="utf-8"))["cases"]
+            if c["id"] == "x1"
+        )
+        await bench_store.export_fromweb("classify", [cross], origin="cards")
+        fp_cards = next(
+            c["batch_fingerprint"]
+            for c in json.loads(path.read_text(encoding="utf-8"))["cases"]
+            if c["id"] == "x1"
+        )
+        assert fp_recorder == fp_cards
 
         # recorder 复用同一入口：显式声明来源与指纹（对照实验分母的载体）
         await bench_store.export_fromweb(
@@ -573,6 +606,118 @@ class TestRecorder:
         assert result["total"] == 0
         cases = await bench_store.list_fromweb("dedup")
         assert [c["id"] for c in cases] == ["keep"]
+
+
+class TestCrossPathIdentity:
+    """跨构造路径的指纹共享边界（纯按 dict 传的断言覆盖不到这一层）。
+
+    指纹是本批用例 id 集的哈希：同一构造路径同批重导必然同指纹；而
+    recorder 构造与 cards 构造对**同一底层数据**是否同 id，按功能分界——
+    classify/merge 两侧材料都是消息 id 集 → 对齐、跨路径共享；dedup 候选侧
+    recorder 用卡片 DB id 而 cards 用 source_msg_id，title 材料形状两侧
+    不同（[msg_id, old_title] vs msg_id）→ 不共享，这两类的跨路径同源
+    互斥必须由消费侧用入训 id 清单对撞（scripts/eval_denominators.py）。
+    各侧材料公式在此钉死：有人改动任一侧 id 口径，本测试即红，强制同步
+    store.batch_fingerprint 文档串与架构文档口径——避免「跨路径共享」被
+    无声地当成既成事实。
+    """
+
+    @pytest.fixture(autouse=True)
+    async def _autouse_setup(self):
+        bench_recorder.reset()
+        yield
+        bench_recorder.reset()
+
+    def _row(self, item_id: str, category: str, content: str, **extra: Any) -> dict[str, Any]:
+        row: dict[str, Any] = {
+            "id": item_id,
+            "category": category,
+            "title": f"标题-{item_id}",
+            "source_quote": content,
+            "source": "bench",
+            "source_msg_id": f"msg-{item_id}",
+            "session_id": "s1",
+            "source_group": "测试群",
+            "msg_time": 1000,
+            "start": "2026-04-20 19:00",
+            "end": "",
+            "extra_times": "",
+            "image_urls": "",
+            "article_url": "",
+            "sender_name": "张三",
+            "key_info": "k",
+            "subject": "主体",
+        }
+        row.update(extra)
+        return row
+
+    def _msg(self, msg_id: str, content: str) -> InternalMessage:
+        return InternalMessage(
+            msg_id=msg_id, content=content, sender_name="张三", sender_id="u1",
+            session_id="s1", group_name="测试群", timestamp=1000, source="bench",
+        )
+
+    def test_classify_identity_aligned_across_builders(self):
+        rows = [self._row("db1", "活动通知", "内容一"), self._row("db2", "交易", "内容二")]
+        cards_cases = bench_store.build_classify_cases_from_rows(rows)
+        assert cards_cases
+        batch = BatchContext(
+            messages=[self._msg("msg-db1", "内容一"), self._msg("msg-db2", "内容二")],
+            client=Mock(),
+        )
+        batch.classify_checks = [
+            ClassifyObservation(msg_index=0, outcome="include", category="活动通知"),
+            ClassifyObservation(msg_index=1, outcome="include", category="交易"),
+        ]
+        assert bench_recorder.build_classify_cases(batch) == 2
+        rec_cases = bench_recorder._cases["classify"]
+        assert sorted(c["id"] for c in rec_cases) == sorted(c["id"] for c in cards_cases)
+        assert bench_store.batch_fingerprint(rec_cases) == bench_store.batch_fingerprint(
+            cards_cases
+        )
+
+    def test_dedup_candidate_identity_diverges(self):
+        row_a = self._row("db1", "活动通知", "内容", content_hash="h1")
+        row_b = self._row("db2", "活动通知", "内容", content_hash="h1")
+        cards_cases = bench_store.build_dedup_cases_from_rows([row_a, row_b])
+        assert cards_cases
+        cand = DedupCandidate(
+            item_id="db1", title="标题-db1", source_quote="内容",
+            source="bench", image_urls=[],
+        )
+        check = DedupCheck(
+            msg=self._msg("msg-db2", "内容"), title="标题-db2",
+            is_duplicate=True, candidate=cand,
+        )
+        rec_case = bench_recorder.build_dedup_case(check)
+        assert rec_case is not None
+        assert rec_case["id"] == bench_store.stable_case_id("dedup", ["db1", "msg-db2"])
+        assert cards_cases[0]["id"] == bench_store.stable_case_id(
+            "dedup", ["msg-db1", "msg-db2"]
+        )
+        assert rec_case["id"] != cards_cases[0]["id"]
+
+    def test_title_identity_diverges_across_builders(self):
+        row = self._row("db2", "活动通知", "内容", key_info="价格, 运费")
+        cards_cases = bench_store.build_title_cases_from_rows([row])
+        assert cards_cases
+        head = MergeCard(
+            title="旧标题", desc="旧标题 内容", key_info="价格", subject="主体X",
+            sender_name="张三", session_id="s1", group_name="群1", msg_time=1000,
+            source="bench", msg_id="msg-db1", source_quote="内容一",
+        )
+        tail = MergeCard(
+            title="补充", desc="补充 内容", key_info="价格, 运费", subject="主体X",
+            sender_name="张三", session_id="s1", group_name="群1", msg_time=1200,
+            source="bench", msg_id="msg-db2", source_quote="内容二",
+        )
+        check = MergeCheck(same=True, head=head, tail=tail)
+        check.title = MergeTitleCheck(old_title="旧标题", key_info="价格, 运费", quote="旧标题\n补充")
+        rec_case = bench_recorder.build_title_case(check)
+        assert rec_case is not None
+        assert rec_case["id"] == bench_store.stable_case_id("title", ["msg-db2", "旧标题"])
+        assert cards_cases[0]["id"] == bench_store.stable_case_id("title", "msg-db2")
+        assert rec_case["id"] != cards_cases[0]["id"]
 
 
 class TestRecordEndpoints:

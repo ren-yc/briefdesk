@@ -170,7 +170,7 @@ class BaseCase(BaseModel):
     id: str
     note: str = ""  # 可选：用例说明/预期理由（便于人工复核）
     origin: str = "manual"  # 用例来源（manual/recorder/cards/synthetic）
-    batch_fingerprint: str = ""  # 导出批次指纹（同源数据隔离的载体，空=未打）
+    batch_fingerprint: str = ""  # 导出批次指纹（内容派生：同批用例重导同指纹；空=未打）
 
     @field_validator("origin")
     @classmethod

@@ -138,16 +138,23 @@ def parse_cases_with_errors(
 # ── 网页导出（写 cases/<feature>.fromweb.json）──
 
 
-def batch_fingerprint(source: str = "fromweb") -> str:
-    """导出批次指纹：sha256(来源标识 + uuid4) 截 16 位十六进制。
+def batch_fingerprint(cases: list[dict[str, Any]]) -> str:
+    """导出批次指纹：sha256(用例 id 集) 截 16 位十六进制（内容派生）。
 
-    每次**调用**生成一个新指纹（uuid4，时间戳只进 description 不进指纹
-    ——秒级时间戳会把同秒多次导出合并成同指纹，粒度错配）；同一批数据
-    若会经两条路径导出（先 recorder 入训、再 cards 进评测），调用方必须
-    显式传同一 source 并自行做内容级互斥（指纹是调用级、不是内容级）。
-    训练数据构建侧按指纹做批次级互斥（与入训记录同指纹的用例出验收分母）。
+    用例 id 本身内容派生（stable_case_id），id 集相同 ⇒ 指纹相同——与
+    导出时机、origin 无关：同一构造路径的同批数据重复导出必然共享指纹
+    （旧调用级 uuid4 每导一次换一个值，「与入训记录同指纹判泄漏」的互斥
+    校验形同虚设）。跨构造路径（recorder 构造 vs cards 构造同一底层数据）
+    是否共享取决于两侧 id 口径是否对齐，按功能分界（回归钉在
+    tests/test_benchmark_plugin.py 的 TestCrossPathIdentity）：
+    classify/merge 都以消息 id 集为材料 → 对齐共享；dedup 候选侧 recorder
+    用卡片 DB id、cards 用 source_msg_id，title 材料形状两侧不同 → 不
+    对齐不共享——这两类的跨路径同源互斥必须用入训 id 清单做 id 级对撞
+    （scripts/eval_denominators.py 消费侧）。整批口径的边界同样存在：
+    批次增删用例后指纹改变，与旧批次的交集成员不再共享旧批指纹。
     """
-    material = f"{source}|{uuid.uuid4()}"
+    ids = sorted(str(case.get("id") or "") for case in cases)
+    material = json.dumps(ids, ensure_ascii=False, sort_keys=True)
     return hashlib.sha256(material.encode()).hexdigest()[:16]
 
 
@@ -168,8 +175,9 @@ async def export_fromweb(
     逐条经 schema 模型校验，任一非法即抛 DatasetError（整批不落盘）；
     origin 受控枚举在写入前校验（单点写入处同样拦非法值）；空列表拒绝
     导出（不改动已有文件）。本函数是用例来源字段（origin/batch_fingerprint）
-    的**单点写入处**：默认 origin=cards + 本调用新指纹；recorder 等其它
-    来源复用本函数时显式传 origin 与自己的指纹（不传则每调用生成）。
+    的**单点写入处**：默认 origin=cards + 按本批用例内容派生的指纹
+    （同批重复导出同指纹，见 batch_fingerprint）；特殊场景需要指定指纹
+    时显式传 fingerprint。
     既有文件里的用例不再重新校验（历史数据原样保留，新入参为准）。
     """
     from briefdesk.plugins.benchmark.schema import CASE_ORIGINS, DatasetError
@@ -183,7 +191,7 @@ async def export_fromweb(
         )
     if not cases:
         raise DatasetError("用例列表为空，未导出（不改动已有文件）")
-    stamped_fingerprint = fingerprint or batch_fingerprint(origin)
+    stamped_fingerprint = fingerprint or batch_fingerprint(cases)
     stamped: list[dict[str, Any]] = []
     for case in cases:
         validated = validate_case(feature, case)
