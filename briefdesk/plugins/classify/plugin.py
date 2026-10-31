@@ -10,6 +10,9 @@
 消费方式 = 影子打分与留一校准。
 """
 
+from __future__ import annotations
+
+import asyncio
 from collections.abc import Awaitable, Callable
 
 from briefdesk.events import EVENT_CATEGORIES_CHANGED
@@ -31,6 +34,8 @@ class ClassifyPlugin(StagePlugin):
     def __init__(self) -> None:
         self._classify_batch: Callable[..., Awaitable[ClassifyOutcome]] | None = None
         self._ctx: PluginContext | None = None
+        # 在飞的重建任务引用集（防 create_task 产物被 GC；见 _on_categories_changed）
+        self._rebuild_tasks: set[asyncio.Task[None]] = set()
 
     async def setup(self, ctx: PluginContext) -> None:
         # 延迟导入：仅加载本插件依赖，且便于测试替换
@@ -94,7 +99,12 @@ class ClassifyPlugin(StagePlugin):
                 logger.warning("类别变更后的分配器重建失败", exc_info=True)
 
         try:
-            asyncio.get_running_loop().create_task(_rebuild_with_retry())
+            # 任务必须持引用：事件循环对 create_task 的产物只持弱引用，
+            # 无外部引用时可能在完成前被 GC（重建静默丢失，缓存停在旧类名
+            # 口径）。集合在任务结束时自行移除，兼作在飞任务的登记表。
+            task = asyncio.get_running_loop().create_task(_rebuild_with_retry())
+            self._rebuild_tasks.add(task)
+            task.add_done_callback(self._rebuild_tasks.discard)
         except RuntimeError:
             pass  # 无运行中循环（测试/关闭序列）：跳过，下次触发重建
 

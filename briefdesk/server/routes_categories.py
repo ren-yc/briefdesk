@@ -3,6 +3,9 @@
 导入即注册路由（装配顺序见 server/__init__.py）。
 """
 
+from __future__ import annotations
+
+import asyncio
 import re
 
 import aiosqlite
@@ -27,13 +30,19 @@ from briefdesk.server.app import app
 
 def _publish_categories_changed() -> None:
     """锁内/锁外均可调：fire-and-forget 结构变更信号（失败不连坐主流程）。"""
-    import asyncio
-
     try:
         loop = asyncio.get_running_loop()
     except RuntimeError:
         return
-    loop.create_task(event_bus.publish(EVENT_CATEGORIES_CHANGED, None))
+    # 任务必须持引用：事件循环对 create_task 产物只持弱引用，无外部引用时
+    # 可能在完成前被 GC（结构变更事件静默丢失，订阅方的缓存重建不触发）。
+    task = loop.create_task(event_bus.publish(EVENT_CATEGORIES_CHANGED, None))
+    _PENDING_EVENTS.add(task)
+    task.add_done_callback(_PENDING_EVENTS.discard)
+
+
+# 在飞事件发布任务引用集（防 create_task 产物被 GC；见上）
+_PENDING_EVENTS: set[asyncio.Task[None]] = set()
 
 _NAME_MAX = 20
 # 提示词上限 400：最长默认提示词 293 字（活动通知），前端两处 maxlength 与此常量

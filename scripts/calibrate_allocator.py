@@ -193,10 +193,16 @@ async def calibrate(db_path: Path) -> dict:
             reverse=True,
         )
         expected = r["category_after"]
-        score = dict(scored).get(expected, 0.0)
+        # 期望类在留一后可能整类消失（该类唯一去重样本就是本查询）：此时
+        # 没有「该类得分」可测。旧口径把它当 0.0 计入 per_class_scores 会
+        # 拖低该类 p25 建议阈值，且 rank 落到 len(scored)+1 比真实末位大 1、
+        # 扭曲 expected_rank_median。缺类直接跳过本样本（不计分、不计秩）。
+        expected_scores = dict(scored)
+        if expected not in expected_scores:
+            continue
+        score = expected_scores[expected]
         rank = next(
-            (rank for rank, (cat, _s) in enumerate(scored) if cat == expected),
-            len(scored),
+            rank for rank, (cat, _s) in enumerate(scored) if cat == expected
         )
         ranks.append(rank + 1)
         per_class_scores.setdefault(expected, []).append(score)

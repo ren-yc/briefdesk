@@ -115,16 +115,23 @@ class CategoryAllocator:
             self._rebuild_pending = True
             logger.info("分配器重建节流中（间隔 %ds），本次请求合并为待重建", _REBUILD_MIN_INTERVAL)
             return -1
-        self._rebuilt_at = now
+        # 节流窗口只在**成功**路径上膛（见下方各 return 前的重置）：若在这里
+        # 就记时，嵌入失败返回 -2 时窗口已被占用，接下来的纠错事件只能拿到
+        # -1 等下一次 force 重试——旧/空缓存最长滞留 5 分钟，与「下个触发点
+        # 重试」的承诺相反。失败路径回滚到上一次成功时间（首次失败置 0），
+        # 让下一次调用立即重试而非被节流吞掉。
+        previous_rebuilt_at = self._rebuilt_at
         self._rebuild_pending = False
 
         if not is_available():
             logger.info("嵌入未启用，分配器不重建（allocate 将回退）")
             self._protos = {}
+            self._rebuilt_at = now
             return 0
         if not samples:
             logger.info("无分类样本（items 为空），分配器置空（冷启动回退 API）")
             self._protos = {}
+            self._rebuilt_at = now
             return 0
 
         # content 去重：recat 覆盖层「计入新类 + 从原类剔除同源 content」
@@ -143,10 +150,13 @@ class CategoryAllocator:
         try:
             vectors = await ai_ports.embed_texts(texts)
         except Exception:
-            # 嵌入失败：保留旧缓存（旧分布优于空缓存），下个触发点重试
+            # 嵌入失败：保留旧缓存（旧分布优于空缓存），回滚节流窗口让下个
+            # 触发点立即重试（不占 300s 窗口，见函数开头注释）
+            self._rebuilt_at = previous_rebuilt_at
             logger.warning("分配器原型嵌入失败，保留旧缓存", exc_info=True)
             return -2
         if len(vectors) != len(deduped):
+            self._rebuilt_at = previous_rebuilt_at
             logger.warning(
                 "分配器嵌入返回数不符（%d/%d），保留旧缓存",
                 len(vectors),
@@ -173,6 +183,7 @@ class CategoryAllocator:
             elif len(proto.vectors) >= 2:
                 proto.threshold = _p5_self_similarity(proto.vectors)
         self._protos = buckets
+        self._rebuilt_at = now  # 节流窗口只在成功路径上膛
         telemetry.record("allocator.rebuild")
         logger.info(
             "分配器重建完成：%d 类 / %d 原型", len(buckets), len(deduped)
