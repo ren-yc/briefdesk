@@ -18,6 +18,7 @@
 - CLI：python -m briefdesk.plugins.benchmark.cli。
 """
 
+import asyncio
 import logging
 from pathlib import Path
 from typing import Any
@@ -43,6 +44,10 @@ class BenchmarkPlugin(WebPlugin, StagePlugin):
     core = False  # 可选插件（实验性基准工具）：默认禁用，经 PLUGINS / 设置页开关启用
     slot = "post_insert"  # 阶段槽位：合并判定之后（batch.merge_checks 已填充）
     priority = 1  # 同槽 priority 升序：在 merge 阶段（priority=0）之后运行
+
+    def __init__(self) -> None:
+        # 在飞节律导出任务引用集（防 create_task 产物被 GC；见 run）
+        self._export_tasks: set[asyncio.Task[Any]] = set()
 
 
     def settings_model(self) -> type[Any]:
@@ -137,9 +142,14 @@ class BenchmarkPlugin(WebPlugin, StagePlugin):
         if bench_recorder.is_enabled():
             bench_recorder.record_batch(batch)
             try:
-                asyncio.get_running_loop().create_task(
+                # 任务必须持引用：事件循环对 create_task 产物只持弱引用，
+                # 无外部引用时可能在完成前被 GC（节律导出静默丢失）。集合
+                # 在任务结束时自行移除。
+                task = asyncio.get_running_loop().create_task(
                     bench_recorder.scheduled_export()
                 )
+                self._export_tasks.add(task)
+                task.add_done_callback(self._export_tasks.discard)
             except RuntimeError:
                 pass  # 无运行中循环（测试/关闭序列）：跳过节律检查
 
