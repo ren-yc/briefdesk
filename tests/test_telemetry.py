@@ -123,6 +123,70 @@ def test_flush_after_eviction_no_duplicate_rows(
     assert last["seq"] == 9
 
 
+def test_flush_partial_write_failure_does_not_duplicate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """写盘中途失败的回归位：已 append 的行必须推进游标。
+
+    失败模式：旧实现循环后一次性赋值 _cosine_flushed——中途抛异常时游标
+    停在旧值，下轮 pending 从旧游标重算，已写入行被再写一遍，且 seq 已
+    消耗使同一数据以两个不同 seq 落成重复行（「游标保证不重复」失效，
+    标定样本权重被系统性偏置）。
+    """
+    for i in range(3):
+        telemetry.record_cosine_truth("s", float(i) / 10, True)
+    from pathlib import Path as _Path
+
+    real_open = _Path.open
+    state = {"truth_writes": 0, "armed": False}
+
+    class _BoomFile:
+        def __init__(self, wrapped):  # type: ignore[no-untyped-def]
+            self._wrapped = wrapped
+
+        def __enter__(self):  # type: ignore[no-untyped-def]
+            self._wrapped.__enter__()
+            return self
+
+        def __exit__(self, *exc):  # type: ignore[no-untyped-def]
+            return self._wrapped.__exit__(*exc)
+
+        def write(self, data):  # type: ignore[no-untyped-def]
+            # 只对 cosine_truth 文件计数并在第二条抛错
+            if state["armed"]:
+                state["truth_writes"] += 1
+                if state["truth_writes"] == 2:
+                    raise OSError("disk full mid-batch")
+            return self._wrapped.write(data)
+
+        def __getattr__(self, name):  # type: ignore[no-untyped-def]
+            return getattr(self._wrapped, name)
+
+    def _open(path_self, *args, **kwargs):  # type: ignore[no-untyped-def]
+        f = real_open(path_self, *args, **kwargs)
+        if "cosine_truth-" in str(path_self):
+            state["armed"] = True
+            return _BoomFile(f)
+        return f
+
+    monkeypatch.setattr(_Path, "open", _open)
+    telemetry.flush()
+    truth_file = next((tmp_path / "tel").glob("cosine_truth-*.jsonl"))
+    written = truth_file.read_text(encoding="utf-8").strip().splitlines()
+    assert len(written) == 1, "第一条已 append，异常前只应有一行"
+    # 恢复 open，下轮 flush 只补未写行（不重写第一条）
+    monkeypatch.setattr(_Path, "open", real_open)
+    telemetry._last_flush = 0.0
+    telemetry.flush()
+    rows = [
+        json.loads(line)
+        for line in truth_file.read_text(encoding="utf-8").strip().splitlines()
+    ]
+    assert len(rows) == 3, f"不得重复落盘，实际 {len(rows)} 行"
+    assert len({(r["boot"], r["seq"]) for r in rows}) == 3
+    assert [r["cosine"] for r in rows] == [0.0, 0.1, 0.2]
+
+
 def test_cosine_truth_capped_after_flush(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

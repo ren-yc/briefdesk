@@ -110,9 +110,11 @@ def record_cosine_truth(source: str, cosine: float, verdict: bool | None) -> Non
 
 
 def cosine_truth_rows() -> list[tuple[str, float, bool | None]]:
-    """读取内存中尚未落盘的余弦-真值明细（测试/诊断用；返回副本）。
+    """读取内存中的余弦-真值明细缓冲（测试/诊断用；返回副本）。
 
-    权威数据在 telemetry_dir()/cosine_truth-YYYYMMDD.jsonl。
+    返回的是**缓冲总行数**（含已落盘部分——flush 只推进游标不清空缓冲，
+    超上限才滚动裁掉已落盘行），不是「尚未落盘」的行。权威数据在
+    telemetry_dir()/cosine_truth-YYYYMMDD.jsonl。
     """
     return list(_cosine_truth)
 
@@ -227,6 +229,11 @@ def flush() -> None:
             truth_daily = (
                 target_dir / f"cosine_truth-{time.strftime('%Y%m%d')}.jsonl"
             )
+            # 逐行推进游标（而非循环后一次性赋值）：写盘中途抛异常时，
+            # 已 append 的行必须算「已落盘」——否则下轮 pending 从旧游标
+            # 重算、把已写入行再写一遍，且 _cosine_seq 已消耗导致同一数据
+            # 以两个不同 seq 落成重复行，「游标保证不重复」的承诺失效。
+            # 追加写 + 单进程假设下，这种逐行推进不引入新的重复窗口。
             with truth_daily.open("a", encoding="utf-8") as f:
                 for source, cosine, verdict in pending:
                     _cosine_seq += 1
@@ -243,7 +250,8 @@ def flush() -> None:
                         )
                         + "\n"
                     )
-            _cosine_flushed = len(_cosine_truth)
+                    f.flush()
+                    _cosine_flushed += 1
             # 内存缓冲超限：删掉的 k 行都已落盘，游标同步收缩到 len(buffer)——
             # 保留行全部已写、下轮 pending 从新缓冲尾部起算，不重写旧行
             if _cosine_flushed > _MAX_COSINE_TRUTH:
