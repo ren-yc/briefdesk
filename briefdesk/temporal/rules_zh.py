@@ -33,6 +33,12 @@ _STRONG_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"(截止|截止到|截至| deadline|Deadline)"),        # 6 截止词
 )
 
+# 时刻形态的模式序号（语言判定住规则包，内核不做字符猜测）：这类线索的
+# 数字是钟点而非月日，覆盖判定须经 LexicalHint.clock 分流——否则「12:30」
+# 的数字会被日期产出 "2026-12-30" 巧合命中，把未覆盖线索记成覆盖
+# （回归见 tests/test_temporal.py 的 hint_resolved 用例）。
+_CLOCK_PATTERN_IDS = frozenset({4, 5})
+
 # ── 弱线索：裸数字日期模式（误检代价 = 一次 LLM 调用，门向误检倾斜）──
 # 4.15 / 05/01 类裸数字形态；与强线索重叠的不产出（强模式已覆盖其语义）。
 _WEAK_PATTERN = re.compile(r"(?<![\d./-])\d{1,2}[./]\d{1,2}(?![\d./-])")
@@ -99,6 +105,7 @@ def lex_hints(text: str) -> list[LexicalHint]:
             text=s.text[:_MAX_HINT_TEXT],
             position=s.start,
             pattern_id=s.pattern_id,
+            clock=s.kind == "strong" and s.pattern_id in _CLOCK_PATTERN_IDS,
         )
         for s in spans
     ]

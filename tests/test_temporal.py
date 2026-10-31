@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from briefdesk.temporal import rules_zh
+from briefdesk.temporal import LexicalHint, ParsedTime, ParseResult, rules_zh
 from briefdesk.temporal import shadow as temporal_shadow
 
 
@@ -88,6 +88,67 @@ def test_hint_resolved_month_day_match() -> None:
     # 时刻类线索解析不出：标记未覆盖（线索级漏检可见，而非消息级吞掉）
     miss = rules_zh.make_result("下周三面试，下午3点到场", 1700000000)
     assert any(not miss.hint_resolved(h) for h in miss.hints if h.kind == "strong")
+
+
+def test_hint_resolved_rejects_substring_false_positive() -> None:
+    """数字子串双向包含口径的误报回归（影子漏检曾被系统性低估）。"""
+    res = ParseResult(times=[ParsedTime(type="start", time="2026-05-13")])
+    clock_hint = LexicalHint(
+        kind="strong", text="下午3点", position=0, pattern_id=4, clock=True
+    )
+    assert not res.hint_resolved(clock_hint)  # "3" 不得蹭中 "0513"
+    colon_hint = LexicalHint(
+        kind="strong", text="12:30", position=0, pattern_id=5, clock=True
+    )
+    date_res = ParseResult(times=[ParsedTime(type="start", time="2026-12-30")])
+    assert not date_res.hint_resolved(colon_hint)  # 时刻线索 vs date-only 产出
+
+
+def test_hint_resolved_date_window_exact() -> None:
+    """日期线索：数字段整窗等于 (月,日)/(年,月,日) 才算覆盖。"""
+    res = ParseResult(times=[ParsedTime(type="start", time="2026-04-15")])
+    assert res.hint_resolved(LexicalHint(kind="weak", text="4.15", position=0))
+    assert res.hint_resolved(
+        LexicalHint(kind="strong", text="4月15日", position=0, pattern_id=1)
+    )
+    assert res.hint_resolved(
+        LexicalHint(kind="strong", text="2026年4月15日", position=0, pattern_id=0)
+    )
+    # 月日窗口不同即未覆盖（旧口径 "155" 会被 lstrip 拼接蹭中）
+    assert not res.hint_resolved(LexicalHint(kind="weak", text="15.4", position=0))
+    wrong = ParseResult(times=[ParsedTime(type="start", time="2026-05-15")])
+    assert not wrong.hint_resolved(LexicalHint(kind="weak", text="4.15", position=0))
+    # 年份容忍：线索无年份、产出有年份，仍算覆盖
+    assert res.hint_resolved(LexicalHint(kind="weak", text="04.15", position=0))
+
+
+def test_hint_resolved_clock_matches_minute_output() -> None:
+    """时刻线索与 HH:MM 分量对撞；12 小时表述容忍 +12h 归一。"""
+    res = ParseResult(times=[ParsedTime(type="start", time="2026-05-15 14:30")])
+    # 「下午2:30」数字 [2,30] 命中 14:30（2+12 归一 + 分钟全同）
+    assert res.hint_resolved(
+        LexicalHint(kind="strong", text="下午2:30", position=0, pattern_id=5, clock=True)
+    )
+    # 「下午3点」数字 [3]：3≠14 且 3+12=15≠14 → 不中
+    assert not res.hint_resolved(
+        LexicalHint(kind="strong", text="下午3点", position=0, pattern_id=4, clock=True)
+    )
+    minute_res = ParseResult(times=[ParsedTime(type="start", time="2026-05-15 15:00")])
+    assert minute_res.hint_resolved(
+        LexicalHint(kind="strong", text="下午3点", position=0, pattern_id=4, clock=True)
+    )
+    # 分钟不同不覆盖（粒度对撞：3点20 不中 15:00）
+    assert not minute_res.hint_resolved(
+        LexicalHint(kind="strong", text="下午3点20", position=0, pattern_id=4, clock=True)
+    )
+
+
+def test_rules_zh_marks_clock_hints() -> None:
+    """规则包的语言判定出口：时刻模式必须带 clock=True（内核不猜字符）。"""
+    hints = rules_zh.lex_hints("下午3点到场")
+    assert hints and all(h.clock for h in hints)
+    hints = rules_zh.lex_hints("5月15日集合")
+    assert hints and not any(h.clock for h in hints)
 
 
 def test_make_result_combines() -> None:
