@@ -139,8 +139,9 @@ def snapshot() -> dict[str, Any]:
     latencies: {kind: {source: {window_count, p50/p95/p99_ms, total_count, total_ms}}}
     —— window_* 是抽稀窗口内的分位与样本数，total_* 是自进程启动的全量
     累计（分位数只从窗口算，不代表全量）。
-    cosine_truth_count 是**未落盘**的明细缓冲行数（权威存储是
-    cosine_truth-*.jsonl 文件，落盘后缓冲收缩），不是历史累计行数。
+    cosine_truth_count 是内存明细缓冲的**总行数**（含已落盘部分——flush
+    只推进游标不清空缓冲，超上限才滚动裁掉已落盘行；权威存储是
+    cosine_truth-*.jsonl 文件），不是未落盘行数，也不是历史累计。
     """
     latencies: dict[str, dict[str, Any]] = defaultdict(dict)
     for (kind, source), (window, n_total, sum_total) in sorted(_samples.items()):
