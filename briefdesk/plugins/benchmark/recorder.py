@@ -355,14 +355,16 @@ async def export_recorded() -> dict[str, Any]:
 
     复用 store.export_fromweb 的逐条校验与原子写：任一功能校验失败即抛
     DatasetError（该功能不落盘）；导出成功后清空累积器。本函数显式声明
-    origin=recorder 与本次导出指纹——观察记录导出是「对照实验分母」的
-    载体，与卡片导出（origin=cards）在同文件内按来源字段区分。
+    origin=recorder；指纹不在此预生成——由写入单点按本批用例内容派生
+    （同批记录重导同指纹，「与入训记录共享指纹即判泄漏」的互斥校验才
+    咬得住；调用级随机指纹每导一次换一个值，同源永不互斥）。观察记录
+    导出是「对照实验分母」的载体，与卡片导出（origin=cards）在同文件内
+    按来源字段区分。
     """
     from briefdesk.plugins.benchmark import store as bench_store
 
     exported: dict[str, int] = {}
     paths: dict[str, str] = {}
-    fingerprint = bench_store.batch_fingerprint("recorder")
     for feature in FEATURES:
         cases = _cases[feature]
         if not cases:
@@ -376,7 +378,6 @@ async def export_recorded() -> dict[str, Any]:
             cases,
             description=description,
             origin="recorder",
-            fingerprint=fingerprint,
         )
         exported[feature] = len(cases)
         paths[feature] = str(path)

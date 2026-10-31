@@ -609,9 +609,15 @@ tests/test_web_plugins.py 的核心前端边界守卫测试覆盖）。`GET /api
 「记录导出」写 `BRIEFDESK_DATA_DIR/benchmark/cases/`、CLI 报告默认写 `benchmark/reports/`、运行目录在
 缓存目录；缺省用例查找为「用户用例目录 → 包内示例」，显式 `--cases-dir` 只查该目录、不回落包内示例。
 **用例来源标注与双口径**：每条用例带 `origin`（`manual` 人工核对/recorder 处理记录/cards 网页卡片导出/
-synthetic 合成，受控枚举、未知值校验报错）与 `batch_fingerprint`（导出批次指纹）。`export_fromweb` 是
-来源字段的单点写入处（默认 `origin=cards` + 本调用新指纹；recorder 复用时显式传 `origin=recorder` 与
-自己的指纹），写入为**合并语义**（按 case id 合并、新覆盖旧——旧覆盖式会静默丢用例；既有文件不可读/
+synthetic 合成，受控枚举、未知值校验报错）与 `batch_fingerprint`（导出批次指纹，**内容派生**：本批用例
+id 集（id 本身内容派生）哈希——同批重导同指纹、与导出时机/来源无关；同一构造路径的同源数据互斥靠它
+咬合。跨构造路径按功能分界：classify/merge 两侧 id 都是消息 id 集，同底层数据同指纹；dedup 候选侧
+recorder 用卡片 DB id 而 cards 用 source_msg_id、title 两侧 id 材料形状不同，跨路径不共享，这两类的
+同源互斥须用入训 id 清单做 id 级对撞。整批口径边界：增删用例后指纹改变，成员级互斥同样以 id 清单
+对撞。调用级随机指纹旧口径会让互斥校验形同虚设）。`export_fromweb` 是来源字段的单点写入处（默认
+`origin=cards` +
+按内容派生指纹；recorder 复用时显式传 `origin=recorder`，指纹同样由单点派生），写入为**合并语义**
+（按 case id 合并、新覆盖旧——旧覆盖式会静默丢用例；既有文件不可读/
 结构非法时拒绝合并覆盖而非静默按空）。消费侧：验收分母只认 `origin=manual`（卡片/记录导出的期望来自
 管道自身判定，混入会让指标虚高）；与入训记录同指纹的用例按批次级互斥出验收分母（只读工具
 `scripts/eval_denominators.py`：分组汇总 + 指纹互斥校验 + 双口径分开统计）。
