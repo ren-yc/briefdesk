@@ -145,17 +145,44 @@ def read_env_embedding_config(env: dict[str, str]) -> tuple[str, str, bool]:
 def _load_effective_env() -> dict[str, str]:
     """按运行时层序合并 dotenv 层（高层覆盖低层），供模型/端点取值。
 
-    进程环境变量的优先级更高，一并并入——脚本应看到与应用进程相同的
-    生效值（判官侧 AI_* 回退同理）。
+    取数与运行时**同口径**（否则盘点会把真实模型行误报成旧模型残留）：
+    - 键名大小写不敏感：pydantic-settings 与 settings_env._env_value 都按
+      upper() 比对；os.environ.get("EMBED_MODEL") 会漏掉 embed_model 这类
+      变体，导致进程环境的值被当成未设置。
+    - dotenv 值做 ${VAR} 插值：DotEnvSettingsSource 会插值，本脚本的
+      load_env_file 不插值；不补这一步，`EMBED_MODEL=${AI_MODEL}` 这类
+      写法会被当成字面模型名，把生效行误判为旧模型残留（该分支被未知
+      目标模型拒绝兜住，不会误删，但会给出错误盘点）。
+    插值变量集 = 已合并的低层值 + 进程环境（大小写不敏感）；未定义的
+    变量按空串处理（与 python-dotenv 的默认一致）。
     """
     merged: dict[str, str] = {}
     for _layer_name, layer_file in reversed(_dotenv_layers()):
         merged.update(load_env_file(layer_file))
+    process_env = {key.upper(): value for key, value in os.environ.items()}
     for key in ("EMBED_MODEL", "EMBED_API_BASE", "AI_MODEL"):
-        value = os.environ.get(key)
+        value = process_env.get(key.upper())
         if value:
             merged[key] = value
-    return merged
+    lookup = {
+        key.upper(): value for key, value in {**merged, **process_env}.items()
+    }
+    interpolated: dict[str, str] = {}
+    for key, value in merged.items():
+        interpolated[key] = _interpolate_env_value(value, lookup)
+    return interpolated
+
+
+_ENV_VAR_REF = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
+
+
+def _interpolate_env_value(value: str, lookup: dict[str, str]) -> str:
+    """把 ${VAR} 引用替换为 lookup 里的值（未定义 → 空串，python-dotenv 口径）。"""
+
+    def _sub(match: re.Match[str]) -> str:
+        return lookup.get(match.group(1).upper(), "")
+
+    return _ENV_VAR_REF.sub(_sub, value)
 
 
 def _parse_probe_response(body: object) -> int:

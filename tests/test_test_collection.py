@@ -92,6 +92,36 @@ def _has_init(node: ast.ClassDef) -> bool:
     )
 
 
+def _init_in_chain(name: str, registry: dict[str, ast.ClassDef]) -> bool:
+    """基类链上是否定义了 __init__（含 tests/ 之外、registry 解析不到的基座）。
+
+    pytest 对非 unittest 类只查类自身有没有 __init__——但 Python 继承会把
+    基座的 __init__ 带进来，pytest 同样跳过收集（实测：基座定义 __init__
+    的 Test* 子类收集 0 条、exit 5、只留 PytestCollectionWarning）。所以
+    「自身无 __init__」不足以判定可收集，必须追链；链上遇到 registry 之外
+    的基类时保守取「可能有 __init__」（宁可误报让人看一眼，也不要静默失明）。
+    """
+    seen: set[str] = set()
+    frontier = [name]
+    while frontier:
+        current = frontier.pop()
+        node = registry.get(current)
+        if node is None:
+            # registry 解析不到：外部基类（stdlib/三方/动态）——按可能有处理
+            return True
+        if _has_init(node):
+            return True
+        for base in _base_last_names(node):
+            if base in _UNITTEST_BASES:
+                return False  # unittest 体系允许自定义 __init__，不受此限
+            if base in ("object",):
+                continue
+            if base not in seen:
+                seen.add(base)
+                frontier.append(base)
+    return False
+
+
 def _collectable_self(name: str, registry: dict[str, ast.ClassDef]) -> bool:
     """类自身可收集口径：Test* 前缀（名字匹配）或 unittest 基类链可达。"""
     return name.startswith("Test") or _unittest_like(name, registry)
@@ -106,7 +136,12 @@ def test_test_classes_are_collected_by_pytest() -> None:
             based_on.setdefault(base, set()).add(node.name)
 
     violations: list[str] = []
-    for path in sorted(_TESTS_DIR.rglob("test_*.py")):
+    for path in sorted(_TESTS_DIR.rglob("*.py")):
+        # 扫描面必须与 pytest 的收集面一致：默认 python_files 为
+        # ['test_*.py', '*_test.py']（本仓库未覆盖该 ini），只看 test_*.py
+        # 会让 *_test.py 里后缀命名的类静默失明
+        if not (path.name.startswith("test_") or path.name.endswith("_test.py")):
+            continue
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
         for cls in ast.walk(tree):
             if not isinstance(cls, ast.ClassDef):
@@ -115,9 +150,9 @@ def test_test_classes_are_collected_by_pytest() -> None:
                 continue
             is_unittest = _unittest_like(cls.name, registry)
             if cls.name.startswith("Test"):
-                if not is_unittest and _has_init(cls):
+                if not is_unittest and _init_in_chain(cls.name, registry):
                     violations.append(
-                        f"{path.name}:{cls.lineno} class {cls.name} 定义了 "
+                        f"{path.name}:{cls.lineno} class {cls.name} 的基类链上有 "
                         "__init__，pytest 会跳过收集（改用夹具）"
                     )
                 continue
