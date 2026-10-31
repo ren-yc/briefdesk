@@ -145,6 +145,40 @@ def test_load_effective_env_layer_order_and_process_env(
     assert env["EMBED_API_BASE"] == "http://from-process-env/v1"
 
 
+def test_load_effective_env_case_insensitive_process_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """进程环境大小写不敏感（与 pydantic-settings / settings_env 同口径）。
+
+    失败模式：os.environ.get("EMBED_MODEL") 漏掉小写变体，盘点把
+    「进程环境已配置的模型」当成未设置、回落 AI_MODEL，把真实生效行
+    误报为旧模型残留。
+    """
+    (mod._dotenv_layers()[1][1]).write_text("EMBED_MODEL=from-dotenv\n", encoding="utf-8")
+    monkeypatch.setenv("embed_model", "from-lowercase-env")
+    env = _load_effective_env()
+    assert env["EMBED_MODEL"] == "from-lowercase-env"
+
+
+def test_load_effective_env_interpolates_variable_refs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """dotenv 的 ${VAR} 插值（DotEnvSettingsSource 会插值，本脚本必须同口径）。
+
+    失败模式：`EMBED_MODEL=${AI_MODEL}` 被当字面模型名 → 与现实维度对不上 →
+    盘点把生效行误报为旧模型残留。
+    """
+    (mod._dotenv_layers()[1][1]).write_text(
+        "AI_MODEL=real-embed-model\nEMBED_MODEL=${AI_MODEL}\n", encoding="utf-8"
+    )
+    monkeypatch.delenv("EMBED_MODEL", raising=False)
+    monkeypatch.delenv("AI_MODEL", raising=False)
+    env = _load_effective_env()
+    assert env["EMBED_MODEL"] == "real-embed-model"
+    model, _base, from_fallback = read_env_embedding_config(env)
+    assert (model, from_fallback) == ("real-embed-model", False)
+
+
 # ── 库路径解析链（与运行时层序一致） ──
 
 
