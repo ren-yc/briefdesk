@@ -6,7 +6,8 @@
 由所有者定夺后回填 allocator.THRESHOLD_OVERRIDES）。
 
 数据源：真实库（--db，只读）或无库时的用法说明。流程：
-1. 取 recat_log 纠错样本（每条含 category_before→category_after 与 content）；
+1. 取 recat_log 纠错样本（每条含 category_before→category_after；content
+   口径与生产覆盖层一致：回查 items 现行 title+quote，见 _load_samples）；
 2. 留一：对第 i 条，其余 recat 样本 + items 窗口样本建原型（按 recat
    覆盖层语义：本条按 category_after 计入、其 content 从原类剔除）；
 3. 查询向量对各类打分（max/mean-of-top-k，与生产 allocate 同口径）；
@@ -35,7 +36,15 @@ _PER_CATEGORY_LIMIT = 100
 
 
 def _load_samples(db_path: Path) -> tuple[list[dict], list[dict]]:
-    """(items 窗口样本, recat 纠错样本)——只读打开，与本 生产同口径。"""
+    """(items 窗口样本, recat 纠错样本)——只读打开，与生产同口径。
+
+    recat 侧 content 口径以 db.get_recat_overlay_samples 为源：经
+    recat_log.item_id 回查 items 现行 title/quote 拼 `title + 空格 + quote`，
+    items 行缺失（卡片已删）才回落存量 quote。只读存量 recat_log.content
+    （裸 quote）时与 items 侧文本必然不同，覆盖层 weight=2 去重永不命中，
+    校准测的是「双锚」分布而非生产分配器（回归见
+    tests/test_calibrate_allocator.py 的同源去重断言）。
+    """
     import sqlite3
 
     if not db_path.is_file():
@@ -51,10 +60,12 @@ def _load_samples(db_path: Path) -> tuple[list[dict], list[dict]]:
             (f"-{_WINDOW_DAYS} days",),
         ).fetchall()
         recat_rows = conn.execute(
-            "SELECT category_before, category_after, content FROM recat_log "
-            "WHERE category_before != category_after "
-            "AND created_at >= datetime('now', ?) "
-            "ORDER BY id DESC",
+            "SELECT r.category_before, r.category_after, r.content, "
+            "i.title AS live_title, i.source_quote AS live_quote "
+            "FROM recat_log r LEFT JOIN items i ON i.id = r.item_id "
+            "WHERE r.category_before != r.category_after "
+            "AND r.created_at >= datetime('now', ?) "
+            "ORDER BY r.id DESC",
             (f"-{_WINDOW_DAYS} days",),
         ).fetchall()
     finally:
@@ -69,15 +80,24 @@ def _load_samples(db_path: Path) -> tuple[list[dict], list[dict]]:
         text = f"{row['title'] or ''} {row['source_quote'] or ''}".strip()
         if text:
             items.append({"category": cat, "content": text})
-    recats = [
-        {
-            "category_before": row["category_before"],
-            "category_after": row["category_after"],
-            "content": (row["content"] or "").strip(),
-        }
-        for row in recat_rows
-        if (row["content"] or "").strip()
-    ]
+    recats: list[dict] = []
+    for row in recat_rows:
+        # 与 db.get_recat_overlay_samples 的回落分支逐条一致：live_quote
+        # 非 None 用现行 quote（可能已被编辑），None（卡已删/行缺失）才用存量
+        quote = (
+            row["live_quote"] if row["live_quote"] is not None else row["content"]
+        )
+        title = row["live_title"] or ""
+        text = f"{title} {quote or ''}".strip()
+        if not text:
+            continue
+        recats.append(
+            {
+                "category_before": row["category_before"],
+                "category_after": row["category_after"],
+                "content": text,
+            }
+        )
     return items, recats
 
 
