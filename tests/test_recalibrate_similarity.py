@@ -10,6 +10,8 @@ import importlib.util
 import sys
 from pathlib import Path
 
+import pytest
+
 _REPO = Path(__file__).resolve().parent.parent
 _SPEC = importlib.util.spec_from_file_location(
     "recalibrate_similarity", _REPO / "scripts" / "recalibrate_similarity.py"
@@ -21,7 +23,7 @@ sys.modules.setdefault("recalibrate_similarity", _mod)
 _SPEC.loader.exec_module(_mod)
 
 
-class PercentileTest:
+class TestPercentile:
     def test_single_value(self):
         assert _mod._percentile([0.5], 50) == 0.5
 
@@ -35,7 +37,7 @@ class PercentileTest:
         assert _mod._percentile(vals, 100) == 0.3
 
 
-class RecalibrateTest:
+class TestRecalibrate:
     def test_known_distribution(self):
         # 3 个正样本分数 [0.9, 0.8, 0.5]，2 个负样本 [0.2, 0.1]
         pairs = [
@@ -50,10 +52,14 @@ class RecalibrateTest:
         result = _mod.recalibrate(pairs, [0.3, 0.5])
         assert result["pairs"] == 5
         assert result["positive_pairs"] == 3
-        # 阈值 0.3：正样本至少命中同文那条 → 召回 ≥ 1/3；触发数 ≥ 命中数
+        # 阈值 0.3：正样本至少命中同文那条 → 召回 ≈ 1/3；触发数 ≥ 命中数。
+        # 容忍 1e-4：结果经 round(x, 4) 截位，0.3333 严格小于理论值 1/3，
+        # 直接 >= 比较会因舍入方向假红（本文件曾因类名不被 pytest 收集而
+        # 从未运行过，这类断言误差只有收集修复后才暴露）
         t03 = next(t for t in result["thresholds"] if t["threshold"] == 0.3)
-        assert t03["positive_recall"] is not None and t03["positive_recall"] >= 1 / 3
-        assert t03["triggered"] >= t03["positive_recall"] * 3
+        assert t03["positive_recall"] is not None
+        assert t03["positive_recall"] == pytest.approx(1 / 3, abs=1e-4)
+        assert t03["triggered"] >= 1
         # 阈值升高触发数单调不增
         t05 = next(t for t in result["thresholds"] if t["threshold"] == 0.5)
         assert t05["triggered"] <= t03["triggered"]
