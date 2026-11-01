@@ -212,6 +212,35 @@ def test_resolve_db_path_dotenv_layer_order(
     assert "dotenv" in source
 
 
+def test_resolve_db_path_process_env_case_insensitive(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """进程环境键名大小写不敏感（运行时 pydantic-settings 如此）。
+
+    失败模式：应用按小写 `db_path` 连 A 库，脚本按大写精确匹配漏读、
+    回落到平台默认库——`--check` 盘点错库、`--execute` 可能清错库。
+    """
+    monkeypatch.delenv("DB_PATH", raising=False)
+    monkeypatch.setenv("db_path", str(tmp_path / "lowercase.sqlite"))
+    p, source = resolve_db_path(None)
+    assert p == tmp_path / "lowercase.sqlite"
+    assert source == "环境变量 DB_PATH"
+
+
+def test_resolve_db_path_dotenv_key_case_insensitive(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """dotenv 层同样大小写不敏感（与 settings_env._lookup_value 同口径）。"""
+    monkeypatch.delenv("DB_PATH", raising=False)
+    monkeypatch.delenv("db_path", raising=False)
+    (mod._dotenv_layers()[0][1]).write_text(
+        f"db_path={tmp_path / 'lowercase-dotenv.sqlite'}\n", encoding="utf-8"
+    )
+    p, source = resolve_db_path(None)
+    assert p == tmp_path / "lowercase-dotenv.sqlite"
+    assert "dotenv" in source
+
+
 def test_resolve_db_path_override_layer(
     tmp_path: Path,
 ) -> None:

@@ -31,6 +31,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from collections.abc import Mapping
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -85,23 +86,45 @@ def resolve_db_path(explicit: Path | None) -> tuple[Path, str]:
     显式 --db > 进程环境 DB_PATH > 项目 .env > 用户暂存 settings.env >
     默认（paths.database_path：BRIEFDESK_DATA_DIR → 平台目录）。
 
+    键名一律**大小写不敏感**（与 pydantic-settings 及 settings_env._env_value
+    同口径）：运行时可解析 `db_path` 这类小写变体，本脚本若按大写精确匹配就会
+    漏读——应用连 A 库、`--check`/`--execute` 却盘点/清空平台默认库，是能真
+    删错库的事故面。
+
     有意偏差：运行时把空串值视为「已设置」，本脚本视为「未设置」继续
     查低层——迁移场景下空串几乎必然是残留配置，报「不存在」比拿空串
     当路径更可用。
     """
     if explicit is not None:
         return explicit, "--db 参数"
-    value = os.environ.get("DB_PATH")
+    value = _env_lookup(os.environ, "DB_PATH")
     if value:
         return Path(value), "环境变量 DB_PATH"
     for layer_name, layer_file in _dotenv_layers():
-        value = load_env_file(layer_file).get("DB_PATH", "")
+        value = _env_lookup(load_env_file(layer_file), "DB_PATH") or ""
         if value:
             path = Path(value)
             if not path.is_absolute():
                 path = path.resolve()
             return path, f"{layer_name}（{layer_file}）"
     return _default_db_path(), "默认（paths.database_path）"
+
+
+def _env_lookup(env: Mapping[str, str], key: str) -> str | None:
+    """大小写不敏感取键值（同名多形态时精确大写优先，其余按遍历序）。
+
+    与 settings_env._env_value 同语义：先精确命中，再逐项 upper() 比对。
+    空串算「有值」——本脚本在调用点用 `or ""` 判断真值，保持既有偏差
+    （空串视为未设置继续查低层）。
+    """
+    direct = env.get(key)
+    if direct is not None:
+        return direct
+    target = key.upper()
+    for name, value in env.items():
+        if name.upper() == target:
+            return value
+    return None
 
 
 def summarize_rows(

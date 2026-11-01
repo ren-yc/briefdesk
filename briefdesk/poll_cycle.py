@@ -152,12 +152,11 @@ async def run_poll_cycle(source: SourceRuntime) -> None:
             len(result.contacts),
             fmt_dur(time_module.perf_counter() - perf_start),
         )
-        # 轮询周期尾部的遥测汇总与落盘（有记录才打 INFO；落盘节流在
-        # telemetry.flush 内部）
+        # 轮询周期尾部的遥测汇总（有记录才打 INFO；落盘统一在 finally 做，
+        # 见下——成功/失败路径都要落盘）
         summary = telemetry_summary()
         if summary:
             logger.info(summary)
-        telemetry_flush()
     except Exception as e:
         # exception 而非 error：这是整条轮询链路的唯一兜底出口（下游轮询器
         # 与客户端都只上抛、不重复记日志），异常可能来自任意深度，没有栈就
@@ -171,6 +170,14 @@ async def run_poll_cycle(source: SourceRuntime) -> None:
         )
         set_status({"lastError": str(e)})
     finally:
+        # 遥测落盘放 finally：失败轮次里已记录的 AI/管道指标同样要落盘——
+        # 那恰恰是最需要诊断的样本，进程随后退出时不能丢。成功路径不再
+        # 单独 flush（只此一处，天然不重复）；flush 自带节流与全异常吞没，
+        # 不会反过来影响轮询收尾。
+        try:
+            telemetry_flush()
+        except Exception:
+            logger.debug("轮询收尾遥测落盘失败（忽略）", exc_info=True)
         # 复位与置位持同一把 _poll_lock（预防性加固）：单事件循环
         # 下当前实现已足够，显式入锁使互斥语义不依赖单线程假设
         async with _poll_lock:

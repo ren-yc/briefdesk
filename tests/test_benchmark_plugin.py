@@ -247,17 +247,17 @@ class TestStore:
         assert fp1 in fps
 
         # 回归：同批内容重导**同指纹**（旧调用级 uuid4 每导一次换一个值，
-        # 同源数据永不互斥，泄漏校验形同虚设）
-        before = {
-            c["id"]: c["batch_fingerprint"]
-            for c in json.loads(path.read_text(encoding="utf-8"))["cases"]
-        }
+        # 同源数据永不互斥，泄漏校验形同虚设）。键用 (origin, id)：合并键
+        # 本身带来源，跨来源同 id 会共存（见下一条断言）
+        def _fingerprints() -> dict[tuple[str, str], str]:
+            return {
+                (c["origin"], c["id"]): c["batch_fingerprint"]
+                for c in json.loads(path.read_text(encoding="utf-8"))["cases"]
+            }
+
+        before = _fingerprints()
         await bench_store.export_fromweb("classify", [{**base, "id": "s2"}])
-        after = {
-            c["id"]: c["batch_fingerprint"]
-            for c in json.loads(path.read_text(encoding="utf-8"))["cases"]
-        }
-        assert after == before
+        assert _fingerprints() == before
 
         # 指纹材料不掺 origin：同 id 的同一批用例跨 origin 导出共享指纹。
         # 注意这只证明「同 id 集 ⇒ 同指纹」；跨构造器是否同 id 是另一层
@@ -268,14 +268,14 @@ class TestStore:
         fp_recorder = next(
             c["batch_fingerprint"]
             for c in json.loads(path.read_text(encoding="utf-8"))["cases"]
-            if c["id"] == "x1"
+            if c["id"] == "x1" and c["origin"] == "recorder"
         )
         await bench_store.export_fromweb("classify", [cross], origin="cards")
-        fp_cards = next(
-            c["batch_fingerprint"]
-            for c in json.loads(path.read_text(encoding="utf-8"))["cases"]
-            if c["id"] == "x1"
-        )
+        cases_now = json.loads(path.read_text(encoding="utf-8"))["cases"]
+        same_id = [c for c in cases_now if c["id"] == "x1"]
+        assert len(same_id) == 2, f"跨来源同 id 必须共存，实际 {len(same_id)} 条"
+        assert {c["origin"] for c in same_id} == {"cards", "recorder"}
+        fp_cards = next(c["batch_fingerprint"] for c in same_id if c["origin"] == "cards")
         assert fp_recorder == fp_cards
 
         # recorder 复用同一入口：显式声明来源与指纹（对照实验分母的载体）

@@ -166,15 +166,24 @@ async def _run_merge(case: MergeCase) -> BinaryCaseEval:
         except Exception:
             logger.debug("merge 基准预筛嵌入失败，本用例跳过预筛", exc_info=True)
         if vectors is not None and len(vectors) == 2:
-            cos = ai_ports.cosine_similarity(vectors[0], vectors[1])
-            if cos < config.merge_prefilter_threshold:
-                telemetry.record("merge.prefilter_skip")
-                return BinaryCaseEval(
-                    case_id=case.id,
-                    predicted=False,
-                    expected=case.expected.merge,
-                    skipped=True,
-                )
+            # 余弦计算与生产 `_candidate_cosine` 同口径地容错：坏向量（维度
+            # 不一致、含非数值）会让 cosine_similarity 抛异常。生产路径此时
+            # 降级为「不预筛、照常调判官」，基准必须镜像同一行为——否则供应
+            # 商返回异常向量时整个 merge benchmark 中止，而这恰恰是最需要
+            # 对照数据的情形（回归见 tests/test_benchmark_prefilter.py）。
+            try:
+                cos = ai_ports.cosine_similarity(vectors[0], vectors[1])
+            except Exception:
+                logger.debug("merge 基准预筛余弦计算失败，本用例跳过预筛", exc_info=True)
+            else:
+                if cos < config.merge_prefilter_threshold:
+                    telemetry.record("merge.prefilter_skip")
+                    return BinaryCaseEval(
+                        case_id=case.id,
+                        predicted=False,
+                        expected=case.expected.merge,
+                        skipped=True,
+                    )
     merged = await judge_merge(head_title, head_content, tail_title, tail_content)
     if merged is None:
         return BinaryCaseEval(

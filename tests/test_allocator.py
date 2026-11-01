@@ -91,6 +91,48 @@ class TestRebuild:
         assert second == -1
         assert al.allocator.stats()["rebuilt_pending"] is True
 
+    async def test_stale_rebuild_does_not_overwrite_newer(self):
+        """并发重建的代次守卫：旧任务晚到不得覆盖新缓存。
+
+        失败模式：连续两次类别变更各起一个 rebuild，二者都在 await 嵌入；
+        旧任务（样本含旧类名）若后完成，会把旧原型写回，缓存长期停在过期
+        口径。用可控的 await 顺序复现：先启动旧任务让它挂在嵌入上，再完整
+        跑完新任务，最后放行旧任务——旧任务必须返回 -3 且不改变缓存。
+        """
+        import asyncio
+
+        old_started = asyncio.Event()
+        release_old = asyncio.Event()
+
+        async def _embed(texts):
+            if texts == ["old-content"]:
+                old_started.set()
+                await release_old.wait()
+                return [_vec(0.1)]
+            return [_vec(0.9)]
+
+        with (
+            patch.object(al.ai_ports, "embed_texts", new=_embed),
+            patch.object(al.ai_ports, "is_embedding_enabled", return_value=True),
+        ):
+            old_task = asyncio.create_task(
+                al.allocator.rebuild(
+                    [{"category": "旧类名", "content": "old-content"}], force=True
+                )
+            )
+            await old_started.wait()
+            # 新任务先完成并提交
+            rc_new = await al.allocator.rebuild(
+                [{"category": "新类名", "content": "new-content"}], force=True
+            )
+            release_old.set()
+            rc_old = await old_task
+
+        assert rc_new == 1
+        assert rc_old == -3, "过期代次必须返回 -3 并丢弃结果"
+        cats = set(al.allocator.stats()["categories"])
+        assert cats == {"新类名"}, f"缓存被旧任务覆盖：{cats}"
+
 
 class TestAllocate:
     async def _seed(self, vectors_by_cat: dict[str, list[list[float]]]):
