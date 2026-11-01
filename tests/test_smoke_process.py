@@ -26,6 +26,163 @@ from scripts.smoke_process import (
     parse_status,
 )
 
+# ── 哨兵文件协议 ──
+# 子进程向测试进程传结果（PID / 进程树）靠哨兵文件。裸 write_text 会先 open('w')
+# 建出空文件、再写内容——测试侧若只判 exists() 就读取，会拿到空串或半截，实测
+# 300 次里 54 次读到脏内容（18%）。生产侧 smoke_process._publish 是「写 .tmp 再
+# os.replace」原子发布（见该模块 docstring 状态文件协议），测试哨兵必须同构：
+# 内容完整可见之前路径不存在，读侧永不见半成品。
+#
+# 为什么模板而不是共享函数：wrapper 以 `-I -S` 启动（隔离模式 + 禁用 site），
+# PYTHONPATH 与已安装包都不进 sys.path，导不到本仓模块；而 scripts/ 不随包分发，
+# 让 wrapper 依赖仓库代码会破坏它的自包含契约（wheel/干净环境路径会崩）。因此
+# 这里保留同构副本，并靠本注释锚定两边必须一致。
+#
+# 路径用 repr() 生成字面量而不是「字符串拼接 + r'' 原始串」：raw 串里写
+# `replace("'", "''")` 是错的——`r'it''s'` 会被解析成两个串拼接、撇号丢失
+# （`C:\Users\O'Brien\...` 变成 `C:\Users\OBrien\...`），脚本写到错误路径、
+# 测试只会超时。repr 一次性覆盖单引号、反斜杠、非 ASCII 等全部转义。
+#
+# 模块导入必须覆盖 payload 与 tail 的全部依赖：`time.sleep(...)` 缺
+# `import time` 是**运行期** NameError，编译期查不出来，而哨兵在崩溃前已写好
+# ——测试会读到 PID 并「通过」，实际测的是个已死的进程。
+_ATOMIC_WRITE_TEMPLATE = (
+    "from pathlib import Path; import json, os, time;"
+    " _t = Path({path_repr} + '.tmp'); _t.write_text({payload}, encoding='utf-8');"
+    " os.replace(_t, Path({path_repr}));"
+)
+
+
+def _atomic_sentinel_script(path: Path, payload: str, tail: str = "") -> str:
+    """构造「原子发布哨兵后继续执行」的子进程脚本片段。
+
+    payload 是单表达式源码；tail 为后续语句（会补分号分隔，调用方不要再带
+    前导分号，否则会生成 `;;` 语法错）。
+    """
+    body = _ATOMIC_WRITE_TEMPLATE.format(
+        path_repr=repr(str(path)), payload=payload
+    )
+    if not tail:
+        return body
+    return body + " " + tail.lstrip(";")
+
+
+def _wait_sentinel(path: Path, parse: Any, *, timeout: float = 10.0) -> Any:
+    """轮询到哨兵文件产出可解析内容为止，返回 parse 的结果。
+
+    parse 返回 None 表示「内容还不完整/不满足结构」，继续重试——不能直接把
+    None 当结果返回，否则「文件已出现但内容不合格」会变成立即失败而非重试。
+    抛 OSError/ValueError 同样视为未就绪。
+
+    原子发布下第一次读就该成功；重试只兜「文件尚未出现」，不再需要容忍半截
+    （但保留异常捕获作防御：将来若有人改回裸写，用例会退化成慢而不错，不会
+    变成必红）。超时用**单调钟**而非递减计数器——递减假设每轮恰好 sleep 那么
+    久，慢机器/CI 负载会把名义 10s 拉成几十秒，失败时表现为长时间挂起。
+    """
+    limit = time.monotonic() + timeout
+    while time.monotonic() < limit:
+        try:
+            value = parse(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            value = None
+        if value is not None:
+            return value
+        time.sleep(0.02)
+    raise AssertionError(f"哨兵未在 {timeout}s 内产出合法内容: {path.name}")
+
+
+class TestAtomicSentinelScript:
+    """哨兵脚本生成的守卫：编译期合法 ≠ 能跑。
+
+    两类真实踩过的坑都在这里钉死——它们在「测试通过」的表象下可以长期潜伏：
+    - 缺 `import time`：`time.sleep(...)` 是运行期 NameError，编译期查不出；
+      而哨兵在崩溃**之前**已写好，读侧拿到 PID 后断言仍成立，测的是死进程。
+    - 路径转义错：raw 串里 `replace("'", "''")` 会把 `O'Brien` 变成 `OBrien`
+      （`r'it''s'` 解析为两串拼接），脚本写到错误路径、读侧超时。
+    """
+
+    def test_generated_script_imports_everything_it_uses(self) -> None:
+        """脚本引用的模块必须都已导入（运行期 NameError 的静态拦截）。"""
+        import ast
+
+        cases = [
+            _atomic_sentinel_script(Path("x.pid"), "str(os.getpid())", "time.sleep(30)"),
+            _atomic_sentinel_script(Path("x.json"), "json.dumps([os.getpid()])"),
+        ]
+        for script in cases:
+            tree = ast.parse(script)
+            imported: set[str] = set()
+            assigned: set[str] = set()
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Import):
+                    imported.update(a.name.split(".")[0] for a in node.names)
+                elif isinstance(node, ast.ImportFrom) and node.module:
+                    imported.add(node.module.split(".")[0])
+                elif isinstance(node, (ast.Assign, ast.AnnAssign)):
+                    targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+                    for t in targets:
+                        if isinstance(t, ast.Name):
+                            assigned.add(t.id)
+            # 只看「未在本脚本赋值的模块属性访问」：`_t.write_text` 是局部变量
+            # 的方法调用，不是模块；`time.sleep` / `os.getpid` / `json.dumps`
+            # 才需要 import
+            used = {
+                node.value.id
+                for node in ast.walk(tree)
+                if isinstance(node, ast.Attribute)
+                and isinstance(node.value, ast.Name)
+                and node.value.id not in assigned
+            }
+            missing = used - imported
+            assert not missing, f"脚本使用了未导入的模块 {missing}：{script}"
+
+    def test_apostrophe_in_path_survives_roundtrip(self) -> None:
+        """含撇号的路径必须原样落地（Windows 用户名 `O'Brien` 是真实场景）。
+
+        旧写法 `str(path).replace("'", "''")` 塞进 `r'...'` 里会被解析成两段
+        字符串拼接、撇号丢失（`O'Brien` → `OBrien`），脚本写到错误路径。
+        """
+        import subprocess
+        import tempfile
+
+        awkward_dir = Path.home() / "it's a dir"  # 只用于构造字符串，不实际创建
+        awkward = awkward_dir / "sentinel.pid"
+        script = _atomic_sentinel_script(awkward, "str(os.getpid())")
+        # 直接读回脚本里的字面量：整段脚本编译后，第一个 Path() 的参数即原路径
+        assert repr(str(awkward)) in script, (
+            f"路径未被 repr 原样写入脚本：期望包含 {str(awkward)!r}，实际 {script}"
+        )
+        # 端到端跑一次：把 awkward 换成真实临时目录下的同名上级路径
+        real_dir = Path(tempfile.mkdtemp(prefix="it's-"))
+        try:
+            real_sentinel = real_dir / "sentinel.pid"
+            ok_script = _atomic_sentinel_script(
+                real_sentinel, "str(os.getpid())", "time.sleep(0.05)"
+            )
+            result = subprocess.run(
+                [sys.executable, "-c", ok_script], capture_output=True, timeout=30, check=False
+            )
+            assert result.returncode == 0, result.stderr.decode()[:400]
+            assert real_sentinel.exists(), f"哨兵未写到正确路径（实际目录内容：{list(real_dir.iterdir())}）"
+            assert int(real_sentinel.read_text(encoding="utf-8")) > 0
+        finally:
+            import shutil
+
+            shutil.rmtree(real_dir, ignore_errors=True)
+
+    def test_sentinel_script_runs_and_publishes(self, tmp_path: Path) -> None:
+        """端到端：真跑一次生成的脚本，确认能写出合法 PID（覆盖运行期错误）。"""
+        sentinel = tmp_path / "sentinel.pid"
+        script = _atomic_sentinel_script(sentinel, "str(os.getpid())", "time.sleep(0.1)")
+        import subprocess
+
+        result = subprocess.run(
+            [sys.executable, "-c", script], capture_output=True, timeout=30, check=False
+        )
+        assert result.returncode == 0, f"子进程失败: {result.stderr.decode()[:400]}"
+        assert sentinel.exists(), "哨兵未写出"
+        assert int(sentinel.read_text(encoding="utf-8")) > 0
+
 
 class TestParseStatus:
     def test_exit_status_accepts_integer(self) -> None:
@@ -152,14 +309,13 @@ class TestSpawnReleaseOrdering:
     @pytest.mark.skipif(sys.platform != "win32", reason="Windows Job 路径")
     def test_real_command_pid_is_inside_the_job(self, root: Path) -> None:
         """真实命令的 PID 必须在 Job 内（ActiveProcesses 计数抓不到「只有 wrapper
-        在内」的错序，必须按 PID 查）。同步手法：命令先写哨兵文件再阻塞，测试轮询
-        哨兵出现后按其中记录的 PID 查归属——start_app 立即返回，恰好提供断言窗口。
+        在内」的错序，必须按 PID 查）。同步手法：命令先原子发布哨兵文件再阻塞，
+        测试轮询哨兵可解析后按其中记录的 PID 查归属——start_app 立即返回，恰好
+        提供断言窗口。
         """
         sentinel = root / "sentinel.pid"
-        script = (
-            "from pathlib import Path; import os, time;"
-            + " Path(r'" + str(sentinel).replace("'", "''") + "').write_text(str(os.getpid()));"
-            + " time.sleep(30)"
+        script = _atomic_sentinel_script(
+            sentinel, "str(os.getpid())", "time.sleep(30)"
         )
         cmds = SmokeCommands(root)
         owned = cmds.start_app(
@@ -168,12 +324,8 @@ class TestSpawnReleaseOrdering:
             cwd=root,
         )
         try:
-            deadline = 10.0
-            while not sentinel.exists() and deadline > 0:
-                time.sleep(0.05)
-                deadline -= 0.05
-            assert sentinel.exists(), "实际命令未在期限内启动"
-            pid = int(sentinel.read_text(encoding="utf-8"))
+            pid = _wait_sentinel(sentinel, int)
+            assert pid > 0, "实际命令未写出合法 PID"
             assert owned._job_handle is not None, "Windows 上必须已指进 Job"
             assert smoke_process._process_in_job(
                 owned._job_handle, pid
@@ -295,42 +447,32 @@ class TestJobCleanupConfirmsZero:
             "import json, os, subprocess, sys, time\n"
             "from pathlib import Path\n"
             "grand = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])\n"
-            "Path(r'" + str(sentinel) + "').write_text("
-            "json.dumps([os.getpid(), grand.pid]), encoding='utf-8')\n"
-            "time.sleep(5.0)\n"
+            + _atomic_sentinel_script(sentinel, "json.dumps([os.getpid(), grand.pid])")
+            + "\ntime.sleep(5.0)\n"
         )
         cmds = SmokeCommands(root)
         owned = cmds.start_app([sys.executable, "-c", child_code], env=dict(os.environ), cwd=root)
         try:
-            # 哨兵用 write_text 直接发布：「文件已存在但内容未写完」的窗口会让读取拿到
-            # 空串或半截内容，轮询必须容忍并重试。
-            pids: list[int] = []
-            deadline = 20.0
-            while len(pids) != 2 and deadline > 0:
-                try:
-                    loaded = json.loads(sentinel.read_text(encoding="utf-8"))
-                except (OSError, ValueError):
-                    loaded = None
+            # 哨兵已原子发布，读侧不会见半成品；_wait_sentinel 只兜「尚未出现」。
+            def _pid_pair(text: str) -> list[int] | None:
+                loaded = json.loads(text)
                 if isinstance(loaded, list) and len(loaded) == 2 and all(
                     isinstance(pid, int) for pid in loaded
                 ):
-                    pids = loaded
-                else:
-                    time.sleep(0.05)
-                    deadline -= 0.05
-            assert len(pids) == 2, "直接子进程未在期限内写出完整进程树哨兵"
+                    return loaded
+                return None
+
+            pids = _wait_sentinel(sentinel, _pid_pair, timeout=20.0)
+            assert pids is not None, "哨兵未产出完整进程树"
             child_pid, grand_pid = pids
             job = owned._job_handle
             assert job is not None, "Windows 上必须已指进 Job"
             assert smoke_process._process_in_job(job, child_pid), "直接子进程不在 Job 内"
             assert smoke_process._process_in_job(job, grand_pid), "孙进程不在 Job 内"
 
-            # 状态文件发布即代表 wrapper 已等到直接子进程结束
-            deadline = 20.0
-            while not owned.status_path.exists() and deadline > 0:
-                time.sleep(0.05)
-                deadline -= 0.05
-            assert owned.status_path.exists(), "wrapper 未在期限内发布完成状态"
+            # 状态文件发布即代表 wrapper 已等到直接子进程结束（生产侧 _publish
+            # 已是原子发布，此处只需要等它出现；空内容不算就绪）。
+            _wait_sentinel(owned.status_path, lambda s: s or None, timeout=20.0)
 
             real_close = smoke_process._close_handle
             sampled: list[int | None] = []
