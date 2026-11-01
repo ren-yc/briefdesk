@@ -30,6 +30,7 @@ from briefdesk.ai_ports import (
 from briefdesk.config import config
 from briefdesk.db import (
     ItemInput,
+    ItemText,
     get_all_item_texts,
     get_existing_item_ids,
     load_embeddings,
@@ -212,13 +213,29 @@ class DedupEngine(DedupService):
                 return
             await self._ensure_cache()
 
+    async def _load_cache_rows(self) -> list[ItemText]:
+        """缓存装载的取数接缝：默认全量已处理卡片。
+
+        这层接缝存在的理由：基准判重用例需要「只看得到本用例那几条 item」的
+        缓存视图。没有接缝时只能靠「每例删库 + 强制串行」间接达成隔离——那把
+        隔离押在执行顺序上，`--concurrency>1` 就失效（并发用例互相看得见对方的
+        item，判重命中的是别人的卡片）。子类覆写本方法可把可见集合变成构造期
+        常量，与调度顺序、并发度、上一例是否失败全部无关。
+
+        生产路径不覆写：行为与接缝引入前逐字节一致（同一条 SQL、同一顺序）。
+        覆写只应改变「取哪些行」，不得改变返回形状——少一个字段会让缓存条目
+        静默缺内容（content_hash 缺 → 原文哈希短路失效）。
+        """
+        return await get_all_item_texts()
+
     async def _ensure_cache(self) -> None:
-        """从当前连接加载全量卡片与嵌入，重建缓存。
+        """从当前连接加载卡片与嵌入，重建缓存。
 
         缓存只从**当前连接**加载：基准判重用例经 _ProbeDedupEngine（本类子类）走
-        check_dedup → ensure_cache → 本方法，从基准自己的 scratch 库取卡片。
+        check_dedup → ensure_cache → 本方法，从基准自己的 scratch 库取卡片，并按
+        `_load_cache_rows` 接缝把可见集合收窄到本用例的 items。
         """
-        items = await get_all_item_texts()
+        items = await self._load_cache_rows()
         self._cache = [
             CachedItem(
                 id=it["id"],

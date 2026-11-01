@@ -8,6 +8,7 @@ from typing import Any
 
 from briefdesk.logger import fmt_dur
 from briefdesk.plugins.benchmark.metrics import (
+    DEDUP_CHANNELS,
     BinaryCaseEval,
     ClassifyCaseEval,
     TitleCaseEval,
@@ -27,7 +28,8 @@ _FEATURE_METRIC_LABELS: dict[str, list[tuple[str, str]]] = {
         ("category_recall", "类别召回率"),
         ("category_f1", "类别 F1"),
         ("time_msg_accuracy", "时间点完全一致率"),
-        ("time_point_recall", "时间点召回率"),
+        ("time_point_recall", "时间点召回率(含回声)"),
+        ("time_point_recall_ex_echo", "时间点召回率(剔回声)"),
         ("time_point_precision", "时间点精确率"),
         ("failure_rate", "本轮失败率"),
         ("summary_fill_rate", "标题概括填充率"),
@@ -37,6 +39,7 @@ _FEATURE_METRIC_LABELS: dict[str, list[tuple[str, str]]] = {
         ("precision", "判重精确率(same)"),
         ("recall", "判重召回率(same)"),
         ("f1", "判重 F1"),
+        ("ai_judged_rate", "AI 判定用例占比"),
     ],
     "merge": [
         ("accuracy", "判定准确率"),
@@ -45,8 +48,9 @@ _FEATURE_METRIC_LABELS: dict[str, list[tuple[str, str]]] = {
         ("f1", "判定 F1"),
     ],
     "title": [
-        ("exact_match_rate", "精确匹配率"),
         ("keyword_hit_rate", "关键词命中率"),
+        ("char_similarity_mean", "字符相似度均值"),
+        ("char_similarity_p50", "字符相似度中位数"),
         ("avg_len", "平均长度(字)"),
         ("too_long_count", "超长(>30字)数"),
         ("fallback_count", "回退原标题数"),
@@ -57,10 +61,15 @@ _FEATURE_METRIC_LABELS: dict[str, list[tuple[str, str]]] = {
 # 比例类指标：乘 100 加百分号。其余是计数或**字数**，不能按比例渲染。
 _RATE_KEYS = {
     "category_accuracy", "category_precision", "category_recall", "category_f1",
+    "category_recall_incl_placeholder",
     "time_msg_accuracy", "time_point_recall", "time_point_precision",
+    "time_point_recall_ex_echo", "time_point_recall_date_ex_echo",
+    "time_point_recall_clock_ex_echo",
     "failure_rate", "summary_fill_rate",
-    "accuracy", "precision", "recall", "f1",
-    "exact_match_rate", "keyword_hit_rate",
+    "accuracy", "precision", "recall", "f1", "ai_judged_rate",
+    "keyword_hit_rate",
+    # 字符相似度是 0~1 的比值，按比例显示才与同表的其它比率可比
+    "char_similarity_mean", "char_similarity_p50",
 }
 
 
@@ -94,11 +103,15 @@ def render_case_lines(feature: str, evals: list[Any]) -> list[str]:
             detail = f"错误: {e.error}"
         elif feature == "classify":
             assert isinstance(e, ClassifyCaseEval)
+            mode = f"[{e.mode}] " if e.mode else ""
+            # 纯占位符用例仍逐行显示，但标明不进主指标——读者看到"命中 0"时
+            # 需要知道这是结构性不可能，而不是模型失败
+            note = "（纯占位符，不进主指标）" if e.placeholder_only else ""
             detail = (
-                f"期望 {e.expected_count} 条，命中 {e.hits}，"
+                f"{mode}期望 {e.expected_count} 条，命中 {e.hits}，"
                 f"模型分类 {e.model_count}（误报 {e.false_positives}），"
                 f"时间 {e.time_msgs_ok}/{e.time_msgs_expected} 条完全一致，"
-                f"失败 {e.failed}"
+                f"失败 {e.failed}{note}"
             )
             if e.hits == e.expected_count and e.false_positives == 0:
                 mark = "✔"
@@ -106,7 +119,10 @@ def render_case_lines(feature: str, evals: list[Any]) -> list[str]:
             assert isinstance(e, BinaryCaseEval)
             mark = "✔" if e.predicted == e.expected else "✘"
             skip = "（预筛跳过，未触发 AI）" if e.skipped else ""
-            detail = f"判定 {e.predicted}，期望 {e.expected}{skip}"
+            # 通道逐例写出来：只给汇总分布时，"个别用例走了意外通道"看不出来，
+            # 而那正是判重错例最常见的成因（嵌入维度不一致、外来候选）
+            channel = f" 通道={e.channel}" if e.channel else ""
+            detail = f"判定 {e.predicted}，期望 {e.expected}{skip}{channel}"
         elif feature == "merge":
             assert isinstance(e, BinaryCaseEval)
             mark = "✔" if e.predicted == e.expected else "✘"
@@ -124,42 +140,138 @@ def render_case_lines(feature: str, evals: list[Any]) -> list[str]:
                     detail += f"，期望 {e.expected_title!r}"
                 if e.expected_keywords:
                     detail += f"，关键词 {e.expected_keywords}"
-                if e.exact_hit or e.keyword_hit:
+                if e.char_similarity is not None:
+                    detail += f"，字符相似 {e.char_similarity:.2f}"
+                if e.keyword_hit or e.soft_hit:
                     mark = "✔"
         lines.append(f"  [{mark}] {e.case_id}  {detail}")
     return lines
 
 
+def _mode_lines(summary: dict[str, float | int]) -> list[str]:
+    """classify 的分 mode 小表（旧 payload 没有 by_mode → 不输出）。"""
+    by_mode = summary.get("by_mode")
+    if not isinstance(by_mode, dict) or not by_mode:
+        return []
+    lines = ["  -- 分 mode（类别召回 / 精确 / 误报）--"]
+    for mode, stats in by_mode.items():
+        if not isinstance(stats, dict):
+            continue
+        recall = float(stats.get("category_recall", 0) or 0) * 100
+        precision = float(stats.get("category_precision", 0) or 0) * 100
+        lines.append(
+            f"  {mode:<10} 召回 {recall:5.1f}%  精确 {precision:5.1f}%  "
+            f"命中 {stats.get('hits', 0)}/{stats.get('expected', 0)}  "
+            f"误报 {stats.get('false_positives', 0)}  "
+            f"用例 {stats.get('cases', 0)}"
+        )
+    return lines
+
+
 def render_metrics(feature: str, summary: dict[str, float | int]) -> list[str]:
+    """指标表 + 该功能的补充行。
+
+    补充行一律走 `.get` 并"缺键就不写这行"：报告 JSON 会长期落盘，旧运行的
+    payload 没有本轮新增的键，渲染历史报告不能因为少一个键而抛 KeyError。
+    """
     lines: list[str] = []
     for key, label in _FEATURE_METRIC_LABELS.get(feature, []):
         value = summary.get(key, 0)
         lines.append(f"  {label:<14} {format_metric(key, value)}")
     extra: list[str] = []
     if feature == "classify":
+        noise = summary.get("false_positives_noise")
+        partial = summary.get("false_positives_partial")
+        # 误报拆两类才谈得上修法：全噪声用例里的误报是"把闲聊当信息"，部分期望
+        # 用例里的是"同批多分了别条"；只给总数时两者混成一个数，看不出该改哪边。
+        split = (
+            f"，其中噪声用例 {noise} / 部分期望用例 {partial}"
+            if noise is not None and partial is not None
+            else ""
+        )
         extra = [
             (
-                f"  期望分类 {summary['expected']} 条 / 模型输出 "
-                f"{summary['model_classified']} 条（误报 {summary['false_positives']}）"
+                f"  期望分类 {summary.get('expected', 0)} 条 / 模型输出 "
+                f"{summary.get('model_classified', 0)} 条"
+                f"（误报 {summary.get('false_positives', 0)}{split}）"
             ),
-            f"  用例 {summary['cases']} 条（出错 {summary['error_cases']}）",
         ]
+        echo = summary.get("time_points_echo")
+        if echo:
+            extra.append(
+                f"  时间点回声（期望值=消息发送时间，非正文抽取）: {echo} 点，"
+                f"剔回声召回 {format_metric('time_point_recall_ex_echo', summary.get('time_point_recall_ex_echo', 0))}"
+                f"（date-only {format_metric('time_point_recall_date_ex_echo', summary.get('time_point_recall_date_ex_echo', 0))}"
+                f" / 带时刻 {format_metric('time_point_recall_clock_ex_echo', summary.get('time_point_recall_clock_ex_echo', 0))}）"
+            )
+        ph_cases = summary.get("placeholder_only_cases")
+        if ph_cases:
+            extra.append(
+                f"  纯占位符用例 {ph_cases} 条（期望 {summary.get('placeholder_only_expected', 0)} 条）"
+                "已从主指标剔除；含其召回 "
+                + format_metric(
+                    "category_recall_incl_placeholder",
+                    summary.get("category_recall_incl_placeholder", 0),
+                )
+            )
+        extra += _mode_lines(summary)
+        extra.append(
+            f"  用例 {summary.get('cases', 0)} 条（出错 {summary.get('error_cases', 0)}）"
+        )
     elif feature in ("dedup", "merge"):
         extra = [
-            f"  TP {summary['tp']} / FP {summary['fp']} / TN {summary['tn']} / FN {summary['fn']}",
-            f"  用例 {summary['cases']} 条（出错 {summary['error_cases']}）",
+            (
+                f"  TP {summary.get('tp', 0)} / FP {summary.get('fp', 0)}"
+                f" / TN {summary.get('tn', 0)} / FN {summary.get('fn', 0)}"
+            ),
+            f"  用例 {summary.get('cases', 0)} 条（出错 {summary.get('error_cases', 0)}）",
         ]
-        # dedup 的「预筛跳过」= 候选门禁未触发 AI；merge 的 = 余弦预筛门拦下
+        # 两条功能的 skipped 含义不同，必须分开措辞：dedup 的零判官路径有三种
+        # （图片/原文哈希短路、判官负缓存命中、候选门直接拒绝），前两种是**正确
+        # 且省钱的判定**，第三种才是"没比成"；merge 的只有余弦预筛门一种。写成
+        # 一句"预筛跳过"会把短路误读成漏判。
         if summary.get("skipped"):
-            extra.append(f"  预筛跳过（未触发 AI 判定）: {summary['skipped']} 条")
+            if feature == "dedup":
+                extra.append(
+                    f"  未触发判官: {summary['skipped']} 条"
+                    "（含精确短路/判官负缓存/候选门拒绝，逐条见通道分布）"
+                )
+            else:
+                extra.append(f"  预筛跳过（未触发 AI 判定）: {summary['skipped']} 条")
+        # 通道分布 + AI 成本：阈值是判定行为的一部分，不写出这两行就无法把
+        # "召回低"归因给判官还是门禁，也看不见放宽门禁换来的 AI 调用代价
+        if "ai_judged_cases" in summary:
+            extra.append(
+                f"  经判官裁决的用例 {summary.get('ai_judged_cases', 0)} 条"
+                f"（占比 {format_metric('ai_judged_rate', summary.get('ai_judged_rate', 0))}；"
+                "一例可对多个候选各调一次，不是 API 调用上限"
+            )
+            channels = [
+                f"{channel} {summary[f'channel_{channel}']}"
+                for channel in DEDUP_CHANNELS
+                if summary.get(f"channel_{channel}")
+            ]
+            if channels:
+                extra.append("  判定通道: " + " / ".join(channels))
+            if "cosine_cases" in summary:
+                extra.append(
+                    f"  余弦链路跑通的用例: {summary.get('cosine_cases', 0)} 条"
+                )
     elif feature == "title":
         extra = [
             (
-                f"  精确匹配用例 {summary['exact_match_cases']} 条 / "
-                f"关键词用例 {summary['keyword_hit_cases']} 条"
+                f"  关键词用例 {summary.get('keyword_hit_cases', 0)} 条 / "
+                f"字符相似用例 {summary.get('char_similarity_cases', 0)} 条"
             ),
-            f"  用例 {summary['cases']} 条（出错 {summary['error_cases']}）",
         ]
+        if summary.get("title_only_cases"):
+            extra.append(
+                f"  仅标题期望用例 {summary['title_only_cases']} 条，"
+                f"软通过（字符相似达描述线）{summary.get('title_only_soft_pass', 0)} 条"
+            )
+        extra.append(
+            f"  用例 {summary.get('cases', 0)} 条（出错 {summary.get('error_cases', 0)}）"
+        )
     return lines + extra
 
 

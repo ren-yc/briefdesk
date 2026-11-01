@@ -123,7 +123,12 @@
             const key = f === "title" ? "keyword_hit_rate" : f === "classify" ? "category_accuracy" : "accuracy";
             const v = s && s[key];
             const pct = typeof v === "number" ? (v * 100).toFixed(1) + "%" : "-";
-            return f + " " + pct;
+            // classify 的 category_accuracy 键名未变，但分母已剔除纯占位符用例
+            // （正文全是 [图片] 一类占位符，生产里进不了分类阶段）。跨运行对比时
+            // 不标出来就会把口径变化读成模型表现变化——这里只在确实剔除过时加注，
+            // 老报告没有该键，保持原样。
+            const ph = f === "classify" && s ? s.placeholder_only_cases : 0;
+            return f + " " + pct + (ph ? "（已剔除 " + ph + " 条纯占位符用例）" : "");
           });
           let durText = "";
           if (typeof st.elapsed_sec === "number" && isFinite(st.elapsed_sec)) {

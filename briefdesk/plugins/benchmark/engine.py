@@ -14,23 +14,27 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import functools
 import logging
 import time
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from briefdesk import ai_ports, telemetry
 from briefdesk.config import config
-from briefdesk.db import insert_item
+from briefdesk.db import ItemText, delete_items, get_item_texts_by_ids, insert_item
 from briefdesk.plugins.benchmark.metrics import (
     BinaryCaseEval,
     ClassifyCaseEval,
     TitleCaseEval,
     aggregate_binary,
     aggregate_classify,
+    aggregate_dedup,
     aggregate_title,
     evaluate_classify_case,
+    title_char_similarity,
 )
 from briefdesk.plugins.benchmark.schema import (
     BaseCase,
@@ -41,8 +45,10 @@ from briefdesk.plugins.benchmark.schema import (
     MergeCase,
     TitleCase,
     card_fields,
+    conflicting_dedup_case_ids,
     load_dataset_file,
     parse_cases,
+    shared_dedup_item_keys,
 )
 from briefdesk.plugins.classify.engine import classify_batch
 from briefdesk.plugins.dedup.engine import (
@@ -61,6 +67,35 @@ FEATURES: tuple[str, ...] = ("classify", "dedup", "merge", "title")
 FROMWEB_SOURCE_LABEL = "cases/*.fromweb.json"  # 网页导出用例的 dataset 标识（报告/JSON 溯源）
 
 
+def provider_label(api_base: str) -> str:
+    """端点的脱敏归类：只输出 `ollama` / `deepseek` / `custom`，空配置输出空串。
+
+    为什么报告需要这一位：同一个模型名打到本机 ollama 与云端 API 的结果不可互比，
+    而报告此前只记 `model`——两轮看起来同配置、实为不同供应商，事后无从分辨，
+    回归对比就在比较两件不同的事。曾经直接记 `ai_api_base` 又走得太远：完整 URL
+    含主机名与端口（内网自建服务时就是内网拓扑），而报告 JSON 会长期留在用户目录、
+    也可能被贴进 issue，属隐私面。枚举是这两者之间唯一站得住的取舍。
+
+    解析用 `urlsplit`：无 scheme 的写法（`localhost:11434`）会被当成
+    scheme='localhost'、hostname 为 None → 归 `custom`。不猜、不补 scheme——
+    补出来的归类会让读者误信「这就是本机 ollama」。
+    """
+    if not api_base:
+        return ""
+    try:
+        parsed = urlsplit(api_base)
+        port = parsed.port
+    except ValueError:
+        # 端口越界等畸形 URL：降级 custom，绝不让基准因为一行配置而整轮失败
+        return "custom"
+    host = (parsed.hostname or "").lower()
+    if port == 11434 or "ollama" in host:
+        return "ollama"
+    if "deepseek" in host:
+        return "deepseek"
+    return "custom"
+
+
 def benchmark_config_snapshot() -> dict[str, Any]:
     """返回不含密钥和 API 地址的实验配置快照。"""
     return {
@@ -73,6 +108,10 @@ def benchmark_config_snapshot() -> dict[str, Any]:
         "embedding_enabled": bool(config.embed_api_base),
         "embedding_model": config.embed_model,
         "embedding_batch_size": config.embed_batch_size,
+        # 供应商归类（脱敏）：与 embedding_enabled 布尔并排看，才能区分
+        # 「本机 bge-m3」与「云端嵌入服务」——两者同名模型、不同判重表现
+        "chat_provider": provider_label(config.ai_api_base),
+        "embed_provider": provider_label(config.embed_api_base),
         "dedup_similarity_threshold": config.dedup_similarity_threshold,
         "dedup_embed_threshold": config.dedup_embed_threshold,
         "dedup_embed_top_k": config.dedup_embed_top_k,
@@ -100,15 +139,69 @@ class CaseProgress:
 
 
 class _ProbeDedupEngine(DedupEngine):
-    """记录 AI 判定调用次数：ai_calls == 0 表示候选预筛直接跳过（未触发 AI）。"""
+    """基准判重探针：把缓存可见集合收窄到本用例，并记录实际判定通道。
 
-    def __init__(self) -> None:
+    三件事都由探针做，不改生产语义：
+
+    - **作用域**（`_load_cache_rows`）：每例新建引擎、但库是共享的 scratch 库，
+      默认接缝加载**全部历史行**——含此前所有用例插入的 items。实测一轮真实
+      基准：116 个进入 AI 的用例里只有 18 例命中自己的 item，其余 98 例命中
+      别人的卡片，外来候选直接贡献 14 例错判。这不是"多测了一点"，是在测另
+      一件事。
+    - **AI 调用计数**（`_ask_ai`）：`ai_calls == 0` 表示候选门直接跳过判定。
+    - **通道与余弦健康度**（`_exact_shortcut` / `_select_candidates`）：配置写了
+      `EMBED_API_BASE` 不代表这轮真走了余弦——基准历史上从不传 `q_emb`，整轮
+      都在重叠通道上跑，报告却显示"嵌入开启"。只有逐例记下实际通道，这类测量
+      链路缺陷才自证得了。
+
+    覆写私有方法是**刻意**取舍：通道信息只在候选选取那一刻存在，抬成生产 API
+    （`DedupResult.channel`）会牵动 types 契约与五个判定出口——为一个观测需求
+    改动判定链路更不值。本类已有 `_ask_ai` 覆写先例。
+    """
+
+    def __init__(self, item_ids: list[str] | None = None) -> None:
         super().__init__()
         self.ai_calls = 0
+        self.channel = ""
+        self.cosine_ran = False
+        self._scope_ids = list(item_ids or [])
 
     async def _ask_ai(self, a: CachedItem, b_title: str, b_quote: str) -> bool | None:
         self.ai_calls += 1
         return await super()._ask_ai(a, b_title, b_quote)
+
+    async def _load_cache_rows(self) -> list[ItemText]:
+        """只取本用例的 items（未给作用域时回退生产的全量取数）。"""
+        if not self._scope_ids:
+            return await super()._load_cache_rows()
+        return await get_item_texts_by_ids(self._scope_ids)
+
+    def _exact_shortcut(
+        self,
+        image_urls: list[str] | None,
+        source: str,
+        source_quote: str,
+    ) -> tuple[CachedItem, str] | None:
+        hit = super()._exact_shortcut(image_urls, source, source_quote)
+        if hit is not None:
+            self.channel = "exact"
+        return hit
+
+    def _select_candidates(
+        self, title: str, q_emb: list[float] | None
+    ) -> tuple[list[tuple[CachedItem, float]], str, bool]:
+        candidates, metric, cosine_ran = super()._select_candidates(title, q_emb)
+        self.cosine_ran = cosine_ran
+        # 零候选时不能用 metric 反推通道：生产在「余弦零候选 → 重叠兜底命中」
+        # 那一支会把 metric 改写回 overlap，"余弦其实跑过"的事实就丢了（同一
+        # 陷阱见 _select_candidates 里公告撤销判据的注释）。
+        if candidates:
+            self.channel = metric
+        elif cosine_ran:
+            self.channel = "cosine_no_candidate"
+        else:
+            self.channel = "none"
+        return candidates, metric, cosine_ran
 
 
 async def _run_classify(case: ClassifyCase) -> ClassifyCaseEval:
@@ -117,32 +210,60 @@ async def _run_classify(case: ClassifyCase) -> ClassifyCaseEval:
     return evaluate_classify_case(case, outcome)
 
 
-async def _run_dedup(case: DedupCase) -> BinaryCaseEval:
+async def _run_dedup(case: DedupCase, *, recycle: bool = True) -> BinaryCaseEval:
     # 与真实管道同路径：items 先作为"已有卡片"入库（dedup 缓存预热从库加载），
     # 再对 query 做候选预筛 + AI 判重。类别对判重无影响，统一用默认值。
-    engine = _ProbeDedupEngine()
-    for item in case.items:
-        msg = item.to_internal()
-        title, _content = card_fields(item)
-        await insert_item(
-            build_item_input(
-                msg, ClassifyResult(msg_index=0, category="活动通知"), title
+    item_ids: list[str] = []
+    try:
+        # 插入也在 try 内：中途抛异常时已插入的行照样要回收——异常由 _guarded 收成
+        # error 用例、不向上冒泡，这一步不删就会一路留到整轮结束
+        for item in case.items:
+            msg = item.to_internal()
+            title, _content = card_fields(item)
+            item_ids.append(
+                await insert_item(
+                    build_item_input(
+                        msg, ClassifyResult(msg_index=0, category="活动通知"), title
+                    )
+                )
             )
+        engine = _ProbeDedupEngine(item_ids)
+        # 预热是拿到 q_emb 的前提，不是性能优化：preembed_batch 首行判
+        # _embed_cache_ok，缓存未加载时它恒返回 None——省掉这一步，基准会在
+        # 「配置了嵌入、实际全程走字符重叠」的假象下跑完整轮（正是那个历史缺陷
+        # 的另一半）。生产不需显式预热，因为 dedup 插件 setup 已在服务启动前做过。
+        await engine.ensure_cache()
+        q_title, q_content = card_fields(case.query)
+        # 与生产 before_run 同口径：锁外批量预嵌，未启用/失败回退重叠通道。绝不
+        # 在 check_dedup 内补嵌入——存储锁内禁远程嵌入是生产约束，不为基准放宽。
+        embeddings = await engine.preembed_batch([(q_title, q_content)])
+        q_emb = embeddings[0] if embeddings else None
+        result = await engine.check_dedup(
+            q_title,
+            source_group=case.query.group_name or "bench",
+            q_emb=q_emb,
+            source_quote=q_content,
+            image_urls=list(case.query.image_urls) or None,
+            source=case.query.source,
         )
-    q_title, q_content = card_fields(case.query)
-    result = await engine.check_dedup(
-        q_title,
-        source_group=case.query.group_name or "bench",
-        source_quote=q_content,
-        image_urls=list(case.query.image_urls) or None,
-        source=case.query.source,
-    )
-    return BinaryCaseEval(
-        case_id=case.id,
-        predicted=result.is_duplicate,
-        expected=case.expected.same,
-        skipped=engine.ai_calls == 0,
-    )
+        return BinaryCaseEval(
+            case_id=case.id,
+            predicted=result.is_duplicate,
+            expected=case.expected.same,
+            skipped=engine.ai_calls == 0,
+            channel=engine.channel,
+            cosine_ran=engine.cosine_ran,
+        )
+    finally:
+        # 回收只为控制 scratch 库体积：不回收则每例 ensure_cache 都要把全表向量
+        # 读一遍（load_embeddings 没有按 id 过滤的入口），用例越多越慢。
+        # 但**共享卡片时一律不删**——两条用例的 items 用同一 (source, msg_id) 时
+        # insert_item 的冲突分支会让两边拿到同一个行 id，谁先跑完谁删，另一条还
+        # 没判的用例就取到空缓存、静默判成「无候选」：作用域没错，是被别人拆了台。
+        # 调用方按数据集算出 recycle（见 _run_feature），键全唯一才回收。
+        # 删在 finally：异常用例也不能把残行留给下一例。
+        if recycle:
+            await delete_items(item_ids)
 
 
 async def _run_merge(case: MergeCase) -> BinaryCaseEval:
@@ -209,6 +330,7 @@ async def _run_title(case: TitleCase) -> TitleCaseEval:
         output=output,
         expected_title=case.expected.title,
         expected_keywords=case.expected.keywords or [],
+        char_similarity=title_char_similarity(output, case.expected.title),
     )
 
 
@@ -248,6 +370,18 @@ async def _run_feature(
     done = 0
     failed = 0
 
+    runner: Any = _RUNNERS[feature]
+    if feature == "dedup":
+        # 回收策略按**整批**用例算，不能按单条：共享卡片的危害发生在两条用例之间
+        # （先跑完的那条删掉两边共用的行），单条用例看不出自己是不是共享方。
+        recycle = not shared_dedup_item_keys(cases)
+        if not recycle:
+            logger.info(
+                "dedup 用例跨例共享历史卡片，本轮不回收 scratch 行"
+                "（避免先跑完的用例把共用卡片删掉、让后跑的用例取到空缓存）"
+            )
+        runner = functools.partial(runner, recycle=recycle)
+
     async def _guarded(worker: Any, case: BaseCase) -> Any:
         nonlocal done, failed
         async with sem:
@@ -267,14 +401,19 @@ async def _run_feature(
             )
         return ev
 
-    return await asyncio.gather(*[_guarded(_RUNNERS[feature], c) for c in cases])
+    return await asyncio.gather(*[_guarded(runner, c) for c in cases])
 
 
-def _aggregate(feature: str, evals: list[Any]) -> dict[str, float | int]:
+def _aggregate(feature: str, evals: list[Any]) -> dict[str, Any]:
+    """按功能聚合。返回类型放宽：classify 的 summary 含嵌套的 by_mode 表。"""
     if feature == "classify":
         return aggregate_classify(evals)  # type: ignore[arg-type]
     if feature == "title":
         return aggregate_title(evals)  # type: ignore[arg-type]
+    if feature == "dedup":
+        # dedup 走自己的聚合：除二元指标外还要通道分布与 AI 调用成本。与 merge
+        # 分开的另一个理由是 merge 的摘要不该长出一堆恒为 0 的 channel_* 键。
+        return aggregate_dedup(evals)  # type: ignore[arg-type]
     return aggregate_binary(evals)  # type: ignore[arg-type]
 
 
@@ -308,6 +447,22 @@ async def load_web_cases(
     cases, errors = bench_store.parse_cases_with_errors(feature, raw_cases)
     for err in errors:
         logger.warning("网页导出用例跳过: %s", err)
+    # 同键不同卡的 items 会让判重的缓存作用域指向别人的卡片。文件数据集在
+    # parse_cases 里整批拒绝（用户可改文件重跑）；网页导出是逐条容错路径，整轮
+    # 失败不是这里该有的行为，但"只打 WARNING 然后照跑"更糟——冲突例的 channel
+    # 照样正常记 overlap/cosine，报告看不出这条结果是错的。两侧期望在这种数据下
+    # 都不可信，故把双方都剔出本轮：用例数明显减少 + WARNING 点名 id，比留一批
+    # 看起来正常、实际错判的结果诚实。
+    conflicts = conflicting_dedup_case_ids(cases)
+    if conflicts:
+        ids = sorted(conflicts)
+        logger.warning(
+            "网页导出判重用例存在同键不同卡（items 唯一键 (source, msg_id) 撞车），"
+            "剔除 %d 条不参与本轮: %s",
+            len(ids),
+            ", ".join(ids),
+        )
+        cases = [c for c in cases if c.id not in conflicts]
     return cases
 
 
@@ -336,9 +491,10 @@ async def run_benchmark_cases(
     started = time.monotonic()
 
     async def _run_all() -> tuple[
-        dict[str, dict[str, float | int]], dict[str, list[Any]], dict[str, float]
+        dict[str, dict[str, Any]], dict[str, list[Any]], dict[str, float]
     ]:
-        summaries: dict[str, dict[str, float | int]] = {}
+        # summary 值类型放宽到 Any：classify 的 summary 里带嵌套的 by_mode 表
+        summaries: dict[str, dict[str, Any]] = {}
         evals_by_feature: dict[str, list[Any]] = {}
         elapsed: dict[str, float] = {}
         for feature, cases in cases_by_feature.items():
@@ -365,7 +521,7 @@ async def run_benchmark_cases(
 
 
 def _build_payload(
-    summaries: dict[str, dict[str, float | int]],
+    summaries: dict[str, dict[str, Any]],
     evals_by_feature: dict[str, list[Any]],
     concurrency: int,
     dataset_label: str | dict[str, str] = FROMWEB_SOURCE_LABEL,

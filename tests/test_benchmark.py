@@ -45,6 +45,7 @@ from briefdesk.plugins.benchmark.schema import (
     parse_cases,
 )
 from briefdesk.types import ClassifyOutcome, ClassifyResult
+from tests._helpers import _scratch_db
 
 PACKAGE_CASES_DIR = (
     Path(__file__).resolve().parents[1] / "briefdesk" / "plugins" / "benchmark" / "cases"
@@ -334,26 +335,85 @@ class ClassifyMetricsTest(unittest.TestCase):
 
 class TitleMetricsTest(unittest.TestCase):
     def test_aggregate_title(self):
+        from briefdesk.plugins.benchmark.metrics import title_char_similarity
+
+        def _ev(case_id, output, expected_title=None, keywords=()):
+            return TitleCaseEval(
+                case_id=case_id,
+                output=output,
+                expected_title=expected_title,
+                expected_keywords=list(keywords),
+                char_similarity=title_char_similarity(output, expected_title),
+            )
+
         evals = [
-            TitleCaseEval(
-                case_id="a", output="塔卡沙a6方格40页团购（5本45元）",
-                expected_title="塔卡沙a6方格40页团购（5本45元）",
-                expected_keywords=["塔卡沙", "团购"],
+            _ev(
+                "a",
+                "塔卡沙a6方格40页团购（5本45元）",
+                "塔卡沙a6方格40页团购（5本45元）",
+                ["塔卡沙", "团购"],
             ),
-            TitleCaseEval(
-                case_id="b", output="摄影社招新",
-                expected_keywords=["摄影社", "面试"],
-            ),
-            TitleCaseEval(case_id="c", output=None, expected_keywords=["a"]),
+            _ev("b", "摄影社招新", None, ["摄影社", "面试"]),
+            _ev("c", None, None, ["a"]),
         ]
         s = aggregate_title(evals)
-        assert s["exact_match_rate"] == 1.0
-        assert s["exact_match_cases"] == 1
         assert s["keyword_hit_rate"] == 1 / 3
         assert s["keyword_hit_cases"] == 3
         assert s["avg_len"] == (len("塔卡沙a6方格40页团购（5本45元）") + len("摄影社招新")) / 2
         assert s["fallback_count"] == 1
         assert s["too_long_count"] == 0
+        # 字符相似只统计「有期望标题可比」的用例：无期望标题（b）与无输出（c）
+        # 都不能算 0 分——前者没有比较对象，后者由 fallback_count 单独计量
+        assert s["char_similarity_cases"] == 1
+        assert s["char_similarity_mean"] == 1.0
+        assert s["char_similarity_p50"] == 1.0
+        assert s["title_only_cases"] == 0
+        # 精确匹配率已撤除：开放生成任务里逐字相等衡量的是抄写不是质量
+        assert "exact_match_rate" not in s
+        assert "exact_match_cases" not in s
+
+    def test_title_only_case_uses_soft_pass(self):
+        """只有标题期望的用例：关键词无从判起，按字符相似给软判定。"""
+        from briefdesk.plugins.benchmark.metrics import (
+            TITLE_SOFT_RATIO,
+            title_char_similarity,
+        )
+
+        near = title_char_similarity("摄影社周五招新面试", "摄影社招新面试")
+        assert near is not None and near >= TITLE_SOFT_RATIO
+        far = title_char_similarity("二手自行车出售", "摄影社招新面试")
+        assert far is not None and far < TITLE_SOFT_RATIO
+        s = aggregate_title(
+            [
+                TitleCaseEval(
+                    case_id="a",
+                    output="摄影社周五招新面试",
+                    expected_title="摄影社招新面试",
+                    char_similarity=near,
+                ),
+                TitleCaseEval(
+                    case_id="b",
+                    output="二手自行车出售",
+                    expected_title="摄影社招新面试",
+                    char_similarity=far,
+                ),
+            ]
+        )
+        assert s["title_only_cases"] == 2
+        assert s["title_only_soft_pass"] == 1
+        assert s["keyword_hit_cases"] == 0
+
+    def test_keyword_present_excludes_soft_pass(self):
+        """关键词期望存在时软判定不越权：软通过只属于「仅标题期望」的用例。"""
+        ev = TitleCaseEval(
+            case_id="a",
+            output="摄影社招新面试",
+            expected_title="摄影社招新面试",
+            expected_keywords=["面试"],
+            char_similarity=1.0,
+        )
+        assert ev.keyword_hit
+        assert not ev.soft_hit
 
     def test_too_long(self):
         output = "这是一个非常非常非常长的标题已经远远超过了三十个字的限制要求长度"
@@ -431,37 +491,6 @@ class DryRunTest(unittest.TestCase):
             assert path.name == "classify.fromweb.json"
 
 
-@contextlib.asynccontextmanager
-async def _scratch_db(categories: list[CategoryDef] | None = None):
-    """临时 scratch 库：config.db_path 指到临时文件、建表、按需换类别，退出还原。
-
-    进程内运行时的隔离缝（providers.bench_environment：暂停管道 + 排空 + 库重定向）
-    已随进程级隔离删除，测试改为自建，与 CLI 手工运行同口径（见 cli._run_isolated）：
-    换连接前先把模块级单例清空，退出时**先关连接再删目录**（Windows 上文件仍被占用
-    会让 TemporaryDirectory 清理报 WinError 32）。
-    """
-    import briefdesk.db as briefdesk_db
-    from briefdesk.plugins.benchmark.providers import prepare_scratch
-
-    old_main, old_embed = briefdesk_db._db, briefdesk_db._embed_db
-    old_path = config.db_path
-    with tempfile.TemporaryDirectory() as d:
-        briefdesk_db._db = briefdesk_db._embed_db = None
-        config.db_path = str(Path(d) / "bench.sqlite")
-        try:
-            await prepare_scratch(categories)
-            yield
-        finally:
-            # 两条连接都要关：只用主连接（get_db）时向量连接可能已被 dedup 惰性打开，
-            # 漏关会让 aiosqlite 的非 daemon 线程把 pytest 卡在退出阶段
-            for conn in (briefdesk_db._db, briefdesk_db._embed_db):
-                if conn is not None:
-                    await conn.close()
-            briefdesk_db._db = old_main
-            briefdesk_db._embed_db = old_embed
-            config.db_path = old_path
-
-
 class TestScratchPreparation:
     async def test_prepare_scratch_replaces_categories(self):
         """scratch 库准备：建表 + 按数据集声明替换类别（默认类别被整份换掉）。"""
@@ -529,8 +558,12 @@ class TestProgress:
         """每条用例 settle 回调一次；done 严格递增、failed 累计正确。"""
         cases = [self._dedup_case(f"d{i}") for i in range(6)]
         events: list[engine.CaseProgress] = []
+        seen_recycle: list[bool] = []
 
-        async def _flaky(case: DedupCase) -> BinaryCaseEval:
+        async def _flaky(case: DedupCase, *, recycle: bool = True) -> BinaryCaseEval:
+            # recycle 是 dedup worker 的契约参数（整批算一次、下发到每条用例），
+            # 这里顺手收下并断言，防止以后改动把它悄悄丢掉
+            seen_recycle.append(recycle)
             if case.id in {"d1", "d4"}:
                 raise RuntimeError("模拟失败")
             return BinaryCaseEval(case_id=case.id, predicted=True, expected=True)
@@ -546,6 +579,10 @@ class TestProgress:
         # 失败用例以 error eval 落位，不拖垮整轮
         assert len(evals) == 6
         assert sum(1 for e in evals if e.error) == 2
+        # 契约参数确实下发到每条用例（取值语义由 tests/test_benchmark_measurement.py
+        # 的共享卡片用例负责，这里不重复断言）
+        assert len(seen_recycle) == 6
+        assert all(isinstance(flag, bool) for flag in seen_recycle)
 
     async def test_run_benchmark_cases_forwards_progress(self):
         """run_benchmark_cases 透传进度回调（离线判重用例：预筛跳过，不触发 AI）。"""
@@ -721,10 +758,12 @@ class ChartsTest(unittest.TestCase):
         payload = self._payload()
         payload["features"]["title"] = {
             "dataset": "cases/title.json",
-            "summary": {"cases": 1, "error_cases": 0, "exact_match_rate": 0.0,
+            "summary": {"cases": 1, "error_cases": 0,
                         "keyword_hit_rate": 1.0, "avg_len": 6.0,
                         "too_long_count": 0, "fallback_count": 0,
-                        "exact_match_cases": 0, "keyword_hit_cases": 1},
+                        "keyword_hit_cases": 1, "char_similarity_cases": 0,
+                        "char_similarity_mean": 0.0, "char_similarity_p50": 0.0,
+                        "title_only_cases": 0, "title_only_soft_pass": 0},
             "cases": [{"case_id": "<script>alert(1)</script>", "output": "摄影社招新",
                        "expected_title": None, "expected_keywords": ["摄影社"], "error": None}],
         }
@@ -794,10 +833,13 @@ class ChartsTest(unittest.TestCase):
             {
                 "cases": 63,
                 "error_cases": 0,
-                "exact_match_rate": 0.0,
-                "exact_match_cases": 63,
                 "keyword_hit_rate": 0.6607,
                 "keyword_hit_cases": 56,
+                "char_similarity_cases": 63,
+                "char_similarity_mean": 0.741,
+                "char_similarity_p50": 0.762,
+                "title_only_cases": 7,
+                "title_only_soft_pass": 5,
                 "avg_len": 23.79,
                 "too_long_count": 9,
                 "fallback_count": 1,
@@ -808,6 +850,8 @@ class ChartsTest(unittest.TestCase):
         assert "2379" not in text, text
         assert "66.1%" in text, text
         assert "平均长度(字)" in text, text
+        # 字符相似是 0~1 的比值，按百分比渲染才与同表的其它比率可比
+        assert "74.1%" in text, text
 
     def test_save_html_report(self):
         from briefdesk.plugins.benchmark.html_report import save_html_report

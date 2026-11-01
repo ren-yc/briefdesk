@@ -20,12 +20,14 @@ timestamp 为方便手工录入，除整数 epoch 秒外还接受本地时间字
 from __future__ import annotations
 
 import json
+import re
 import time
 from pathlib import Path
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
 
+from briefdesk.masking import PLACEHOLDER_ONLY_RE
 from briefdesk.types import InternalMessage
 
 # 用例来源受控枚举（对齐 ai_reasoning_effort 校验器风格：未知值响亮报错）。
@@ -39,6 +41,21 @@ FeatureName = Literal["classify", "dedup", "merge", "title"]
 
 # 卡片标题缺省来源：消息未提供 title 时取 content 前 50 字
 _DEFAULT_CARD_TITLE_CHARS = 50
+
+# mode 的历史载体是 note（外部脚本转换出来的数据集只有 note，形如
+# "sample_id=542；mode=fictional；碎片:1,2,3"）；real 样本没有 mode= 前缀，
+# 只在 note 里以独立 token 出现（"sample_id=0；real；src=..."）。
+# 两者都是**约定而非结构**，故显式 mode 字段优先，解析只作兼容回退。
+_MODE_IN_NOTE_RE = re.compile(r"mode\s*=\s*([A-Za-z0-9_]+)")
+_REAL_TOKEN_RE = re.compile(r"(?:^|[；;，,\s])real(?:$|[；;，,\s])")
+
+# mode 的已知取值（切片维度，非受控枚举：数据集自定义的 mode 照样能切片）。
+# 存在的用途只有一个——dry-run 时把"看起来像拼错"的值点名出来。历史上就出现过
+# 一个数据集只有 5 种 mode、另一个用 oov_custom 的情形；拼错的值会静默多出一个
+# 只有一两条用例的切片，读者很难察觉自己按一个假分组在读数。
+KNOWN_CLASSIFY_MODES: frozenset[str] = frozenset(
+    {"prod", "oov", "mix", "fictional", "single", "real", "unspecified"}
+)
 
 
 class DatasetError(Exception):
@@ -190,6 +207,42 @@ class ClassifyCase(BaseCase):
 
     messages: list[MessageIn] = Field(min_length=1)
     expected: list[ClassifyExpected] = Field(default_factory=list)
+    mode: str = ""
+    """数据集切片维度（prod/oov/mix/fictional/single/real）。
+
+    为什么需要显式字段：类别指标的解释力取决于「这批用例测的是不是生产分布」——
+    词表外（oov）样本与生产样本混在一个分母里，总分既不代表能力（非 oov 部分
+    九成以上命中）也不代表上限（oov 部分不到一半），验收时无从取信。留空时
+    回退解析 note 里的历史写法（外部脚本转换的数据集只有 note），旧数据集零迁移。
+    """
+
+    def resolved_mode(self) -> str:
+        """显式字段 > note 的 `mode=<值>` > note 里独立的 `real` 标记 > unspecified。"""
+        if self.mode:
+            return self.mode
+        note = self.note
+        found = _MODE_IN_NOTE_RE.search(note)
+        if found:
+            return found.group(1)
+        if _REAL_TOKEN_RE.search(note):
+            return "real"
+        return "unspecified"
+
+    def placeholder_only(self) -> bool:
+        """全部消息正文都是附件占位符（`[图片]`/`[链接]` 一类）→ 无正文可分类。
+
+        判定与生产入口过滤共用同一正则（`briefdesk.masking.PLACEHOLDER_ONLY_RE`），
+        且比较的是 `to_internal()` 之后的正文——脱敏改写发生在构造期，生产看到的
+        就是改写后的文本；拿数据集原文判定会与该过滤口径漂移。这类消息在真实
+        管道里进不了分类阶段，把它们的期望算进分母会得到结构性不可能通过的指标。
+
+        命名不叫「全图片」：正则匹配**任意**纯占位符，将来出现 `[链接]` 用例时
+        归因仍成立（无正文），而"图片"会说谎。
+        """
+        return all(
+            PLACEHOLDER_ONLY_RE.match(m.to_internal().content.strip())
+            for m in self.messages
+        )
 
 
 class DedupCase(BaseCase):
@@ -260,6 +313,96 @@ class DatasetFile(BaseModel):
 # ── 加载与校验 ──
 
 
+def dedup_item_key_conflicts(cases: list[BaseCase]) -> list[str]:
+    """找出同键不同卡的 dedup items：`(source, msg_id)` 相同但卡片内容不同。
+
+    为什么要单独校验：items 表的唯一键是 `(source, source_msg_id)`，而判重的缓存
+    作用域是按 `insert_item` 返回的行 id 收窄的。两条用例（或同一用例的两条 item）
+    用同一个键承载不同内容时，后插入的一方会命中冲突分支、拿到**前一条**的行 id
+    ——它声明的那张历史卡片根本没进库，缓存里躺着的是别人的标题与正文。表现为
+    「命中的相似卡在用例里找不到」，且没有任何报错，只能靠装载期校验拦住。
+
+    跨用例复用为何也要查（而不是只查用例内）：每例跑完会回收自己的 items，串行时
+    后一例插入同键并不会撞车；但 `--concurrency>1` 下前一例的行还活着，冲突就真的
+    发生。隔离设计的前提是「并发与串行同结果」，故校验按整个数据集做。
+
+    同键同卡不算冲突：那是多条用例引用同一张历史卡片（网页导出多例共享候选正是
+    这种形态），插入返回的是同一行——内容本就相同，作用域不会指错。比较口径用
+    `card_fields`（标题 + 正文）：标题参与重叠与嵌入，只比正文会漏掉「同文异标题」
+    这种同样会改变判重结果的复用。
+    """
+    seen: dict[tuple[str, str], tuple[str, tuple[str, str]]] = {}
+    errors: list[str] = []
+    for case in cases:
+        if not isinstance(case, DedupCase):
+            continue
+        for item in case.items:
+            key = (item.source, item.msg_id)
+            owner, card = seen.setdefault(key, (case.id, card_fields(item)))
+            if card != card_fields(item):
+                errors.append(
+                    f"用例 {case.id}: item (source={item.source!r}, "
+                    f"msg_id={item.msg_id!r}) 与用例 {owner!r} 同键不同卡"
+                    "（items 唯一键撞车：本条声明的卡片不会入库，"
+                    "判重的缓存作用域会指向别人的卡片）"
+                )
+    return errors
+
+
+def shared_dedup_item_keys(cases: list[BaseCase]) -> set[tuple[str, str]]:
+    """跨用例共享的 `(source, msg_id)` 键集合（同键同卡——合法但影响回收策略）。
+
+    与 `dedup_item_key_conflicts` 的分工：那条查「同键不同卡」（必须拒绝），这条查
+    「同键同卡」（允许——多条用例引用同一张历史卡片是 recorder 导出的常见形态）。
+
+    为什么要单独暴露：允许共享卡之后，「跑完就把自己的 items 删掉」不再安全——
+    A 例先跑完删掉共享行，还在排队的 B 例按 id 取数会取到空，静默判成「无候选」。
+    调用方据此决定本轮要不要回收（键全唯一才回收；有共享就一律保留）。
+    """
+    seen: dict[tuple[str, str], str] = {}
+    shared: set[tuple[str, str]] = set()
+    for case in cases:
+        if not isinstance(case, DedupCase):
+            continue
+        for item in case.items:
+            key = (item.source, item.msg_id)
+            owner = seen.setdefault(key, case.id)
+            if owner != case.id:
+                shared.add(key)
+    return shared
+
+
+def conflicting_dedup_case_ids(cases: list[BaseCase]) -> set[str]:
+    """参与「同键不同卡」复用的**双方**用例 id（与 `dedup_item_key_conflicts` 同判据）。
+
+    为什么单独要一份 id 而不是只用错误文案：文件数据集走 `parse_cases`，可以整体拒绝
+    （用户改文件重跑）；网页导出是**逐条容错**的（非法项跳过不影响整轮），整轮拒绝会让
+    用户界面上一次运行直接失败。但"照跑只留一行 WARNING"更糟——冲突时后插入的一方经
+    `insert_item` 的冲突分支拿到前一条的行 id，判重命中的是别人的卡片，而逐例 `channel`
+    照样正常记 overlap/cosine，报告里**看不出这条结果是错的**。两侧期望在这种数据下都
+    不可信，所以把**双方**都剔出本轮：用例数会明显减少、WARNING 点名 id，比留一批
+    看起来正常、实际错判的结果诚实。
+    """
+    seen: dict[tuple[str, str], dict[str, tuple[str, str]]] = {}
+    bad: set[str] = set()
+    for case in cases:
+        if not isinstance(case, DedupCase):
+            continue
+        for item in case.items:
+            key = (item.source, item.msg_id)
+            card = card_fields(item)
+            holders = seen.setdefault(key, {})
+            for other_id, other_card in holders.items():
+                if other_card != card:
+                    bad.update({other_id, case.id})
+            mine = holders.get(case.id)
+            if mine is not None and mine != card:
+                # 同一用例内部同键不同卡：声明了两张历史卡、库里只会有一行，本例整体不可信
+                bad.add(case.id)
+            holders[case.id] = card
+    return bad
+
+
 def load_dataset_file(path: str | Path) -> DatasetFile:
     """加载并校验测试集文件顶层结构（feature/description/categories/cases）。
 
@@ -284,7 +427,9 @@ def parse_cases(dataset: DatasetFile) -> list[BaseCase]:
 
     额外规则：
     - 用例 id 必须唯一；
-    - classify 期望中的 index 不得重复（同一消息只允许一条期望）。
+    - classify 期望中的 index 不得重复（同一消息只允许一条期望）；
+    - dedup 的 items 不得出现「同 `(source, msg_id)` 键、不同卡片」的复用
+      （items 唯一键撞车会让判重的缓存作用域指向别人的卡片；同键同卡允许）。
     """
     model = _CASE_MODELS[dataset.feature]
     errors: list[str] = []
@@ -310,6 +455,8 @@ def parse_cases(dataset: DatasetFile) -> list[BaseCase]:
                 errors.append(
                     f"用例 {case.id}: 期望 index 重复 {dup}（同一消息只允许一条期望）"
                 )
+    if dataset.feature == "dedup":
+        errors += dedup_item_key_conflicts(cases)
     if errors:
         raise DatasetError(f"数据集 {dataset.feature} 用例校验失败:\n" + "\n".join(errors))
     return cases
