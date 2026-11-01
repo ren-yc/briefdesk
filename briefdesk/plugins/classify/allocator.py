@@ -82,6 +82,11 @@ class CategoryAllocator:
         self._protos: dict[str, CategoryPrototypes] = {}
         self._rebuilt_at = 0.0
         self._rebuild_pending = False
+        # 重建代次：每次 rebuild 启动时领号，嵌入返回后只有仍是「最新代」的
+        # 任务可以提交缓存。没有它时，连续两次类别变更会并发跑两个 rebuild，
+        # 旧任务（样本更旧）若晚于新任务完成就会把旧原型写回——缓存长期停在
+        # 过期类别口径，且白付两次嵌入成本。
+        self._generation = 0
 
     # ── 重建 ──
 
@@ -98,7 +103,12 @@ class CategoryAllocator:
         本模块不触 DB（纯计算 + 嵌入，可单测）。force=True 跳过节流
         （校准/测试用）。
         返回嵌入的原型条数（0 = 无样本，缓存清空 → 分配器不可用；
-        -1 = 节流合并；-2 = 嵌入失败保留旧缓存）。
+        -1 = 节流合并；-2 = 嵌入失败保留旧缓存；-3 = 代次过期，结果已
+        被更新的重建超越，本次丢弃不提交）。
+
+        并发语义：每次 rebuild 启动领一个代次号，嵌入返回后只有仍是**最新
+        代**才提交缓存。类别变更事件可能连续触发多个重建任务，旧任务晚到
+        时不得覆盖新结果（否则缓存停在过期类别口径，且白付嵌入成本）。
 
         节流合并语义：-1 只表示「本次请求被并入待重建」，**调用方必须保证
         兑现**——事件触发路径拿到 -1 后须等剩余间隔耗尽再重试（见插件的
@@ -122,16 +132,22 @@ class CategoryAllocator:
         # 让下一次调用立即重试而非被节流吞掉。
         previous_rebuilt_at = self._rebuilt_at
         self._rebuild_pending = False
+        # 领号：本次重建的代次。嵌入是 await（会让出控制权），期间可能有更
+        # 新的 rebuild 启动——只有自己是当前最新代时才允许提交缓存。
+        self._generation += 1
+        my_generation = self._generation
 
         if not is_available():
             logger.info("嵌入未启用，分配器不重建（allocate 将回退）")
-            self._protos = {}
-            self._rebuilt_at = now
+            if my_generation == self._generation:
+                self._protos = {}
+                self._rebuilt_at = now
             return 0
         if not samples:
             logger.info("无分类样本（items 为空），分配器置空（冷启动回退 API）")
-            self._protos = {}
-            self._rebuilt_at = now
+            if my_generation == self._generation:
+                self._protos = {}
+                self._rebuilt_at = now
             return 0
 
         # content 去重：recat 覆盖层「计入新类 + 从原类剔除同源 content」
@@ -151,18 +167,32 @@ class CategoryAllocator:
             vectors = await ai_ports.embed_texts(texts)
         except Exception:
             # 嵌入失败：保留旧缓存（旧分布优于空缓存），回滚节流窗口让下个
-            # 触发点立即重试（不占 300s 窗口，见函数开头注释）
-            self._rebuilt_at = previous_rebuilt_at
+            # 触发点立即重试（不占 300s 窗口，见函数开头注释）。仅在仍是
+            # 最新代时回滚，避免旧任务把新任务刚上膛的窗口改回旧值。
+            if my_generation == self._generation:
+                self._rebuilt_at = previous_rebuilt_at
             logger.warning("分配器原型嵌入失败，保留旧缓存", exc_info=True)
             return -2
         if len(vectors) != len(deduped):
-            self._rebuilt_at = previous_rebuilt_at
+            if my_generation == self._generation:
+                self._rebuilt_at = previous_rebuilt_at
             logger.warning(
                 "分配器嵌入返回数不符（%d/%d），保留旧缓存",
                 len(vectors),
                 len(deduped),
             )
             return -2
+
+        # 代次校验：嵌入 await 期间若已有更新的 rebuild 启动，本任务的结果
+        # 基于更旧的样本，必须丢弃而不是覆盖新缓存（否则连续两次类别变更
+        # 时旧原型可能晚到覆盖新的，缓存长期停在过期口径）。
+        if my_generation != self._generation:
+            logger.info(
+                "分配器重建代次过期（gen=%d，最新=%d），丢弃本次结果",
+                my_generation,
+                self._generation,
+            )
+            return -3
 
         buckets: dict[str, CategoryPrototypes] = {}
         for s, vec in zip(deduped, vectors):

@@ -168,10 +168,13 @@ async def export_fromweb(
 ) -> Path:
     """把用例列表**合并**写入 cases/<feature>.fromweb.json（原子写）。
 
-    合并语义（替代旧覆盖式）：读现有文件 → 按 case id 合并（新覆盖旧、
-    文件独有的保留）→ 原子写回。导出路径的用例 id 内容派生（stable_case_id
-    ——同批数据重复导出同 id 就地更新，不堆积副本）；要删除用例请走
-    delete_all_fromweb 或手工编辑文件。
+    合并语义（替代旧覆盖式）：读现有文件 → 按 **(origin, case id)** 合并
+    （同源新覆盖旧、其余保留）→ 原子写回。键必须带 origin：用例 id 是内容
+    派生的（stable_case_id），classify/merge 的 cards 与 recorder 对同一批
+    底层数据会生成**相同 id**（由 TestCrossPathIdentity 钉住），只用 id 合并
+    会让后导出的来源静默覆盖先导出的那份，验收分母与对照实验分母互相污染。
+    同源重复导出仍原地更新（同 origin 同 id），不堆积副本；跨来源各自独立
+    成条，由 origin 字段区分。要删除用例请走 delete_all_fromweb 或手工编辑。
     逐条经 schema 模型校验，任一非法即抛 DatasetError（整批不落盘）；
     origin 受控枚举在写入前校验（单点写入处同样拦非法值）；空列表拒绝
     导出（不改动已有文件）。本函数是用例来源字段（origin/batch_fingerprint）
@@ -227,10 +230,15 @@ async def export_fromweb(
                 "既有导出文件中 %d 条无法识别的条目被丢弃（缺 id 或非对象）：%s",
                 dropped, path.name,
             )
-    by_id = {c.get("id"): c for c in existing_cases}
+    # 合并键 (origin, id)：跨来源同 id 必须共存（不同来源是不同分母，见
+    # docstring）。缺 origin 的历史条目按 schema 默认值 "manual" 归键——
+    # 与 parse 侧 model_validate 的缺省口径一致，避免同一条目被判成两个键。
+    by_key: dict[tuple[str, str], dict[str, Any]] = {}
+    for entry in existing_cases:
+        by_key[(str(entry.get("origin") or "manual"), str(entry.get("id")))] = entry
     for case in stamped:
-        by_id[case["id"]] = case
-    merged = list(by_id.values())
+        by_key[(str(case["origin"]), str(case["id"]))] = case
+    merged = list(by_key.values())
     payload = {
         "feature": feature,
         "description": description

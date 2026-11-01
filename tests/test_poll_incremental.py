@@ -1237,3 +1237,67 @@ class TestPollFlagReset:
         with patches[0], patches[1], patches[2], patches[3]:
             await run_poll_cycle(source)
         assert not pc._polling
+
+
+class TestPollCycleTelemetryFlush:
+    """遥测落盘必须在所有退出路径执行。
+
+    失败模式：flush 原先只在 try 尾部调用，而整轮轮询抛异常时 except 分支
+    只更新状态——失败轮次里已记录的 AI/管道指标不会落盘，进程随后退出即丢，
+    恰好丢掉最需要诊断的样本。
+    """
+
+    def _source(self) -> Mock:
+        source = Mock()
+        source.name = "weflow-legacy"
+        source.client = Mock()
+        source.fetch_history = AsyncMock(
+            return_value=SimpleNamespace(
+                contacts=[], sessions=[], messages=[], failed_sessions=set()
+            )
+        )
+        return source
+
+    def _stack(self, pipeline_side_effect=None):
+        from contextlib import ExitStack
+
+        stack = ExitStack()
+        pipeline = AsyncMock(return_value=True)
+        if pipeline_side_effect is not None:
+            pipeline.side_effect = pipeline_side_effect
+        stack.enter_context(
+            patch("briefdesk.poll_cycle.get_enabled_sessions", new=AsyncMock(return_value=[]))
+        )
+        stack.enter_context(patch("briefdesk.poll_cycle.set_status", new=Mock()))
+        stack.enter_context(patch("briefdesk.poll_cycle.process_all_batches", new=pipeline))
+        stack.enter_context(
+            patch("briefdesk.poll_cycle.update_session_last_polls", new=AsyncMock())
+        )
+        flush = stack.enter_context(patch("briefdesk.poll_cycle.telemetry_flush"))
+        return stack, flush
+
+    async def test_flush_runs_on_success(self):
+        source = self._source()
+        stack, flush = self._stack()
+        with stack:
+            await run_poll_cycle(source)
+        assert flush.call_count == 1, "成功路径必须落盘一次"
+
+    async def test_flush_runs_on_failure(self):
+        """失败轮次同样落盘——本用例的核心断言（旧实现在此路径不 flush）。"""
+        source = self._source()
+        stack, flush = self._stack(pipeline_side_effect=RuntimeError("boom"))
+        with stack:
+            await run_poll_cycle(source)
+        assert flush.call_count == 1, "失败路径也必须落盘（否则失败样本全丢）"
+
+    async def test_flush_failure_does_not_break_reset(self):
+        """落盘自身抛错不得影响 _polling 复位（遥测绝不连坐轮询收尾）。"""
+        import briefdesk.poll_cycle as pc
+
+        source = self._source()
+        stack, flush = self._stack()
+        with stack:
+            flush.side_effect = OSError("disk full")
+            await run_poll_cycle(source)
+        assert not pc._polling
