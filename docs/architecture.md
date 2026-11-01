@@ -624,6 +624,13 @@ recorder 用卡片 DB id 而 cards 用 source_msg_id、title 两侧 id 材料形
 结构非法时拒绝合并覆盖而非静默按空）。消费侧：验收分母只认 `origin=manual`（卡片/记录导出的期望来自
 管道自身判定，混入会让指标虚高）；与入训记录同指纹的用例按批次级互斥出验收分母（只读工具
 `scripts/eval_denominators.py`：分组汇总 + 指纹互斥校验 + 双口径分开统计）。
+**数据集裁剪**（`scripts/prune_benchmark_cases.py`）：按 id 删除用例的专用工具，默认
+dry-run、必须显式 `--apply` 才写盘——删的是**用户目录里的数据集文件**且仓库内不留备份
+（AGENTS 禁止 `*.bak` 入库），不可撤销，故把"看一眼再动手"做成默认。写盘前必须过
+`schema.load_dataset_file` 的结构校验，且**待删 id 未全部命中即整体拒绝**（部分删除会让
+"重复已清理"的结论不成立；一条都没命中通常意味着选错了文件——用例 id 前缀形态相近）。
+用途是去掉逐字重复的用例：同一份证据计入分母两次，同一张历史卡片还可能同时支持
+`same=true` 与 `same=false`。
 **classify 处理记录采集**：recorder 经 `build_classify_cases` 把批级
 `ClassifyObservation`（classify 引擎产出、`batch.classify_checks` 携带）聚合为一条 ClassifyCase
 （per-instance 期望挂 expected 列表，**只收 include**——uncertain/error 无类别真值不入评分，
