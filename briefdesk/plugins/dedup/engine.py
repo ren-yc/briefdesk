@@ -428,8 +428,8 @@ class DedupEngine(DedupService):
         即满分）。
 
         该分数同时是重叠通道的召回门禁与加权多数票的票权，换度量 = 改
-        判定行为：DEDUP_SIMILARITY_THRESHOLD 默认 0.3 维持在字符集口径下
-        的取值，重标定流程见 scripts/recalibrate_similarity.py（附交付）。
+        判定行为：DEDUP_SIMILARITY_THRESHOLD 的默认值已按本度量重标定（见
+        config 字段说明），重标定流程见 scripts/recalibrate_similarity.py。
         """
         a = a.replace(" ", "")
         b = b.replace(" ", "")

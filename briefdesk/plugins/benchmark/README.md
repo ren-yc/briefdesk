@@ -170,7 +170,8 @@ python -m briefdesk.plugins.benchmark.cli --model deepseek-v4-flash --concurrenc
 ```
 
 - **dedup 候选预筛注意**：未配置 `EMBED_API_BASE` 时用标题字符重叠预筛（阈值
-  `DEDUP_SIMILARITY_THRESHOLD`=0.3），重叠不足的 pair **不会触发 AI**、直接判为不同。
+  `DEDUP_SIMILARITY_THRESHOLD`=0.07，bigram Jaccard 口径标定值），重叠不足的 pair
+  **不会触发 AI**、直接判为不同。
   要评测 LLM 判重质量，请让 `query.title` 与某条 `items.title` 保持足够重叠
   （如相同标题、不同正文）；结果中会标注"预筛跳过"的用例数。
 - title 期望的 `title` 精确匹配 与 `keywords` 包含匹配至少提供一种；

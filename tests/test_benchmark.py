@@ -663,7 +663,7 @@ class ChartsTest(unittest.TestCase):
                 "embedding_enabled": False,
                 "embedding_model": "",
                 "embedding_batch_size": 20,
-                "dedup_similarity_threshold": 0.3,
+                "dedup_similarity_threshold": 0.07,
                 "dedup_embed_threshold": 0.8,
                 "dedup_embed_top_k": 3,
                 "dedup_embed_fallback_threshold": 0.65,

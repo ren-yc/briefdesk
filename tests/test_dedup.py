@@ -252,6 +252,58 @@ class TitleOverlapTest(unittest.TestCase):
             DedupEngine._title_overlap("123 abc", "abc 123")
 
 
+class SimilarityThresholdCalibrationTest(unittest.TestCase):
+    """DEDUP_SIMILARITY_THRESHOLD 默认值是 bigram 口径的标定产物，不是经验值。
+
+    为什么钉这个数：度量由单字符交/min 换成字符 bigram Jaccard 后分数分布整体
+    左移，旧默认 0.3 在新口径下几乎关死候选门——无嵌入向量部署（未配
+    EMBED_API_BASE，重叠是主通道）的同题对放行率从约九成掉到两成，表现为
+    「重复卡片照样入库」。失败模式静默且不确定（看起来只是"没判重"），只能靠
+    默认值断言拦住"顺手改回旧值"这类回退。
+
+    标定来源：benchmark dedup 用例集的 query/item 自有标题对（召回真值），
+    0.07 处 same 对放行约九成、负例放行约九成九；0.09→0.10 间有断崖
+    （0.10 起 same 对放行腰斩），故取断崖前的平台。复算命令见
+    scripts/recalibrate_similarity.py。
+    """
+
+    def test_default_is_calibrated_value(self):
+        from briefdesk.config import Settings
+
+        self.assertEqual(Settings(_env_file=None).dedup_similarity_threshold, 0.07)
+
+    def test_env_alias_overrides_default(self):
+        """显式配置优先于默认值：老部署写死 0.3 时行为不变（不静默改判定）。"""
+        import os
+
+        from briefdesk.config import Settings
+
+        with patch.dict(os.environ, {"DEDUP_SIMILARITY_THRESHOLD": "0.3"}):
+            self.assertEqual(Settings(_env_file=None).dedup_similarity_threshold, 0.3)
+
+    def test_out_of_range_rejected(self):
+        """阈值仍受 ge=0/le=1 约束：越界构造即报错，不会静默夹到合法区间。"""
+        from pydantic import ValidationError
+
+        from briefdesk.config import Settings
+
+        for bad in ("-0.01", "1.5"):
+            with self.subTest(value=bad), self.assertRaises(ValidationError):
+                Settings(_env_file=None, DEDUP_SIMILARITY_THRESHOLD=bad)
+
+    def test_calibrated_value_admits_representative_same_pair(self):
+        """标定值的可判定性质：同一事项、不同措辞的标题对必须过门。
+
+        这对取自 benchmark dedup 用例集（同一桩事的两种写法）。旧默认 0.3 把它
+        挡在门外——用例集里 134 个 same=true 对有 89 个落在 [0.07, 0.3) 区间，
+        即旧值下三分之二的主通道重复对根本不触发判重。
+        """
+        same_pair = ("校运会百米赛报名", "校运会100米报名")
+        score = DedupEngine._title_overlap(*same_pair)
+        assert score >= 0.07, f"标定值放不进同题重复对（{score:.4f}）"
+        assert score < 0.3, "旧值 0.3 不该仍能放行，否则本用例失去回退拦截力"
+
+
 class NegCacheEngineIntegrationTest(unittest.IsolatedAsyncioTestCase):
     """负缓存在引擎内部路径上的挂钩：remove_items / add_to_cache 全路径失效。"""
 
@@ -1146,18 +1198,20 @@ class DedupTieredCandidateTest(unittest.IsolatedAsyncioTestCase):
             # 无候选是常规路径，诊断记在 DEBUG（不占 WARNING，见 _select_candidates）
             self.assertLogs("briefdesk.plugins.dedup.engine", level="DEBUG") as logs,
         ):
-            # 与缓存标题共 1 个 bigram（"篮球"），overlap ≈ 0.15 < 阈值 0.30：
-            # 落在"有候选但不够格"分支，诊断才报得出差距
+            # 与缓存标题共 1 个 bigram（"篮球"），overlap ≈ 0.06 < 阈值 0.07：
+            # 落在"有候选但不够格"分支，诊断才报得出差距。分数须同时满足
+            # 「非零」（否则归因走 overlap 全零分支，报不出差距）与「低于
+            # 现行阈值」（高于阈值就成了采纳候选，没有无候选诊断可查）。
             result = await engine.check_dedup(
-                "转让一辆二手篮球社自行车", "新生2群", q_emb=[0.5, 0.6]
+                "今天下午在体育馆进行篮球比赛", "新生2群", q_emb=[0.5, 0.6]
             )
         assert not result.is_duplicate
         merge_mock.assert_not_awaited()
         assert any("判重无候选" in line for line in logs.output)
         assert any("cosine top-1=" in line for line in logs.output)
         # 诊断里仍要报出重叠差距（复用的是兜底那次扫描的结果，不是省掉了信息）
-        assert any("overlap top-1=0.15" in line for line in logs.output)
-        assert overlap_calls == ["转让一辆二手篮球社自行车"]
+        assert any("overlap top-1=0.06" in line for line in logs.output)
+        assert overlap_calls == ["今天下午在体育馆进行篮球比赛"]
 
     async def test_zero_overlap_diagnosed_apart_from_empty_cache(self):
         """重叠全零（缓存非空但无共同字符）不得归因为「缓存为空」。
