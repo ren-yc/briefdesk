@@ -127,8 +127,15 @@ class Settings(KeyringSettingsBase):
     /api/sync 同路径的同步（进行中互斥）。"""
 
     dedup_similarity_threshold: float = Field(
-        default=0.3, alias="DEDUP_SIMILARITY_THRESHOLD", ge=0, le=1
+        default=0.07, alias="DEDUP_SIMILARITY_THRESHOLD", ge=0, le=1
     )
+    """标题字符 bigram Jaccard 的候选门阈值。
+
+    取值来自 dedup 用例集的自有 item 对标定（召回真值口径）：0.07 时 same 对
+    放行约九成、负例放行约九成九；旧值 0.3 是单字符交/min 口径的经验值，换
+    bigram 后分布整体左移，沿用会让无嵌入部署的召回掉到两成。重标定流程见
+    scripts/recalibrate_similarity.py。
+    """
 
     # 嵌入向量去重（可选）：EMBED_API_BASE 留空则整体禁用，回退到字符重叠预过滤
     embed_api_base: str = Field(default="", alias="EMBED_API_BASE")

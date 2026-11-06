@@ -37,6 +37,7 @@ from briefdesk.plugins.benchmark.html_report import build_html_report, save_html
 from briefdesk.plugins.benchmark.report import render_feature_block, save_json_report
 from briefdesk.plugins.benchmark.schema import (
     FEATURES,
+    KNOWN_CLASSIFY_MODES,
     BaseCase,
     CategoryDef,
     DatasetError,
@@ -130,12 +131,24 @@ def _dry_stats(feature: str, cases: list) -> dict:
         messages = sum(len(c.messages) for c in cls_cases)
         expected = sum(len(c.expected) for c in cls_cases)
         cats = sorted({e.category for c in cls_cases for e in c.expected})
+        modes: dict[str, int] = {}
+        for c in cls_cases:
+            key = c.resolved_mode()
+            modes[key] = modes.get(key, 0) + 1
         return {
             "cases": len(cases),
             "messages": messages,
             "expected": expected,
             "noise": messages - expected,
             "categories": cats,
+            # 预检把两件"跑完 45 分钟才发现"的事提到调 AI 之前：mode 分布决定
+            # 报告能否按切片读数（全是 oov 的一批不能当生产能力看）；纯占位符
+            # 用例不进主指标，数量得先看见才知道分母为什么对不上。
+            "modes": modes,
+            # 未知 mode 单独点名：拼错的值会静默多出一个只有一两条用例的切片，
+            # 读者按一个假分组读数却看不出异常（自定义 mode 合法，故只提示不拒绝）
+            "unknown_modes": sorted(m for m in modes if m not in KNOWN_CLASSIFY_MODES),
+            "placeholder_only": sum(1 for c in cls_cases if c.placeholder_only()),
         }
     if feature == "dedup":
         dd_cases = [c for c in cases if isinstance(c, DedupCase)]
@@ -153,8 +166,9 @@ def _dry_stats(feature: str, cases: list) -> dict:
     tt_cases = [c for c in cases if isinstance(c, TitleCase)]
     return {
         "cases": len(cases),
-        "exact": sum(1 for c in tt_cases if c.expected.title),
-        "keyword": sum(1 for c in tt_cases if c.expected.keywords),
+        # 键名跟着指标口径走：精确匹配率已撤除，这里统计的是「声明了哪类期望」
+        "with_title_expected": sum(1 for c in tt_cases if c.expected.title),
+        "with_keywords_expected": sum(1 for c in tt_cases if c.expected.keywords),
     }
 
 
@@ -186,6 +200,23 @@ def run_dry_run(
                     "  类别覆盖: "
                     + ", ".join(f"{c.name}（{c.prompt or '无说明'}）" for c in ds.categories)
                 )
+            if stats["modes"]:
+                print(
+                    "  mode 分布: "
+                    + ", ".join(f"{m}×{n}" for m, n in sorted(stats["modes"].items()))
+                )
+            if stats["unknown_modes"]:
+                print(
+                    "  ⚠ 未知 mode（不在 "
+                    + "/".join(sorted(KNOWN_CLASSIFY_MODES))
+                    + " 之内，仍会单独切片但可能是拼错）: "
+                    + ", ".join(stats["unknown_modes"])
+                )
+            if stats["placeholder_only"]:
+                print(
+                    f"  纯占位符用例 {stats['placeholder_only']} 条"
+                    "（正文无信息可分类，运行后不进主指标）"
+                )
         elif f == "dedup":
             print(
                 f"  用例 {stats['cases']} 条，历史卡片 {stats['items']} 条，"
@@ -198,7 +229,8 @@ def run_dry_run(
         else:
             print(
                 f"  用例 {stats['cases']} 条，"
-                f"精确匹配期望 {stats['exact']} 条，关键词期望 {stats['keyword']} 条"
+                f"标题期望 {stats['with_title_expected']} 条，"
+                f"关键词期望 {stats['with_keywords_expected']} 条"
             )
     return payload
 

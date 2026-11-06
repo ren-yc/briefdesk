@@ -178,18 +178,34 @@ class BenchmarkIsolationTest(unittest.TestCase):
                 _digest(production), before, "基准运行改动了生产库（隔离失效）"
             )
 
-            # 反向确认这次运行真的写了东西：夹具卡片被合成进 scratch 库，
-            # 否则「生产库没变」可能只是因为整个运行什么都没做。
+            # 反向确认这次运行真的做了事，否则「生产库没变」可能只是因为整个
+            # 运行什么都没做。证据取两条留下的痕迹：
+            #   ① scratch 库被本进程建表并播种（items 表若存在说明走完了建库路径）；
+            #   ② 报告里确有该功能的用例评估记录（说明用例真被执行过）。
+            # 不能用 items 行数当证据：判重用例跑完会回收自己插入的卡片——缓存
+            # 作用域按 id 收窄后，留着残行只会让后续用例的向量加载越库越大。
             self.assertTrue(scratch.exists())
             conn = sqlite3.connect(str(scratch))
             try:
-                written = conn.execute("SELECT COUNT(*) FROM items").fetchone()[0]
                 cats = [
                     r[0] for r in conn.execute("SELECT name FROM categories ORDER BY id")
                 ]
+                tables = {
+                    r[0]
+                    for r in conn.execute(
+                        "SELECT name FROM sqlite_master WHERE type='table'"
+                    )
+                }
             finally:
                 conn.close()
-            self.assertGreaterEqual(written, 1, "scratch 库里没有合成卡片，运行未生效")
+            self.assertIn("items", tables, "scratch 库没建表，运行未生效")
+            report_path = run_dir / "report.json"
+            self.assertTrue(report_path.exists(), "运行没产出报告")
+            payload = json.loads(report_path.read_text(encoding="utf-8"))
+            dedup_summary = payload.get("features", {}).get("dedup", {}).get("summary", {})
+            self.assertGreaterEqual(
+                dedup_summary.get("cases", 0), 1, "报告里没有判重用例，运行未生效"
+            )
             # 反向的隔离证据：scratch 库拿的是 init_schema 播种的默认类别，
             # **不含**生产库那条自建类别——它若出现就说明生产库被读了。
             self.assertNotIn("生产类别", cats, "scratch 库读到了生产库的类别（隔离失效）")

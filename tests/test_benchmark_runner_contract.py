@@ -111,7 +111,7 @@ async def _release_db_singletons() -> None:
 
 
 # 标题有明显重叠 → 预筛给候选，必然触发 AI 判定（走 --ai-provider stub）。
-# 标题对须在字符 bigram Jaccard 口径下仍 ≥ DEDUP_SIMILARITY_THRESHOLD（0.3）：
+# 标题对须在字符 bigram Jaccard 口径下仍 ≥ DEDUP_SIMILARITY_THRESHOLD（0.07）：
 # 度量换轨后共同词稀疏的长标题会跌破门禁、AI 替身不被触发（skipped=1）。
 _AI_DATASET = {
     "feature": "dedup",

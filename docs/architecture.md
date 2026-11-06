@@ -585,7 +585,10 @@ tests/test_web_plugins.py 的核心前端边界守卫测试覆盖）。`GET /api
    再 spawn 子进程（`python -m briefdesk.plugins.benchmark.runner`）。父进程**生效中**的
    benchmark 非密钥行为配置（模型、推理/JSON/视觉/分类输出、嵌入与去重参数）经环境变量下传：
    设置页改动是「暂存、重启后生效」，子进程若自己读 `.env` 会拿到尚未生效的值；密钥不下传，
-   子进程走自己的钥匙串。报告记录这些配置的快照，但不记录 API 地址或密钥。
+   子进程走自己的钥匙串。报告记录这些配置的快照，但不记录 API 地址或密钥——只记**脱敏后的
+   供应商归类**（`chat_provider`/`embed_provider`，取值 `ollama`/`deepseek`/`custom`，空配置为空串）：
+   同模型名打到本机与云端的结果不可互比，只记 `model` 会让事后对账把两轮当成同配置比较；
+   而完整 URL 含主机名与端口，属隐私面（报告 JSON 长期落盘、也可能被贴进 issue）。
 2. **运行期**：父进程只做三件事——按 `progress.jsonl` 的**行数增长**判进展（阈值按
    `BENCHMARK_RUN_STALL_SECONDS × --progress-every` 放大，因为进度是节流写入的；`--progress-every`
    只在 CLI 直跑时由参数给出，Web 路径恒为 1、等于不放大）、终态行落盘后的宽限 kill、
@@ -621,12 +624,55 @@ recorder 用卡片 DB id 而 cards 用 source_msg_id、title 两侧 id 材料形
 结构非法时拒绝合并覆盖而非静默按空）。消费侧：验收分母只认 `origin=manual`（卡片/记录导出的期望来自
 管道自身判定，混入会让指标虚高）；与入训记录同指纹的用例按批次级互斥出验收分母（只读工具
 `scripts/eval_denominators.py`：分组汇总 + 指纹互斥校验 + 双口径分开统计）。
+**数据集裁剪**（`scripts/prune_benchmark_cases.py`）：按 id 删除用例的专用工具，默认
+dry-run、必须显式 `--apply` 才写盘——删的是**用户目录里的数据集文件**且仓库内不留备份
+（AGENTS 禁止 `*.bak` 入库），不可撤销，故把"看一眼再动手"做成默认。写盘前必须过
+`schema.load_dataset_file` 的结构校验，且**待删 id 未全部命中即整体拒绝**（部分删除会让
+"重复已清理"的结论不成立；一条都没命中通常意味着选错了文件——用例 id 前缀形态相近）。
+用途是去掉逐字重复的用例：同一份证据计入分母两次，同一张历史卡片还可能同时支持
+`same=true` 与 `same=false`。
 **classify 处理记录采集**：recorder 经 `build_classify_cases` 把批级
 `ClassifyObservation`（classify 引擎产出、`batch.classify_checks` 携带）聚合为一条 ClassifyCase
 （per-instance 期望挂 expected 列表，**只收 include**——uncertain/error 无类别真值不入评分，
 其存在记入 note 供训练导出侧盘点）。**节律导出**：`scheduled_export` 批尾检查，24h 间隔且有
 累积才自动导出（首见调用只锚定不导出——防首批记录立即清空）；失败回退时间戳下个节律重试。
 纯内存记录重启即丢是已知语义（定节律导出为显式缓解）。
+
+**判重测量的两条契约**（`engine._run_dedup` + `_ProbeDedupEngine`）：基准必须与生产同路径，
+否则量出来的不是同一件事——
+
+1. **query 向量与生产同口径**：先 `insert_item` 落卡片，再 `ensure_cache()` → `preembed_batch()`
+   → `check_dedup(q_emb=...)`。`ensure_cache()` 不是优化：`preembed_batch` 首行判
+   `_embed_cache_ok`，缓存未加载时恒返回 None，跳过预热基准就会在「配置了嵌入、实际全程走
+   字符重叠」的假象下跑完整轮。反过来也**不许**在 `check_dedup` 内补嵌入——存储锁内禁远程
+   嵌入是生产约束（见去重章节），不为基准放宽。
+2. **每例只见自己的 items**：`DedupEngine._load_cache_rows()` 是缓存取数接缝，默认全量
+   （生产行为不变）；探针覆写为按本用例插入的行 id 取数。缺它的后果实测过：全表加载让
+   后面的用例把前面用例的卡片当"历史重复卡"（一轮里 116 个进入判官的用例只有 18 例命中
+   自己的卡片），而"每例删库 + 强制串行"的替代做法把隔离押在执行顺序上，`--concurrency>1`
+   即失效——接缝让可见集合成为构造期常量。
+   回收（`delete_items`）只用于控制 scratch 体积，且**按整批决定**：`insert_item` 的唯一键是
+   `(source, source_msg_id)`，两条用例共享同一张历史卡片时（recorder 导出的常见形态）两边
+   拿到同一个行 id，先跑完的那条一删就把另一条的缓存掏空、静默判成"无候选"——故
+   `_run_feature` 用 `schema.shared_dedup_item_keys` 查出共享键就整批关掉回收。
+   配套地，dedup 用例不允许「同键不同卡」（撞键时 `insert_item` 返回别人的行 id，作用域指向
+   错卡；装载期由 `schema.dedup_item_key_conflicts` 校验，网页导出路径按 WARNING 点名）。
+
+探针另记两字段进 `BinaryCaseEval`：`channel`（实际判定通道 `exact`/`cosine`/`overlap`/
+`cosine_no_candidate`/`none`）与 `cosine_ran`（余弦链路是否跑通）。通道必须在候选选取那一刻
+取：零候选时生产会把 `metric` 改写回 `overlap`，用 `metric` 反推就丢掉"余弦其实跑过"。
+dedup 摘要另有 `channel_*` 计数与 `ai_judged_cases`/`ai_judged_rate`（**经判官裁决的用例数**，
+不是 API 调用数——一例可对多个候选各调一次）——候选门阈值属判定行为，不写出代价就把
+"召回低"错归因给判官。
+
+**指标口径的三条解释规则**（报告与 JSON 同时体现）：classify 主指标剔除纯占位符用例
+（正文全是 `[图片]` 一类占位符，生产里进不了分类阶段；`placeholder_only_*` 单独计数、
+另给 `category_recall_incl_placeholder` 供历史对比）并按 `mode` 切片（`by_mode`，验收按切片
+读数）；误报按用例形态拆 `false_positives_noise`（全噪声用例）/`false_positives_partial`；
+时间点区分**回声点**（期望值就是该消息自己的发送时间，非正文抽取；`*_ex_echo` 系列才是解析
+能力读数，旧键保留作历史口径）；title 撤除精确匹配率（开放生成任务里逐字相等衡量抄写不是
+质量），改给字符相似度均值/中位数与「仅标题期望」用例的软通过线 `TITLE_SOFT_RATIO`。
+新增字段一律带默认值，历史报告 payload 必须仍能渲染（缺字段显示「-」）。
 
 #### briefdesk/sources_base.py
 
@@ -1197,7 +1243,7 @@ required field of `weflow`/`qqflow` → that plugin self-disables via `PluginDis
 | `IGNORE_SELF` | `true` | 过滤本账号自己发送的消息（所有消息入口：SSE 实时 + REST 回填）。weflow / weflow-legacy REST 按 `isSend` 判定；两源 SSE 上游都不推自消息（weflow-server 推送端据 `isSend=1` 主动跳过，weflow-legacy 的 SSE 上游已不推送）；qqflow REST 先按 `isSend`（上游 40013 方向列归一化为 `{0,1}`）判，`isSend=0` 时再按自身 UID（`u_<QQFLOW_QQ>`）兜底（部分 QQ 版本缺该列），SSE 事件无发送者标识、开启后按消息回查 REST（每消息 +1 次本机 HTTP）。**注意 qqflow 的 `self_uid` 由配置推导而非取自上游**：服务端若绑着别的账号，自过滤会静默失效（把对方的消息当别人发的收进来，同时漏掉真正的自消息）——这是账号身份闸门在 qqflow 侧比 weflow 更要紧的原因（weflow 用数据自带的 `isSend`，不受影响） |
 | `REALTIME_BATCH_MAX_COUNT` / `REALTIME_BATCH_TIMEOUT_MS` | `1` / `180000` | Realtime batch buffer flush thresholds (跨源公共：监听器攒批 + 实时路径 pipeline 切批) |
 | `BACKFILL_BATCH_MAX_COUNT` | `10` | Backfill batch size per AI classify call (independent of SSE batching)。⚠️ 长批 + 多群易引发 AI 输出 index 漂移/漏回，默认已由 20 调为 10 |
-| `DEDUP_SIMILARITY_THRESHOLD` | `0.3` | Dedup pre-filter: title overlap (character bigram Jaccard; 单字符标题退回字符集) ratio that triggers AI semantic dedup（嵌入整体不可用时为主通道；嵌入模式下余弦零候选时作兜底通道）。⚠️ 度量已由单字符交/min 换为 bigram Jaccard（分布整体左移），0.3 沿用旧口径取值、重标定流程见 `scripts/recalibrate_similarity.py` |
+| `DEDUP_SIMILARITY_THRESHOLD` | `0.07` | Dedup pre-filter: title overlap (character bigram Jaccard; 单字符标题退回字符集) ratio that triggers AI semantic dedup（嵌入整体不可用时为主通道；嵌入模式下余弦零候选时作兜底通道）。取值按 bigram Jaccard 口径重标定（dedup 用例集的自有 item 对：0.07 时 same 对放行约九成、负例约九成九；旧值 0.3 属单字符交/min 口径，沿用会让无嵌入部署召回掉到两成），重标定流程见 `scripts/recalibrate_similarity.py` |
 | `EMBED_API_BASE` | `` (empty = disabled) | Embedding API base URL; non-empty enables embedding cosine pre-filter (falls back to `AI_API_BASE` if empty within enabled mode) |
 | `EMBED_MODEL` | `` (falls back to `AI_MODEL`) | Embedding model name |
 | `EMBED_API_KEY` | `` (falls back to `AI_API_KEY`) | Embedding API key（SecretStr 持有） |

@@ -7,7 +7,7 @@
       "note": "措辞不同但实质相同 → 同一件事（same=true）",
       "items": [
         {
-          "msg_id": "i1",
+          "msg_id": "dd-001-a",
           "content": "摄影社招新面试，周三下午3点，体育馆",
           "sender_name": "李娜",
           "sender_id": "u1",
@@ -19,7 +19,7 @@
         }
       ],
       "query": {
-        "msg_id": "q1",
+        "msg_id": "dd-001-q",
         "content": "摄影社周三下午三点在体育馆招新",
         "sender_name": "刘洋",
         "sender_id": "u2",
@@ -36,7 +36,7 @@
       "note": "两个不同社团的招新 → 不是同一件事（same=false）",
       "items": [
         {
-          "msg_id": "i1",
+          "msg_id": "dd-002-a",
           "content": "位育摄影社招新，欢迎加入",
           "sender_name": "张伟",
           "sender_id": "u1",
@@ -48,7 +48,7 @@
         }
       ],
       "query": {
-        "msg_id": "q1",
+        "msg_id": "dd-002-q",
         "content": "南洋模范摄影社招新面试",
         "sender_name": "王强",
         "sender_id": "u2",
@@ -65,7 +65,7 @@
       "note": "完全不同话题（字符重叠过低时预筛直接跳过 AI，判定仍应为 false）",
       "items": [
         {
-          "msg_id": "i1",
+          "msg_id": "dd-003-a",
           "content": "出二手自行车，八成新，150元",
           "sender_name": "赵敏",
           "sender_id": "u1",
@@ -77,7 +77,7 @@
         }
       ],
       "query": {
-        "msg_id": "q1",
+        "msg_id": "dd-003-q",
         "content": "求购考研数学复习全书，价格可议",
         "sender_name": "陈晨",
         "sender_id": "u2",

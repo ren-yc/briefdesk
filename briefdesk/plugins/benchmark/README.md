@@ -103,10 +103,10 @@ python -m briefdesk.plugins.benchmark.cli --model deepseek-v4-flash --concurrenc
 
 | 功能 | 引擎入口（与生产同路径） | 测试集输入 | 期望标注 | 主要指标 |
 |---|---|---|---|---|
-| classify | `classify_batch(messages)` | 一批 InternalMessage | 每条应分类消息的 `index`/`category`，可选 `start`/`end`/`times` | 类别准确率/精确率/召回率/F1、时间点完全一致率、失败率 |
-| dedup | `DedupEngine.check_dedup` | `items`（历史卡片）+ `query`（新消息） | `same: true/false` | 判重准确率/精确率/召回率/F1、预筛跳过数 |
+| classify | `classify_batch(messages)` | 一批 InternalMessage | 每条应分类消息的 `index`/`category`，可选 `start`/`end`/`times`；可选 `mode` 切片维度 | 类别准确率/精确率/召回率/F1（不含纯占位符用例，按 mode 切片另列）、时间点完全一致率、时间点召回率（含回声 / 剔回声）、失败率 |
+| dedup | `DedupEngine.check_dedup` | `items`（历史卡片）+ `query`（新消息） | `same: true/false` | 判重准确率/精确率/召回率/F1、未触发判官数、经判官裁决用例数与占比、判定通道分布 |
 | merge | `judge_merge` | `head` + `tail` 两张卡 | `merge: true/false` | 判定准确率/精确率/召回率/F1 |
-| title | `summarize_title` | 一张卡 + `old_title`/`key_info` | `title` 精确 与/或 `keywords` 包含 | 精确匹配率、关键词命中率、平均长度、回退数 |
+| title | `summarize_title` | 一张卡 + `old_title`/`key_info` | `title` 精确 与/或 `keywords` 包含 | 关键词命中率、字符相似度均值/中位数、平均长度、超长数、回退数 |
 
 ## 测试集格式（手动添加 / 网页导出共用）
 
@@ -170,7 +170,8 @@ python -m briefdesk.plugins.benchmark.cli --model deepseek-v4-flash --concurrenc
 ```
 
 - **dedup 候选预筛注意**：未配置 `EMBED_API_BASE` 时用标题字符重叠预筛（阈值
-  `DEDUP_SIMILARITY_THRESHOLD`=0.3），重叠不足的 pair **不会触发 AI**、直接判为不同。
+  `DEDUP_SIMILARITY_THRESHOLD`=0.07，bigram Jaccard 口径标定值），重叠不足的 pair
+  **不会触发 AI**、直接判为不同。
   要评测 LLM 判重质量，请让 `query.title` 与某条 `items.title` 保持足够重叠
   （如相同标题、不同正文）；结果中会标注"预筛跳过"的用例数。
 - title 期望的 `title` 精确匹配 与 `keywords` 包含匹配至少提供一种；
@@ -180,14 +181,36 @@ python -m briefdesk.plugins.benchmark.cli --model deepseek-v4-flash --concurrenc
 
 - **类别准确率** = 期望集合中类别精确命中数 / 期望条数（漏检即扣分，与召回率同值）；
   **精确率** = 命中数 / 模型输出条数（误报扣分）；F1 为两者调和平均。
+  三项主指标**不含**纯占位符用例（正文全是 `[图片]` 一类附件占位符，生产里根本
+  进不了分类阶段）；这类用例单独计数并另给一条 `含其召回`，便于与旧报告对比。
+- **分 mode 读数**：报告按用例 `mode`（prod/oov/mix/fictional/single/real/unspecified）
+  切片给出各自的召回/精确/误报。**验收要看切片，不要只看总分**——词表外（oov）样本
+  与生产样本混算时，总分既不代表能力也不代表上限。mode 优先取用例的 `mode` 字段，
+  字段为空时回退解析 `note` 里的 `mode=xxx` 或独立的 `real` 标记。
 - **时间点完全一致率** = 时间点集合与期望精确相等（多提/漏提都扣）的消息占比；
   另有逐点召回率/精确率（只按 `(type, time)` 比对，忽略 label）。
+  逐点召回给两口径：`时间点召回率(含回声)` 是历史口径（与旧报告可比），
+  `(剔回声)` 才是解析能力读数——**回声点**指期望值就是这条消息自己的发送时间
+  （标注时从界面复制而来，不是从正文抽取），它留在分母里量的是"模型会不会复读
+  时间戳"。date-only 与带时刻另外分开统计。
 - **失败率** = `outcome.failed` 条数 / 消息总数（解析失败、未知类别、网络错误等
   本轮无法入库的消息；生产中这些消息会在回填窗口重试）。
 - **dedup/merge**：以 true 为正类，accuracy/precision/recall/F1 + TP/FP/TN/FN；
-  dedup 额外统计"预筛跳过"用例数。
-- **title**：精确匹配率（有 `title` 期望的用例）、关键词命中率（有 `keywords` 期望的用例）、
-  平均输出长度、超长（>30 字，与 `TITLE_PROMPT` 约束一致）数与回退原标题数。
+  dedup 额外统计**未触发判官的用例数**、**经判官裁决的用例数与占比**（`ai_judged_cases`
+  / `ai_judged_rate`——是"用例数"而不是 API 调用数，一例可对多个候选各调一次判官）与
+  **逐例判定通道**
+  （`exact` 图片/原文哈希短路、`cosine` 余弦候选、`overlap` 字符重叠候选、
+  `cosine_no_candidate` 余弦跑通但零候选、`none` 无任何候选）。
+  通道必须逐例记录：候选门阈值属于判定行为，配置写了嵌入也不代表这轮真走了余弦。
+  另注意 dedup 的"未触发判官"含三种成因——精确短路（正确的零 AI 判定）、判官负缓存命中
+  （同上）、候选门拒绝（没比成）；靠通道列区分，别把总数当漏判数。merge 的同名计数只有
+  余弦预筛门一种成因。
+- **title**：关键词命中率（有 `keywords` 期望的用例，硬判定）、平均输出长度、
+  超长（>30 字，与 `TITLE_PROMPT` 约束一致）数与回退原标题数；
+  另给**字符相似度**均值/中位数（输出与期望标题的序列比对分，0~1）。
+  精确匹配率已撤除：标题是开放生成，逐字相等衡量的是抄写而不是质量。
+  只有 `title` 期望、没有 `keywords` 的用例按字符相似 ≥0.70 给**软通过**（明细中标
+  「软」），该线只是描述线，不作门槛——能作门槛的只有关键词。
 
 ## 常见问题
 
