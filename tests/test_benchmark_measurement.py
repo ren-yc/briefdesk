@@ -880,6 +880,36 @@ class TestReportBackwardCompatibility:
         assert "类别准确率" in svg
         assert "时间点召回率(剔回声)" not in svg
 
+    def test_title_verdict_keeps_legacy_exact_match_as_soft_pass(self):
+        """旧 payload 没有 char_similarity：逐字相同不能被重渲染成失败。
+
+        `char_similarity` 是本轮新增的逐例派生分，历史报告里没有这个键。旧口径
+        下「仅标题期望 + 逐字相同」是通过的；新代码若只看相似度就会把它判成 ✘，
+        等于用新标准改写历史结论。回退只对缺键的历史 payload 生效。
+        """
+        from briefdesk.plugins.benchmark.html_report import _title_ok, _verdict
+
+        legacy_exact = {
+            "case_id": "tt-legacy",
+            "output": "摄影社招新面试",
+            "expected_title": "摄影社招新面试",
+            "expected_keywords": None,
+            "error": None,
+        }
+        hard, soft = _title_ok(legacy_exact)
+        assert hard is False
+        assert soft is True
+        assert 'class="warn"' in _verdict("title", legacy_exact)
+
+        # 新 payload 同一个用例带相似度键：走相似度判定，不被旧回退短路
+        new_form = dict(legacy_exact, char_similarity=0.95)
+        assert _title_ok(new_form) == (False, True)
+        low_sim = dict(legacy_exact, char_similarity=0.10)
+        assert _title_ok(low_sim) == (False, False)
+        # 旧 payload 但逐字不同：仍判失败，回退不能放宽成无条件通过
+        mismatch = dict(legacy_exact, output="篮球社招新")
+        assert _title_ok(mismatch) == (False, False)
+
     def test_html_chart_treats_null_value_as_missing(self):
         """键存在但值为 null 与缺键同义：主表显示「-」，图表也不能画 0.0%。
 

@@ -403,6 +403,11 @@ def _title_ok(case: dict[str, Any]) -> tuple[bool, bool]:
     1 例逐字相同，把它当质量读数会把结论带偏）。
     软判定给「只有标题期望」的用例：字符相似达描述线算软通过，明细里同时显示
     相似度，读者看得见这是宽松判定而不是漏判。
+
+    旧 payload 没有 `char_similarity` 键（该字段是本轮新增的逐例派生分）：
+    那时逐字相等就是当时的通过条件，落在它上面的历史用例不能被重渲染成失败，
+    因此按旧口径判为软通过。新 payload 一定有该键（`dataclasses.asdict` 会写入，
+    空值为 null），故这条回退只对历史报告生效，不参与新报告的判定。
     """
     output = case.get("output")
     if output is None:
@@ -410,6 +415,9 @@ def _title_ok(case: dict[str, Any]) -> tuple[bool, bool]:
     keywords = case.get("expected_keywords") or []
     if keywords:
         return bool(all(k in output for k in keywords)), False
+    if "char_similarity" not in case:
+        expected_title = case.get("expected_title")
+        return False, bool(expected_title) and output == expected_title
     similarity = case.get("char_similarity")
     soft = isinstance(similarity, (int, float)) and similarity >= TITLE_SOFT_RATIO
     return False, soft
