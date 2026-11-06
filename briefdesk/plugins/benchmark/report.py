@@ -79,13 +79,17 @@ def format_metric(key: str, value: float | None) -> str:
     平均长度是**字数**而不是比例：照比例渲染过，会把「平均长度 23.8 字」显示成
     「2379.0%」（回归见 tests/test_benchmark.py 的 title 指标渲染用例）。计数类是
     整数，原样输出；缺失值统一显示「-」。
+
+    缺失判断必须在比例分支**之前**：比例分支里的 `value or 0` 会把 None 变成 0，
+    于是"旧报告没记录这个指标"被渲染成"0.0%"，读者会当成真实的零（回归见
+    tests/test_benchmark_measurement.py 的旧 payload 渲染用例）。
     """
-    if key in _RATE_KEYS:
-        return f"{float(value or 0) * 100:.1f}%"
-    if key == "avg_len":
-        return f"{float(value or 0):.1f} 字"
     if value is None:
         return "-"
+    if key in _RATE_KEYS:
+        return f"{float(value) * 100:.1f}%"
+    if key == "avg_len":
+        return f"{float(value):.1f} 字"
     return str(value)
 
 
@@ -173,11 +177,13 @@ def render_metrics(feature: str, summary: dict[str, float | int]) -> list[str]:
 
     补充行一律走 `.get` 并"缺键就不写这行"：报告 JSON 会长期落盘，旧运行的
     payload 没有本轮新增的键，渲染历史报告不能因为少一个键而抛 KeyError。
+    主表则相反——每个指标都占一行，缺键显示「-」而不是补 0：补 0 会让"这一轮
+    没测过这个指标"看起来像"测了，结果是零"。
     """
     lines: list[str] = []
     for key, label in _FEATURE_METRIC_LABELS.get(feature, []):
-        value = summary.get(key, 0)
-        lines.append(f"  {label:<14} {format_metric(key, value)}")
+        text = format_metric(key, summary[key]) if key in summary else "-"
+        lines.append(f"  {label:<14} {text}")
     extra: list[str] = []
     if feature == "classify":
         noise = summary.get("false_positives_noise")
@@ -198,11 +204,13 @@ def render_metrics(feature: str, summary: dict[str, float | int]) -> list[str]:
         ]
         echo = summary.get("time_points_echo")
         if echo:
+            # 拆分键可能是旧 payload 里没有的（回声点数是更早的键）：缺了显示
+            # 「-」而不是补 0，理由同主表
             extra.append(
                 f"  时间点回声（期望值=消息发送时间，非正文抽取）: {echo} 点，"
-                f"剔回声召回 {format_metric('time_point_recall_ex_echo', summary.get('time_point_recall_ex_echo', 0))}"
-                f"（date-only {format_metric('time_point_recall_date_ex_echo', summary.get('time_point_recall_date_ex_echo', 0))}"
-                f" / 带时刻 {format_metric('time_point_recall_clock_ex_echo', summary.get('time_point_recall_clock_ex_echo', 0))}）"
+                f"剔回声召回 {format_metric('time_point_recall_ex_echo', summary.get('time_point_recall_ex_echo'))}"
+                f"（date-only {format_metric('time_point_recall_date_ex_echo', summary.get('time_point_recall_date_ex_echo'))}"
+                f" / 带时刻 {format_metric('time_point_recall_clock_ex_echo', summary.get('time_point_recall_clock_ex_echo'))}）"
             )
         ph_cases = summary.get("placeholder_only_cases")
         if ph_cases:
@@ -211,7 +219,7 @@ def render_metrics(feature: str, summary: dict[str, float | int]) -> list[str]:
                 "已从主指标剔除；含其召回 "
                 + format_metric(
                     "category_recall_incl_placeholder",
-                    summary.get("category_recall_incl_placeholder", 0),
+                    summary.get("category_recall_incl_placeholder"),
                 )
             )
         extra += _mode_lines(summary)
@@ -243,7 +251,7 @@ def render_metrics(feature: str, summary: dict[str, float | int]) -> list[str]:
         if "ai_judged_cases" in summary:
             extra.append(
                 f"  经判官裁决的用例 {summary.get('ai_judged_cases', 0)} 条"
-                f"（占比 {format_metric('ai_judged_rate', summary.get('ai_judged_rate', 0))}；"
+                f"（占比 {format_metric('ai_judged_rate', summary.get('ai_judged_rate'))}；"
                 "一例可对多个候选各调一次，不是 API 调用上限"
             )
             channels = [

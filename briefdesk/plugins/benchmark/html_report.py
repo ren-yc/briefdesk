@@ -165,16 +165,23 @@ def _metric_value(key: str, value: Any) -> str:
 
 
 def _fmt(summary: dict[str, Any], key: str) -> str:
-    """按指标口径格式化 summary[key]（缺键按 0 处理）。"""
-    return format_metric(key, summary.get(key, 0))
+    """按指标口径格式化 summary[key]（缺键显示「-」，与主表同口径）。
+
+    补 0 会让"这一轮没测过该指标"读成"测了是零"——补充行虽然多数被父键
+    存在性守着，但守的是父键（如回声点数），不保证拆分键本身在旧 payload 里
+    也有。
+    """
+    return format_metric(key, summary[key]) if key in summary else "-"
 
 
 def _metric_table(feature: str, summary: dict[str, Any], elapsed_sec: float | None = None) -> str:
     rows: list[str] = []
     for key, label in _FEATURE_METRIC_LABELS.get(feature, []):
-        rows.append(
-            f"<tr><td>{_esc(label)}</td><td>{_metric_value(key, summary.get(key, 0))}</td></tr>"
-        )
+        # 与终端主表同口径：缺键显示「-」而不是补 0——旧报告里没记录的指标
+        # 若渲染成 0.0%，会被读成"测过且为零"（与 docs/architecture.md 的
+        # 历史 payload 兼容约定一致）
+        text = _metric_value(key, summary[key]) if key in summary else "-"
+        rows.append(f"<tr><td>{_esc(label)}</td><td>{text}</td></tr>")
     extras: list[tuple[str, str]] = []
     if feature == "classify":
         noise = summary.get("false_positives_noise")
@@ -314,36 +321,48 @@ def _mode_table(summary: dict[str, Any]) -> str:
     )
 
 
+def _chart_items(
+    summary: dict[str, Any], spec: list[tuple[str, str]]
+) -> list[tuple[str, float]]:
+    """把 (标签, 键名) 规格翻成图表数据，**缺键的指标不画**。
+
+    为什么不能补 0：历史 payload 没有本轮新增的键，补 0 会画出一根标着
+    「0.0%」的条，和主表补 0 是同一个误读——"没测过"看起来像"测了是零"。
+    图表没有「-」的位置，缺的指标直接不出现；全部缺失时 `bar_chart_svg`
+    自己会退化成占位图。
+    """
+    return [(label, float(summary[key] or 0)) for label, key in spec if key in summary]
+
+
 def _feature_charts(feature: str, summary: dict[str, Any]) -> str:
     if feature == "classify":
-        items = [
-            ("类别准确率", summary.get("category_accuracy", 0)),
-            ("类别精确率", summary.get("category_precision", 0)),
-            ("类别召回率", summary.get("category_recall", 0)),
-            ("类别 F1", summary.get("category_f1", 0)),
-            ("时间点完全一致率", summary.get("time_msg_accuracy", 0)),
-            ("时间点召回率(含回声)", summary.get("time_point_recall", 0)),
-            ("时间点召回率(剔回声)", summary.get("time_point_recall_ex_echo", 0)),
-            ("时间点精确率", summary.get("time_point_precision", 0)),
-            ("本轮失败率", summary.get("failure_rate", 0)),
-            ("标题概括填充率", summary.get("summary_fill_rate", 0)),
-        ]
-        svg = bar_chart_svg("分类指标", [(label, float(v or 0)) for label, v in items])
+        items = _chart_items(summary, [
+            ("类别准确率", "category_accuracy"),
+            ("类别精确率", "category_precision"),
+            ("类别召回率", "category_recall"),
+            ("类别 F1", "category_f1"),
+            ("时间点完全一致率", "time_msg_accuracy"),
+            ("时间点召回率(含回声)", "time_point_recall"),
+            ("时间点召回率(剔回声)", "time_point_recall_ex_echo"),
+            ("时间点精确率", "time_point_precision"),
+            ("本轮失败率", "failure_rate"),
+            ("标题概括填充率", "summary_fill_rate"),
+        ])
+        svg = bar_chart_svg("分类指标", items)
         return f'<div class="chart">{svg}</div>'
     if feature in ("dedup", "merge"):
-        items = [
-            ("准确率", summary.get("accuracy", 0)),
-            ("精确率", summary.get("precision", 0)),
-            ("召回率", summary.get("recall", 0)),
-            ("F1", summary.get("f1", 0)),
-        ]
         # AI 判定占比只在 dedup 出现（merge 摘要没有该键）：候选门阈值一改它就用
-        # 跳变，图上没有这根条就只能从指标表里数出来。
-        if "ai_judged_rate" in summary:
-            items.append(("判官裁决用例占比", summary.get("ai_judged_rate", 0)))
+        # 跳变，图上没有这根条就只能从指标表里数出来；缺键时由 _chart_items 跳过
+        items = _chart_items(summary, [
+            ("准确率", "accuracy"),
+            ("精确率", "precision"),
+            ("召回率", "recall"),
+            ("F1", "f1"),
+            ("判官裁决用例占比", "ai_judged_rate"),
+        ])
         bar = bar_chart_svg(
             "判定指标",
-            [(label, float(v or 0)) for label, v in items],
+            items,
             color=_FEATURE_COLORS[feature],
         )
         matrix = confusion_svg(
@@ -354,16 +373,16 @@ def _feature_charts(feature: str, summary: dict[str, Any]) -> str:
             int(summary.get("fn", 0)),
         )
         return f'<div class="chart">{bar}</div><div class="chart">{matrix}</div>'
-    items = [
-        ("关键词命中率", summary.get("keyword_hit_rate", 0)),
-        # 字符相似是描述线（0~1 的比值，和比率同刻度）：标题为开放生成，
-        # 逐字相等只衡量抄写不衡量质量，故不再画精确匹配率
-        ("字符相似度均值", summary.get("char_similarity_mean", 0)),
-        ("字符相似度中位数", summary.get("char_similarity_p50", 0)),
-    ]
+    # 字符相似是描述线（0~1 的比值，和比率同刻度）：标题为开放生成，
+    # 逐字相等只衡量抄写不衡量质量，故不再画精确匹配率
+    items = _chart_items(summary, [
+        ("关键词命中率", "keyword_hit_rate"),
+        ("字符相似度均值", "char_similarity_mean"),
+        ("字符相似度中位数", "char_similarity_p50"),
+    ])
     svg = bar_chart_svg(
         "标题指标",
-        [(label, float(v or 0)) for label, v in items],
+        items,
         color=_FEATURE_COLORS["title"],
     )
     return f'<div class="chart">{svg}</div>'

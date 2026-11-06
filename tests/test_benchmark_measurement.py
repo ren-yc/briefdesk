@@ -798,6 +798,88 @@ class TestReportBackwardCompatibility:
             lines = render_metrics(feature, payload["features"][feature]["summary"])
             assert lines, feature
 
+    def test_terminal_missing_metric_renders_dash_not_zero(self):
+        """旧 payload 缺的指标显示「-」，不能被渲染成 0.0%。
+
+        为什么必须区分：`time_point_recall_ex_echo` 是本轮新增键，旧报告里根本
+        没有这一列。补 0 会把它显示成"剔回声召回 0.0%"，读者据此得出"旧版本
+        时间抽取完全失败"的错误结论——而真实原因是那一轮没测这个口径。
+        """
+        from briefdesk.plugins.benchmark.report import render_metrics
+
+        payload = self._legacy_payload()
+        text = "\n".join(render_metrics("classify", payload["features"]["classify"]["summary"]))
+        assert "时间点召回率(剔回声)" in text
+        for line in text.splitlines():
+            if "时间点召回率(剔回声)" in line:
+                assert line.rstrip().endswith("-"), line
+                assert "0.0%" not in line, line
+        # 有键且真的是 0 的指标仍显示 0.0%：占位符不能吃掉真实零值
+        for line in text.splitlines():
+            if "时间点完全一致率" in line:
+                assert line.rstrip().endswith("0.0%"), line
+
+    def test_html_missing_metric_renders_dash_not_zero(self):
+        """HTML 主表与终端同口径：缺键显示「-」，真实零值仍是 0.0%。"""
+        from briefdesk.plugins.benchmark.html_report import _metric_table
+
+        payload = self._legacy_payload()
+        table = _metric_table("classify", payload["features"]["classify"]["summary"])
+        assert "<td>-</td>" in table
+        rows = table.split("<tr>")
+        echo_row = next(r for r in rows if "时间点召回率(剔回声)" in r)
+        assert "<td>-</td>" in echo_row, echo_row
+        assert "0.0%" not in echo_row, echo_row
+        exact_row = next(r for r in rows if "时间点完全一致率" in r)
+        assert "0.0%" in exact_row, exact_row
+
+    def test_format_metric_none_is_dash_for_rate_keys(self):
+        """比例键的 None 也必须走「-」：比例分支里的 `value or 0` 会吞掉 None。"""
+        from briefdesk.plugins.benchmark.report import format_metric
+
+        for key in ("time_point_recall_ex_echo", "char_similarity_mean", "accuracy", "ai_judged_rate"):
+            assert format_metric(key, None) == "-", key
+        # 真实零值照旧是 0.0%，不被当成缺失
+        assert format_metric("accuracy", 0.0) == "0.0%"
+        assert format_metric("char_similarity_mean", 0) == "0.0%"
+
+    def test_terminal_extra_line_shows_dash_for_missing_split_key(self):
+        """补充行里的拆分键缺失时也给「-」：父键存在不代表拆分键存在。
+
+        场景：`time_points_echo` 是更早的键，旧 payload 有它但没有本轮的
+        `time_point_recall_date_ex_echo` / `_clock_ex_echo`。补 0 会把两个
+        口径都印成 0.0%，读起来像"两类时点全错"，实际是没记录。
+        """
+        from briefdesk.plugins.benchmark.report import render_metrics
+
+        summary = {
+            "cases": 1,
+            "error_cases": 0,
+            "time_points_echo": 3,
+            "time_point_recall_ex_echo": 0.5,
+        }
+        text = "\n".join(render_metrics("classify", summary))
+        line = next(ln for ln in text.splitlines() if "时间点回声" in ln)
+        assert "剔回声召回 50.0%" in line, line
+        assert "date-only -" in line, line
+        assert "带时刻 -" in line, line
+
+    def test_html_extra_line_shows_dash_for_missing_split_key(self):
+        """HTML 补充行与终端同口径：缺拆分键显示「-」。"""
+        from briefdesk.plugins.benchmark.html_report import _metric_table
+
+        summary = {"cases": 1, "error_cases": 0, "time_points_echo": 3, "time_point_recall_ex_echo": 0.5}
+        table = _metric_table("classify", summary)
+        assert "date-only -" in table, table
+
+    def test_html_chart_skips_missing_metric_instead_of_zero_bar(self):
+        """图表里缺的指标直接不画：补 0 会得到一根标着 0.0% 的条。"""
+        from briefdesk.plugins.benchmark.html_report import _feature_charts
+
+        svg = _feature_charts("classify", {"category_accuracy": 0.5, "cases": 1})
+        assert "类别准确率" in svg
+        assert "时间点召回率(剔回声)" not in svg
+
     def test_terminal_case_lines_render_legacy_evals(self):
         """旧 payload 的逐用例 dict 走 HTML 渲染路径不得抛 KeyError。"""
         from briefdesk.plugins.benchmark.html_report import _case_rows
