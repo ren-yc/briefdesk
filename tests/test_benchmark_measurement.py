@@ -880,6 +880,28 @@ class TestReportBackwardCompatibility:
         assert "类别准确率" in svg
         assert "时间点召回率(剔回声)" not in svg
 
+    def test_html_chart_treats_null_value_as_missing(self):
+        """键存在但值为 null 与缺键同义：主表显示「-」，图表也不能画 0.0%。
+
+        JSON 里的 `null` 反序列化成 None，是旧报告表达"未记录"的另一种形态。
+        只判 `key in summary` 会让同一份报告里主表写「-」、图表画零长条。
+        """
+        from briefdesk.plugins.benchmark.html_report import (
+            _feature_charts,
+            _metric_table,
+        )
+
+        summary = {"accuracy": 0.5, "precision": 0.5, "recall": 0.5, "f1": 0.5, "ai_judged_rate": None}
+        svg = _feature_charts("dedup", summary)
+        # 只看条形图那一段：混淆矩阵在同一段 HTML 里，它的百分比与本题无关
+        bar = svg.split("</svg>")[0]
+        assert "判官裁决用例占比" not in bar, bar
+        # 精确匹配独立出现的 ">0.0%<"：50.0% 里也含 "0.0%" 子串，不能用 in
+        assert ">0.0%<" not in bar, bar
+        # 主表同输入显示「-」：两处口径一致
+        table = _metric_table("dedup", summary)
+        assert "<td>-</td>" in table, table
+
     def test_terminal_case_lines_render_legacy_evals(self):
         """旧 payload 的逐用例 dict 走 HTML 渲染路径不得抛 KeyError。"""
         from briefdesk.plugins.benchmark.html_report import _case_rows

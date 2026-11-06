@@ -324,14 +324,22 @@ def _mode_table(summary: dict[str, Any]) -> str:
 def _chart_items(
     summary: dict[str, Any], spec: list[tuple[str, str]]
 ) -> list[tuple[str, float]]:
-    """把 (标签, 键名) 规格翻成图表数据，**缺键的指标不画**。
+    """把 (标签, 键名) 规格翻成图表数据，**缺失的指标不画**。
 
     为什么不能补 0：历史 payload 没有本轮新增的键，补 0 会画出一根标着
     「0.0%」的条，和主表补 0 是同一个误读——"没测过"看起来像"测了是零"。
     图表没有「-」的位置，缺的指标直接不出现；全部缺失时 `bar_chart_svg`
     自己会退化成占位图。
+
+    判据是 `summary.get(key) is not None` 而不是 `key in summary`：键存在
+    但值为 null 的 payload（JSON 里 `null` 反序列化成 None）与缺键同义，
+    否则主表显示「-」、图表却画 0.0%，同一份报告自相矛盾。
     """
-    return [(label, float(summary[key] or 0)) for label, key in spec if key in summary]
+    return [
+        (label, float(summary[key]))
+        for label, key in spec
+        if summary.get(key) is not None
+    ]
 
 
 def _feature_charts(feature: str, summary: dict[str, Any]) -> str:
