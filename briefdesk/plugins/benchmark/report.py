@@ -9,16 +9,17 @@ from typing import Any
 from briefdesk.logger import fmt_dur
 from briefdesk.plugins.benchmark.metrics import (
     DEDUP_CHANNELS,
+    TITLE_SOFT_RATIO,
     BinaryCaseEval,
     ClassifyCaseEval,
     TitleCaseEval,
 )
 
 _FEATURE_TITLES = {
-    "classify": "分类（classify_batch）",
-    "dedup": "去重（check_dedup）",
-    "merge": "合并判定（judge_merge）",
-    "title": "标题重拟（summarize_title）",
+    "classify": "分类",
+    "dedup": "去重",
+    "merge": "合并",
+    "title": "标题",
 }
 
 _FEATURE_METRIC_LABELS: dict[str, list[tuple[str, str]]] = {
@@ -35,17 +36,17 @@ _FEATURE_METRIC_LABELS: dict[str, list[tuple[str, str]]] = {
         ("summary_fill_rate", "标题概括填充率"),
     ],
     "dedup": [
-        ("accuracy", "判重准确率"),
-        ("precision", "判重精确率(same)"),
-        ("recall", "判重召回率(same)"),
-        ("f1", "判重 F1"),
+        ("accuracy", "准确率"),
+        ("precision", "精确率(same)"),
+        ("recall", "召回率(same)"),
+        ("f1", "F1"),
         ("ai_judged_rate", "AI 判定用例占比"),
     ],
     "merge": [
-        ("accuracy", "判定准确率"),
-        ("precision", "判定精确率(合并)"),
-        ("recall", "判定召回率(合并)"),
-        ("f1", "判定 F1"),
+        ("accuracy", "准确率"),
+        ("precision", "精确率(合并)"),
+        ("recall", "召回率(合并)"),
+        ("f1", "F1"),
     ],
     "title": [
         ("keyword_hit_rate", "关键词命中率"),
@@ -172,67 +173,116 @@ def _mode_lines(summary: dict[str, float | int]) -> list[str]:
     return lines
 
 
-def render_metrics(feature: str, summary: dict[str, float | int]) -> list[str]:
-    """指标表 + 该功能的补充行。
+def _count_text(summary: dict[str, Any], key: str, *, unit: str = " 条") -> str:
+    """计数字段的展示值：缺键或 null 显示「-」，否则「<值><单位>」。
 
-    补充行一律走 `.get` 并"缺键就不写这行"：报告 JSON 会长期落盘，旧运行的
-    payload 没有本轮新增的键，渲染历史报告不能因为少一个键而抛 KeyError。
-    主表则相反——每个指标都占一行，缺键显示「-」而不是补 0：补 0 会让"这一轮
-    没测过这个指标"看起来像"测了，结果是零"。
+    与主表同一套规矩——补 0 会让"这一轮没记录"读成"这一轮是零"。这些计数键在
+    正常 payload 里恒有，缺只可能来自损坏或手写的旧数据，正因如此更不该伪造 0。
+    缺值时连单位一起省掉：印刷体里的「- 条」像排版事故，干净的「-」才读得懂。
     """
-    lines: list[str] = []
-    for key, label in _FEATURE_METRIC_LABELS.get(feature, []):
-        text = format_metric(key, summary[key]) if key in summary else "-"
-        lines.append(f"  {label:<14} {text}")
-    extra: list[str] = []
+    value = summary.get(key)
+    if value is None:
+        return "-"
+    return f"{value}{unit}"
+
+
+def case_count_text(summary: dict[str, Any]) -> str:
+    """用例数（出错数）文案：终端指标表末行与 HTML 段首 meta 共用。
+
+    单点维护的理由同 `feature_extra_rows`：同一句话在两处各写一遍，改一处忘一处
+    就会出现「终端说 841 条、HTML 说别的」这种口径分叉。
+    """
+    text = f"用例 {_count_text(summary, 'cases')}"
+    errors = summary.get("error_cases")
+    if errors is not None:
+        text += f"（出错 {errors}）"
+    return text
+
+
+def elapsed_text(elapsed_sec: float) -> str:
+    """测试用时文案：终端尾行与 HTML 段首 meta 共用。
+
+    同一个值在两处换名字（「用时」/「测试用时」），读者会当成两个指标。
+    """
+    return f"测试用时 {fmt_dur(elapsed_sec)}"
+
+
+def feature_extra_rows(feature: str, summary: dict[str, Any]) -> list[tuple[str, str]]:
+    """该功能补充行的 (标签, 值)——HTML 指标表与终端报告共用同一份文案。
+
+    单点维护的理由：同一组数字在两处各写一遍句式，改一处忘一处就会出现
+    「终端说剔除、HTML 没说」这种口径分叉，而读者往往只看到其中一份。
+
+    缺键口径分两类，与主表一致：
+    - 早期就有的核心计数（期望分类 / 模型输出 / 混淆矩阵）恒出行，缺键显示「-」；
+    - 后加的计数与拆分键（回声点、占位符、通道分布、标题用例构成）缺键则整行不出现
+      ——它们表达的是"这一轮记没记这个口径"，出行并补 0 会被读成"记了，是零"。
+    报告 JSON 会长期落盘，旧 payload 没有后加的键，渲染历史报告不能抛 KeyError。
+    """
+    rows: list[tuple[str, str]]
     if feature == "classify":
+        rows = [
+            ("期望分类", _count_text(summary, "expected")),
+        ]
         noise = summary.get("false_positives_noise")
         partial = summary.get("false_positives_partial")
-        # 误报拆两类才谈得上修法：全噪声用例里的误报是"把闲聊当信息"，部分期望
-        # 用例里的是"同批多分了别条"；只给总数时两者混成一个数，看不出该改哪边。
+        # 误报拆两类才谈得上修法：噪声用例里的是"把闲聊当信息"，部分期望用例里的
+        # 是"同批多分了别条"；只给总数时两者混成一个数，看不出该改哪边。
         split = (
-            f"，其中噪声用例 {noise} / 部分期望用例 {partial}"
+            f"；噪声 {noise} / 部分期望 {partial}"
             if noise is not None and partial is not None
             else ""
         )
-        extra = [
+        rows.append(
             (
-                f"  期望分类 {summary.get('expected', 0)} 条 / 模型输出 "
-                f"{summary.get('model_classified', 0)} 条"
-                f"（误报 {summary.get('false_positives', 0)}{split}）"
-            ),
-        ]
+                "模型输出",
+                (
+                    f"{_count_text(summary, 'model_classified')}"
+                    # 误报是"模型输出条数"里的一个子计数，带「条」会读成两个并列量
+                    f"（误报 {_count_text(summary, 'false_positives', unit='')}{split}）"
+                ),
+            )
+        )
         echo = summary.get("time_points_echo")
         if echo:
             # 拆分键可能是旧 payload 里没有的（回声点数是更早的键）：缺了显示
-            # 「-」而不是补 0，理由同主表
-            extra.append(
-                f"  时间点回声（期望值=消息发送时间，非正文抽取）: {echo} 点，"
-                f"剔回声召回 {format_metric('time_point_recall_ex_echo', summary.get('time_point_recall_ex_echo'))}"
-                f"（date-only {format_metric('time_point_recall_date_ex_echo', summary.get('time_point_recall_date_ex_echo'))}"
-                f" / 带时刻 {format_metric('time_point_recall_clock_ex_echo', summary.get('time_point_recall_clock_ex_echo'))}）"
+            # 「-」而不是补 0——补 0 会把"没记录"印成"两类时点全错"
+            rows.append(
+                (
+                    "时间点回声",
+                    (
+                        f"{echo} 点（消息发送时间，已剔除）；剔回声召回 "
+                        f"{format_metric('time_point_recall_ex_echo', summary.get('time_point_recall_ex_echo'))}"
+                        f"（date-only {format_metric('time_point_recall_date_ex_echo', summary.get('time_point_recall_date_ex_echo'))}"
+                        f" / 带时刻 {format_metric('time_point_recall_clock_ex_echo', summary.get('time_point_recall_clock_ex_echo'))}）"
+                    ),
+                )
             )
         ph_cases = summary.get("placeholder_only_cases")
         if ph_cases:
-            extra.append(
-                f"  纯占位符用例 {ph_cases} 条（期望 {summary.get('placeholder_only_expected', 0)} 条）"
-                "已从主指标剔除；含其召回 "
-                + format_metric(
-                    "category_recall_incl_placeholder",
-                    summary.get("category_recall_incl_placeholder"),
+            rows.append(
+                (
+                    "纯占位符用例",
+                    f"{ph_cases} 条（期望 {_count_text(summary, 'placeholder_only_expected')}，已剔除）；"
+                    "含其召回 "
+                    + format_metric(
+                        "category_recall_incl_placeholder",
+                        summary.get("category_recall_incl_placeholder"),
+                    ),
                 )
             )
-        extra += _mode_lines(summary)
-        extra.append(
-            f"  用例 {summary.get('cases', 0)} 条（出错 {summary.get('error_cases', 0)}）"
-        )
-    elif feature in ("dedup", "merge"):
-        extra = [
+        return rows
+    if feature in ("dedup", "merge"):
+        rows = [
             (
-                f"  TP {summary.get('tp', 0)} / FP {summary.get('fp', 0)}"
-                f" / TN {summary.get('tn', 0)} / FN {summary.get('fn', 0)}"
-            ),
-            f"  用例 {summary.get('cases', 0)} 条（出错 {summary.get('error_cases', 0)}）",
+                "混淆矩阵",
+                (
+                    f"TP {_count_text(summary, 'tp', unit='')}"
+                    f" / FP {_count_text(summary, 'fp', unit='')}"
+                    f" / TN {_count_text(summary, 'tn', unit='')}"
+                    f" / FN {_count_text(summary, 'fn', unit='')}"
+                ),
+            )
         ]
         # 两条功能的 skipped 含义不同，必须分开措辞：dedup 的零判官路径有三种
         # （图片/原文哈希短路、判官负缓存命中、候选门直接拒绝），前两种是**正确
@@ -240,19 +290,29 @@ def render_metrics(feature: str, summary: dict[str, float | int]) -> list[str]:
         # 一句"预筛跳过"会把短路误读成漏判。
         if summary.get("skipped"):
             if feature == "dedup":
-                extra.append(
-                    f"  未触发判官: {summary['skipped']} 条"
-                    "（含精确短路/判官负缓存/候选门拒绝，逐条见通道分布）"
+                rows.append(
+                    (
+                        "未触发判官",
+                        (
+                            f"{summary['skipped']} 条"
+                            "（精确短路 / 负缓存 / 候选门拒绝，见通道列）"
+                        ),
+                    )
                 )
             else:
-                extra.append(f"  预筛跳过（未触发 AI 判定）: {summary['skipped']} 条")
+                rows.append(("预筛跳过", f"{summary['skipped']} 条（未触发 AI）"))
         # 通道分布 + AI 成本：阈值是判定行为的一部分，不写出这两行就无法把
         # "召回低"归因给判官还是门禁，也看不见放宽门禁换来的 AI 调用代价
         if "ai_judged_cases" in summary:
-            extra.append(
-                f"  经判官裁决的用例 {summary.get('ai_judged_cases', 0)} 条"
-                f"（占比 {format_metric('ai_judged_rate', summary.get('ai_judged_rate'))}；"
-                "一例可对多个候选各调一次，不是 API 调用上限"
+            rows.append(
+                (
+                    "经判官裁决",
+                    (
+                        f"{_count_text(summary, 'ai_judged_cases')}"
+                        f"（占比 {format_metric('ai_judged_rate', summary.get('ai_judged_rate'))}；"
+                        "非 API 调用数）"
+                    ),
+                )
             )
             channels = [
                 f"{channel} {summary[f'channel_{channel}']}"
@@ -260,26 +320,54 @@ def render_metrics(feature: str, summary: dict[str, float | int]) -> list[str]:
                 if summary.get(f"channel_{channel}")
             ]
             if channels:
-                extra.append("  判定通道: " + " / ".join(channels))
+                rows.append(("判定通道", " / ".join(channels)))
             if "cosine_cases" in summary:
-                extra.append(
-                    f"  余弦链路跑通的用例: {summary.get('cosine_cases', 0)} 条"
+                rows.append(
+                    ("余弦链路跑通", f"{summary.get('cosine_cases', 0)} 条（配置与实走不一致时核对）")
                 )
-    elif feature == "title":
-        extra = [
+        return rows
+    if feature != "title":
+        # 未知功能不猜模板：静默落进 title 分支会印出「用例构成 关键词 …」这种
+        # 张冠李戴的补充行，比空着更难发现。空列表让问题在标题处立刻可见。
+        return []
+    # 用例构成：两个计数键是后加的，旧 payload 只有 keyword_hit_cases 或都没有。
+    # 缺哪个就不写哪个——补 0 会印出「字符相似 0 条」，读起来像"这轮测了但一条都没命中"，
+    # 实际是那一轮根本没记录这个口径。
+    parts = []
+    if summary.get("keyword_hit_cases") is not None:
+        parts.append(f"关键词 {summary['keyword_hit_cases']} 条")
+    if summary.get("char_similarity_cases") is not None:
+        parts.append(f"字符相似 {summary['char_similarity_cases']} 条")
+    rows = [("用例构成", " / ".join(parts))] if parts else []
+    if summary.get("title_only_cases"):
+        rows.append(
             (
-                f"  关键词用例 {summary.get('keyword_hit_cases', 0)} 条 / "
-                f"字符相似用例 {summary.get('char_similarity_cases', 0)} 条"
-            ),
-        ]
-        if summary.get("title_only_cases"):
-            extra.append(
-                f"  仅标题期望用例 {summary['title_only_cases']} 条，"
-                f"软通过（字符相似达描述线）{summary.get('title_only_soft_pass', 0)} 条"
+                "仅标题期望",
+                (
+                    f"{summary['title_only_cases']} 条，"
+                    f"软通过 {summary.get('title_only_soft_pass', 0)} 条"
+                    f"（字符相似 ≥{TITLE_SOFT_RATIO:.2f}，描述指标非门槛）"
+                ),
             )
-        extra.append(
-            f"  用例 {summary.get('cases', 0)} 条（出错 {summary.get('error_cases', 0)}）"
         )
+    return rows
+
+
+def render_metrics(feature: str, summary: dict[str, float | int]) -> list[str]:
+    """指标表 + 该功能的补充行。
+
+    补充行文案与 HTML 共用 `feature_extra_rows`（见其文档串）。主表每个指标恒占
+    一行，缺键显示「-」而不是补 0：补 0 会让"这一轮没测过这个指标"看起来像
+    "测了，结果是零"。
+    """
+    lines: list[str] = []
+    for key, label in _FEATURE_METRIC_LABELS.get(feature, []):
+        text = format_metric(key, summary[key]) if key in summary else "-"
+        lines.append(f"  {label:<14} {text}")
+    extra = [f"  {label:<14} {value}" for label, value in feature_extra_rows(feature, summary)]
+    if feature == "classify":
+        extra += _mode_lines(summary)
+    extra.append(f"  {case_count_text(summary)}")
     return lines + extra
 
 
@@ -294,7 +382,7 @@ def render_feature_block(
     lines.append("  -- 指标 --")
     lines += render_metrics(feature, summary)
     if elapsed_sec is not None:
-        lines.append(f"  测试用时 {fmt_dur(elapsed_sec)}")
+        lines.append(f"  {elapsed_text(elapsed_sec)}")
     return lines
 
 

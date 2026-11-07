@@ -70,7 +70,9 @@ def bar_chart_svg(
             f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" '
             f'viewBox="0 0 {width} {height}">'
         ),
-        _text(plot_left, 18, title, size=14, fill="#1f2937", weight="bold"),
+        # 标题从画布左缘起画，不复用标签列左缘：标签列宽 172px，从那里起画
+        # 只剩 348px 可用，稍长的标题就会被 SVG 视口裁掉（且不报错）
+        _text(12, 18, title, size=14, fill="#1f2937", weight="bold"),
     ]
     for i, (label, value) in enumerate(items):
         y = _CHART_TOP + i * _ROW_H
@@ -110,7 +112,8 @@ def confusion_svg(
             f'height="{origin_y + 2 * cell + 34}" viewBox="0 0 {width} '
             f'{origin_y + 2 * cell + 34}">'
         ),
-        _text(origin_x, 18, title, size=14, fill="#1f2937", weight="bold"),
+        # 同上：标题从画布左缘起画，不占绘图区起点
+        _text(12, 18, title, size=14, fill="#1f2937", weight="bold"),
     ]
     for col, label in ((0, "期望是"), (1, "期望否")):
         cx = origin_x + col * cell + cell / 2
@@ -159,7 +162,8 @@ def overview_bar_svg(
             f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" '
             f'viewBox="0 0 {width} {height}">'
         ),
-        _text(plot_left, 18, title, size=14, fill="#1f2937", weight="bold"),
+        # 多色总览与单色条形图同口径：标题从画布左缘起画
+        _text(12, 18, title, size=14, fill="#1f2937", weight="bold"),
     ]
     for i, (label, value, color) in enumerate(items):
         y = _CHART_TOP + i * _ROW_H

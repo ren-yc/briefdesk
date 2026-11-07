@@ -17,10 +17,13 @@ from briefdesk.plugins.benchmark.charts import (
     confusion_svg,
     overview_bar_svg,
 )
-from briefdesk.plugins.benchmark.metrics import DEDUP_CHANNELS, TITLE_SOFT_RATIO
+from briefdesk.plugins.benchmark.metrics import TITLE_SOFT_RATIO
 from briefdesk.plugins.benchmark.report import (
     _FEATURE_METRIC_LABELS,
     _FEATURE_TITLES,
+    case_count_text,
+    elapsed_text,
+    feature_extra_rows,
     format_metric,
 )
 
@@ -30,7 +33,9 @@ body { font-family: "Microsoft YaHei", "PingFang SC", sans-serif; margin: 24px;
 h1 { font-size: 22px; }
 h2 { font-size: 17px; margin-top: 28px; border-bottom: 2px solid #e5e7eb;
      padding-bottom: 4px; }
-.meta { color: #4b5563; font-size: 13px; }
+.meta { color: #4b5563; font-size: 13px; margin: 4px 0; }
+.meta-label { background: #e5e7eb; color: #374151; border-radius: 4px;
+              padding: 1px 6px; margin-right: 8px; font-size: 12px; }
 .chart { background: #fff; border: 1px solid #e5e7eb; border-radius: 8px;
          padding: 12px; margin: 10px 0; display: inline-block; }
 table { border-collapse: collapse; background: #fff; margin: 8px 0;
@@ -83,16 +88,24 @@ def _provider_text(config: dict[str, Any], key: str) -> str:
 
 
 def _header(payload: dict[str, Any]) -> str:
+    """报告头：运行状态与配置分两行，避免一行过长折成两截。
+
+    分组不是排版洁癖：一行 2000px 在常见窗口里会从中间折行，"总用时"这种结论性
+    字段会被折到第二行末尾、和它前缀的配置项混在一起读。
+    """
     config = payload.get("config") or {}
     vision = "开启" if config.get("vision_enabled") else "关闭"
     embedding = "开启" if config.get("embedding_enabled") else "关闭"
-    meta = [
+    run_meta = [
         ("运行时间", payload.get("generated_at", "")),
         ("模型", payload.get("model", "")),
         ("对话来源", _provider_text(config, "chat_provider")),
         ("嵌入来源", _provider_text(config, "embed_provider")),
         ("并发", str(payload.get("concurrency", ""))),
         ("推理强度", payload.get("reasoning_effort", "")),
+        ("总用时", _dur(payload.get("elapsed_sec"))),
+    ]
+    config_meta = [
         ("JSON 模式", config.get("json_mode", "")),
         ("分类最大输出", config.get("max_classify_tokens", "")),
         ("视觉分类", vision),
@@ -107,15 +120,16 @@ def _header(payload: dict[str, Any]) -> str:
             f"强匹配 {config.get('dedup_strong_threshold', '')} / "
             f"Top-K {config.get('dedup_embed_top_k', '')}"
         )),
-        ("总用时", _dur(payload.get("elapsed_sec"))),
     ]
-    parts = ['<h1>LLM 功能基准报告</h1><p class="meta">']
-    parts.append(
-        "&nbsp;·&nbsp;".join(
-            f"<b>{_esc(k)}</b> {_esc(v)}" for k, v in meta
+    parts = ["<h1>LLM 功能基准报告</h1>"]
+    for label, meta in (("运行", run_meta), ("配置", config_meta)):
+        parts.append(
+            f'<p class="meta"><span class="meta-label">{label}</span>'
+            + "&nbsp;·&nbsp;".join(
+                f"<b>{_esc(k)}</b> {_esc(v)}" for k, v in meta
+            )
+            + "</p>"
         )
-    )
-    parts.append("</p>")
     return "".join(parts)
 
 
@@ -124,6 +138,15 @@ _FEATURE_COLORS = {
     "dedup": "#7C3AED",
     "merge": "#D97706",
     "title": "#059669",
+}
+
+# 总览图的条形标签＝功能名 · 头条指标名。标题只写「各功能核心指标」，由每条自己
+# 说明比的是什么——图例塞进标题会让标题长到被 SVG 视口裁掉。
+_OVERVIEW_METRICS = {
+    "classify": "类别准确率",
+    "dedup": "准确率",
+    "merge": "准确率",
+    "title": "关键词命中率",
 }
 
 
@@ -140,10 +163,15 @@ def _overview(payload: dict[str, Any]) -> str:
         summary = payload.get("features", {}).get(feature, {}).get("summary")
         if not summary:
             continue
+        value = summary.get(headline_keys[feature])
+        # 缺键/None 不画这根条：补 0 会得到一根标着「0.0%」的条，把"这轮没测"
+        # 读成"测了是零"——与 _chart_items 同一口径
+        if not isinstance(value, (int, float)):
+            continue
         items.append(
             (
-                _FEATURE_TITLES.get(feature, feature),
-                float(summary.get(headline_keys[feature], 0) or 0),
+                f"{_FEATURE_TITLES[feature]} · {_OVERVIEW_METRICS[feature]}",
+                float(value),
                 _FEATURE_COLORS[feature],
             )
         )
@@ -151,10 +179,7 @@ def _overview(payload: dict[str, Any]) -> str:
         return ""
     return (
         '<div class="chart">'
-        + overview_bar_svg(
-            "各功能核心指标（classify=类别准确率 / dedup·merge=准确率 / title=关键词命中率）",
-            items,
-        )
+        + overview_bar_svg("各功能核心指标", items)
         + "</div>"
     )
 
@@ -164,17 +189,12 @@ def _metric_value(key: str, value: Any) -> str:
     return _esc(format_metric(key, value))
 
 
-def _fmt(summary: dict[str, Any], key: str) -> str:
-    """按指标口径格式化 summary[key]（缺键显示「-」，与主表同口径）。
+def _metric_table(feature: str, summary: dict[str, Any]) -> str:
+    """指标表：主指标恒占一行（缺键「-」）+ 该功能的补充行。
 
-    补 0 会让"这一轮没测过该指标"读成"测了是零"——补充行虽然多数被父键
-    存在性守着，但守的是父键（如回声点数），不保证拆分键本身在旧 payload 里
-    也有。
+    补充行与终端报告共用 `feature_extra_rows`，两处只有一个文案源。用例数、
+    出错数与用时挪到段首 meta 行（见 `_section_meta`），表格只留指标本身。
     """
-    return format_metric(key, summary[key]) if key in summary else "-"
-
-
-def _metric_table(feature: str, summary: dict[str, Any], elapsed_sec: float | None = None) -> str:
     rows: list[str] = []
     for key, label in _FEATURE_METRIC_LABELS.get(feature, []):
         # 与终端主表同口径：缺键显示「-」而不是补 0——旧报告里没记录的指标
@@ -182,111 +202,7 @@ def _metric_table(feature: str, summary: dict[str, Any], elapsed_sec: float | No
         # 历史 payload 兼容约定一致）
         text = _metric_value(key, summary[key]) if key in summary else "-"
         rows.append(f"<tr><td>{_esc(label)}</td><td>{text}</td></tr>")
-    extras: list[tuple[str, str]] = []
-    if feature == "classify":
-        noise = summary.get("false_positives_noise")
-        partial = summary.get("false_positives_partial")
-        # 误报拆两类才谈得上修法：全噪声用例里的误报是"把闲聊当信息"，部分期望
-        # 用例里的是"同批多分了别条"；合成一个数就只是扣分，看不出该改哪边。
-        fp_text = f"{summary.get('false_positives', 0)} 条"
-        if noise is not None and partial is not None:
-            fp_text += f"（噪声用例 {noise} / 部分期望用例 {partial}）"
-        extras = [
-            ("期望分类", f"{summary.get('expected', 0)} 条"),
-            ("模型输出", f"{summary.get('model_classified', 0)} 条（误报 {fp_text}）"),
-        ]
-        echo = summary.get("time_points_echo")
-        if echo:
-            extras.append(
-                (
-                    "时间点回声",
-                    f"{echo} 点是消息自己的发送时间（非正文抽取），已从解析能力口径剔除",
-                )
-            )
-            extras.append(
-                (
-                    "回声口径拆分",
-                    (
-                        f"剔回声后 date-only {_fmt(summary, 'time_point_recall_date_ex_echo')}"
-                        f" / 带时刻 {_fmt(summary, 'time_point_recall_clock_ex_echo')}"
-                    ),
-                )
-            )
-        if summary.get("placeholder_only_cases"):
-            extras.append(
-                (
-                    "纯占位符用例",
-                    (
-                        f"{summary['placeholder_only_cases']} 条（期望 "
-                        f"{summary.get('placeholder_only_expected', 0)} 条）不计入主指标；"
-                        f"含其召回 {_fmt(summary, 'category_recall_incl_placeholder')}"
-                    ),
-                )
-            )
-    elif feature in ("dedup", "merge"):
-        extras = [
-            ("混淆矩阵", f"TP {summary.get('tp', 0)} / FP {summary.get('fp', 0)} / TN {summary.get('tn', 0)} / FN {summary.get('fn', 0)}"),
-        ]
-        # 两条功能的 skipped 含义不同：dedup 的零判官路径有三种（图片/原文哈希
-        # 短路、判官负缓存命中、候选门直接拒绝），前两种是正确且省钱的判定，第三种
-        # 才是"没比成"；merge 只有余弦预筛门一种。标签写死"预筛跳过"会把短路误读成漏判。
-        if summary.get("skipped"):
-            if feature == "dedup":
-                extras.append(
-                    (
-                        "未触发判官",
-                        (
-                            f"{summary['skipped']} 条"
-                            "（含精确短路/判官负缓存/候选门拒绝，逐条见下方通道列）"
-                        ),
-                    )
-                )
-            else:
-                extras.append(("预筛跳过", f"{summary['skipped']} 条（未触发 AI 判定）"))
-        # 通道分布与 AI 成本只属于 dedup（merge 无通道概念）。不写出来的后果：
-        # 阈值放宽使 AI 调用翻倍、或整轮其实没走余弦，报告上都长得一样。
-        if "ai_judged_cases" in summary:
-            extras.append(
-                (
-                    "经判官裁决",
-                    (
-                        f"{summary.get('ai_judged_cases', 0)} 条"
-                        f"（占比 {_fmt(summary, 'ai_judged_rate')}；"
-                        "一例可对多个候选各调一次判官，本数不是 API 调用上限"
-                    ),
-                )
-            )
-            distribution = " / ".join(
-                f"{channel} {summary[f'channel_{channel}']}"
-                for channel in DEDUP_CHANNELS
-                if summary.get(f"channel_{channel}")
-            )
-            if distribution:
-                extras.append(("判定通道", distribution))
-            if "cosine_cases" in summary:
-                extras.append(
-                    ("余弦链路跑通", f"{summary.get('cosine_cases', 0)} 条（配置与实走不一致时以此核对）")
-                )
-    elif feature == "title":
-        extras = [
-            ("平均长度", f"{summary.get('avg_len', 0):.1f} 字"),
-            ("超长/回退", f"{summary.get('too_long_count', 0)} / {summary.get('fallback_count', 0)} 条"),
-        ]
-        if summary.get("title_only_cases"):
-            extras.append(
-                (
-                    "仅标题期望用例",
-                    (
-                        f"{summary['title_only_cases']} 条，软通过"
-                        f"（字符相似 ≥{TITLE_SOFT_RATIO:.2f}）"
-                        f"{summary.get('title_only_soft_pass', 0)} 条；"
-                        "字符相似是描述指标，不作门槛"
-                    ),
-                )
-            )
-    extras.append(("用例", f"{summary.get('cases', 0)} 条（出错 {summary.get('error_cases', 0)}）"))
-    extras.append(("测试用时", _dur(elapsed_sec)))
-    for label, value in extras:
+    for label, value in feature_extra_rows(feature, summary):
         rows.append(f"<tr><td>{_esc(label)}</td><td>{_esc(value)}</td></tr>")
     return f"<table><tr><th>指标</th><th>值</th></tr>{''.join(rows)}</table>"
 
@@ -343,6 +259,11 @@ def _chart_items(
 
 
 def _feature_charts(feature: str, summary: dict[str, Any]) -> str:
+    """该功能的图表。条形图标题一律「<功能>指标」：同报告里两张图同名就分不清。
+
+    混淆矩阵是例外——它画的是判定分布不是比率，标题只写「混淆矩阵」，行列含义
+    由图内的「期望是/期望否」「预测是/预测否」四个轴标签表达。
+    """
     if feature == "classify":
         items = _chart_items(summary, [
             ("类别准确率", "category_accuracy"),
@@ -356,7 +277,7 @@ def _feature_charts(feature: str, summary: dict[str, Any]) -> str:
             ("本轮失败率", "failure_rate"),
             ("标题概括填充率", "summary_fill_rate"),
         ])
-        svg = bar_chart_svg("分类指标", items)
+        svg = bar_chart_svg(f"{_FEATURE_TITLES['classify']}指标", items)
         return f'<div class="chart">{svg}</div>'
     if feature in ("dedup", "merge"):
         # AI 判定占比只在 dedup 出现（merge 摘要没有该键）：候选门阈值一改它就用
@@ -369,18 +290,23 @@ def _feature_charts(feature: str, summary: dict[str, Any]) -> str:
             ("判官裁决用例占比", "ai_judged_rate"),
         ])
         bar = bar_chart_svg(
-            "判定指标",
+            f"{_FEATURE_TITLES[feature]}指标",
             items,
             color=_FEATURE_COLORS[feature],
         )
+        # 轴标签已写明「期望是/期望否」「预测是/预测否」，标题不必重复一遍
         matrix = confusion_svg(
-            "混淆矩阵（行=预测，列=期望）",
+            "混淆矩阵",
             int(summary.get("tp", 0)),
             int(summary.get("fp", 0)),
             int(summary.get("tn", 0)),
             int(summary.get("fn", 0)),
         )
         return f'<div class="chart">{bar}</div><div class="chart">{matrix}</div>'
+    if feature != "title":
+        # 未知功能不猜格式：静默落进 title 分支会印出「标题指标 / 用例构成」这种
+        # 张冠李戴的图，比空图更难发现。空串让调用方少一段，问题在标题处立刻可见。
+        return ""
     # 字符相似是描述线（0~1 的比值，和比率同刻度）：标题为开放生成，
     # 逐字相等只衡量抄写不衡量质量，故不再画精确匹配率
     items = _chart_items(summary, [
@@ -389,7 +315,7 @@ def _feature_charts(feature: str, summary: dict[str, Any]) -> str:
         ("字符相似度中位数", "char_similarity_p50"),
     ])
     svg = bar_chart_svg(
-        "标题指标",
+        f"{_FEATURE_TITLES['title']}指标",
         items,
         color=_FEATURE_COLORS["title"],
     )
@@ -526,14 +452,54 @@ def _case_rows(feature: str, cases: list[dict[str, Any]]) -> str:
     return f"<table><tr>{header}</tr>{''.join(rows)}</table>"
 
 
+_DATASET_DIR_NAMES = frozenset({"cases"})
+"""数据集文件的常规父目录名。只有父目录是它时才保留两级，其余一律只留文件名。
+
+为什么不能一律留末两级：`--dataset` 接受任意路径，`C:\\Users\\<用户名>\\classify.json`
+的末两级恰好是 `<用户名>/classify.json`——用户名照样进报告，等于没脱敏。
+"""
+
+
+def _dataset_short(value: object) -> str:
+    """数据集只显示 `cases/xxx.json` 或裸文件名，绝不带盘符与用户目录。
+
+    完整路径带盘符与用户名。报告按 README 可另存分享，绝对路径是不必要的环境
+    暴露；文件名已足以定位是哪个数据集，完整路径仍在 report.json 里（CLI 的
+    dry-run 也会打印）。
+    """
+    text = str(value or "")
+    if not text:
+        return "-"
+    parts = [p for p in text.replace("\\", "/").split("/") if p]
+    if not parts:
+        return "-"
+    if len(parts) >= 2 and parts[-2] in _DATASET_DIR_NAMES:
+        return "/".join(parts[-2:])
+    return parts[-1]
+
+
+def _section_meta(data: dict[str, Any], summary: dict[str, Any]) -> str:
+    """段首一行：数据集 · 用例数（出错数）· 用时。
+
+    用例数与用时原先压在指标表末尾，与"指标"不是一类东西；前置成一行后表格只留
+    指标本身。数据集本来就是段首独立一行，一并并进来，省掉一整行。
+    """
+    parts = [f"数据集 {_esc(_dataset_short(data.get('dataset')))}"]
+    parts.append(_esc(case_count_text(summary)))
+    elapsed = data.get("elapsed_sec")
+    if elapsed is not None:
+        parts.append(_esc(elapsed_text(elapsed)))
+    return '<p class="dataset">' + "&nbsp;·&nbsp;".join(parts) + "</p>"
+
+
 def _feature_section(feature: str, data: dict[str, Any]) -> str:
     summary = data.get("summary") or {}
     cases = data.get("cases") or []
     parts = [
         f"<h2>{_esc(_FEATURE_TITLES.get(feature, feature))}</h2>",
-        f'<p class="dataset">数据集: {_esc(data.get("dataset", ""))}</p>',
+        _section_meta(data, summary),
         _feature_charts(feature, summary),
-        _metric_table(feature, summary, data.get("elapsed_sec")),
+        _metric_table(feature, summary),
     ]
     if feature == "classify":
         parts.append(_mode_table(summary))
