@@ -1052,22 +1052,20 @@ class PluginsExpectedUnavailableTest(StagedFileTestCase):
                 data = self.client.get("/api/settings/env").json()
         self.assertIn("PLUGINS 不是合法 JSON", data["pluginsExpectedError"])
 
-    def test_candidate_bytes_interpolation_seen_by_precheck(self) -> None:
-        """暂存值含 ${VAR} 时预检看到展开后的值，与提交后重新解析同源。
+    def test_staged_value_with_variable_expr_is_rejected_422(self) -> None:
+        """暂存层是字面量层：值含 ${VAR} 在规范化层直接拒绝。
 
-        内存 dict 合并直接 json.loads 看到的是展开前的原文：PLUGINS=["${X:-weflow}"]
-        是合法 JSON（字符串内容而已），但它不是提交后真正生效的名单。
+        此前暂存按 dotenv 默认插值解析：读到的会是环境变量展开值而非用户
+        原文，随后的写入路径把展开值重新序列化落成明文——环境里的秘密经
+        「无关字段的保存」持久化。字面量化后此类表达式没有合法形态。
         """
         res = self.client.put(
             "/api/settings/env",
-            json={"items": {"PLUGINS": '["${BD_TEST_PLUGIN:-weflow}"]'}},
+            json={"items": {"AI_MODEL": "${BD_TEST_SECRET_VAR}"}},
         )
-        # weflow 在测试进程没有元数据登记：预检按**展开后的** ["weflow"] 校验，
-        # 无人可校验（validate 返回 None → []）所以放行落盘
-        self.assertEqual(res.status_code, 200)
-        # 落盘的是原文；read_staged() 会按 dotenv 规则展开，因此这里断言文件字节
-        self.assertIn("${BD_TEST_PLUGIN:-weflow}", self.staged_path.read_text(encoding="utf-8"))
-        self.assertEqual(read_staged()["PLUGINS"], '["weflow"]')
+        self.assertEqual(res.status_code, 422)
+        self.assertIn("${VAR}", res.json()["detail"])
+        self.assertNotIn("AI_MODEL", read_staged())
 
     def test_put_with_broken_higher_layer_plugins_and_valid_required_is_409(self) -> None:
         """高层坏 PLUGINS + 有效必选名单时 PUT 必须 409，不能把异常冒成 500。
@@ -1313,6 +1311,59 @@ class EnvFileContractTest(unittest.TestCase):
                 with patch.dict(os.environ, {"PROBE_VALUE": "env"}):
                     self.assertEqual(self._Probe().value, "env")
                     self.assertEqual(self._Probe(_env_file=str(explicit)).value, "env")
+
+
+class LiteralStagedLayerParseTest(unittest.TestCase):
+    """解析侧与展示/写入侧同口径：暂存层不展开 ${VAR}，项目 .env 层仍展开。
+
+    只有解析侧也关掉插值，「设置页看到的值」才等于「下次启动真正生效的值」；
+    只关展示侧的话，用户看到的原文与进程实际消费的展开值会静默分叉。
+    """
+
+    class _Probe(KeyringSettingsBase):
+        value: str = Field(default="default", alias="PROBE_VALUE")
+
+    def test_staged_layer_literal_and_project_layer_interpolated(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            project = root / ".env"
+            project.write_text(
+                "PROBE_REF=project-ref\n", encoding="utf-8"
+            )
+            staged = root / "settings.env"
+            staged.write_text(
+                "PROBE_VALUE=${PROBE_REF}\nPROBE_REF=staged-ref\n", encoding="utf-8"
+            )
+            with (
+                _env_without("PROBE_VALUE"),
+                _env_without("PROBE_REF"),
+                patch.dict(os.environ, {"BRIEFDESK_SETTINGS_FILE": str(staged)}),
+                patch.object(paths, "project_dotenv_path", return_value=project),
+            ):
+                # 暂存层胜出：值是字面 ${PROBE_REF}，不是任何展开结果
+                self.assertEqual(self._Probe().value, "${PROBE_REF}")
+                # 展示侧（read_staged）同口径
+                self.assertEqual(
+                    read_staged()["PROBE_VALUE"], "${PROBE_REF}"
+                )
+
+    def test_project_layer_template_still_expands(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            project = root / ".env"
+            project.write_text(
+                "PROBE_BASE=project-base\nPROBE_VALUE=${PROBE_BASE}-x\n",
+                encoding="utf-8",
+            )
+            staged = root / "settings.env"
+            staged.write_text("", encoding="utf-8")
+            with (
+                _env_without("PROBE_VALUE"),
+                _env_without("PROBE_BASE"),
+                patch.dict(os.environ, {"BRIEFDESK_SETTINGS_FILE": str(staged)}),
+                patch.object(paths, "project_dotenv_path", return_value=project),
+            ):
+                self.assertEqual(self._Probe().value, "project-base-x")
 
 
 class AllSettingsTwoLayerTest(StagedFileTestCase):

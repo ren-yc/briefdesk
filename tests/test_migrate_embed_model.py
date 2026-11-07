@@ -163,12 +163,12 @@ def test_load_effective_env_case_insensitive_process_env(
 def test_load_effective_env_interpolates_variable_refs(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """dotenv 的 ${VAR} 插值（DotEnvSettingsSource 会插值，本脚本必须同口径）。
+    """项目 .env 层的 ${VAR} 插值（运行时对该层开启插值，脚本必须同口径）。
 
     失败模式：`EMBED_MODEL=${AI_MODEL}` 被当字面模型名 → 与现实维度对不上 →
     盘点把生效行误报为旧模型残留。
     """
-    (mod._dotenv_layers()[1][1]).write_text(
+    (mod._dotenv_layers()[0][1]).write_text(
         "AI_MODEL=real-embed-model\nEMBED_MODEL=${AI_MODEL}\n", encoding="utf-8"
     )
     monkeypatch.delenv("EMBED_MODEL", raising=False)
@@ -177,6 +177,22 @@ def test_load_effective_env_interpolates_variable_refs(
     assert env["EMBED_MODEL"] == "real-embed-model"
     model, _base, from_fallback = read_env_embedding_config(env)
     assert (model, from_fallback) == ("real-embed-model", False)
+
+
+def test_load_effective_env_staged_layer_is_literal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """暂存层按字面量解析：${VAR} 原样返回，不展开为低层/环境值。
+
+    运行时解析链对暂存层关闭插值（字面量层）；脚本若对暂存值插值，
+    看到的取值会与真实生效值分叉。
+    """
+    (mod._dotenv_layers()[1][1]).write_text(
+        "EMBED_MODEL=${AI_MODEL}\n", encoding="utf-8"
+    )
+    monkeypatch.delenv("EMBED_MODEL", raising=False)
+    env = _load_effective_env()
+    assert env["EMBED_MODEL"] == "${AI_MODEL}"
 
 
 # ── 库路径解析链（与运行时层序一致） ──

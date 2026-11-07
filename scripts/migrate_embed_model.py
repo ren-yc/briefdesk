@@ -172,16 +172,19 @@ def _load_effective_env() -> dict[str, str]:
     - 键名大小写不敏感：pydantic-settings 与 settings_env._env_value 都按
       upper() 比对；os.environ.get("EMBED_MODEL") 会漏掉 embed_model 这类
       变体，导致进程环境的值被当成未设置。
-    - dotenv 值做 ${VAR} 插值：DotEnvSettingsSource 会插值，本脚本的
-      load_env_file 不插值；不补这一步，`EMBED_MODEL=${AI_MODEL}` 这类
-      写法会被当成字面模型名，把生效行误判为旧模型残留（该分支被未知
-      目标模型拒绝兜住，不会误删，但会给出错误盘点）。
-    插值变量集 = 已合并的低层值 + 进程环境（大小写不敏感）；未定义的
+    - ${VAR} 插值只作用于项目 .env 层（dotenv 语义层）；用户暂存层按字面量
+      解析（运行时解析链对暂存层关闭插值），其值不参与变量展开——若对暂存
+      值也插值，脚本看到的模型名会与真实生效值分叉，盘点结论失真。
+    插值变量集 = 项目 .env 已合并值 + 进程环境（大小写不敏感）；未定义的
     变量按空串处理（与 python-dotenv 的默认一致）。
     """
     merged: dict[str, str] = {}
-    for _layer_name, layer_file in reversed(_dotenv_layers()):
-        merged.update(load_env_file(layer_file))
+    interpolated_keys: set[str] = set()
+    for layer_name, layer_file in reversed(_dotenv_layers()):
+        layer_values = load_env_file(layer_file)
+        merged.update(layer_values)
+        if layer_name != "override":
+            interpolated_keys.update(layer_values)
     process_env = {key.upper(): value for key, value in os.environ.items()}
     for key in ("EMBED_MODEL", "EMBED_API_BASE", "AI_MODEL"):
         value = process_env.get(key.upper())
@@ -192,7 +195,10 @@ def _load_effective_env() -> dict[str, str]:
     }
     interpolated: dict[str, str] = {}
     for key, value in merged.items():
-        interpolated[key] = _interpolate_env_value(value, lookup)
+        if key in interpolated_keys:
+            interpolated[key] = _interpolate_env_value(value, lookup)
+        else:
+            interpolated[key] = value
     return interpolated
 
 

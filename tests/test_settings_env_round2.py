@@ -7,7 +7,8 @@
 - 覆盖态方向：来源判定必须返回真正压住该键的层，运行中新增高层来源时
   开关随之禁用；
 - 预检键匹配与真实 dotenv 解析同口径（大小写不敏感）；
-- 整值模板草稿（值来自变量展开）进入预检，落盘原文、回读展开；换行与
+- 暂存层字面量化：${VAR} 在写入层 422 拒绝，旧残留按字面量往返、不再
+  展开为环境值（跨层引用一律写在项目 .env / 环境变量层）；换行与
   dotenv 行内注释起点仍拒绝；
 - 暂存提交失败显式 500：删除/写入/替换失败不得谎报 ok:true，写后重读失败
   明确「已写入、状态未知」。
@@ -335,7 +336,13 @@ class PrecheckCaseSensitivityTest(StagedFileTestCase):
 
 
 class WholeValueTemplateTest(StagedFileTestCase):
-    """整值模板草稿：原文非 JSON 但展开后为合法数组的口径。"""
+    """暂存层字面量化后的 ${VAR} 契约：写入层拒绝、旧残留不再展开。
+
+    历史口径（整值模板草稿落盘原文、回读 dotenv 展开）已废弃：暂存按字面量
+    解析后，模板草稿只会把「看起来是引用」的字符串当真值消费，且解析曾把
+    环境展开值带回写入路径（无关保存时落成明文）。新契约：${VAR} 在规范化
+    层 422；手工/旧版本写入的残留按字面量往返、不再展开为环境值。
+    """
 
     def setUp(self) -> None:
         super().setUp()
@@ -345,33 +352,31 @@ class WholeValueTemplateTest(StagedFileTestCase):
             headers={"Origin": "http://localhost"},
         )
 
-    def test_whole_value_template_passes_and_stages_raw(self) -> None:
-        """${VAR:-[...]} 整值草稿落盘原文；回读（dotenv 展开）为合法名单。"""
+    def test_whole_value_template_rejected_422(self) -> None:
+        """${VAR:-[...]} 整值草稿在规范化层拒绝，不落盘。"""
         res = self.client.put(
             "/api/settings/env",
             json={"items": {"PLUGINS": '${BD_TEST_PLUGINS:-["benchmark"]}'}},
         )
-        self.assertEqual(res.status_code, 200)
-        self.assertIn(
-            '${BD_TEST_PLUGINS:-["benchmark"]}',
-            self.staged_path.read_text(encoding="utf-8"),
-        )
-        self.assertEqual(
-            settings_env.read_staged()["PLUGINS"], '["benchmark"]'
-        )
-
-    def test_expansion_to_invalid_is_409_and_file_unchanged(self) -> None:
-        """展开后非法（变量缺失 → 空串）：组合预检 409，文件不变。"""
-        with _env_without("BD_TEST_PLUGINS"):
-            res = self.client.put(
-                "/api/settings/env",
-                json={"items": {"PLUGINS": "${BD_TEST_PLUGINS}"}},
-            )
-        self.assertEqual(res.status_code, 409)
+        self.assertEqual(res.status_code, 422)
+        self.assertIn("${VAR}", res.json()["detail"])
         self.assertNotIn("PLUGINS", settings_env.read_staged())
 
+    def test_legacy_template_residue_reads_back_literal(self) -> None:
+        """旧版本落盘的模板残留：按字面量往返，不再展开为环境值。
+
+        残留不经 PUT（规范化层会拒绝），模拟外部编辑器/旧版本直接写文件。
+        """
+        self.staged_path.write_text(
+            'PLUGINS=${BD_TEST_PLUGINS:-["benchmark"]}\n', encoding="utf-8"
+        )
+        self.assertEqual(
+            settings_env.read_staged()["PLUGINS"],
+            '${BD_TEST_PLUGINS:-["benchmark"]}',
+        )
+
     def test_multiline_template_rejected_422(self) -> None:
-        """放宽处必须补换行拒绝：multi 分支走不到通用 text 尾巴。
+        """multi 值含换行仍拒绝：字面量守卫不改变行格式防注入语义。
 
         draft 必须是字符串：元组会被 payload 校验在路由函数体之前挡下（422 的
         detail 是列表），根本走不到这里要证明的规范化层。
@@ -386,7 +391,7 @@ class WholeValueTemplateTest(StagedFileTestCase):
         detail = res.json()["detail"]
         # 字符串 detail = 规范化层抛的文案；payload 层 422 的 detail 是列表
         self.assertIsInstance(detail, str)
-        self.assertIn("换行", detail)
+        self.assertIn("${VAR}", detail)
         self.assertNotIn("PLUGINS", settings_env.read_staged())
 
     def test_carriage_return_template_rejected_422(self) -> None:
@@ -400,7 +405,7 @@ class WholeValueTemplateTest(StagedFileTestCase):
         self.assertEqual(res.status_code, 422)
         detail = res.json()["detail"]
         self.assertIsInstance(detail, str)
-        self.assertIn("换行", detail)
+        self.assertIn("${VAR}", detail)
         self.assertNotIn("PLUGINS", settings_env.read_staged())
 
     def test_prepare_rejects_newline_value_directly(self) -> None:
@@ -412,8 +417,8 @@ class WholeValueTemplateTest(StagedFileTestCase):
         with self.assertRaises(ValueError):
             settings_env.prepare_staged_write({"LOG_LEVEL": "a" + chr(10) + "b"})
 
-    def test_inline_comment_template_rejected_422(self) -> None:
-        """放宽处必须补「 #」拒绝：dotenv 回读截断会写出与用户所见不同的名单。"""
+    def test_inline_comment_with_template_rejected_422(self) -> None:
+        """含 ${VAR} 的行内注释写法同样拒绝（守卫先于一切类型分支）。"""
         res = self.client.put(
             "/api/settings/env",
             json={"items": {"PLUGINS": '${BD_A:-["a"]} # 注释'}},
@@ -421,8 +426,8 @@ class WholeValueTemplateTest(StagedFileTestCase):
         self.assertEqual(res.status_code, 422)
         self.assertNotIn("PLUGINS", settings_env.read_staged())
 
-    def test_bad_json_without_variable_still_422(self) -> None:
-        """不含 ${ 的坏 JSON 仍 422：放宽只针对「展开后才定论」的草稿。"""
+    def test_bad_json_still_422(self) -> None:
+        """不含 ${ 的坏 JSON 仍 422：与模板无关的常规校验不变。"""
         res = self.client.put(
             "/api/settings/env",
             json={"items": {"PLUGINS": "not-json"}},
@@ -430,21 +435,14 @@ class WholeValueTemplateTest(StagedFileTestCase):
         self.assertEqual(res.status_code, 422)
         self.assertNotIn("PLUGINS", settings_env.read_staged())
 
-    def test_second_put_after_templated_draft_is_200(self) -> None:
-        """跨条回归：落盘模板草稿后再 PUT 任一插件键必须 200，不得误 409。
-
-        逐层解码若用未展开原文判 JSON，会把合法展开值误判成坏 JSON。
-        """
-        first = self.client.put(
-            "/api/settings/env",
-            json={"items": {"PLUGINS": '${BD_TEST_PLUGINS:-["benchmark"]}'}},
-        )
-        self.assertEqual(first.status_code, 200)
+    def test_json_string_value_with_dollar_expr_rejected_422(self) -> None:
+        """合法 JSON 内嵌 ${VAR} 字符串同样拒绝：守卫看值原文不看解析结果。"""
         res = self.client.put(
             "/api/settings/env",
-            json={"items": {"PLUGINS_REQUIRED": json.dumps(["benchmark"])}},
+            json={"items": {"PLUGINS": '["${BD_TEST_PLUGIN:-weflow}"]'}},
         )
-        self.assertEqual(res.status_code, 200)
+        self.assertEqual(res.status_code, 422)
+        self.assertNotIn("PLUGINS", settings_env.read_staged())
 
 
 class StagedCommitFailureTest(StagedFileTestCase):
