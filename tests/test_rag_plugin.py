@@ -967,6 +967,42 @@ class TestPromptFlatten(unittest.TestCase):
         evidence_line = user.split("证据：\n")[1]
         assert "\n" not in evidence_line  # 单条证据恒为单行
 
+    def test_evidence_sender_and_group_names_masked_in_prompt(self):
+        """RAG 证据行的昵称/群名不得携带明文 PII（构造层已统一脱敏）。
+
+        合成消息走 InternalMessage 构造（生产同源），随后按入库形态
+        ChunkRow 喂给 prompt 构造——验证掩码确实随数据进入 AI 边界。
+        """
+        from datetime import datetime
+
+        from briefdesk.plugins.rag.db import ChunkRow
+        from briefdesk.plugins.rag.engine import Hit
+        from briefdesk.plugins.rag.prompts import build_answer_prompt
+        from briefdesk.types import InternalMessage
+
+        msg = InternalMessage(
+            msg_id="m1",
+            content="活动通知",
+            sender_name="张sender-review@example.invalid",
+            sender_id="u1",
+            session_id="s1",
+            group_name="群group-review@example.invalid",
+            timestamp=1700000000,
+        )
+        chunk = ChunkRow(
+            source="weflow-legacy", msg_id=msg.msg_id, session_id=msg.session_id,
+            group_name=msg.group_name, sender_name=msg.sender_name,
+            msg_time=msg.timestamp, content=msg.content,
+        )
+        messages = build_answer_prompt(
+            datetime(2026, 1, 1, 12, 0, tzinfo=UTC), "问题？",
+            [Hit(chunk=chunk, cos=1.0, rrf=1.0, has_fts=False)],
+        )
+        user = messages[1]["content"]
+        assert "sender-review@example.invalid" not in user
+        assert "group-review@example.invalid" not in user
+        assert "[EMAIL]" in user
+
     def test_history_included_in_prompt_within_cap(self):
         from datetime import datetime
 

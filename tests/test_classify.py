@@ -1344,6 +1344,29 @@ class BatchBudgetTruncationTest(unittest.TestCase):
         msg = _build_user_message(self._groups(["你好"]))
         assert "0: A: 你好" in msg
 
+    def test_sender_and_group_names_masked_in_user_message(self):
+        """分类 user prompt 的昵称/群名不得携带明文 PII（构造层已统一脱敏）。
+
+        消息走 InternalMessage 构造（生产同源），群头与发送者名以掩码形态
+        进入最终 user 消息——合成邮箱不再经分类输入外发。
+        """
+        from briefdesk.types import InternalMessage
+
+        msg = InternalMessage(
+            msg_id="m1",
+            content="活动通知",
+            sender_name="张sender-review@example.invalid",
+            sender_id="u1",
+            session_id="s1",
+            group_name="群group-review@example.invalid",
+            timestamp=1750000000,
+        )
+        built, truncated = _build_user_message_ex(_group_messages([msg]))
+        assert truncated == []
+        assert "sender-review@example.invalid" not in built
+        assert "group-review@example.invalid" not in built
+        assert "[EMAIL]" in built
+
 
 class TestClassifyBatchTruncationFailed:
     """集成：被预算剔除的消息必须进 outcome.failed（回填重试），
