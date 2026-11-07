@@ -136,15 +136,15 @@ def _group_messages(
     messages: list[InternalMessage],
     vision_images: dict[tuple[str, str], list[bytes]] | None = None,
 ) -> list[dict]:
-    groups: dict[str, dict] = {}
+    groups: dict[tuple[str, str], dict] = {}
     images_by_msg = vision_images or {}
     for i, msg in enumerate(messages):
-        # 不同源可能有同名群，键加源前缀避免跨源并组
-        key = msg.group_name or msg.session_id
-        if msg.source:
-            key = f"{msg.source}:{key}"
+        # 分组键是会话身份 (source, session_id)，不是群名：不同会话可能同名，
+        # 掩码后同形（群名嵌 PII 掩成同一占位符）或上游重名都会把两个会话
+        # 错误并进同一群头，模型收到混淆的会话上下文。群名只作群头显示。
+        key = (msg.source or "", msg.session_id)
         if key not in groups:
-            groups[key] = {"groupName": key, "messages": []}
+            groups[key] = {"groupName": msg.group_name, "messages": []}
         groups[key]["messages"].append(
             {
                 "index": i,

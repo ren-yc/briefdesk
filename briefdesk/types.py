@@ -17,8 +17,11 @@ class InternalMessage:
 
     content 构造即脱敏：任何位置创建的本类型，content 都不含明文
     手机号/身份证/邮箱/银行卡（PII 脱敏见 briefdesk/masking.py）。
-    sender_name/group_name 构造即净化：统一过滤控制字符与首尾空白
-    （多源显示名清洗见 briefdesk/masking.py 的 clean_display_name）。
+    sender_name/group_name 构造即净化 + 脱敏：统一过滤控制字符与首尾
+    空白（clean_display_name），并按与 content 相同的 PII 规则处理
+    （mask_content）——三者使用同一套规则，正文脱敏才有完整出口：
+    昵称/群名里嵌邮箱、手机号的形态此前会绕过掩码，随后原样进入
+    分类与 RAG 的 AI 请求、落库并随导出携带。
     """
 
     msg_id: str
@@ -37,8 +40,8 @@ class InternalMessage:
     def __post_init__(self) -> None:
         """构造即脱敏/净化：保证隐私与脏数据在入库、AI、前端展示前已被处理。"""
         self.content = mask_content(self.content)
-        self.sender_name = clean_display_name(self.sender_name)
-        self.group_name = clean_display_name(self.group_name)
+        self.sender_name = mask_content(clean_display_name(self.sender_name))
+        self.group_name = mask_content(clean_display_name(self.group_name))
 
 
 class ContextMsg(TypedDict):

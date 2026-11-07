@@ -604,8 +604,8 @@ class SecretsPutPayload(BaseModel):
 async def api_settings_env_put(payload: EnvPutPayload):
     """批量暂存：{items: {KEY: value|null}}；null = 恢复默认（移除暂存）。
 
-    校验与提交针对同一份候选字节：预检看到的就是落盘后的解析结果（值含
-    ${VAR} 展开时，内存 dict 合并直接 json.loads 会看到展开前的原文）。锁内
+    校验与提交针对同一份候选字节：预检看到的就是落盘后的解析结果（暂存层
+    按字面量解析、不展开 ${VAR}，此类表达式在规范化层已被直接拒绝）。锁内
     严格读取——暂存读不出来时拒绝写入，不把读失败当「无暂存」覆盖成空。
     """
     raw_items = payload.items
@@ -637,8 +637,9 @@ async def api_settings_env_put(payload: EnvPutPayload):
             _merged, candidate = prepare_staged_write(updates)
         except StagedReadError as exc:
             raise HTTPException(409, f"暂存状态无法读取，拒绝写入: {exc}") from exc
-        # 插件组合复检只看**候选字节回读**（dotenv 解析过一遍，含变量展开），
-        # 与提交后的解析严格同源；单键 422 校验已在 _normalize 完成。
+        # 插件组合复检只看**候选字节回读**（与真实回读同一套 dotenv 规则，
+        # 暂存层字面量、不展开），与提交后的解析严格同源；单键 422 校验已在
+        # _normalize 完成。
         if {"PLUGINS", "PLUGINS_REQUIRED"} & set(updates):
             try:
                 _candidate_staged = read_staged_from_bytes(candidate)

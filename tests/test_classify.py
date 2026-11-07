@@ -1344,6 +1344,66 @@ class BatchBudgetTruncationTest(unittest.TestCase):
         msg = _build_user_message(self._groups(["你好"]))
         assert "0: A: 你好" in msg
 
+    def test_sender_and_group_names_masked_in_user_message(self):
+        """分类 user prompt 的昵称/群名不得携带明文 PII（构造层已统一脱敏）。
+
+        消息走 InternalMessage 构造（生产同源），群头与发送者名以掩码形态
+        进入最终 user 消息——合成邮箱不再经分类输入外发。
+        """
+        from briefdesk.types import InternalMessage
+
+        msg = InternalMessage(
+            msg_id="m1",
+            content="活动通知",
+            sender_name="张sender-review@example.invalid",
+            sender_id="u1",
+            session_id="s1",
+            group_name="群group-review@example.invalid",
+            timestamp=1750000000,
+        )
+        built, truncated = _build_user_message_ex(_group_messages([msg]))
+        assert truncated == []
+        assert "sender-review@example.invalid" not in built
+        assert "group-review@example.invalid" not in built
+        assert "[EMAIL]" in built
+
+    def test_same_masked_group_names_stay_separate_groups(self):
+        """分组键是会话身份而非群名：掩码后同形的两个会话不得并组。
+
+        两个群名嵌不同邮箱时掩码后同形；分组若按群名，同批的两个会话会被
+        放进同一群头，模型收到混淆的会话上下文。
+        """
+        from briefdesk.types import InternalMessage
+
+        messages = [
+            InternalMessage(
+                msg_id="m1",
+                content="甲群通知",
+                sender_name="张三",
+                sender_id="u1",
+                session_id="sess-a",
+                group_name="群a@example.invalid",
+                timestamp=1750000000,
+            ),
+            InternalMessage(
+                msg_id="m2",
+                content="乙群通知",
+                sender_name="李四",
+                sender_id="u2",
+                session_id="sess-b",
+                group_name="群b@example.invalid",
+                timestamp=1750000001,
+            ),
+        ]
+        groups = _group_messages(messages)
+        assert len(groups) == 2
+        # 群头显示掩码后的群名（两处都掩成同一占位符），而非 source:session_id 组合键
+        assert all(g["groupName"] == "群[EMAIL]" for g in groups)
+        built, _ = _build_user_message_ex(groups)
+        assert "sess-a" not in built
+        assert "sess-b" not in built
+        assert "[EMAIL]" in built
+
 
 class TestClassifyBatchTruncationFailed:
     """集成：被预算剔除的消息必须进 outcome.failed（回填重试），

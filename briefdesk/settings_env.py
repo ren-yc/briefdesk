@@ -8,6 +8,11 @@ Support/briefdesk/`，Linux `~/.config/briefdesk/`），也可经环境变量
 
 - 文件只存非密钥键值（`KEY=VALUE` 行，UTF-8、无注释、键序稳定）；
   密钥一律走系统密钥环（briefdesk/secrets_store.py），绝不落此文件。
+  本层为**字面量层**：解析全程 `interpolate=False`，`${VAR}` 不是本层的
+  语法——若按 dotenv 默认开启插值，读到的将是环境变量展开结果而非用户
+  原文，随后的写入路径会把展开值重新序列化落成明文（环境秘密经配置接口
+  回显/落盘的通路），展示与解析也会和用户所见分叉。跨层引用一律写在
+  项目 .env / 环境变量层（那两层仍按 dotenv 默认插值解析）。
 - 解析优先级：系统密钥环（仅密钥）> 环境变量 > **项目根 .env** > **用户暂存文件**
   > 默认值。两个 dotenv 层是**独立来源**（不再是同一个 env_file 列表里的两项）：
   `dotenv_layers()` 是唯一的有序层定义，解析（settings_base）与展示
@@ -48,6 +53,16 @@ def get_settings_file() -> Path:
     只在 paths 一处定义，避免两个模块各自手写而漂移。
     """
     return paths.settings_file()
+
+
+def _dotenv_read(
+    path: Path, *, interpolate: bool
+) -> dict[str, str | None]:
+    """读一个 dotenv 文件；interpolate 决定是否展开 ${VAR}（dotenv 默认开）。
+
+    展示、来源判定与写入路径全部经由本入口，插值口径只在此一处定义。
+    """
+    return dotenv_values(str(path), encoding="utf-8", interpolate=interpolate)
 
 
 def field_env_key(model: type[BaseSettings], name: str) -> str:
@@ -104,14 +119,21 @@ def _lookup_value(values: Mapping[str, str | None], alias: str) -> str | None:
     return None
 
 
-def _file_value(path: Path, alias: str) -> str | None:
+def _file_value(path: Path, alias: str, *, interpolate: bool = True) -> str | None:
     """文件里该键的值：大小写不敏感，且 `KEY=` 的空串算「有值」。
 
     为什么空串算有值：`DotEnvSettingsSource` 会采纳空串（普通 str 字段得到 `''`、
     int 字段直接 ValidationError），"留空即未设置" 不成立。
+
+    `interpolate` 由**调用方按层身份**传入：项目 .env 层开启（dotenv 语义层），
+    暂存层关闭（字面量层，见模块 docstring 与 `read_staged_strict`）。判定依据
+    是层名而不是文件名——`BRIEFDESK_SETTINGS_FILE` 可把暂存层重定向到任意
+    文件名（测试/便携场景），按文件名判断会在重定向形态下把暂存值展开、
+    与解析侧的字面量口径分叉。关闭插值必须与解析侧同口径，否则展示/来源
+    判定看到的值与真实构造不一致。
     """
     try:
-        values = dotenv_values(str(path), encoding="utf-8")
+        values = _dotenv_read(path, interpolate=interpolate)
     except (OSError, UnicodeDecodeError):
         return None
     return _lookup_value(values, alias)
@@ -133,7 +155,8 @@ def env_shadowed_dotenv_keys(model: type[BaseSettings]) -> list[str]:
     if project is None:
         return []
     try:
-        file_values = dotenv_values(str(project), encoding="utf-8")
+        # 项目 .env 是 dotenv 语义层：插值口径与解析侧一致（默认开）。
+        file_values = _dotenv_read(project, interpolate=True)
     except (OSError, UnicodeDecodeError):
         return []
     secret_keys = set(getattr(model, "KEYRING_FIELDS", {}).values())
@@ -172,8 +195,8 @@ def resolve_alias_layers(
     胜出值判定与逐层可用性判定必须共用本函数：名单键是否可用要看每一层——
     高层合法、低层坏 JSON 时真实 Settings() 构造会在低层解码失败，只看胜出值
     会放行「保存成功、下次启动失败」的配置。文件层取值经与 composed_value 同一
-    dotenv 解析（含 ${VAR} 插值）：整值草稿落盘的是未展开原文，解析后可能是
-    合法数组，用未插值的原始行文本判 JSON 会把它误判成坏值。
+    dotenv 解析（项目 .env 层含 ${VAR} 插值，暂存层字面量——与解析侧同口径）。
+    整值模板草稿不再存在：暂存值含 ${VAR} 在规范化层即被拒绝。
 
     env 命中也作为最高一层参与；`staged_override` 存在时替换 override 层的取值
     （调用方传入「写入之后的暂存态」，文件不再参与该层）。层遍历中某文件层读盘
@@ -188,7 +211,7 @@ def resolve_alias_layers(
         if name == SOURCE_OVERRIDE and staged_override is not None:
             value = _lookup_value(staged_override, alias)
         else:
-            value = _file_value(file, alias)
+            value = _file_value(file, alias, interpolate=name != SOURCE_OVERRIDE)
         if value is not None:
             resolved.append((name, value))
     return resolved
@@ -314,7 +337,10 @@ def read_staged_strict() -> dict[str, str]:
     """
     path = get_settings_file()
     try:
-        raw = dotenv_values(str(path), encoding="utf-8")
+        # 暂存层是字面量层（见模块 docstring）：这里若按 dotenv 默认插值，
+        # 读到的是环境展开值而非用户原文——随后的写入路径会把展开值重新
+        # 序列化落成明文，环境秘密经「无关字段的保存」持久化到暂存文件。
+        raw = _dotenv_read(path, interpolate=False)
     except FileNotFoundError:
         return {}
     except (OSError, UnicodeDecodeError) as error:
@@ -330,7 +356,7 @@ def read_staged() -> dict[str, str]:
     """
     path = get_settings_file()
     try:
-        raw = dotenv_values(str(path), encoding="utf-8")
+        raw = _dotenv_read(path, interpolate=False)
     except (OSError, UnicodeDecodeError):
         logger.debug("暂存文件读取失败: %s", path, exc_info=True)
         return {}
@@ -367,12 +393,14 @@ def read_staged_from_bytes(candidate: bytes | None) -> dict[str, str]:
     """按暂存文件同一套 dotenv 规则解析候选字节（PUT 预检用）。
 
     candidate 为 None（全部删除）等价于空暂存。解析口径必须与真实回读一致
-    （同一 parser、同一插值规则），预检看到的才是提交后会生效的值。坏编码
-    抛 UnicodeDecodeError，由调用方显式拒绝写入。
+    （同一 parser、同一插值规则——暂存层字面量、不展开），预检看到的才是
+    提交后会生效的值。坏编码抛 UnicodeDecodeError，由调用方显式拒绝写入。
     """
     if candidate is None:
         return {}
-    raw = dotenv_values(stream=StringIO(candidate.decode("utf-8")))
+    raw = dotenv_values(
+        stream=StringIO(candidate.decode("utf-8")), interpolate=False
+    )
     return {k: v for k, v in raw.items() if v is not None}
 
 

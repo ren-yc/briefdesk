@@ -3,15 +3,19 @@
 子类只需定义 KEYRING_FIELDS 字典和 model_config['env_prefix']。
 """
 
+from collections.abc import Mapping
 from contextvars import ContextVar
+from pathlib import Path
 from typing import Any, ClassVar
 
+from dotenv import dotenv_values
 from pydantic_settings import (
     BaseSettings,
     DotEnvSettingsSource,
     PydanticBaseSettingsSource,
     SettingsConfigDict,
 )
+from pydantic_settings.sources.providers.dotenv import parse_env_vars
 
 from briefdesk import settings_env
 from briefdesk.secrets_store import KeyringSource
@@ -27,6 +31,29 @@ from briefdesk.secrets_store import KeyringSource
 _ENV_FILE_EXPLICIT: ContextVar[bool] = ContextVar(
     "briefdesk_env_file_explicit", default=False
 )
+
+
+class LiteralDotEnvSource(DotEnvSettingsSource):
+    """关闭 ${VAR} 插值的 dotenv 来源：**仅供用户暂存层使用**。
+
+    暂存层是字面量层（见 settings_env 模块 docstring）：若走父类默认口径，
+    dotenv 会把 `${AI_API_KEY}` 之类的表达式就地展开成进程环境的值——用户
+    在设置页看到的、以及下次启动真正生效的，都不再是写入时的原文。解析与
+    settings_env 的展示/写入路径共用「暂存不插值」这一条口径，分叉即事故。
+    """
+
+    def _read_env_file(self, file_path: Path) -> Mapping[str, str | None]:
+        file_vars = dotenv_values(
+            file_path,
+            encoding=self.env_file_encoding or "utf-8",
+            interpolate=False,
+        )
+        return parse_env_vars(
+            file_vars,
+            self.case_sensitive,
+            self.env_ignore_empty,
+            self.env_parse_none_str,
+        )
 
 
 class KeyringSettingsBase(BaseSettings):
@@ -94,11 +121,16 @@ class KeyringSettingsBase(BaseSettings):
         else:
             # 缺省：项目 .env 与暂存文件是**两个独立来源**，顺序取自
             # settings_env.dotenv_layers()（与 source_of / 启动快照同一份定义）。
-            for _name, path in settings_env.dotenv_layers():
+            # 项目 .env 按 dotenv 默认语义插值；暂存层是字面量层，不展开 ${VAR}
+            # （否则读到的就不是用户原文，写回链路会把环境展开值落成明文）。
+            for name, path in settings_env.dotenv_layers():
+                source_cls = (
+                    LiteralDotEnvSource
+                    if name == settings_env.SOURCE_OVERRIDE
+                    else DotEnvSettingsSource
+                )
                 sources.append(
-                    DotEnvSettingsSource(
-                        settings_cls, env_file=path, env_file_encoding="utf-8"
-                    )
+                    source_cls(settings_cls, env_file=path, env_file_encoding="utf-8")
                 )
         sources.append(file_secret_settings)
         return tuple(sources)

@@ -107,6 +107,58 @@ class CleanDisplayNameTest(unittest.TestCase):
         self.assertEqual(clean_display_name(None), "")
 
 
+class InternalMessageMaskingContractTest(unittest.TestCase):
+    """构造即脱敏的三字段同规则契约：正文、昵称、群名同一套 PII 规则。
+
+    昵称/群名此前只做控制字符清洗：嵌在里面的邮箱、手机号会绕过掩码，
+    原样进入分类与 RAG 的 AI 请求、落库并随导出携带——正文脱敏在不同
+    字段上没有形成完整出口。合成数据（.invalid 保留域名、合成号段）。
+    """
+
+    def _msg(self, sender: str, group: str, content: str):
+        from briefdesk.types import InternalMessage
+
+        return InternalMessage(
+            msg_id="m1",
+            content=content,
+            sender_name=sender,
+            sender_id="u1",
+            session_id="s1",
+            group_name=group,
+            timestamp=0,
+        )
+
+    def test_email_in_sender_and_group_masked(self):
+        msg = self._msg(
+            "昵称me@example.invalid",
+            "群聊group@example.invalid",
+            "正文 contact@example.invalid",
+        )
+        self.assertNotIn("@", msg.sender_name)
+        self.assertIn("[EMAIL]", msg.sender_name)
+        self.assertNotIn("@", msg.group_name)
+        self.assertIn("[EMAIL]", msg.group_name)
+        self.assertNotIn("@", msg.content)
+        self.assertIn("[EMAIL]", msg.content)
+
+    def test_phone_in_sender_masked(self):
+        msg = self._msg("张13800138000", "通知群", "正文")
+        self.assertNotIn("13800138000", msg.sender_name)
+        self.assertIn("[PHONE]", msg.sender_name)
+
+    def test_control_chars_still_cleaned_before_masking(self):
+        msg = self._msg("\x01\x01Alice\x7f", "  \t 群A  ", "正文")
+        self.assertEqual(msg.sender_name, "Alice")
+        self.assertEqual(msg.group_name, "群A")
+
+    def test_masking_idempotent_via_reconstruction(self):
+        first = self._msg("昵称a@b.invalid", "群g@h.invalid", "c@d.invalid")
+        second = self._msg(first.sender_name, first.group_name, first.content)
+        self.assertEqual(first.sender_name, second.sender_name)
+        self.assertEqual(first.group_name, second.group_name)
+        self.assertEqual(first.content, second.content)
+
+
 class NormalizeSubjectTest(unittest.TestCase):
     def test_nfkc_fullwidth_to_halfwidth(self):
         self.assertEqual(normalize_subject("ＡＣＭ"), "acm")

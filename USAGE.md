@@ -115,7 +115,12 @@ A: 需同时满足：`AI_VISION_ENABLED=true`、`ocr` 插件已启用、模型�
 ## 7. 数据与隐私
 
 - 所有数据存于本地 SQLite，默认落在平台用户数据目录（Windows `%LOCALAPPDATA%\briefdesk\data\briefdesk.sqlite`，
-  可经 `DB_PATH` 覆盖）；消息内容经脱敏后处理，密钥走系统钥匙串不落明文。
+  可经 `DB_PATH` 覆盖）；消息内容（正文、昵称、群名）经同一套规则脱敏后处理，密钥走系统钥匙串不落明文。
+- **文本脱敏不遮盖图片内容**：开启视觉输入（`AI_VISION_ENABLED`，需 `ocr` 插件）时，消息图片会经归一化后
+  **连同图片像素一并发送给所选模型供应商**——OCR 识别出的文字会被掩码，但图片里的文字、人脸等内容不经过
+  任何脱敏。是否开启视觉输入，请按你与所选供应商之间的数据约定自行决定。
+- 暂存配置（UI「启动配置」）按**字面量**保存：值里写 `${VAR}` 不会被展开、保存时直接拒绝（提示改为写在
+  项目 `.env` 或环境变量层）；跨层引用属项目 `.env`（dotenv 语义）的能力。
 - 配置文件（UI 暂存）在 `%LOCALAPPDATA%\briefdesk\settings.env`；基准用例/报告在 `…\briefdesk\benchmark\`、
   运行目录在 `…\briefdesk\Cache\benchmark\runs\`（可用 `BRIEFDESK_DATA_DIR` / `BRIEFDESK_CACHE_DIR` /
   `BRIEFDESK_SETTINGS_FILE` 重定向，这三个变量只读进程环境变量）。

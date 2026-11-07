@@ -1333,10 +1333,11 @@ required field of `weflow`/`qqflow` → that plugin self-disables via `PluginDis
   `apply_when` 参数按字段声明；benchmark 三个运行参数为 `next_run`、`keep_runs` 为 `next_cleanup`）——前端暂存徽章、
   草稿生效行与保存 toast 按它措辞，写死「重启生效」会把运行参数误标成要重启（与 `expected_*` 的「下次运行/清理采用」语义一致）。
   PUT 的插件组合复检（`PLUGINS` / `PLUGINS_REQUIRED` 任一被写都要跑）按**候选字节**判定：先在写锁内严格读取现有暂存并合成
-  「提交后会落盘的那份字节」，再用与真实回读同一套 dotenv 规则解析（含 `${VAR}` 展开）——内存 dict 合并直接 `json.loads` 看到的是
-  展开前的原文，预检结论会与提交后的实际组合不一致。名单解析失败 / 元素非字符串**不是**「无冲突」：显式返回 409 + `unavailable` issue，
-  不写盘（旧实现回落 `config.plugins` 或过滤坏元素，会放行「保存成功、重启必失败」的组合）；所有层都未提供时按模型默认 `[]`，
-  不回落启动快照。`validate_selection` 未接入（无 manager）时同样以 409 报「无法完成组合校验」，不当作无问题放行。
+  「提交后会落盘的那份字节」，再用与真实回读同一套 dotenv 规则解析（暂存层**字面量、不展开 `${VAR}`**，见下）——
+  内存 dict 合并直接 `json.loads` 看到的是原文，预检结论必须与提交后的实际组合同源。名单解析失败 / 元素非字符串**不是**「无冲突」：
+  显式返回 409 + `unavailable` issue，不写盘（旧实现回落 `config.plugins` 或过滤坏元素，会放行「保存成功、重启必失败」的组合）；
+  所有层都未提供时按模型默认 `[]`，不回落启动快照。`validate_selection` 未接入（无 manager）时同样以 409 报「无法完成组合校验」，
+  不当作无问题放行。
 - **逐层解码判可用性、胜出值判类型**（`settings_env.resolve_alias_layers` 是层序的唯一定义，展示用的 `composed_value`
   就是它的首层视图——两处各写一份判定必然漂移）：任一层提供了该键但 JSON 解码失败（含空串）就判不可用，因为真实
   `Settings()` 构造时**每一层**都会解码，高层合法压不住低层的坏 JSON（实测：env 合法 + 项目 `.env` 写 `not-json`，
@@ -1347,11 +1348,16 @@ required field of `weflow`/`qqflow` → that plugin self-disables via `PluginDis
   `plugins_required=` 时读盘命中；预检若用大小写敏感的精确查表就查不到该层，会放行「必选含 benchmark、启用列表不含」
   的矛盾组合（写锁只串行化本进程 API，锁不住外部编辑器，所以这是常态路径）。因此 `staged_override` 分支走
   `_lookup_value`；不要在 `read_staged_from_bytes` 里另做键归一化（那会引入第二份口径）。回归：`PrecheckCaseSensitivityTest`。
-- **整值模板草稿**：multi 字段允许「原文非 JSON、但 dotenv 展开后为合法字符串数组」的草稿进入预检（`normalize_setting`
-  只在 `json.loads` 失败且原文含 `${` 时放行**落盘原文**，不经 `json.dumps` 规范化，否则模板被改写、与回读口径不一致；
-  `json.loads` 成功但元素非全字符串不放宽）。放宽处必须自带通用 text 尾巴的两道拒绝（multi 分支走不到那里）：换行会把
-  `KEY=VALUE` 拆成伪键行，「 #」是 dotenv 行内注释起点（回读截断会写出与用户所见不同的名单）。回归：`WholeValueTemplateTest`。
-  暂存文件读不出来（权限/编码）时 PUT 直接拒绝写入（`StagedReadError` → 409；旧行为把读失败当空文件，下一次写入会抹掉整个
+- **暂存层是字面量层（`${VAR}` 不展开）**：用户暂存 `settings.env` 在**全部读取入口**（展示 `read_staged`/`read_staged_strict`、
+  来源判定 `_file_value`、PUT 预检 `read_staged_from_bytes`、pydantic 解析侧 `settings_base.LiteralDotEnvSource`）统一以
+  `interpolate=False` 解析——项目 `.env` 层仍按 dotenv 默认插值。为什么必须关：开启插值时读到的是环境变量展开值而非用户原文，
+  写入路径随后会把展开值重新序列化落成明文（进程环境里的秘密经「往暂存写一个 `${AI_API_KEY}`」→ 无关字段的下一次保存持久化），
+  且展示与解析同用户所见分叉。配套约束：`normalize_setting` 对**一切类型**（含 multi 的 JSON 内）拒绝 `${` 表达式（422），
+  此前「整值模板草稿落盘原文、回读展开」的放宽随之删除——字面量化后模板草稿只会被当真值消费，没有合法形态。需要跨层引用
+  写在项目 `.env`（dotenv 语义层）或进程环境。解析侧与展示/写入侧必须同口径：只关展示侧的话，用户看到的原文与进程实际
+  消费的展开值会静默分叉。回归：`tests/test_settings_env.py` 的 `LiteralStagedLayerParseTest`、
+  `tests/test_settings_env_round2.py` 的 `WholeValueTemplateTest`。
+- 暂存文件读不出来（权限/编码）时 PUT 直接拒绝写入（`StagedReadError` → 409；旧行为把读失败当空文件，下一次写入会抹掉整个
   暂存态）。**写方向同样不得静默**：`commit_staged_write` 的写入/替换/删除失败抛 `StagedCommitError`（继承 `OSError`，
   只忽略「文件本就不存在」），路由统一映射为 500 + `{type: "staged_commit_failed", stage: mkdir|write|replace|delete}`——
   删除失败被吞成 `ok:true` 是静默丢写入（文件仍在磁盘、内容原样），而裸 `OSError` 穿出路由只会留下无 detail 的 500；

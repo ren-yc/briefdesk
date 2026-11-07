@@ -271,30 +271,33 @@ def staged_value(raw: str, setting_type: str) -> object:
     return raw
 
 
+# 暂存层字面量守卫：值里出现变量表达式一律拒绝。
+# 暂存层不展开 ${VAR}（settings_env/_base 同口径），放行它们只会让用户把
+# 「看起来是引用」的字符串当成配置存下来——运行时按字面量消费，模型名、URL
+# 直接坏掉；更糟的历史形态是解析层曾按 dotenv 插值消费，环境里的秘密经展开
+# 回显到响应、并在下一次无关保存时落成明文。需要跨层引用请写在项目 .env
+# （dotenv 语义层）或进程环境，暂存层只存字面值。
+_DOLLAR_EXPR_RE = re.compile(r"\$\{")
+
+
+def _reject_dollar_expr(raw: str) -> None:
+    if _DOLLAR_EXPR_RE.search(raw):
+        raise ValueError(
+            "暂存值不支持 ${VAR} 变量引用（暂存层按字面量保存）；"
+            "需要引用环境变量或跨键组合请写在项目 .env"
+        )
+
+
 def normalize_setting(meta: dict[str, Any], raw: str) -> str:
     """按 schema 元数据校验并规范化一个暂存值。"""
+    # 字面量守卫先于一切类型分支：值含 ${VAR} 一律拒绝（含 multi 的 JSON 内）。
+    _reject_dollar_expr(raw)
     setting_type = meta.get("type")
     if setting_type == "multi":
         try:
             parsed = json.loads(raw)
         except json.JSONDecodeError:
-            if "${" not in raw:
-                raise
-            # 整值模板草稿：原文不是 JSON，但 dotenv 回读会展开 ${VAR}，展开后
-            # 可能是合法数组——落盘原文（不做 json.dumps 规范化，否则模板被改写、
-            # 与回读的展开口径不一致），最终合法性由候选字节回读判定：展开后
-            # 非法在组合预检 409 且不落盘。json.loads 成功但元素非全字符串时不
-            # 放宽（类型仍按「须为 JSON 字符串数组」拒），与逐层解码只对胜出值
-            # 判类型同口径。
-            # 放宽不等于放行注入：multi 分支走不到通用 text 尾巴，两道拒绝必须
-            # 在此补上——换行会把 KEY=VALUE 行拆出伪键（可注入任意配置行，含
-            # 密钥名）；「 #」是 dotenv 行内注释起点，回读截断会写出与用户所见
-            # 不同的名单。
-            if "\n" in raw or "\r" in raw:
-                raise ValueError("值不能包含换行符")
-            if " #" in raw:
-                raise ValueError("值不能包含「 #」（dotenv 行内注释起点）")
-            return raw
+            raise ValueError("须为 JSON 字符串数组") from None
         if not isinstance(parsed, list) or not all(
             isinstance(value, str) for value in parsed
         ):
