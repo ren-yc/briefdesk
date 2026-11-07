@@ -746,8 +746,11 @@ class ChartsTest(unittest.TestCase):
 
         html_text = build_html_report(self._payload())
         assert "<!DOCTYPE html>" in html_text
-        assert "分类（classify_batch）" in html_text
-        assert "混淆矩阵（行=预测，列=期望）" in html_text
+        assert "<h2>分类</h2>" in html_text
+        # 精确到图表标题本身：只查子串的话，旧标题「混淆矩阵（行=预测，列=期望）」
+        # 也能通过，锁不住标题精简
+        assert ">混淆矩阵</text>" in html_text
+        assert "混淆矩阵（" not in html_text
         assert "100.0%" in html_text
         assert "dd-001" in html_text
         assert "JSON 模式" in html_text
@@ -772,7 +775,7 @@ class ChartsTest(unittest.TestCase):
         assert "<script>alert(1)</script>" not in html_text
 
     def test_html_report_shows_elapsed(self):
-        """HTML 报告头部含总用时、各功能指标表含测试用时。"""
+        """HTML 报告头部含总用时、每功能段首 meta 行含该功能用时。"""
         from briefdesk.plugins.benchmark.html_report import build_html_report
 
         payload = self._payload()
@@ -782,13 +785,15 @@ class ChartsTest(unittest.TestCase):
         html_text = build_html_report(payload)
         assert "总用时" in html_text
         assert "12.3s" in html_text
-        assert "测试用时" in html_text
-        assert "5.7s" in html_text
-        assert "450ms" in html_text
+        assert "测试用时 5.7s" in html_text
+        assert "测试用时 450ms" in html_text
+        # 用时挪到段首 meta 行后不再占指标表的一行
+        assert "<td>测试用时</td>" not in html_text
         # 缺省时显示 '-' 而非报错
         html_text = build_html_report(self._payload())
         assert "总用时" in html_text
         assert "<b>总用时</b> -" in html_text
+        assert "测试用时" not in html_text.split("<h2>分类</h2>")[1].split("</p>")[0]
 
     def test_build_payload_includes_elapsed(self):
         """payload 顶层 elapsed_sec + 每功能 elapsed_sec 由 _build_payload 写入。"""

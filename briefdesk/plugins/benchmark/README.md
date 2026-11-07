@@ -104,8 +104,8 @@ python -m briefdesk.plugins.benchmark.cli --model deepseek-v4-flash --concurrenc
 | 功能 | 引擎入口（与生产同路径） | 测试集输入 | 期望标注 | 主要指标 |
 |---|---|---|---|---|
 | classify | `classify_batch(messages)` | 一批 InternalMessage | 每条应分类消息的 `index`/`category`，可选 `start`/`end`/`times`；可选 `mode` 切片维度 | 类别准确率/精确率/召回率/F1（不含纯占位符用例，按 mode 切片另列）、时间点完全一致率、时间点召回率（含回声 / 剔回声）、失败率 |
-| dedup | `DedupEngine.check_dedup` | `items`（历史卡片）+ `query`（新消息） | `same: true/false` | 判重准确率/精确率/召回率/F1、未触发判官数、经判官裁决用例数与占比、判定通道分布 |
-| merge | `judge_merge` | `head` + `tail` 两张卡 | `merge: true/false` | 判定准确率/精确率/召回率/F1 |
+| dedup | `DedupEngine.check_dedup` | `items`（历史卡片）+ `query`（新消息） | `same: true/false` | 准确率/精确率/召回率/F1、未触发判官数、经判官裁决用例数与占比、判定通道分布 |
+| merge | `judge_merge` | `head` + `tail` 两张卡 | `merge: true/false` | 准确率/精确率/召回率/F1 |
 | title | `summarize_title` | 一张卡 + `old_title`/`key_info` | `title` 精确 与/或 `keywords` 包含 | 关键词命中率、字符相似度均值/中位数、平均长度、超长数、回退数 |
 
 ## 测试集格式（手动添加 / 网页导出共用）
