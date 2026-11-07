@@ -31,10 +31,12 @@ from briefdesk.server import routes_settings_env as settings_routes
 from briefdesk.settings_base import KeyringSettingsBase
 from briefdesk.settings_env import (
     SOURCE_DOTENV,
+    SOURCE_OVERRIDE,
     StagedReadError,
     field_env_key,
     get_settings_file,
     read_staged,
+    resolve_alias_layers,
     source_of,
     write_staged,
 )
@@ -1364,6 +1366,35 @@ class LiteralStagedLayerParseTest(unittest.TestCase):
                 patch.object(paths, "project_dotenv_path", return_value=project),
             ):
                 self.assertEqual(self._Probe().value, "project-base-x")
+
+    def test_staged_redirect_to_other_filename_stays_literal(self) -> None:
+        """暂存层重定向到非 settings.env 文件名时仍按字面量取值。
+
+        BRIEFDESK_SETTINGS_FILE 可把暂存层指到任意文件名（测试/便携场景）；
+        插值判定必须依据层身份（SOURCE_OVERRIDE）而不是文件名，否则重定向
+        形态下展示/来源判定会展开暂存值、与解析侧字面量口径分叉。
+        """
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            project = root / ".env"
+            project.write_text("PROBE_REF=project-ref\n", encoding="utf-8")
+            staged = root / "portable.env"
+            staged.write_text(
+                "PROBE_VALUE=${PROBE_REF}\nPROBE_REF=staged-ref\n", encoding="utf-8"
+            )
+            with (
+                _env_without("PROBE_VALUE"),
+                _env_without("PROBE_REF"),
+                patch.dict(os.environ, {"BRIEFDESK_SETTINGS_FILE": str(staged)}),
+                patch.object(paths, "project_dotenv_path", return_value=project),
+            ):
+                # resolve_alias_layers（展示/来源判定路径）：暂存层字面量
+                layers = resolve_alias_layers("PROBE_VALUE")
+                self.assertEqual(
+                    layers, [(SOURCE_OVERRIDE, "${PROBE_REF}")]
+                )
+                # 解析侧同口径：真实构造拿到字面值
+                self.assertEqual(self._Probe().value, "${PROBE_REF}")
 
 
 class AllSettingsTwoLayerTest(StagedFileTestCase):

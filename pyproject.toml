@@ -18,6 +18,10 @@ dependencies = [
     "fastapi>=0.115",
     "uvicorn[standard]>=0.34",
     "httpx>=0.28",
+    # httpx 默认 SSL 上下文取 certifi.where()（未配置自定义 CA 时）：锁文件升到
+    # 修复版只覆盖 CI/新装环境，这里抬运行时下限才能让既有环境升级本包时
+    # 一并脱离保留已撤销信任根的旧 bundle
+    "certifi>=2026.10.19",
     "aiosqlite>=0.20",
     "pydantic>=2.10",
     "pydantic-settings>=2.7",

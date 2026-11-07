@@ -55,12 +55,6 @@ def get_settings_file() -> Path:
     return paths.settings_file()
 
 
-#: 暂存文件的固定文件名：_file_value 以「是否为暂存层」决定插值开关。
-#: BRIEFDESK_SETTINGS_FILE 可以把暂存层指到任意路径（测试/便携场景），按
-#: 文件名判断而不是按路径判断，覆盖显式重定向的形态。
-STAGED_FILENAME = "settings.env"
-
-
 def _dotenv_read(
     path: Path, *, interpolate: bool
 ) -> dict[str, str | None]:
@@ -125,19 +119,21 @@ def _lookup_value(values: Mapping[str, str | None], alias: str) -> str | None:
     return None
 
 
-def _file_value(path: Path, alias: str) -> str | None:
+def _file_value(path: Path, alias: str, *, interpolate: bool = True) -> str | None:
     """文件里该键的值：大小写不敏感，且 `KEY=` 的空串算「有值」。
 
     为什么空串算有值：`DotEnvSettingsSource` 会采纳空串（普通 str 字段得到 `''`、
     int 字段直接 ValidationError），"留空即未设置" 不成立。
 
-    参数是**层名**：项目 .env 层按 dotenv 默认口径插值，暂存层关闭插值——
-    暂存是字面量层（见模块 docstring 与 `read_staged_strict`）。关闭插值必须
-    与解析侧（pydantic-settings 的 DotEnvSettingsSource 子类）同口径，否则
-    展示/来源判定看到的值与真实构造不一致。
+    `interpolate` 由**调用方按层身份**传入：项目 .env 层开启（dotenv 语义层），
+    暂存层关闭（字面量层，见模块 docstring 与 `read_staged_strict`）。判定依据
+    是层名而不是文件名——`BRIEFDESK_SETTINGS_FILE` 可把暂存层重定向到任意
+    文件名（测试/便携场景），按文件名判断会在重定向形态下把暂存值展开、
+    与解析侧的字面量口径分叉。关闭插值必须与解析侧同口径，否则展示/来源
+    判定看到的值与真实构造不一致。
     """
     try:
-        values = _dotenv_read(path, interpolate=path.name != STAGED_FILENAME)
+        values = _dotenv_read(path, interpolate=interpolate)
     except (OSError, UnicodeDecodeError):
         return None
     return _lookup_value(values, alias)
@@ -215,7 +211,7 @@ def resolve_alias_layers(
         if name == SOURCE_OVERRIDE and staged_override is not None:
             value = _lookup_value(staged_override, alias)
         else:
-            value = _file_value(file, alias)
+            value = _file_value(file, alias, interpolate=name != SOURCE_OVERRIDE)
         if value is not None:
             resolved.append((name, value))
     return resolved

@@ -1367,6 +1367,43 @@ class BatchBudgetTruncationTest(unittest.TestCase):
         assert "group-review@example.invalid" not in built
         assert "[EMAIL]" in built
 
+    def test_same_masked_group_names_stay_separate_groups(self):
+        """分组键是会话身份而非群名：掩码后同形的两个会话不得并组。
+
+        两个群名嵌不同邮箱时掩码后同形；分组若按群名，同批的两个会话会被
+        放进同一群头，模型收到混淆的会话上下文。
+        """
+        from briefdesk.types import InternalMessage
+
+        messages = [
+            InternalMessage(
+                msg_id="m1",
+                content="甲群通知",
+                sender_name="张三",
+                sender_id="u1",
+                session_id="sess-a",
+                group_name="群a@example.invalid",
+                timestamp=1750000000,
+            ),
+            InternalMessage(
+                msg_id="m2",
+                content="乙群通知",
+                sender_name="李四",
+                sender_id="u2",
+                session_id="sess-b",
+                group_name="群b@example.invalid",
+                timestamp=1750000001,
+            ),
+        ]
+        groups = _group_messages(messages)
+        assert len(groups) == 2
+        # 群头显示掩码后的群名（两处都掩成同一占位符），而非 source:session_id 组合键
+        assert all(g["groupName"] == "群[EMAIL]" for g in groups)
+        built, _ = _build_user_message_ex(groups)
+        assert "sess-a" not in built
+        assert "sess-b" not in built
+        assert "[EMAIL]" in built
+
 
 class TestClassifyBatchTruncationFailed:
     """集成：被预算剔除的消息必须进 outcome.failed（回填重试），
