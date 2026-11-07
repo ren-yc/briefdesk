@@ -76,8 +76,13 @@ jobs:
         run: pip install -r requirements-dev.txt
 
       # 版本唯一性预检 + 构建 + 产物成员断言 + twine check；正式索引下版本必须等于仓库静态值
+      # 版本输入是自由文本：GitHub 表达式替换发生在 shell 解析之前，直接内插 run
+      # 等于把审批者看到的版本值当代码执行（分号即可拼接第二条语句）。经 step 的
+      # env 结构化传入，shell 里以带引号的变量引用消费，值永远是单个参数。
       - name: Build and verify artifacts
-        run: python scripts/release_check.py --target ${{ inputs.target }} --version ${{ inputs.version }}
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: python scripts/release_check.py --target ${{ inputs.target }} --version "$RELEASE_VERSION"
 
       - name: Publish to TestPyPI
         if: inputs.target == 'testpypi'
@@ -123,7 +128,11 @@ jobs:
         run: pip install -r requirements-dev.txt
 
       - name: Verify wheel install path
-        run: python scripts/wheel_smoke.py --install-from ${{ inputs.target }} --version ${{ inputs.version }}
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: python scripts/wheel_smoke.py --install-from ${{ inputs.target }} --version "$env:RELEASE_VERSION"
 
       - name: Verify sdist install path
-        run: python scripts/wheel_smoke.py --install-from ${{ inputs.target }} --version ${{ inputs.version }} --from-sdist
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: python scripts/wheel_smoke.py --install-from ${{ inputs.target }} --version "$env:RELEASE_VERSION" --from-sdist
