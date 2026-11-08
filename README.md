@@ -1,8 +1,19 @@
 # 简报台
 
-> 本地运行的网页应用，通过可插拔消息源（weflow-server 或 WeFlow 监听微信群，qqflow-server 监听 QQ 群）获取群消息，AI 自动分类筛选有价值的信息并结构化展示。
+> 本地运行的网页应用：通过可插拔消息源（weflow-server 或 WeFlow 监听微信群，qqflow-server 监听 QQ 群）获取群消息，AI 自动分类筛选有价值的信息并结构化展示。
+
+## Highlights
+
+简报台的核心能力集中在多消息源采集、四阶段处理链、可审核卡片与快速启动四件事。
+
+- **多消息源可共存**：安装版 WeFlow、weflow-server 或 qqflow-server 任选其一，启动回填 + 增量轮询 + SSE 实时监听
+- **一条处理链**：图片 OCR → AI 分类 → 语义去重 → 同话题合并，结果写入 SQLite 并经 SSE 推送到原生 JS 前端
+- **可审核的卡片**：按类别 / 群聊 / 状态筛选，支持备忘录、忽略、原文上下文与同主体折叠
+- **5 分钟可装可跑**：Python 3.12 + 任一消息源 + `AI_API_KEY`，启动后浏览器打开 `http://localhost:3000`
 
 ## 功能
+
+下面十条是开箱可用的功能，机制细节与默认值统一收在使用指南。
 
 - **消息获取**：启动回填 + 按会话增量轮询，并辅以 SSE 实时监听，多消息源可共存；会话启用或从未轮询时按 `BACKFILL_HOURS` 默认 24h 窗口回填一次，设为 -1 拉取全部历史（每次同步都会全量扫描，慎用），各会话独立水位，`POLL_OVERLAP_SECONDS` 控制重叠容错
 - **AI 分类**：AI 自动将消息分类，内置 13 类、出厂默认启用 5 类（活动通知、社团招新、学术、交易、实习）；可在设置中自定义类别（名称/提示词/颜色/启停）
@@ -18,6 +29,8 @@
 > 功能细节、回填窗口、水位与重叠容错、类别默认值见 [USAGE.md](USAGE.md)。
 
 ## 快速开始
+
+装好 Python 3.12 与任一消息源、填好 `AI_API_KEY` 后即可启动，浏览器打开 `http://localhost:3000`。
 
 ### 前置条件
 
@@ -97,6 +110,8 @@ briefdesk                           # 或 python -m briefdesk
 完整的数据流图、模块职责、插件框架、数据库 Schema、配置项与设计陷阱详见 [docs/architecture.md](docs/architecture.md)；日常使用（启动、配置、常见操作）详见 [USAGE.md](USAGE.md)；想给简报台写插件（消息源/阶段/Web 扩展）请阅读[第三方插件开发指南](docs/plugin-dev.md)。
 
 ## 技术栈
+
+运行时是 Python + FastAPI，前端是无构建的原生 JS，数据落 SQLite。
 
 - **运行时与 Web**：Python + uvicorn + FastAPI，前端为原生 HTML + CSS + JavaScript（无框架）
 - **数据与 AI**：SQLite (aiosqlite 异步) + AI Chat API (openai SDK 兼容)，HTTP 客户端 httpx (异步)

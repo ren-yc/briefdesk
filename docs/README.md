@@ -21,6 +21,8 @@
 
 ## 阅读路径
 
+第一次接触、要改代码、要写插件三种场景各有一条最短路径。
+
 - **第一次接触**：先 [README.md](../README.md) 跑通，再按上表挑任务；日常操作细节在 [USAGE.md](../USAGE.md)。
 - **要改代码**：[architecture.md](architecture.md) 是架构细节的唯一汇总处 → 根目录 [AGENTS.md](../AGENTS.md)（命令、质量门禁、提交规范）。模块职责、插件框架、DB schema、server 路由、配置项或跨模块陷阱变化都须回写 architecture.md。
 - **要写插件**：[plugin-dev.md](plugin-dev.md)（最小示例、槽位契约、生命周期与失败补偿、配置与密钥、测试建议）→ [architecture.md](architecture.md) 的「插件框架」与「核心模块」两节。
