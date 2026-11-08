@@ -15,6 +15,8 @@
 
 ## 同步流程
 
+同步分两步：上游重建供应分支并推送，briefdesk 侧再拉取镜像。
+
 ```powershell
 # 上游侧（weflow-server / qqflow-server）：SDK 变更提交推送后，重建供应分支。
 # 本地分支必须一起更新：下游按路径 fetch 的是分支本身，只推 origin 会让下游继续拿到旧镜像。
@@ -32,6 +34,8 @@ powershell -File scripts/sync_vendor.ps1
 从 HEAD 正文找不到。解析不到即打印两方正文并响亮报错，不静默跳过）→ 打印可直接粘贴的同步记录行 → import 冒烟（解释器取 `$env:PYTHON`，未设时用 `python`）。
 
 ## 同步记录
+
+记录按时间顺序保留每次同步的两仓 commit 与上游改动，供对账与回溯。
 
 - 初始挂载：weflow `sdk-dist`（55cb066，源自 weflow-server master `d8d191b`）、qqflow `sdk-dist`（fdc3f0c，源自 qqflow-server master `a4f0d0e`）。
 - 生成层去空白同步：weflow `sdk-dist`（`04bcbb7`，源自 weflow-server master `a192767`）、qqflow `sdk-dist`（`b6f1f06`，源自 qqflow-server master `c840db5`）。上游生成管线新增确定性规范化（逐行去行尾空白、折叠结尾空行、保证单个结尾换行），镜像随之更新；此次同步后 vendor 内不再有条目级空白问题，范围级空白门禁对镜像部分归零。

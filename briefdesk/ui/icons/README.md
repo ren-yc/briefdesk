@@ -10,6 +10,8 @@
 
 ## 新增图标流程
 
+新增图标一律走「取图并登记 → 代码引用 → 跑守卫」三步。
+
 1. 取图标并登记（二选一）：
    - 首选脚本：`python scripts/fetch_icons.py add <name>`——从钉定版本的 lucide-static 逐个拉取并自动登记 manifest（禁止整库拷贝、禁止引入第二图标库）；
    - 或从 [lucide.dev](https://lucide.dev) 取单个 SVG 拷入本目录（英文 kebab-case 命名），手动在 `briefdesk/ui/icon-manifest.txt` 登记一行 `/icons/<name>.svg`；
@@ -17,6 +19,8 @@
 3. 跑 `python -m pytest tests/test_icon_manifest.py tests/test_fetch_icons_script.py`，双向断言通过后方可提交。
 
 ## 插件图标通道
+
+插件图标只复用核心清单或内联 SVG，不另建图标目录。
 
 插件前端（`briefdesk/plugins/*/ui/`）**不单独携带图标目录**，图标来源二选一：
 

@@ -240,7 +240,7 @@ powershell -ExecutionPolicy Bypass -File scripts/install-hooks.ps1
 
 简报台是本地网页应用：可插拔消息源采集群聊消息，经统一过滤与阶段化管道（OCR 增强 → AI 分类 → 语义去重 → 同话题合并）写入 SQLite，由 FastAPI 经 SSE 实时推送到原生 JS 前端。**数据流、模块职责与槽位契约一律以架构文档为准，此处不复制**——本文件与架构文档各留一份就会出现「改了一处、另一处仍是旧口径」的漂移。
 
-- **完整架构文档**：[docs/architecture.md](docs/architecture.md)——模块职责、插件框架、数据库 schema、server 路由清单、配置项表、设计要点与陷阱。涉及架构的任务先读它。
+- **完整架构文档**：[docs/architecture.md](docs/architecture.md)——模块职责、插件框架、数据库 schema、server 路由清单、配置项、设计要点与陷阱。涉及架构的任务先读它。
 - **同步更新义务**（元维护规则）：出现下列改动时，必须回写 `docs/architecture.md` 对应小节：
   - 新增/删除插件或管道阶段槽位；
   - DB schema 变更（建表/列/约束）；

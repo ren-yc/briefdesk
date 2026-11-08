@@ -1,7 +1,8 @@
 # briefdesk 插件开发指南
 
 面向第三方开发者的插件编写手册：从最小可运行示例到生命周期契约、配置与密钥、测试建议。
-架构背景请先阅读 [architecture.md](architecture.md) 的「插件框架」与「核心模块」两节；本文只讲「怎么写」。
+
+> 架构背景先读 [architecture.md](architecture.md) 的「插件框架」与「核心模块」两节；本文只讲「怎么写」。
 
 ## 目录
 
@@ -17,8 +18,7 @@
 
 ## 最小 WebPlugin 示例
 
-WebPlugin 在核心 REST 之外挂自己的路由与前端资源（日历、提醒、rag 问答均如此实现）。
-下面是一个可直接复制的最小插件（假设放在你的包 `myplug` 中）：
+WebPlugin 在核心 REST 之外挂自己的路由与前端资源（日历、提醒、rag 问答均如此实现），最小实现只需一个类加模块级 `plugin` 实例；下面的示例可直接复制（假设放在你的包 `myplug` 中）。
 
 ```python
 # myplug/plugin.py
@@ -64,28 +64,50 @@ class MyPlugin(Plugin, WebPlugin):
 plugin = MyPlugin()  # 模块底部必须暴露名为 plugin 的实例（entry point 指向它）
 ```
 
-前端约定：`asset_dir` 目录下的文件经 `/plugin-assets/myplug/<path>` 服务（浏览器直连，可引用
-`briefdesk/ui/app.js` 导出的助手）；`app.js` 提供的公共助手清单见 `tests/test_web_plugins.py` 的对账表（`esc`/`escAttr`/`showToast`/`registerPluginView` 等）。
+- `asset_dir` 目录下的文件经 `/plugin-assets/myplug/<path>` 服务，浏览器直连，可引用 `briefdesk/ui/app.js` 导出的助手。
+- `app.js` 提供的公共助手清单见 `tests/test_web_plugins.py` 的对账表（`esc`/`escAttr`/`showToast`/`registerPluginView` 等）。
 
 ## StagePlugin 槽位契约
 
-StagePlugin 参与消息处理管道。管道骨架 `briefdesk/pipeline.py` 按槽位顺序调度，
-同槽位内按 `priority` 升序（数字小者先跑）：
+StagePlugin 参与消息处理管道，管道骨架 `briefdesk/pipeline.py` 按槽位顺序 enrich → classify → dedup → post_insert 调度，同槽位按 `priority` 升序（数字小者先跑）。
 
-- 槽位：`enrich` — 调用时机：入口过滤后、分类前（OCR 等输入增强）；管道对每批在**锁外**直接调 `run`；锁纪律：**前段相：`run` 在 storage_lock 外**——取图字节等网络调用就是这里的正常工作；管道**不探测**本槽位的 `before_run`/`after_run`，写了不会执行；失败/早退语义：可选插件缺失/禁用时 enrich 槽为空：纯占位符图片消息被入口过滤，混合消息降级纯文本；置位 `vision_without_ocr` 公告
-- 槽位：`classify` — 调用时机：enrich 之后；对每批消息调 AI 并把 `ClassifyOutcome` 写入 `batch.outcomes`；锁纪律：**前段相：`run` 锁外**——AI 请求即本阶段的核心工作；同样不探测 `before_run`/`after_run`；失败/早退语义：引擎抛错 → 整批进 `failed` 保留待回填；`outcomes` 缺失按契约违约整批保留
-- 槽位：`dedup` — 调用时机：classify 之后；判重/入库/缓存；锁纪律：**存储相：`run` 在 storage_lock 内**；`before_run` 由管道在**锁外**调用（行规划/批内预嵌入等重活放这里）；`after_run` 批尾锁外执行，向量落库内部自持 `storage_lock`（含写锁重试退避，见 `engine.flush_pending_embeddings` 的锁内代价说明）；失败/早退语义：判重失败的消息保留待回填；`processed` 标记只给确定终态的行
-- 槽位：`post_insert` — 调用时机：入库后的派生处理（合并、rag 索引）；锁纪律：**存储相：`run` 锁内**；`before_run`/`after_run` 与 dedup 同口径（锁外预计算、批尾锁外收尾）；失败/早退语义：单阶段异常只记日志，不回滚已入库卡片
+### `enrich`
 
-通用规则：
+- **调用时机**：入口过滤后、分类前（OCR 等输入增强）；管道对每批在**锁外**直接调 `run`。
+- **锁纪律**：**前段相：`run` 在 storage_lock 外**——取图字节等网络调用就是这里的正常工作。
+- **钩子**：管道**不探测**本槽位的 `before_run`/`after_run`，写了不会执行。
+- **失败/早退**：可选插件缺失/禁用时 enrich 槽为空——纯占位符图片消息被入口过滤，混合消息降级纯文本；置位 `vision_without_ocr` 公告。
 
-- **锁纪律**：管道分两套相位。**前段相**（enrich/classify 的 `run`）在 `storage_lock` 外执行，网络调用是这两个槽位的正常工作；**存储相**（dedup/post_insert 的 `run` 与入口 raw 落库）在 `storage_lock` 内执行—— 单连接 + 隐式事务下，锁外的 commit 会把锁内未完成的多步写提前提交。存储相插件的网络调用与重活放 `before_run`（仅 dedup/post_insert 两个槽位被管道探测）。锁内唯一允许的网络调用是判官类 chat（dedup 判票/strong、merge 判官/标题）：判定与入库有批内顺序依赖（先行消息入库后后续判定要能看到），不能移出锁；以 `_JUDGE_TIMEOUT`（45s）单请求超时约束最坏持锁时间。
+### `classify`
+
+- **调用时机**：enrich 之后；对每批消息调 AI 并把 `ClassifyOutcome` 写入 `batch.outcomes`。
+- **锁纪律**：**前段相：`run` 锁外**——AI 请求即本阶段的核心工作；同样不探测 `before_run`/`after_run`。
+- **失败/早退**：引擎抛错 → 整批进 `failed` 保留待回填；`outcomes` 缺失按契约违约整批保留。
+
+### `dedup`
+
+- **调用时机**：classify 之后；判重/入库/缓存。
+- **锁纪律**：**存储相：`run` 在 storage_lock 内**；`before_run` 由管道在**锁外**调用（行规划/批内预嵌入等重活放这里）。
+- **收尾**：`after_run` 批尾锁外执行，向量落库内部自持 `storage_lock`（含写锁重试退避，见 `engine.flush_pending_embeddings` 的锁内代价说明）。
+- **失败/早退**：判重失败的消息保留待回填；`processed` 标记只给确定终态的行。
+
+### `post_insert`
+
+- **调用时机**：入库后的派生处理（合并、rag 索引）。
+- **锁纪律**：**存储相：`run` 锁内**；`before_run`/`after_run` 与 dedup 同口径（锁外预计算、批尾锁外收尾）。
+- **失败/早退**：单阶段异常只记日志，不回滚已入库卡片。
+
+### 通用规则
+
+- **锁纪律**：管道分两套相位。**前段相**（enrich/classify 的 `run`）在 `storage_lock` 外执行，网络调用是这两个槽位的正常工作；**存储相**（dedup/post_insert 的 `run` 与入口 raw 落库）在 `storage_lock` 内执行——单连接 + 隐式事务下，锁外的 commit 会把锁内未完成的多步写提前提交。
+- **重活放 `before_run`**：存储相插件的网络调用与重活放 `before_run`（仅 dedup/post_insert 两个槽位被管道探测）。
+- **锁内唯一允许的网络调用是判官类 chat**（dedup 判票/strong、merge 判官/标题）：判定与入库有批内顺序依赖（先行消息入库后后续判定要能看到），不能移出锁；以 `_JUDGE_TIMEOUT`（45s）单请求超时约束最坏持锁时间。
 - **早退语义**：`process_all_batches` 在「无启用类别 / classify 或 dedup 阶段缺失 / 分类全失败」时返回 False——整批不标记 processed，回填窗口内自动重试；阶段插件不得自行标记 processed 之外的行。
 - **可选依赖**：rapidocr/onnxruntime 这类可选运行时依赖应在 `setup` 里延迟导入，缺失时抛 `PluginDisabledError`（禁用本插件，不影响其余功能）。
 
 ## 生命周期与失败补偿
 
-装配顺序（见 `briefdesk/plugin/manager.py`）：
+装配顺序（见 `briefdesk/plugin/manager.py`）固定为发现、过滤、互斥仲裁、依赖拓扑排序，再分三段执行 setup、activate 与逆序 teardown。
 
 ```
 发现 → 过滤（PLUGINS）→ 互斥仲裁 → 依赖拓扑排序 → setup_all → （HTTP 启动）→ activate_all → … → teardown_all（逆序）
@@ -99,9 +121,11 @@ StagePlugin 参与消息处理管道。管道骨架 `briefdesk/pipeline.py` 按�
 
 ## 发现方式与配置
 
-**发现**两条路：
+插件经 entry point 或开发期目录被发现，再由 `PLUGINS` 显式白名单决定是否启用。
 
-1. **entry points**（推荐）：在你的包 `pyproject.toml` 声明
+### 发现
+
+1. **entry points**（推荐）：在你的包 `pyproject.toml` 声明：
 
    ```toml
    [project.entry-points."briefdesk.plugins"]
@@ -111,8 +135,9 @@ StagePlugin 参与消息处理管道。管道骨架 `briefdesk/pipeline.py` 按�
    等号右侧指向**模块级插件实例**（不是类）。
 2. **PLUGIN_PATH**：环境变量 `PLUGIN_PATH` 指向一个含插件模块的目录（本地开发用），框架按同样约定发现 `plugin` 实例。
 
-**启用**：`PLUGINS` 环境变量为可选插件的显式白名单（JSON 数组，如
-`PLUGINS=["weflow","qqflow"]`；无通配语义）——
+### 启用
+
+`PLUGINS` 环境变量为可选插件的显式白名单（JSON 数组，如 `PLUGINS=["weflow","qqflow"]`；无通配语义）：
 
 - 不在列表中的可选插件被禁用（disabled，原因「未启用」）；未知名打 WARNING。
 - `core = True` 的核心插件**恒装配**，不受 PLUGINS 过滤。
@@ -122,10 +147,11 @@ StagePlugin 参与消息处理管道。管道骨架 `briefdesk/pipeline.py` 按�
 
 ## 事件订阅与端口获取
 
-**事件订阅**：核心事件总线 `briefdesk.events`（模块级单例 `event_bus`，main 注入
-PluginContext）。插件在 setup 里经 `ctx.subscribe_event(event, handler)` 订阅；
-handler 同步/异步均可：`events.py` 的 `publish` 对协程函数与返回 awaitable 的同步函数都会
-await；处理器异常只记日志不传播。发布方可能持存储锁调用（如删除卡片），需要与锁内写入保持原子的处理器（如 dedup 清缓存）应实现为同步函数，避免锁内 await。
+插件通过核心事件总线解耦，通过 `PluginContext` 取得去重与 AI 两个服务端口。
+
+- **事件订阅**：核心事件总线 `briefdesk.events`（模块级单例 `event_bus`，main 注入 PluginContext）。插件在 setup 里经 `ctx.subscribe_event(event, handler)` 订阅。
+- **处理器形态**：handler 同步/异步均可——`events.py` 的 `publish` 对协程函数与返回 awaitable 的同步函数都会 await；处理器异常只记日志不传播。
+- **锁内语义**：发布方可能持存储锁调用（如删除卡片），需要与锁内写入保持原子的处理器（如 dedup 清缓存）应实现为同步函数，避免锁内 await。
 
 ```python
 from briefdesk.events import EVENT_ITEMS_DELETED
@@ -137,24 +163,28 @@ def _on_items_deleted(self, item_ids: list[str]) -> None:
     ...  # 卡片被删除：清理你的派生数据（缓存/索引/向量）
 ```
 
-核心已发布的事件：`EVENT_ITEMS_DELETED`（"items_deleted"，删除卡片时同步清理派生数据的钩子——rag 的孤儿对账、dedup 的缓存清理都靠它）。自行 `event_bus.publish` 的新事件（如 rag 的）与核心事件共用同一总线和 `ctx.subscribe_event` 订阅路径。
-
-**端口获取**（仅核心提供的两个服务端口）：
-
-- `ctx.dedup`：`DedupService` 端口（dedup 插件 setup 注册）——同进程内共享去重缓存，merge 等后置阶段经此查询。
-- `ctx.ai`：`AIProvider` 端口（ai_provider 插件 setup 注册）——`chat`/`embed_texts` 等（`chat` 可选 `timeout`/`max_retries`）。**引擎代码不要直接 import 供应商插件**：`briefdesk.ai_ports` 提供函数式端口（`ai_ports.chat(...)` 等），插件未装配时结构化报错。
-
-依赖 `ai_provider` 的插件应声明 `dependencies=("ai_provider",)`，setup 里 `ctx.ai is None`
-即视为依赖未就绪（自禁用并提示）。
+- **核心事件**：`EVENT_ITEMS_DELETED`（"items_deleted"，删除卡片时同步清理派生数据的钩子——rag 的孤儿对账、dedup 的缓存清理都靠它）。自行 `event_bus.publish` 的新事件（如 rag 的）与核心事件共用同一总线和 `ctx.subscribe_event` 订阅路径。
+- **`ctx.dedup`**：`DedupService` 端口（dedup 插件 setup 注册）——同进程内共享去重缓存，merge 等后置阶段经此查询。
+- **`ctx.ai`**：`AIProvider` 端口（ai_provider 插件 setup 注册）——`chat`/`embed_texts` 等（`chat` 可选 `timeout`/`max_retries`）。
+- **不要直接 import 供应商插件**：`briefdesk.ai_ports` 提供函数式端口（`ai_ports.chat(...)` 等），插件未装配时结构化报错。
+- **依赖声明**：依赖 `ai_provider` 的插件应声明 `dependencies=("ai_provider",)`，setup 里 `ctx.ai is None` 即视为依赖未就绪（自禁用并提示）。
 
 ## 配置与密钥
 
-- **配置类**：继承 `briefdesk.settings_base.KeyringSettingsBase`（pydantic-settings），用 `model_config` 设 `env_prefix`；字段注释写清对应环境变量与默认值。
-- **密钥字段**：`SecretStr` 类型 + 类级 `KEYRING_FIELDS` 映射（字段名 → 环境变量名）。解析链：**init 参数 > 系统密钥环（keyring）> 环境变量 > 项目 .env > 用户暂存文件（UI「设置」写入的 settings.env）> 默认值**；`repr`/序列化自动掩码。完整口径见 `briefdesk/settings_base.py` 的 `KeyringSettingsBase` docstring 与 `briefdesk/secrets_store.py` 的模块说明——漏掉「用户暂存文件」这层会让读者误以为设置页保存的密钥不参与解析。
-- **密钥写入**：`briefdesk secrets set <NAME>`（CLI）或 UI「设置 → 启动配置」面板底部的「密钥（系统钥匙串）」区；**禁止把真实密钥写进 .env 之外的任何仓库文件、日志或示例**。
-- **设置面板**：实现 `settings_schema(self, instance=None, *, running=True)` 并转调 `build_settings_schema(<你的 Settings>, instance, running=running, plugin=self.name, ...)`（参考 rag 插件）——`instance`/`running` 由 `PluginManager` 下发：它在你的 setup 成功后经可选的 `settings_instance()` 钩子取运行实例并登记来源快照，设置页展示的 `current`/`source` 才是「本进程正在用的值」；不实现这两个钩子的旧插件仍可用，只是字段不带运行快照（框架按 `running=False` 展示「无运行值」）。字段类型/默认值/约束/密钥状态由框架统一生成，密钥不回传明文。**文案参数按字段名传**：`labels` / `hints` / `warnings` / `apply_when` 的键是**字段名**（如 `top_k`），只有 `options` 按**环境键名**（如 `LOG_LEVEL`）——按环境键名建前四张字典会恒落空且不报错（字段照常渲染，只是没有你的中文文案）。
+配置继承 `KeyringSettingsBase`，密钥用 `SecretStr` 加 `KEYRING_FIELDS` 声明；解析链与设置页展示共用同一份层定义。
 
-  **运行期才采用配置的插件**（采用时点晚于 setup，如 benchmark 的三个运行参数）应改声明两个可选钩子，而不是 `settings_instance()`：
+- **配置类**：继承 `briefdesk.settings_base.KeyringSettingsBase`（pydantic-settings），用 `model_config` 设 `env_prefix`；字段注释写清对应环境变量与默认值。
+- **密钥字段**：`SecretStr` 类型 + 类级 `KEYRING_FIELDS` 映射（字段名 → 环境变量名）。解析链：**init 参数 > 系统密钥环（keyring）> 环境变量 > 项目 .env > 用户暂存文件（UI「设置」写入的 settings.env）> 默认值**；`repr`/序列化自动掩码。
+  - 完整口径见 `briefdesk/settings_base.py` 的 `KeyringSettingsBase` docstring 与 `briefdesk/secrets_store.py` 的模块说明——漏掉「用户暂存文件」这层会让读者误以为设置页保存的密钥不参与解析。
+- **密钥写入**：`briefdesk secrets set <NAME>`（CLI）或 UI「设置 → 启动配置」面板底部的「密钥（系统钥匙串）」区；**禁止把真实密钥写进 .env 之外的任何仓库文件、日志或示例**。
+
+### 设置面板
+
+实现 `settings_schema(self, instance=None, *, running=True)` 并转调 `build_settings_schema(<你的 Settings>, instance, running=running, plugin=self.name, ...)`（参考 rag 插件）。
+
+- **运行快照**：`instance`/`running` 由 `PluginManager` 下发——它在你的 setup 成功后经可选的 `settings_instance()` 钩子取运行实例并登记来源快照，设置页展示的 `current`/`source` 才是「本进程正在用的值」；不实现这两个钩子的旧插件仍可用，只是字段不带运行快照（框架按 `running=False` 展示「无运行值」）。
+- **字段与文案**：字段类型/默认值/约束/密钥状态由框架统一生成，密钥不回传明文。**文案参数按字段名传**：`labels` / `hints` / `warnings` / `apply_when` 的键是**字段名**（如 `top_k`），只有 `options` 按**环境键名**（如 `LOG_LEVEL`）——按环境键名建前四张字典会恒落空且不报错（字段照常渲染，只是没有你的中文文案）。
+- **运行期才采用配置的插件**（采用时点晚于 setup，如 benchmark 的三个运行参数）应改声明两个可选钩子，而不是 `settings_instance()`：
 
   ```python
   def settings_model(self) -> type[BaseSettings]:
@@ -172,12 +202,19 @@ def _on_items_deleted(self, item_ids: list[str]) -> None:
   ```
 
   manager 会把这些键翻译成环境键并覆盖对应行的 `current`（`source` 下发 `run`），`expected_*` 仍按当前文件解析——于是「本次运行采用」与「下次运行采用」是两个可分辨的答案。没有活动运行时不要给 `current`：拿「按当前文件解析的值」冒充运行值，正是运行中改配置后页面与实际不一致的成因。
-- **必填校验**：`briefdesk.plugin.config_helpers.validate_required_config(settings, {...})` 统一检查必填项（缺失时一次性列出全部环境变量名），在 setup 抛 `PluginDisabledError`。
+
+### 必填校验
+
+`briefdesk.plugin.config_helpers.validate_required_config(settings, {...})` 统一检查必填项（缺失时一次性列出全部环境变量名），在 setup 抛 `PluginDisabledError`。
 
 ## 测试建议
 
+插件测试与仓库现有测试同跑，重点是隔离真实环境与覆盖静态接线。
+
 - **测试位置**：放你自己的包里或随 `tests/` 提交均可；跑法与仓库一致（`python -m pytest tests/`）。
-- **默认用 pytest 风格**：测试类不继承 unittest，直接写 `async def test_x()`（`asyncio_mode = "auto"`，见 `pyproject.toml`）；类名须为 `Test*` 才会被收集。共享夹具从 `tests/conftest.py` 导入：**`memory_db`**（`:memory:` + `init_schema` 的连接，用例结束自动关闭）、**`temp_db`**（真实文件库**路径**，供走 `get_db`/`get_embed_db` 或备份/恢复的用例自建连接）、**`fake_embed_provider`**（可配 enabled 的嵌入 Provider 工厂，调用 `fake_embed_provider(True)` 取实例）。配置隔离用 `patch.object(config, ...)`；模块级单例（`db.get_db`、`stages`、`status`）在用例间需显式复位。
+- **默认用 pytest 风格**：测试类不继承 unittest，直接写 `async def test_x()`（`asyncio_mode = "auto"`，见 `pyproject.toml`）；类名须为 `Test*` 才会被收集。
+- **共享夹具**：从 `tests/conftest.py` 导入 **`memory_db`**（`:memory:` + `init_schema` 的连接，用例结束自动关闭）、**`temp_db`**（真实文件库**路径**，供走 `get_db`/`get_embed_db` 或备份/恢复的用例自建连接）、**`fake_embed_provider`**（可配 enabled 的嵌入 Provider 工厂，调用 `fake_embed_provider(True)` 取实例）。
+- **隔离**：配置隔离用 `patch.object(config, ...)`；模块级单例（`db.get_db`、`stages`、`status`）在用例间需显式复位。
 - **unittest 风格（少量历史用例）**：仓库仍有少数用例继承 `unittest.IsolatedAsyncioTestCase`——这些用例依赖 `assertLogs`/`assertNoLogs` 向目标 logger 挂 handler 并临时改级别的语义，改用 `caplog`（走 root handler + propagation）**不等价**，故刻意保留。新写测试无需沿用此风格。
 - **不触碰真实环境**：不连真实上游、不写真实密钥、不发真实 AI 请求——用 `unittest.mock.AsyncMock` / `httpx.MockTransport` 打桩（参考 `tests/test_source_robustness.py` 的 SSE 真身测试）。
 - **静态守卫**：涉及前端资源或 app.js 接线时，参考 `tests/test_announcements.py::UiWiringTest` 的「读源码断言关键写法」风格补守卫。
