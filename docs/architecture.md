@@ -218,6 +218,8 @@ Cross-module base types: `InternalMessage` dataclass (msg_id, content, sender_na
 
 共享文本净化（纯函数、只依赖标准库 re/unicodedata）：`mask_content` 把手机号/身份证/邮箱/银行卡替换为占位符（幂等），被 `types.py`（InternalMessage 构造即脱敏）、ocr 插件（OCR 文本替换 content 前）与 db（主体时间线查询）调用。正则同时覆盖**全角数字０-９**、**15 位一代身份证**、**+86/86 国家码前缀手机号**（86+11 位，含分隔符写法 `+86 138 0013 8000`）与**全角＠邮箱**。分隔符容错二次扫描 `_SEP_RUN_RE`：捕获「数字 + 半/全角连字符/空格（±前导 +/-）」候选串，按分隔符切段后要求**段数 ≤ 5**（真实 PII 分组至多 5 段）且去分隔符总位数构成已知 PII 形态才整体替换——段数守卫防数字列表/日期范围按总位数撞型的聚合误伤（`12 13 … 19`、`301-302-…-306`）；整段不构成 PII 时再按空白切分逐段判定，空白分隔符以捕获组原样回填（不丢字符、保证幂等）。已脱敏文本（占位符不含数字）天然幂等。
 
+**已知盲区（有意保留）**：其它分隔符写法不在覆盖面内——`+86 (138) 0013-8000`（括号分组）这类写法两个扫描都命中不了。不扩面是有意取舍：分隔符表每多一类（点号/冒号/括号），IP、时间、版本号与普通分组的误伤面就同步增大，现有守卫（`SeparatorAggregationGuardTest` 的日期范围/数字列表/房间号链样本）只锚定了当前分隔符表。脱敏因此只是概率性缓解而非全面保证，文本外发风险按「数据与隐私」口径自行评估。命中面以 `tests/test_masking.py`（`MaskContentTest` / `SeparatorRunEdgeTest` / `MixedSeparatorTest` / `CountryCodePrefixTest`）与 `SeparatorAggregationGuardTest` 的误伤守卫为准。
+
 #### briefdesk/ai_ports.py
 
 AI 供应商端口：ai_provider 插件在 setup 阶段把实例注册到 `ctx.ai` 与本模块（`set_ai`），引擎（classify/dedup/merge）经端口函数 `chat`/`embed_texts`/`is_embedding_enabled`/`embed_model_name` 调用，核心不依赖具体供应商。`rag_chat` 为问答专用端口：模型/端点/Key 以 override 参数由调用方传入（端口不认识 `RAG_` 前缀），供应商未实现时回退复用 `chat` 并**静默丢弃 override**。未注册时 chat/embed 抛 RuntimeError（配置错误明示），`embed_model_name` 回退 config、`is_embedding_enabled` 安全返回 False（引擎/实验离线可用）。`loads_json`（JSON 修复解析）与 `top_k_similar`（余弦 Top-K）为供应商无关工具，亦收于本模块。模块级单例，测试用 `set_ai(None)` 复位。判官类调用额外传 `max_retries=0` 且许可等待纳入 `timeout`：锁内单次判官最坏持有 ≈ 2×45s（排队 + 请求），此前 SDK 默认 2 次重试且排队不计时，最坏可达数分钟。`AIProvider.chat` 的 `max_retries` 为可选参数，第三方供应商可忽略。

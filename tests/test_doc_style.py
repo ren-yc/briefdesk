@@ -167,7 +167,13 @@ def common_lines(lines: list[str], kinds: list[str]) -> set[int]:
 
 
 def closure_state(lines: list[str]) -> tuple[bool, bool]:
-    """返回 (未闭合围栏, 未闭合注释)；注释里的围栏字面量不翻转围栏状态。"""
+    """返回 (未闭合围栏, 未闭合注释)；注释里的围栏字面量不翻转围栏状态。
+
+    注释识别须以「不在围栏内」为前提（与 classify 先注释后围栏的顺序不同，
+    此处围栏内行一律归围栏，围栏内的 <!-- 是代码内容）——否则 ````html
+    示例块内以 <!-- 开头且无 --> 的行会开启注释状态，吞掉后续闭合围栏，
+    误报「未闭合围栏 + 未闭合注释」双未闭合。
+    """
     in_fence: str | None = None
     in_comment = False
     for raw in lines:
@@ -176,7 +182,7 @@ def closure_state(lines: list[str]) -> tuple[bool, bool]:
             if "-->" in line:
                 in_comment = False
             continue
-        if line.lstrip().startswith("<!--"):
+        if in_fence is None and line.lstrip().startswith("<!--"):
             if "-->" not in line:
                 in_comment = True
             continue
@@ -412,6 +418,17 @@ class DocStyleGuardTest(unittest.TestCase):
     def test_clean_sample_passes(self) -> None:
         text = "# 标题\n\n## 目录\n\n- [节](#节)\n\n## 节\n\n一句话结论。\n"
         self.assertEqual(scan_shape(text, "clean")["problems"], [])
+
+    def test_fence_interior_comment_not_misclassified(self) -> None:
+        # 围栏内的 <!-- 是代码内容：不得开启注释状态吞掉闭合围栏，
+        # 否则围栏内以 <!-- 开头且块内无 --> 的合法文档被误报
+        # 「未闭合围栏 + 未闭合注释」双未闭合
+        text = (
+            "# 标题\n\n## 目录\n\n- [节](#节)\n\n## 节\n\n一句话结论。\n\n"
+            "```html\n<!-- 多行注释第一行\n第二行无闭合标记\n```\n\n结尾。\n"
+        )
+        result = scan_shape(text, "fence-comment")
+        self.assertEqual(result["problems"], [])
 
     def test_common_segment_pairing(self) -> None:
         lines = [
