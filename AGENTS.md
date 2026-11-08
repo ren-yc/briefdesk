@@ -44,57 +44,24 @@ powershell -ExecutionPolicy Bypass -File scripts/install-hooks.ps1
 - 类型检查: `python -m mypy briefdesk/ tests/`（tests/ 为签名级检查；函数体深检因测试桩惯用法噪音大暂缓，配置理由见 pyproject `[tool.mypy]` 注释。CI 中 mypy 仅查 `briefdesk/` 包级——tests/ 的签名级检查由本地门禁覆盖，两处口径差异为有意为之）
 - 测试: `python -m pytest tests/`
 - 空白/冲突检查: `git diff --check`
-- 构建与元数据: `python -m build --wheel` + `python -m twine check dist/*`
-  （构建前先清空 `dist/` **与 `build/`**，避免校验到历史 artifact；`build/lib` 是 setuptools
-  的增量暂存目录，只清 `dist/` 时它会用**上一次构建的文件副本**填新 wheel——实测把
-  `vendor/qqflow_sdk/__init__.py` 改名后门禁仍绿，清掉 `build/` 才按预期变红；完整 wheel
-  冒烟——临时 venv 安装、真进程启动、写入隔离——在独立 CI job 跑，本地不跑）
-- sdist 产出与断言: `python scripts/sdist_check.py`
-  （构建到唯一临时目录，断言 sdist 成员集合与 wheel 的运行时资源一一对应、从 sdist
-  重建的 wheel 与直接构建的 wheel 数据成员相同、twine check 通过；不进 pytest——断言
-  依赖真实构建。脚本自带构建与 twine check，不要再单独跑 `python -m build --sdist`）
-- 版本号与试发: `pyproject.toml` 的 `version` 是静态值，索引不允许覆盖同版本——试发用
-  `python scripts/release_check.py`（查 TestPyPI 算下一个空闲 `0.1.0.devN` → 构建期间瞬态写入
-  版本 → 逐字节还原 → `twine check`），加 `--upload` 才真的上传；正式发布才用 `0.1.0`。
-  端到端验证两条安装路径都要跑：`python scripts/wheel_smoke.py --install-from testpypi --version 0.1.0.devN`
-  （索引上的 wheel）与同一条命令加 `--from-sdist`（`--no-binary` 强制 sdist + 本地构建，构建后端
-  先从 PyPI 预装）——pip 对纯 Python 包默认只选 wheel，不强制就永远测不到源码分发那条路，而
-  「sdist 少带运行时资源」只在它上面暴露。正式索引把 `testpypi` 换成 `pypi` 即可。
-  凭据由 twine 从系统钥匙串取（`python -m keyring set https://test.pypi.org/legacy/ __token__`），
-  不进环境变量、不入仓库、不写 `.env`
-- **装 TestPyPI 的包不要用 `--extra-index-url pypi.org` 一把梭**：pip 跨索引取最高版本，
-  实测被 TestPyPI 上别人试传的 `fastapi 1.0`（正式 PyPI 是 0.142.x）影子化、依赖构建失败。
-  冒烟因此改成「依赖走 PyPI、本包走 TestPyPI」两段式，文档与 README/USAGE 同口径。
-  本机的 `release_check.py --upload` 只是试发便利入口；正式发布走下面的 CI workflow
-- **发布走 CI 的 `publish.yml`**（`workflow_dispatch` + environment 审批 + OIDC 可信发布，
-  本机不持有任何上传凭据）：`publish` job 在 **ubuntu** 上跑 `release_check.py`（版本唯一性预检、
-  构建、产物成员断言）再用 `pypa/gh-action-pypi-publish` 上传（带 PEP 740 构建证明）——上传
-  action 是 Docker 容器动作，只在 Linux runner 上能跑；`verify` job 在 **windows** 上按
-  「索引 + 版本」跑两条安装路径的冒烟（主平台 + 进程清理契约），因此不需要在 job 之间传产物。
-  冒烟取索引元数据时会先等该版本挂出来（上传到可见有秒级延迟，立刻失败会把「索引延迟」报成
-  「版本不存在」）。
-  只允许从 `master` 触发；正式索引的版本必须等于 `pyproject.toml` 的静态值（脚本强校验），
-  试发版本（`0.1.0.devN` / `0.1.0rc1`）只在构建期写入并逐字节还原，仓库里永不落地。
-  一次性配置：GitHub environments `testpypi` / `pypi`（后者配 Required reviewers），
-  两个索引各登记 trusted publisher（Owner `ren-yc`、Repository `briefdesk`、Workflow `publish.yml`）
-- **写入路径覆盖分工**（只发 GET 证明不了写入隔离，两侧都要看：冒烟在 CI 的
-  `wheel-smoke` job，隔离回归在 `isolation-smoke` job）：
+- 构建与元数据: `python -m build --wheel` + `python -m twine check dist/*`（构建前先清空 `dist/` **与 `build/`**，避免校验到历史 artifact；`build/lib` 是 setuptools 的增量暂存目录，只清 `dist/` 时它会用**上一次构建的文件副本**填新 wheel——实测把 `vendor/qqflow_sdk/__init__.py` 改名后门禁仍绿，清掉 `build/` 才按预期变红；完整 wheel 冒烟——临时 venv 安装、真进程启动、写入隔离——在独立 CI job 跑，本地不跑）
+- sdist 产出与断言: `python scripts/sdist_check.py`（构建到唯一临时目录，断言 sdist 成员集合与 wheel 的运行时资源一一对应、从 sdist 重建的 wheel 与直接构建的 wheel 数据成员相同、twine check 通过；不进 pytest——断言依赖真实构建。脚本自带构建与 twine check，不要再单独跑 `python -m build --sdist`）
+- 版本号与试发: `pyproject.toml` 的 `version` 是静态值，索引不允许覆盖同版本——试发用 `python scripts/release_check.py`（查 TestPyPI 算下一个空闲 `0.1.0.devN` → 构建期间瞬态写入版本 → 逐字节还原 → `twine check`），加 `--upload` 才真的上传；正式发布才用 `0.1.0`。端到端验证两条安装路径都要跑：`python scripts/wheel_smoke.py --install-from testpypi --version 0.1.0.devN`（索引上的 wheel）与同一条命令加 `--from-sdist`（`--no-binary` 强制 sdist + 本地构建，构建后端先从 PyPI 预装）——pip 对纯 Python 包默认只选 wheel，不强制就永远测不到源码分发那条路，而「sdist 少带运行时资源」只在它上面暴露。正式索引把 `testpypi` 换成 `pypi` 即可。凭据由 twine 从系统钥匙串取（`python -m keyring set https://test.pypi.org/legacy/ __token__`），不进环境变量、不入仓库、不写 `.env`
+- **装 TestPyPI 的包不要用 `--extra-index-url pypi.org` 一把梭**：pip 跨索引取最高版本，实测被 TestPyPI 上别人试传的 `fastapi 1.0`（正式 PyPI 是 0.142.x）影子化、依赖构建失败。冒烟因此改成「依赖走 PyPI、本包走 TestPyPI」两段式，文档与 README/USAGE 同口径。本机的 `release_check.py --upload` 只是试发便利入口；正式发布走下面的 CI workflow
+- **发布走 CI 的 `publish.yml`**（`workflow_dispatch` + environment 审批 + OIDC 可信发布，本机不持有任何上传凭据）：`publish` job 在 **ubuntu** 上跑 `release_check.py`（版本唯一性预检、构建、产物成员断言）再用 `pypa/gh-action-pypi-publish` 上传（带 PEP 740 构建证明）——上传 action 是 Docker 容器动作，只在 Linux runner 上能跑；`verify` job 在 **windows** 上按「索引 + 版本」跑两条安装路径的冒烟（主平台 + 进程清理契约），因此不需要在 job 之间传产物。冒烟取索引元数据时会先等该版本挂出来（上传到可见有秒级延迟，立刻失败会把「索引延迟」报成「版本不存在」）。只允许从 `master` 触发；正式索引的版本必须等于 `pyproject.toml` 的静态值（脚本强校验），试发版本（`0.1.0.devN` / `0.1.0rc1`）只在构建期写入并逐字节还原，仓库里永不落地。一次性配置：GitHub environments `testpypi` / `pypi`（后者配 Required reviewers），两个索引各登记 trusted publisher（Owner `ren-yc`、Repository `briefdesk`、Workflow `publish.yml`）
+- **写入路径覆盖分工**（只发 GET 证明不了写入隔离，两侧都要看：冒烟在 CI 的 `wheel-smoke` job，隔离回归在 `isolation-smoke` job）：
 
-  | 写入路径 | 覆盖位置 |
-  |---|---|
-  | 配置保存（`PUT /api/settings/env`，带与端口一致的同源 `Origin`） | `scripts/wheel_smoke.py` |
-  | Benchmark 用例导出（`store.export_fromweb`，辅助进程直调 + 虚构用例） | 同上 |
-  | 基准执行与报告（`runner --ai-provider stub --source file`） | 同上 |
-  | supervisor 运行目录 / CLI `--out` 默认目录 | 同上（各自单独断言） |
-  | 运行中失败也能收尾（Web 基准故意用不可达端点 + 缓存 run 目录） | 同上 |
-  | 命令与所属进程全部回收（Job / 进程组所有权，含孙进程） | 同上（`scripts/smoke_process.py`；协议单测在 `tests/test_smoke_process.py`） |
-  | 基准终态按 `run_id` 核对（HTTP 失败不得当作「已收尾」） | 同上 |
-  | 子进程对生产库的隔离（真 spawn + 逐表内容摘要不变） | `tests/test_benchmark_isolation.py` |
+- 写入路径：配置保存（`PUT /api/settings/env`，带与端口一致的同源 `Origin`） — 覆盖位置：`scripts/wheel_smoke.py`
+- 写入路径：Benchmark 用例导出（`store.export_fromweb`，辅助进程直调 + 虚构用例） — 覆盖位置：同上
+- 写入路径：基准执行与报告（`runner --ai-provider stub --source file`） — 覆盖位置：同上
+- 写入路径：supervisor 运行目录 / CLI `--out` 默认目录 — 覆盖位置：同上（各自单独断言）
+- 写入路径：运行中失败也能收尾（Web 基准故意用不可达端点 + 缓存 run 目录） — 覆盖位置：同上
+- 写入路径：命令与所属进程全部回收（Job / 进程组所有权，含孙进程） — 覆盖位置：同上（`scripts/smoke_process.py`；协议单测在 `tests/test_smoke_process.py`）
+- 写入路径：基准终态按 `run_id` 核对（HTTP 失败不得当作「已收尾」） — 覆盖位置：同上
+- 写入路径：子进程对生产库的隔离（真 spawn + 逐表内容摘要不变） — 覆盖位置：`tests/test_benchmark_isolation.py`
 
   冒烟跑在全新 venv 与空库上；**本机真实数据下的写入行为不在 CI 覆盖内**。
-- 范围级空白检查（对齐 CI 的空树口径，覆盖全部跟踪文件；上一条只查工作区，
-  对已入库的空白问题失明——rag/config.py 末尾空行曾因此逃逸到 CI 才拦下）:
-  `git diff --check 4b825dc642cb6eb9a060e54bf8d69288fbee4904..HEAD`
+- 范围级空白检查（对齐 CI 的空树口径，覆盖全部跟踪文件；上一条只查工作区，对已入库的空白问题失明——rag/config.py 末尾空行曾因此逃逸到 CI 才拦下）:`git diff --check 4b825dc642cb6eb9a060e54bf8d69288fbee4904..HEAD`
 - 新增功能必须补充或更新对应测试
 - 不要为了“让当前任务快速完成”而跳过上述任何一步；若门禁失败，必须先修复再提交
 

@@ -2,7 +2,7 @@
 
 > 面向普通用户的日常使用手册。开发与架构细节见 `README.md` 与 `docs/architecture.md`。
 
-## 1. 安装与启动
+## 安装与启动
 
 ### 前置条件
 
@@ -43,7 +43,7 @@ pip install fastapi "uvicorn[standard]" httpx aiosqlite pydantic pydantic-settin
 pip 会把两个索引合并后取最高版本，而 TestPyPI 上存在别人试传的同名依赖（实测 `fastapi 1.0` 稳定版
 vs 正式 PyPI 的 `0.142.x`），依赖会被影子化成残缺包、构建直接失败。
 
-## 2. 首次使用（3 步向导）
+## 首次使用向导
 
 首次打开页面会弹出向导（仅当从未完成且未启用任何群聊时）：
 
@@ -67,7 +67,7 @@ vs 正式 PyPI 的 `0.142.x`），依赖会被影子化成残缺包、构建直�
 
 > 未启用任何群聊时，前端空态会给出可操作的下一步提示：「去『群聊筛选』发现会话」/「去设置启用群聊」/「立即同步」，点击即可跳转；未启用会话不会拉取任何消息，这不是故障。
 
-## 3. 日常使用
+## 日常使用
 
 ### 主列表
 
@@ -91,7 +91,7 @@ vs 正式 PyPI 的 `0.142.x`），依赖会被影子化成残缺包、构建直�
 - 手动触发：顶栏 **同步消息** 按钮，或向导中的 **开始同步**。
 - 周期同步：配置 `POLL_INTERVAL_SECONDS > 0` 后自动按间隔补齐 SSE 断连窗口的消息。
 
-## 4. 设置
+## 设置
 
 ### 群聊筛选
 
@@ -114,28 +114,26 @@ vs 正式 PyPI 的 `0.142.x`），依赖会被影子化成残缺包、构建直�
 
 #### 环境变量逐字清单
 
-| 环境变量 | 默认 | 说明 |
-|---|---|---|
-| `PLUGINS` | `[]` | 可选插件（消息源/ocr/benchmark）显式启用列表（JSON 数组，无通配）；核心插件恒装配，亦可在设置页「插件」面板逐个开关 |
-| `POLL_OVERLAP_SECONDS` | `300` | 增量轮询窗口与水位间的重叠秒数（吸收边界秒/时钟偏差/翻页偏移；重叠部分由已处理表去重，无 AI 开销） |
-| `POLL_INTERVAL_SECONDS` | `0`（禁用） | 周期同步间隔（秒）：SSE 断连窗口的消息补齐兜底，>0 时按周期自动触发与「同步消息」同路径的同步（进行中互斥） |
-| `IGNORE_SELF` | `true` | 过滤本账号自己发送的消息（SSE 实时 + REST 回填） |
-| `MAX_CLASSIFY_TOKENS` | `8192` | 单次 AI 分类最大输出 token（触顶截断会破坏 JSON） |
-| `AI_MAX_CONCURRENCY` | `4` | AI 请求最大并发，`0` = 不限制（本地模型建议设 1） |
-| `AI_REASONING_EFFORT` | `auto` | 推理强度：`auto` 不干预 / `off` 尽力关闭思考（发送 `reasoning_effort="none"`，端点明确拒收时自动改为不发送）/ `omit` 永不发送 / `minimal`…`max` 固定强度。DeepSeek 等思考系模型建议 `off`：思考输出挤占 max_tokens 会截断丢批（取值必须全小写） |
-| `AI_JSON_MODE` | `auto` | JSON 严格输出（`response_format=json_object`）：`auto` 启发式（ollama 端点或 deepseek-v4 系列）/ `on` 强制开 / `off` 强制关 |
-| `AI_VISION_ENABLED` | `false` | 视觉模型开关：AI_MODEL 支持图片输入时开启，含图消息将 OCR 文本连同图片一并送入分类（需启用 ocr 插件；端点不支持图片时自动降级纯文本重试并公告提示） |
-| `AI_VISION_MAX_IMAGES` | `4` | 单条消息随分类请求附图上限（1–20；多图超出部分只发 OCR 文本） |
-| `REALTIME_BATCH_MAX_COUNT` / `REALTIME_BATCH_TIMEOUT_MS` | `1` / `180000` | 实时批缓冲（攒够条数 / 超时毫秒触发处理） |
-| `BACKFILL_BATCH_MAX_COUNT` | `10` | 回填时单批 AI 分类的消息条数（默认已由 20 调为 10：批越大 AI 返回 index 漂移的绝对误差面越大） |
-| `IGNORED_EXPIRY_HOURS` | `0`（禁用） | 启动时清理超过该时长的已忽略条目 |
-| `MERGE_WINDOW_MINUTES` / `MERGE_MAX_CANDIDATES` / `MERGE_PREFILTER_THRESHOLD` | `10` / `3` / `-1`（关闭） | 会话内同话题片段合并窗口（分钟）/ 候选上限 / 合并判官余弦预筛门（`-1` 关闭；门限须由余弦-真值数据标定产生，未标定前保持关闭）；`0` = 禁用合并 |
-| `BENCHMARK_PAUSE_PIPELINE` / `BENCHMARK_KEEP_RUNS` / `BENCHMARK_RUN_TIMEOUT_SECONDS` / `BENCHMARK_RUN_STALL_SECONDS` | `true` / `5` / `0`（不限）/ `600` | benchmark 插件专属（需启用 benchmark 插件）：运行期暂停管道 / 保留运行产物数 / 单次运行总时长上限 / 无进展终止阈值 |
-| `EMBED_API_BASE` / `EMBED_MODEL` / `EMBED_API_KEY` | 空（禁用） | 嵌入向量去重：填入嵌入服务地址后启用余弦预筛（留空回退字符重叠预过滤） |
-| `EMBED_BATCH_SIZE` | `20` | 单次嵌入请求的批量条数（历史缓存加载 + 逐批预嵌入共用） |
-| `DEDUP_SIMILARITY_THRESHOLD` / `DEDUP_EMBED_THRESHOLD` / `DEDUP_EMBED_TOP_K` / `DEDUP_EMBED_FALLBACK_THRESHOLD` / `DEDUP_STRONG_THRESHOLD` | `0.07` / `0.80` / `3` / `0.65` / `0.99` | 去重预筛与 AI 判重门禁阈值（`DEDUP_SIMILARITY_THRESHOLD` 为标题 bigram Jaccard 口径，默认值已按该口径重标定；换度量或换数据集后重新标定用 `scripts/recalibrate_similarity.py`） |
-| `LOG_LEVEL` | `INFO` | 日志级别（DEBUG 开逐条细节，并放出 uvicorn 的 HTTP 请求日志——默认静默以免逐请求刷屏） |
-| `DB_PATH` / `SERVER_PORT` | 用户数据目录 `data/briefdesk.sqlite` / `3000` | SQLite 路径 / Web 端口 |
+- 环境变量：`PLUGINS` — 默认：`[]`；说明：可选插件（消息源/ocr/benchmark）显式启用列表（JSON 数组，无通配）；核心插件恒装配，亦可在设置页「插件」面板逐个开关
+- 环境变量：`POLL_OVERLAP_SECONDS` — 默认：`300`；说明：增量轮询窗口与水位间的重叠秒数（吸收边界秒/时钟偏差/翻页偏移；重叠部分由已处理表去重，无 AI 开销）
+- 环境变量：`POLL_INTERVAL_SECONDS` — 默认：`0`（禁用）；说明：周期同步间隔（秒）：SSE 断连窗口的消息补齐兜底，>0 时按周期自动触发与「同步消息」同路径的同步（进行中互斥）
+- 环境变量：`IGNORE_SELF` — 默认：`true`；说明：过滤本账号自己发送的消息（SSE 实时 + REST 回填）
+- 环境变量：`MAX_CLASSIFY_TOKENS` — 默认：`8192`；说明：单次 AI 分类最大输出 token（触顶截断会破坏 JSON）
+- 环境变量：`AI_MAX_CONCURRENCY` — 默认：`4`；说明：AI 请求最大并发，`0` = 不限制（本地模型建议设 1）
+- 环境变量：`AI_REASONING_EFFORT` — 默认：`auto`；说明：推理强度：`auto` 不干预 / `off` 尽力关闭思考（发送 `reasoning_effort="none"`，端点明确拒收时自动改为不发送）/ `omit` 永不发送 / `minimal`…`max` 固定强度。DeepSeek 等思考系模型建议 `off`：思考输出挤占 max_tokens 会截断丢批（取值必须全小写）
+- 环境变量：`AI_JSON_MODE` — 默认：`auto`；说明：JSON 严格输出（`response_format=json_object`）：`auto` 启发式（ollama 端点或 deepseek-v4 系列）/ `on` 强制开 / `off` 强制关
+- 环境变量：`AI_VISION_ENABLED` — 默认：`false`；说明：视觉模型开关：AI_MODEL 支持图片输入时开启，含图消息将 OCR 文本连同图片一并送入分类（需启用 ocr 插件；端点不支持图片时自动降级纯文本重试并公告提示）
+- 环境变量：`AI_VISION_MAX_IMAGES` — 默认：`4`；说明：单条消息随分类请求附图上限（1–20；多图超出部分只发 OCR 文本）
+- 环境变量：`REALTIME_BATCH_MAX_COUNT` / `REALTIME_BATCH_TIMEOUT_MS` — 默认：`1` / `180000`；说明：实时批缓冲（攒够条数 / 超时毫秒触发处理）
+- 环境变量：`BACKFILL_BATCH_MAX_COUNT` — 默认：`10`；说明：回填时单批 AI 分类的消息条数（默认已由 20 调为 10：批越大 AI 返回 index 漂移的绝对误差面越大）
+- 环境变量：`IGNORED_EXPIRY_HOURS` — 默认：`0`（禁用）；说明：启动时清理超过该时长的已忽略条目
+- 环境变量：`MERGE_WINDOW_MINUTES` / `MERGE_MAX_CANDIDATES` / `MERGE_PREFILTER_THRESHOLD` — 默认：`10` / `3` / `-1`（关闭）；说明：会话内同话题片段合并窗口（分钟）/ 候选上限 / 合并判官余弦预筛门（`-1` 关闭；门限须由余弦-真值数据标定产生，未标定前保持关闭）；`0` = 禁用合并
+- 环境变量：`BENCHMARK_PAUSE_PIPELINE` / `BENCHMARK_KEEP_RUNS` / `BENCHMARK_RUN_TIMEOUT_SECONDS` / `BENCHMARK_RUN_STALL_SECONDS` — 默认：`true` / `5` / `0`（不限）/ `600`；说明：benchmark 插件专属（需启用 benchmark 插件）：运行期暂停管道 / 保留运行产物数 / 单次运行总时长上限 / 无进展终止阈值
+- 环境变量：`EMBED_API_BASE` / `EMBED_MODEL` / `EMBED_API_KEY` — 默认：空（禁用）；说明：嵌入向量去重：填入嵌入服务地址后启用余弦预筛（留空回退字符重叠预过滤）
+- 环境变量：`EMBED_BATCH_SIZE` — 默认：`20`；说明：单次嵌入请求的批量条数（历史缓存加载 + 逐批预嵌入共用）
+- 环境变量：`DEDUP_SIMILARITY_THRESHOLD` / `DEDUP_EMBED_THRESHOLD` / `DEDUP_EMBED_TOP_K` / `DEDUP_EMBED_FALLBACK_THRESHOLD` / `DEDUP_STRONG_THRESHOLD` — 默认：`0.07` / `0.80` / `3` / `0.65` / `0.99`；说明：去重预筛与 AI 判重门禁阈值（`DEDUP_SIMILARITY_THRESHOLD` 为标题 bigram Jaccard 口径，默认值已按该口径重标定；换度量或换数据集后重新标定用 `scripts/recalibrate_similarity.py`）
+- 环境变量：`LOG_LEVEL` — 默认：`INFO`；说明：日志级别（DEBUG 开逐条细节，并放出 uvicorn 的 HTTP 请求日志——默认静默以免逐请求刷屏）
+- 环境变量：`DB_PATH` / `SERVER_PORT` — 默认：用户数据目录 `data/briefdesk.sqlite` / `3000`；说明：SQLite 路径 / Web 端口
 
 > 配置说明：`.env` 以项目根目录为基准解析，从任意目录启动（`python main.py` / `python -m briefdesk` / `briefdesk`）都会读到同一份配置；默认数据库落在平台用户数据目录（Windows `%LOCALAPPDATA%\briefdesk\data\briefdesk.sqlite`），可用 `DB_PATH` 覆盖（显式相对路径按当前工作目录解析，`~` 不展开）。
 > `PLUGINS` 未启用任何消息源插件时进入**降级启动**：应用照常运行（UI/设置/向导可用），状态栏明示「无消息源」，消息采集不可用——配置消息源后重启生效。
@@ -158,8 +156,7 @@ vs 正式 PyPI 的 `0.142.x`），依赖会被影子化成残缺包、构建直�
 - `python-multipart`（表单解析）
 - `keyring`（系统密钥环：密钥型配置的第一解析层）
 - `platformdirs`（用户配置目录定位）
-- `python-dateutil`、`typing-extensions`（vendor SDK 生成层 import 期需要；插件装配对每个
-  entry point 无条件 `load()`，缺项时该源被记 `failed` 并打 ERROR，向导/插件面板可见）
+- `python-dateutil`、`typing-extensions`（vendor SDK 生成层 import 期需要；插件装配对每个 entry point 无条件 `load()`，缺项时该源被记 `failed` 并打 ERROR，向导/插件面板可见）
 
 OCR 依赖为**可选**（`pip install -e ".[ocr]"`）：
 
@@ -168,7 +165,7 @@ OCR 依赖为**可选**（`pip install -e ".[ocr]"`）：
 
 未安装 OCR 依赖时，OCR 阶段插件在启动时自禁用（`PluginDisabledError`，非致命），图片消息仍以原文入库展示，仅不做文字识别。
 
-## 5. 插件功能（按需）
+## 插件功能
 
 - **日历**：侧边栏入口，按日期查看带截止时间的卡片；当日浮层可展开详情。
 - **提醒**：卡片 `⋯` 菜单设提醒，到期轮询提示；设置面板有自动提醒开关。
@@ -176,7 +173,7 @@ OCR 依赖为**可选**（`pip install -e ".[ocr]"`）：
 
 > 以上功能由插件提供，未启用时对应入口不显示，不影响核心使用。
 
-## 6. 常见问题
+## 常见问题
 
 **Q: 页面一直显示“无消息源”？**
 A: 未在 `PLUGINS` 中启用任何消息源插件。检查 `.env` 或启动配置中的 `PLUGINS`，并确认对应消息源服务已启动，重试后重启应用。
@@ -193,33 +190,23 @@ A: 上游未提供发送者名时的兜底显示，不影响分类与去重。QQ
 **Q: 视觉分类不工作？**
 A: 需同时满足：`AI_VISION_ENABLED=true`、`ocr` 插件已启用、模型支持图片输入。不满足时自动降级纯文本分类；端点不支持图片会在顶部公告提示。
 
-## 7. 数据与隐私
+## 数据与隐私
 
-- 所有数据存于本地 SQLite，默认落在平台用户数据目录（Windows `%LOCALAPPDATA%\briefdesk\data\briefdesk.sqlite`，
-  可经 `DB_PATH` 覆盖）；消息内容（正文、昵称、群名）经同一套规则脱敏后处理，密钥走系统钥匙串不落明文。
-- **文本脱敏不遮盖图片内容**：开启视觉输入（`AI_VISION_ENABLED`，需 `ocr` 插件）时，消息图片会经归一化后
-  **连同图片像素一并发送给所选模型供应商**——OCR 识别出的文字会被掩码，但图片里的文字、人脸等内容不经过
-  任何脱敏。是否开启视觉输入，请按你与所选供应商之间的数据约定自行决定。
-- 暂存配置（UI「启动配置」）按**字面量**保存：值里写 `${VAR}` 不会被展开、保存时直接拒绝（提示改为写在
-  项目 `.env` 或环境变量层）；跨层引用属项目 `.env`（dotenv 语义）的能力。
-- 配置文件（UI 暂存）在 `%LOCALAPPDATA%\briefdesk\settings.env`；基准用例/报告在 `…\briefdesk\benchmark\`、
-  运行目录在 `…\briefdesk\Cache\benchmark\runs\`（可用 `BRIEFDESK_DATA_DIR` / `BRIEFDESK_CACHE_DIR` /
-  `BRIEFDESK_SETTINGS_FILE` 重定向，这三个变量只读进程环境变量）。
-- **旧版本的数据不会被自动发现或迁移**：默认库路径与配置文件位置都变了，旧位置的文件保持原样、不再被读取；
-  本版本不提供旧库的迁移、导入或兼容转换指引。
-- 导出与备份：`GET /api/export/items`（CSV）、`GET /api/backup`（SQLite 备份下载）、`POST /api/restore`（上传恢复，重启生效）。
-  恢复时原库会保留为 `{DB_PATH}.pre-restore`（只留最近一代，含隐私数据，已在 `.gitignore` 中排除），替换失败会自动回滚并保留待恢复文件。
+- 所有数据存于本地 SQLite，默认落在平台用户数据目录（Windows `%LOCALAPPDATA%\briefdesk\data\briefdesk.sqlite`，可经 `DB_PATH` 覆盖）；消息内容（正文、昵称、群名）经同一套规则脱敏后处理，密钥走系统钥匙串不落明文。
+- **文本脱敏不遮盖图片内容**：开启视觉输入（`AI_VISION_ENABLED`，需 `ocr` 插件）时，消息图片会经归一化后 **连同图片像素一并发送给所选模型供应商**——OCR 识别出的文字会被掩码，但图片里的文字、人脸等内容不经过任何脱敏。是否开启视觉输入，请按你与所选供应商之间的数据约定自行决定。
+- 暂存配置（UI「启动配置」）按**字面量**保存：值里写 `${VAR}` 不会被展开、保存时直接拒绝（提示改为写在项目 `.env` 或环境变量层）；跨层引用属项目 `.env`（dotenv 语义）的能力。
+- 配置文件（UI 暂存）在 `%LOCALAPPDATA%\briefdesk\settings.env`；基准用例/报告在 `…\briefdesk\benchmark\`、运行目录在 `…\briefdesk\Cache\benchmark\runs\`（可用 `BRIEFDESK_DATA_DIR` / `BRIEFDESK_CACHE_DIR` /`BRIEFDESK_SETTINGS_FILE` 重定向，这三个变量只读进程环境变量）。
+- **旧版本的数据不会被自动发现或迁移**：默认库路径与配置文件位置都变了，旧位置的文件保持原样、不再被读取；本版本不提供旧库的迁移、导入或兼容转换指引。
+- 导出与备份：`GET /api/export/items`（CSV）、`GET /api/backup`（SQLite 备份下载）、`POST /api/restore`（上传恢复，重启生效）。恢复时原库会保留为 `{DB_PATH}.pre-restore`（只留最近一代，含隐私数据，已在 `.gitignore` 中排除），替换失败会自动回滚并保留待恢复文件。
 
 ### 数据与配置文件位置
 
 运行期可写的东西都在平台用户目录，安装目录只放代码与只读资源：
 
-| 内容 | 位置（Windows） | 覆盖入口 |
-|---|---|---|
-| SQLite 数据库 | `%LOCALAPPDATA%\briefdesk\data\briefdesk.sqlite` | `DB_PATH` |
-| UI 暂存配置 | `%LOCALAPPDATA%\briefdesk\settings.env` | `BRIEFDESK_SETTINGS_FILE` |
-| 基准用例与报告 | `%LOCALAPPDATA%\briefdesk\benchmark\{cases,reports}\` | `BRIEFDESK_DATA_DIR` |
-| 基准运行目录 | `%LOCALAPPDATA%\briefdesk\Cache\benchmark\runs\` | `BRIEFDESK_CACHE_DIR` |
+- 内容：SQLite 数据库 — 位置（Windows）：`%LOCALAPPDATA%\briefdesk\data\briefdesk.sqlite`；覆盖入口：`DB_PATH`
+- 内容：UI 暂存配置 — 位置（Windows）：`%LOCALAPPDATA%\briefdesk\settings.env`；覆盖入口：`BRIEFDESK_SETTINGS_FILE`
+- 内容：基准用例与报告 — 位置（Windows）：`%LOCALAPPDATA%\briefdesk\benchmark\{cases,reports}\`；覆盖入口：`BRIEFDESK_DATA_DIR`
+- 内容：基准运行目录 — 位置（Windows）：`%LOCALAPPDATA%\briefdesk\Cache\benchmark\runs\`；覆盖入口：`BRIEFDESK_CACHE_DIR`
 
 `BRIEFDESK_DATA_DIR` / `BRIEFDESK_CACHE_DIR` / `BRIEFDESK_SETTINGS_FILE` **只读进程环境变量**
 （写进 `.env` 无效）；macOS / Linux 走各自平台约定目录（platformdirs）。
