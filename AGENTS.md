@@ -4,6 +4,8 @@ This file provides guidance to AI coding agents when working with code in this r
 
 ## Commands
 
+本仓常用命令集中在下面一段代码块：安装、运行、检查与提交前门禁按顺序执行即可。
+
 ```bash
 # Install dependencies (editable mode)
 pip install -e .
@@ -38,17 +40,34 @@ powershell -ExecutionPolicy Bypass -File scripts/install-hooks.ps1
 
 ## AI 协作规范（所有开发助手必须遵守）
 
+本节的门禁、编码、注释与提交信息规则是每次提交前的共同口径。
+
 ### 提交前质量门禁
 
 - Lint: `python -m ruff check briefdesk/ tests/`
 - 类型检查: `python -m mypy briefdesk/ tests/`（tests/ 为签名级检查；函数体深检因测试桩惯用法噪音大暂缓，配置理由见 pyproject `[tool.mypy]` 注释。CI 中 mypy 仅查 `briefdesk/` 包级——tests/ 的签名级检查由本地门禁覆盖，两处口径差异为有意为之）
 - 测试: `python -m pytest tests/`
 - 空白/冲突检查: `git diff --check`
-- 构建与元数据: `python -m build --wheel` + `python -m twine check dist/*`（构建前先清空 `dist/` **与 `build/`**，避免校验到历史 artifact；`build/lib` 是 setuptools 的增量暂存目录，只清 `dist/` 时它会用**上一次构建的文件副本**填新 wheel——实测把 `vendor/qqflow_sdk/__init__.py` 改名后门禁仍绿，清掉 `build/` 才按预期变红；完整 wheel 冒烟——临时 venv 安装、真进程启动、写入隔离——在独立 CI job 跑，本地不跑）
+- 构建与元数据：
+  - 命令：`python -m build --wheel` + `python -m twine check dist/*`。
+  - 构建前先清空 `dist/` **与 `build/`**，避免校验到历史 artifact；`build/lib` 是 setuptools 的增量暂存目录，只清 `dist/` 时它会用**上一次构建的文件副本**填新 wheel，把 `vendor/qqflow_sdk/__init__.py` 改名后门禁仍绿就是这个原因，清掉 `build/` 才按预期变红。
+  - 完整 wheel 冒烟（临时 venv 安装、真进程启动、写入隔离）在独立 CI job 跑，本地不跑。
 - sdist 产出与断言: `python scripts/sdist_check.py`（构建到唯一临时目录，断言 sdist 成员集合与 wheel 的运行时资源一一对应、从 sdist 重建的 wheel 与直接构建的 wheel 数据成员相同、twine check 通过；不进 pytest——断言依赖真实构建。脚本自带构建与 twine check，不要再单独跑 `python -m build --sdist`）
-- 版本号与试发: `pyproject.toml` 的 `version` 是静态值，索引不允许覆盖同版本——试发用 `python scripts/release_check.py`（查 TestPyPI 算下一个空闲 `0.1.0.devN` → 构建期间瞬态写入版本 → 逐字节还原 → `twine check`），加 `--upload` 才真的上传；正式发布才用 `0.1.0`。端到端验证两条安装路径都要跑：`python scripts/wheel_smoke.py --install-from testpypi --version 0.1.0.devN`（索引上的 wheel）与同一条命令加 `--from-sdist`（`--no-binary` 强制 sdist + 本地构建，构建后端先从 PyPI 预装）——pip 对纯 Python 包默认只选 wheel，不强制就永远测不到源码分发那条路，而「sdist 少带运行时资源」只在它上面暴露。正式索引把 `testpypi` 换成 `pypi` 即可。凭据由 twine 从系统钥匙串取（`python -m keyring set https://test.pypi.org/legacy/ __token__`），不进环境变量、不入仓库、不写 `.env`
-- **装 TestPyPI 的包不要用 `--extra-index-url pypi.org` 一把梭**：pip 跨索引取最高版本，实测被 TestPyPI 上别人试传的 `fastapi 1.0`（正式 PyPI 是 0.142.x）影子化、依赖构建失败。冒烟因此改成「依赖走 PyPI、本包走 TestPyPI」两段式，文档与 README/USAGE 同口径。本机的 `release_check.py --upload` 只是试发便利入口；正式发布走下面的 CI workflow
-- **发布走 CI 的 `publish.yml`**（`workflow_dispatch` + environment 审批 + OIDC 可信发布，本机不持有任何上传凭据）：`publish` job 在 **ubuntu** 上跑 `release_check.py`（版本唯一性预检、构建、产物成员断言）再用 `pypa/gh-action-pypi-publish` 上传（带 PEP 740 构建证明）——上传 action 是 Docker 容器动作，只在 Linux runner 上能跑；`verify` job 在 **windows** 上按「索引 + 版本」跑两条安装路径的冒烟（主平台 + 进程清理契约），因此不需要在 job 之间传产物。冒烟取索引元数据时会先等该版本挂出来（上传到可见有秒级延迟，立刻失败会把「索引延迟」报成「版本不存在」）。只允许从 `master` 触发；正式索引的版本必须等于 `pyproject.toml` 的静态值（脚本强校验），试发版本（`0.1.0.devN` / `0.1.0rc1`）只在构建期写入并逐字节还原，仓库里永不落地。一次性配置：GitHub environments `testpypi` / `pypi`（后者配 Required reviewers），两个索引各登记 trusted publisher（Owner `ren-yc`、Repository `briefdesk`、Workflow `publish.yml`）
+- 版本号与试发：
+  - `pyproject.toml` 的 `version` 是静态值，索引不允许覆盖同版本——试发用 `python scripts/release_check.py`（查 TestPyPI 算下一个空闲 `0.1.0.devN` → 构建期间瞬态写入版本 → 逐字节还原 → `twine check`），加 `--upload` 才真的上传；正式发布才用 `0.1.0`。
+  - 端到端验证两条安装路径都要跑：`python scripts/wheel_smoke.py --install-from testpypi --version 0.1.0.devN`（索引上的 wheel）与同一条命令加 `--from-sdist`（`--no-binary` 强制 sdist + 本地构建，构建后端先从 PyPI 预装）。
+  - 原因：pip 对纯 Python 包默认只选 wheel，不强制就永远测不到源码分发那条路，而「sdist 少带运行时资源」只在它上面暴露；正式索引把 `testpypi` 换成 `pypi` 即可。
+  - 凭据由 twine 从系统钥匙串取（`python -m keyring set https://test.pypi.org/legacy/ __token__`），不进环境变量、不入仓库、不写 `.env`。
+- **装 TestPyPI 的包不要用 `--extra-index-url pypi.org` 一把梭**：
+  - pip 跨索引取最高版本，会被 TestPyPI 上别人试传的 `fastapi 1.0`（正式 PyPI 是 0.142.x）影子化、依赖构建失败。
+  - 冒烟因此改成「依赖走 PyPI、本包走 TestPyPI」两段式，文档与 README/USAGE 同口径；本机的 `release_check.py --upload` 只是试发便利入口，正式发布走下面的 CI workflow。
+- **发布走 CI 的 `publish.yml`**：
+  - 触发与凭据：`workflow_dispatch` + environment 审批 + OIDC 可信发布，本机不持有任何上传凭据。
+  - `publish` job 在 **ubuntu** 上跑 `release_check.py`（版本唯一性预检、构建、产物成员断言）再用 `pypa/gh-action-pypi-publish` 上传（带 PEP 740 构建证明）——上传 action 是 Docker 容器动作，只在 Linux runner 上能跑。
+  - `verify` job 在 **windows** 上按「索引 + 版本」跑两条安装路径的冒烟（主平台 + 进程清理契约），因此不需要在 job 之间传产物。
+  - 冒烟取索引元数据时会先等该版本挂出来（上传到可见有秒级延迟，立刻失败会把「索引延迟」报成「版本不存在」）。
+  - 只允许从 `master` 触发；正式索引的版本必须等于 `pyproject.toml` 的静态值（脚本强校验），试发版本（`0.1.0.devN` / `0.1.0rc1`）只在构建期写入并逐字节还原，仓库里永不落地。
+  - 一次性配置：GitHub environments `testpypi` / `pypi`（后者配 Required reviewers），两个索引各登记 trusted publisher（Owner `ren-yc`、Repository `briefdesk`、Workflow `publish.yml`）。
 - **写入路径覆盖分工**（只发 GET 证明不了写入隔离，两侧都要看：冒烟在 CI 的 `wheel-smoke` job，隔离回归在 `isolation-smoke` job）：
 
 - 写入路径：配置保存（`PUT /api/settings/env`，带与端口一致的同源 `Origin`） — 覆盖位置：`scripts/wheel_smoke.py`
@@ -70,7 +89,7 @@ powershell -ExecutionPolicy Bypass -File scripts/install-hooks.ps1
 - 该文件是 `pyproject.toml` 的 `[dev,ocr]` **依赖闭包**，由 `pip-compile` 生成，**不是** `pip freeze` 的整环境快照。重新生成用文件头部记录的那条命令。
 - 不用 `pip freeze`：整环境快照会把项目从不 import 的包一并钉死（曾因此钉入 yank 版本的 `polars` 与整套 ML 栈），任何无关包的 yank 或平台轮子缺失都会弄红 CI。
 - 升级依赖：`pip-compile --upgrade`（全量）或 `-P <包名>`（单包），随后必须在本地重跑全部门禁；不加 `--upgrade` 时既有 pin 会被复用，仅做闭包收敛。
-- 该文件只服务 CI 的可复现安装，不参与任何测试断言；修改后应在干净虚拟环境中实测 `pip install -r requirements-dev.txt` + `pip install -e . --no-deps` 后跑一遍 pytest，确认闭包足够。
+- 该文件只服务 CI 的可复现安装，不参与任何测试断言；修改后应在干净虚拟环境中执行 `pip install -r requirements-dev.txt` + `pip install -e . --no-deps`，再跑一遍 pytest，确认闭包足够。
 - 锁文件应以 **requires-python 下限（3.12）** 解析生成：CI 矩阵含 3.12/3.13/3.14 安装同一份锁文件，用高版本解析可能引入 `Requires-Python` 排除低版本的 pin（失败模式：低版本 CI 解析锁文件即失败）。当前文件即由 3.12 生成——以文件头部那行 `pip-compile with Python …` 为准，重生成时不要换高版本解释器。
 
 ### 临时文件清理
@@ -97,7 +116,8 @@ powershell -ExecutionPolicy Bypass -File scripts/install-hooks.ps1
 ### 注释、文档与提交信息规范（禁止编号引用）
 
 - **禁止编号引用**：代码注释、docstring、测试的文档串、仓库文档与提交信息中，不得写入指向仓库之外一次性材料的条目号。典型形态：
-  - 审查报告 / 计划的条目码（形如「字母码 + 数字」或「数字 + 字母码」，或「中文方括号 + 序号 + 条目码」；同一条目拆子项时的「字母码 + 数字 + 小写字母」也算）。数字在前的形态只在「见 / 决策 / 条目 / 序号 / 表」一类指针词邻近时判定——孤立的「数字+字母」与 3D、5G、2FA 这类技术名词同形，按形状硬判会把正常注释一起拦下；
+  - 审查报告 / 计划的条目码（形如「字母码 + 数字」或「数字 + 字母码」，或「中文方括号 + 序号 + 条目码」；同一条目拆子项时的「字母码 + 数字 + 小写字母」也算）。
+  - 数字在前的形态只在「见 / 决策 / 条目 / 序号 / 表」一类指针词邻近时判定——孤立的「数字+字母」与 3D、5G、2FA 这类技术名词同形，按形状硬判会把正常注释一起拦下；
   - 用「复核 / 审查报告 / 审计 / 排期 / 决策」等词做归因、后面跟一个编号（含带圈数字）；后面跟中文量词（「复核 3 处」「决策 3 项」）属于自然行文，不算；
   - 裸归因短语（「审查」紧接「修复 / 回归」且处在标签位——后随冒号、括号、编号或行尾）；
   - 章节指针（`§N` / `§N.M`——仓库内没有带章节号的文档，出现即指向仓外）；
@@ -113,19 +133,29 @@ powershell -ExecutionPolicy Bypass -File scripts/install-hooks.ps1
         连接带未提交事务被归还（回归见 tests/test_db.py 的 atomic_transaction 用例）
   ```
 
-- **豁免**（不视为编号引用）：可跟踪的 issue / PR 编号（如 `Fixes #123`，便于外部读者回查）、编码名与标准编号（UTF-8、RFC 5987）、公开标准的章节号（如 RFC 5987 的 3.2 节——与标准编号同属可回查引用，但孤立章节指针不豁免）、静态检查码（`noqa: F401` 一类）、依赖版本号（小写 `v1.2.3`）、控制字符名（C0 / C1）、领域指标名（如 F 值类指标）、与条目码同形但后缀字母表封闭的量纲（容量单位 MB/GB、千次记法 K、HTTP 状态类通配 1XX）、十六进制颜色字面量（要求含 A-F，纯数字的 `#` 编号照常判定）、少量固定技术缩写（ES6、MD5、延迟分位等，名单见 `scripts/forbidden_refs.py` 的 `_EXEMPT`）。豁免是**剥离片段后再扫**：同一行夹带的其它编号照常判定。JS 代码行末尾的 `//` 注释与整行注释同口径。提交信息只扫真正入库的部分（`#` 注释行与 `git commit -v` 的 diff 不算）。
+- **豁免**（不视为编号引用）：
+  - 可跟踪的 issue / PR 编号（如 `Fixes #123`，便于外部读者回查）、编码名与标准编号（UTF-8、RFC 5987）、公开标准的章节号（如 RFC 5987 的 3.2 节——与标准编号同属可回查引用，但孤立章节指针不豁免）、静态检查码（`noqa: F401` 一类）。
+  - 依赖版本号（小写 `v1.2.3`）、控制字符名（C0 / C1）、领域指标名（如 F 值类指标）。
+  - 与条目码同形但后缀字母表封闭的量纲（容量单位 MB/GB、千次记法 K、HTTP 状态类通配 1XX）、十六进制颜色字面量（要求含 A-F，纯数字的 `#` 编号照常判定）、少量固定技术缩写（ES6、MD5、延迟分位等，名单见 `scripts/forbidden_refs.py` 的 `_EXEMPT`）。
+  - 豁免是**剥离片段后再扫**：同一行夹带的其它编号照常判定。JS 代码行末尾的 `//` 注释与整行注释同口径。提交信息只扫真正入库的部分（`#` 注释行与 `git commit -v` 的 diff 不算）。
 - **例外**：确实需要在注释里保留某个编号时，在同一行写 `allow-plan-ref` 并说明理由。
 - **扫描面**（决定「漏写会不会被拦」，改动本节时须同步 `iter_segments`）：
-  - **在面内**：`.py .js .mjs .md .yml .yaml .toml .ps1 .sh .css .html .example` 的注释与文档正文，以及提交信息（subject + body，`#` 注释行与 scissors 之后的 diff 不算）。JS 走逐字符状态机，整行注释、行尾注释、块注释一并收，字符串与模板串里的 `//` `/*` 不算注释起点；CSS 的 `/* */` 与 HTML 的 `<!-- -->` 块注释同口径。Python 的采集面是**所有**字符串表达式语句——不止各节点首位的 docstring，类体中部的说明串同样入扫。`.example` 模板（`.env.example`）按 `#` 行注释扫。
+  - **在面内**：`.py .js .mjs .md .yml .yaml .toml .ps1 .sh .css .html .example` 的注释与文档正文，以及提交信息（subject + body，`#` 注释行与 scissors 之后的 diff 不算）。
+  - JS 走逐字符状态机，整行注释、行尾注释、块注释一并收，字符串与模板串里的 `//` `/*` 不算注释起点；CSS 的 `/* */` 与 HTML 的 `<!-- -->` 块注释同口径。
+  - Python 的采集面是**所有**字符串表达式语句——不止各节点首位的 docstring，类体中部的说明串同样入扫。`.example` 模板（`.env.example`）按 `#` 行注释扫。
   - **不在面内**：无此类片段的文件（`.svg .json` 等；`.svg` 全是上游图标库的逐字节副本，有意不纳面）——扫描器对它们返回空片段。往这些文件写注释时不享受门禁兜底，需人工复核。
   - **「点名的 `.md` 必须存在」只在全量扫描生效**（`--tree` 与 pytest 守卫）：增量模式手里没有稳定的树快照，当场判「不存在」会误伤同时新增的文件。写注释时若要指向仓内文档，用真实存在的路径。
   - `_EXEMPT` 白名单按**实际命中**增补（当前含少量仓库内暂未出现的防御项）；新增条目要写明它为什么与条目码同形却不是编号。
 - **工具与门禁**：
   - 本地提交：`scripts/install-hooks.ps1` 安装的 pre-commit（密钥 + 编号）与 commit-msg（提交信息）钩子；
   - 命令行：`python scripts/forbidden_refs.py`（扫描 staged）、`--ref origin/master`（扫描差异）、`--tree`（全量）、`--message-file <路径>`（提交信息）。退出码：0 = 无命中、1 = 命中、**2 = 扫描未执行（git 取差异失败，拒绝放行——空 diff 不等于干净）**；
-  - CI 侧统一入口：`python scripts/ci_scan.py`（读 `GITHUB_EVENT_NAME` / `GITHUB_EVENT_PATH`，范围只认事件载荷里的固定 SHA：PR 用 `base.sha`/`head.sha` 的 merge-base 到事件 head，push 用 `before`/`after`）。非零 `before` 本地缺失时先精确 fetch 该 SHA，仍取不到返回 2 阻断；全零 `before` 是首次推送的已知空边界（空树 → after，提交集合取全部祖先）；`before == after` 是合法空范围；删除分支事件明确无操作。
-  - 两个扫描器另有成对的双端参数：`python scripts/secret_scan.py --base <commit|空树> --head <commit>`、`python scripts/forbidden_refs.py --base ... --head ...`（直接比较两端树，不构造三点范围）、`python scripts/forbidden_refs.py --commits [--base ...] --head ...`（提交信息集合 = reachable 差集；无 `--base` 时取 head 全部祖先）。任一环节读取失败一律退出 2。
-  - 门禁：`tests/test_no_plan_refs.py` 随 pytest 一起跑，对全库注释 / 文档 **0 容忍**（存量已清理完毕），并覆盖本地领先 `origin/master` 的提交信息（无基线时 skip）；`tests/test_ci_scan.py` 用临时仓库构造真实 DAG 覆盖事件范围与退出码承诺；CI 的扫描步骤已合并为一次 `ci_scan` 调用，覆盖直接推 master 的路径。
+  - CI 侧统一入口：`python scripts/ci_scan.py`（读 `GITHUB_EVENT_NAME` / `GITHUB_EVENT_PATH`，范围只认事件载荷里的固定 SHA：PR 用 `base.sha`/`head.sha` 的 merge-base 到事件 head，push 用 `before`/`after`）。
+  - 非零 `before` 本地缺失时先精确 fetch 该 SHA，仍取不到返回 2 阻断；全零 `before` 是首次推送的已知空边界（空树 → after，提交集合取全部祖先）；`before == after` 是合法空范围；删除分支事件明确无操作。
+  - 两个扫描器另有成对的双端参数：`python scripts/secret_scan.py --base <commit|空树> --head <commit>`、`python scripts/forbidden_refs.py --base ... --head ...`（直接比较两端树，不构造三点范围）。
+  - `python scripts/forbidden_refs.py --commits [--base ...] --head ...`：提交信息集合 = reachable 差集；无 `--base` 时取 head 全部祖先。
+  - 任一环节读取失败一律退出 2。
+  - 门禁：`tests/test_no_plan_refs.py` 随 pytest 一起跑，对全库注释 / 文档 **0 容忍**（存量已清理完毕），并覆盖本地领先 `origin/master` 的提交信息（无基线时 skip）；`tests/test_ci_scan.py` 用临时仓库构造真实 DAG 覆盖事件范围与退出码承诺。
+  - CI 的扫描步骤已合并为一次 `ci_scan` 调用，覆盖直接推 master 的路径。
 
 ### 隐私与敏感数据扫描
 
@@ -172,6 +202,39 @@ powershell -ExecutionPolicy Bypass -File scripts/install-hooks.ps1
   ```
 - commit message 应概括改动文件、行为变化与测试/文档更新；不要写入真实密钥、Token 或敏感信息。
 - commit message（subject 与 body）不得包含编号引用与流水号批次（详见上文「注释、文档与提交信息规范」）；用行为变化描述代替。
+
+### 文档排版规范
+
+改写仓库文档时按下列规则收口：让读者按文档目的找到结论，而不是在段落里翻找机制。
+
+#### 换行
+
+- **懒换行**：中文散文一个段落只占一个物理行，交给渲染器折行；一段只讲一个论点。理由：段内硬折行渲染后会变成词中空格，中文尤其明显。
+- **折点禁令**：散文段内禁止「行尾汉字、下一行以汉字或全角开括号开头」的换行；句末标点后换行不算折点，确需折行只允许落在 ASCII 空格、行内代码或链接边界。理由：这类折点会把两个汉字粘成错词，由文档守卫拦截。
+
+#### 结构
+
+- **一文档一目的**：按文档分工归位，与所在文件目的不符的段落搬走或删掉。理由：一份文档承载多个目的时，读者不知道该从哪一段找结论。
+- **结论先行**：每个 `##` 节首行是一句话结论；机制与理由最多一句，展开去 `docs/architecture.md` 或源码注释。理由：先给结论，读者不必读完整节才知道要不要继续看。
+- **段落**：一段一个论点、中心句在段首；一句一个想法；不强求字数硬上限，以读起来不冗长为准。理由：字数硬阈值会把必要的机制说明拦成碎片。
+- **列表**：一个 bullet 一个主题，装不下就升级为小节；步骤用编号列表、前置条件写在步骤之前；三项以上并列用列表，不用 ①②③ 分号链。理由：分号链把并列项塞进一句，读者无法逐项核对。
+- **表格**：表格是索引不是内容容器；单元格不留空（用「—」）；六十显示列以内作人工复核软口径，超宽内容转成表下一行短摘要加注解列表。理由：超宽单元格把正文塞进格子，既难读又难以逐字比对。
+- **目录**：长文档必须有锚点目录且覆盖全部 `##` 节；`docs/architecture.md` 与 `docs/plugin-dev.md` 保持。理由：长文档没有目录时，读者只能靠全文搜索定位小节。
+- **标题**：用名词短语、末尾不加点号；去掉序号式标题。理由：序号式标题一改顺序就要同步全部入链与锚点；端点标题模板不适用于本仓。
+
+#### 行文
+
+- **代码块**：标注语言；命令可粘贴执行，占位符用 `<your-api-key>` 一类尖括号形态并在首现处说明替换方法；不写伪代码。理由：不可粘贴的命令会把读者卡在第一步。
+- **告警块**：`> [!NOTE]` 系标记每节至多一个、一到两句；机制分析不进告警块；真正引用上游原文保持裸 `>`。理由：告警块堆叠会把正文的注意力冲散。
+- **链接**：链接文字用目标标题原文；同一文档同一目标只链一次；不用「点击这里 / 见本文其它部分」。理由：含糊的链接文字让读者无法预判点开的是哪一份文档。
+- **术语首现**：首次出现的中文名称后附英文与代码形态，此后用短名。理由：首现不交代代码形态，读者无法把文档术语对上源码标识符。
+- **示例与占位符**：`<your-api-key>`、`<token>`、`<db_path>` 一类形态；不出现真实 ID / 路径 / 密钥样值。理由：真实样值一旦入库就无法确认是否已脱敏。
+- **中英混排与标点**：汉字与英文、数字间留一个空格；散文用全角标点、代码上下文用半角；句末括号加注时句号在括号外；标题末尾无点号；不用一逗到底。理由：混排不留空格会让渲染后的词边界不可辨认。
+- **加粗与简洁纪律**：加粗仅用于术语定义、警告锚点、小节结论句；删带具体计数、耗时或个人账号归属的经验性措辞与「需要注意的是 / 换句话说 / 事实上」；量级用「大库 / 小库」定性词；一段至多一处破折号补语、一句话至多一对括号且不嵌套。理由：加粗泛滥等于没有重点，具体计数会让文档随数据变化过期。
+- **实证纪律**：行为断言带可搜索的回归位置（测试函数名 / 快照名 / 用例 id）；「见相关测试」不合格；回归位置只进 `docs/architecture.md` 与源码注释，不进门面与使用指南。理由：没有回归位置的断言在改动后无法核对是否仍然成立。
+- **提交信息**：按 Conventional Commits（英文 type/scope + 中文 subject）写行为变化，不写编号引用、不写流水号批次。理由：提交信息是仓库内可回查的变更记录，编号指向仓外会让读者无法还原上下文。
+
+本节与「注释、文档与提交信息规范」「架构指引」的同步义务同时生效：排版规则管写法，编号引用扫描管可回查性，架构事实仍以 `docs/architecture.md` 为单一来源。
 
 ## 架构指引
 
