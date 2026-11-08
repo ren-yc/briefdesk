@@ -121,6 +121,53 @@ weflow-server :5033        WeFlow(legacy) :5031        qqflow-server :5032
 | `briefdesk/plugin/config_helpers.py` | 插件配置验证助手：`validate_required_config(settings, {字段名: 环境变量名})` 统一必填项检查——SecretStr 自动解包、非 str 标量（如 property 返回的 dict）按真值判定，缺失任一项抛 `PluginDisabledError` 一次性列出**全部**缺失环境变量名（weflow/weflow-legacy/qqflow 三个源插件 setup 共用；调用方应把所有必填项放进同一次调用以聚合报错，勿拆成多次）。 |
 | `briefdesk/plugin/manager.py` | `PluginManager`：发现/过滤/拓扑排序/生命周期编排（setup → activate → teardown）/失败隔离/`infos()`。详见下方「插件框架」。 |
 
+```
+briefdesk/
+├── main.py                 # 入口 shim，转发至 briefdesk/main.py（DB → 插件装配（含源注册/去重缓存预热）→ HTTP 服务器 → 插件激活 + 源监听启动 → 首轮回填）
+├── .env.example            # 环境配置模板（复制为 .env 后填写）
+├── .env                    # 密钥配置（本地生成，不入库）
+├── briefdesk/
+│   ├── __main__.py         # python -m briefdesk 入口
+│   ├── config.py           # pydantic Settings 读 .env（.env 与默认 DB 路径以项目根目录为基准）
+│   ├── logger.py           # 日志配置（格式/级别/uvicorn 统一）
+│   ├── masking.py          # 消息内容脱敏（mask_content）
+│   ├── events.py           # 内部事件总线（核心 ↔ 插件解耦）
+│   ├── plugin/             # 插件框架：Plugin 协议 + PluginManager（entry points / PLUGIN_PATH 发现）
+│   │   ├── base.py             # Plugin 协议、PluginContext、加载约定
+│   │   └── manager.py          # 发现、过滤、拓扑排序、生命周期编排
+│   ├── db.py               # aiosqlite 数据库操作（主连接 + 向量连接，WAL + 外键）
+│   ├── pipeline.py         # 管道骨架（入口统一过滤 → 并行 enrich/classify → 锁内 dedup/跳过标记/post_insert → 通知）
+│   ├── poll_cycle.py       # 轮询周期业务编排（按会话增量窗口）
+│   ├── realtime.py         # 进程内发布/订阅（前端 SSE）
+│   ├── status.py           # 运行时状态 + 消息源注册表（/api/status 数据源）
+│   ├── sync.py             # 同步服务（trigger_sync：启动首轮回填与 /api/sync 共用）
+│   ├── stages.py           # 管道阶段注册表（槽位 enrich → classify → dedup → post_insert）
+│   ├── ai_ports.py         # AI 供应商端口（引擎经端口函数调用，核心不依赖具体供应商）
+│   ├── sources_base.py     # 消息源核心契约（SourceClient / RealtimeListener / SourceRuntime）
+│   ├── types.py            # 跨模块基础类型（含管道跨插件契约）
+│   ├── server/             # FastAPI 服务子包（app/中间件/核心路由/类别路由/设置与环境键路由/媒体代理/静态托管/插件注入/回调）
+│   └── plugins/            # 内置插件（消息源 + AI 供应商 + 管道阶段 + Web 插件）
+│       ├── weflow/             # weflow 消息源（微信 4.x，weflow-server :5033；同构六文件分层；API 契约见上游文档）
+│       ├── weflow_legacy/      # WeFlow Legacy 消息源（plugin.py + client/config/normalize/poller/runtime/sse）
+│       ├── qqflow/             # qqflow 消息源（plugin.py + 同构六文件分层；API 契约见上游文档）
+│       ├── ai_provider/        # AI 供应商插件（plugin.py 注册端口 / engine.py OpenAI 兼容 chat + 嵌入）
+│       ├── ocr/                # OCR 阶段插件（plugin.py 槽位 enrich / engine.py RapidOCR；依赖可选，未安装时自禁用）
+│       ├── classify/           # AI 分类阶段插件（plugin.py 槽位 classify / engine.py 提示词与解析）
+│       ├── dedup/              # 语义去重阶段插件（plugin.py 槽位 dedup / engine.py DedupEngine）
+│       ├── merge/              # 同话题合并阶段插件（plugin.py 槽位 post_insert / engine.py 判官）
+│       ├── calendar/           # 日历 Web 插件（plugin.py + router.py + db.py：/api/calendar；ui/ 含完整前端）
+│       ├── reminders/          # 提醒 Web 插件（plugin.py + router.py：提醒设置 + 到期轮询；ui/ 含完整前端）
+│       ├── rag/                # 检索问答 Web 插件（plugin.py + router.py + db.py + engine.py + prompts.py；ui/ 含完整前端）
+│       └── benchmark/           # 实验基准（case 样例 + runner + 报告生成，见 benchmark/README.md；可选插件，默认禁用，PLUGINS 显式列名启用）
+│   ├── ui/                 # 核心 SPA（随包分发；挂载见 server/static.py）
+│   │   ├── index.html      # 桌面端页面
+│   │   ├── app.js          # 前端逻辑
+│   │   ├── style.css       # 样式
+│   │   ├── icons/          # 图标资源（Lucide SVG 子集，见 icons/README.md）
+│   │   └── icon-manifest.txt  # 图标清单（源码维护资源，不进 wheel）
+└── tests/
+```
+
 ### 核心模块详解
 
 #### briefdesk/main.py
@@ -1013,6 +1060,19 @@ after_run（锁外，本插件不取存储锁）对存活卡补嵌回归余弦
   差异（多 `data:` 行的拼接、上限是否约束单个完整帧）见 `sources_base.iter_sse_data_events` 文档串与
   两仓 SDK 的 `watch` 文档串，两边各自成立、只记录不统一。**vendor 内禁改**——补丁一律上游先行再经
   `scripts/sync_vendor.ps1` 同步；本地修改的失败模式是下次同步产生冲突、需人工解决（不是自动丢弃）。
+
+### 插件机制补充说明
+
+本体只保留核心（存储、管道骨架、HTTP、状态总线），扩展功能以插件挂载：
+
+- 打包插件经 `[project.entry-points."briefdesk.plugins"]` 声明；开发期插件放 `PLUGIN_PATH` 目录（每个 `.py` 暴露 `plugin` 实例）即可被加载
+- `briefdesk/plugin/manager.py` 的 `PluginManager`：发现 → 核心/可选分层过滤（核心恒装配；可选按 `PLUGINS` 显式列表，互斥对先列者保留）→ 依赖拓扑排序 → setup（HTTP 启动前）→ activate（服务器就绪后）→ teardown（逆序幂等）
+- 单插件失败只禁用该插件；`PLUGINS_REQUIRED` 名单内的失败则中止启动
+- 依赖方向由 `tests/test_no_core_imports_plugins.py` 守卫：核心永不 import `briefdesk.plugins.*`
+- 插件分核心/可选两层：核心插件（ai_provider/classify/dedup/merge/rag/calendar/reminders）恒装配；可选插件（weflow/weflow-legacy/qqflow/ocr/benchmark）默认禁用，经 `PLUGINS` 显式列名或设置页「插件」面板逐个开关启用；插件可声明 `conflicts` 互斥（weflow 与 weflow-legacy 互斥——同一上游新旧采集器，同开会重复采集）
+- 管道阶段化：OCR / AI 分类 / 语义去重 / 同话题合并各是一个阶段插件（`briefdesk/plugins/{ocr,classify,dedup,merge}/`，槽位 enrich → classify → dedup → post_insert），`briefdesk/pipeline.py` 只做编排（入口过滤 → 并行分类 → 锁内入库/合并 → 状态/通知）；核心删除卡片经事件总线通知去重插件清理缓存；OCR 依赖（rapidocr/onnxruntime）为可选安装，未安装时 OCR 插件自禁用、纯图片消息（无文字）在入口被屏蔽（不落库且水位照常推进，重新启用 OCR 后**不会自动恢复**——要找回需重新停用/启用会话触发 `BACKFILL_HOURS` 回填，或临时设为 -1 全量回填），图片+文字混合消息不受影响
+- AI 供应商插件（`briefdesk/plugins/ai_provider/`）：chat + 嵌入能力注册到 `briefdesk/ai_ports.py` 端口，引擎经端口函数调用、核心不依赖具体供应商；分类/去重/合并声明依赖 ai_provider（被禁用时随依赖降级，管道对 "阶段缺失"整批保留不标记，防消息丢失）
+- Web 插件（`WebPlugin` 协议：router + 静态资源）：日历/提醒/检索问答路由为示范插件（`briefdesk/plugins/{calendar,reminders,rag}/`）；核心提供 `/api/plugins` 元数据与 `/plugin-assets/<name>/` 静态资源；**插件的完整前端随插件包分发**——calendar 的按钮/视图容器/浮层/样式全在 `calendar/ui/`（`ui.js` 自建 DOM 并注册核心 `registerPluginView` 视图钩子接入 hash 路由与刷新联动，`ui.css` 随注入）；reminders 的提醒按钮/菜单、设置面板「自动提醒」控件与到期轮询全在 `reminders/ui/`（`ui.js` 注册核心 `registerItemRowExtension` 行内扩展接入卡片动作区与 `handleRowAction`，经 `data-plugin-slot` 注入设置面板）；核心 `briefdesk/ui/` 只留通用加载器与两类扩展钩子（`TestCoreFrontendBoundary` 守卫），不写死任何插件功能入口
 
 ## 数据库
 
