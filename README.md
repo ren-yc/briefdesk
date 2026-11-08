@@ -22,7 +22,7 @@
 ### 前置条件
 
 - Python >= 3.12
-- 任一消息源运行中：weflow-server（微信 4.x，默认 `http://127.0.0.1:5033`）、WeFlow（HTTP API 已开启，默认 `:5031`）或 qqflow-server（默认 `http://127.0.0.1:5032`）
+- 任一消息源运行中：安装版 WeFlow（桌面客户端开启 HTTP API，默认 `:5031`，对应本仓 `weflow-legacy` 插件）、weflow-server（微信 4.x 无头服务，默认 `http://127.0.0.1:5033`，接口形态参考安装版 WeFlow）或 qqflow-server（QQ NT 版无头服务，默认 `http://127.0.0.1:5032`）
 - AI API Key（环境变量 `AI_API_KEY`）
 
 ### 安装运行
