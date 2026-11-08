@@ -24,8 +24,7 @@ python main.py                   # 或 python -m briefdesk / briefdesk
 
 浏览器打开 `http://localhost:3000`。
 
-**从索引安装（发布版）**：`pip install briefdesk`（可选图片 OCR：`pip install "briefdesk[ocr]"`），
-用 `briefdesk` 启动；配置与数据目录位置同源码安装（只有源码/editable 模式才读项目根 `.env`）。
+**从索引安装（发布版）**：`pip install briefdesk`（可选图片 OCR：`pip install "briefdesk[ocr]"`），用 `briefdesk` 启动。**发布版不读项目根或当前目录的 `.env`**（`paths.project_dotenv_path()` 在 wheel 模式返回 None）：配置走进程环境变量，或在设置页「启动配置」与「密钥区」填写；数据目录位置与源码安装一致。
 
 ### 试用预发布版（TestPyPI）
 
@@ -50,7 +49,7 @@ pip 会把两个索引合并后取最高版本，而 TestPyPI 上存在别人试
 
 1. **环境检查**：展示各消息源连接状态；若后端有错误/警告（如 `AI_API_KEY` / 所选消息源的必填密钥缺失、消息源未启动）会给出提示与常见原因；
 2. **选择群聊**：勾选要监控的会话——**群聊默认勾选，私聊 / 公众号默认不勾**（避免无意监控私聊）。会话列表为空时可先到 设置 → 群聊筛选 点「发现新群聊」拉取最新会话列表，再回来重试；
-3. **开始同步**：首次会按 `BACKFILL_HOURS`（默认 24 小时）回填一次已启用会话的历史消息，此后按会话增量轮询 + SSE 实时监听；同步完成后回到主页面，AI 分类后的信息卡片会陆续出现。
+3. **开始同步**：首次会按 `BACKFILL_HOURS`（默认 24 小时）回填一次已启用会话的历史消息，此后按会话增量轮询 + SSE 实时监听（默认无周期轮询，见「同步状态」说明）；同步完成后回到主页面，AI 分类后的信息卡片会陆续出现。
 
 随时可点右上角「跳过」（或按 `Esc`）退出向导，之后再手动操作：**设置 → 群聊筛选** 勾选群聊 → 顶部 **同步消息**。跳过或走完向导后不再弹出（浏览器 localStorage 记忆）。
 
@@ -80,7 +79,7 @@ pip 会把两个索引合并后取最高版本，而 TestPyPI 上存在别人试
 
 - 顶部状态胶囊显示消息源连接状态与同步进度（新增条数、处理中/已完成）。
 - 手动触发：顶栏 **同步消息** 按钮，或向导中的 **开始同步**。
-- 周期同步：配置 `POLL_INTERVAL_SECONDS > 0` 后自动按间隔补齐 SSE 断连窗口的消息。
+- 周期同步：默认关闭（`POLL_INTERVAL_SECONDS=0`），SSE 断连窗口的消息不会自动补齐——手动点「同步消息」或把该变量设为正值（如 `600`）后按间隔自动同步。
 
 ## 设置
 
@@ -128,7 +127,7 @@ pip 会把两个索引合并后取最高版本，而 TestPyPI 上存在别人试
 - 环境变量：`LOG_LEVEL` — 默认：`INFO`；说明：日志级别（DEBUG 开逐条细节，并放出 uvicorn 的 HTTP 请求日志——默认静默以免逐请求刷屏）
 - 环境变量：`DB_PATH` / `SERVER_PORT` — 默认：用户数据目录 `data/briefdesk.sqlite` / `3000`；说明：SQLite 路径 / Web 端口
 
-> 配置说明：`.env` 以项目根目录为基准解析，从任意目录启动（`python main.py` / `python -m briefdesk` / `briefdesk`）都会读到同一份配置；默认数据库落在平台用户数据目录（Windows `%LOCALAPPDATA%\briefdesk\data\briefdesk.sqlite`），可用 `DB_PATH` 覆盖（显式相对路径按当前工作目录解析，`~` 不展开）。
+> 配置说明：`.env` 以项目根目录为基准解析，从任意目录启动（`python main.py` / `python -m briefdesk` / `briefdesk`）都会读到同一份配置——**仅限源码 / editable 安装**；发布版（wheel）不读任何隐式 `.env`，配置走进程环境变量或设置页。默认数据库落在平台用户数据目录（Windows `%LOCALAPPDATA%\briefdesk\data\briefdesk.sqlite`），可用 `DB_PATH` 覆盖（显式相对路径按当前工作目录解析，`~` 不展开）。
 > `PLUGINS` 未启用任何消息源插件时进入**降级启动**：应用照常运行（UI/设置/向导可用），状态栏明示「无消息源」，消息采集不可用——配置消息源后重启生效。
 
 #### 依赖说明
@@ -156,7 +155,7 @@ OCR 依赖为**可选**（`pip install -e ".[ocr]"`）：
 - `rapidocr`（RapidOCR，基于 ONNX 的跨平台 OCR 框架）
 - `onnxruntime`（ONNX Runtime CPU 推理后端，无需 GPU / CUDA）
 
-未安装 OCR 依赖时，OCR 阶段插件在启动时自禁用（`PluginDisabledError`，非致命），图片消息仍以原文入库展示，仅不做文字识别。
+未安装 OCR 依赖时，OCR 阶段插件在启动时自禁用（`PluginDisabledError`，非致命）；**纯图片消息（消息内容只有图片占位符）在管道入口被过滤，不会入库**——重新启用 OCR 后需重新启用会话或临时 `BACKFILL_HOURS=-1` 回填找回，图片+文字混合消息不受影响。
 
 ## 插件功能
 
@@ -176,7 +175,7 @@ OCR 依赖为**可选**（`pip install -e ".[ocr]"`）：
 A: 未在 `PLUGINS` 中启用任何消息源插件。检查 `.env` 或启动配置中的 `PLUGINS`，并确认对应消息源服务已启动，重试后重启应用。
 
 **Q: 图片消息没有被识别？**
-A: 检查是否安装 OCR 依赖（`pip install -e ".[ocr]"`）且 `ocr` 插件已启用；未启用时纯图片消息会被过滤，重新启用后需重新启用会话或临时 `BACKFILL_HOURS=-1` 回填找回。
+A: 检查是否安装 OCR 依赖（`pip install -e ".[ocr]"`）且 `ocr` 插件已启用；未启用时纯图片消息不会入库（入口过滤），重新启用后需重新启用会话或临时 `BACKFILL_HOURS=-1` 回填找回。
 
 **Q: 设置保存后不生效？**
 A: 启动配置为重启生效。保存后重启 `python main.py`。
@@ -189,10 +188,12 @@ A: 需同时满足：`AI_VISION_ENABLED=true`、`ocr` 插件已启用、模型�
 
 ## 数据与隐私
 
-所有数据留在本地 SQLite，密钥不落明文；图片外发与旧数据边界是两处需要单独确认的风险。
+所有数据留在本地 SQLite；使用外部 AI 端点时，消息文本会随分类请求外发给所选供应商，图片外发与旧数据边界是另两处需要单独确认的风险。
 
-- 所有数据存于本地 SQLite，默认落在平台用户数据目录（Windows `%LOCALAPPDATA%\briefdesk\data\briefdesk.sqlite`，可经 `DB_PATH` 覆盖）；消息内容（正文、昵称、群名）经同一套规则脱敏后处理，密钥走系统钥匙串不落明文。
+- 所有数据存于本地 SQLite，默认落在平台用户数据目录（Windows `%LOCALAPPDATA%\briefdesk\data\briefdesk.sqlite`，可经 `DB_PATH` 覆盖）。
+- **文本会发送给 AI 供应商**：AI 分类请求包含群名、发送者名与消息文本（经同一套规则脱敏——手机号/身份证/邮箱/银行卡等替换为占位符——但正文语义内容原样外发）。不用外部 AI 端点（本地模型）时不存在该外发。
 - **文本脱敏不遮盖图片内容**：开启视觉输入（`AI_VISION_ENABLED`，需 `ocr` 插件）时，消息图片会经归一化后 **连同图片像素一并发送给所选模型供应商**——OCR 识别出的文字会被掩码，但图片里的文字、人脸等内容不经过任何脱敏。是否开启视觉输入，请按你与所选供应商之间的数据约定自行决定。
+- **密钥存储分两条路**：系统钥匙串（`briefdesk secrets set` / UI 密钥区，Windows 为凭据管理器/DPAPI）中的密钥随用户账号加密、不落明文；写在 `.env` 里的密钥是**明文文件**——含密钥的 `.env` 不要提交版本库（已在 `.gitignore` 排除）、不要随网盘/备份/截图连带分享。
 - 暂存配置（UI「启动配置」）按**字面量**保存：值里写 `${VAR}` 不会被展开、保存时直接拒绝（提示改为写在项目 `.env` 或环境变量层）；跨层引用属项目 `.env`（dotenv 语义）的能力。
 - 配置文件（UI 暂存）在 `%LOCALAPPDATA%\briefdesk\settings.env`；基准用例/报告在 `…\briefdesk\benchmark\`、运行目录在 `…\briefdesk\Cache\benchmark\runs\`（可用 `BRIEFDESK_DATA_DIR` / `BRIEFDESK_CACHE_DIR` /`BRIEFDESK_SETTINGS_FILE` 重定向，这三个变量只读进程环境变量）。
 - **旧版本的数据不会被自动发现或迁移**：默认库路径与配置文件位置都变了，旧位置的文件保持原样、不再被读取；本版本不提供旧库的迁移、导入或兼容转换指引。

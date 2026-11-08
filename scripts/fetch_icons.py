@@ -10,7 +10,7 @@
 
     python scripts/fetch_icons.py add <name> [<name> ...]   # 拉取并登记
     python scripts/fetch_icons.py add --overwrite <name>    # 覆盖已存在文件
-    python scripts/fetch_icons.py check                     # 校验钉定版本可用性
+    python scripts/fetch_icons.py check [--version <ver>]   # 校验钉定（或指定）版本可用性
     python scripts/fetch_icons.py show                      # 显示钉定版本
 """
 
@@ -26,10 +26,10 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 ICONS_DIR = REPO_ROOT / "briefdesk" / "ui" / "icons"
 MANIFEST = REPO_ROOT / "briefdesk" / "ui" / "icon-manifest.txt"
 
-# 钉定的 lucide-static 版本。升级流程：先 `python scripts/fetch_icons.py check`
-# 确认清单全部图标在新版本仍可拉取（未被改名/移除），再改本常量并同步更新
-# briefdesk/ui/icons/README.md 的「版本记录」，最后跑 tests/test_icon_manifest.py 与
-# tests/test_fetch_icons_script.py。
+# 钉定的 lucide-static 版本。升级流程：先 `python scripts/fetch_icons.py
+# check --version <目标版本>` 确认清单全部图标在目标版本仍可拉取（未被改名/
+# 移除），再改本常量并同步更新 briefdesk/ui/icons/README.md 的「版本记录」，
+# 最后跑 tests/test_icon_manifest.py 与 tests/test_fetch_icons_script.py。
 LUCIDE_STATIC_VERSION = "1.34.0"
 
 # 与 briefdesk/ui/app.js 的 _SVG_CONTENT_RE / tests/test_icon_manifest.py 保持一致：
@@ -133,7 +133,14 @@ def _main(argv: list[str] | None = None) -> int:
     add_p = sub.add_parser("add", help="拉取并登记图标（逐个拉取，禁止整库拷贝）")
     add_p.add_argument("names", nargs="+", metavar="NAME")
     add_p.add_argument("--overwrite", action="store_true", help="覆盖已存在文件")
-    sub.add_parser("check", help="校验清单全部图标在钉定版本可用")
+    sub.add_parser("check", help="校验清单全部图标在钉定（或 --version 指定）版本可用")
+    check_p = sub.choices["check"]
+    check_p.add_argument(
+        "--version",
+        default=None,
+        metavar="VER",
+        help="校验目标版本（升级前用：先对目标版本跑 check，通过后再改钉定常量）",
+    )
     sub.add_parser("show", help="显示钉定版本")
     args = parser.parse_args(argv)
 
@@ -141,11 +148,14 @@ def _main(argv: list[str] | None = None) -> int:
         print(f"lucide-static@{LUCIDE_STATIC_VERSION}")
         return 0
     if args.command == "check":
-        results = check_icons()
+        version = args.version or LUCIDE_STATIC_VERSION
+        results = check_icons(version=version)
         ok = True
         for name, verdict in results:
             print(f"{name}: {verdict}")
             ok = ok and verdict == "可用"
+        if args.version:
+            print(f"（校验目标版本 lucide-static@{args.version}，钉定值尚未改动）")
         return 0 if ok else 1
     rc = 0
     for name in args.names:

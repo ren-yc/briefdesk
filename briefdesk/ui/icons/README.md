@@ -5,7 +5,7 @@
 - **选型**：Lucide（线框 stroke-2 风格）——全站图标风格与语义命名一致。
 - **许可**：Lucide 采用 [ISC 许可](https://lucide.dev/license)。本子集随本项目（MIT）分发，原始版权声明如下：
   > ISC License © 2020-2026 Lucide Contributors
-- **版本记录**：本子集钉定 vendored 自 `lucide-static@1.34.0`（文件中内嵌 `@license lucide-static v1.34.0 - ISC` 头注释可核对）。钉定值唯一事实来源为 `scripts/fetch_icons.py` 的 `LUCIDE_STATIC_VERSION`，`python scripts/fetch_icons.py show` 可查看。升级流程：先跑 `check` 确认清单全部图标在新版本仍可拉取（未被改名/移除）→ 改脚本常量 → 更新本节 → 跑清单守卫测试。
+- **版本记录**：本子集钉定 vendored 自 `lucide-static@1.34.0`（文件中内嵌 `@license lucide-static v1.34.0 - ISC` 头注释可核对）。钉定值唯一事实来源为 `scripts/fetch_icons.py` 的 `LUCIDE_STATIC_VERSION`，`python scripts/fetch_icons.py show` 可查看。升级流程：先跑 `python scripts/fetch_icons.py check --version <目标版本>` 对**目标版本**校验清单（此时钉定值未动，旧版功能不受影响）→ 校验全绿后再改脚本常量 → 更新本节 → 跑清单守卫测试。
 - **单一事实来源**：`briefdesk/ui/icon-manifest.txt`（与目录文件集合必须一致，由 `tests/test_icon_manifest.py` 双向守卫）。
 
 ## 新增图标流程

@@ -701,7 +701,7 @@ All via `.env` file, with an additional UI-staged overlay layer (see 「配置�
 ### 轮询与回填
 
 - **`POLL_OVERLAP_SECONDS`**：默认 `300`。增量轮询窗口与上次水位间的重叠秒数：吸收边界秒/时钟偏差/翻页偏移，重叠部分由 processed_messages 去重。
-- **`POLL_INTERVAL_SECONDS`**：默认 `0` (disabled)。Periodic sync interval in seconds: fallback to backfill messages missed during SSE outages; >0 triggers the same sync path as `/api/sync` periodically (mutually exclusive)。
+- **`POLL_INTERVAL_SECONDS`**：默认 `0`（禁用）。周期同步间隔（秒）：SSE 断连窗口的消息补齐兜底；大于 0 时按该周期自动触发与 `/api/sync` 同路径的同步（进行中互斥）。
 - **`BACKFILL_HOURS`**：默认 `24`。REST 回填窗口：会话启用/从未轮询时按该窗口回填一次，此后按会话增量；`-1` = pull all history (warns at startup, pages to hasMore end)。
 - **`IGNORED_EXPIRY_HOURS`**：默认 `0` (disabled)。On startup, purge ignored items older than this many hours (deletes from `items` + `raw_messages`, keeps `processed_messages`)。
 - **`IGNORE_SELF`**：默认 `true`。过滤自己发送的消息（所有消息入口：SSE 实时 + REST 回填）。

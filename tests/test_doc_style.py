@@ -43,7 +43,7 @@ COMMON_BEGIN = "<!-- common:begin -->"
 COMMON_END = "<!-- common:end -->"
 
 _HEADING = re.compile(r"^\s{0,3}(#{1,6})\s")
-_FENCE = re.compile(r"^\s*(```|~~~)")
+_FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
 _LIST = re.compile(r"^(\s*)([-*+]|\d{1,3}[.)])\s+")
 _QUOTE = re.compile(r"^\s*>")
 _TABLE = re.compile(r"^\s*\|")
@@ -59,10 +59,27 @@ def _slug(text: str) -> str:
     return value.replace(" ", "-")
 
 
+def _fence_step(line: str, open_fence: str | None) -> str | None:
+    """CommonMark 围栏状态转移：返回新的开启围栏标记（None = 不在围栏内）。
+
+    开启行可带信息串；闭合行须与开启行同字符、长度不小于开启长度、
+    且标记后只允许空白——```` 围栏内的 ``` 与带信息串的行都不再翻转状态。
+    """
+    match = _FENCE.match(line)
+    if not match:
+        return open_fence
+    marker, rest = match.group(1), match.group(2)
+    if open_fence is None:
+        return marker
+    if marker[0] == open_fence[0] and len(marker) >= len(open_fence) and not rest.strip():
+        return None
+    return open_fence
+
+
 def classify(lines: list[str]) -> list[str]:
     """单一行分类器：先注释、后围栏，避免多份状态机分歧导致失败开放。"""
     kinds: list[str] = []
-    in_fence = False
+    in_fence: str | None = None
     in_comment = False
     prev_blank = True
     in_indent = False
@@ -75,12 +92,23 @@ def classify(lines: list[str]) -> list[str]:
             prev_blank = False
             continue
         if _FENCE.match(line):
-            kinds.append("code")
-            in_fence = not in_fence
-            prev_blank = False
-            in_indent = False
-            continue
-        if in_fence:
+            next_fence = _fence_step(line, in_fence)
+            if next_fence != in_fence:
+                # 围栏边界行（开启或真正闭合）：本行按代码计
+                in_fence = next_fence
+                kinds.append("code")
+                prev_blank = False
+                in_indent = False
+                continue
+            # 匹配围栏正则但未翻转（同字符短围栏 / 错字符）：按围栏内代码计
+            if in_fence is not None:
+                kinds.append("code")
+                prev_blank = False
+                continue
+            # 不在围栏内的「伪闭合」形态（如缩进 4 格的 ```` 行越过开启围栏）
+            # 落到后续分类，不吞行
+        if in_fence is not None:
+            # 围栏内、非围栏标记行：一律按代码计（等价旧 in_fence 兜底分支）
             kinds.append("code")
             prev_blank = False
             continue
@@ -140,7 +168,7 @@ def common_lines(lines: list[str], kinds: list[str]) -> set[int]:
 
 def closure_state(lines: list[str]) -> tuple[bool, bool]:
     """返回 (未闭合围栏, 未闭合注释)；注释里的围栏字面量不翻转围栏状态。"""
-    in_fence = False
+    in_fence: str | None = None
     in_comment = False
     for raw in lines:
         line = raw.rstrip("\r")
@@ -153,8 +181,9 @@ def closure_state(lines: list[str]) -> tuple[bool, bool]:
                 in_comment = True
             continue
         if _FENCE.match(line):
-            in_fence = not in_fence
-    return in_fence, in_comment
+            in_fence = _fence_step(line, in_fence)
+            continue
+    return in_fence is not None, in_comment
 
 
 def is_break(lines: list[str], kinds: list[str], index: int) -> bool:
@@ -254,8 +283,8 @@ def scan_shape(text: str, rel: str) -> dict[str, Any]:
     if folds:
         problems.append(f"折点 {len(folds)} 处：{folds[:10]}")
 
-    in_fence, in_comment = closure_state(lines)
-    if in_fence:
+    fence_open, in_comment = closure_state(lines)
+    if fence_open:
         problems.append("未闭合围栏")
     if in_comment:
         problems.append("未闭合注释")
@@ -362,6 +391,15 @@ class DocStyleGuardTest(unittest.TestCase):
             "numbered": ("# 标题\n\n## 1. 安装\n\n正文。\n", "编号 H2"),
             "section-gap": ("# 标题\n\n## 节\n\n### 子节\n\n正文。\n", "节首即标题"),
             "missing-toc": ("# 标题\n\n## 节\n\n" + "正文。\n" * 310, "缺少 ## 目录"),
+            # 四反引号围栏内的三反引号行是内容不是闭合；围栏在尾部四反引号处才闭合
+            "nested-fence": (
+                "# 标题\n\n````\n内部 ``` 示例\n```\n内部行\n````\n\n中文甲\n乙中文\n",
+                "折点",
+            ),
+            # 闭合标记短于开启标记（``` 开、`` 后）不闭合
+            "short-close": ("# 标题\n\n````\n代码\n``\n\n中文甲\n乙中文\n", "未闭合围栏"),
+            # 带信息串的行不是闭合行
+            "close-with-info": ("# 标题\n\n```\n代码\n```python\n\n中文甲\n乙中文\n", "未闭合围栏"),
         }
         for name, (text, expected) in samples.items():
             with self.subTest(name=name):
