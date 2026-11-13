@@ -1,19 +1,12 @@
 # LLM 功能基准测试插件（benchmark）
 
-对四个 LLM 功能（**分类 classify / 去重 dedup / 合并判定 merge / 标题重拟 title**）
-做**输出质量**评估：与生产管道**同引擎、同 AI 供应商**（真实 API），逐用例判定 +
-聚合指标 + 可选 HTML 图表报告。
+对四个 LLM 功能（**分类 classify / 去重 dedup / 合并判定 merge / 标题重拟 title**）做**输出质量**评估：与生产管道**同引擎、同 AI 供应商**（真实 API），逐用例判定 + 聚合指标 + 可选 HTML 图表报告。
 
-> ⚠️ 运行会**真实调用 AI**（读 `.env` 的 `AI_API_KEY` / `AI_API_BASE` / `AI_MODEL`），
-> 按用例数产生 API 费用。以**独立子进程**运行：父子只经文件交换，
-> **运行期间界面照常可用**（写操作、备份与导出都不受影响，列表区显示真实卡片），
-> 产物落在用户缓存目录 `benchmark/runs/`（Windows `%LOCALAPPDATA%\briefdesk\Cache\benchmark\runs`）下
-> 并按 `BENCHMARK_KEEP_RUNS` 轮转。运行期间
-> **消息处理会暂停**：实时消息延后到下一轮回填窗口处理（不丢失），结束后如未开启
-> 周期同步，请在界面上点一次同步补齐。
-> 测试数据请使用虚构/脱敏内容（AGENTS.md 隐私规范）。
+> ⚠️ 运行会**真实调用 AI**（读 `.env` 的 `AI_API_KEY` / `AI_API_BASE` / `AI_MODEL`），按用例数产生 API 费用。以**独立子进程**运行：父子只经文件交换，**运行期间界面照常可用**（写操作、备份与导出都不受影响，列表区显示真实卡片），产物落在用户缓存目录 `benchmark/runs/`（Windows `%LOCALAPPDATA%\briefdesk\Cache\benchmark\runs`）下并按 `BENCHMARK_KEEP_RUNS` 轮转。运行期间 **消息处理会暂停**：实时消息延后到下一轮回填窗口处理（不丢失），结束后如未开启周期同步，请在界面上点一次同步补齐。测试数据请使用虚构/脱敏内容（AGENTS.md 隐私规范）。
 
 ## 配置（`.env`，全部可选）
+
+四项配置都只在运行期生效，采用时点分「每次开始」与「每次轮转」两类。
 
 | 键 | 默认 | 采用时点 | 说明 |
 |---|---|---|---|
@@ -22,65 +15,33 @@
 | `BENCHMARK_RUN_STALL_SECONDS` | `600` | 每次运行开始 | 运行期的「无进展」阈值（按进度行数增长判定） |
 | `BENCHMARK_KEEP_RUNS` | `5` | 每次运行目录轮转 | 保留多少次运行的产物；最新一次**已完成**的永不删除 |
 
-「采用时点」的含义：**运行开始**的那三个参数在 start 时冻结，运行中改它们不影响已发布的运行，只改变
-下一次运行（设置页 `current` 显示本次采用值、`expected` 显示下次运行值）；**每次轮转**的 `BENCHMARK_KEEP_RUNS`
-在下一次清理运行目录时生效。
+「采用时点」的含义：**运行开始**的那三个参数在 start 时冻结，运行中改它们不影响已发布的运行，只改变下一次运行（设置页 `current` 显示本次采用值、`expected` 显示下次运行值）；**每次轮转**的 `BENCHMARK_KEEP_RUNS` 在下一次清理运行目录时生效。
 
 ## 用法一：Web（插件）
 
-插件**默认禁用**（实验性工具，属可选插件，`PLUGINS` 默认 `[]` 不会加载它）：
-需在 `.env` 中显式列名启用，如 `PLUGINS=["benchmark"]`，或在应用内
-「设置 → 插件」面板打开开关。启用后随应用
-加载，设置弹窗 → **「关于」面板 → 「基准测试」区块**：
+Web 入口把用例导出、处理记录与运行都收在设置弹窗的「基准测试」区块。
 
-1. **导出当前列表为基准用例**：把当前筛选条件下的卡片导出为**四类**基准用例
-   （期望 = 卡片当前状态；无类别卡片跳过；与「导出卡片 CSV」同口径），
-   逐功能**合并写入**用户用例目录 `cases/<feature>.fromweb.json`（文件存储，
-   不写数据库；同 id 用例更新为新状态、其余既有用例保留——要移除旧用例请
-   先「清空基准用例」）。每条用例带来源标注：`origin=cards`（卡片导出）与
-   `batch_fingerprint`（按本批用例 id 集内容派生的批次指纹，同批重导同
-   指纹；训练数据侧按它做同路径批次互斥，跨路径/成员级互斥用入训 id 清单）。四类期望推导：
-   - **classify**：期望 = 卡片当前分类/主体/时间字段（按批上限拆分多例）；
-     **已忽略卡片（is_verified=-1）作为噪声样本进入 messages、不写期望**——
-     它们是 AI 误分类上来的闲聊（人工标记应丢弃），模型不应输出分类结果
-     （输出即计为误报）；噪声样本恒被纳入，与当前视图的"未核实"筛选无关；
-   - **title**：每卡一例，期望 = 卡片关键词包含（`key_info` 拆分；无 key_info
-     回退期望标题 = 卡片当前标题）；已忽略卡片排除（噪声不作标题期望）；
-   - **dedup**：same=true = 同 `content_hash` 却共存的卡片对（同一信息）；
-     same=false = 时间相邻且类别不同的共存卡片对（不同信息）；已忽略卡片排除；
-   - **merge**：同会话同类别、时间窗（`MERGE_WINDOW_MINUTES`）内的相邻卡片对，
-     同主体同发送者 → merge=true（同话题片段），主体均非空且不同 → merge=false；
-     已忽略卡片排除。
-   注意：title/dedup/merge 用例数与列表规模成正比（每卡/每对一例），请先用
-   筛选控制规模再导出。
-2. **记录处理过程**（可选，默认关闭）：benchmark 同时注册为**阶段插件**
-   （slot=post_insert），开启后在**管道真实处理时点**采集 dedup/merge 的判定
-   观察记录并累积内存。它与「导出当前列表」互补——按卡片最终状态导出只能看到
-   "去重漏判/未合并"的共存对（命中证据已被删库），而处理记录能捕获：
-   - **dedup**：判重命中的 (query, 命中候选) → same=true；候选被判定为不同的
-     (query, 最高分候选) → same=false（真实 AI 判定依据，非相邻类别近似）；
+插件**默认禁用**（实验性工具，属可选插件，`PLUGINS` 默认 `[]` 不会加载它）：需在 `.env` 中显式列名启用，如 `PLUGINS=["benchmark"]`，或在应用内「设置 → 插件」面板打开开关。启用后随应用加载，设置弹窗 → **「关于」面板 → 「基准测试」区块**：
+
+1. **导出当前列表为基准用例**：把当前筛选条件下的卡片导出为**四类**基准用例（期望 = 卡片当前状态；无类别卡片跳过；与「导出卡片 CSV」同口径），逐功能**合并写入**用户用例目录 `cases/<feature>.fromweb.json`（文件存储，不写数据库；同 id 用例更新为新状态、其余既有用例保留——要移除旧用例请先「清空基准用例」）。每条用例带来源标注：`origin=cards`（卡片导出）与 `batch_fingerprint`（按本批用例 id 集内容派生的批次指纹，同批重导同指纹；训练数据侧按它做同路径批次互斥，跨路径/成员级互斥用入训 id 清单）。四类期望推导：
+   - **classify**：期望 = 卡片当前分类/主体/时间字段（按批上限拆分多例）；**已忽略卡片（is_verified=-1）作为噪声样本进入 messages、不写期望**—— 它们是 AI 误分类上来的闲聊（人工标记应丢弃），模型不应输出分类结果（输出即计为误报）；噪声样本恒被纳入，与当前视图的"未核实"筛选无关；
+   - **title**：每卡一例，期望 = 卡片关键词包含（`key_info` 拆分；无 key_info 回退期望标题 = 卡片当前标题）；已忽略卡片排除（噪声不作标题期望）；
+   - **dedup**：same=true = 同 `content_hash` 却共存的卡片对（同一信息）；same=false = 时间相邻且类别不同的共存卡片对（不同信息）；已忽略卡片排除；
+   - **merge**：同会话同类别、时间窗（`MERGE_WINDOW_MINUTES`）内的相邻卡片对，同主体同发送者 → merge=true（同话题片段），主体均非空且不同 → merge=false；已忽略卡片排除。注意：title/dedup/merge 用例数与列表规模成正比（每卡/每对一例），请先用筛选控制规模再导出。
+2. **记录处理过程**（可选，默认关闭）：benchmark 同时注册为**阶段插件**（slot=post_insert），开启后在**管道真实处理时点**采集 dedup/merge 的判定观察记录并累积内存。它与「导出当前列表」互补——按卡片最终状态导出只能看到 "去重漏判/未合并"的共存对（命中证据已被删库），而处理记录能捕获：
+   - **dedup**：判重命中的 (query, 命中候选) → same=true；候选被判定为不同的 (query, 最高分候选) → same=false（真实 AI 判定依据，非相邻类别近似）；
    - **merge**：合并判定命中/未命中的 (head, tail) 对 → merge=true/false；
-   - **title**：合并后重拟标题事件（old_title + 合并后 key_info/quote →
-     期望 = key_info 关键词包含，与网页导出同口径）。
-   **导出处理记录**把累积记录逐功能合并写入用户用例目录的 `cases/<feature>.fromweb.json`
-   （`origin=recorder`，批次指纹由写入单点按本批用例内容派生，与卡片导出按来源字段区分），导出后清空累积器；
-   **丢弃记录**不清文件。
-   记录含真实聊天内容，导出文件已 gitignore，请勿长时间开启后忘记导出。
-3. **运行基准测试**：后台真实调用 AI（耗时数分钟），状态实时轮询；
-   完成后显示各功能核心指标，可**打开图表报告**（自包含 HTML，可另存分享）。
+   - **title**：合并后重拟标题事件（old_title + 合并后 key_info/quote → 期望 = key_info 关键词包含，与网页导出同口径）。**导出处理记录**把累积记录逐功能合并写入用户用例目录的 `cases/<feature>.fromweb.json`（`origin=recorder`，批次指纹由写入单点按本批用例内容派生，与卡片导出按来源字段区分），导出后清空累积器；**丢弃记录**不清文件。记录含真实聊天内容，导出文件已 gitignore，请勿长时间开启后忘记导出。
+3. **运行基准测试**：后台真实调用 AI（耗时数分钟），状态实时轮询；完成后显示各功能核心指标，可**打开图表报告**（自包含 HTML，可另存分享）。
 4. **清空基准用例**：删除用户用例目录下全部 `cases/*.fromweb.json`（不影响卡片数据与包内示例）。
 
 > `*.fromweb.json` 含真实聊天内容，现落在用户数据目录（不再进仓库），样例仍**禁止提交**（AGENTS.md 隐私规范）。
 
-API：`GET/DELETE /api/benchmark/cases`（列出/删除导出用例）、
-`POST /api/benchmark/import-current`（导出当前列表）、
-`GET/POST /api/benchmark/record`（记录状态/开关）、
-`POST /api/benchmark/export-recorded`（导出处理记录）、
-`DELETE /api/benchmark/record`（丢弃记录）、
-`POST/GET/DELETE /api/benchmark/run`（运行/状态/取消）、
-`GET /api/benchmark/report(.json)`（结果）。
+API：`GET/DELETE /api/benchmark/cases`（列出/删除导出用例）、`POST /api/benchmark/import-current`（导出当前列表）、`GET/POST /api/benchmark/record`（记录状态/开关）、`POST /api/benchmark/export-recorded`（导出处理记录）、`DELETE /api/benchmark/record`（丢弃记录）、`POST/GET/DELETE /api/benchmark/run`（运行/状态/取消）、`GET /api/benchmark/report(.json)`（结果）。
 
 ## 用法二：CLI
+
+CLI 与 Web 共用同一引擎与数据集，适合脚本化跑单功能。
 
 ```bash
 python -m briefdesk.plugins.benchmark.cli --dry-run          # 校验文件数据集（不调用 AI）
@@ -89,24 +50,18 @@ python -m briefdesk.plugins.benchmark.cli --charts            # 额外生成 HTM
 python -m briefdesk.plugins.benchmark.cli --model deepseek-v4-flash --concurrency 4
 ```
 
-- 文件数据集缺省查两个目录：**用户用例目录优先**（手写 `<feature>.json` 与网页导出的
-  `<feature>.fromweb.json`），未命中再回落**包内示例目录**（`<feature>.example.json`，
-  复制后手动编辑；结构与 schema 校验见下）。单目录内查找顺序不变：`<feature>.json` →
-  `<feature>.fromweb.json` → `<feature>.example.json`；显式 `--cases-dir` 只查该目录、
-  不回落包内示例；
-- 运行中每完成 5 条用例输出一次进度（如 `  classify 5/20 · 42.3s`，失败用例
-  带 `（失败 N）`；最后一条恒输出），`--dry-run` 不评估、无进度；
-- 结果导出到用户数据目录 `benchmark/reports/`：`run-<时间戳>.json`（指标 + 逐用例明细）与
-  `run-<时间戳>.html`（`--charts` 时，自包含 SVG 图表报告）。
+- 文件数据集缺省查两个目录：**用户用例目录优先**（手写 `<feature>.json` 与网页导出的 `<feature>.fromweb.json`），未命中再回落**包内示例目录**（`<feature>.example.json`，复制后手动编辑；结构与 schema 校验见下）。单目录内查找顺序不变：`<feature>.json` → `<feature>.fromweb.json` → `<feature>.example.json`；显式 `--cases-dir` 只查该目录、不回落包内示例；
+- 运行中每完成 5 条用例输出一次进度（如 `  classify 5/20 · 42.3s`，失败用例带 `（失败 N）`；最后一条恒输出），`--dry-run` 不评估、无进度；
+- 结果导出到用户数据目录 `benchmark/reports/`：`run-<时间戳>.json`（指标 + 逐用例明细）与 `run-<时间戳>.html`（`--charts` 时，自包含 SVG 图表报告）。
 
 ## 四个功能与评估口径
 
-| 功能 | 引擎入口（与生产同路径） | 测试集输入 | 期望标注 | 主要指标 |
-|---|---|---|---|---|
-| classify | `classify_batch(messages)` | 一批 InternalMessage | 每条应分类消息的 `index`/`category`，可选 `start`/`end`/`times`；可选 `mode` 切片维度 | 类别准确率/精确率/召回率/F1（不含纯占位符用例，按 mode 切片另列）、时间点完全一致率、时间点召回率（含回声 / 剔回声）、失败率 |
-| dedup | `DedupEngine.check_dedup` | `items`（历史卡片）+ `query`（新消息） | `same: true/false` | 准确率/精确率/召回率/F1、未触发判官数、经判官裁决用例数与占比、判定通道分布 |
-| merge | `judge_merge` | `head` + `tail` 两张卡 | `merge: true/false` | 准确率/精确率/召回率/F1 |
-| title | `summarize_title` | 一张卡 + `old_title`/`key_info` | `title` 精确 与/或 `keywords` 包含 | 关键词命中率、字符相似度均值/中位数、平均长度、超长数、回退数 |
+四个功能各有独立的用例形状与主指标，验收按功能与 mode 切片读数。
+
+- 功能：classify — 引擎入口（与生产同路径）：`classify_batch(messages)`；测试集输入：一批 InternalMessage；期望标注：每条应分类消息的 `index`/`category`，可选 `start`/`end`/`times`；可选 `mode` 切片维度；主要指标：类别准确率/精确率/召回率/F1（不含纯占位符用例，按 mode 切片另列）、时间点完全一致率、时间点召回率（含回声 / 剔回声）、失败率
+- 功能：dedup — 引擎入口（与生产同路径）：`DedupEngine.check_dedup`；测试集输入：`items`（历史卡片）+ `query`（新消息）；期望标注：`same: true/false`；主要指标：准确率/精确率/召回率/F1、未触发判官数、经判官裁决用例数与占比、判定通道分布
+- 功能：merge — 引擎入口（与生产同路径）：`judge_merge`；测试集输入：`head` + `tail` 两张卡；期望标注：`merge: true/false`；主要指标：准确率/精确率/召回率/F1
+- 功能：title — 引擎入口（与生产同路径）：`summarize_title`；测试集输入：一张卡 + `old_title`/`key_info`；期望标注：`title` 精确 与/或 `keywords` 包含；主要指标：关键词命中率、字符相似度均值/中位数、平均长度、超长数、回退数
 
 ## 测试集格式（手动添加 / 网页导出共用）
 
@@ -123,13 +78,9 @@ python -m briefdesk.plugins.benchmark.cli --model deepseek-v4-flash --concurrenc
 
 ### 消息输入（InternalMessage 形状，四个功能通用）
 
-字段与 `briefdesk.types.InternalMessage` 对齐：`msg_id`、`content`、`sender_name`、
-`sender_id`、`session_id`、`group_name`、`timestamp`、`source`、`is_self`、
-`image_urls`、`article_url`。必填仅 `msg_id` + `content`，其余可省略。
+字段与 `briefdesk.types.InternalMessage` 对齐：`msg_id`、`content`、`sender_name`、`sender_id`、`session_id`、`group_name`、`timestamp`、`source`、`is_self`、`image_urls`、`article_url`。必填仅 `msg_id` + `content`，其余可省略。
 
-- `timestamp` 除整数 epoch 秒外，**推荐直接写本地时间字符串**：
-  `"2026-04-05 14:30"`（或 `"2026-04-05"`），自动换算；
-  分类的时间提取以该时刻为相对时间锚点，请写真实意图对应的时间。
+- `timestamp` 除整数 epoch 秒外，**推荐直接写本地时间字符串**：`"2026-04-05 14:30"`（或 `"2026-04-05"`），自动换算；分类的时间提取以该时刻为相对时间锚点，请写真实意图对应的时间。
 - 两个基准扩展字段（模拟"已分类卡片"）：
   - `title`：可选，卡片的标题（缺省取 content 前 50 字）；
   - `key_info`：可选，卡片关键词（title 判官使用）。
@@ -169,54 +120,25 @@ python -m briefdesk.plugins.benchmark.cli --model deepseek-v4-flash --concurrenc
   "expected": { "title": "精确期望（可选）", "keywords": ["关键词", "包含匹配（可选）"] } }
 ```
 
-- **dedup 候选预筛注意**：未配置 `EMBED_API_BASE` 时用标题字符重叠预筛（阈值
-  `DEDUP_SIMILARITY_THRESHOLD`=0.07，bigram Jaccard 口径标定值），重叠不足的 pair
-  **不会触发 AI**、直接判为不同。
-  要评测 LLM 判重质量，请让 `query.title` 与某条 `items.title` 保持足够重叠
-  （如相同标题、不同正文）；结果中会标注"预筛跳过"的用例数。
-- title 期望的 `title` 精确匹配 与 `keywords` 包含匹配至少提供一种；
-  标题是开放生成，**建议主要用 `keywords`**（精确率对多次运行有抖动，仅作参考）。
+- **dedup 候选预筛注意**：未配置 `EMBED_API_BASE` 时用标题字符重叠预筛（阈值 `DEDUP_SIMILARITY_THRESHOLD`=0.07，bigram Jaccard 口径标定值），重叠不足的 pair **不会触发 AI**、直接判为不同。要评测 LLM 判重质量，请让 `query.title` 与某条 `items.title` 保持足够重叠（如相同标题、不同正文）；结果中会标注"预筛跳过"的用例数。
+- title 期望的 `title` 精确匹配 与 `keywords` 包含匹配至少提供一种；标题是开放生成，**建议主要用 `keywords`**（精确率对多次运行有抖动，仅作参考）。
 
 ## 指标定义
 
-- **类别准确率** = 期望集合中类别精确命中数 / 期望条数（漏检即扣分，与召回率同值）；
-  **精确率** = 命中数 / 模型输出条数（误报扣分）；F1 为两者调和平均。
-  三项主指标**不含**纯占位符用例（正文全是 `[图片]` 一类附件占位符，生产里根本
-  进不了分类阶段）；这类用例单独计数并另给一条 `含其召回`，便于与旧报告对比。
-- **分 mode 读数**：报告按用例 `mode`（prod/oov/mix/fictional/single/real/unspecified）
-  切片给出各自的召回/精确/误报。**验收要看切片，不要只看总分**——词表外（oov）样本
-  与生产样本混算时，总分既不代表能力也不代表上限。mode 优先取用例的 `mode` 字段，
-  字段为空时回退解析 `note` 里的 `mode=xxx` 或独立的 `real` 标记。
-- **时间点完全一致率** = 时间点集合与期望精确相等（多提/漏提都扣）的消息占比；
-  另有逐点召回率/精确率（只按 `(type, time)` 比对，忽略 label）。
-  逐点召回给两口径：`时间点召回率(含回声)` 是历史口径（与旧报告可比），
-  `(剔回声)` 才是解析能力读数——**回声点**指期望值就是这条消息自己的发送时间
-  （标注时从界面复制而来，不是从正文抽取），它留在分母里量的是"模型会不会复读
-  时间戳"。date-only 与带时刻另外分开统计。
-- **失败率** = `outcome.failed` 条数 / 消息总数（解析失败、未知类别、网络错误等
-  本轮无法入库的消息；生产中这些消息会在回填窗口重试）。
-- **dedup/merge**：以 true 为正类，accuracy/precision/recall/F1 + TP/FP/TN/FN；
-  dedup 额外统计**未触发判官的用例数**、**经判官裁决的用例数与占比**（`ai_judged_cases`
-  / `ai_judged_rate`——是"用例数"而不是 API 调用数，一例可对多个候选各调一次判官）与
-  **逐例判定通道**
-  （`exact` 图片/原文哈希短路、`cosine` 余弦候选、`overlap` 字符重叠候选、
-  `cosine_no_candidate` 余弦跑通但零候选、`none` 无任何候选）。
-  通道必须逐例记录：候选门阈值属于判定行为，配置写了嵌入也不代表这轮真走了余弦。
-  另注意 dedup 的"未触发判官"含三种成因——精确短路（正确的零 AI 判定）、判官负缓存命中
-  （同上）、候选门拒绝（没比成）；靠通道列区分，别把总数当漏判数。merge 的同名计数只有
-  余弦预筛门一种成因。
-- **title**：关键词命中率（有 `keywords` 期望的用例，硬判定）、平均输出长度、
-  超长（>30 字，与 `TITLE_PROMPT` 约束一致）数与回退原标题数；
-  另给**字符相似度**均值/中位数（输出与期望标题的序列比对分，0~1）。
-  精确匹配率已撤除：标题是开放生成，逐字相等衡量的是抄写而不是质量。
-  只有 `title` 期望、没有 `keywords` 的用例按字符相似 ≥0.70 给**软通过**（明细中标
-  「软」），该线只是描述线，不作门槛——能作门槛的只有关键词。
+指标以「期望集合 vs 模型输出」为口径，主指标不含纯占位符用例。
+
+- **类别准确率** = 期望集合中类别精确命中数 / 期望条数（漏检即扣分，与召回率同值）；**精确率** = 命中数 / 模型输出条数（误报扣分）；F1 为两者调和平均。三项主指标**不含**纯占位符用例（正文全是 `[图片]` 一类附件占位符，生产里根本进不了分类阶段）；这类用例单独计数并另给一条 `含其召回`，便于与旧报告对比。
+- **分 mode 读数**：报告按用例 `mode`（prod/oov/mix/fictional/single/real/unspecified）切片给出各自的召回/精确/误报。**验收要看切片，不要只看总分**——词表外（oov）样本与生产样本混算时，总分既不代表能力也不代表上限。mode 优先取用例的 `mode` 字段，字段为空时回退解析 `note` 里的 `mode=xxx` 或独立的 `real` 标记。
+- **时间点完全一致率** = 时间点集合与期望精确相等（多提/漏提都扣）的消息占比；另有逐点召回率/精确率（只按 `(type, time)` 比对，忽略 label）。逐点召回给两口径：`时间点召回率(含回声)` 是历史口径（与旧报告可比），`(剔回声)` 才是解析能力读数——**回声点**指期望值就是这条消息自己的发送时间（标注时从界面复制而来，不是从正文抽取），它留在分母里量的是"模型会不会复读时间戳"。date-only 与带时刻另外分开统计。
+- **失败率** = `outcome.failed` 条数 / 消息总数（解析失败、未知类别、网络错误等本轮无法入库的消息；生产中这些消息会在回填窗口重试）。
+- **dedup/merge**：以 true 为正类，accuracy/precision/recall/F1 + TP/FP/TN/FN；dedup 额外统计**未触发判官的用例数**、**经判官裁决的用例数与占比**（`ai_judged_cases`/ `ai_judged_rate`——是"用例数"而不是 API 调用数，一例可对多个候选各调一次判官）与 **逐例判定通道**（`exact` 图片/原文哈希短路、`cosine` 余弦候选、`overlap` 字符重叠候选、`cosine_no_candidate` 余弦跑通但零候选、`none` 无任何候选）。通道必须逐例记录：候选门阈值属于判定行为，配置写了嵌入也不代表这轮真走了余弦。另注意 dedup 的"未触发判官"含三种成因——精确短路（正确的零 AI 判定）、判官负缓存命中（同上）、候选门拒绝（没比成）；靠通道列区分，别把总数当漏判数。merge 的同名计数只有余弦预筛门一种成因。
+- **title**：关键词命中率（有 `keywords` 期望的用例，硬判定）、平均输出长度、超长（>30 字，与 `TITLE_PROMPT` 约束一致）数与回退原标题数；另给**字符相似度**均值/中位数（输出与期望标题的序列比对分，0~1）。精确匹配率已撤除：标题是开放生成，逐字相等衡量的是抄写而不是质量。只有 `title` 期望、没有 `keywords` 的用例按字符相似 ≥0.70 给**软通过**（明细中标「软」），该线只是描述线，不作门槛——能作门槛的只有关键词。
 
 ## 常见问题
+
+以下四类问题最常见，先按对应入口排查。
 
 - **`DatasetError: 用例校验失败`**：`--dry-run` 会列出全部非法用例与字段错误，按提示修正。
 - **dedup 大量"预筛跳过"**：标题重叠不足，未走到 AI；参考上文候选预筛注意。
 - **想测不同模型**：`--model` 覆盖模型名；同一测试集多跑几次可观察判定稳定性。
-- **Web 导出的用例去哪了**：用户用例目录 `cases/*.fromweb.json`（classify/dedup/
-  merge/title 四类，合并式文件，不写数据库；含真实聊天内容，已 gitignore，
-  禁止提交）；CLI 未找到 `<feature>.json` 时会自动回退使用它们。
+- **Web 导出的用例去哪了**：用户用例目录 `cases/*.fromweb.json`（classify/dedup/merge/title 四类，合并式文件，不写数据库；含真实聊天内容，已 gitignore，禁止提交）；CLI 未找到 `<feature>.json` 时会自动回退使用它们。

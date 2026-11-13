@@ -124,3 +124,21 @@ def test_check_icons_flags_unacceptable_format(tmp_path: Path) -> None:
         return BAD_SVG.encode()
 
     assert check_icons(fetch=fetch, manifest=manifest) == [("a", "内容格式不可接受")]
+
+
+def test_check_icons_honors_explicit_version(tmp_path: Path) -> None:
+    """check --version <目标版本> 校验的是目标版本 URL，而非钉定常量。"""
+    from scripts import fetch_icons
+
+    manifest = _manifest_file(tmp_path, ["a"])
+    seen: list[str] = []
+
+    def fetch(url: str) -> bytes:
+        seen.append(url)
+        return GOOD_SVG.encode()
+
+    results = check_icons(version="9.9.9", fetch=fetch, manifest=manifest)
+    assert results == [("a", "可用")]
+    assert seen == ["https://unpkg.com/lucide-static@9.9.9/icons/a.svg"]
+    # 钉定常量不受影响：升级流程是「先校验目标版本，再改常量」
+    assert fetch_icons.LUCIDE_STATIC_VERSION == "1.34.0"

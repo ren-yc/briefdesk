@@ -32,11 +32,10 @@ REQUIRED = [
     "briefdesk/plugins/benchmark/cases/title.example.json",
 ]
 
-#: 明确**不**进分发包的资源：源码维护文件与上游镜像文档（运行期从不读取）
+#: 明确**不**进分发包的资源：源码维护文件（运行期从不读取）
 EXCLUDED = [
     "briefdesk/ui/icon-manifest.txt",
     "briefdesk/ui/icons/README.md",
-    "briefdesk/plugins/weflow_legacy/weflow-legacy-api.md",
 ]
 
 

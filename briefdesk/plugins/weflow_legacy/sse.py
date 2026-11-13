@@ -26,8 +26,8 @@ from briefdesk.sources_base import (
 logger = logging.getLogger(__name__)
 
 # 近期事件去重缓存上限（按 event+rawid，FIFO）：防断线重连/上游重复投递导致
-# 同一事件重复进管道（weflow-legacy-api.md 明确建议接收端按 event+rawid 去重；
-# 与 qqflow 监听器一致）。被去重挡下的消息未标记 processed，回填窗口内可恢复
+# 同一事件重复进管道（上游文档建议接收端按 event+rawid 去重，与 qqflow 监听器一致）；
+# 被去重挡下的消息未标记 processed，回填窗口内可恢复
 _SEEN_LIMIT = 1024
 
 # 周期统计上报间隔（秒）
