@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import contextlib
+import os
 import re
 import subprocess
 import unicodedata
@@ -354,19 +355,29 @@ def scan_shape(text: str, rel: str) -> dict[str, Any]:
     }
 
 
+def _parse_ls_files(stdout: bytes) -> list[str]:
+    """NUL 边界切分 git ls-files -z 的字节输出，逐路径 os.fsdecode。
+
+    不走文本模式：默认 core.quotePath=true 下非 ASCII 路径会被转义成
+    "\346\226\207\346\241\243.md" 形态，守卫会拿转义名开文件直接 FileNotFoundError；
+    且文本模式的通用换行转换会破坏二进制安全读法。os.fsdecode 按
+    sys/filesystem encoding 还原路径（与 pathlib 打开文件的解码口径一致）。
+    """
+    return [os.fsdecode(path) for path in stdout.split(b"\0") if path]
+
+
 def tracked_markdown() -> list[str]:
+    """列出全部 tracked Markdown 的相对路径（字节安全解析）。"""
     with contextlib.chdir(ROOT):
         result = subprocess.run(
-            ["git", "ls-files", "*.md"],
+            ["git", "ls-files", "-z", "*.md"],
             capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
             check=False,
         )
     if result.returncode != 0:
-        raise RuntimeError(f"git ls-files 失败：{result.stderr.strip()}")
-    return [line for line in result.stdout.splitlines() if line.strip()]
+        stderr = result.stderr.decode("utf-8", errors="replace").strip()
+        raise RuntimeError(f"git ls-files 失败：{stderr}")
+    return _parse_ls_files(result.stdout)
 
 
 def ensure_files(files: list[str]) -> list[str]:
@@ -418,6 +429,14 @@ class DocStyleGuardTest(unittest.TestCase):
     def test_clean_sample_passes(self) -> None:
         text = "# 标题\n\n## 目录\n\n- [节](#节)\n\n## 节\n\n一句话结论。\n"
         self.assertEqual(scan_shape(text, "clean")["problems"], [])
+
+    def test_parse_ls_files_bytes(self) -> None:
+        # 非 ASCII 路径与结尾 NUL：文本模式会把前者转义成 "\346..." 形态，
+        # 守卫拿转义名开文件直接 FileNotFoundError；字节解析必须原样还原
+        name = "文档.md"
+        raw = name.encode("utf-8") + b"\0" + b"README.md\0"
+        self.assertEqual(_parse_ls_files(raw), [name, "README.md"])
+        self.assertEqual(_parse_ls_files(b""), [])
 
     def test_fence_interior_comment_not_misclassified(self) -> None:
         # 围栏内的 <!-- 是代码内容：不得开启注释状态吞掉闭合围栏，
