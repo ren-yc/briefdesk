@@ -4,17 +4,25 @@ from __future__ import annotations
 
 import json
 import logging
+import time
+from datetime import date, timedelta
 from pathlib import Path
 
 import pytest
 
 from briefdesk import telemetry
+from briefdesk.config import config
 
 
 @pytest.fixture(autouse=True)
 def _reset(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     telemetry.reset_for_tests()
     monkeypatch.setattr(telemetry, "telemetry_dir", lambda: tmp_path / "tel")
+    # 固定为开启：本文件的断言都是「记录确实发生了」。宿主 shell 若导出了
+    # TELEMETRY_ENABLED=false，config 单例在 import 期就已经是关的——
+    # conftest 的清环境夹具晚于 import，改不了已构造的实例，只有在此覆盖
+    # 才与宿主无关；关闭语义的用例自己再改成 False。
+    monkeypatch.setattr(config, "telemetry_enabled", True)
     yield
     telemetry.reset_for_tests()
 
@@ -265,3 +273,102 @@ def test_snapshot_json_safe() -> None:
     snap = telemetry.snapshot()
     encoded = json.dumps(snap, ensure_ascii=False)
     assert "k|s" in encoded
+
+
+def test_disabled_switch_skips_recording_and_disk(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """关闭后四个入口全部早退：不计数、不落盘，连目录都不建。
+
+    失败模式：门只加在 flush 上时，进程照样在热路径累计计数，用户关掉开关
+    只换来「不写盘」——内存里的量仍在涨，任何一次 snapshot 都能看到被记录
+    的内容。
+    """
+    monkeypatch.setattr(config, "telemetry_enabled", False)
+    telemetry.record("judge.call", "weflow")
+    telemetry.observe("judge.latency", 12.0, "weflow")
+    telemetry.record_cosine_truth("weflow", 0.9, True)
+    snap = telemetry.snapshot()
+    assert snap["counters"] == {}
+    assert snap["latencies"] == {}
+    assert telemetry.cosine_truth_rows() == []
+    telemetry.flush()
+    assert not (tmp_path / "tel").exists(), "关闭时不得创建落盘目录"
+
+
+def test_switch_is_read_per_call(monkeypatch: pytest.MonkeyPatch) -> None:
+    """开关每次调用现读：先关后开能立刻恢复记录。
+
+    失败模式：把开关缓存成模块级常量后，「重启后生效」悄悄变成「导入时
+    生效」——本进程内无论怎么改配置都停在导入时的状态。
+    """
+    monkeypatch.setattr(config, "telemetry_enabled", False)
+    telemetry.record("a")
+    assert telemetry.snapshot()["counters"] == {}
+    monkeypatch.setattr(config, "telemetry_enabled", True)
+    telemetry.record("a")
+    assert telemetry.snapshot()["counters"] == {"a|": 1}
+
+
+def _dated_name(prefix: str, days_ago: int) -> str:
+    # 与写入侧同口径的本地日历日（见 telemetry._prune_expired）
+    today = date(*time.localtime()[:3])
+    return f"{prefix}-{(today - timedelta(days=days_ago)):%Y%m%d}.jsonl"
+
+
+def test_flush_prunes_only_expired_dated_files(tmp_path: Path) -> None:
+    """保留期只删「过期 + 严格命名 + 直属」的文件，其余一律不碰。
+
+    失败模式：宽 glob 或递归删除会连中间文件（`latest.json.tmp`）与用户自行
+    放进目录的东西一起删；只按前缀匹配则任何自定义名字都会被误判成年纪。
+    本用例故意不产生任何计数——空快照轮次同样要清理，否则「永远没有 AI
+    流量」的部署永远等不到清理。
+    """
+    target = tmp_path / "tel"
+    target.mkdir()
+    expired_snapshot = _dated_name("telemetry", 15)
+    keep_snapshot = _dated_name("telemetry", 14)
+    expired_truth = _dated_name("cosine_truth", 181)
+    keep_truth = _dated_name("cosine_truth", 180)
+    unrelated = ["latest.json", "latest.json.tmp", "notes.jsonl", "telemetry-weekly.jsonl"]
+    for name in [expired_snapshot, keep_snapshot, expired_truth, keep_truth, *unrelated]:
+        (target / name).write_text("x\n", encoding="utf-8")
+    telemetry.flush()
+    remaining = {p.name for p in target.iterdir()}
+    assert expired_snapshot not in remaining, "15 天前的快照应被删除"
+    assert expired_truth not in remaining, "181 天前的余弦真值应被删除"
+    assert {keep_snapshot, keep_truth, *unrelated} <= remaining, "未过期与不匹配的文件必须保留"
+
+
+def test_empty_snapshot_keeps_previous_latest(tmp_path: Path) -> None:
+    """空快照不覆盖 latest.json，也不追加当日快照行。
+
+    失败模式：重启后第一个轮询周期通常没有 AI 流量，无条件覆盖会把上一会话
+    的验收读数清成空——读数窗口从「上次有流量」塌缩成「本次启动」。
+    """
+    telemetry.record("judge.call", "weflow")
+    telemetry.flush()
+    target = tmp_path / "tel"
+    latest = target / "latest.json"
+    before = latest.read_text(encoding="utf-8")
+    daily = next(target.glob("telemetry-*.jsonl"))
+    lines_before = len(daily.read_text(encoding="utf-8").strip().splitlines())
+    # 模拟重启：内存清空、节流窗口归零，落盘文件保留
+    telemetry.reset_for_tests()
+    telemetry.flush()
+    assert latest.read_text(encoding="utf-8") == before
+    assert len(daily.read_text(encoding="utf-8").strip().splitlines()) == lines_before
+
+
+def test_empty_snapshot_still_flushes_cosine_truth(tmp_path: Path) -> None:
+    """空快照守卫只拦快照：待落盘的余弦真值照常增量写入。
+
+    否则只有余弦真值、没有 AI 计数的轮次会把标定样本一直留在内存里，进程
+    退出即丢——而这正是「合并预筛跑过一轮但没走判官」的典型形态。
+    """
+    telemetry.record_cosine_truth("weflow", 0.42, False)
+    telemetry.flush()
+    target = tmp_path / "tel"
+    assert not (target / "latest.json").exists()
+    truth = next(target.glob("cosine_truth-*.jsonl"))
+    assert len(truth.read_text(encoding="utf-8").strip().splitlines()) == 1

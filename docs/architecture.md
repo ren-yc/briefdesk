@@ -277,6 +277,8 @@ else:
 
 最小遥测集（验收门基线测量的基础设施）：进程内计数器（`record(kind, source)`）与耗时样本窗口（`observe(kind, ms, source)`，上限抽稀保窗口、全量 count/total 独立累计）+ merge 余弦-真值明细（`record_cosine_truth(source, cosine, verdict)`，预筛门限 ROC 标定输入）。全部记录入口与读路径（`snapshot`/`format_summary`）兜底吞异常——遥测故障绝不连坐判定路径。AI 调用计时在 `ai_ports.chat` 统一挂（调用方传 `telemetry_kind` 标注任务维度，如 `judge.dedup`/`classify.sysb`；取消单列 `.cancelled` 不进延迟分布，失败记 `.error`）。落盘用户数据目录 `telemetry/`：`latest.json`（验收门读数入口）、每日 `telemetry-YYYYMMDD.jsonl`（快照流）、每日 `cosine_truth-YYYYMMDD.jsonl`（标定明细，权威存储；内存只是待写缓冲，flush 增量追加）。写盘点只有轮询周期尾部（`poll_cycle` 汇总 + flush，30s 节流，失败后窗口内不重试防风暴）。
 
+**开关与保留期**：`TELEMETRY_ENABLED`（默认开、重启生效）关闭时四个入口（`record`/`observe`/`record_cosine_truth`/`flush`）在**建目录之前**早退——不计数、不写入，已落盘文件原样保留（关闭不等于清理）。开关每次调用现读配置单例，不缓存成模块常量（缓存会把「重启后生效」退化成「导入时生效」），也不在热路径构造 `Settings()`（构造走密钥环）。`flush` 的执行顺序固定：开关门 → 节流 → 建目录 → 清理过期文件 → `snapshot()` → 条件写快照 → 增量写余弦真值；清理只删**直属且严格命名**的文件（快照 14 天、余弦-真值 180 天，本地日期口径，`latest.json.tmp` 一类中间文件不匹配），且随同步触发而非日历触发——空闲进程不清理是接受的，代价只是多留几天文件；余弦-真值留长是因为消费者（标定脚本）在仓外，静默删除等于丢掉预筛门限的唯一标定输入。快照为空（本进程无任何计数与耗时样本）时跳过 `latest.json` 与当日快照行：重启后首个轮询周期通常没有 AI 流量，无条件覆盖会把上一会话的验收读数清成空；待落盘的余弦真值不受该守卫影响，照常增量写入。汇总行打 DEBUG（默认 INFO 下每轮一行近千字符会把业务行冲散），验收读数以落盘的 `latest.json` 为准。
+
 #### briefdesk/negcache.py
 
 去重判官负向缓存（判官减负）：记录「完全相同的判官输入 → DIFFERENT」的确定性结论，命中时判官直接返回 False（该候选照常按 DIFFERENT 参与各自门禁计权），省掉一次 AI 调用。对子键 = `(query_key(title, quote), item_id)`——查询侧取判官输入文本哈希而非消息 id：判定是两段文本的函数，文本相同判定即相同；且查询消息在判定时点还没有 item_id。**只缓存 False**：None（判定未知）与 True（SAME 后通常触发合并改写）都不是可复用的确定性结论；候选缺 id（测试桩/异常形状）降级直通判官不写脏键。`NegativeCache` 实例归 `DedupEngine` 所有（基准引擎每用例新建即天然隔离），OrderedDict LRU 上限 `DEFAULT_NEGCACHE_CAPACITY`（5 万对量级）+ item 侧反向索引（item_id → 对子键集），失效统一「使该 item 全部对子失效」。
@@ -289,7 +291,7 @@ else:
 
 #### briefdesk/config.py
 
-`pydantic-settings` 从两个独立来源读取（项目根 .env 高于 UI 暂存文件；密钥型字段以 `SecretStr` 持有，repr/序列化自动掩码；解析链见「配置解析链」小节）。含 `plugins`（`PLUGINS`，默认 `[]`，JSON 数组，无通配语义，只过滤**可选插件**——不列出即禁用；核心插件恒装配，亦可在设置页「插件」面板逐个开关）、`plugins_required`/`plugin_path`、`db_path`（`DB_PATH`，默认 `paths.database_path()`——用户数据目录 `data/briefdesk.sqlite`；相对路径按 cwd 解析、`~` 不展开）、`server_port`（3000）、`backfill_hours`（24）、`log_level`（`LOG_LEVEL`，默认 `"INFO"`，logger.py 读取）、`realtime_batch_max_count`/`realtime_batch_timeout_ms`（实时批缓冲，跨源公共）、`backfill_batch_max_count`（回填切批）、AI 模型等。
+`pydantic-settings` 从两个独立来源读取（项目根 .env 高于 UI 暂存文件；密钥型字段以 `SecretStr` 持有，repr/序列化自动掩码；解析链见「配置解析链」小节）。含 `plugins`（`PLUGINS`，默认 `[]`，JSON 数组，无通配语义，只过滤**可选插件**——不列出即禁用；核心插件恒装配，亦可在设置页「插件」面板逐个开关）、`plugins_required`/`plugin_path`、`db_path`（`DB_PATH`，默认 `paths.database_path()`——用户数据目录 `data/briefdesk.sqlite`；相对路径按 cwd 解析、`~` 不展开）、`server_port`（3000）、`backfill_hours`（24）、`log_level`（`LOG_LEVEL`，默认 `"INFO"`，logger.py 读取）、`telemetry_enabled`（`TELEMETRY_ENABLED`，默认 `true`，本地运行指标开关，重启生效）、`realtime_batch_max_count`/`realtime_batch_timeout_ms`（实时批缓冲，跨源公共）、`backfill_batch_max_count`（回填切批）、AI 模型等。
 
 插件专属配置（`WEFLOW_*`/`WEFLOW_LEGACY_*`/`QQFLOW_*`/`RAG_*`）在各插件包的 `config.py`，不占 app 级配置——前缀归插件所有，核心 `Settings` 不得声明同前缀字段（会被 `build_settings_schema` 派生成「核心密钥」抢占插件条目）。
 
@@ -721,6 +723,7 @@ All via `.env` file, with an additional UI-staged overlay layer (see 「配置�
 - **`BRIEFDESK_DATA_DIR` / `BRIEFDESK_CACHE_DIR`**：默认平台用户数据/缓存目录（Windows `%LOCALAPPDATA%\briefdesk` 与 `%LOCALAPPDATA%\briefdesk\Cache`）。数据/缓存目录覆盖（**只读进程环境变量**，写进 `.env` 无效）：数据库、Benchmark 用例与报告、运行目录都随之迁移。
 - **`BRIEFDESK_SETTINGS_FILE`**：默认用户配置目录下的 `settings.env`。UI 暂存配置文件覆盖（**只读进程环境变量**）。
 - **`SERVER_PORT`**：默认 `3000`。FastAPI/uvicorn port。
+- **`TELEMETRY_ENABLED`**：默认 `true`。本地运行指标开关（只记计数与耗时，**不含消息正文**）：关闭后不再计数也不落盘，已落盘文件保留；重启后生效，只约束本进程（基准子进程按自己的配置解析）。保留期：快照 14 天、余弦-真值明细 180 天，随同步触发清理。
 
 ### benchmark 插件
 

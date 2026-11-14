@@ -188,6 +188,15 @@ class Settings(KeyringSettingsBase):
     log_level: str = Field(default="INFO", alias="LOG_LEVEL")
     """日志级别（DEBUG / INFO / WARNING / ERROR / CRITICAL），由 logger.py 读取。"""
 
+    telemetry_enabled: bool = Field(default=True, alias="TELEMETRY_ENABLED")
+    """本地运行指标（遥测）开关：关闭后不再计数、不再落盘，已落盘的指标文件
+    保留不动——关闭不等于清理；清理挂在落盘上，因此关闭期间也不会淘汰旧文件，
+    重新开启后按保留期补删。
+
+    重启后生效（配置是启动期单例，与其它设置项同口径）。默认开启：记录只含
+    计数与耗时、不含消息正文，且判定门限的标定与故障诊断都依赖真实运行积累
+    的数据。开关只约束本进程，基准子进程按它自己的配置解析。"""
+
     model_config: ClassVar[SettingsConfigDict] = {"populate_by_name": True}
 
 

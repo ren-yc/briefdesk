@@ -125,6 +125,7 @@ pip 会把两个索引合并后取最高版本，而 TestPyPI 上存在别人试
 - 环境变量：`EMBED_BATCH_SIZE` — 默认：`20`；说明：单次嵌入请求的批量条数（历史缓存加载 + 逐批预嵌入共用）
 - 环境变量：`DEDUP_SIMILARITY_THRESHOLD` / `DEDUP_EMBED_THRESHOLD` / `DEDUP_EMBED_TOP_K` / `DEDUP_EMBED_FALLBACK_THRESHOLD` / `DEDUP_STRONG_THRESHOLD` — 默认：`0.07` / `0.80` / `3` / `0.65` / `0.99`；说明：去重预筛与 AI 判重门禁阈值（`DEDUP_SIMILARITY_THRESHOLD` 为标题 bigram Jaccard 口径，默认值已按该口径重标定；换度量或换数据集后重新标定用 `scripts/recalibrate_similarity.py`）
 - 环境变量：`LOG_LEVEL` — 默认：`INFO`；说明：日志级别（DEBUG 开逐条细节，并放出 uvicorn 的 HTTP 请求日志——默认静默以免逐请求刷屏）
+- 环境变量：`TELEMETRY_ENABLED` — 默认：`true`；说明：本地运行指标开关（只记计数与耗时，不含消息正文；写入用户数据目录 `telemetry/`，不外发）。关闭后不再计数也不写入，已生成的文件保留；重启生效，只约束本进程
 - 环境变量：`DB_PATH` / `SERVER_PORT` — 默认：用户数据目录 `data/briefdesk.sqlite` / `3000`；说明：SQLite 路径 / Web 端口
 
 > 配置说明：`.env` 以项目根目录为基准解析，从任意目录启动（`python main.py` / `python -m briefdesk` / `briefdesk`）都会读到同一份配置——**仅限源码 / editable 安装**；发布版（wheel）不读任何隐式 `.env`，配置走进程环境变量或设置页。默认数据库落在平台用户数据目录（Windows `%LOCALAPPDATA%\briefdesk\data\briefdesk.sqlite`），可用 `DB_PATH` 覆盖（显式相对路径按当前工作目录解析，`~` 不展开）。
@@ -191,6 +192,7 @@ A: 需同时满足：`AI_VISION_ENABLED=true`、`ocr` 插件已启用、模型�
 所有数据留在本地 SQLite；使用外部 AI 端点时，消息文本会随分类请求外发给所选供应商，图片外发与旧数据边界是另两处需要单独确认的风险。
 
 - 所有数据存于本地 SQLite，默认落在平台用户数据目录（Windows `%LOCALAPPDATA%\briefdesk\data\briefdesk.sqlite`，可经 `DB_PATH` 覆盖）。
+- **本地运行指标不外发**：应用在本机记录 AI 调用次数、各阶段耗时与合并判定的余弦-真值（**不含消息正文**），写入用户数据目录 `telemetry/`，不上传任何地方。可在设置页关闭（`TELEMETRY_ENABLED`，重启生效）：关闭后不再写入，已生成的文件保留；快照保留 14 天，余弦-真值明细保留 180 天（清理随同步执行，关闭期间不清理）。
 - **文本会发送给 AI 供应商**：AI 分类请求包含群名、发送者名与消息文本（正文语义内容原样外发）。文本脱敏（手机号/身份证/邮箱/银行卡替换为占位符）只覆盖常见写法，**不是全面保证**——带括号等不常见分隔符的手机号（如 `+86 (138) 0013-8000`）不会被替换、会原样外发，敏感文本请按此自行评估。不用外部 AI 端点（本地模型）时不存在该外发。
 - **文本脱敏不遮盖图片内容**：开启视觉输入（`AI_VISION_ENABLED`，需 `ocr` 插件）时，消息图片会经归一化后 **连同图片像素一并发送给所选模型供应商**——OCR 识别出的文字会被掩码，但图片里的文字、人脸等内容不经过任何脱敏。是否开启视觉输入，请按你与所选供应商之间的数据约定自行决定。
 - **密钥存储分两条路**：系统钥匙串（`briefdesk secrets set` / UI 密钥区，Windows 为凭据管理器/DPAPI）中的密钥随用户账号加密、不落明文；写在 `.env` 里的密钥是**明文文件**——含密钥的 `.env` 不要提交版本库（已在 `.gitignore` 排除）、不要随网盘/备份/截图连带分享。
@@ -207,6 +209,7 @@ A: 需同时满足：`AI_VISION_ENABLED=true`、`ocr` 插件已启用、模型�
 - 内容：UI 暂存配置 — 位置（Windows）：`%LOCALAPPDATA%\briefdesk\settings.env`；覆盖入口：`BRIEFDESK_SETTINGS_FILE`
 - 内容：基准用例与报告 — 位置（Windows）：`%LOCALAPPDATA%\briefdesk\benchmark\{cases,reports}\`；覆盖入口：`BRIEFDESK_DATA_DIR`
 - 内容：基准运行目录 — 位置（Windows）：`%LOCALAPPDATA%\briefdesk\Cache\benchmark\runs\`；覆盖入口：`BRIEFDESK_CACHE_DIR`
+- 内容：本地运行指标（快照与余弦-真值明细） — 位置（Windows）：`%LOCALAPPDATA%\briefdesk\telemetry\`；覆盖入口：`BRIEFDESK_DATA_DIR`
 
 `BRIEFDESK_DATA_DIR` / `BRIEFDESK_CACHE_DIR` / `BRIEFDESK_SETTINGS_FILE` **只读进程环境变量**
 （写进 `.env` 无效）；macOS / Linux 走各自平台约定目录（platformdirs）。
