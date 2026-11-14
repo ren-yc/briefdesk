@@ -91,13 +91,22 @@ def _clip_desc(text: str) -> str:
 
 
 async def judge_merge(
-    title_a: str, desc_a: str, title_b: str, desc_b: str
+    title_a: str,
+    desc_a: str,
+    title_b: str,
+    desc_b: str,
+    *,
+    source: str = "",
 ) -> bool | None:
     """AI 判定两张卡是否同话题片段（应合并）。
 
     返回 True/False 为判官结论；判官不可用/解析失败返回 None
     （调用方保守不合并；None 区别于明确的 False——失败不构成判定依据，
     观察型插件据此跳过记录）。
+
+    source 只进遥测维度：调用方传**触发本次判定的新消息侧**（生产是落库的
+    那条新消息、基准是用例自带源），与余弦-真值记录同侧——两处口径必须
+    一致，否则「耗时按源分布」和「真值按源分布」指向不同的源，读数无法互证。
     """
     desc_a = _clip_desc(desc_a)
     desc_b = _clip_desc(desc_b)
@@ -118,6 +127,7 @@ async def judge_merge(
                 timeout=_JUDGE_TIMEOUT,
                 max_retries=0,  # SDK 重试会把锁内单次判官最坏耗时放大 3 倍
                 telemetry_kind="judge.merge",
+                telemetry_source=source,
             )
         except Exception as e:  # noqa: BLE001 — 判官失败应保守不合并，不能中断管道
             logger.warning("合并判官请求失败（保守不合并）: %s", e)
@@ -206,8 +216,13 @@ def _parse_title(content: str, *, repair: bool = True) -> str | None:
     return title
 
 
-async def summarize_title(old_title: str, key_info: str, quote: str) -> str | None:
-    """合并后重拟标题：依据合并内容生成概括性标题；失败返回 None（回退原标题）。"""
+async def summarize_title(
+    old_title: str, key_info: str, quote: str, *, source: str = ""
+) -> str | None:
+    """合并后重拟标题：依据合并内容生成概括性标题；失败返回 None（回退原标题）。
+
+    source 只进遥测维度，口径同 `judge_merge`（触发本次判定的新消息侧）。
+    """
     try:
         resp = await chat(
             messages=[
@@ -224,6 +239,7 @@ async def summarize_title(old_title: str, key_info: str, quote: str) -> str | No
             timeout=_JUDGE_TIMEOUT,
             max_retries=0,  # 标题重拟同样在锁内，禁用 SDK 重试
             telemetry_kind="title.merge",
+            telemetry_source=source,
         )
     except Exception as e:  # noqa: BLE001 — 标题重拟失败应回退原标题，不能中断合并
         logger.warning("重拟标题请求失败（回退原标题）: %s", e)

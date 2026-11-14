@@ -161,7 +161,12 @@ class MergePlugin(StagePlugin):
                     telemetry.record("merge.prefilter_skip", row.msg.source)
                     continue
                 same = await judge_merge(
-                    cand["title"] or "", cand_desc, row.title, new_desc
+                    cand["title"] or "",
+                    cand_desc,
+                    row.title,
+                    new_desc,
+                    # 源维度取新消息侧（tail）：与下方余弦-真值记录同侧
+                    source=row.msg.source,
                 )
                 # 余弦-真值旁路记录（含 None=判官不可用；余弦须在合并改写
                 # 缓存前取，此处时点正确）。预筛门放行后才记录：被门挡下的
@@ -293,7 +298,7 @@ class MergePlugin(StagePlugin):
                 # 合并后重拟标题：卡片内容已变，头句未必概括合并后的完整话题；
                 # 重拟失败（None）保守回退原标题
                 merged_title = await summarize_title(
-                    merged_title, merged_key, merged_quote
+                    merged_title, merged_key, merged_quote, source=row.msg.source
                 ) or merged_title
                 # 重拟标题观察记录（期望关键词由观察方从 key_info 拆分——来自
                 # 分类阶段而非本判官，可作独立 ground truth）

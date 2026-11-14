@@ -62,9 +62,35 @@ class TestChatTelemetry:
         provider.chat = AsyncMock(return_value=_resp())
         ai_ports.set_ai(provider)
         await ai_ports.chat([{"role": "user", "content": "x"}], temperature=0.1, max_tokens=4,
-                            telemetry_kind="k")
+                            telemetry_kind="k", telemetry_source="weflow")
         _args, kwargs = provider.chat.await_args
         assert "telemetry_kind" not in kwargs
+        # 源维度同理：只是端口层的读数标注，供应商的参数集不因遥测变化
+        assert "telemetry_source" not in kwargs
+
+    async def test_source_dimension_lands_in_counters_and_latency(self):
+        provider = Mock()
+        provider.chat = AsyncMock(return_value=_resp())
+        ai_ports.set_ai(provider)
+        await ai_ports.chat([{"role": "user", "content": "x"}], temperature=0.1,
+                            max_tokens=4, telemetry_kind="judge.dedup",
+                            telemetry_source="weflow")
+        snap = telemetry.snapshot()
+        assert snap["counters"]["judge.dedup.call|weflow"] == 1
+        entry = snap["latencies"]["judge.dedup.latency"]["weflow"]
+        assert entry["total_count"] == 1
+
+    async def test_error_bucket_carries_source(self):
+        provider = Mock()
+        provider.chat = AsyncMock(side_effect=RuntimeError("boom"))
+        ai_ports.set_ai(provider)
+        with pytest.raises(RuntimeError):
+            await ai_ports.chat([{"role": "user", "content": "x"}], temperature=0.1,
+                                max_tokens=4, telemetry_kind="judge.merge",
+                                telemetry_source="qqflow")
+        counters = telemetry.snapshot()["counters"]
+        assert counters["judge.merge.error|qqflow"] == 1
+        assert "judge.merge.call|qqflow" not in counters
 
     async def test_timeout_error_counts_and_enters_latency(self):
         provider = Mock()
@@ -143,3 +169,61 @@ class TestMergeCosineTruthBypass:
             self._ctx(stub), self._row(), {"id": "c1"}, True
         )
         assert telemetry.cosine_truth_rows() == []
+
+
+class TestJudgeSourceDimension:
+    """判官调用的源维度：去重取候选条目自带 source，合并取新消息侧 source。"""
+
+    async def test_dedup_judge_carries_item_source(self):
+        from briefdesk.plugins.dedup.engine import CachedItem, DedupEngine
+
+        provider = Mock()
+        provider.chat = AsyncMock(return_value=_resp('{"same": true}'))
+        ai_ports.set_ai(provider)
+        # 直接测单候选判定：它是「源维度从哪里来」的唯一连接点，走完整
+        # check_dedup 需要库与缓存装配，与本断言无关
+        verdict = await DedupEngine()._ask_ai(
+            CachedItem(id="i1", title="标题", source="weflow", source_quote="原文"),
+            "候选标题",
+            "候选原文",
+        )
+        assert verdict is True
+        assert telemetry.snapshot()["counters"]["judge.dedup.call|weflow"] == 1
+
+    async def test_merge_judge_carries_tail_source(self):
+        from briefdesk.plugins.merge.engine import judge_merge
+
+        provider = Mock()
+        provider.chat = AsyncMock(return_value=_resp('{"merge": false}'))
+        ai_ports.set_ai(provider)
+        assert await judge_merge("a", "b", "c", "d", source="qqflow") is False
+        assert telemetry.snapshot()["counters"]["judge.merge.call|qqflow"] == 1
+
+    async def test_title_rewrite_carries_source(self):
+        from briefdesk.plugins.merge.engine import summarize_title
+
+        provider = Mock()
+        provider.chat = AsyncMock(return_value=_resp('{"title":"新标题"}'))
+        ai_ports.set_ai(provider)
+        assert await summarize_title("旧标题", "关键信息", "原文", source="bench") == "新标题"
+        assert telemetry.snapshot()["counters"]["title.merge.call|bench"] == 1
+
+
+class TestRagChatFallback:
+    """rag 专用通道回退单独计数：与「回答失败」是两种不同故障。"""
+
+    async def test_counted_when_provider_lacks_rag_chat(self):
+        provider = Mock()  # Mock 类没有声明 rag_chat → 走回退分支
+        provider.chat = AsyncMock(return_value=_resp())
+        ai_ports.set_ai(provider)
+        await ai_ports.rag_chat([{"role": "user", "content": "q"}])
+        assert telemetry.snapshot()["counters"]["rag.chat_fallback|"] == 1
+
+    async def test_not_counted_when_specialized_channel_exists(self):
+        class _Modern(Mock):
+            async def rag_chat(self, messages, **kwargs):
+                return _resp()
+
+        ai_ports.set_ai(_Modern())
+        await ai_ports.rag_chat([{"role": "user", "content": "q"}])
+        assert "rag.chat_fallback|" not in telemetry.snapshot()["counters"]

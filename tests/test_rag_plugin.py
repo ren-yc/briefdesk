@@ -839,6 +839,15 @@ class TestRagAsk(_MemoryEngineBase):
         await self._index([_msg("m1", "周六6点开会有通知")])
         yield
 
+    @pytest.fixture(autouse=True)
+    def _clean_telemetry(self):
+        """计数器是进程级全局：本类断言精确值，前后都清干净。"""
+        from briefdesk import telemetry
+
+        telemetry.reset_for_tests()
+        yield
+        telemetry.reset_for_tests()
+
     async def test_answer_with_citation_subset(self):
         result = await self.engine.ask("周六6点开会有通知")
         assert not result.refused
@@ -926,6 +935,77 @@ class TestRagAsk(_MemoryEngineBase):
         result = await self.engine.ask("周六6点开会有通知")
         assert [c["msg_id"] for c in result.citations] == ["m1"]
 
+
+    async def test_telemetry_identity_across_terminal_buckets(self):
+        """五桶恒等式：ask = refused + answered + retrieve_error + answer_error + cancelled。
+
+        失败模式：分母计在检索之后时，检索异常连分母都没有；取消路径漏桶时
+        ask 已计而终态桶全空（CancelledError 是 BaseException，`except
+        Exception` 兜不住）。两者都会让读数显示「零失败」，把故障藏起来。
+        """
+        from briefdesk import telemetry
+
+        await self.engine.ask("周六6点开会有通知")  # answered
+        await self.engine.ask("完全不相关的问题")  # refused（不调 AI）
+        with patch.object(
+            self.engine,
+            "retrieve",
+            new=AsyncMock(side_effect=RuntimeError("embed down")),
+        ), pytest.raises(RuntimeError):
+            await self.engine.ask("周六6点开会有通知")  # retrieve_error
+        self.provider.chat = AsyncMock(side_effect=RuntimeError("ai down"))
+        with pytest.raises(RuntimeError):
+            await self.engine.ask("周六6点开会有通知")  # answer_error
+        self.provider.chat = AsyncMock(side_effect=asyncio.CancelledError())
+        with pytest.raises(asyncio.CancelledError):
+            await self.engine.ask("周六6点开会有通知")  # cancelled
+
+        counters = telemetry.snapshot()["counters"]
+        assert counters["rag.ask|"] == 5
+        terminal = sum(
+            counters.get(f"rag.{name}|", 0)
+            for name in (
+                "refused",
+                "answered",
+                "retrieve_error",
+                "answer_error",
+                "cancelled",
+            )
+        )
+        assert terminal == 5, counters
+
+    async def test_citation_fallback_counted_when_regex_hits(self):
+        """纯文本回答靠正文 [n] 捡回引用 → 记 citation_fallback。
+
+        两种回退的失败模式不同：这里丢的是 JSON 引用契约（结构化引用），
+        rag.chat_fallback 丢的是模型 override——混成一个桶就分不出是哪种。
+        """
+        from briefdesk import telemetry
+
+        self.provider.chat = AsyncMock(
+            return_value=_chat_response("活动在周六6点举行 [1]。")
+        )
+        await self.engine.ask("周六6点开会有通知")
+        counters = telemetry.snapshot()["counters"]
+        assert counters["rag.citation_fallback|"] == 1
+        assert counters["rag.answered|"] == 1
+
+    async def test_citation_fallback_not_counted_without_marks(self):
+        from briefdesk import telemetry
+
+        self.provider.chat = AsyncMock(return_value=_chat_response("活动在周六6点。"))
+        await self.engine.ask("周六6点开会有通知")
+        # 正则一无所获属另一形态（回退全部证据），不计入契约回退
+        assert "rag.citation_fallback|" not in telemetry.snapshot()["counters"]
+
+    async def test_citation_fallback_not_counted_with_explicit_citations(self):
+        from briefdesk import telemetry
+
+        self.provider.chat = AsyncMock(
+            return_value=_chat_response('{"answer":"没有相关依据。","citations":[]}')
+        )
+        await self.engine.ask("周六6点开会有通知")
+        assert "rag.citation_fallback|" not in telemetry.snapshot()["counters"]
 
     async def test_evidence_chars_setting_truncates_prompt(self):
         # RAG_EVIDENCE_CHARS 传入证据构造：超长消息在 prompt 内被截断并标注

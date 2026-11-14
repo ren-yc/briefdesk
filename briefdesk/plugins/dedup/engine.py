@@ -590,6 +590,9 @@ class DedupEngine(DedupService):
         None 及 `_collect_verdicts` 的异常整形一致。绝不能返回 False 冒充
         明确 DIFF 判定：strong 短路路径会据此剔除候选，把"最强证据从未
         成立"伪装成"已否证"，令多数票的分母悄然变小。"""
+        # 源维度只是读数标注：取属性这一步不能连坐判定——候选用鸭子类型
+        # （测试桩/异常形状）时缺 source 也只该退化成空维度，而不是抛错。
+        source = getattr(a, "source", "")
         for attempt in (1, 2):
             try:
                 resp = await chat(
@@ -605,6 +608,9 @@ class DedupEngine(DedupService):
                     timeout=_JUDGE_TIMEOUT,
                     max_retries=0,  # SDK 重试会把锁内单次判官最坏耗时放大 3 倍
                     telemetry_kind="judge.dedup",
+                    # 源维度取候选条目自带值（CachedItem.source，装载 SQL 已含该列）：
+                    # 混合源部署下才分得清哪一路的去重判官在拖耗时
+                    telemetry_source=source,
                 )
             except Exception as e:
                 # 仅 DEBUG：判定失败是被容错的（调用方 _judge_* 按"该候选降级/
