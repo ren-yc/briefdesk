@@ -68,6 +68,11 @@ powershell -ExecutionPolicy Bypass -File scripts/install-hooks.ps1
   - 冒烟取索引元数据时会先等该版本挂出来（上传到可见有秒级延迟，立刻失败会把「索引延迟」报成「版本不存在」）。
   - 只允许从 `master` 触发；正式索引的版本必须等于 `pyproject.toml` 的静态值（脚本强校验），试发版本（`0.1.0.devN` / `0.1.0rc1`）只在构建期写入并逐字节还原，仓库里永不落地。
   - 一次性配置：GitHub environments `testpypi` / `pypi`（后者配 Required reviewers），两个索引各登记 trusted publisher（Owner `ren-yc`、Repository `briefdesk`、Workflow `publish.yml`）。
+- **打 tag 与变更说明**：
+  - 本仓**不建 GitHub Release**：变更说明进仓库根目录的 `CHANGELOG.md`，按「新增 / 变更 / 破坏性变更 / 修复」分组，每条带可搜索的回归位置（测试函数名 / 用例 id），未发布的改动先记在 `[Unreleased]` 下。
+  - tag 在正式索引上传**成功之后**打：`publish.yml` 的 `pypi` 目标上传成功、`verify` 双路径绿之后再动。索引版本不可撤回，上传失败往往要改版本重发，先打 tag 会留下指向未发布版本的 tag，删它得 force-push。
+  - 形态：annotated + GPG 签名，消息用 `briefdesk X.Y.Z` 一行（与既有 tag 同形），变更细节写进 `CHANGELOG.md`、不在消息里重复。
+  - 指向：`master` 上「含该版本号、且 `publish.yml` 实际构建」的那个提交，不是 PR 分支上的提交。
 - **写入路径覆盖分工**（只发 GET 证明不了写入隔离，两侧都要看：冒烟在 CI 的 `wheel-smoke` job，隔离回归在 `isolation-smoke` job）：
 
 - 写入路径：配置保存（`PUT /api/settings/env`，带与端口一致的同源 `Origin`） — 覆盖位置：`scripts/wheel_smoke.py`
