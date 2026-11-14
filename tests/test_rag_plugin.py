@@ -840,11 +840,18 @@ class TestRagAsk(_MemoryEngineBase):
         yield
 
     @pytest.fixture(autouse=True)
-    def _clean_telemetry(self):
-        """计数器是进程级全局：本类断言精确值，前后都清干净。"""
+    def _clean_telemetry(self, monkeypatch: pytest.MonkeyPatch):
+        """计数器是进程级全局：本类断言精确值，前后都清干净。
+
+        固定成开启：宿主 shell 若导出 TELEMETRY_ENABLED=false，config 单例在
+        import 期就是关的，conftest 的清环境夹具晚于 import、改不了已构造的
+        实例——不覆盖的话「计数确实发生」的用例会以 KeyError 失败。
+        """
         from briefdesk import telemetry
+        from briefdesk.config import config
 
         telemetry.reset_for_tests()
+        monkeypatch.setattr(config, "telemetry_enabled", True)
         yield
         telemetry.reset_for_tests()
 
