@@ -66,6 +66,11 @@ FEATURES: tuple[str, ...] = ("classify", "dedup", "merge", "title")
 
 FROMWEB_SOURCE_LABEL = "cases/*.fromweb.json"  # 网页导出用例的 dataset 标识（报告/JSON 溯源）
 
+# 基准判官调用的遥测源维度**恒为这个值**，不用例自带 source：网页导出的用例会
+# 保留导出时那条卡片的真实源（weflow/qqflow），拿它当维度会让基准的调用次数与
+# 耗时混进生产桶——「基准流量单独成桶」就落空了，而基准正是要反复跑、批量跑的那一侧。
+_TELEMETRY_SOURCE = "bench"
+
 
 def provider_label(api_base: str) -> str:
     """端点的脱敏归类：只输出 `ollama` / `deepseek` / `custom`，空配置输出空串。
@@ -310,9 +315,8 @@ async def _run_merge(case: MergeCase) -> BinaryCaseEval:
         head_content,
         tail_title,
         tail_content,
-        # 基准流量单独成桶：用例自带来源（默认 "bench"），不与真实源混在一起。
-        # 取 tail 侧与生产同口径（触发判定的新消息侧）。
-        source=case.tail.source,
+        # 基准流量单独成桶：用例可能带着导出时的真实源，恒记 bench 才不与生产混
+        source=_TELEMETRY_SOURCE,
     )
     if merged is None:
         return BinaryCaseEval(
@@ -333,7 +337,10 @@ async def _run_title(case: TitleCase) -> TitleCaseEval:
     old_title = case.old_title or title
     key_info = case.key_info or case.message.key_info
     output = await summarize_title(
-        old_title, key_info, case.message.content, source=case.message.source
+        old_title,
+        key_info,
+        case.message.content,
+        source=_TELEMETRY_SOURCE,
     )
     return TitleCaseEval(
         case_id=case.id,

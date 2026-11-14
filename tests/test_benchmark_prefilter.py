@@ -7,12 +7,23 @@
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, patch
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 
 from briefdesk.plugins.benchmark import engine as bench_engine
 from briefdesk.plugins.benchmark import store as bench_store
+
+
+def _chat_resp(content: str) -> SimpleNamespace:
+    return SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                message=SimpleNamespace(content=content), finish_reason="stop"
+            )
+        ]
+    )
 
 
 def _merge_case() -> bench_store.MergeCase:
@@ -77,3 +88,80 @@ class TestMergePrefilterResilience:
         assert judge.await_count == 0, "低于阈值不应调用判官"
         assert result.predicted is False
         assert result.skipped is True
+
+
+class TestTelemetrySourceIsBenchOnly:
+    """基准判官的遥测恒记 bench：用例可能带着导出时的真实源。
+
+    网页导出的用例保留原卡片的 source（weflow/qqflow）：拿它当遥测维度，
+    基准反复批量跑产生的调用次数与耗时会混进生产桶，「基准流量单独成桶」失效。
+    """
+
+    async def test_merge_case_with_production_source_records_bench(self):
+        from briefdesk import ai_ports, telemetry
+        from briefdesk.config import config
+
+        telemetry.reset_for_tests()
+        case = bench_store.MergeCase.model_validate(
+            {
+                "id": "merge-1",
+                "head": {
+                    "msg_id": "m1",
+                    "content": "团购 价格",
+                    "title": "团购",
+                    "source": "weflow",
+                },
+                "tail": {
+                    "msg_id": "m2",
+                    "content": "补充 运费",
+                    "title": "补充",
+                    "source": "weflow",
+                },
+                "expected": {"merge": True},
+            }
+        )
+        # 走真实的 ai_ports.chat 包装（遥测在端口层记），只把供应商换成桩
+        provider = Mock()
+        provider.chat = AsyncMock(return_value=_chat_resp('{"merge": true}'))
+        provider.is_embedding_enabled = Mock(return_value=False)
+        ai_ports.set_ai(provider)
+        try:
+            with patch.object(config, "telemetry_enabled", True):
+                result = await bench_engine._run_merge(case)
+            counters = telemetry.snapshot()["counters"]
+        finally:
+            ai_ports.set_ai(None)
+            telemetry.reset_for_tests()
+        assert result.predicted is True
+        assert counters["judge.merge.call|bench"] == 1
+        assert not [k for k in counters if k.startswith("judge.merge.call|weflow")]
+
+    async def test_title_case_with_production_source_records_bench(self):
+        from briefdesk import ai_ports, telemetry
+        from briefdesk.config import config
+
+        telemetry.reset_for_tests()
+        case = bench_store.TitleCase.model_validate(
+            {
+                "id": "title-1",
+                "message": {
+                    "msg_id": "m1",
+                    "content": "团购 价格",
+                    "title": "团购",
+                    "source": "qqflow",
+                },
+                "expected": {"title": "团购（含运费）"},
+            }
+        )
+        provider = Mock()
+        provider.chat = AsyncMock(return_value=_chat_resp('{"title":"团购（含运费）"}'))
+        ai_ports.set_ai(provider)
+        try:
+            with patch.object(config, "telemetry_enabled", True):
+                await bench_engine._run_title(case)
+            counters = telemetry.snapshot()["counters"]
+        finally:
+            ai_ports.set_ai(None)
+            telemetry.reset_for_tests()
+        assert counters["title.merge.call|bench"] == 1
+        assert not [k for k in counters if k.startswith("title.merge.call|qqflow")]
