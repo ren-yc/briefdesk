@@ -305,7 +305,15 @@ async def _run_merge(case: MergeCase) -> BinaryCaseEval:
                         expected=case.expected.merge,
                         skipped=True,
                     )
-    merged = await judge_merge(head_title, head_content, tail_title, tail_content)
+    merged = await judge_merge(
+        head_title,
+        head_content,
+        tail_title,
+        tail_content,
+        # 基准流量单独成桶：用例自带来源（默认 "bench"），不与真实源混在一起。
+        # 取 tail 侧与生产同口径（触发判定的新消息侧）。
+        source=case.tail.source,
+    )
     if merged is None:
         return BinaryCaseEval(
             case_id=case.id,
@@ -324,7 +332,9 @@ async def _run_title(case: TitleCase) -> TitleCaseEval:
     title, _desc = card_fields(case.message)
     old_title = case.old_title or title
     key_info = case.key_info or case.message.key_info
-    output = await summarize_title(old_title, key_info, case.message.content)
+    output = await summarize_title(
+        old_title, key_info, case.message.content, source=case.message.source
+    )
     return TitleCaseEval(
         case_id=case.id,
         output=output,

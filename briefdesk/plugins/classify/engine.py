@@ -955,10 +955,13 @@ def _build_time_user_message(
     return "\n".join(parts)
 
 
-def _parse_times_response(content: str) -> dict[int, list[dict]]:
+def _parse_times_response(content: str) -> dict[int, list[dict]] | None:
     """解析时间提取 JSON → {index: [{"type","time","label"}, ...]}。
 
-    整体非法返回空 dict（调用方回退默认）；单条脏项只跳过该条。
+    解析失败返回 None，合法空产出返回 {}：`{"task":"times","data":[]}` 是
+    「模型答了、但没有时间点」，而纯文本、错 task 外壳、`data` 不是列表都是
+    「输出不可解析」——两者混成同一个 {} 会让影子汇总把解析失败记成「模型确实
+    没给时间」，系统性低估规则解析器的替换收益。单条脏项只跳过该条。
     """
     text = content.strip()
     if text.startswith("```"):
@@ -966,9 +969,12 @@ def _parse_times_response(content: str) -> dict[int, list[dict]]:
     text = _slice_json_root(text)
     raw = loads_json(text)
     if isinstance(raw, dict):
+        task = raw.get("task")
+        if isinstance(task, str) and task != "times":
+            return None  # 别的任务的输出（错壳）：不可解析，不是空产出
         raw = raw.get("data")  # 标准外壳 {"task":"times","data":[...]}；裸数组为旧格式兼容
     if not isinstance(raw, list):
-        return {}
+        return None
     data = raw
     out: dict[int, list[dict]] = {}
     for item in data:
@@ -1085,6 +1091,16 @@ async def _extract_times_core(
         await _extract_times_core(results, time_indexes[mid:], messages, depth - 1)
         return
     times_map = _parse_times_response(content)
+    if times_map is None:
+        # 必须提前 return：_apply_times_to_results 会直接 .get()，None 会在下一行
+        # 抛 AttributeError——而这条路径本该是「留空继续」，不是整批失败。
+        logger.warning(
+            "时间提取输出无法解析（start/end/times 留空）；原始输出：%s", content[:200]
+        )
+        _record_temporal_shadow(
+            results, time_indexes, messages, sysc_failed="parse_error"
+        )
+        return
     filled = _apply_times_to_results(results, times_map)
     logger.info(
         "时间提取: %d/%d 条（深度剩余 %d）", filled, len(time_indexes), depth
@@ -1228,6 +1244,13 @@ async def _classify_once(
         observations=_error_observations(messages, offset),
     )
 
+    # sysb 的遥测源维度：生产按源送批（每个源一次 process_all_batches），批内一致，
+    # 取首条即可；批内混源属防御分支（切批只按大小、不保证同源），此时留空维度
+    # 不猜——把两种源的耗时混进一个源桶比没有维度更误导。
+    batch_source = messages[0].source if messages else ""
+    if any(m.source != batch_source for m in messages):
+        batch_source = ""
+
     async def _request(with_images: bool) -> ChatResponse:
         # vision 路由：有图时 user content 从 str 换成多模态 content parts
         # （文本 part + 逐条图片段），无图时维持原样 str（字节级兼容）。
@@ -1242,6 +1265,7 @@ async def _classify_once(
             temperature=0.1,
             max_tokens=config.max_classify_tokens,
             telemetry_kind="classify.sysb",
+            telemetry_source=batch_source,
         )
 
     async def _fallback_request(why: str) -> ChatResponse | None:

@@ -723,13 +723,28 @@ class RagEngine:
         session_id: str | None = None,
         history: list[dict] | None = None,
     ) -> AskResult:
-        """检索 + 引用式回答；检索为空 → 诚实拒答且不调用 AI。"""
+        """检索 + 引用式回答；检索为空 → 诚实拒答且不调用 AI。
+
+        遥测恒等式：`rag.ask` = refused + answered + retrieve_error +
+        answer_error + cancelled。`ask` 必须在检索**之前**计数——检索本身就会
+        抛（嵌入端点故障、库损坏），计在之后意味着这些失败连分母都没有，读数
+        永远看着「零失败」。取消单列：CancelledError 是 BaseException 子类，
+        `except Exception` 兜不到它，而取消路径上「ask 已计、终态桶全空」会让
+        恒等式失效。
+        """
 
         from briefdesk import telemetry
         from briefdesk.plugins.rag.prompts import build_answer_prompt
 
-        hits = await self.retrieve(question, session_id)
         telemetry.record("rag.ask")
+        try:
+            hits = await self.retrieve(question, session_id)
+        except asyncio.CancelledError:
+            telemetry.record("rag.cancelled")
+            raise
+        except Exception:
+            telemetry.record("rag.retrieve_error")
+            raise
         if not hits:
             telemetry.record("rag.refused")
             return AskResult(refused=True, answer="没有在群聊记录里找到相关消息。")
@@ -737,54 +752,69 @@ class RagEngine:
             datetime.now(UTC).astimezone(), question.strip(), hits, history or [],
             self.settings.evidence_chars,
         )
-        # 问答模型通道 override 来自本插件配置域（三项留空 = 复用主链路 AI）
-        resp = await ai_ports.rag_chat(
-            messages,
-            temperature=0.2,
-            max_tokens=1024,
-            model=self.settings.model,
-            api_base=self.settings.api_base,
-            api_key=self.settings.api_key.get_secret_value(),
-        )
-        content = ""
-        choices = getattr(resp, "choices", None) or []
-        if choices:
-            content = (choices[0].message.content or "").strip()
-        if not content:
-            # 空 choices / 空答案：按拒答返回，不伪装成「已答但无引用」
-            logger.warning("rag: 模型返回空响应（choices=%d），按拒答处理", len(choices))
-            telemetry.record("rag.refused")
-            return AskResult(refused=True, answer="模型未返回内容，请稍后重试。")
-        # 双态解析：deepseek 系强制 json_object 输出 → 优先 JSON 契约；
-        # 其它供应商纯文本 → 回退 [n] 正则（兼容两路）
-        answer = content
-        cited: set[int] = set()
-        explicit = False  # 模型给出了 citations 列表（含空列表）→ 不再回退全部证据
-        parsed = ai_ports.loads_json(content)
-        if isinstance(parsed, dict) and isinstance(parsed.get("answer"), str):
-            answer = parsed["answer"].strip()
-            if not answer:
-                logger.warning("rag: JSON 契约下 answer 为空，按拒答处理")
+        try:
+            # 问答模型通道 override 来自本插件配置域（三项留空 = 复用主链路 AI）
+            resp = await ai_ports.rag_chat(
+                messages,
+                temperature=0.2,
+                max_tokens=1024,
+                model=self.settings.model,
+                api_base=self.settings.api_base,
+                api_key=self.settings.api_key.get_secret_value(),
+            )
+            content = ""
+            choices = getattr(resp, "choices", None) or []
+            if choices:
+                content = (choices[0].message.content or "").strip()
+            if not content:
+                # 空 choices / 空答案：按拒答返回，不伪装成「已答但无引用」
+                logger.warning(
+                    "rag: 模型返回空响应（choices=%d），按拒答处理", len(choices)
+                )
                 telemetry.record("rag.refused")
                 return AskResult(refused=True, answer="模型未返回内容，请稍后重试。")
-            nums = parsed.get("citations")
-            if isinstance(nums, list):
-                explicit = True
-                for n in nums:
-                    v = _citation_index(n)
-                    if v is not None and 1 <= v <= len(hits):
-                        cited.add(v)
-        if not cited and not explicit:
-            cited = {
-                int(m.group(1))
-                for m in self._CITE_RE.finditer(content)
-                if 1 <= int(m.group(1)) <= len(hits)
-            }
-        if explicit:
-            nums = sorted(cited)
-        else:
-            nums = sorted(cited) if cited else list(range(1, len(hits) + 1))
-        citations = [self._citation(n, hits[n - 1]) for n in nums]
+            # 双态解析：deepseek 系强制 json_object 输出 → 优先 JSON 契约；
+            # 其它供应商纯文本 → 回退 [n] 正则（兼容两路）
+            answer = content
+            cited: set[int] = set()
+            explicit = False  # 模型给出了 citations 列表（含空列表）→ 不再回退全部证据
+            parsed = ai_ports.loads_json(content)
+            if isinstance(parsed, dict) and isinstance(parsed.get("answer"), str):
+                answer = parsed["answer"].strip()
+                if not answer:
+                    logger.warning("rag: JSON 契约下 answer 为空，按拒答处理")
+                    telemetry.record("rag.refused")
+                    return AskResult(refused=True, answer="模型未返回内容，请稍后重试。")
+                nums = parsed.get("citations")
+                if isinstance(nums, list):
+                    explicit = True
+                    for n in nums:
+                        v = _citation_index(n)
+                        if v is not None and 1 <= v <= len(hits):
+                            cited.add(v)
+            if not cited and not explicit:
+                cited = {
+                    int(m.group(1))
+                    for m in self._CITE_RE.finditer(content)
+                    if 1 <= int(m.group(1)) <= len(hits)
+                }
+                if cited:
+                    # 与「无专用通道」是两种故障：这条是 JSON 契约没生效、引用
+                    # 只能从正文 [n] 里正则捡回来，丢的是结构化引用（而非模型
+                    # override）。命中才记——正则一无所获属另一形态（回退全部
+                    # 证据），记进来会把两种不同成因混成一个桶。
+                    telemetry.record("rag.citation_fallback")
+            if explicit:
+                nums = sorted(cited)
+            else:
+                nums = sorted(cited) if cited else list(range(1, len(hits) + 1))
+            citations = [self._citation(n, hits[n - 1]) for n in nums]
+        except asyncio.CancelledError:
+            telemetry.record("rag.cancelled")
+            raise
+        except Exception:
+            telemetry.record("rag.answer_error")
+            raise
         telemetry.record("rag.answered")
         # 引用维度单独分桶：answered 是两者的分母，「有引用的回答占比」
         # 由 with/no_citation 两桶读出（空引用列表也是有效回答形态）

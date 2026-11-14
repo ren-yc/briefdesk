@@ -674,11 +674,19 @@ class TimesResponseTest(unittest.TestCase):
         )
         assert parsed == {0: []}
 
-    def test_garbage_or_non_array_returns_empty(self):
-        # task 不再校验；外壳/垃圾/非数组统一回退空结果
-        assert _parse_times_response('{"task":"other","data":[]}') == {}
-        assert _parse_times_response("纯文本没有JSON") == {}
-        assert _parse_times_response('{"task":"times","data":{}}') == {}
+    def test_garbage_or_non_array_returns_none(self):
+        """不可解析 → None，与「合法空产出」区分开。
+
+        None 让调用点把该轮记为解析失败（影子汇总按 parse_error 归因），
+        `{}` 只留给模型答了但确实没有时间点的情形——混成一个值会把规则解析器
+        的替换收益系统性低估。
+        """
+        assert _parse_times_response('{"task":"other","data":[]}') is None
+        assert _parse_times_response("纯文本没有JSON") is None
+        assert _parse_times_response('{"task":"times","data":{}}') is None
+
+    def test_empty_data_list_is_legit_empty(self):
+        assert _parse_times_response('{"task":"times","data":[]}') == {}
 
     def test_markdown_fence_tolerated(self):
         parsed = _parse_times_response(
@@ -1246,6 +1254,25 @@ class TestExtractTimes:
         ):
             await extract_times(results, [0], [self._msg("面试")])
         assert results[0].start == ""
+
+    async def test_unparseable_keeps_empty_and_marks_parse_error(self):
+        """不可解析 → 留空且不抛，并在影子汇总里归因 parse_error。
+
+        失败模式：解析函数返回 None 后继续往下走，`_apply_times_to_results`
+        直接 `.get()` 会抛 AttributeError，把「时间留空继续」变成整批失败；
+        归因混进「模型没给时间」则会让规则解析器的替换收益被系统性低估。
+        """
+        results = [ClassifyResult(msg_index=0, category="活动通知")]
+        with patch(
+            "briefdesk.plugins.classify.engine.chat",
+            new=AsyncMock(return_value=self._resp("stop", "这不是 JSON")),
+        ), patch(
+            "briefdesk.plugins.classify.engine._record_temporal_shadow"
+        ) as shadow:
+            await extract_times(results, [0], [self._msg("面试")])
+        assert results[0].start == ""
+        assert results[0].extra_times == []
+        assert shadow.call_args.kwargs["sysc_failed"] == "parse_error"
 
     async def test_empty_time_indexes_noop(self):
         with patch("briefdesk.plugins.classify.engine.chat", new=AsyncMock()) as chat:

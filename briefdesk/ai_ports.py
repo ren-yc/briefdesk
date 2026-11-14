@@ -50,6 +50,7 @@ async def chat(
     timeout: float | None = None,
     max_retries: int | None = None,
     telemetry_kind: str = "",
+    telemetry_source: str = "",
 ) -> ChatResponse:
     """统一 AI 调用端口（模型/供应商由已注册插件决定）。
 
@@ -67,6 +68,10 @@ async def chat(
     取消（CancelledError）单独计数且不进延迟分布（半程耗时混入会污染
     分位数）；其余异常（含 TimeoutError——判官超时正是要观测的最坏
     尾部）计入 .error 并保留延迟样本。
+
+    telemetry_source：消息源维度（如 "weflow"），与 telemetry_kind 一样
+    只进遥测、**绝不进传给供应商的 kwargs**——调用方不传时归入空维度，
+    读数按「指标 → 源」两层聚合，混合源部署才分得清是哪一路的耗时。
     """
     from briefdesk import telemetry
 
@@ -81,17 +86,20 @@ async def chat(
     try:
         resp = await _require_ai().chat(messages, **kwargs)
     except asyncio.CancelledError:
-        telemetry.record(f"{telemetry_kind or 'chat'}.cancelled")
+        telemetry.record(f"{telemetry_kind or 'chat'}.cancelled", telemetry_source)
         raise
     except Exception:
         elapsed = (time.perf_counter() - start) * 1000.0
-        telemetry.record(f"{telemetry_kind or 'chat'}.error")
-        telemetry.observe(f"{telemetry_kind or 'chat'}.latency", elapsed)
+        telemetry.record(f"{telemetry_kind or 'chat'}.error", telemetry_source)
+        telemetry.observe(
+            f"{telemetry_kind or 'chat'}.latency", elapsed, telemetry_source
+        )
         raise
-    telemetry.record(f"{telemetry_kind or 'chat'}.call")
+    telemetry.record(f"{telemetry_kind or 'chat'}.call", telemetry_source)
     telemetry.observe(
         f"{telemetry_kind or 'chat'}.latency",
         (time.perf_counter() - start) * 1000.0,
+        telemetry_source,
     )
     return resp
 
@@ -114,6 +122,9 @@ async def rag_chat(
 
     供应商未实现 rag_chat（旧实现/测试桩）时回退复用 chat 端口。注意此路径
     **静默丢弃 override**：旧供应商没有专用通道的概念，只能按主通道应答。
+    回退单独计数（`rag.chat_fallback`，无消息源维度）：它意味着「专用通道
+    没生效、问答实际跑在主模型上」，与回答失败是两种故障，合成一个桶就分不开
+    ——用户配了 RAG_MODEL 却没被用上，只能从这里看出来。
     """
     ai = _require_ai()
     # 类级检测：Mock/旧实现等实例级动态属性（__getattr__）不视为实现了 rag_chat，
@@ -130,6 +141,9 @@ async def rag_chat(
             api_base=api_base,
             api_key=api_key,
         )
+    from briefdesk import telemetry
+
+    telemetry.record("rag.chat_fallback")
     return await ai.chat(messages, temperature=temperature, max_tokens=max_tokens)
 
 
