@@ -9,6 +9,7 @@
   回填起点 / overlap 组合计算（互不影响）
 """
 
+import logging
 import time
 import unittest
 from types import SimpleNamespace
@@ -1252,8 +1253,15 @@ class TestPollCycleTelemetryFlush:
         source.name = "weflow-legacy"
         source.client = Mock()
         source.fetch_history = AsyncMock(
+            # 形状与 types.PollResult 一致：轮询周期会读 session_errors 置
+            # lastWarning，缺这个属性会在收尾前抛 AttributeError，把「成功
+            # 路径」的断言都变成走失败分支
             return_value=SimpleNamespace(
-                contacts=[], sessions=[], messages=[], failed_sessions=set()
+                contacts=[],
+                sessions=[],
+                messages=[],
+                failed_sessions=set(),
+                session_errors={},
             )
         )
         return source
@@ -1301,3 +1309,27 @@ class TestPollCycleTelemetryFlush:
             flush.side_effect = OSError("disk full")
             await run_poll_cycle(source)
         assert not pc._polling
+
+    async def test_summary_logs_at_debug_only(
+        self, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+    ):
+        """汇总行走 DEBUG：默认 INFO 下每轮一行近千字符会把业务行冲散，而
+        验收读数是落盘的 latest.json，终端里不必再重复一遍。"""
+        monkeypatch.setattr(
+            "briefdesk.poll_cycle.telemetry_summary",
+            lambda: "遥测 judge.call|weflow-legacy=1",
+        )
+        source = self._source()
+        stack, _flush = self._stack()
+        with stack:
+            with caplog.at_level(logging.INFO, logger="briefdesk.poll_cycle"):
+                await run_poll_cycle(source)
+            assert not [
+                r for r in caplog.records if str(r.message).startswith("遥测")
+            ], "INFO 下不得出现遥测汇总行"
+            caplog.clear()
+            with caplog.at_level(logging.DEBUG, logger="briefdesk.poll_cycle"):
+                await run_poll_cycle(source)
+            assert [
+                r for r in caplog.records if str(r.message).startswith("遥测")
+            ], "DEBUG 下必须能看到遥测汇总行"

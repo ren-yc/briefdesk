@@ -137,6 +137,10 @@ _CORE_UI: dict[str, dict[str, Any]] = {
     "DB_PATH": {"label": "数据库文件路径", "warn": "重启后数据库将使用新路径；旧库不会被自动发现或迁移"},
     "SERVER_PORT": {"label": "服务端口", "warn": "重启后访问地址将变为新端口"},
     "LOG_LEVEL": {"label": "日志级别", "hint": "DEBUG 开启逐条细节；INFO 只保留阶段与汇总"},
+    "TELEMETRY_ENABLED": {
+        "label": "启用本地运行指标",
+        "hint": "只记计数与耗时，不含消息正文；关闭后不再写入，已有文件保留",
+    },
 }
 
 def _core_schema() -> list[dict[str, Any]]:

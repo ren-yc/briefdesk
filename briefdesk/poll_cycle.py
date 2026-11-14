@@ -152,11 +152,13 @@ async def run_poll_cycle(source: SourceRuntime) -> None:
             len(result.contacts),
             fmt_dur(time_module.perf_counter() - perf_start),
         )
-        # 轮询周期尾部的遥测汇总（有记录才打 INFO；落盘统一在 finally 做，
-        # 见下——成功/失败路径都要落盘）
+        # 轮询周期尾部的遥测汇总（有记录才打 DEBUG）：默认 INFO 下每轮一行
+        # 近千字符会把同步/分类的业务行冲散，而验收读数是落盘的 latest.json，
+        # 终端里重复一遍只是噪音。落盘统一在 finally 做，见下——成功/失败
+        # 路径都要落盘。
         summary = telemetry_summary()
         if summary:
-            logger.info(summary)
+            logger.debug(summary)
     except Exception as e:
         # exception 而非 error：这是整条轮询链路的唯一兜底出口（下游轮询器
         # 与客户端都只上抛、不重复记日志），异常可能来自任意深度，没有栈就

@@ -295,6 +295,19 @@ class SettingsSchemaTest(unittest.TestCase):
         self.assertEqual(max_images["min"], 1)
         self.assertEqual(max_images["max"], 20)
 
+    def test_core_settings_expose_telemetry_switch(self) -> None:
+        # 遥测开关上屏：默认开（诊断与门限标定依赖真实运行积累），采用时点
+        # 是重启——与其它设置项同口径，页面上显示「下次启动生效」
+        from briefdesk.server.routes_settings_env import _core_schema
+
+        by_key = {item["key"]: item for item in _core_schema()}
+        item = by_key["TELEMETRY_ENABLED"]
+        self.assertEqual(item["type"], "boolean")
+        self.assertEqual(item["default"], True)
+        self.assertEqual(item["applyWhen"], "restart")
+        self.assertEqual(item["label"], "启用本地运行指标")
+        self.assertIn("正文", item["hint"])
+
     def test_every_core_field_has_curated_copy(self) -> None:
         """核心字段必须有中文文案，且 _CORE_UI 不得含未知键。
 
