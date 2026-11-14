@@ -18,6 +18,11 @@ from briefdesk.config import config
 def _reset(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     telemetry.reset_for_tests()
     monkeypatch.setattr(telemetry, "telemetry_dir", lambda: tmp_path / "tel")
+    # 固定为开启：本文件的断言都是「记录确实发生了」。宿主 shell 若导出了
+    # TELEMETRY_ENABLED=false，config 单例在 import 期就已经是关的——
+    # conftest 的清环境夹具晚于 import，改不了已构造的实例，只有在此覆盖
+    # 才与宿主无关；关闭语义的用例自己再改成 False。
+    monkeypatch.setattr(config, "telemetry_enabled", True)
     yield
     telemetry.reset_for_tests()
 

@@ -18,6 +18,7 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 
 from briefdesk import ai_ports, telemetry
+from briefdesk.config import config
 
 # merge 包的 __init__ 把 plugin（实例）re-export 到包级，须 importlib 取
 # 真正的模块对象
@@ -25,9 +26,13 @@ merge_plugin: Any = importlib.import_module("briefdesk.plugins.merge.plugin")
 
 
 @pytest.fixture(autouse=True)
-def _reset_telemetry() -> Any:
+def _reset_telemetry(monkeypatch: pytest.MonkeyPatch) -> Any:
     telemetry.reset_for_tests()
     ai_ports.set_ai(None)
+    # 固定为开启：本文件的断言都是「计数确实发生了」。宿主 shell 若导出了
+    # TELEMETRY_ENABLED=false，config 单例在 import 期就已关掉，conftest 的
+    # 清环境夹具晚于 import、改不了已构造的实例。
+    monkeypatch.setattr(config, "telemetry_enabled", True)
     yield
     telemetry.reset_for_tests()
     ai_ports.set_ai(None)
