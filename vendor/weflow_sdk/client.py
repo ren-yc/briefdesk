@@ -255,6 +255,35 @@ def _parse_sse_block(block: bytes) -> _SseFrame | None:
     return _SseFrame(event, data, id_)
 
 
+def _advanced_cursor(page: gen.PullEnvelope, cursor: str | None) -> str | None:
+    """Next opaque cursor, or ``None`` when this page drained the session.
+
+    Shape guard shared by the async loop (:meth:`Client.drain_session_cursor`)
+    and the synchronous facade (:meth:`SyncClient.drain_session_cursor`):
+    ``hasMore=true`` with an absent next cursor, or with the very cursor this
+    request carried, would spin in place - handing the same page to ``on_page``
+    forever. One copy of the judgment is what keeps the two entries from
+    disagreeing about what a bad page is.
+
+    Call it **before** delivering the page: a rejected page must never reach
+    the callback.
+    """
+    if not page.sync.has_more:
+        return None
+    next_cursor = page.sync.next_cursor
+    if next_cursor is None:
+        raise ShapeError(
+            "sync.hasMore=true but sync.nextCursor is absent: "
+            "echoing the previous cursor would loop forever"
+        )
+    if next_cursor == cursor:
+        raise ShapeError(
+            "sync.nextCursor did not advance beyond the request cursor "
+            f"(hasMore=true would loop forever): {next_cursor}"
+        )
+    return next_cursor
+
+
 class Client:
     """Async client for one weflow-server instance.
 
@@ -617,28 +646,17 @@ class Client:
         total = 0
         while True:
             page = await self.pull_page_cursor(talker, cursor, since)
-            if not page.sync.has_more:
-                total += len(page.messages)
-                on_page(page.messages)
-                return total
             # Shape guard BEFORE delivery: with hasMore=true, a next cursor that
             # is absent or identical to the one this request carried would spin
             # in place, handing the same page to ``on_page`` forever. Judge the
             # page's shape first, then deliver - a rejected page never reaches
-            # the callback.
-            next_cursor = page.sync.next_cursor
-            if next_cursor is None:
-                raise ShapeError(
-                    "sync.hasMore=true but sync.nextCursor is absent: "
-                    "echoing the previous cursor would loop forever"
-                )
-            if next_cursor == cursor:
-                raise ShapeError(
-                    "sync.nextCursor did not advance beyond the request cursor "
-                    f"(hasMore=true would loop forever): {next_cursor}"
-                )
+            # the callback. The guard itself lives in ``_advanced_cursor`` so the
+            # synchronous facade cannot answer the same question differently.
+            next_cursor = _advanced_cursor(page, cursor)
             total += len(page.messages)
             on_page(page.messages)
+            if next_cursor is None:
+                return total
             cursor = next_cursor
 
     async def drain_session(
@@ -1130,6 +1148,9 @@ class SyncClient:
 
     The method surface mirrors :class:`Client` one-to-one; ``watch`` returns a
     normal iterator that keeps the same reconnect/``Last-Event-ID`` semantics.
+    That correspondence is machine-checked (``test_sync_client_surface_mirrors_client``):
+    adding an entry to ``Client`` alone used to be invisible, because no caller
+    failed and therefore no test did either.
     """
 
     def __init__(
@@ -1238,6 +1259,41 @@ class SyncClient:
         limit: int | None = None,
     ) -> gen.PullEnvelope:
         return self._call(self._client.pull_page(talker, since, offset, limit))
+
+    def pull_page_cursor(
+        self,
+        talker: str,
+        cursor: str | None,
+        since: int | None = None,
+        limit: int | None = None,
+    ) -> gen.PullEnvelope:
+        """Synchronous counterpart of :meth:`Client.pull_page_cursor`."""
+        return self._call(self._client.pull_page_cursor(talker, cursor, since, limit))
+
+    def drain_session_cursor(
+        self,
+        talker: str,
+        since: int | None,
+        on_page: Callable[[list[gen.PullMessage]], None],
+    ) -> int:
+        """Synchronous counterpart of :meth:`Client.drain_session_cursor`.
+
+        The loop runs in the caller thread so ``on_page`` stays where the caller
+        expects it, and keeps both judgments of the async entry: a
+        :class:`CursorReset` propagates instead of restarting, and the shared
+        ``_advanced_cursor`` guard rejects a non-advancing cursor before the
+        page is delivered.
+        """
+        cursor: str | None = None
+        total = 0
+        while True:
+            page = self.pull_page_cursor(talker, cursor, since)
+            next_cursor = _advanced_cursor(page, cursor)
+            total += len(page.messages)
+            on_page(page.messages)
+            if next_cursor is None:
+                return total
+            cursor = next_cursor
 
     def drain_session(
         self,

@@ -113,6 +113,18 @@ class ShapeError(ClientError):
     """The body did not match the documented shape."""
 
 
+class CursorReset(StatusError):
+    """The progress cursor is no longer valid (409 + ``reason``).
+
+    Disposition is to **drop the cursor and restart the pull once**, not to
+    retry the same token: retrying keeps returning 409. Subclasses
+    :class:`StatusError`, so callers that only branch on the status code still
+    catch it.
+    """
+
+    reason = "cursor_reset_required"
+
+
 class NotReady(ClientError):
     """``wait_ready``/``ensure_ready`` hit its deadline before the account reached ready."""
 
@@ -289,6 +301,35 @@ def _parse_sse_block(block: bytes) -> _SseFrame | None:
     return _SseFrame(event, data, id_)
 
 
+def _advanced_cursor(page: gen.PullEnvelope, cursor: str | None) -> str | None:
+    """Next opaque cursor, or ``None`` when this page drained the session.
+
+    Shape guard shared by the async loop (:meth:`Client.drain_session_cursor`)
+    and the synchronous facade (:meth:`SyncClient.drain_session_cursor`):
+    ``hasMore=true`` with an absent next cursor, or with the very cursor this
+    request carried, would spin in place - handing the same page to ``on_page``
+    forever. One copy of the judgment is what keeps the two entries from
+    disagreeing about what a bad page is.
+
+    Call it **before** delivering the page: a rejected page must never reach
+    the callback.
+    """
+    if not page.sync.has_more:
+        return None
+    next_cursor = page.sync.next_cursor
+    if next_cursor is None:
+        raise ShapeError(
+            "sync.hasMore=true but sync.nextCursor is absent: "
+            "echoing the previous cursor would loop forever"
+        )
+    if next_cursor == cursor:
+        raise ShapeError(
+            "sync.nextCursor did not advance beyond the request cursor "
+            f"(hasMore=true would loop forever): {next_cursor}"
+        )
+    return next_cursor
+
+
 class Client:
     """Async client for one qqflow-server instance.
 
@@ -372,6 +413,16 @@ class Client:
         # 200..300 as an error, and a surfaced 3xx would otherwise fall into
         # `resp.json()` and come out as a shape error instead of a status error.
         if not 200 <= resp.status_code < 300:
+            # 409 + ``reason`` is an actionable conflict: read the body once so
+            # the caller does not have to guess from the status code alone. A
+            # body that will not parse falls through to the plain StatusError.
+            if resp.status_code == 409:
+                try:
+                    body = resp.json()
+                except ValueError:
+                    body = None
+                if isinstance(body, dict) and body.get("reason") == CursorReset.reason:
+                    raise CursorReset(resp.status_code, url, body.get("message"))
             raise StatusError(resp.status_code, url)
         try:
             return resp.json()
@@ -594,6 +645,71 @@ class Client:
             f"/api/v1/sessions/{_encode_path_segment(talker)}/messages", query
         )
         )
+
+    async def pull_page_cursor(
+        self,
+        talker: str,
+        cursor: str | None,
+        since: int | None = None,
+        limit: int | None = None,
+    ) -> gen.PullEnvelope:
+        """Fetch one page through the **opaque progress cursor**.
+
+        When ``cursor`` is given the server ignores ``since`` / ``offset``. The
+        token must be echoed verbatim: parsing it copies the server-side
+        progress model into the client, and that copy goes stale the moment the
+        server changes its cursor generation.
+        """
+        query: dict[str, str] = {}
+        if cursor is not None:
+            query["cursor"] = cursor
+        elif since is not None:
+            query["since"] = str(since)
+        if limit is not None:
+            query["limit"] = str(limit)
+        return self._validate(gen.PullEnvelope,
+            await self._get_json(
+            f"/api/v1/sessions/{_encode_path_segment(talker)}/messages", query
+        )
+        )
+
+    async def drain_session_cursor(
+        self,
+        talker: str,
+        since: int | None,
+        on_page: Callable[[list[gen.PullMessage]], None],
+    ) -> int:
+        """Drain one session through the opaque cursor, echoing it verbatim.
+
+        On :class:`CursorReset` the error is **raised as-is**: this loop has
+        already handed earlier pages to ``on_page`` and there is no mechanism
+        to revoke callback results or ask the caller to clear them - silently
+        restarting after delivery would give append-style callers duplicate
+        records and double-count ``total``. Recovering from a reset (drain
+        again from scratch, deduplicate what was already delivered) is the
+        caller's job: it knows how it consumes the pages.
+
+        A next cursor that is absent or **identical to the cursor this request
+        carried** is a shape error too: paging on would spin in place,
+        handing the same page to ``on_page`` forever. Both terminate with an
+        error instead of guessing.
+        """
+        cursor: str | None = None
+        total = 0
+        while True:
+            page = await self.pull_page_cursor(talker, cursor, since)
+            # Shape guard BEFORE delivery: with hasMore=true, a next cursor that
+            # is absent or identical to the one this request carried would spin
+            # in place, handing the same page to ``on_page`` forever. Judge the
+            # page's shape first, then deliver - a rejected page never reaches
+            # the callback. The guard itself lives in ``_advanced_cursor`` so the
+            # synchronous facade cannot answer the same question differently.
+            next_cursor = _advanced_cursor(page, cursor)
+            total += len(page.messages)
+            on_page(page.messages)
+            if next_cursor is None:
+                return total
+            cursor = next_cursor
 
     async def drain_session(
         self,
@@ -1191,6 +1307,41 @@ class SyncClient:
         limit: int | None = None,
     ) -> gen.PullEnvelope:
         return self._call(self._client.pull_page(talker, since, offset, limit))
+
+    def pull_page_cursor(
+        self,
+        talker: str,
+        cursor: str | None,
+        since: int | None = None,
+        limit: int | None = None,
+    ) -> gen.PullEnvelope:
+        """Synchronous counterpart of :meth:`Client.pull_page_cursor`."""
+        return self._call(self._client.pull_page_cursor(talker, cursor, since, limit))
+
+    def drain_session_cursor(
+        self,
+        talker: str,
+        since: int | None,
+        on_page: Callable[[list[gen.PullMessage]], None],
+    ) -> int:
+        """Synchronous counterpart of :meth:`Client.drain_session_cursor`.
+
+        The loop runs in the caller thread so ``on_page`` stays where the caller
+        expects it, and keeps both judgments of the async entry: a
+        :class:`CursorReset` propagates instead of restarting, and the shared
+        ``_advanced_cursor`` guard rejects a non-advancing cursor before the
+        page is delivered.
+        """
+        cursor: str | None = None
+        total = 0
+        while True:
+            page = self.pull_page_cursor(talker, cursor, since)
+            next_cursor = _advanced_cursor(page, cursor)
+            total += len(page.messages)
+            on_page(page.messages)
+            if next_cursor is None:
+                return total
+            cursor = next_cursor
 
     def drain_session(
         self,
