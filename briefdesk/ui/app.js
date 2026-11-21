@@ -2778,7 +2778,7 @@ function renderCollapsedGroup(group) {
   const allSelected = batchMode && group.members.every(m => selectedIds.has(String(m.id)));
   const colorStyle = catColor.get(group.category) ? `--cat:${escAttr(catColor.get(group.category))}` : "";
   return `
-    <div class="group-collapsed${allSelected ? " selected" : ""}" data-key="${escAttr(group.key)}" data-msgtime="${itemTime(rep)}" data-subject="${escAttr(group.subject)}" data-category="${escAttr(group.category)}" style="${colorStyle}">
+    <div class="group-collapsed${allSelected ? " selected" : ""}" data-key="${escAttr(group.key)}" data-msgtime="${escAttr(itemTime(rep))}" data-subject="${escAttr(group.subject)}" data-category="${escAttr(group.category)}" style="${colorStyle}">
       <button class="group-more-btn group-head" data-subject="${escAttr(group.subject)}" data-cat="${escAttr(group.category)}" title="${batchMode ? "选择 / 取消选择该主体全部卡片（" + n + " 张）" : "查看该主体全部卡片"}" aria-label="${escAttr(group.subject)}，共 ${n} 条，${batchMode ? "选择或取消选择整组" : "查看全部"}">
         <span class="group-subject subject-link" data-subject="${escAttr(group.subject)}" title="查看该主体全部记录">${esc(group.subject)}</span>
         <span class="group-count">${n} 条</span>
@@ -2793,7 +2793,7 @@ function renderGroupHeader(group) {
   const allSelected = batchMode && group.members.every(m => selectedIds.has(String(m.id)));
   const colorStyle = catColor.get(group.category) ? `--cat:${escAttr(catColor.get(group.category))}` : "";
   return `
-    <div class="group-header" data-key="${escAttr(group.key)}" data-msgtime="${itemTime(group.members[0])}" style="${colorStyle}">
+    <div class="group-header" data-key="${escAttr(group.key)}" data-msgtime="${escAttr(itemTime(group.members[0]))}" style="${colorStyle}">
       ${batchMode ? `<label class="batch-check" title="选择 / 取消选择该主体全部卡片"><input type="checkbox" aria-label="选择整组：${escAttr(group.subject)}" ${allSelected ? "checked" : ""}></label>` : ""}
       <h3 class="group-subject subject-link" data-subject="${escAttr(group.subject)}" title="查看该主体全部记录">${esc(group.subject)}</h3>
       <span class="group-count">${n} 条</span>
@@ -2850,7 +2850,7 @@ function renderCollapsedGroupByChat(group) {
   const allSelected = batchMode && group.members.every(m => selectedIds.has(String(m.id)));
   // 跨类别组无单一类别色 → 不设 --cat，组块整体回退默认强调色
   return `
-    <div class="group-collapsed by-chat${allSelected ? " selected" : ""}" data-key="${escAttr(group.key)}" data-msgtime="${itemTime(rep)}" data-chat="${escAttr(group.name)}">
+    <div class="group-collapsed by-chat${allSelected ? " selected" : ""}" data-key="${escAttr(group.key)}" data-msgtime="${escAttr(itemTime(rep))}" data-chat="${escAttr(group.name)}">
       <button class="group-more-btn group-head" data-chat="${escAttr(group.name)}" title="${batchMode ? "选择 / 取消选择该群全部卡片（" + n + " 张）" : "查看该群全部卡片"}" aria-label="${escAttr(group.name)}，共 ${n} 条，${batchMode ? "选择或取消选择整组" : "查看全部"}">
         <img src="/icons/users.svg" class="icon-sm" alt="">
         <span class="group-subject">${esc(group.name)}</span>

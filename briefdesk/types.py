@@ -22,6 +22,12 @@ class InternalMessage:
     （mask_content）——三者使用同一套规则，正文脱敏才有完整出口：
     昵称/群名里嵌邮箱、手机号的形态此前会绕过掩码，随后原样进入
     分类与 RAG 的 AI 请求、落库并随导出携带。
+    timestamp 构造即收敛为 int（bool 归 0）：源侧 normalize 直接透传
+    上游响应字段（如 event.get("timestamp", 0)），上游返回字符串时间戳
+    时会原样入库——SQLite 的 INTEGER 声明不拒绝字符串，前端分组模板
+    又把它插进 data-msgtime 属性，异常值可闭合属性注入标记（详见
+    app.js 分组渲染的 escAttr 口径）。收敛点放在类型构造处，与内容
+    脱敏同层：所有源的产出在进入管道前统一归位。
     """
 
     msg_id: str
@@ -42,6 +48,10 @@ class InternalMessage:
         self.content = mask_content(self.content)
         self.sender_name = mask_content(clean_display_name(self.sender_name))
         self.group_name = mask_content(clean_display_name(self.group_name))
+        # bool 是 int 子类，isinstance(bool, int) 为真——显式归 0，防止
+        # True/False 落库后经 JSON 序列化呈现为 true/false 这类非数字形态
+        if isinstance(self.timestamp, bool) or not isinstance(self.timestamp, int):
+            self.timestamp = 0
 
 
 class ContextMsg(TypedDict):

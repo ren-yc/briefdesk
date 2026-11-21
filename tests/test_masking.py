@@ -159,6 +159,53 @@ class InternalMessageMaskingContractTest(unittest.TestCase):
         self.assertEqual(first.content, second.content)
 
 
+class InternalMessageTimestampCoercionTest(unittest.TestCase):
+    """timestamp 构造即收敛为 int（bool 归 0）的契约测试。
+
+    源侧 normalize 直接透传上游响应字段（如 event.get("timestamp", 0)），
+    上游返回字符串时间戳时会原样入库——SQLite 的 INTEGER 声明不拒绝
+    字符串，前端分组模板又把它插进 data-msgtime 属性，异常值可闭合
+    属性注入标记。收敛点与内容脱敏同在 __post_init__，所有源的产出
+    在进入管道前统一归位；测试值使用蓄意构造的注入形态以证明闭合
+    路径被切断，不指向任何真实数据。
+    """
+
+    def _msg(self, timestamp: object):
+        from briefdesk.types import InternalMessage
+
+        return InternalMessage(
+            msg_id="m1",
+            content="正文",
+            sender_name="发送者",
+            sender_id="u1",
+            session_id="s1",
+            group_name="群A",
+            timestamp=timestamp,  # type: ignore[arg-type]
+        )
+
+    def test_int_passthrough(self):
+        self.assertEqual(self._msg(1750000000).timestamp, 1750000000)
+
+    def test_zero_passthrough(self):
+        self.assertEqual(self._msg(0).timestamp, 0)
+
+    def test_string_coerced_to_zero(self):
+        msg = self._msg('"><img src=x onerror=alert(1)>')
+        self.assertEqual(msg.timestamp, 0)
+        self.assertIsInstance(msg.timestamp, int)
+
+    def test_float_coerced_to_zero(self):
+        self.assertEqual(self._msg(1750000000.5).timestamp, 0)
+
+    def test_bool_coerced_to_zero(self):
+        # bool 是 int 子类：不显式拦截就会以 true/false 形态落库
+        self.assertEqual(self._msg(True).timestamp, 0)
+        self.assertEqual(self._msg(False).timestamp, 0)
+
+    def test_none_coerced_to_zero(self):
+        self.assertEqual(self._msg(None).timestamp, 0)
+
+
 class NormalizeSubjectTest(unittest.TestCase):
     def test_nfkc_fullwidth_to_halfwidth(self):
         self.assertEqual(normalize_subject("ＡＣＭ"), "acm")

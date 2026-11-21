@@ -4,7 +4,11 @@
 
 ## [Unreleased]
 
-暂无未发布变更。
+本节收录尚未发布的行为变化，发布时归入对应版本号并注明日期。
+
+### 修复
+
+- 源侧透传的异常时间戳不再进入前端属性插值：`InternalMessage` 构造即把非 int（含 bool）时间戳归 0，堵住字符串时间戳经 SQLite 宽类型落库、再被分组模板插进 `data-msgtime` 属性的路径；三处分组模板的时间戳属性与单卡口径统一走 `escAttr`。回归：`InternalMessageTimestampCoercionTest`。
 
 ## [0.2.0] - 2026-11-14
 
