@@ -73,9 +73,9 @@ _DIGEST_RE = re.compile(r"[0-9a-f]{64}")
 
 # 新身份默认合并窗口（秒）：窗口内的新身份并进同一次落盘；首次初始化立即提交。
 DEFAULT_FLUSH_WINDOW = 5.0
-# 合并窗口上限（秒）：窗口过长会让新别名迟迟不能出境，等待的调用方跟着排队；
-# 非有限值（nan/inf）会让 `asyncio.sleep` 永远醒不来。
-MAX_FLUSH_WINDOW = 30.0
+# 合并窗口上限（秒）：契约承诺新别名不超过 5 秒出境，窗口只能更短；窗口过长
+# 会让等待的调用方跟着排队。非有限值（nan/inf）会让 `asyncio.sleep` 永远醒不来。
+MAX_FLUSH_WINDOW = 5.0
 # 跨进程锁等待上限（秒）。超时即失败，不无限等（等不到锁说明另一个写者卡住）。
 LOCK_TIMEOUT_SECONDS = 10.0
 _LOCK_RETRY_INTERVAL = 0.02
@@ -204,6 +204,18 @@ class _AliasCode(NamedTuple):
 
     prefix: str
     code: str
+
+
+class _Snapshot(NamedTuple):
+    """一次初始化的完整结果：注册表 + 由盘上映射填好的缓存。
+
+    两个字段必须一起发布。只发布注册表会让并发请求在缓存还没填好时看到
+    `_registry` 非空而提前返回，拿空缓存把每个已知身份重新分一遍别名（重启后
+    别名漂移）；填缓存中途抛错时也会留下「有注册表、空缓存」的半成品。
+    """
+
+    registry: _Registry
+    committed: dict[str, str]
 
 
 def _short_code(digest: str) -> str:
@@ -566,6 +578,10 @@ class Pseudonymizer:
         （最长等 10 秒）。同步执行会把整个事件循环连同其它请求一起卡住，而
         `alias_for` 正处在出境前的准备路径上，卡住的代价是整条管道停摆。
         共享 future 是为了让并发首启只建一次表：各自建表会互相覆盖盐。
+
+        等待者只可能看到「没有注册表」或「完整快照」两种状态：写线程只构造快照、
+        不写实例字段，发布在协程里一次性完成（见 `_init_registry`），因此填缓存
+        期间 `_registry` 仍为空，晚到的请求会继续等同一个 future 而不是绕过它。
         """
         if self._registry is not None:
             return self._registry
@@ -583,13 +599,14 @@ class Pseudonymizer:
         return await asyncio.shield(future)
 
     async def _init_registry(self, future: asyncio.Future[_Registry]) -> None:
-        """在写线程里加载注册表，把结果或异常交给所有等待者。
+        """在写线程里构造完整快照，回到协程里一次性发布注册表与缓存。
 
-        失败只落到 future 上，不写进 `_registry` 也不留半成品：半成品（有盐、
-        缺映射）会让后续请求拿着不完整的表算出与历史不一致的别名。
+        失败只落到 future 上，两个字段都不动：半成品（有盐、缺映射，或有注册表、
+        空缓存）会让后续请求拿着不完整的表算出与历史不一致的别名。发布两步之间
+        没有 await，事件循环上的其它协程不可能看到中间态。
         """
         try:
-            registry = await asyncio.to_thread(self._load)
+            snapshot = await asyncio.to_thread(self._load)
         except asyncio.CancelledError:
             if not future.done():
                 future.cancel()
@@ -603,16 +620,21 @@ class Pseudonymizer:
                     PseudonymError(f"别名注册表初始化失败（{type(error).__name__}）")
                 )
         else:
+            self._registry = snapshot.registry
+            self._committed = snapshot.committed
             if not future.done():
-                future.set_result(registry)
+                future.set_result(snapshot.registry)
         finally:
             # 只清自己那一轮：新一轮已经换上新 future 时不能把人家清掉
             if self._init_future is future:
                 self._init_future = None
                 self._init_task = None
 
-    def _load(self) -> _Registry:
-        """读取注册表（每进程一次）；文件不存在时在锁内创建含新盐的初始表。
+    def _load(self) -> _Snapshot:
+        """读取注册表并构造完整快照（不发布：发布只由协程一次性完成）。
+
+        文件不存在时在锁内创建含新盐的初始表，并把「注册表 + 空缓存」作为快照
+        返回；已加载过的实例直接复用进程内快照，不再读盘。
 
         盐必须在任何哈希计算之前落定。两个进程同时首次启动时若各自生成盐再各自
         提交，两边的映射会互相覆盖——先提交的一方别名在重启后全部失效。因此
@@ -620,33 +642,34 @@ class Pseudonymizer:
 
         区分「文件不存在」与「读取失败」靠异常类型，不用 `Path.exists()` 预判：
         预判与真正的读取之间有窗口，文件在这期间被写坏会被当成「不存在」而直接
-        被新表覆盖，等于一次静默重盐。读到的既有映射同时填进内存缓存。
+        被新表覆盖，等于一次静默重盐。
         """
         if self._registry is not None:
-            return self._registry
+            return _Snapshot(self._registry, dict(self._committed))
         path = self.registry_file
         try:
-            return self._adopt(_read_registry(path))
+            return self._build_snapshot(_read_registry(path))
         except _RegistryMissing:
             pass
         with _registry_lock(self.lock_file, timeout=self._lock_timeout):
             try:
-                return self._adopt(_read_registry(path))
+                return self._build_snapshot(_read_registry(path))
             except _RegistryMissing:
                 registry = _Registry(salt=os.urandom(_SALT_SIZE), aliases={})
                 _atomic_write(path, _serialize_registry(registry))
-                return self._adopt(registry)
+                return self._build_snapshot(registry)
 
-    def _adopt(self, registry: _Registry) -> _Registry:
-        """把读到的注册表定为进程内快照，并把已有映射填进内存缓存。
+    def _build_snapshot(self, registry: _Registry) -> _Snapshot:
+        """注册表 → 快照：把盘上已有映射并进进程内缓存副本。
 
         已注册身份（盘上已有 digest）此后命中 `_committed` 纯内存，不再读盘、
         不再抢锁；不填这一步，重启后每个已知身份都要走一遍完整提交路径。
+        只写局部副本，所以任何一步失败都不会污染实例状态。
         """
-        self._registry = registry
+        committed = dict(self._committed)
         for digest, alias in registry.aliases.items():
-            self._committed.setdefault(digest, alias)
-        return registry
+            committed.setdefault(digest, alias)
+        return _Snapshot(registry=registry, committed=committed)
 
     # ── 批量提交 ──
 
@@ -719,7 +742,7 @@ class Pseudonymizer:
         """在写线程里：持锁重读磁盘 → 合并分配 → 原子写 → 返回本批别名。"""
         if not batch:
             return {}
-        registry = self._load()
+        registry = self._load().registry
         path = self.registry_file
         with _registry_lock(self.lock_file, timeout=self._lock_timeout):
             disk = _read_registry(path)
@@ -833,13 +856,35 @@ _BARE_CODE_RE = re.compile(
 # 前缀出现位置：用来逐个判断「前缀后面跟的是什么」，比一条大正则更容易说明
 # 每一种被改写的方式。
 _ALIAS_PREFIX_SEARCH_RE = re.compile(rf"{ALIAS_PERSON_PREFIX}|{ALIAS_GROUP_PREFIX}")
-# 前缀后紧跟的 ASCII 串：用于判断「长得像别名但不合法」。4 是下限——`同学3人`
-# 这类自然行文只有 1 个字符，按候选计会把遥测淹没在普通中文里。
-_CANDIDATE_TAIL_RE = re.compile(r"[A-Za-z0-9_-]{4,}")
-# 纯 base32 的 4~5 位串：像被截断的短码（`同学ABCD`）。含小写或 0/1/8/9 的串由
-# 「长度 ≥ 短码长度才算候选」那条覆盖，不必在这里逐类穷举。
-_TRUNCATED_CODE_RE = re.compile(rf"[{_BASE32_CHARS}]{{4,5}}")
+# 前缀后紧跟的 ASCII 串：取最大连续段，再按「像不像被改写的别名」逐段判定。
+# 缺了这段就没法区分「前缀 + 被改写的别名」和「前缀 + 自然中文」。
+_PREFIX_TAIL_RE = re.compile(r"[A-Za-z0-9_-]+")
+# 候选字符集：base32 的大小写并集。小写形态同样是模型抄错，不是自然文本；
+# 0/1/8/9 不在里面，所以纯数字串天然落在候选之外。
+_CANDIDATE_CHARS = frozenset(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz234567"
+)
+_ASCII_LETTER_RE = re.compile(r"[A-Za-z]")
 _ASCII_TOKEN_CHAR_RE = re.compile(r"[A-Za-z0-9_-]")
+
+
+def _is_rewritten_candidate(run: str) -> bool:
+    """前缀后的 ASCII 串是否像「被改写的别名」而不是自然文本。
+
+    两段判定对应两种改写形态：
+
+    - 短截断或大小写改写：1–6 个字符全在候选字符集里，且至少含一个 ASCII 字母
+      （`同学A`、`同学ABC`、`同学abcd`）；
+    - 被拼长：前 6 个字符已经是一个短码的形状，后面还接着 ASCII
+      （`同学ABCDEFG`、`同学ABCDEF-1x`）。
+
+    纯数字串一律不算：`同学3人`、`同学2345人` 里跟的是数量词，按候选计只会把
+    还原失败遥测淹没在普通中文里。
+    """
+    if not _ASCII_LETTER_RE.search(run):
+        return False
+    head = run if len(run) <= ALIAS_CODE_LENGTH else run[:ALIAS_CODE_LENGTH]
+    return all(char in _CANDIDATE_CHARS for char in head)
 
 
 class NameContext:
@@ -862,8 +907,11 @@ class NameContext:
         self._person_cache: dict[str, str] = {}
         self._group_cache: dict[str, str] = {}
         self._failed_fields: set[str] = set()
-        # 字段 → 上次还原输出：同一字段重复调用时据此短路，避免二次替换
-        self._last_output: dict[str, str] = {}
+        # 字段 → (上次输入, 对应输出)：只有输入相同才复用输出（这才是幂等）。
+        # 只记输出会在「新输入恰好等于上次输出」时误短路，漏掉真正的模型输出。
+        self._last_io: dict[str, tuple[str, str]] = {}
+        # 本请求已写回文本的显示名：它们再次出现时原样保留，不再当别名二次替换
+        self._produced: set[str] = set()
         self._restore_failures = 0
 
     def __repr__(self) -> str:
@@ -960,52 +1008,75 @@ class NameContext:
         小写、后缀不是纯数字、缺前缀的裸码）时原样保留并计一次失败。不模糊
         猜测——凭猜测替换会把无关文本改成某个人名，而原样保留至少看得见问题。
 
-        幂等只在单次请求内成立（`restore(restore(x)) == restore(x)`）：每字段
-        记住上次输出，输入与它相同就直接返回。真实显示名可能本身形似别名（有人
-        就叫「同学ABCDEF」），没有这层记忆时第二次还原会把刚写回去的真名当成
-        别名再换一次，字段在多次兜底之间就漂了。失败计数按字段去重，重复调用
-        不会把一次失败放大成多条遥测。
+        幂等按「同一字段 + 同一输入」成立：每个字段记住上次的输入与它对应的
+        输出，输入相同才直接复用输出。只按「输入等于上次输出」短路会误伤真正的
+        模型输出——同一字段的新一轮文本可能恰好等于上一轮的还原结果。
+
+        替换时还看本请求已产出的显示名：它们是我们自己写回去的文本，再次出现时
+        原样保留、不计失败。真实显示名可能恰好和别名同形（有人就叫
+        `同学ABCDEF`），把它当别名再换一次会把这个人换成另一个人的名字；这里
+        有意选择「宁可留下化名，也不换成另一个人」的隐私取舍。代价是：如果模型
+        真的输出了与某个已产出显示名完全相同的别名，这一次不会还原，也不记失败
+        ——宁可少还原一次，也不把一个人错认成另一个人。失败计数按字段去重，重复
+        调用不会把一次失败放大成多条遥测。
         """
         if not text or not self._enabled or not self._by_alias:
             return text
-        if self._last_output.get(field) == text:
-            return text
+        cached = self._last_io.get(field)
+        if cached is not None and cached[0] == text:
+            return cached[1]
 
         def _substitute(match: re.Match[str]) -> str:
             token = match.group(0)
+            if token in self._produced:
+                # 我们自己写回去的显示名：不能再换成另一个人
+                return token
             name = self._by_alias.get(token)
             if name is None:
                 self.mark_restore_failed(field)
                 return token
+            self._produced.add(name)
             return name
 
         restored = _ALIAS_TOKEN_RE.sub(_substitute, text)
         if field not in self._failed_fields and self._looks_like_broken_alias(text):
             self.mark_restore_failed(field)
-        self._last_output[field] = restored
+        self._last_io[field] = (text, restored)
         return restored
 
     def _looks_like_broken_alias(self, text: str) -> bool:
         """文本里是否存在「形似别名但不合法」的片段（只判定，不改写）。
 
-        逐项列出被改写的方式：前缀后的 ASCII 串长度不对（被拼长或截断）、含有
-        小写或 base32 之外的字符、带非数字后缀，以及丢了前缀但在本请求里已知的
-        裸短码。任何一项命中都说明模型抄错了别名，调用方按「没还原出来」处理。
+        逐个前缀判断它后面跟的是什么：
+
+        - 完整且本请求已知的别名由替换路径处理，不算失败；
+        - 本请求已产出的显示名不算失败：那是我们自己写回去的文本；
+        - 1–6 个候选字符且含 ASCII 字母（`同学A`、`同学ABC`、`同学abcd`）：
+          短截断或大小写改写；
+        - 合法短码形状后面还接着 ASCII（`同学ABCDEFG`、`同学ABCDEF-1x`）：
+          被拼长或后缀不是纯数字；
+        - 形态合法但不在本请求已知别名里：模型抄了一个不存在的别名。
+
+        另外丢了前缀但在本请求里已知的裸短码同样算「没还原出来」。纯数字串
+        （`同学3人`、`同学2345人`）是自然中文，不按候选计。任何一项命中都说明
+        模型抄错了别名，调用方按「没还原出来」处理。
         """
         for match in _ALIAS_PREFIX_SEARCH_RE.finditer(text):
             start = match.start()
             if start > 0 and _ASCII_TOKEN_CHAR_RE.match(text[start - 1]):
                 # 前缀被粘在 ASCII 词中间（`X同学...`）：不是别名起点
                 continue
-            tail = _CANDIDATE_TAIL_RE.match(text, match.end())
+            tail = _PREFIX_TAIL_RE.match(text, match.end())
             if tail is None:
+                # 前缀后面直接是汉字/标点：自然行文，不是别名
                 continue
             span = text[start : tail.end()]
-            if span in self._by_alias:
-                # 完整且已知的别名由替换路径处理，不算失败
+            if span in self._by_alias or span in self._produced:
                 continue
-            run = tail.group(0)
-            if len(run) >= ALIAS_CODE_LENGTH or _TRUNCATED_CODE_RE.fullmatch(run):
+            if _ALIAS_SHAPE_RE.fullmatch(span):
+                # 形态合法却查不到：模型抄了一个不存在的别名
+                return True
+            if _is_rewritten_candidate(tail.group(0)):
                 return True
         for match in _BARE_CODE_RE.finditer(text):
             if match.group(1) in self._codes:

@@ -110,7 +110,15 @@ def _dimensions(port: str, role: str) -> str:
 
 
 def _sanitize_label(value: str, *, fallback: str) -> str:
-    """把 `kind`/`source` 收敛成受控词：形态不符就整值换成默认桶。"""
+    """把 `kind`/`source` 收敛成受控词形态：形态不符就整值换成默认桶。
+
+    这是**形态过滤，不是受控词表**：只判定「有没有空白/中文/下划线、长度是否
+    超限」，不判断取值是不是某个具体的插件名或任务标签。因此 `member-0001`
+    这种全小写、带连字符、形似用户 ID 的值会原样通过；接线的调用方必须自己从
+    插件名或固定任务标签取维度，不能把业务对象（人名、群名、ID）直接传进来。
+    本函数不承诺挡住所有身份信息，只保证「形态异常的整值不会被截断成可识别
+    片段」——截断后的残片仍可能认出是谁。
+    """
     if not isinstance(value, str):
         return fallback
     if _LABEL_RE.fullmatch(value):

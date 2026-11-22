@@ -236,6 +236,25 @@ def test_metadata_labels_keep_well_formed_values() -> None:
         assert ai_egress.current_metadata().source == ""
 
 
+def test_shape_filter_does_not_catch_id_shaped_labels() -> None:
+    """形态过滤不是受控词表：全小写、带连字符的 `member-0001` 会原样通过。
+
+    这是已知局限：`_sanitize_label` 只看形态，认不出「长得像 ID」的取值。接线
+    的调用方必须从插件名或固定任务标签取维度，不能把业务 ID 直接传进来。钉住
+    这条行为是为了让「以为已经挡住身份信息」的改动先在这里失败，而不是留给人
+    凭印象判断。
+    """
+    with ai_egress.use_metadata(
+        port=ai_egress.PORT_CHAT,
+        role=ai_egress.ROLE_MAIN,
+        kind="member-0001",
+        source="member-0002",
+    ):
+        metadata = ai_egress.current_metadata()
+        assert metadata.kind == "member-0001"
+        assert metadata.source == "member-0002"
+
+
 def test_unknown_port_or_role_is_rejected() -> None:
     with pytest.raises(ValueError, match="chat"):
         ai_egress.record_send_attempt("chatting", ai_egress.ROLE_MAIN, REMOTE_BASE)
