@@ -225,7 +225,7 @@ Cross-module base types: `InternalMessage` dataclass (msg_id, content, sender_na
 
 #### briefdesk/pseudonym.py
 
-出站显示名的安装级别名注册表与请求级还原上下文：`Pseudonymizer` 负责盐、哈希与别名的原子提交，`NameContext` 负责一次请求内的别名准备与逆映射，身份键与策略判定同在本模块单源。注册表在用户数据目录 `pseudonym/mapping.json`，同文件存安装级盐与「HMAC-SHA256 完整哈希 → 别名」映射——分开存会在两次写入之间出现「映射已更新、盐还是旧的」半发布态，重启后同一身份算出另一个别名。文件里只有盐与哈希，不写人名、群名、`sender_id` 与会话 ID；盐与哈希同处一文件意味着拿到文件即可穷举常见昵称，它是不出明文的下限，不是不可逆的安全边界。新别名先落盘再出境（合并窗口只减少写盘次数，不改变这个顺序），因此进程崩溃后模型见过的别名仍然可还原；已提交身份命中内存缓存，零 I/O。任何一步失败都停：注册表损坏、版本不支持、盐缺失或与进程内盐不一致、加锁超时、写盘失败一律抛 `PseudonymError`，不自动重盐、不退回真名。`NameContext` 不落盘、不进日志，`__repr__` 只暴露计数。回归见 `tests/test_pseudonym.py`（注册表校验、锁竞争、还原边界）与 `tests/test_classify.py` 的 `TestPseudonymOutbound`/`TestPseudonymRestore`。
+出站显示名的安装级别名注册表与请求级还原上下文：`Pseudonymizer` 负责盐、哈希与别名的原子提交，`NameContext` 负责一次请求内的别名准备与逆映射，身份键与策略判定同在本模块单源。注册表在用户数据目录 `pseudonym/mapping.json`，同文件存安装级盐与「HMAC-SHA256 完整哈希 → 别名」映射——分开存会在两次写入之间出现「映射已更新、盐还是旧的」半发布态，重启后同一身份算出另一个别名。文件里只有盐与哈希，不写人名、群名、`sender_id` 与会话 ID；盐与哈希同处一文件意味着拿到文件即可穷举常见昵称，它是不出明文的下限，不是不可逆的安全边界。新别名先落盘再出境（合并窗口只减少写盘次数，不改变这个顺序），因此重启后同一身份的别名保持稳定，模型见过的别名仍能还原；已提交身份命中内存缓存，零 I/O。任何一步失败都停：注册表损坏、版本不支持、盐缺失或与进程内盐不一致、加锁超时、写盘失败一律抛 `PseudonymError`，不自动重盐、不退回真名。`NameContext` 不落盘、不进日志，`__repr__` 只暴露计数。回归见 `tests/test_pseudonym.py`（注册表校验、锁竞争、还原边界）与 `tests/test_classify.py` 的 `TestPseudonymOutbound`/`TestPseudonymRestore`。
 
 #### briefdesk/ai_ports.py
 
@@ -822,6 +822,7 @@ All via `.env` file, with an additional UI-staged overlay layer (see 「配置�
 - 大库每次启动都会执行回填语句 `UPDATE ... WHERE sender_id = ''`，全表扫描，启动期耗时随 `rag_chunks` 行数增长。
 - 幂等只在单次请求内保证（`NameContext` 用完即弃），跨请求不做去重或缓存复用。
 - 保护范围是「本请求写回过的显示名」的完整文本区间，不是实体识别：显示名之外与被改写过的别名仍按启发式处理。
+- 展示名的还原目标统一为「该身份在本请求内最后一次非空显示名」，人与群同规则；空显示名不作为还原目标，同名多条消息按最终名字还原。
 
 ### 出境与排队指标
 
@@ -836,15 +837,15 @@ All via `.env` file, with an additional UI-staged overlay layer (see 「配置�
 | `ai.egress.sdk_retry.<port>.<role>` | 远端请求被 SDK 内部重试一次 |
 | `ai.local.sdk_retry.<port>.<role>` | 本地请求被 SDK 内部重试一次 |
 | `ai.pseudonym.prepare_failed` | 别名准备失败一次（按准备次数计，不按消息条数计） |
-| `ai.pseudonym.restore_failed` | 还原失败一次（按字段去重，同一字段不重复计） |
+| `ai.pseudonym.restore_failed` | 还原失败一次（启发式信号：按字段去重，同一字段不重复计；不代表精确还原覆盖率，前缀后少量 ASCII 字母的自然行文会各计一次） |
 | `ai.egress.blocked.<port>.<role>` | 仅保留指标名，本版没有递增路径 |
 
 `<port>` 取 `chat` / `rag` / `embed`，`<role>` 取 `main` / `judge` / `gen` / `classify`（当前接线只发 `main`）。四个口径要点：
 
 - 发送尝试按「调用方发起几次显式 create」计：排队失败、替身短路与 create 之前的入参校验都不计，进了 SDK 之后失败（序列化错误、4xx/5xx）照常计一次。
-- SDK 内部重试单列（读请求头 `x-stainless-retry-count`，兼容不带前缀的 `retry-count`），与逻辑尝试分开：一次 create 被重试两次不会读成三次出境。
+- SDK 内部重试单列（读请求头 `x-stainless-retry-count`，兼容不带前缀的 `retry-count`），与逻辑尝试分开：一次 create 被重试两次不会读成三次出境。该指标依赖 SDK 重试头可读；观测钩子不可用时该值未知，不得解读为零。
 - 排队超时与排队取消只进 `ai.queue.*`，不占发送桶——否则「一直排队到被取消」与「真发出去了」在读数上没法区分。
-- 关闭遥测（`TELEMETRY_ENABLED=false`）时不写零值键：读数为空表示未知，不能当成「零出境」。
+- 关闭遥测（`TELEMETRY_ENABLED=false`）时不写零值键：读数为空表示未知，不能当成「零出境」；基准报告带 `telemetry_enabled` 与 `sdk_retry_observed` 两个显式状态位，报告消费方按状态位判断读数可信度。
 
 ## 设计要点与陷阱
 
@@ -982,7 +983,7 @@ All via `.env` file, with an additional UI-staged overlay layer (see 「配置�
 `rag_chunks` 的读取必须先过字段投影，回滚也只有保留这两样才成立——只做一半会在启动后立刻 `TypeError`。
 
 - **为什么必须投影**：`SELECT c.*` 的列集合随表结构变化，`ChunkRow(**dict(row))` 在表多一列时直接 `TypeError`；投影按 dataclass 字段取值，旧 shape（列少，取默认值）与新 shape（列多，多余列丢弃）都能读。
-- **回滚必须同时保留追加列**：直接退到更早的基线会重新假设「列恰好等于 dataclass 字段」，库里的 `sender_id` 立刻让 FTS 腿与向量腿同时哑掉，检索静默变成空结果；保留投影读取器的版本不受影响。
+- **回滚必须同时保留追加列**：直接退到更早的基线会重新假设「列恰好等于 dataclass 字段」，库里的 `sender_id` 会让关键词检索腿在读取时抛 `TypeError`（旧代码的 `ChunkRow(**row)` 遇新列直接失败）；向量腿不依赖该读取器，仍能返回。保留投影读取器的版本两条腿都不受影响。
 - **回填只填空串**：非空值可能是回填之后原始消息被删除、现在查不到的那一份，覆盖等于用「现在没有」擦掉「当时有」。
 - 回归：`tests/test_rag_plugin.py` 的 `test_rollback_reader_ignores_unknown_columns`、`test_sender_id_migration_is_idempotent`、`test_upsert_preserves_known_sender_id`、`test_fts_and_vector_share_sender_id`。
 

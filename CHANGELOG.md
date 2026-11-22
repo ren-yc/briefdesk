@@ -23,7 +23,7 @@
 ### 破坏性变更
 
 - `build_answer_prompt` 的 `names` 改为必填：不再回退 chunk 上的显示名，调用方必须为每条证据准备展示名，长度与命中条数不符直接报错。回归：`test_evidence_pseudonymized_for_remote_endpoint`、`test_evidence_names_kept_for_local_endpoint`。
-- rag 表新增 `rag_chunks.sender_id`：回滚必须保留字段投影读取器与新增列，直接退到旧代码会因 `SELECT c.*` 多出一列而 `TypeError`，检索两条腿同时哑掉。回归：`test_rollback_reader_ignores_unknown_columns`。
+- rag 表新增 `rag_chunks.sender_id`：回滚必须保留字段投影读取器与新增列，直接退到旧代码会因 `SELECT c.*` 多出一列而 `TypeError`，关键词检索腿在读取时失败；向量腿不经过该读取器、不受影响。回归：`test_rollback_reader_ignores_unknown_columns`。
 
 ### 修复
 
@@ -31,7 +31,7 @@
 - 别名还原不再把一个人换成另一个人：本请求已写回过的显示名整体受保护，落在其中的片段不再被当成别名二次替换。回归：`test_produced_display_name_is_never_reinterpreted`、`test_protected_display_name_survives_inside_sentence`。
 - 注册表读取失败不再被当成「文件不存在」而静默重建：损坏、缺盐与版本不支持一律拒绝出站，避免一次重盐让历史化名永久失效。回归：`test_read_registry_rejects_non_alias_values`、`test_version_error_does_not_echo_value`。
 - 本地端点判定的绕过路径收口：带凭据段或空 userinfo、控制字符、非法端口与近似域名一律按远端处理，畸形 URL 不再被判成本地。回归：`test_local_endpoint_matrix_fail_closed`、`test_remote_endpoint_matrix_fail_closed`。
-- 空串不再覆盖 rag 里已有的 `sender_id`：回填与 upsert 都只补空值。回归：`test_upsert_preserves_known_sender_id`。
+- rag 里已有的 `sender_id` 不再被空串覆盖：回填与 upsert 都只保留旧值，新写入的非空值仍可更新。回归：`test_upsert_preserves_known_sender_id`。
 
 ## [0.2.0] - 2026-11-14
 
