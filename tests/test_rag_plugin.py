@@ -540,30 +540,74 @@ class TestRagDb:
         finally:
             await db.close()
 
-        # 场景三：列已存在（幂等重跑分支）+ 回填抛错 → 已有值不被部分改动
+        # 场景三：列已存在（幂等重跑分支）+ 回填完成**之后**才失败
+        # → 部分写入被 SAVEPOINT 回滚，已有值与全部行数据保持原样。
+        # 失败必须发生在真实 UPDATE 已执行之后：注入在写入前就抛错的语句
+        # 钉不住「回滚已写入的部分」，删掉已有列分支的 SAVEPOINT 也照样绿。
         db = await _build_old_shape_db()
         try:
             cursor = await db.execute(
                 "ALTER TABLE rag_chunks ADD COLUMN sender_id TEXT NOT NULL DEFAULT ''"
             )
             await cursor.close()
+            # 先手工写入非空已知值：回滚后它必须原样保留（不被回填语句改动、
+            # 也不被错误的部分写入覆盖）
+            cursor = await db.execute(
+                "UPDATE rag_chunks SET sender_id = 'known' WHERE msg_id = 'm1'"
+            )
+            await cursor.close()
             await db.commit()
+            # 再造一行缺值，回填会真实写入它——失败点放在写入之后
+            cursor = await db.execute(
+                "INSERT INTO rag_chunks(source,msg_id,session_id,group_name,"
+                "sender_name,msg_time,content,item_id) VALUES(?,?,?,?,?,?,?,?)",
+                ("weflow-legacy", "m2", "s1", "测试群", "小红", 1700000100, "内容二", ""),
+            )
+            await cursor.close()
+            await db.commit()
+
+            original_execute = db.execute
+            backfill_done = {"done": False}
+
+            async def _fail_after_update(sql, *args, **kwargs):
+                cursor = await original_execute(sql, *args, **kwargs)
+                if "UPDATE rag_chunks SET sender_id" in sql and not backfill_done["done"]:
+                    # UPDATE 已真实执行（含 m2 的回填写入）后才抛错
+                    backfill_done["done"] = True
+                    raise RuntimeError("回填后的维护步骤失败")
+                return cursor
+
             with (
                 patch.object(
-                    rag_db,
-                    "_SENDER_ID_BACKFILL_SQL",
-                    "UPDATE rag_chunks SET sender_id = (SELECT no_such_col FROM x)",
+                    db, "execute", side_effect=_fail_after_update, create=True
                 ),
-                pytest.raises(sqlite3.OperationalError),
+                pytest.raises(RuntimeError),
             ):
                 await ensure_rag_schema(db)
+            assert backfill_done["done"], "回填语句必须真的执行过"
+            # 回滚完整：已知值原样、缺值行回空、行集合不变
             cursor = await db.execute(
-                "SELECT sender_id FROM rag_chunks WHERE msg_id='m1'"
+                "SELECT msg_id, sender_id, sender_name FROM rag_chunks ORDER BY msg_id"
             )
             try:
-                assert (await cursor.fetchone())["sender_id"] == ""
+                rows = [dict(r) for r in await cursor.fetchall()]
             finally:
                 await cursor.close()
+            assert [(r["msg_id"], r["sender_id"]) for r in rows] == [
+                ("m1", "known"), ("m2", ""),
+            ]
+            # 事务不残留：SAVEPOINT 已 RELEASE，重跑迁移成功
+            await ensure_rag_schema(db)
+            cursor = await db.execute(
+                "SELECT msg_id, sender_id FROM rag_chunks ORDER BY msg_id"
+            )
+            try:
+                rows = [tuple(r) for r in await cursor.fetchall()]
+            finally:
+                await cursor.close()
+            assert rows == [("m1", "known"), ("m2", "u2")] or rows == [
+                ("m1", "known"), ("m2", ""),
+            ]  # raw 有 m2 则回填 u2，无则保持空串——两者都是合法终态
         finally:
             await db.close()
 
@@ -2436,9 +2480,12 @@ class TestRagEvidenceNamePreparation(_MemoryEngineBase):
         assert context.display_name_for(names[0].sender) == "成员甲"
         assert context.display_name_for(names[1].sender) == "成员乙"
 
-    async def test_idless_same_name_across_sessions_shares_alias(self):
-        """缺 ID、同名、跨会话：身份键含 source+session+名字段，跨会话同名者
-        键不同（best-effort 边界内的有意取舍）；同会话同名者必须共用一个别名。
+    async def test_idless_same_name_session_dimension_and_cross_session_split(self):
+        """缺 ID 同名三输入（s1/s1/s2）：同会话复用同一别名，跨会话分离。
+
+        失败模式：删掉缺 ID 身份键的会话维度后，跨会话同名者被并成同一身份——
+        s1 与 s2 的「同名人」各拿到对方会话的化名。只有同会话输入的旧用例钉不住
+        这个维度，异名跨会话的另案又测不到「同名」分支。
         """
         from briefdesk import pseudonym
 
@@ -2450,10 +2497,17 @@ class TestRagEvidenceNamePreparation(_MemoryEngineBase):
         hits = [
             self._hit(self._chunk("m1", "", "同名人", session_id="s1")),
             self._hit(self._chunk("m2", "", "同名人", session_id="s1")),
+            self._hit(self._chunk("m3", "", "同名人", session_id="s2")),
         ]
         names = await type(self.engine)._prepare_evidence_names(context, hits)
+        # 同会话同名：一个身份、一个别名
         assert names[0].sender == names[1].sender
         assert names[0].sender.startswith("同学")
+        # 跨会话同名：会话维度参与身份键，不得共用别名
+        assert names[2].sender != names[0].sender
+        assert names[2].sender.startswith("同学")
+        assert context.display_name_for(names[0].sender) == "同名人"
+        assert context.display_name_for(names[2].sender) == "同名人"
 
     async def test_group_without_session_id_uses_name_key(self):
         """群缺会话 ID：按群名分键，两个无会话群的证据不得共用第一个群名。"""
@@ -2516,6 +2570,31 @@ class TestRagEvidenceNamePreparation(_MemoryEngineBase):
         assert names[1].group.startswith("群")
         assert context.display_name_for(names[1].group, kind="group") == "真群名"
 
+    async def test_group_real_then_empty_keeps_alias_and_restore(self):
+        """同一群先真名后空名：尾部空名不得擦掉已收敛的有效群名。
+
+        失败模式：空调用返回空串覆盖映射后，整批证据群名全空、还原无目标。
+        反向时序（真名在前）与空→真是两条独立路径，classify 的反向用例覆盖
+        不到这段独立的 RAG 实现。
+        """
+        from briefdesk import pseudonym
+
+        context = pseudonym.NameContext(
+            enabled=True, pseudonymizer=pseudonym.Pseudonymizer(
+                pseudonym.registry_dir(), flush_window=0.0,
+            )
+        )
+        hits = [
+            self._hit(self._chunk("m1", "u1", "小明", group_name="真群名")),
+            self._hit(self._chunk("m2", "u1", "小明", group_name="")),
+        ]
+        names = await type(self.engine)._prepare_evidence_names(context, hits)
+        # 两条证据同会话：群只有一个，空名消息随会话身份拿同一个化名
+        assert names[0].group == names[1].group
+        assert names[0].group.startswith("群")
+        # 出站别名与逆映射都在：还原目标仍是真名
+        assert context.display_name_for(names[0].group, kind="group") == "真群名"
+
     async def test_all_blank_names_stay_blank_without_alias_error(self):
         """整批显示名为空：不登记身份、不误报别名缺失，出站保持空串。"""
         from briefdesk import pseudonym
@@ -2556,13 +2635,15 @@ class TestRagEvidenceNamePreparation(_MemoryEngineBase):
         assert context.display_name_for(names[0].group, kind="group") == "真群名"
 
     async def test_new_identities_share_exactly_one_commit_increment(
-        self, monkeypatch
+        self, tmp_path, monkeypatch
     ):
         """预热后一批新身份只增加一次落盘提交：分两轮 gather 会多出一个窗口。
 
         上一版守卫只断言 `commit_count >= 1` 且未预热：「群 gather → 人 gather」
         的错误实现同样通过。这里先提交预热身份，再断言本批增量**恰好为 1**，
-        并把人与群、缺 ID 回放身份混进同一批。
+        并把人与群、缺 ID 回放身份混进同一批。注册表用例独立（tmp_path）：共享
+        会话级注册表时前序用例可能已登记本批身份，「预热后」就不再等于「本批
+        全新」，两轮 gather 的错误实现在整组里照样 12 passed。
         """
         import asyncio
 
@@ -2591,20 +2672,21 @@ class TestRagEvidenceNamePreparation(_MemoryEngineBase):
         monkeypatch.setattr(asyncio, "sleep", _counting_sleep)
 
         pseudonymizer = pseudonym.Pseudonymizer(
-            pseudonym.registry_dir(), flush_window=0.05,
+            tmp_path / "pseudonym", flush_window=0.05,
         )
-        # 预热：先提交一个身份，让后续批次落在「非首次提交」区间
+        # 预热：先提交一个与本批身份无关的身份，让后续批次落在「非首次提交」
+        # 区间（首次初始化跳过合并窗口，计不出「共享一次窗口」）
         warm = pseudonym.NameContext(enabled=True, pseudonymizer=pseudonymizer)
         await warm.person_alias(
             source="weflow-legacy", sender_id="warm",
-            session_id="s1", display_name="预热者",
+            session_id="warm-sess", display_name="预热者",
         )
         assert commit_count["n"] >= 1
         baseline = commit_count["n"]
 
         context = pseudonym.NameContext(enabled=True, pseudonymizer=pseudonymizer)
         hits = [
-            # 三个新有 ID 身份 + 一个新群 + 一个缺 ID 新身份
+            # 三个新有 ID 身份 + 一个缺 ID 新身份（全部未在注册表出现过）
             self._hit(self._chunk("m1", "u1", "成员一")),
             self._hit(self._chunk("m2", "u2", "成员二")),
             self._hit(self._chunk("m3", "u3", "成员三")),

@@ -1212,19 +1212,64 @@ def test_record_retry_observed_buckets_by_locality() -> None:
 
 
 def test_egress_summary_uses_header_observation_not_telemetry_switch() -> None:
-    """汇总的 observed 只认「头真的被读到」，不认遥测开关。
+    """汇总的 observed 只认「头真的被读到」，不认遥测开关或发送尝试。
 
-    错误实现（observed = telemetry._enabled()）会把「开关开着但钩子没挂上」
-    报成可观测——这里直接塞计数器验证判定来源。
+    两阶段断言缺一不可：只断「两者都在时 observed=true」放过了
+    `observed = attempts > 0` 的错误实现——发送尝试在先、观测未落账的窗口里
+    （钩子没挂上、头不可读都是真实形态）报告必须明确 observed=false。
     """
     summary = bench_engine._egress_summary()
     assert summary == {
         "attempt_total": 0, "sdk_retry_total": 0, "sdk_retry_observed": False,
     }
 
+    # 阶段一：只有发送尝试，观测计数未落账 → false（未知不是可观测）
     ai_egress.record_send_attempt(ai_egress.PORT_CHAT, ai_egress.ROLE_MAIN, REMOTE_BASE)
+    summary = bench_engine._egress_summary()
+    assert summary == {
+        "attempt_total": 1, "sdk_retry_total": 0, "sdk_retry_observed": False,
+    }
+
+    # 阶段二：观测计数落账 → true，零重试成为可信读数
     ai_egress.record_retry_observed(ai_egress.PORT_CHAT, ai_egress.ROLE_MAIN, False)
     summary = bench_engine._egress_summary()
     assert summary == {
         "attempt_total": 1, "sdk_retry_total": 0, "sdk_retry_observed": True,
     }
+
+
+async def test_report_observed_false_when_hook_never_sees_header(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """真实发送路径上钩子拿不到重试头：报告 observed=false，零不可信。
+
+    对应上一版把「遥测开关」当观测状态的失败形态：钩子没挂上（客户端工厂丢掉
+    event_hooks）时一次重试都不会被记——把零当真会静默丢掉全部内部重试。报告
+    的 observed 必须来自观测桶计数，而不是「遥测开着」或「发送尝试存在」。
+    """
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json=_chat_body())
+
+    _install_transport(monkeypatch, handler)
+
+    def _hookless_client(**kwargs: Any) -> httpx.AsyncClient:
+        kwargs.pop("event_hooks", None)  # 钩子没挂上：观测链路断开
+        return httpx.AsyncClient(
+            transport=httpx.MockTransport(handler), follow_redirects=True, **kwargs
+        )
+
+    monkeypatch.setattr(engine, "DefaultAsyncHttpxClient", _hookless_client)
+    ai_ports.set_ai(Provider())
+
+    await ai_ports.chat(
+        [{"role": "user", "content": "hi"}], temperature=0.1, max_tokens=16
+    )
+
+    assert len(requests) == 1
+    summary = bench_engine._egress_summary()
+    assert summary["attempt_total"] == 1
+    assert summary["sdk_retry_total"] == 0
+    assert summary["sdk_retry_observed"] is False
