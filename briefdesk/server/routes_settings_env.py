@@ -20,7 +20,12 @@ from typing import Any
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
-from briefdesk.config import REASONING_EFFORT_VALUES, Settings, config
+from briefdesk.config import (
+    PSEUDONYMIZE_NAMES_VALUES,
+    REASONING_EFFORT_VALUES,
+    Settings,
+    config,
+)
 from briefdesk.secrets_store import (
     DB_KEYS_BASE,
     SECRET_NAMES,
@@ -103,6 +108,12 @@ _CORE_UI: dict[str, dict[str, Any]] = {
         "label": "单条消息随请求附图上限",
         "hint": "多图消息超出部分只发 OCR 文本",
     },
+    "AI_PSEUDONYMIZE_NAMES": {
+        "label": "出站姓名/群名替换为化名",
+        "hint": "auto=仅当 AI 端点在远端时启用（本地模型不改写输入）；"
+                "on=强制启用；off=强制关闭。只替换姓名/群名这类展示名，"
+                "不改正文与编号，也不是全字段匿名",
+    },
     "MAX_CLASSIFY_TOKENS": {"label": "单次分类最大输出 token"},
     "BACKFILL_HOURS": {"label": "历史回填窗口（小时）", "hint": "-1 = 拉取全部历史（耗时且 AI 调用激增，慎用）"},
     "IGNORED_EXPIRY_HOURS": {"label": "已忽略条目过期（小时）", "hint": "0 = 禁用清理"},
@@ -165,6 +176,10 @@ def _core_schema() -> list[dict[str, Any]]:
             # 必须按环境键名登记：settings_schema 以 key 判 select，否则字段只会渲染成
             # 文本框（见 _field_type 的兜底分支）
             "AI_REASONING_EFFORT": list(REASONING_EFFORT_VALUES),
+            # 空选项是隐私开关的「未填写」态：暂存层把它存成空串，启动期按 auto
+            # 消费。不登记空选项的话，用户把下拉清空会得到 422（该项保存失败），
+            # 而启动期又明确接受空串——两条路径对同一份文件给出不同答案。
+            "AI_PSEUDONYMIZE_NAMES": ["", *PSEUDONYMIZE_NAMES_VALUES],
         },
     )
     for item in items:

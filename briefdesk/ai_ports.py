@@ -5,6 +5,9 @@
   转发到已注册的 AIProvider 实例（未注册时 chat/embed 抛 RuntimeError 明示
   配置错误，启用性检查安全返回 False）；`rag_chat` 额外接受 model/api_base/
   api_key override，由调用方从自己的配置域下传（见该函数 docstring）；
+- `resolve_rag_dispatch`：**可提前查询**的实际派发计划（端点/模型），与
+  `rag_chat` 的转发判断共用同一处逻辑。调用方要在构建 prompt 之前知道
+  「这次到底会发到哪个端点」（是否本地）才能决定要不要改写展示名；
 - 三个转发端口在转发期间用 `ai_egress.use_metadata` 标注出境元数据（端口、
   角色、任务标签、消息源标签），本身**不计数**：端口调用不等于出境，计数在
   供应商引擎的发送边界（排队失败/替身短路都不该算作发送尝试）；
@@ -19,6 +22,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
@@ -118,6 +122,72 @@ async def chat(
     return resp
 
 
+@dataclass(frozen=True)
+class RagDispatch:
+    """一次 RAG 问答的**实际派发**计划：真正会被使用的端点与模型。
+
+    为什么调用方需要它：要不要把展示名（姓名、群名）换成化名，取决于这次请求
+    落到本地还是远端端点，而这个决定发生在构建 prompt **之前**。只看自己手里的
+    override 会判错——供应商没有专用通道时 `rag_chat` 回退走 `chat`，override 被
+    静默丢弃、请求打到主端点。若调用方按 override 判成本地、请求却落在远端主机，
+    真实姓名就被原样送出（静默泄露，不是报错）。
+
+    Key 只以布尔出现：`has_api_key` 足够判断凭据层是否生效，而计划会进日志、
+    快照与测试断言，明文一旦进来就跟着流出去。
+    """
+
+    dedicated: bool
+    """供应商是否真的实现了专用 rag_chat（类级声明；旧实现与测试桩为 False）。"""
+    model: str
+    """实际生效模型：专用通道用 override（留空回退主模型）；回退 chat 时恒为主模型。"""
+    api_base: str
+    """实际生效端点：专用通道用 override（留空回退主端点）；回退 chat 时恒为主端点。"""
+    has_api_key: bool
+    """这次派发是否带着 override Key；回退 chat 时恒为 False（chat 不接受 Key 覆盖）。"""
+
+
+def resolve_rag_dispatch(
+    *, model: str = "", api_base: str = "", api_key: str = ""
+) -> RagDispatch:
+    """算出这次 RAG 问答**实际**会派发到哪个端点与模型（只查询，不发送）。
+
+    判定写在这一处、由 `rag_chat` 调用：两份 hasattr 判断迟早会分叉，而分叉的
+    后果是「计划说本地、实际发远端」这类静默泄露，不是报错（回归见
+    tests/test_ai_dispatch.py）。
+
+    语义（与供应商实现里 override 的解析规则逐项对齐，三项不当作一个原子包）：
+    - `dedicated=True`：专用通道生效，model/api_base 各自按 override 回退主配置；
+    - `dedicated=False`：旧供应商没有专用通道，回退复用 `chat`，override 全部
+      丢弃，模型与端点都是主配置的值——`api_base` 必须报**主端点**，报 override
+      会把调用方引向「本次是本地请求」的错误结论。
+
+    失败模式：绕开本函数、直接拿 override 判本地的调用方，会在回退路径上把真名
+    发给远端主端点。正确用法是「先取计划 → 按计划的 api_base 判本地 → 再构建
+    prompt」，让判定与发送描述同一件事。
+
+    未注册供应商时与 `rag_chat` 一样抛 RuntimeError：计划描述的是「这次调用会
+    发生什么」，没有供应商就没有派发可言，静默按主端点出计划只会掩盖配置错误。
+    """
+    ai = _require_ai()
+    from briefdesk.config import config
+
+    # 类级检测：Mock/旧实现等实例级动态属性（__getattr__）不视为实现了 rag_chat，
+    # 只有真正声明该方法的供应商类才走专用通道，否则回退复用 chat。
+    if not hasattr(type(ai), "rag_chat"):
+        return RagDispatch(
+            dedicated=False,
+            model=config.ai_model,
+            api_base=config.ai_api_base,
+            has_api_key=False,
+        )
+    return RagDispatch(
+        dedicated=True,
+        model=model or config.ai_model,
+        api_base=api_base or config.ai_api_base,
+        has_api_key=bool(api_key),
+    )
+
+
 async def rag_chat(
     messages: list[dict],
     *,
@@ -139,14 +209,17 @@ async def rag_chat(
     回退单独计数（`rag.chat_fallback`，无消息源维度）：它意味着「专用通道
     没生效、问答实际跑在主模型上」，与回答失败是两种故障，合成一个桶就分不开
     ——用户配了 RAG_MODEL 却没被用上，只能从这里看出来。
+
+    走哪条路由由 `resolve_rag_dispatch` 决定（同一份判断，调用方可以提前查询
+    实际端点）；override 仍按原值转发，留空时的回退在供应商实现里完成——两处
+    的回退规则一致，端口层不替供应商改写参数。
     """
     ai = _require_ai()
+    dispatch = resolve_rag_dispatch(model=model, api_base=api_base, api_key=api_key)
     # 端口层只标注「这次是 rag 端口」，计数留给引擎的发送边界（见 engine 的
     # _sending）：rag 的 prompt 准备失败时根本没发送，端口调用次数不等于出境次数。
     with ai_egress.use_metadata(port=ai_egress.PORT_RAG, role=ai_egress.ROLE_MAIN):
-        # 类级检测：Mock/旧实现等实例级动态属性（__getattr__）不视为实现了 rag_chat，
-        # 只有真正声明该方法的供应商类才走专用通道，否则回退复用 chat。
-        if hasattr(type(ai), "rag_chat"):
+        if dispatch.dedicated:
             # 运行时防御性检测仍有意义：测试经 set_ai 注入的桩可能未声明 rag_chat
             # （mypy 对函数体内构造的对象不做协议校验）；静态层面 AIProvider 协议
             # 已含 rag_chat 成员（plugin/base.py），无需 ignore。

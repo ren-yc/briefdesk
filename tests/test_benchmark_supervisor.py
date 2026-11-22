@@ -240,6 +240,7 @@ class SupervisorTest(unittest.IsolatedAsyncioTestCase):
             patch.object(config, "ai_reasoning_effort", "off"),
             patch.object(config, "ai_model", "m1"),
             patch.object(config, "ai_json_mode", "on"),
+            patch.object(config, "ai_pseudonymize_names", "on"),
             patch.object(config, "max_classify_tokens", 1234),
             patch.object(config, "ai_vision_enabled", True),
             patch.object(config, "ai_vision_max_images", 7),
@@ -256,6 +257,9 @@ class SupervisorTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(env.get("AI_REASONING_EFFORT"), "off")
         self.assertEqual(env.get("AI_MODEL"), "m1")
         self.assertEqual(env.get("AI_JSON_MODE"), "on")
+        # 隐私开关下传的是**当前生效值**（这里故意取非默认的 on）：传默认值会让
+        # 父子两侧跑在不同隐私策略上，而同一次基准的报告不体现这个差异。
+        self.assertEqual(env.get("AI_PSEUDONYMIZE_NAMES"), "on")
         self.assertEqual(env.get("MAX_CLASSIFY_TOKENS"), "1234")
         self.assertEqual(env.get("AI_VISION_ENABLED"), "true")
         self.assertEqual(env.get("AI_VISION_MAX_IMAGES"), "7")
@@ -269,6 +273,15 @@ class SupervisorTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(env.get("DEDUP_STRONG_THRESHOLD"), "0.98")
         for secret_name in ("AI_API_KEY", "EMBED_API_KEY", "RAG_API_KEY"):
             self.assertNotIn(secret_name, env)
+        # 只查「本函数显式下传」的键，不受宿主环境里恰好存在的同名变量干扰；
+        # role 键不在本次下传范围（角色配置与父进程解析另有改动），提前夹带一个
+        # 半成品键会让子进程读到与父进程不一致的角色口径。
+        explicit = {key for key, value in env.items() if os.environ.get(key) != value}
+        self.assertEqual(
+            sorted(k for k in explicit if k.startswith(("AI_JUDGE_", "AI_GEN_"))),
+            [],
+            "不得提前下传 role 键",
+        )
 
     async def test_state_does_not_scan_disk_while_running(self) -> None:
         """运行期间 state() 不扫盘：这是 3s 轮询的热路径，而扫盘是同步 I/O。

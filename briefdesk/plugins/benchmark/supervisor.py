@@ -262,6 +262,10 @@ def _child_env() -> dict[str, str]:
             "MAX_CLASSIFY_TOKENS": str(config.max_classify_tokens),
             "AI_VISION_ENABLED": str(config.ai_vision_enabled).lower(),
             "AI_VISION_MAX_IMAGES": str(config.ai_vision_max_images),
+            # 下传当前生效值而不是默认值：这一项决定子进程会不会改写要送出去的
+            # 展示名，父子两侧口径不一致时，同一次基准会跑到「另一套隐私策略」上，
+            # 而报告不会体现这个差异。
+            "AI_PSEUDONYMIZE_NAMES": config.ai_pseudonymize_names,
             "EMBED_API_BASE": config.embed_api_base,
             "EMBED_MODEL": config.embed_model,
             "EMBED_BATCH_SIZE": str(config.embed_batch_size),
