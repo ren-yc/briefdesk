@@ -1849,6 +1849,33 @@ class TestPseudonymOutbound:
         assert "张三" not in sysb
         assert "张三" not in sysc
 
+    async def test_idless_same_name_session_dimension_and_cross_session_split(
+        self, pseudo_registry
+    ):
+        # 缺 ID 同名三输入（s1/s1/s2）：同会话复用同一化名，跨会话分离——
+        # 删掉身份键 session 维度的错误实现（跨会话同名者并成一人）在本类
+        # 自身也要变红，不依赖 RAG 侧的独立实现抓红。
+        first = _pseudo_msg(msg_id="m1", sender_id="", sender_name="同名人",
+                            session_id="s1")
+        second = _pseudo_msg(msg_id="m2", sender_id="", sender_name="同名人",
+                             session_id="s1")
+        third = _pseudo_msg(msg_id="m3", sender_id="", sender_name="同名人",
+                            session_id="s2")
+        names = await prepare_name_context([first, second, third])
+        alias_first = names.senders[("name", "weflow-legacy", "s1", "同名人")]
+        alias_third = names.senders[("name", "weflow-legacy", "s2", "同名人")]
+        assert alias_first.startswith("同学")
+        assert alias_third.startswith("同学")
+        assert alias_first != alias_third
+        # 同会话两条消息在 prompt 里用同一个化名
+        built = _build_user_message(
+            _group_messages([first, second, third], names=names)
+        )
+        assert built.count(alias_first) == 2
+        assert built.count(alias_third) == 1
+        assert names.ctx.display_name_for(alias_first, kind="person") == "同名人"
+        assert names.ctx.display_name_for(alias_third, kind="person") == "同名人"
+
     async def test_empty_then_real_name_resolves_to_real_name(
         self, pseudo_registry
     ):

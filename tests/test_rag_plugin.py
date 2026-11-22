@@ -540,10 +540,14 @@ class TestRagDb:
         finally:
             await db.close()
 
-        # 场景三：列已存在（幂等重跑分支）+ 回填完成**之后**才失败
+        # 场景三：列已存在（幂等重跑分支）+ 回填真实写入**之后**才失败
         # → 部分写入被 SAVEPOINT 回滚，已有值与全部行数据保持原样。
-        # 失败必须发生在真实 UPDATE 已执行之后：注入在写入前就抛错的语句
-        # 钉不住「回滚已写入的部分」，删掉已有列分支的 SAVEPOINT 也照样绿。
+        # 三层缺一不可：失败点必须在 UPDATE 真实写入之后（写入前抛错钉不住
+        # 「回滚已写入的部分」）；必须有被实际更新的行（无匹配 raw 行时
+        # WHERE EXISTS 让 rowcount=0，「执行过语句」不等于「发生过写入」）；
+        # 抛错前必须先断言写入确实发生（否则守卫可能在验证一条没写任何东西
+        # 的语句）。删除 ROLLBACK 只留 RELEASE 的错误实现会在 m2 残留 u2，
+        # 被回滚状态断言抓红。
         db = await _build_old_shape_db()
         try:
             cursor = await db.execute(
@@ -556,47 +560,68 @@ class TestRagDb:
                 "UPDATE rag_chunks SET sender_id = 'known' WHERE msg_id = 'm1'"
             )
             await cursor.close()
-            await db.commit()
-            # 再造一行缺值，回填会真实写入它——失败点放在写入之后
+            # 再造一行缺值，且 raw 里有匹配行（sender_id='u2'）：回填会真实
+            # 写入它——这是「部分写入」的载体
             cursor = await db.execute(
                 "INSERT INTO rag_chunks(source,msg_id,session_id,group_name,"
                 "sender_name,msg_time,content,item_id) VALUES(?,?,?,?,?,?,?,?)",
                 ("weflow-legacy", "m2", "s1", "测试群", "小红", 1700000100, "内容二", ""),
             )
             await cursor.close()
+            cursor = await db.execute(
+                "INSERT INTO raw_messages(source,msg_id,session_id,group_name,"
+                "sender_id,sender_name,content,timestamp) VALUES(?,?,?,?,?,?,?,?)",
+                ("weflow-legacy", "m2", "s1", "测试群", "u2", "小红", "内容二", 1700000100),
+            )
+            await cursor.close()
             await db.commit()
 
             original_execute = db.execute
-            backfill_done = {"done": False}
+            wrote = {"rowcount": None, "verified": False}
 
-            async def _fail_after_update(sql, *args, **kwargs):
+            async def _fail_after_real_write(sql, *args, **kwargs):
                 cursor = await original_execute(sql, *args, **kwargs)
-                if "UPDATE rag_chunks SET sender_id" in sql and not backfill_done["done"]:
-                    # UPDATE 已真实执行（含 m2 的回填写入）后才抛错
-                    backfill_done["done"] = True
+                if "UPDATE rag_chunks SET sender_id" in sql and wrote["rowcount"] is None:
+                    # UPDATE 已真实执行：先采集写入证据（rowcount 与 m2 当前值），
+                    # 异常捕获后再严格断言——否则守卫可能在验证一条没写任何
+                    # 东西的语句
+                    wrote["rowcount"] = cursor.rowcount
+                    check = await original_execute(
+                        "SELECT sender_id FROM rag_chunks WHERE msg_id='m2'"
+                    )
+                    try:
+                        row = await check.fetchone()
+                    finally:
+                        await check.close()
+                    wrote["verified"] = row is not None and row["sender_id"] == "u2"
                     raise RuntimeError("回填后的维护步骤失败")
                 return cursor
 
             with (
                 patch.object(
-                    db, "execute", side_effect=_fail_after_update, create=True
+                    db, "execute", side_effect=_fail_after_real_write, create=True
                 ),
                 pytest.raises(RuntimeError),
             ):
                 await ensure_rag_schema(db)
-            assert backfill_done["done"], "回填语句必须真的执行过"
-            # 回滚完整：已知值原样、缺值行回空、行集合不变
+            assert wrote["rowcount"] == 1, wrote
+            assert wrote["verified"], "抛错前 m2 必须已真实写入 u2"
+            # 回滚完整：已知值原样、缺值行回空、显示名等其余列不变
             cursor = await db.execute(
-                "SELECT msg_id, sender_id, sender_name FROM rag_chunks ORDER BY msg_id"
+                "SELECT msg_id, sender_id, sender_name, group_name FROM rag_chunks "
+                "ORDER BY msg_id"
             )
             try:
                 rows = [dict(r) for r in await cursor.fetchall()]
             finally:
                 await cursor.close()
-            assert [(r["msg_id"], r["sender_id"]) for r in rows] == [
-                ("m1", "known"), ("m2", ""),
+            assert rows == [
+                {"msg_id": "m1", "sender_id": "known", "sender_name": "小明",
+                 "group_name": "测试群"},
+                {"msg_id": "m2", "sender_id": "", "sender_name": "小红",
+                 "group_name": "测试群"},
             ]
-            # 事务不残留：SAVEPOINT 已 RELEASE，重跑迁移成功
+            # 事务不残留：SAVEPOINT 已 RELEASE，重跑迁移必须严格得到 known/u2
             await ensure_rag_schema(db)
             cursor = await db.execute(
                 "SELECT msg_id, sender_id FROM rag_chunks ORDER BY msg_id"
@@ -605,9 +630,7 @@ class TestRagDb:
                 rows = [tuple(r) for r in await cursor.fetchall()]
             finally:
                 await cursor.close()
-            assert rows == [("m1", "known"), ("m2", "u2")] or rows == [
-                ("m1", "known"), ("m2", ""),
-            ]  # raw 有 m2 则回填 u2，无则保持空串——两者都是合法终态
+            assert rows == [("m1", "known"), ("m2", "u2")]
         finally:
             await db.close()
 
