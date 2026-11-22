@@ -128,6 +128,17 @@ _SCHEMA = [
 ]
 
 
+# 回填语句单源：迁移与幂等重跑共用同一条 UPDATE，避免两处手抄漂移。
+_SENDER_ID_BACKFILL_SQL = (
+    "UPDATE rag_chunks SET sender_id = ("
+    "SELECT COALESCE(r.sender_id, '') FROM raw_messages r "
+    "WHERE r.source = rag_chunks.source AND r.msg_id = rag_chunks.msg_id) "
+    "WHERE sender_id = '' AND EXISTS ("
+    "SELECT 1 FROM raw_messages r "
+    "WHERE r.source = rag_chunks.source AND r.msg_id = rag_chunks.msg_id)"
+)
+
+
 async def ensure_rag_schema(db: aiosqlite.Connection) -> None:
     """创建 rag 五表中的四张普通表（chunks/embeddings/meta/skipped 幂等；FTS 虚拟表由 ensure_fts 惰性创建）。
 
@@ -144,13 +155,20 @@ async def ensure_rag_schema(db: aiosqlite.Connection) -> None:
 
 
 async def _migrate_sender_id(db: aiosqlite.Connection) -> None:
-    """给旧库补 `sender_id` 列并按 `(source, msg_id)` 回填；幂等。
+    """给旧库补 `sender_id` 列并按 `(source, msg_id)` 回填；幂等且整体原子。
 
     为什么先 `PRAGMA table_info` 再 ALTER：`ALTER TABLE ... ADD COLUMN` 没有
     `IF NOT EXISTS` 形态，重复执行会抛 "duplicate column name"，而 ensure_schema
     在每次启动都会跑——那样第二次启动就再也起不来了。缺列才 ALTER 让本函数可以
     被无脑重复调用（回归见 tests/test_rag_plugin.py 的
     test_sender_id_migration_is_idempotent）。
+
+    为什么必须显式 SAVEPOINT：aiosqlite 默认隔离级别下，DDL 与 DML 各自开启
+    隐式事务，外层的 commit 无法把它们合并成一个原子单元——回填失败回滚时
+    ALTER 已经生效，库会停在「列在、值全空、且下次启动因列存在而永远不再
+    回填」的死状态。SAVEPOINT 把两步包进一个可整体回滚的单元，失败恢复到
+    「列不存在」（旧 shape 可读）或「列存在且回填未完成」（下次启动重试）两种
+    单一状态之一，绝不出现中间态。
 
     为什么回填只填空串：非空值可能是运行期从原始消息带下来的更准的值（回填
     之后消息可能被删除，raw 里已经没有这一行）。覆盖非空值等于用「现在查不到」
@@ -164,18 +182,29 @@ async def _migrate_sender_id(db: aiosqlite.Connection) -> None:
     columns = {
         row["name"] for row in await fetch_all(db, "PRAGMA table_info(rag_chunks)")
     }
-    if "sender_id" not in columns:
+    if "sender_id" in columns:
+        # 列已存在：只做回填（幂等），仍包进 SAVEPOINT——回填失败同样整体回滚。
+        await db.execute("SAVEPOINT sender_id_backfill")
+        try:
+            await db.execute(_SENDER_ID_BACKFILL_SQL)
+        except BaseException:
+            await db.execute("ROLLBACK TO sender_id_backfill")
+            await db.execute("RELEASE sender_id_backfill")
+            raise
+        await db.execute("RELEASE sender_id_backfill")
+        return
+    await db.execute("SAVEPOINT sender_id_migration")
+    try:
         await db.execute(
             "ALTER TABLE rag_chunks ADD COLUMN sender_id TEXT NOT NULL DEFAULT ''"
         )
-    await db.execute(
-        "UPDATE rag_chunks SET sender_id = ("
-        "SELECT COALESCE(r.sender_id, '') FROM raw_messages r "
-        "WHERE r.source = rag_chunks.source AND r.msg_id = rag_chunks.msg_id) "
-        "WHERE sender_id = '' AND EXISTS ("
-        "SELECT 1 FROM raw_messages r "
-        "WHERE r.source = rag_chunks.source AND r.msg_id = rag_chunks.msg_id)"
-    )
+        await db.execute(_SENDER_ID_BACKFILL_SQL)
+    except BaseException:
+        # CancelledError 也是 BaseException：取消同样不能留下半迁移状态。
+        await db.execute("ROLLBACK TO sender_id_migration")
+        await db.execute("RELEASE sender_id_migration")
+        raise
+    await db.execute("RELEASE sender_id_migration")
 
 
 # ---------------------------------------------------------------- 元信息 --

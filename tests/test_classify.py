@@ -1849,6 +1849,38 @@ class TestPseudonymOutbound:
         assert "张三" not in sysb
         assert "张三" not in sysc
 
+    async def test_empty_then_real_name_resolves_to_real_name(
+        self, pseudo_registry
+    ):
+        # 同一 sender_id 先空名后真名：还原目标取最后的非空显示名，出站名用真名
+        # 对应的化名——空显示名不锁定映射，否则这个人整批拿空串出站。
+        empty = _pseudo_msg(msg_id="m1", sender_name="")
+        real = _pseudo_msg(msg_id="m2", sender_name="张三")
+        names = await prepare_name_context([empty, real])
+        key = ("id", "weflow-legacy", "u1")
+        alias = names.senders[key]
+        assert alias.startswith("同学")
+        built = _build_user_message(_group_messages([empty, real], names=names))
+        # 两条消息同一发送者（身份键相同）：空名消息的发送者与真名消息共用同一
+        # 化名，不能因为先出现的是空名就整批拿空串出站。
+        assert built.count(alias) == 2
+        assert names.ctx.display_name_for(alias, kind="person") == "张三"
+
+    async def test_group_rename_uses_final_name_for_restore(
+        self, pseudo_registry
+    ):
+        # 同一会话两次群名：还原目标取最后一个非空群名（与 RAG 证据行同口径）。
+        first = _pseudo_msg(msg_id="m1", group_name="旧群名")
+        second = _pseudo_msg(msg_id="m2", group_name="新群名")
+        names = await prepare_name_context([first, second])
+        gkey = ("weflow-legacy", "s1")
+        alias = names.groups[gkey]
+        assert alias.startswith("群")
+        assert names.ctx.display_name_for(alias, kind="group") == "新群名"
+        built = _build_user_message(_group_messages([first, second], names=names))
+        # 同一会话只有一个群头，两条消息都归在这一个群头下
+        assert built.count(f"群 0: {alias}") == 1
+
     async def test_same_group_name_in_two_sessions_keeps_distinct_aliases(
         self, pseudo_registry
     ):

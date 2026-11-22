@@ -204,16 +204,26 @@ async def prepare_name_context(messages: list[InternalMessage]) -> PreparedNames
     sender_names: dict[tuple[str, ...], str] = {}
     sender_msgs: dict[tuple[str, ...], InternalMessage] = {}
     for msg in messages:
-        group_names.setdefault((msg.source or "", msg.session_id), msg.group_name)
+        gkey = (msg.source or "", msg.session_id)
+        # 还原目标口径（人与群同一规则）：本请求内最后一个非空显示名。空显示名
+        # 跳过、不锁定空串，先空后真名的人拿真名出站、也拿真名还原。首个非空
+        # 出现者参与并发准备；最终映射值由这一遍按输入顺序决定。
+        if (msg.group_name or "").strip() or gkey not in group_names:
+            group_names[gkey] = msg.group_name
         sender_key = _sender_identity_key(msg)
         sender_msgs.setdefault(sender_key, msg)
-        sender_names.setdefault(sender_key, msg.sender_name)
+        if (msg.sender_name or "").strip() or sender_key not in sender_names:
+            sender_names[sender_key] = msg.sender_name
 
     if not enabled:
         # 关闭时不做任何准备：映射值就是原值（含未清洗的空白），builder 产出的
         # prompt 文本与未接入假名化时逐字节一致，也不产生任何读盘或 await。
         return PreparedNames(ctx=ctx, groups=group_names, senders=sender_names)
 
+    # 只对「首个非空显示名」并发取别名（新身份在此共享一次落盘窗口）；同名多
+    # 显示名的最终映射值在下面按输入顺序覆盖，别名按身份键复用、不重复提交。
+    first_group_alias: dict[tuple[str, str], str] = {}
+    first_sender_alias: dict[tuple[str, ...], str] = {}
     group_aliases, sender_aliases = await asyncio.gather(
         asyncio.gather(
             *(
@@ -226,29 +236,29 @@ async def prepare_name_context(messages: list[InternalMessage]) -> PreparedNames
         asyncio.gather(
             *(
                 ctx.person_alias(
-                    source=msg.source or "",
-                    sender_id=msg.sender_id or "",
-                    session_id=msg.session_id,
-                    display_name=msg.sender_name or "",
+                    source=key[1],
+                    sender_id=key[2] if key[0] == "id" else "",
+                    session_id=key[2] if key[0] == "name" else "",
+                    display_name=display,
                 )
-                for msg in sender_msgs.values()
+                for key, display in sender_names.items()
             )
         ),
     )
-    groups = dict(zip(group_names, group_aliases, strict=True))
-    senders = dict(zip(sender_msgs, sender_aliases, strict=True))
+    first_group_alias = dict(zip(group_names, group_aliases, strict=True))
+    first_sender_alias = dict(zip(sender_names, sender_aliases, strict=True))
+    groups = dict(first_group_alias)
+    senders = dict(first_sender_alias)
 
-    # 同身份多个显示名：按输入顺序再走一遍（全是缓存命中），把还原目标钉在
-    # 最后一个非空显示名上。并发完成顺序不确定，这一遍不能省。
+    # 同身份多个显示名：按输入顺序把映射值钉在最后一个非空显示名对应的别名上。
+    # 逆映射（别名 → 显示名）在冻结模块内部按「最后登记」更新，无需这里重放。
     for msg in messages:
-        if not senders.get(_sender_identity_key(msg)):
-            continue
-        await ctx.person_alias(
-            source=msg.source or "",
-            sender_id=msg.sender_id or "",
-            session_id=msg.session_id,
-            display_name=msg.sender_name or "",
-        )
+        gkey = (msg.source or "", msg.session_id)
+        if (msg.group_name or "").strip() and first_group_alias.get(gkey):
+            groups[gkey] = first_group_alias[gkey]
+        sender_key = _sender_identity_key(msg)
+        if (msg.sender_name or "").strip() and first_sender_alias.get(sender_key):
+            senders[sender_key] = first_sender_alias[sender_key]
     return PreparedNames(ctx=ctx, groups=groups, senders=senders)
 
 

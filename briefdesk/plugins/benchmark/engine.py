@@ -101,6 +101,30 @@ def provider_label(api_base: str) -> str:
     return "custom"
 
 
+def _egress_summary() -> dict[str, Any]:
+    """出境观测摘要（脱敏）：只落汇总数字与可用性状态位。
+
+    `sdk_retry_observed=false` 表示「本批没有可用的重试观测钩子」，重试值未知；
+    消费方不得把它读成零。遥测关闭时数字为空是「未知」，同样不解读为零。
+    """
+    counters = telemetry.snapshot().get("counters") or {}
+    attempts = sum(
+        value
+        for key, value in counters.items()
+        if key.startswith(("ai.egress.remote_attempt.", "ai.local.attempt."))
+    )
+    retries = sum(
+        value
+        for key, value in counters.items()
+        if key.startswith(("ai.egress.sdk_retry.", "ai.local.sdk_retry."))
+    )
+    return {
+        "attempt_total": attempts,
+        "sdk_retry_total": retries,
+        "sdk_retry_observed": telemetry._enabled(),
+    }
+
+
 def benchmark_config_snapshot() -> dict[str, Any]:
     """返回不含密钥和 API 地址的实验配置快照。"""
     return {
@@ -123,6 +147,10 @@ def benchmark_config_snapshot() -> dict[str, Any]:
         "dedup_embed_fallback_threshold": config.dedup_embed_fallback_threshold,
         "dedup_strong_threshold": config.dedup_strong_threshold,
         "merge_prefilter_threshold": config.merge_prefilter_threshold,
+        # 隐私与观测状态位：报告消费方按它们判断出境读数可信度——遥测关闭时
+        # 计数为空表示未知，不是零；SDK 重试钩子不可用时重试值同样未知。
+        "pseudonymize_names": config.ai_pseudonymize_names or "auto",
+        "telemetry_enabled": telemetry._enabled(),
     }
 
 
@@ -568,6 +596,9 @@ def _build_payload(
         # 报告必须自带这一项，否则事后无法判断某次运行到底发了什么参数
         "reasoning_effort": config.ai_reasoning_effort,
         "config": benchmark_config_snapshot(),
+        # 出境观测摘要：只落汇总数字与状态位，不带端点、密钥或身份值。
+        # sdk_retry_observed=false 表示「重试值未知」，消费方不得把它读成零。
+        "egress_summary": _egress_summary(),
         "concurrency": max(1, concurrency),
         "elapsed_sec": total_elapsed,
         "features": {

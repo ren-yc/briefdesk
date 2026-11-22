@@ -2146,3 +2146,116 @@ class TestActivatePrepareUnderLock:
         finally:
             await memory_db.close()
             await plugin.teardown()
+
+
+class TestRagEvidenceNamePreparation(_MemoryEngineBase):
+    """证据名准备的并发与还原目标口径（PR 复核补项的守卫）。"""
+
+    @staticmethod
+    def _chunk(msg_id, sender_id, sender_name, group_name="测试群",
+               session_id="s1", ts=1700000000):
+        from briefdesk.plugins.rag.db import ChunkRow
+
+        return ChunkRow(
+            source="weflow-legacy", msg_id=msg_id, session_id=session_id,
+            group_name=group_name, sender_name=sender_name,
+            msg_time=ts, content="内容", item_id="",
+            sender_id=sender_id,
+        )
+
+    @staticmethod
+    def _hit(chunk):
+        from briefdesk.plugins.rag.engine import Hit
+
+        return Hit(chunk=chunk, cos=0.9, rrf=1.0, has_fts=True)
+
+    async def test_new_identities_share_one_commit_window(self, monkeypatch):
+        """多个新身份并发准备只等一个合并窗口：逐条 await 会各等一次。
+
+        失败模式：串行准备让 N 条新证据等 N 个窗口，证据越多问答越慢；并发后
+        同批身份共享同一次落盘提交。
+        """
+        import asyncio
+
+        from briefdesk import pseudonym
+        from briefdesk.config import config
+
+        monkeypatch.setattr(config, "ai_pseudonymize_names", "on")
+
+        commit_count = {"n": 0}
+        sleeps = {"n": 0}
+
+        real_commit = pseudonym.Pseudonymizer._commit_sync
+
+        def _counting_commit(self_p, batch):
+            commit_count["n"] += 1
+            return real_commit(self_p, batch)
+
+        real_sleep = asyncio.sleep
+
+        async def _counting_sleep(delay, *args, **kwargs):
+            if delay > 0:
+                sleeps["n"] += 1
+            return await real_sleep(0)
+
+        monkeypatch.setattr(pseudonym.Pseudonymizer, "_commit_sync", _counting_commit)
+        # 只统计「合并窗口的等待次数」：直接包住 flush 的 sleep。不替换 pseudonym
+        # 的 asyncio（模块内部用 get_running_loop，替换会缺成员）。
+        monkeypatch.setattr(asyncio, "sleep", _counting_sleep)
+
+        context = pseudonym.NameContext(
+            enabled=True, pseudonymizer=pseudonym.Pseudonymizer(
+                pseudonym.registry_dir(), flush_window=0.05,
+            )
+        )
+        hits = [
+            self._hit(self._chunk(f"m{i}", f"u{i}", f"成员{i}"))
+            for i in range(3)
+        ]
+        names = await type(self.engine)._prepare_evidence_names(context, hits)
+        assert len(names) == 3
+        assert all(n.sender.startswith("同学") for n in names)
+        assert all(n.group.startswith("群") for n in names)
+        # 全部新身份一次提交：串行实现会各等一个窗口（sleeps ≥ 3）
+        assert sleeps["n"] <= 1, sleeps
+        assert commit_count["n"] >= 1
+
+    async def test_last_non_empty_display_name_wins(self):
+        """同一身份先空名后真名：还原目标取最后的非空显示名。
+
+        失败模式：首次出现者锁定映射后，先空后真名的人拿空串出站、还原也
+        找不到目标。
+        """
+        from briefdesk import pseudonym
+
+        context = pseudonym.NameContext(
+            enabled=True, pseudonymizer=pseudonym.Pseudonymizer(
+                pseudonym.registry_dir(), flush_window=0.0,
+            )
+        )
+        hits = [
+            self._hit(self._chunk("m1", "u9", "")),
+            self._hit(self._chunk("m2", "u9", "真名甲")),
+        ]
+        names = await type(self.engine)._prepare_evidence_names(context, hits)
+        assert names[0].sender == names[1].sender
+        assert names[1].sender.startswith("同学")
+        assert context.display_name_for(names[1].sender) == "真名甲"
+
+    async def test_group_rename_uses_final_name(self):
+        """同群两次改名：出站与还原目标都用最终群名（与分类批同口径）。"""
+        from briefdesk import pseudonym
+
+        context = pseudonym.NameContext(
+            enabled=True, pseudonymizer=pseudonym.Pseudonymizer(
+                pseudonym.registry_dir(), flush_window=0.0,
+            )
+        )
+        hits = [
+            self._hit(self._chunk("m1", "u1", "小明", group_name="旧群名")),
+            self._hit(self._chunk("m2", "u1", "小明", group_name="新群名")),
+        ]
+        names = await type(self.engine)._prepare_evidence_names(context, hits)
+        assert names[0].group == names[1].group
+        assert names[0].group.startswith("群")
+        assert context.display_name_for(names[1].group, kind="group") == "新群名"

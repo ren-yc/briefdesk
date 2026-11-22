@@ -203,6 +203,9 @@ def snapshot() -> dict[str, Any]:
         }
     return {
         "ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        # 显式开关状态：关闭时其余字段为空但不缺失——消费方按它判断读数是
+        # 「零」还是「未知」，不能拿空 counters 当「零出境」。
+        "enabled": _enabled(),
         "counters": dict(sorted(_counters.items())),
         "latencies": dict(latencies),
         "cosine_truth_count": len(_cosine_truth),

@@ -740,24 +740,128 @@ class RagEngine:
         显示名)`；群优先 `(source, session_id)`，缺失时才用已掩码群名。在本层另写
         一套键规则，就会出现「同一身份在两条证据行里拿到两个不同化名」。
 
+        全部身份并发 gather：冻结模块对新身份有合并落盘窗口，逐条 await 会让每条
+        新证据各等一个窗口，证据越多准备越慢；并发后同批身份共享同一次落盘。gather
+        之后按输入顺序再过一遍——此时全是内存缓存命中——把「同一身份多个显示名」
+        的还原目标钉在最后一个非空显示名上（与分类批同一口径），并发完成顺序
+        不确定，靠它自己钉不住。
+
         准备失败（注册表损坏、锁超时、写盘失败）向上抛：调用方据此让这次回答的
         请求根本不发生。不要在这里捕获后回退原名——那等于把假名化失败悄悄升级成
         一次明文出境。
         """
+        group_jobs: dict[tuple[str, str], str] = {}
+        person_jobs: dict[tuple[str, str, str, str], str] = {}
+        for hit in hits:
+            chunk = hit.chunk
+            gkey = (chunk.source, chunk.session_id)
+            group_jobs.setdefault(gkey, chunk.group_name)
+            pkey = (
+                chunk.source,
+                chunk.sender_id,
+                chunk.session_id,
+                chunk.sender_name,
+            )
+            person_jobs.setdefault(pkey, chunk.sender_name)
+
+        if group_jobs:
+            group_values = await asyncio.gather(
+                *(
+                    context.group_alias(
+                        source=source,
+                        session_id=session_id,
+                        group_name=group_name,
+                    )
+                    for (source, session_id), group_name in group_jobs.items()
+                )
+            )
+            group_map = dict(zip(
+                (
+                    (source, session_id, name)
+                    for (source, session_id), name in group_jobs.items()
+                ),
+                group_values,
+                strict=True,
+            ))
+        else:
+            group_map = {}
+        if person_jobs:
+            person_values = await asyncio.gather(
+                *(
+                    context.person_alias(
+                        source=source,
+                        sender_id=sender_id,
+                        session_id=session_id,
+                        display_name=sender_name,
+                    )
+                    for (
+                        source,
+                        sender_id,
+                        session_id,
+                        sender_name,
+                    ), sender_name in person_jobs.items()
+                )
+            )
+            person_map = dict(zip(person_jobs, person_values, strict=True))
+        else:
+            person_map = {}
+
+        # 出站映射：群按 (source, session_id) 收敛成一个别名；人按 (source,
+        # sender_id) 收敛。并发键以「显示名」为尾段只是为了一次性把全部新身份
+        # 提交进注册表，真正出站时同一身份只会有一个别名（身份键不含显示名，
+        # 有 ID 时）；无 ID 时显示名参与身份键，同名同会话天然共用，异名则各自
+        # 有别名——这与「还原目标取最后非空显示名」一致。
+        group_out: dict[tuple[str, str], str] = {}
+        person_out: dict[tuple[str, str], str] = {}
+        for (source, session_id, _name), alias in group_map.items():
+            group_out[(source, session_id)] = alias
+        for (source, sender_id, _session_id, _name), alias in person_map.items():
+            if sender_id:
+                person_out[(source, sender_id)] = alias
+
+        # 还原目标：同一身份在本请求内最后一个非空显示名（人与群同规则）。
+        # 逆映射（别名 → 显示名）在冻结模块按「每次 group/person_alias 调用
+        # 登记」更新，所以这里按输入顺序对最终显示名各调一次缓存命中的准备，
+        # 把还原目标钉到最后一个非空名字——并发完成顺序不可靠，靠它钉不住。
+        final_group: dict[tuple[str, str], str] = {}
+        final_person: dict[tuple[str, str], str] = {}
+        for hit in hits:
+            chunk = hit.chunk
+            if chunk.group_name.strip():
+                final_group[(chunk.source, chunk.session_id)] = chunk.group_name
+            if chunk.sender_name.strip():
+                final_person[(chunk.source, chunk.sender_id)] = chunk.sender_name
+
         names: list[EvidenceNames] = []
         for hit in hits:
             chunk = hit.chunk
-            group = await context.group_alias(
-                source=chunk.source,
-                session_id=chunk.session_id,
-                group_name=chunk.group_name,
-            )
-            sender = await context.person_alias(
-                source=chunk.source,
-                sender_id=chunk.sender_id,
-                session_id=chunk.session_id,
-                display_name=chunk.sender_name,
-            )
+            gkey = (chunk.source, chunk.session_id)
+            pkey2 = (chunk.source, chunk.sender_id)
+            group = group_out.get(gkey, chunk.group_name)
+            sender = person_out.get(pkey2, chunk.sender_name)
+            # 无 ID 的人：显示名参与身份键，异名异别名——按最后非空显示名取。
+            if not chunk.sender_id.strip():
+                sender_display = final_person.get(pkey2, chunk.sender_name)
+                sender = person_map.get(
+                    (chunk.source, "", chunk.session_id, sender_display),
+                    sender,
+                )
+            # 把还原目标钉到最后非空显示名（缓存命中、无 I/O）。
+            group_final = final_group.get(gkey)
+            if group and group_final:
+                await context.group_alias(
+                    source=chunk.source,
+                    session_id=chunk.session_id,
+                    group_name=group_final,
+                )
+            person_final = final_person.get(pkey2)
+            if sender and person_final:
+                await context.person_alias(
+                    source=chunk.source,
+                    sender_id=chunk.sender_id,
+                    session_id=chunk.session_id,
+                    display_name=person_final,
+                )
             names.append(EvidenceNames(group=group, sender=sender))
         return names
 
