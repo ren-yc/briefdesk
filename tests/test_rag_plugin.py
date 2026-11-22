@@ -1,6 +1,7 @@
 """RAG 插件测试：装配自禁用、库层、索引、回填、检索与问答路由。"""
 
 import asyncio
+import re
 import unittest
 from datetime import UTC
 from types import SimpleNamespace
@@ -149,12 +150,16 @@ class TestRagDb:
         yield
         await self.db.close()
     @staticmethod
-    def _row(msg_id="m1", content="周六6点开会有通知，别迟到", item_id="", ts=1700000000):
+    def _row(
+        msg_id="m1", content="周六6点开会有通知，别迟到", item_id="", ts=1700000000,
+        sender_id="",
+    ):
         from briefdesk.plugins.rag.db import ChunkRow
 
         return ChunkRow(
             source="weflow-legacy", msg_id=msg_id, session_id="s1", group_name="测试群",
             sender_name="小明", msg_time=ts, content=content, item_id=item_id,
+            sender_id=sender_id,
         )
 
     async def _seed_raw(self, msg_id, ts=1700000000, content=None):
@@ -353,6 +358,204 @@ class TestRagDb:
         status = await count_status(self.db)
         assert status["rag_chunks"] == 1
         assert status["fts_tokenizer"] == "trigram"
+
+    async def test_sender_id_migration_is_idempotent(self):
+        """旧库补列 + 回填只能发生一次：重复 ensure 不得再 ALTER。
+
+        失败模式：`ALTER TABLE ... ADD COLUMN` 没有 IF NOT EXISTS，重复执行抛
+        "duplicate column name"，而 ensure_schema 每次启动都跑——不幂等的迁移
+        会让第二次启动永久起不来。同时复核「只回填空值」：已经把 sender_id 写
+        进去的行不能被下一次启动用（此刻可能已不存在的）事实源覆盖。
+        """
+        from briefdesk.plugins.rag.db import ensure_rag_schema, fts_search
+
+        db = await aiosqlite.connect(":memory:")
+        db.row_factory = aiosqlite.Row
+        try:
+            await init_schema(db)
+            # 改造前的建表语句（没有 sender_id）：模拟升级前的既有库
+            cursor = await db.execute(
+                "CREATE TABLE rag_chunks ("
+                "source TEXT NOT NULL, msg_id TEXT NOT NULL,"
+                " session_id TEXT NOT NULL, group_name TEXT NOT NULL DEFAULT '',"
+                " sender_name TEXT NOT NULL DEFAULT '',"
+                " msg_time INTEGER NOT NULL DEFAULT 0, content TEXT NOT NULL,"
+                " item_id TEXT NOT NULL DEFAULT '',"
+                " PRIMARY KEY (source, msg_id))"
+            )
+            await cursor.close()
+            cursor = await db.execute(
+                "INSERT INTO raw_messages(source,msg_id,session_id,group_name,"
+                "sender_id,sender_name,content,timestamp) VALUES(?,?,?,?,?,?,?,?)",
+                ("weflow-legacy", "m1", "s1", "测试群", "u1", "小明", "内容", 1700000000),
+            )
+            await cursor.close()
+            cursor = await db.execute(
+                "INSERT INTO rag_chunks(source,msg_id,session_id,group_name,"
+                "sender_name,msg_time,content,item_id) VALUES(?,?,?,?,?,?,?,?)",
+                ("weflow-legacy", "m1", "s1", "测试群", "小明", 1700000000, "内容", ""),
+            )
+            await cursor.close()
+            await db.commit()
+
+            statements: list[str] = []
+            await db.set_trace_callback(statements.append)
+            await ensure_rag_schema(db)
+            await ensure_rag_schema(db)  # 重复启动：不得再 ALTER
+            alters = [
+                s for s in statements
+                if "ALTER TABLE rag_chunks ADD COLUMN sender_id" in s
+            ]
+            assert len(alters) == 1, statements
+            cursor = await db.execute(
+                "SELECT sender_id FROM rag_chunks WHERE msg_id='m1'"
+            )
+            try:
+                assert (await cursor.fetchone())["sender_id"] == "u1"
+            finally:
+                await cursor.close()
+
+            # 回填只填空值：模拟事实源已被删除后再次启动，已知身份不得被擦掉
+            cursor = await db.execute("DELETE FROM raw_messages")
+            await cursor.close()
+            await db.commit()
+            await ensure_rag_schema(db)
+            cursor = await db.execute(
+                "SELECT sender_id FROM rag_chunks WHERE msg_id='m1'"
+            )
+            try:
+                assert (await cursor.fetchone())["sender_id"] == "u1"
+            finally:
+                await cursor.close()
+
+            # 回滚视角（旧代码 + 新库）：表上多出后来追加的列时，行读取器仍要能读
+            cursor = await db.execute(
+                "ALTER TABLE rag_chunks ADD COLUMN column_added_later TEXT NOT NULL DEFAULT ''"
+            )
+            await cursor.close()
+            await db.commit()
+            await _seed_session(db, "weflow-legacy", "s1", enabled=1, is_group=1)
+            hits = await fts_search(db, "内容", limit=10)
+            assert [(h.msg_id, h.sender_id) for h in hits] == [("m1", "u1")]
+        finally:
+            await db.close()
+
+    async def test_missing_raw_id_stays_empty(self):
+        """raw 缺行或 raw 自身缺 ID 时保持空串，不得用 sender_name 猜身份。
+
+        猜出来的 ID 会把两个同名的人并成一个身份，假名化随后把 A 的化名贴到 B
+        的证据行上——比没有身份更糟，因为它看起来是对的。
+        """
+        from briefdesk.plugins.rag.db import ensure_rag_schema, upsert_chunks
+
+        # m1：raw 有这一行但 sender_id 为空；m2：raw 里根本没有这一行
+        cursor = await self.db.execute(
+            "INSERT INTO raw_messages(source,msg_id,session_id,group_name,"
+            "sender_id,sender_name,content,timestamp) VALUES(?,?,?,?,?,?,?,?)",
+            ("weflow-legacy", "m1", "s1", "测试群", "", "小明", "内容", 1700000000),
+        )
+        await cursor.close()
+        await self.db.commit()
+        await upsert_chunks(self.db, [self._row("m1"), self._row("m2")])
+
+        await ensure_rag_schema(self.db)  # 重复迁移：只回填缺失值
+        cursor = await self.db.execute(
+            "SELECT msg_id, sender_id, sender_name FROM rag_chunks ORDER BY msg_id"
+        )
+        try:
+            rows = [dict(r) for r in await cursor.fetchall()]
+        finally:
+            await cursor.close()
+        assert [(r["msg_id"], r["sender_id"]) for r in rows] == [
+            ("m1", ""), ("m2", ""),
+        ]
+        # 显示名照旧入库：空 ID 不等于丢名字
+        assert {r["sender_name"] for r in rows} == {"小明"}
+
+    async def test_upsert_preserves_known_sender_id(self):
+        """空 sender_id 不得覆盖既有非空值（回填在事实源删除后给出的就是空串）。"""
+        from briefdesk.plugins.rag.db import upsert_chunks
+
+        async def _sender_id() -> str:
+            cursor = await self.db.execute(
+                "SELECT sender_id FROM rag_chunks WHERE msg_id='m1'"
+            )
+            try:
+                return (await cursor.fetchone())["sender_id"]
+            finally:
+                await cursor.close()
+
+        await upsert_chunks(self.db, [self._row(sender_id="u1")])
+        assert await _sender_id() == "u1"
+        await upsert_chunks(self.db, [self._row(sender_id="")])  # 回填重建（空 ID）
+        assert await _sender_id() == "u1"  # 保留已知身份
+        await upsert_chunks(self.db, [self._row(sender_id="u2")])  # 消息重处理
+        assert await _sender_id() == "u2"
+
+    async def test_fts_and_vector_share_sender_id(self):
+        """两条召回腿都得带上同形身份字段：只有一侧生效时向量命中无法假名化。
+
+        FTS 表的列固定为 content/sender_name/group_name/source/msg_id（不重建），
+        身份来自 join 回来的 rag_chunks；向量腿走显式投影 + 同一投影读取器。
+        两条腿都要给出一致的 sender_id，否则「远端化名」只在关键词命中时成立。
+        """
+        from briefdesk.plugins.rag.db import (
+            ensure_fts,
+            fetch_new_embeddings,
+            fts_search,
+            parse_embedding_rows,
+            sync_fts,
+            upsert_chunks,
+            upsert_embeddings,
+        )
+
+        await _seed_session(self.db, "weflow-legacy", "s1", enabled=1, is_group=1)
+        await ensure_fts(self.db)
+        row = self._row(sender_id="u1")
+        await upsert_chunks(self.db, [row])
+        await sync_fts(self.db, [row])
+        await upsert_embeddings(
+            self.db, [("weflow-legacy", "m1")], [[1.0, 0.0]], "test-model", "t0"
+        )
+
+        fts_hits = await fts_search(self.db, "有通知", limit=10)  # ≥3 字符 → MATCH
+        assert [(h.msg_id, h.sender_id) for h in fts_hits] == [("m1", "u1")]
+        like_hits = await fts_search(self.db, "开会", limit=10)  # 2 字符 → LIKE 兜底
+        assert [(h.msg_id, h.sender_id) for h in like_hits] == [("m1", "u1")]
+
+        raw_rows, _ = await fetch_new_embeddings(self.db, "test-model", "")
+        entries, _bad = parse_embedding_rows(raw_rows)
+        assert [(c.msg_id, c.sender_id) for c, _ in entries] == [("m1", "u1")]
+
+    async def test_rollback_reader_ignores_unknown_columns(self):
+        """旧 shape / 新 shape 的行都能读成 ChunkRow：多余列丢弃、缺列走默认。
+
+        回滚兼容的取证：`SELECT c.*` 的列集合随表结构变化，直接
+        `ChunkRow(**dict(row))` 在「新库 + 多一列」时 TypeError（FTS 腿与向量腿
+        同时哑），所以走投影读取器。回滚必须带它 + 保留追加列，直接退到旧基线
+        仍会炸。
+        """
+        from briefdesk.plugins.rag.db import ChunkRow, chunk_from_row
+
+        newer_shape = {
+            "source": "weflow-legacy", "msg_id": "m1", "session_id": "s1",
+            "group_name": "测试群", "sender_name": "小明", "msg_time": 1700000000,
+            "content": "周六6点开会有通知", "item_id": "i1", "sender_id": "u1",
+            "column_added_later": "x",
+        }
+        # 前置：改造前的写法在「多一列」时确实炸——读取器存在的理由
+        with pytest.raises(TypeError):
+            ChunkRow(**newer_shape)
+        chunk = chunk_from_row(newer_shape)
+        assert (chunk.msg_id, chunk.sender_id, chunk.item_id) == ("m1", "u1", "i1")
+
+        older_shape = {
+            k: v for k, v in newer_shape.items()
+            if k not in ("sender_id", "column_added_later")
+        }
+        old_chunk = chunk_from_row(older_shape)
+        assert old_chunk.sender_id == ""  # 缺列走默认空串，不炸
+        assert old_chunk.msg_id == "m1"
 
     async def test_ensure_fts_reconciles_existing_table_tokenizer(self):
         # 历史 unicode61 表 + meta 缺失：不得误报 trigram（IF NOT EXISTS 短路）
@@ -740,6 +943,38 @@ class TestRagBackfill(_MemoryEngineBase):
         counts = await self._embed_count_by_model()
         assert counts.get("model-b") == 2
 
+    async def test_backfill_preserves_ocr_item_and_watermark(self):
+        """回填补身份字段时不得动到 OCR 文本、卡片引用与检索水位/窗口。
+
+        失败模式：回填重建 ChunkRow 时顺手用 raw 原文/空 item_id 覆盖，会把 OCR
+        文本与「消息→卡片」引用永久抹掉；把 sender_id 一并重置则让下一次假名化
+        退化为按会话+显示名猜测。水位与窗口是增量消费的游标，回填只该推进自己的
+        预算，不该改动它们。
+        """
+        from briefdesk.plugins.rag.config import RagSettings as RS
+
+        await self._seed("m1", 1, content="通知正文")  # raw 行带 sender_id u1
+        await self._seed("old", 30, content="窗口外的旧消息")
+        msg = _msg("m1", "通知正文\n[OCR]\n海报文字")
+        await self._index([msg], [(msg, "i1")])  # 运行期：OCR 文本 + 卡片引用
+        self.provider.embed_model_name = Mock(return_value="model-b")
+        self.engine.settings = RS(backfill_days=7)  # 窗口只含 m1
+        self.engine._vec_watermark = "keep-watermark"
+
+        assert await self.engine.backfill_step(self.now) == 1
+        cursor = await self.db.execute(
+            "SELECT content, item_id, sender_id FROM rag_chunks WHERE msg_id='m1'"
+        )
+        try:
+            row = dict(await cursor.fetchone())
+        finally:
+            await cursor.close()
+        assert "[OCR]" in row["content"], "回填不得以原文覆盖 OCR 增强文本"
+        assert row["item_id"] == "i1", "回填的空 item_id 不得清掉卡片引用"
+        assert row["sender_id"] == "u1", "回填须从事实源补上身份字段"
+        assert await self._chunk_ids() == ["m1"], "窗口外的行不得被本轮选中"
+        assert self.engine._vec_watermark == "keep-watermark"
+
 
 class TestRagRetrieve(_MemoryEngineBase):
     """混合检索：RRF 融合、会话白名单、拒答门。"""
@@ -942,6 +1177,123 @@ class TestRagAsk(_MemoryEngineBase):
         result = await self.engine.ask("周六6点开会有通知")
         assert [c["msg_id"] for c in result.citations] == ["m1"]
 
+    @staticmethod
+    def _evidence_block(prompt_messages: list[dict]) -> str:
+        """取 prompt 里的证据块（展示名是否化名只看这一段）。"""
+
+        return prompt_messages[1]["content"].split("证据：\n")[1]
+
+    async def test_evidence_pseudonymized_for_remote_endpoint(self, monkeypatch):
+        """远端主端点 + auto：证据行的人名/群名换成化名形态，原显示名不出境。"""
+        from briefdesk.config import config
+
+        monkeypatch.setattr(config, "ai_api_base", "https://api.deepseek.com")
+        await self.engine.ask("周六6点开会有通知")
+        evidence = self._evidence_block(self.provider.chat.call_args.args[0])
+        assert "小明" not in evidence
+        assert "测试群" not in evidence
+        assert re.search(r"同学[A-Z2-7]{6}", evidence)
+        assert re.search(r"群[A-Z2-7]{6}", evidence)
+
+    async def test_evidence_names_kept_for_local_endpoint(self, monkeypatch):
+        """本地端点 + auto：不改写输入——本地进程不出境，改名只会让输入漂移。"""
+        from briefdesk.config import config
+
+        monkeypatch.setattr(config, "ai_api_base", "http://127.0.0.1:11434/v1")
+        await self.engine.ask("周六6点开会有通知")
+        evidence = self._evidence_block(self.provider.chat.call_args.args[0])
+        assert "小明" in evidence
+        assert "测试群" in evidence
+        assert not re.search(r"同学[A-Z2-7]{6}", evidence)
+        assert not re.search(r"群[A-Z2-7]{6}", evidence)
+
+    async def test_rag_fallback_pseudonymizes_for_actual_main_endpoint(
+        self, monkeypatch
+    ):
+        """旧供应商丢弃 RAG override：按**实际主端点**判远端，仍须假名化。
+
+        失败模式：拿本插件的 override（本地）判成本地 → 请求被 ai_ports 回退到
+        chat 后打到远端主端点，姓名原样出境且没有任何报错。这里用「本地 RAG
+        override + 旧供应商 + 远端主端点」钉住「计划驱动」这一点。
+        """
+        from briefdesk.config import config
+        from briefdesk.plugins.rag.config import RagSettings as RS
+
+        monkeypatch.setattr(config, "ai_api_base", "https://api.deepseek.com")
+        self.engine.settings = RS(
+            model="qwen-plus", api_base="http://127.0.0.1:11434/v1"
+        )
+        await self.engine.ask("周六6点开会有通知")
+        # 前置：旧供应商没有专用通道，实际发送走 chat（override 被丢弃）
+        self.provider.chat.assert_awaited()
+        evidence = self._evidence_block(self.provider.chat.call_args.args[0])
+        assert "小明" not in evidence
+        assert re.search(r"同学[A-Z2-7]{6}", evidence)
+
+    async def test_answer_restore_preserves_citations_and_plain_output(self, monkeypatch):
+        """入库前按请求内逆映射还原答案；引用编号与 source/msg_id 原样保留。
+
+        JSON 契约与纯文本两种形态都在解析之后还原：要还原的是给人看的文字，
+        编号不是身份。引用元数据（sender_name/source/msg_id）来自库里的原始行，
+        不因出站化名而改变。主端点显式钉成远端：宿主 shell 里可能配着本地 ollama，
+        不钉就会静默跑到「auto 不启用」那条分支上，用例变成什么都没验证。
+        """
+        from briefdesk.config import config
+
+        monkeypatch.setattr(config, "ai_api_base", "https://api.deepseek.com")
+        await self.engine.ask("周六6点开会有通知")  # 先取到这次请求用过的化名
+        evidence = self._evidence_block(self.provider.chat.call_args.args[0])
+        matched = re.search(r"同学[A-Z2-7]{6}", evidence)
+        assert matched is not None, evidence
+        alias = matched.group(0)
+
+        # 纯文本形态（模型没走 JSON 契约）
+        self.provider.chat = AsyncMock(
+            return_value=_chat_response(f"{alias}说活动在周六6点举行 [1]。")
+        )
+        result = await self.engine.ask("周六6点开会有通知")
+        assert result.answer == "小明说活动在周六6点举行 [1]。"
+        assert [c["msg_id"] for c in result.citations] == ["m1"]
+
+        # JSON 契约形态
+        self.provider.chat = AsyncMock(
+            return_value=_chat_response(
+                f'{{"answer": "{alias}通知活动在周六6点 [1]。", "citations": [1]}}'
+            )
+        )
+        result = await self.engine.ask("周六6点开会有通知")
+        assert result.answer == "小明通知活动在周六6点 [1]。"
+        assert result.citations[0]["n"] == 1
+        assert result.citations[0]["sender_name"] == "小明"  # 引用元数据仍是真名
+        assert alias not in result.answer
+
+    async def test_prepare_failure_skips_answer_request(self, monkeypatch):
+        """假名化准备失败：这次回答的 create 不发生，查询嵌入的计数照旧留下。
+
+        失败模式：准备失败后「退回真名照样发」——那会把一次可观测的失败升级成
+        静默泄露；反过来把整次 ask 记成零也不对，查询嵌入已经真的发生过，那是
+        另一个端口，无法随本次失败回滚。错误必须上抛（不吞、不重试明文）。
+        """
+        from briefdesk import pseudonym, telemetry
+        from briefdesk.config import config
+
+        monkeypatch.setattr(config, "ai_api_base", "https://api.deepseek.com")
+
+        class _BrokenPseudonymizer:
+            async def alias_for(self, kind, identity_key, display_name):
+                raise pseudonym.PseudonymError("注册表不可用")
+
+        monkeypatch.setattr(
+            pseudonym, "get_pseudonymizer", lambda: _BrokenPseudonymizer()
+        )
+        with pytest.raises(pseudonym.PseudonymError):
+            await self.engine.ask("周六6点开会有通知")
+        self.provider.chat.assert_not_awaited()  # 对应回答的 create 没发生
+        self.provider.embed_texts.assert_awaited()  # 查询嵌入真的发生过
+        counters = telemetry.snapshot()["counters"]
+        assert counters["ai.pseudonym.prepare_failed|"] == 1
+        assert counters["rag.answer_error|"] == 1
+
 
     async def test_telemetry_identity_across_terminal_buckets(self):
         """五桶恒等式：ask = refused + answered + retrieve_error + answer_error + cancelled。
@@ -1031,8 +1383,16 @@ class TestRagAsk(_MemoryEngineBase):
         assert "独特结尾句" not in ev
 
 
-class TestPromptFlatten(unittest.TestCase):
+class TestPromptFlatten:
     """证据块压平换行：多行原文无法伪造新的「[n] 发送者:」证据行。"""
+
+    @staticmethod
+    def _names(group: str = "测试群", sender: str = "小明") -> list:
+        """单条证据的展示名（prompt 构造只消费调用方准备好的值）。"""
+
+        from briefdesk.plugins.rag.prompts import EvidenceNames
+
+        return [EvidenceNames(group=group, sender=sender)]
 
     def test_multiline_content_flattened(self):
         from datetime import datetime
@@ -1049,22 +1409,30 @@ class TestPromptFlatten(unittest.TestCase):
         messages = build_answer_prompt(
             datetime(2026, 1, 1, 12, 0, tzinfo=UTC), "问题？",
             [Hit(chunk=chunk, cos=1.0, rrf=1.0, has_fts=False)],
+            names=self._names(),
         )
         user = messages[1]["content"]
         evidence_line = user.split("证据：\n")[1]
         assert "\n" not in evidence_line  # 单条证据恒为单行
 
-    def test_evidence_sender_and_group_names_masked_in_prompt(self):
-        """RAG 证据行的昵称/群名不得携带明文 PII（构造层已统一脱敏）。
+    async def test_evidence_sender_and_group_names_masked_in_prompt(self, tmp_path):
+        """RAG 证据行的昵称/群名不得携带明文 PII；远端换化名，本地端点不变。
 
-        合成消息走 InternalMessage 构造（生产同源），随后按入库形态
-        ChunkRow 喂给 prompt 构造——验证掩码确实随数据进入 AI 边界。
+        合成消息走 InternalMessage 构造（生产同源），随后按入库形态 ChunkRow 喂给
+        prompt 构造——验证掩码与假名化确实随数据进入 AI 边界。本地端点保持原样
+        是策略的一部分：本地进程不出境，改写只会让输入无谓漂移；判定本身由
+        `pseudonymize_enabled(mode, remote_endpoint=...)` 单源给出。
         """
         from datetime import datetime
 
         from briefdesk.plugins.rag.db import ChunkRow
         from briefdesk.plugins.rag.engine import Hit
-        from briefdesk.plugins.rag.prompts import build_answer_prompt
+        from briefdesk.plugins.rag.prompts import EvidenceNames, build_answer_prompt
+        from briefdesk.pseudonym import (
+            NameContext,
+            Pseudonymizer,
+            pseudonymize_enabled,
+        )
         from briefdesk.types import InternalMessage
 
         msg = InternalMessage(
@@ -1079,16 +1447,49 @@ class TestPromptFlatten(unittest.TestCase):
         chunk = ChunkRow(
             source="weflow-legacy", msg_id=msg.msg_id, session_id=msg.session_id,
             group_name=msg.group_name, sender_name=msg.sender_name,
-            msg_time=msg.timestamp, content=msg.content,
+            msg_time=msg.timestamp, content=msg.content, sender_id=msg.sender_id,
         )
-        messages = build_answer_prompt(
-            datetime(2026, 1, 1, 12, 0, tzinfo=UTC), "问题？",
-            [Hit(chunk=chunk, cos=1.0, rrf=1.0, has_fts=False)],
-        )
-        user = messages[1]["content"]
-        assert "sender-review@example.invalid" not in user
-        assert "group-review@example.invalid" not in user
-        assert "[EMAIL]" in user
+        hit = Hit(chunk=chunk, cos=1.0, rrf=1.0, has_fts=False)
+
+        async def _prompt(*, remote: bool) -> str:
+            context = NameContext(
+                Pseudonymizer(tmp_path / ("remote" if remote else "local")),
+                enabled=pseudonymize_enabled("auto", remote_endpoint=remote),
+            )
+            names = [
+                EvidenceNames(
+                    group=await context.group_alias(
+                        source=chunk.source,
+                        session_id=chunk.session_id,
+                        group_name=chunk.group_name,
+                    ),
+                    sender=await context.person_alias(
+                        source=chunk.source,
+                        sender_id=chunk.sender_id,
+                        session_id=chunk.session_id,
+                        display_name=chunk.sender_name,
+                    ),
+                )
+            ]
+            messages = build_answer_prompt(
+                datetime(2026, 1, 1, 12, 0, tzinfo=UTC), "问题？", [hit], names=names,
+            )
+            return messages[1]["content"]
+
+        remote_user = await _prompt(remote=True)
+        local_user = await _prompt(remote=False)
+
+        for user in (remote_user, local_user):
+            assert "sender-review@example.invalid" not in user
+            assert "group-review@example.invalid" not in user
+        # 远端 auto：展示名换成化名形态，连掩码后的原显示名也不再出现
+        assert re.search(r"同学[A-Z2-7]{6}", remote_user)
+        assert re.search(r"群[A-Z2-7]{6}", remote_user)
+        assert "[EMAIL]" not in remote_user
+        # 本地端点：不生成化名，展示名保持既有掩码形态
+        assert "[EMAIL]" in local_user
+        assert "同学" not in local_user
+        assert not re.search(r"群[A-Z2-7]{6}", local_user)
 
     def test_history_included_in_prompt_within_cap(self):
         from datetime import datetime
@@ -1108,6 +1509,7 @@ class TestPromptFlatten(unittest.TestCase):
                 {"role": "user", "content": "xx活动周六吗"},
                 {"role": "assistant", "content": "周六6点 [1]。"},
             ],
+            names=self._names(),
         )
         user = messages[1]["content"]
         assert "对话历史：" in user
@@ -1124,6 +1526,7 @@ class TestPromptFlatten(unittest.TestCase):
                    for i in range(10)]
         messages = build_answer_prompt(
             datetime(2026, 1, 1, 12, 0, tzinfo=UTC), "问题？", [], history,
+            names=[],
         )
         user = messages[1]["content"]
         assert "更早的 4 条对话已省略" in user
@@ -1146,6 +1549,7 @@ class TestPromptFlatten(unittest.TestCase):
         messages = build_answer_prompt(
             datetime(2026, 1, 1, 12, 0, tzinfo=UTC), "问题？",
             [Hit(chunk=chunk, cos=1.0, rrf=1.0, has_fts=False)],
+            names=self._names(),
         )
         ev = messages[1]["content"].split("证据：\n")[1]
         assert ev.endswith("…")
@@ -1167,6 +1571,7 @@ class TestPromptFlatten(unittest.TestCase):
         messages = build_answer_prompt(
             datetime(2026, 1, 1, 12, 0, tzinfo=UTC), "问题？",
             [Hit(chunk=chunk, cos=1.0, rrf=1.0, has_fts=False)],
+            names=self._names(),
         )
         ev = messages[1]["content"].split("证据：\n")[1]
         assert "…" not in ev

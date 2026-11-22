@@ -15,7 +15,8 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import dataclass
+from collections.abc import Mapping
+from dataclasses import dataclass, fields
 
 import aiosqlite
 import numpy as np
@@ -50,7 +51,12 @@ async def fetch_one(
 
 @dataclass
 class ChunkRow:
-    """一条已索引消息（与 raw_messages 行同源，item_id 为产出的卡片可空）。"""
+    """一条已索引消息（与 raw_messages 行同源，item_id 为产出的卡片可空）。
+
+    sender_id 与 raw_messages 同源：只用于本地的身份计算（假名化时把同一个人
+    认成同一个身份），不进 prompt、不进引用元数据。它排在最后且带默认值——
+    旧库/旧数据构造 ChunkRow 时不传这个字段仍能通过，不必同步改所有调用点。
+    """
 
     source: str
     msg_id: str
@@ -60,6 +66,29 @@ class ChunkRow:
     msg_time: int  # 秒级 epoch（raw_messages.timestamp 原值）
     content: str
     item_id: str = ""
+    sender_id: str = ""
+
+
+# 读取行的唯一合法投影面：查询行 → ChunkRow 只认这些名字。
+_CHUNK_FIELD_NAMES = tuple(field.name for field in fields(ChunkRow))
+
+
+def chunk_from_row(row: aiosqlite.Row | Mapping[str, object]) -> ChunkRow:
+    """把查询行投影成 ChunkRow：只取 dataclass 已知字段，缺列走默认值。
+
+    为什么不能沿用 `ChunkRow(**dict(row))`：`SELECT c.*` 的列集合随表结构变化，
+    rag_chunks 后来追加了 sender_id，多出的列会让 dataclass 构造直接 TypeError
+    ——FTS 腿与向量腿会同时哑掉。按已知字段投影后，旧 shape（列少，sender_id
+    取默认空串）与新 shape（列多，多余列被丢弃）都能读。
+
+    这是回滚兼容的一半：另一半是保留追加列本身。回滚必须回到带本读取器的版本，
+    直接退到更早的基线仍会 TypeError——旧基线假设 `c.*` 的列恰好等于 dataclass
+    字段，那正是本函数要消掉的假设。
+    """
+    data = dict(row)
+    return ChunkRow(
+        **{name: data[name] for name in _CHUNK_FIELD_NAMES if name in data}
+    )
 
 
 _SCHEMA = [
@@ -72,6 +101,7 @@ _SCHEMA = [
         msg_time     INTEGER NOT NULL DEFAULT 0,
         content      TEXT NOT NULL,
         item_id      TEXT NOT NULL DEFAULT '',
+        sender_id    TEXT NOT NULL DEFAULT '',
         PRIMARY KEY (source, msg_id)
     )""",
     """CREATE TABLE IF NOT EXISTS rag_chunk_embeddings (
@@ -99,11 +129,53 @@ _SCHEMA = [
 
 
 async def ensure_rag_schema(db: aiosqlite.Connection) -> None:
-    """创建 rag 五表中的四张普通表（chunks/embeddings/meta/skipped 幂等；FTS 虚拟表由 ensure_fts 惰性创建）。"""
+    """创建 rag 五表中的四张普通表（chunks/embeddings/meta/skipped 幂等；FTS 虚拟表由 ensure_fts 惰性创建）。
+
+    同时把旧库的 rag_chunks 补到当前 shape（见 `_migrate_sender_id`），并把缺失
+    的 sender_id 从事实源回填——迁移与回填在同一个提交里完成，中途失败整体回滚、
+    重启可重跑。不重建 FTS/向量表，也不改核心库的 schema/version 合同：rag 表是
+    派生索引，本函数只追加自己这张表的一列。
+    """
 
     for ddl in _SCHEMA:
         await db.execute(ddl)
+    await _migrate_sender_id(db)
     await db.commit()
+
+
+async def _migrate_sender_id(db: aiosqlite.Connection) -> None:
+    """给旧库补 `sender_id` 列并按 `(source, msg_id)` 回填；幂等。
+
+    为什么先 `PRAGMA table_info` 再 ALTER：`ALTER TABLE ... ADD COLUMN` 没有
+    `IF NOT EXISTS` 形态，重复执行会抛 "duplicate column name"，而 ensure_schema
+    在每次启动都会跑——那样第二次启动就再也起不来了。缺列才 ALTER 让本函数可以
+    被无脑重复调用（回归见 tests/test_rag_plugin.py 的
+    test_sender_id_migration_is_idempotent）。
+
+    为什么回填只填空串：非空值可能是运行期从原始消息带下来的更准的值（回填
+    之后消息可能被删除，raw 里已经没有这一行）。覆盖非空值等于用「现在查不到」
+    擦掉「当时查到了」。
+
+    为什么 raw 缺行/缺 ID 时保持空串而不是用 sender_name 猜：猜出来的 ID 会把
+    两个同名的人合并成同一个身份，随后的假名化就会把 A 的化名贴到 B 的证据行上
+    ——这比没有身份更糟，因为它看起来是对的。空串的代价只是退化为「按会话 +
+    显示名」的 best-effort 身份。
+    """
+    columns = {
+        row["name"] for row in await fetch_all(db, "PRAGMA table_info(rag_chunks)")
+    }
+    if "sender_id" not in columns:
+        await db.execute(
+            "ALTER TABLE rag_chunks ADD COLUMN sender_id TEXT NOT NULL DEFAULT ''"
+        )
+    await db.execute(
+        "UPDATE rag_chunks SET sender_id = ("
+        "SELECT COALESCE(r.sender_id, '') FROM raw_messages r "
+        "WHERE r.source = rag_chunks.source AND r.msg_id = rag_chunks.msg_id) "
+        "WHERE sender_id = '' AND EXISTS ("
+        "SELECT 1 FROM raw_messages r "
+        "WHERE r.source = rag_chunks.source AND r.msg_id = rag_chunks.msg_id)"
+    )
 
 
 # ---------------------------------------------------------------- 元信息 --
@@ -306,7 +378,7 @@ async def fts_search(
     sql += order
     params.append(limit)
     rows = await fetch_all(db, sql, params)
-    return [ChunkRow(**dict(r)) for r in rows]
+    return [chunk_from_row(r) for r in rows]
 
 
 # ---------------------------------------------------------------- 写入侧 --
@@ -319,7 +391,8 @@ async def upsert_chunks(db: aiosqlite.Connection, rows: list[ChunkRow]) -> None:
         return
     cursor = await db.executemany(
         "INSERT INTO rag_chunks(source, msg_id, session_id, group_name, "
-        "sender_name, msg_time, content, item_id) VALUES(?,?,?,?,?,?,?,?) "
+        "sender_name, msg_time, content, item_id, sender_id) "
+        "VALUES(?,?,?,?,?,?,?,?,?) "
         "ON CONFLICT(source, msg_id) DO UPDATE SET "
         "session_id=excluded.session_id, group_name=excluded.group_name, "
         "sender_name=excluded.sender_name, msg_time=excluded.msg_time, "
@@ -328,11 +401,16 @@ async def upsert_chunks(db: aiosqlite.Connection, rows: list[ChunkRow]) -> None:
         # （空串），无条件覆盖会把运行期已写入的「消息→卡片」引用永久清空
         # 空串时保留既有值，非空时（消息重处理）才覆盖。
         "item_id=CASE WHEN excluded.item_id='' THEN rag_chunks.item_id "
-        "ELSE excluded.item_id END",
+        "ELSE excluded.item_id END, "
+        # sender_id 同一思路：回填只从事实源读，事实源那一行可能已被删除
+        # （raw 缺行时回填给出空串）。空串覆盖会把已知身份擦成未知，
+        # 随后的假名化只能退化为按会话 + 显示名猜测。
+        "sender_id=CASE WHEN excluded.sender_id='' THEN rag_chunks.sender_id "
+        "ELSE excluded.sender_id END",
         [
             (
                 r.source, r.msg_id, r.session_id, r.group_name,
-                r.sender_name, r.msg_time, r.content, r.item_id,
+                r.sender_name, r.msg_time, r.content, r.item_id, r.sender_id,
             )
             for r in rows
         ],
@@ -383,7 +461,7 @@ async def fetch_new_embeddings(
 
     sql = (
         "SELECT c.source, c.msg_id, c.session_id, c.group_name, c.sender_name,"
-        " c.msg_time, c.content, c.item_id, e.embedding, e.created_at"
+        " c.msg_time, c.content, c.item_id, c.sender_id, e.embedding, e.created_at"
         " FROM rag_chunk_embeddings e"
         " JOIN rag_chunks c ON c.source = e.source AND c.msg_id = e.msg_id"
         " WHERE e.model = ? AND e.created_at >= ?"
@@ -418,17 +496,9 @@ def parse_embedding_rows(
         except (json.JSONDecodeError, TypeError, ValueError):
             bad_keys.append(key)
             continue
-        entries.append(
-            (
-                ChunkRow(
-                    source=r["source"], msg_id=r["msg_id"],
-                    session_id=r["session_id"], group_name=r["group_name"],
-                    sender_name=r["sender_name"], msg_time=r["msg_time"],
-                    content=r["content"], item_id=r["item_id"],
-                ),
-                floats,
-            )
-        )
+        # 与 FTS 腿同一条投影读取器：两条腿返回的身份字段必须同形（sender_id
+        # 只加在一侧时，向量命中拿不到身份、只有 FTS 命中能假名化）。
+        entries.append((chunk_from_row(r), floats))
     return entries, bad_keys
 
 

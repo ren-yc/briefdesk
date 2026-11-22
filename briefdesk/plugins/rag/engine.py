@@ -5,6 +5,10 @@
 读路径（/api/rag/ask）：向量缓存（created_at 水位增量填充，解析放工作线程）
 → FTS 双路召回 → RRF 融合 → 拒答门 → AI 引用式回答。
 
+出站假名化：证据行里的姓名/群名先看**实际派发端点**（供应商没有专用 rag_chat
+时 override 会被丢弃、请求走主端点），远端才换成化名，本地原样；回答文本按请求
+内逆映射还原。准备失败时这次回答的请求根本不发生——绝不回退成真名重发。
+
 作用域语义（隐私边界，见 architecture.md）：启用会话恒为前提；
 RAG_GROUP_ONLY（默认开）进一步限定群聊——停用会话即时不可问出。
 rag 五表（chunks/embeddings/fts/meta/skipped）是 raw_messages 的派生索引；向量表
@@ -24,7 +28,8 @@ from datetime import UTC, datetime
 import aiosqlite
 import numpy as np
 
-from briefdesk import ai_ports
+from briefdesk import ai_egress, ai_ports
+from briefdesk.config import config
 from briefdesk.db import get_db, get_embed_db, get_embed_lock, storage_lock
 from briefdesk.masking import PLACEHOLDER_ONLY_RE
 from briefdesk.plugins.rag.config import RagSettings
@@ -44,6 +49,8 @@ from briefdesk.plugins.rag.db import (
     upsert_chunks,
     upsert_embeddings,
 )
+from briefdesk.plugins.rag.prompts import EvidenceNames, build_answer_prompt
+from briefdesk.pseudonym import NameContext, pseudonymize_enabled
 from briefdesk.types import BatchContext
 
 logger = logging.getLogger(__name__)
@@ -290,6 +297,7 @@ class RagEngine:
                 msg_time=msg.timestamp,
                 content=msg.content,
                 item_id=item_map.get((msg.source, msg.msg_id), ""),
+                sender_id=msg.sender_id,
             )
             rows.append(row)
             vec = batch.preembeddings.pop((row.source, row.msg_id), None)
@@ -342,7 +350,7 @@ class RagEngine:
         # rag_skipped），旧向量永不更新。
         sql = (
             "SELECT r.source, r.msg_id, r.session_id, r.group_name, "
-            "r.sender_name, r.timestamp AS msg_time, "
+            "r.sender_name, r.sender_id, r.timestamp AS msg_time, "
             "COALESCE(c.content, r.content) AS content "
             "FROM raw_messages r "
             "LEFT JOIN rag_chunks c ON c.source = r.source AND c.msg_id = r.msg_id "
@@ -367,7 +375,7 @@ class RagEngine:
                 source=r["source"], msg_id=r["msg_id"],
                 session_id=r["session_id"], group_name=r["group_name"],
                 sender_name=r["sender_name"], msg_time=r["msg_time"],
-                content=r["content"],
+                content=r["content"], sender_id=r["sender_id"],
             )
             for r in raw_rows
             if _indexable(r["content"])
@@ -703,6 +711,57 @@ class RagEngine:
     _CITE_RE = re.compile(r"\[(\d{1,2})\]")
 
     @staticmethod
+    def _name_context(dispatch: ai_ports.RagDispatch) -> NameContext:
+        """按**实际派发端点**决定这次请求要不要假名化。
+
+        判定只看 `dispatch.api_base`，绝不拿本插件的 `settings.api_base`
+        （override）代替：供应商没有专用 rag_chat 时，`ai_ports.rag_chat` 回退
+        复用 `chat`，override 被静默丢弃、请求落到主端点。按 override 判成本地、
+        请求却发往远端主机，姓名就被原样送出去了——这是静默泄露，不是报错
+        （回归见 tests/test_rag_plugin.py 的
+        test_rag_fallback_pseudonymizes_for_actual_main_endpoint）。
+
+        本地端点给 disabled 上下文：名字原样透传，也不碰磁盘上的别名注册表。
+        """
+        enabled = pseudonymize_enabled(
+            config.ai_pseudonymize_names,
+            remote_endpoint=not ai_egress.is_local_endpoint(dispatch.api_base),
+        )
+        return NameContext(enabled=enabled)
+
+    @staticmethod
+    async def _prepare_evidence_names(
+        context: NameContext, hits: list[Hit]
+    ) -> list[EvidenceNames]:
+        """准备每条证据行的展示名（按身份键复用同一化名）。
+
+        身份键优先级由 pseudonym 模块单源决定，这里只负责把 chunk 的字段喂进去：
+        人优先 `(source, sender_id)`，缺失时退化为 `(source, session_id, 已掩码
+        显示名)`；群优先 `(source, session_id)`，缺失时才用已掩码群名。在本层另写
+        一套键规则，就会出现「同一身份在两条证据行里拿到两个不同化名」。
+
+        准备失败（注册表损坏、锁超时、写盘失败）向上抛：调用方据此让这次回答的
+        请求根本不发生。不要在这里捕获后回退原名——那等于把假名化失败悄悄升级成
+        一次明文出境。
+        """
+        names: list[EvidenceNames] = []
+        for hit in hits:
+            chunk = hit.chunk
+            group = await context.group_alias(
+                source=chunk.source,
+                session_id=chunk.session_id,
+                group_name=chunk.group_name,
+            )
+            sender = await context.person_alias(
+                source=chunk.source,
+                sender_id=chunk.sender_id,
+                session_id=chunk.session_id,
+                display_name=chunk.sender_name,
+            )
+            names.append(EvidenceNames(group=group, sender=sender))
+        return names
+
+    @staticmethod
     def _citation(n: int, hit: Hit) -> dict:
         chunk = hit.chunk
         return {
@@ -731,10 +790,13 @@ class RagEngine:
         永远看着「零失败」。取消单列：CancelledError 是 BaseException 子类，
         `except Exception` 兜不到它，而取消路径上「ask 已计、终态桶全空」会让
         恒等式失效。
+
+        假名化准备失败落在 answer_error：这次回答的 create 没发生，与「请求发出
+        但失败」在「没有答案」上同类；已发生的查询嵌入仍如实留在 embed 桶里
+        （那是另一个端口，无法随本次失败回滚）。
         """
 
         from briefdesk import telemetry
-        from briefdesk.plugins.rag.prompts import build_answer_prompt
 
         telemetry.record("rag.ask")
         try:
@@ -748,19 +810,28 @@ class RagEngine:
         if not hits:
             telemetry.record("rag.refused")
             return AskResult(refused=True, answer="没有在群聊记录里找到相关消息。")
-        messages = build_answer_prompt(
-            datetime.now(UTC).astimezone(), question.strip(), hits, history or [],
-            self.settings.evidence_chars,
-        )
+        # 问答模型通道 override 来自本插件配置域（三项留空 = 复用主链路 AI）。
+        # 先按同一三元组取一次**实际派发计划**，再用它决定要不要假名化、并用
+        # 完全相同的值发送：计划与发送描述同一件事，否则回退到主端点的请求会
+        # 按 override 判成本地而带上真名。
+        override = {
+            "model": self.settings.model,
+            "api_base": self.settings.api_base,
+            "api_key": self.settings.api_key.get_secret_value(),
+        }
         try:
-            # 问答模型通道 override 来自本插件配置域（三项留空 = 复用主链路 AI）
+            dispatch = ai_ports.resolve_rag_dispatch(**override)
+            context = self._name_context(dispatch)
+            names = await self._prepare_evidence_names(context, hits)
+            messages = build_answer_prompt(
+                datetime.now(UTC).astimezone(), question.strip(), hits, history or [],
+                self.settings.evidence_chars, names=names,
+            )
             resp = await ai_ports.rag_chat(
                 messages,
                 temperature=0.2,
                 max_tokens=1024,
-                model=self.settings.model,
-                api_base=self.settings.api_base,
-                api_key=self.settings.api_key.get_secret_value(),
+                **override,
             )
             content = ""
             choices = getattr(resp, "choices", None) or []
@@ -808,6 +879,11 @@ class RagEngine:
                 nums = sorted(cited)
             else:
                 nums = sorted(cited) if cited else list(range(1, len(hits) + 1))
+            # 入站还原只作用在答案自由文本上：此时两种输出形态（JSON 契约与纯文本）
+            # 都已经解析完，剩下的是要给人看的文字。引用编号、source/msg_id 与证据
+            # 下标原样保留——化名只替换显示了身份的那部分文字，编号不是身份。
+            # 还原失败（模型把化名抄错）保留化名并计遥测，不改发真名、不重试明文。
+            answer = context.restore(answer, field="answer")
             citations = [self._citation(n, hits[n - 1]) for n in nums]
         except asyncio.CancelledError:
             telemetry.record("rag.cancelled")

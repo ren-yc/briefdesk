@@ -1,7 +1,15 @@
-"""RAG 回答 prompt 构造 — 证据块格式与回答纪律（引用/拒答/防注入/超长截断）。"""
+"""RAG 回答 prompt 构造 — 证据块格式与回答纪律（引用/拒答/防注入/超长截断）。
+
+证据行的展示名（群名、发送者名）不由本模块决定：它们必须由调用方按「这次请求
+实际会发到哪个端点」预先准备好（本地端点保持原样，远端按策略换化名）。本模块只
+做纯文本拼装，不读配置、不碰别名注册表、不做任何 I/O：同步 builder 里出现磁盘
+读或 await 会把它拖进请求关键路径，也会让「这段 prompt 到底有没有假名化」变成
+一个无法从入参判断的问题。
+"""
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
@@ -14,21 +22,39 @@ _HISTORY_MAX_MESSAGES = 6
 _HISTORY_MAX_CHARS = 200
 
 
+@dataclass(frozen=True)
+class EvidenceNames:
+    """一条证据行要用的展示名（已按出站策略准备：化名或原名）。"""
+
+    group: str
+    sender: str
+
+
 def build_answer_prompt(
     now: datetime,
     question: str,
     hits: list[Hit],
     history: list[dict] | None = None,
     evidence_chars: int = 600,
-
+    *,
+    names: list[EvidenceNames],
 ) -> list[dict]:
     """构造回答消息序列：system 纪律 + 当前时间锚定 + 对话历史 + 编号证据块。
 
     单条证据内容超过 evidence_chars 字符时截断并以「…」标注（防超长消息打满上下文）。
+
+    names 与 hits 一一对应，且必须由调用方准备（没有默认值）：若本函数自己回退
+    到 chunk 上的显示名，任何漏传就变成「真名原样出境」——那正是整套假名化要挡
+    的失败，且在 prompt 里看不出来。长度不符直接报错：把一条证据的化名挪到另一
+    条上，读者（模型）会以为是另一个人说的，比缺名更难发现。
     """
 
+    if len(names) != len(hits):
+        raise ValueError(
+            f"证据展示名与命中条数不符: names={len(names)} hits={len(hits)}"
+        )
     lines: list[str] = []
-    for i, hit in enumerate(hits, start=1):
+    for i, (hit, display) in enumerate(zip(hits, names, strict=True), start=1):
         chunk = hit.chunk
         stamp = datetime.fromtimestamp(chunk.msg_time, tz=UTC).astimezone().strftime(
             "%Y-%m-%d %H:%M"
@@ -38,7 +64,7 @@ def build_answer_prompt(
         if len(flat) > evidence_chars:
             flat = flat[:evidence_chars] + "…"
         line = (
-            f"[{i}] {stamp} {chunk.group_name}·{chunk.sender_name}: "
+            f"[{i}] {stamp} {display.group}·{display.sender}: "
             f"{flat}"
         )
         if chunk.item_id:
