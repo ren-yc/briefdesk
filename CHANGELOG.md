@@ -32,6 +32,12 @@
 - 注册表读取失败不再被当成「文件不存在」而静默重建：损坏、缺盐与版本不支持一律拒绝出站，避免一次重盐让历史化名永久失效。回归：`test_read_registry_rejects_non_alias_values`、`test_version_error_does_not_echo_value`。
 - 本地端点判定的绕过路径收口：带凭据段或空 userinfo、控制字符、非法端口与近似域名一律按远端处理，畸形 URL 不再被判成本地。回归：`test_local_endpoint_matrix_fail_closed`、`test_remote_endpoint_matrix_fail_closed`。
 - rag 里已有的 `sender_id` 不再被空串覆盖：回填与 upsert 都只保留旧值，新写入的非空值仍可更新。回归：`test_upsert_preserves_known_sender_id`。
+- RAG 证据名的身份键、出站映射与还原目标统一走 pseudonym 模块的身份键单源：缺 ID 的发送者不再被错并成同一个人（同会话异名者各得化名、还原各还原到本人），跨会话缺 ID 的发送者不再因映射查不到而把真名送进远端证据行。回归：`test_idless_senders_in_same_session_keep_distinct_aliases`、`test_idless_senders_in_different_sessions_stay_separate`、`test_group_without_session_id_uses_name_key`。
+- 证据行与分类批的「最后非空显示名」口径内建于收集阶段：先空后真名、真名后空名、群名先空后真都不再出现空名覆盖有效别名或锁定首个空串。回归：`test_empty_name_after_real_name_never_wipes_alias`、`test_group_empty_then_real_name_resolves_to_real`、`test_trailing_empty_name_does_not_wipe_earlier_real_name`、`test_multiple_real_names_take_the_last_one`。
+- RAG 证据名的全部身份（人与群）共享一次并发准备：分两轮 gather 或逐条 await 会让每个合并落盘窗口各等一次，证据越多准备越慢。回归：`test_new_identities_share_exactly_one_commit_increment`。
+- 启用假名化时证据名的出站映射查不到即按准备失败处理，不再静默回退真名。回归：`test_prepare_failure_skips_answer_request`。
+- `rag_chunks.sender_id` 迁移的回填失败或被取消时整体回滚：不再留下「列已加、值全空、下次启动不再回填」的死状态。回归：`test_sender_id_backfill_failure_rolls_back_whole_migration`。
+- SDK 重试观测状态独立计数：`sdk_retry_observed` 只由「请求头里真的读到了重试序号」推出（新指标 `ai.egress.retry_observed.*` / `ai.local.retry_observed.*`），不再把遥测开关当成观测可用——钩子未挂或头不可读时报告不再把「零次重试」伪装成可信读数。回归：`test_retry_observed_true_with_zero_retries`、`test_egress_summary_uses_header_observation_not_telemetry_switch`。
 
 ## [0.2.0] - 2026-11-14
 

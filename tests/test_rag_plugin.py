@@ -2,6 +2,7 @@
 
 import asyncio
 import re
+import sqlite3
 import unittest
 from datetime import UTC
 from types import SimpleNamespace
@@ -437,6 +438,132 @@ class TestRagDb:
             await _seed_session(db, "weflow-legacy", "s1", enabled=1, is_group=1)
             hits = await fts_search(db, "内容", limit=10)
             assert [(h.msg_id, h.sender_id) for h in hits] == [("m1", "u1")]
+        finally:
+            await db.close()
+
+    async def test_sender_id_backfill_failure_rolls_back_whole_migration(self):
+        """回填 UPDATE 失败或被取消：迁移整体回滚，不留「列在值空」的死状态。
+
+        失败模式：ALTER 在 SAVEPOINT 外先行生效时，回填失败会让库停在「列已加、
+        值全空、下次启动因列存在而永远不再回填」的死状态——假名化随后把所有
+        缺 ID 的证据行并成一个身份。CancelledError 同为 BaseException，必须走
+        同一回滚路径；列已存在的幂等重跑分支同样受保护。
+        """
+        from briefdesk.plugins.rag import db as rag_db
+        from briefdesk.plugins.rag.db import ensure_rag_schema
+
+        async def _build_old_shape_db() -> aiosqlite.Connection:
+            db = await aiosqlite.connect(":memory:")
+            db.row_factory = aiosqlite.Row
+            await init_schema(db)
+            cursor = await db.execute(
+                "CREATE TABLE rag_chunks ("
+                "source TEXT NOT NULL, msg_id TEXT NOT NULL,"
+                " session_id TEXT NOT NULL, group_name TEXT NOT NULL DEFAULT '',"
+                " sender_name TEXT NOT NULL DEFAULT '',"
+                " msg_time INTEGER NOT NULL DEFAULT 0, content TEXT NOT NULL,"
+                " item_id TEXT NOT NULL DEFAULT '',"
+                " PRIMARY KEY (source, msg_id))"
+            )
+            await cursor.close()
+            cursor = await db.execute(
+                "INSERT INTO raw_messages(source,msg_id,session_id,group_name,"
+                "sender_id,sender_name,content,timestamp) VALUES(?,?,?,?,?,?,?,?)",
+                ("weflow-legacy", "m1", "s1", "测试群", "u1", "小明", "内容", 1700000000),
+            )
+            await cursor.close()
+            cursor = await db.execute(
+                "INSERT INTO rag_chunks(source,msg_id,session_id,group_name,"
+                "sender_name,msg_time,content,item_id) VALUES(?,?,?,?,?,?,?,?)",
+                ("weflow-legacy", "m1", "s1", "测试群", "小明", 1700000000, "内容", ""),
+            )
+            await cursor.close()
+            await db.commit()
+            return db
+
+        async def _columns(db: aiosqlite.Connection) -> set[str]:
+            cursor = await db.execute("PRAGMA table_info(rag_chunks)")
+            try:
+                return {row["name"] for row in await cursor.fetchall()}
+            finally:
+                await cursor.close()
+
+        # 场景一：缺列 + ALTER 成功 + 回填抛错 → 列消失、行数据原样，可重跑
+        db = await _build_old_shape_db()
+        try:
+            with (
+                patch.object(
+                    rag_db,
+                    "_SENDER_ID_BACKFILL_SQL",
+                    "UPDATE rag_chunks SET sender_id = (SELECT no_such_col FROM x)",
+                ),
+                pytest.raises(sqlite3.OperationalError),
+            ):
+                await ensure_rag_schema(db)
+            assert "sender_id" not in await _columns(db)
+            cursor = await db.execute("SELECT msg_id FROM rag_chunks")
+            try:
+                assert [r["msg_id"] for r in await cursor.fetchall()] == ["m1"]
+            finally:
+                await cursor.close()
+            # 同一连接重跑（SQL 已恢复）：迁移成功、回填正确
+            await ensure_rag_schema(db)
+            assert "sender_id" in await _columns(db)
+            cursor = await db.execute(
+                "SELECT sender_id FROM rag_chunks WHERE msg_id='m1'"
+            )
+            try:
+                assert (await cursor.fetchone())["sender_id"] == "u1"
+            finally:
+                await cursor.close()
+        finally:
+            await db.close()
+
+        # 场景二：缺列 + 回填被取消 → 与失败同一回滚路径（列消失）
+        db = await _build_old_shape_db()
+        try:
+            original_execute = db.execute
+
+            async def _cancel_on_backfill(sql, *args, **kwargs):
+                if "UPDATE rag_chunks SET sender_id" in sql:
+                    raise asyncio.CancelledError()
+                return await original_execute(sql, *args, **kwargs)
+
+            with (
+                patch.object(
+                    db, "execute", side_effect=_cancel_on_backfill, create=True
+                ),
+                pytest.raises(asyncio.CancelledError),
+            ):
+                await ensure_rag_schema(db)
+            assert "sender_id" not in await _columns(db)
+        finally:
+            await db.close()
+
+        # 场景三：列已存在（幂等重跑分支）+ 回填抛错 → 已有值不被部分改动
+        db = await _build_old_shape_db()
+        try:
+            cursor = await db.execute(
+                "ALTER TABLE rag_chunks ADD COLUMN sender_id TEXT NOT NULL DEFAULT ''"
+            )
+            await cursor.close()
+            await db.commit()
+            with (
+                patch.object(
+                    rag_db,
+                    "_SENDER_ID_BACKFILL_SQL",
+                    "UPDATE rag_chunks SET sender_id = (SELECT no_such_col FROM x)",
+                ),
+                pytest.raises(sqlite3.OperationalError),
+            ):
+                await ensure_rag_schema(db)
+            cursor = await db.execute(
+                "SELECT sender_id FROM rag_chunks WHERE msg_id='m1'"
+            )
+            try:
+                assert (await cursor.fetchone())["sender_id"] == ""
+            finally:
+                await cursor.close()
         finally:
             await db.close()
 
@@ -1291,7 +1418,8 @@ class TestRagAsk(_MemoryEngineBase):
         self.provider.chat.assert_not_awaited()  # 对应回答的 create 没发生
         self.provider.embed_texts.assert_awaited()  # 查询嵌入真的发生过
         counters = telemetry.snapshot()["counters"]
-        assert counters["ai.pseudonym.prepare_failed|"] == 1
+        # 并发准备下人与群各走一次 alias_for，按准备次数计：1 个群 + 1 个人 = 2
+        assert counters["ai.pseudonym.prepare_failed|"] == 2
         assert counters["rag.answer_error|"] == 1
 
 
@@ -2259,3 +2387,234 @@ class TestRagEvidenceNamePreparation(_MemoryEngineBase):
         assert names[0].group == names[1].group
         assert names[0].group.startswith("群")
         assert context.display_name_for(names[1].group, kind="group") == "新群名"
+
+    async def test_idless_senders_in_same_session_keep_distinct_aliases(self):
+        """同会话两个缺 ID 的发送者：各得独立别名，不得并成一个人。
+
+        失败模式：出站映射按 (source, sender_id) 收敛且 sender_id='' 时，同源
+        全部无 ID 发送者共用一个键——成员甲的证据贴上成员乙的化名，还原时全部
+        还原成乙。身份键必须走 pseudonym 单源（含会话与显示名维度）。
+        """
+        from briefdesk import pseudonym
+
+        context = pseudonym.NameContext(
+            enabled=True, pseudonymizer=pseudonym.Pseudonymizer(
+                pseudonym.registry_dir(), flush_window=0.0,
+            )
+        )
+        hits = [
+            self._hit(self._chunk("m1", "", "成员甲")),
+            self._hit(self._chunk("m2", "", "成员乙")),
+        ]
+        names = await type(self.engine)._prepare_evidence_names(context, hits)
+        assert names[0].sender.startswith("同学")
+        assert names[1].sender.startswith("同学")
+        assert names[0].sender != names[1].sender
+        assert context.display_name_for(names[0].sender) == "成员甲"
+        assert context.display_name_for(names[1].sender) == "成员乙"
+
+    async def test_idless_senders_in_different_sessions_stay_separate(self):
+        """不同会话、缺 ID、异名：不得共用键，更不得回退真名。
+
+        失败模式：按 (source, sender_id) 查映射时键与准备阶段不一致，查不到就
+        静默回退原始 sender_name——真名直接进远端证据行。
+        """
+        from briefdesk import pseudonym
+
+        context = pseudonym.NameContext(
+            enabled=True, pseudonymizer=pseudonym.Pseudonymizer(
+                pseudonym.registry_dir(), flush_window=0.0,
+            )
+        )
+        hits = [
+            self._hit(self._chunk("m1", "", "成员甲", session_id="s1")),
+            self._hit(self._chunk("m2", "", "成员乙", session_id="s2")),
+        ]
+        names = await type(self.engine)._prepare_evidence_names(context, hits)
+        assert all(n.sender.startswith("同学") for n in names)
+        assert names[0].sender != names[1].sender
+        assert context.display_name_for(names[0].sender) == "成员甲"
+        assert context.display_name_for(names[1].sender) == "成员乙"
+
+    async def test_idless_same_name_across_sessions_shares_alias(self):
+        """缺 ID、同名、跨会话：身份键含 source+session+名字段，跨会话同名者
+        键不同（best-effort 边界内的有意取舍）；同会话同名者必须共用一个别名。
+        """
+        from briefdesk import pseudonym
+
+        context = pseudonym.NameContext(
+            enabled=True, pseudonymizer=pseudonym.Pseudonymizer(
+                pseudonym.registry_dir(), flush_window=0.0,
+            )
+        )
+        hits = [
+            self._hit(self._chunk("m1", "", "同名人", session_id="s1")),
+            self._hit(self._chunk("m2", "", "同名人", session_id="s1")),
+        ]
+        names = await type(self.engine)._prepare_evidence_names(context, hits)
+        assert names[0].sender == names[1].sender
+        assert names[0].sender.startswith("同学")
+
+    async def test_group_without_session_id_uses_name_key(self):
+        """群缺会话 ID：按群名分键，两个无会话群的证据不得共用第一个群名。"""
+        from briefdesk import pseudonym
+
+        context = pseudonym.NameContext(
+            enabled=True, pseudonymizer=pseudonym.Pseudonymizer(
+                pseudonym.registry_dir(), flush_window=0.0,
+            )
+        )
+        hits = [
+            self._hit(self._chunk("m1", "u1", "小明", group_name="甲群", session_id="")),
+            self._hit(self._chunk("m2", "u2", "小红", group_name="乙群", session_id="")),
+        ]
+        names = await type(self.engine)._prepare_evidence_names(context, hits)
+        assert names[0].group.startswith("群")
+        assert names[1].group.startswith("群")
+        assert names[0].group != names[1].group
+        assert context.display_name_for(names[0].group, kind="group") == "甲群"
+        assert context.display_name_for(names[1].group, kind="group") == "乙群"
+
+    async def test_empty_name_after_real_name_never_wipes_alias(self):
+        """同一发送者先真名后空名：空调用不得覆盖已收敛的最终名。
+
+        失败模式：映射被空调用的返回值覆盖后，整批发送者名全空、还原无目标——
+        「最后非空显示名」口径必须内建于收集阶段，而不是靠事后登记补救。
+        """
+        from briefdesk import pseudonym
+
+        context = pseudonym.NameContext(
+            enabled=True, pseudonymizer=pseudonym.Pseudonymizer(
+                pseudonym.registry_dir(), flush_window=0.0,
+            )
+        )
+        hits = [
+            self._hit(self._chunk("m1", "u9", "真名甲")),
+            self._hit(self._chunk("m2", "u9", "")),
+        ]
+        names = await type(self.engine)._prepare_evidence_names(context, hits)
+        # 空名消息与真名消息共用同一化名（同身份），整批不出现空名
+        assert names[0].sender == names[1].sender
+        assert names[1].sender.startswith("同学")
+        assert context.display_name_for(names[1].sender) == "真名甲"
+
+    async def test_group_empty_then_real_name_resolves_to_real(self):
+        """同一群先空名后真名：还原目标取真名，首个空名不锁定。"""
+        from briefdesk import pseudonym
+
+        context = pseudonym.NameContext(
+            enabled=True, pseudonymizer=pseudonym.Pseudonymizer(
+                pseudonym.registry_dir(), flush_window=0.0,
+            )
+        )
+        hits = [
+            self._hit(self._chunk("m1", "u1", "小明", group_name="")),
+            self._hit(self._chunk("m2", "u1", "小明", group_name="真群名")),
+        ]
+        names = await type(self.engine)._prepare_evidence_names(context, hits)
+        assert names[0].group == names[1].group
+        assert names[1].group.startswith("群")
+        assert context.display_name_for(names[1].group, kind="group") == "真群名"
+
+    async def test_all_blank_names_stay_blank_without_alias_error(self):
+        """整批显示名为空：不登记身份、不误报别名缺失，出站保持空串。"""
+        from briefdesk import pseudonym
+
+        context = pseudonym.NameContext(
+            enabled=True, pseudonymizer=pseudonym.Pseudonymizer(
+                pseudonym.registry_dir(), flush_window=0.0,
+            )
+        )
+        hits = [
+            self._hit(self._chunk("m1", "", "", group_name="")),
+            self._hit(self._chunk("m2", "u1", "", group_name="")),
+        ]
+        names = await type(self.engine)._prepare_evidence_names(context, hits)
+        assert [n.sender for n in names] == ["", ""]
+        assert [n.group for n in names] == ["", ""]
+
+    async def test_blank_group_name_joins_session_identity(self):
+        """同会话群名一空一真：空名消息的群随会话身份拿同一个化名。
+
+        群身份键按会话收敛：会话里哪怕只有一条证据带真实群名，同一会话的空名
+        消息也用它（群只有一个，空名只是缺失而不是另一个群）。
+        """
+        from briefdesk import pseudonym
+
+        context = pseudonym.NameContext(
+            enabled=True, pseudonymizer=pseudonym.Pseudonymizer(
+                pseudonym.registry_dir(), flush_window=0.0,
+            )
+        )
+        hits = [
+            self._hit(self._chunk("m1", "u1", "小明", group_name="")),
+            self._hit(self._chunk("m2", "u2", "小红", group_name="真群名")),
+        ]
+        names = await type(self.engine)._prepare_evidence_names(context, hits)
+        assert names[0].group == names[1].group
+        assert names[0].group.startswith("群")
+        assert context.display_name_for(names[0].group, kind="group") == "真群名"
+
+    async def test_new_identities_share_exactly_one_commit_increment(
+        self, monkeypatch
+    ):
+        """预热后一批新身份只增加一次落盘提交：分两轮 gather 会多出一个窗口。
+
+        上一版守卫只断言 `commit_count >= 1` 且未预热：「群 gather → 人 gather」
+        的错误实现同样通过。这里先提交预热身份，再断言本批增量**恰好为 1**，
+        并把人与群、缺 ID 回放身份混进同一批。
+        """
+        import asyncio
+
+        from briefdesk import pseudonym
+        from briefdesk.config import config
+
+        monkeypatch.setattr(config, "ai_pseudonymize_names", "on")
+
+        commit_count = {"n": 0}
+        sleeps = {"n": 0}
+
+        real_commit = pseudonym.Pseudonymizer._commit_sync
+
+        def _counting_commit(self_p, batch):
+            commit_count["n"] += 1
+            return real_commit(self_p, batch)
+
+        real_sleep = asyncio.sleep
+
+        async def _counting_sleep(delay, *args, **kwargs):
+            if delay > 0:
+                sleeps["n"] += 1
+            return await real_sleep(0)
+
+        monkeypatch.setattr(pseudonym.Pseudonymizer, "_commit_sync", _counting_commit)
+        monkeypatch.setattr(asyncio, "sleep", _counting_sleep)
+
+        pseudonymizer = pseudonym.Pseudonymizer(
+            pseudonym.registry_dir(), flush_window=0.05,
+        )
+        # 预热：先提交一个身份，让后续批次落在「非首次提交」区间
+        warm = pseudonym.NameContext(enabled=True, pseudonymizer=pseudonymizer)
+        await warm.person_alias(
+            source="weflow-legacy", sender_id="warm",
+            session_id="s1", display_name="预热者",
+        )
+        assert commit_count["n"] >= 1
+        baseline = commit_count["n"]
+
+        context = pseudonym.NameContext(enabled=True, pseudonymizer=pseudonymizer)
+        hits = [
+            # 三个新有 ID 身份 + 一个新群 + 一个缺 ID 新身份
+            self._hit(self._chunk("m1", "u1", "成员一")),
+            self._hit(self._chunk("m2", "u2", "成员二")),
+            self._hit(self._chunk("m3", "u3", "成员三")),
+            self._hit(self._chunk("m4", "u1", "成员一")),  # 已在批内，键复用
+            self._hit(self._chunk("m5", "", "无身份者")),
+        ]
+        names = await type(self.engine)._prepare_evidence_names(context, hits)
+        assert len(names) == 5
+        assert all(n.sender.startswith("同学") for n in names)
+        assert names[0].sender == names[3].sender
+        # 本批全部新身份一次提交：串行或分两轮 gather 都会多等窗口（sleeps ≥ 2）
+        assert sleeps["n"] <= 1, sleeps
+        assert commit_count["n"] == baseline + 1, commit_count

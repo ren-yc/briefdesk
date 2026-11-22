@@ -1866,6 +1866,41 @@ class TestPseudonymOutbound:
         assert built.count(alias) == 2
         assert names.ctx.display_name_for(alias, kind="person") == "张三"
 
+    async def test_multiple_real_names_take_the_last_one(self, pseudo_registry):
+        # 同一 sender_id 多个非空名：「取第一个非空名」的实现会拿错还原目标——
+        # 必须钉在最后一个非空显示名上（人与群同规则）。
+        first = _pseudo_msg(msg_id="m1", sender_name="曾用名")
+        second = _pseudo_msg(msg_id="m2", sender_name="现用名")
+        names = await prepare_name_context([first, second])
+        alias = names.senders[("id", "weflow-legacy", "u1")]
+        assert alias.startswith("同学")
+        assert names.ctx.display_name_for(alias, kind="person") == "现用名"
+
+    async def test_trailing_empty_name_does_not_wipe_earlier_real_name(
+        self, pseudo_registry
+    ):
+        # 真名在前、空名收尾：空名不得覆盖已收敛的映射，否则整批拿空串出站、
+        # 还原无目标——「最后非空」的判定必须发生在收集阶段而不是事后登记。
+        real = _pseudo_msg(msg_id="m1", sender_name="张三")
+        empty = _pseudo_msg(msg_id="m2", sender_name="")
+        names = await prepare_name_context([real, empty])
+        alias = names.senders[("id", "weflow-legacy", "u1")]
+        assert alias.startswith("同学")
+        built = _build_user_message(_group_messages([real, empty], names=names))
+        assert built.count(alias) == 2
+        assert names.ctx.display_name_for(alias, kind="person") == "张三"
+
+    async def test_trailing_empty_group_name_does_not_wipe_earlier_name(
+        self, pseudo_registry
+    ):
+        # 群名先非空后空：同上，空群名不得覆盖已有群名映射。
+        real = _pseudo_msg(msg_id="m1", group_name="社团群")
+        empty = _pseudo_msg(msg_id="m2", group_name="")
+        names = await prepare_name_context([real, empty])
+        alias = names.groups[("weflow-legacy", "s1")]
+        assert alias.startswith("群")
+        assert names.ctx.display_name_for(alias, kind="group") == "社团群"
+
     async def test_group_rename_uses_final_name_for_restore(
         self, pseudo_registry
     ):

@@ -280,3 +280,15 @@ def record_sdk_retry(port: str, role: str, is_local: bool) -> None:
     """
     prefix = "ai.local.sdk_retry" if is_local else "ai.egress.sdk_retry"
     telemetry.record(f"{prefix}.{_dimensions(port, role)}", _current_source())
+
+
+def record_retry_observed(port: str, role: str, is_local: bool) -> None:
+    """标记一次 create 的重试观测可用（请求头里真的读到了重试序号）。
+
+    与发送尝试同口径（按 create 计）。它回答的是「SDK 重试读数可不可信」：
+    钩子没挂上、客户端不写重试头或头不可解析时，`sdk_retry` 桶一次都不会被记，
+    只看这个桶无法区分「真的零重试」与「观测盲区」；没有本旗标计数，「零」就
+    不能当可信读数消费。
+    """
+    prefix = "ai.local.retry_observed" if is_local else "ai.egress.retry_observed"
+    telemetry.record(f"{prefix}.{_dimensions(port, role)}", _current_source())

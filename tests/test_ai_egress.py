@@ -22,6 +22,7 @@ from briefdesk import ai_egress, ai_ports, telemetry
 from briefdesk.config import config
 from briefdesk.plugins.ai_provider import engine
 from briefdesk.plugins.ai_provider.engine import Provider
+from briefdesk.plugins.benchmark import engine as bench_engine
 
 REMOTE_BASE = "https://ai.example.invalid/v1"
 LOCAL_BASE = "http://localhost:11434/v1"
@@ -471,7 +472,10 @@ class TestSendBoundary:
 
         assert counted_before_transport == [1]
         assert len(requests) == 1
-        assert _egress_counters() == {"ai.egress.remote_attempt.chat.main|": 1}
+        assert _egress_counters() == {
+            "ai.egress.remote_attempt.chat.main|": 1,
+            "ai.egress.retry_observed.chat.main|": 1,
+        }
 
     async def test_local_base_counts_local_not_remote(
         self, monkeypatch: pytest.MonkeyPatch
@@ -491,7 +495,10 @@ class TestSendBoundary:
         )
 
         # 本地请求不伪装成出境：remote 桶一个键都不能出现
-        assert _egress_counters() == {"ai.local.attempt.chat.main|": 1}
+        assert _egress_counters() == {
+            "ai.local.attempt.chat.main|": 1,
+            "ai.local.retry_observed.chat.main|": 1,
+        }
         assert len(requests) == 1
 
     async def test_rag_and_embed_use_their_own_ports(
@@ -523,7 +530,9 @@ class TestSendBoundary:
         assert embed_batches == [2, 2, 1]
         assert _egress_counters() == {
             "ai.egress.remote_attempt.rag.main|": 1,
+            "ai.egress.retry_observed.rag.main|": 1,
             "ai.egress.remote_attempt.embed.main|": 3,
+            "ai.egress.retry_observed.embed.main|": 3,
         }
 
     async def test_queue_timeout_and_cancel_do_not_count_send(
@@ -590,6 +599,7 @@ class TestSendBoundary:
         assert requests[1].headers.get("x-stainless-retry-count") == "1"
         assert _egress_counters() == {
             "ai.egress.remote_attempt.chat.main|": 1,
+            "ai.egress.retry_observed.chat.main|": 1,
             "ai.egress.sdk_retry.chat.main|": 1,
         }
 
@@ -626,7 +636,10 @@ class TestSendBoundary:
         assert bodies[0]["reasoning_effort"] == "none"
         assert "reasoning_effort" not in bodies[1]
         # 降级重发是调用方发起的第二次显式 create：逻辑尝试 2，SDK 重试 0
-        assert _egress_counters() == {"ai.egress.remote_attempt.chat.main|": 2}
+        assert _egress_counters() == {
+            "ai.egress.remote_attempt.chat.main|": 2,
+            "ai.egress.retry_observed.chat.main|": 2,
+        }
         assert "ai.egress.sdk_retry.chat.main|" not in _counters()
 
     async def test_stub_provider_never_counts_egress(
@@ -655,7 +668,10 @@ class TestSendBoundary:
         await ai_ports.chat(
             [{"role": "user", "content": "x"}], temperature=0.1, max_tokens=16
         )
-        assert _egress_counters() == {"ai.egress.remote_attempt.chat.main|": 1}
+        assert _egress_counters() == {
+            "ai.egress.remote_attempt.chat.main|": 1,
+            "ai.egress.retry_observed.chat.main|": 1,
+        }
 
     async def test_disabled_telemetry_writes_no_zero_keys(
         self, monkeypatch: pytest.MonkeyPatch
@@ -884,7 +900,10 @@ class TestPortMetadataWiring:
             )
         ]
         # source 维度进计数键：端口层不设元数据时这里会变成不带 |weflow 的键
-        assert _egress_counters() == {"ai.egress.remote_attempt.chat.main|weflow": 1}
+        assert _egress_counters() == {
+            "ai.egress.remote_attempt.chat.main|weflow": 1,
+            "ai.egress.retry_observed.chat.main|weflow": 1,
+        }
 
     async def test_rag_port_metadata_reaches_the_send_boundary(
         self, monkeypatch: pytest.MonkeyPatch
@@ -914,7 +933,10 @@ class TestPortMetadataWiring:
                 source="",
             )
         ]
-        assert _egress_counters() == {"ai.egress.remote_attempt.rag.main|": 1}
+        assert _egress_counters() == {
+            "ai.egress.remote_attempt.rag.main|": 1,
+            "ai.egress.retry_observed.rag.main|": 1,
+        }
 
     async def test_embed_port_metadata_reaches_the_send_boundary(
         self, monkeypatch: pytest.MonkeyPatch
@@ -940,7 +962,10 @@ class TestPortMetadataWiring:
                 source="",
             )
         ]
-        assert _egress_counters() == {"ai.egress.remote_attempt.embed.main|": 1}
+        assert _egress_counters() == {
+            "ai.egress.remote_attempt.embed.main|": 1,
+            "ai.egress.retry_observed.embed.main|": 1,
+        }
 
 
 async def test_call_site_port_wins_over_metadata_port(
@@ -962,7 +987,10 @@ async def test_call_site_port_wins_over_metadata_port(
             [{"role": "user", "content": "hi"}], temperature=0.1, max_tokens=16
         )
 
-    assert _egress_counters() == {"ai.egress.remote_attempt.chat.main|": 1}
+    assert _egress_counters() == {
+        "ai.egress.remote_attempt.chat.main|": 1,
+        "ai.egress.retry_observed.chat.main|": 1,
+    }
     assert "ai.egress.remote_attempt.rag.main|" not in _counters()
 
 
@@ -999,6 +1027,59 @@ async def test_sdk_retry_hook_records_each_ordinal_once() -> None:
     # 生命周期外仍会跑到，不能把重定向/复用连接算成某次 create 的重试。
     await engine._on_sdk_request(_retry_request(3))
     assert _egress_counters() == {"ai.egress.sdk_retry.chat.main|": 2}
+
+
+async def test_retry_observed_true_with_zero_retries() -> None:
+    """没有重试头可读的请求仍必须让观测状态可信：observed 记的是「头读到了」。
+
+    失败模式：把 sdk_retry_observed 实现成「遥测开关的值」时，两个无重试头的
+    请求会被报成「已观测且零次重试」——零成了可信读数，而实际上钩子是否挂上、
+    头是否可读都无从确认，SDK 内部重试全部静默丢失。
+    """
+    tracker = engine._SdkRetryTracker(
+        ai_egress.PORT_CHAT, ai_egress.ROLE_MAIN, is_local=False
+    )
+    token = engine._RETRY_TRACKER.set(tracker)
+    try:
+        # 两次请求都不带重试头：SDK 一定会写（首次为 0），缺失即观测盲区，
+        # 但只要有一次真的读到了（这里是模拟头可读的请求 0），观测就算成立
+        request = httpx.Request("POST", f"{REMOTE_BASE}/chat/completions")
+        await engine._on_sdk_request(request)
+        assert tracker.header_seen is False  # 头缺失：不算观测成立
+
+        request0 = _retry_request(0)
+        await engine._on_sdk_request(request0)
+        assert tracker.header_seen is True
+    finally:
+        engine._RETRY_TRACKER.reset(token)
+
+    assert _egress_counters() == {}  # 序号 0 不是重试，重试桶必须为空
+
+
+async def test_retry_observed_absent_when_header_never_parsed() -> None:
+    """头从未被读到（非数字、缺失）时观测可用计数不得出现。
+
+    `retry_observed` 键出现即承诺「重试读数可信」；承诺必须在头真的被解析过
+    之后兑现，否则「零重试」又是不可信读数。
+    """
+    tracker = engine._SdkRetryTracker(
+        ai_egress.PORT_CHAT, ai_egress.ROLE_MAIN, is_local=False
+    )
+    token = engine._RETRY_TRACKER.set(tracker)
+    try:
+        garbage = httpx.Request(
+            "POST", f"{REMOTE_BASE}/chat/completions",
+            headers={"x-stainless-retry-count": "not-a-number"},
+        )
+        await engine._on_sdk_request(garbage)
+        assert tracker.header_seen is False
+
+        bare = httpx.Request("POST", f"{REMOTE_BASE}/chat/completions")
+        await engine._on_sdk_request(bare)
+        assert tracker.header_seen is False
+    finally:
+        engine._RETRY_TRACKER.reset(token)
+    assert _egress_counters() == {}
 
 
 class _CountingWrappedClient:
@@ -1085,4 +1166,65 @@ async def test_serialization_failure_inside_create_counts_one_attempt(
         )
 
     assert requests == []
+    # 请求没到传输层：重试头从未被读到，观测可用计数不得出现（零不可信）
     assert _egress_counters() == {"ai.egress.remote_attempt.chat.main|": 1}
+    assert "ai.egress.retry_observed.chat.main|" not in _counters()
+
+
+async def test_retry_observed_never_confuses_headerless_responses(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """头可读但全程无重试：observed=true 且 sdk_retry_total=0 可信。
+
+    这是把「遥测开关当观测状态」的旧错误实现钉死在真实发送路径上：SDK 一次都
+    没重试时，报告必须允许消费方把零当真——观测状态来自「头真的被读到」，不是
+    遥测开关。
+    """
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json=_chat_body())
+
+    _install_transport(monkeypatch, handler)
+    ai_ports.set_ai(Provider())
+
+    await ai_ports.chat(
+        [{"role": "user", "content": "hi"}], temperature=0.1, max_tokens=16
+    )
+
+    assert len(requests) == 1
+    assert _egress_counters() == {
+        "ai.egress.remote_attempt.chat.main|": 1,
+        "ai.egress.retry_observed.chat.main|": 1,
+    }
+    assert "ai.egress.sdk_retry.chat.main|" not in _counters()
+
+
+def test_record_retry_observed_buckets_by_locality() -> None:
+    """观测可用计数按本地/远端分桶，键形态与 sdk_retry 一致。"""
+    ai_egress.record_retry_observed(ai_egress.PORT_CHAT, ai_egress.ROLE_MAIN, False)
+    ai_egress.record_retry_observed(ai_egress.PORT_RAG, ai_egress.ROLE_MAIN, True)
+    assert _counters() == {
+        "ai.egress.retry_observed.chat.main|": 1,
+        "ai.local.retry_observed.rag.main|": 1,
+    }
+
+
+def test_egress_summary_uses_header_observation_not_telemetry_switch() -> None:
+    """汇总的 observed 只认「头真的被读到」，不认遥测开关。
+
+    错误实现（observed = telemetry._enabled()）会把「开关开着但钩子没挂上」
+    报成可观测——这里直接塞计数器验证判定来源。
+    """
+    summary = bench_engine._egress_summary()
+    assert summary == {
+        "attempt_total": 0, "sdk_retry_total": 0, "sdk_retry_observed": False,
+    }
+
+    ai_egress.record_send_attempt(ai_egress.PORT_CHAT, ai_egress.ROLE_MAIN, REMOTE_BASE)
+    ai_egress.record_retry_observed(ai_egress.PORT_CHAT, ai_egress.ROLE_MAIN, False)
+    summary = bench_engine._egress_summary()
+    assert summary == {
+        "attempt_total": 1, "sdk_retry_total": 0, "sdk_retry_observed": True,
+    }

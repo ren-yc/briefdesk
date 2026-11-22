@@ -104,8 +104,10 @@ def provider_label(api_base: str) -> str:
 def _egress_summary() -> dict[str, Any]:
     """出境观测摘要（脱敏）：只落汇总数字与可用性状态位。
 
-    `sdk_retry_observed=false` 表示「本批没有可用的重试观测钩子」，重试值未知；
-    消费方不得把它读成零。遥测关闭时数字为空是「未知」，同样不解读为零。
+    `sdk_retry_observed` 表示本批至少一次 create 的请求头里读到了重试序号
+    （观测链路真的在转），此时 `sdk_retry_total` 才是可信读数；为 false 时
+    重试次数未知——遥测关闭、钩子没挂上或头不可读都落到这个状态，消费方不得
+    把总数读成零。遥测关闭时其余数字为空同样按未知理解。
     """
     counters = telemetry.snapshot().get("counters") or {}
     attempts = sum(
@@ -118,10 +120,15 @@ def _egress_summary() -> dict[str, Any]:
         for key, value in counters.items()
         if key.startswith(("ai.egress.sdk_retry.", "ai.local.sdk_retry."))
     )
+    observed = sum(
+        value
+        for key, value in counters.items()
+        if key.startswith(("ai.egress.retry_observed.", "ai.local.retry_observed."))
+    )
     return {
         "attempt_total": attempts,
         "sdk_retry_total": retries,
-        "sdk_retry_observed": telemetry._enabled(),
+        "sdk_retry_observed": observed > 0,
     }
 
 

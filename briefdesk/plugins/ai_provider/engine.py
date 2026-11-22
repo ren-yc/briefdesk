@@ -71,15 +71,20 @@ class _SdkRetryTracker:
     每次 create 各建一份：同一序号在重定向时会再次经过请求钩子，靠 `seen` 去重
     才能保证一次内部重试只 +1；effort 降级会重新 create，因此也用新集合，
     不把两次逻辑发送的重试序号混在一起。
+
+    `header_seen` 记录「本次 create 至少一个请求真的读到了重试序号头」：遥测开着
+    不代表钩子挂上了、更不代表头可读——三者缺一，重试次数就只能是未知。收尾时
+    按这个旗标记观测可用，报告侧才能把「零次重试」当成可信读数。
     """
 
-    __slots__ = ("is_local", "port", "role", "seen")
+    __slots__ = ("header_seen", "is_local", "port", "role", "seen")
 
     def __init__(self, port: str, role: str, *, is_local: bool) -> None:
         self.port = port
         self.role = role
         self.is_local = is_local
         self.seen: set[int] = set()
+        self.header_seen = False
 
 
 # 当前任务正在进行的 create 的观测状态；未处于任何 create 内时为 None（钩子直接
@@ -96,8 +101,14 @@ _RETRY_TRACKER: ContextVar[_SdkRetryTracker | None] = ContextVar(
 _RETRY_HEADER_NAMES = ("x-stainless-retry-count", "retry-count")
 
 
-def _retry_count(headers: httpx.Headers) -> int:
-    """从请求头读重试序号；缺失或非数字按 0 —— 认不出就当没重试，不猜。"""
+def _retry_ordinal(headers: httpx.Headers) -> int | None:
+    """从请求头读重试序号；头缺失或非数字返回 None。
+
+    None 与 0 必须分开：SDK 把每次请求的序号都写进头（首次为 0），「读到 0」
+    才是重试观测真正生效的证据；「头根本没出现」只说明钩子没挂上或客户端不写
+    这个头——这两种形态在读数上必须可区分，否则「真的没重试」与「没读到头」
+    长得一模一样，零次就成了不可信读数。
+    """
     for name in _RETRY_HEADER_NAMES:
         raw = headers.get(name)
         if raw is None:
@@ -105,8 +116,8 @@ def _retry_count(headers: httpx.Headers) -> int:
         try:
             return int(raw)
         except ValueError:
-            return 0
-    return 0
+            return None
+    return None
 
 
 async def _on_sdk_request(request: httpx.Request) -> None:
@@ -127,11 +138,14 @@ async def _on_sdk_request(request: httpx.Request) -> None:
         tracker = _RETRY_TRACKER.get()
         if tracker is None:
             return
-        retries = _retry_count(request.headers)
-        if retries <= 0 or retries in tracker.seen:
+        ordinal = _retry_ordinal(request.headers)
+        if ordinal is None:
+            return
+        tracker.header_seen = True
+        if ordinal <= 0 or ordinal in tracker.seen:
             return
         ai_egress.record_sdk_retry(tracker.port, tracker.role, tracker.is_local)
-        tracker.seen.add(retries)
+        tracker.seen.add(ordinal)
     except Exception:  # 钩子异常绝不连坐请求
         logger.debug("SDK 重试计数失败（忽略）", exc_info=True)
 
@@ -152,14 +166,22 @@ def _sending(port: str, base: str) -> Iterator[None]:
     角色由端口层写入的元数据决定（目前只有主通道，即 `main`）；直接调用引擎时
     拿到安全默认值，不会因为没有元数据就丢计数。端口取调用点自己的，不由元数据
     决定：端口是代码路径的属性，一次误设的元数据不该把 rag 的发送记进 chat 桶。
+
+    收尾时若本次 create 至少一个请求读到了重试序号头，单独记一次观测可用：
+    该计数与发送尝试同口径（按 create 计），报告侧用它判断「SDK 重试读数」
+    是可信的零还是未知——遥测开关替代不了这个判断，钩子没挂上或头不可读时
+    一次重试都不会被记，把零当可信会静默丢掉全部内部重试。
     """
     role = ai_egress.current_metadata().role
     is_local = ai_egress.record_send_attempt(port, role, base)
-    token = _RETRY_TRACKER.set(_SdkRetryTracker(port, role, is_local=is_local))
+    tracker = _SdkRetryTracker(port, role, is_local=is_local)
+    token = _RETRY_TRACKER.set(tracker)
     try:
         yield
     finally:
         _RETRY_TRACKER.reset(token)
+        if tracker.header_seen:
+            ai_egress.record_retry_observed(port, role, is_local)
 
 
 @asynccontextmanager

@@ -24,6 +24,7 @@ import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from typing import Any
 
 import aiosqlite
 import numpy as np
@@ -50,7 +51,13 @@ from briefdesk.plugins.rag.db import (
     upsert_embeddings,
 )
 from briefdesk.plugins.rag.prompts import EvidenceNames, build_answer_prompt
-from briefdesk.pseudonym import NameContext, pseudonymize_enabled
+from briefdesk.pseudonym import (
+    NameContext,
+    PseudonymError,
+    group_identity_key,
+    person_identity_key,
+    pseudonymize_enabled,
+)
 from briefdesk.types import BatchContext
 
 logger = logging.getLogger(__name__)
@@ -735,133 +742,156 @@ class RagEngine:
     ) -> list[EvidenceNames]:
         """准备每条证据行的展示名（按身份键复用同一化名）。
 
-        身份键优先级由 pseudonym 模块单源决定，这里只负责把 chunk 的字段喂进去：
-        人优先 `(source, sender_id)`，缺失时退化为 `(source, session_id, 已掩码
-        显示名)`；群优先 `(source, session_id)`，缺失时才用已掩码群名。在本层另写
-        一套键规则，就会出现「同一身份在两条证据行里拿到两个不同化名」。
+        收集与出站全部复用 pseudonym 模块的身份键单源（`person_identity_key` /
+        `group_identity_key`）：本层另写一套键规则，就会出现「准备用的键」与
+        「还原目标用的键」口径分叉——缺 ID 的发送者被错并成同一人（同会话两条
+        证据共用一个化名、还原都还原成同一个人），或按残缺键查不到映射而静默
+        回退真名出境。
 
-        全部身份并发 gather：冻结模块对新身份有合并落盘窗口，逐条 await 会让每条
-        新证据各等一个窗口，证据越多准备越慢；并发后同批身份共享同一次落盘。gather
-        之后按输入顺序再过一遍——此时全是内存缓存命中——把「同一身份多个显示名」
-        的还原目标钉在最后一个非空显示名上（与分类批同一口径），并发完成顺序
-        不确定，靠它自己钉不住。
+        先按输入顺序收敛每个身份的最终显示名（空显示名跳过、不锁定空串：先空
+        后真名的人拿真名出站，也拿真名还原）；再用最终显示名重算身份键并发取
+        别名。缺 ID 时显示名参与身份键，最终名替换后键随名收敛——同一身份的
+        每条证据从此只有一个键、一个化名、一个还原目标（别名调用发生在最终名
+        上，逆映射登记的正是最终名）。人与群共享**一次** gather：冻结模块对新
+        身份有合并落盘窗口，逐条 await 或分两轮 gather 会让每个窗口各等一次，
+        证据越多准备越慢。
 
-        准备失败（注册表损坏、锁超时、写盘失败）向上抛：调用方据此让这次回答的
-        请求根本不发生。不要在这里捕获后回退原名——那等于把假名化失败悄悄升级成
-        一次明文出境。
+        启用假名化时出站映射只查身份键，查不到（映射遗漏）按准备失败处理，
+        绝不静默回退真名；准备失败（注册表损坏、锁超时、写盘失败）同样向上抛，
+        调用方据此让这次回答的请求根本不发生。不要捕获后回退原名——那等于把
+        假名化失败悄悄升级成一次明文出境。
         """
-        group_jobs: dict[tuple[str, str], str] = {}
-        person_jobs: dict[tuple[str, str, str, str], str] = {}
+        if not context.enabled:
+            # 关闭时不做任何准备：每条证据用原值（含未清洗的空白），与未接入
+            # 假名化时逐字节一致，也不产生任何读盘或 await。
+            return [
+                EvidenceNames(group=hit.chunk.group_name, sender=hit.chunk.sender_name)
+                for hit in hits
+            ]
+
+        person_final: dict[str, str] = {}
+        group_final: dict[str, str] = {}
         for hit in hits:
             chunk = hit.chunk
-            gkey = (chunk.source, chunk.session_id)
-            group_jobs.setdefault(gkey, chunk.group_name)
-            pkey = (
-                chunk.source,
-                chunk.sender_id,
-                chunk.session_id,
-                chunk.sender_name,
-            )
-            person_jobs.setdefault(pkey, chunk.sender_name)
-
-        if group_jobs:
-            group_values = await asyncio.gather(
-                *(
-                    context.group_alias(
-                        source=source,
-                        session_id=session_id,
-                        group_name=group_name,
-                    )
-                    for (source, session_id), group_name in group_jobs.items()
-                )
-            )
-            group_map = dict(zip(
-                (
-                    (source, session_id, name)
-                    for (source, session_id), name in group_jobs.items()
-                ),
-                group_values,
-                strict=True,
-            ))
-        else:
-            group_map = {}
-        if person_jobs:
-            person_values = await asyncio.gather(
-                *(
-                    context.person_alias(
-                        source=source,
-                        sender_id=sender_id,
-                        session_id=session_id,
-                        display_name=sender_name,
-                    )
-                    for (
-                        source,
-                        sender_id,
-                        session_id,
-                        sender_name,
-                    ), sender_name in person_jobs.items()
-                )
-            )
-            person_map = dict(zip(person_jobs, person_values, strict=True))
-        else:
-            person_map = {}
-
-        # 出站映射：群按 (source, session_id) 收敛成一个别名；人按 (source,
-        # sender_id) 收敛。并发键以「显示名」为尾段只是为了一次性把全部新身份
-        # 提交进注册表，真正出站时同一身份只会有一个别名（身份键不含显示名，
-        # 有 ID 时）；无 ID 时显示名参与身份键，同名同会话天然共用，异名则各自
-        # 有别名——这与「还原目标取最后非空显示名」一致。
-        group_out: dict[tuple[str, str], str] = {}
-        person_out: dict[tuple[str, str], str] = {}
-        for (source, session_id, _name), alias in group_map.items():
-            group_out[(source, session_id)] = alias
-        for (source, sender_id, _session_id, _name), alias in person_map.items():
-            if sender_id:
-                person_out[(source, sender_id)] = alias
-
-        # 还原目标：同一身份在本请求内最后一个非空显示名（人与群同规则）。
-        # 逆映射（别名 → 显示名）在冻结模块按「每次 group/person_alias 调用
-        # 登记」更新，所以这里按输入顺序对最终显示名各调一次缓存命中的准备，
-        # 把还原目标钉到最后一个非空名字——并发完成顺序不可靠，靠它钉不住。
-        final_group: dict[tuple[str, str], str] = {}
-        final_person: dict[tuple[str, str], str] = {}
-        for hit in hits:
-            chunk = hit.chunk
-            if chunk.group_name.strip():
-                final_group[(chunk.source, chunk.session_id)] = chunk.group_name
-            if chunk.sender_name.strip():
-                final_person[(chunk.source, chunk.sender_id)] = chunk.sender_name
-
-        names: list[EvidenceNames] = []
-        for hit in hits:
-            chunk = hit.chunk
-            gkey = (chunk.source, chunk.session_id)
-            pkey2 = (chunk.source, chunk.sender_id)
-            group = group_out.get(gkey, chunk.group_name)
-            sender = person_out.get(pkey2, chunk.sender_name)
-            # 无 ID 的人：显示名参与身份键，异名异别名——按最后非空显示名取。
-            if not chunk.sender_id.strip():
-                sender_display = final_person.get(pkey2, chunk.sender_name)
-                sender = person_map.get(
-                    (chunk.source, "", chunk.session_id, sender_display),
-                    sender,
-                )
-            # 把还原目标钉到最后非空显示名（缓存命中、无 I/O）。
-            group_final = final_group.get(gkey)
-            if group and group_final:
-                await context.group_alias(
-                    source=chunk.source,
-                    session_id=chunk.session_id,
-                    group_name=group_final,
-                )
-            person_final = final_person.get(pkey2)
-            if sender and person_final:
-                await context.person_alias(
+            if (chunk.sender_name or "").strip():
+                pkey0 = person_identity_key(
                     source=chunk.source,
                     sender_id=chunk.sender_id,
                     session_id=chunk.session_id,
-                    display_name=person_final,
+                    display_name=chunk.sender_name,
                 )
+                person_final[pkey0] = chunk.sender_name.strip()
+            if (chunk.group_name or "").strip():
+                gkey0 = group_identity_key(
+                    source=chunk.source,
+                    session_id=chunk.session_id,
+                    group_name=chunk.group_name,
+                )
+                group_final[gkey0] = chunk.group_name.strip()
+
+        # 第二轮：用最终显示名重算身份键。缺 ID 时最终名正是键的一部分，键随
+        # 名收敛；同一身份的每条证据由此拿到同一个键。
+        person_jobs: dict[str, tuple[str, str, str, str]] = {}
+        group_jobs: dict[str, tuple[str, str, str]] = {}
+        plans: list[tuple[str | None, str | None]] = []
+        for hit in hits:
+            chunk = hit.chunk
+            pkey0 = person_identity_key(
+                source=chunk.source,
+                sender_id=chunk.sender_id,
+                session_id=chunk.session_id,
+                display_name=chunk.sender_name,
+            )
+            final_name = person_final.get(pkey0, "")
+            if final_name:
+                pkey = person_identity_key(
+                    source=chunk.source,
+                    sender_id=chunk.sender_id,
+                    session_id=chunk.session_id,
+                    display_name=final_name,
+                )
+                person_jobs.setdefault(
+                    pkey,
+                    (chunk.source, chunk.sender_id, chunk.session_id, final_name),
+                )
+            else:
+                pkey = None
+            gkey0 = group_identity_key(
+                source=chunk.source,
+                session_id=chunk.session_id,
+                group_name=chunk.group_name,
+            )
+            final_group = group_final.get(gkey0, "")
+            if final_group:
+                gkey = group_identity_key(
+                    source=chunk.source,
+                    session_id=chunk.session_id,
+                    group_name=final_group,
+                )
+                group_jobs.setdefault(
+                    gkey, (chunk.source, chunk.session_id, final_group)
+                )
+            else:
+                gkey = None
+            plans.append((pkey, gkey))
+
+        # 人与群一起进同一次 gather：窗口按「登记到提交」计时，分两轮 gather
+        # 会让后一轮的新身份再各等一个窗口。别名结果按身份键归还。
+        async def _person(job: tuple[str, str, str, str]) -> str:
+            source, sender_id, session_id, name = job
+            return await context.person_alias(
+                source=source, sender_id=sender_id,
+                session_id=session_id, display_name=name,
+            )
+
+        async def _group(job: tuple[str, str, str]) -> str:
+            source, session_id, name = job
+            return await context.group_alias(
+                source=source, session_id=session_id, group_name=name,
+            )
+
+        jobs: list[tuple[str, Any]] = [
+            *(("person", job) for job in person_jobs.values()),
+            *(("group", job) for job in group_jobs.values()),
+        ]
+        aliases = (
+            await asyncio.gather(
+                *(_person(job) if kind == "person" else _group(job) for kind, job in jobs)
+            )
+            if jobs
+            else []
+        )
+        alias_by_key: dict[str, str] = {}
+        for (kind, job), alias in zip(jobs, aliases, strict=True):
+            key = (
+                person_identity_key(
+                    source=job[0], sender_id=job[1],
+                    session_id=job[2], display_name=job[3],
+                )
+                if kind == "person"
+                else group_identity_key(
+                    source=job[0], session_id=job[1], group_name=job[2]
+                )
+            )
+            alias_by_key[key] = alias
+
+        # 出站映射按预先算好的键投影；启用假名化后查不到映射（映射遗漏）按
+        # 准备失败处理，绝不静默回退真名。整批无显示名的身份没有注册键，
+        # 出站保持空串——空名不是身份，也不构成出境风险。
+        names: list[EvidenceNames] = []
+        for hit, (pkey, gkey) in zip(hits, plans, strict=True):
+            if pkey is None:
+                sender = ""
+            else:
+                sender = alias_by_key.get(pkey, "")
+                if not sender:
+                    raise PseudonymError("证据发送者别名缺失：出站映射不回退真名")
+            if gkey is None:
+                group = ""
+            else:
+                group = alias_by_key.get(gkey, "")
+                if not group:
+                    raise PseudonymError("证据群名别名缺失：出站映射不回退真名")
             names.append(EvidenceNames(group=group, sender=sender))
         return names
 
