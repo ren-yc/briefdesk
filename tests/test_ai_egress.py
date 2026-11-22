@@ -709,3 +709,380 @@ class TestSendBoundary:
         # 钩子确实走到了记账、并在那里抛错：异常被吞掉，请求照常完成
         assert attempted == [True]
         assert "ai.egress.sdk_retry.chat.main|" not in _counters()
+
+
+# ── 无界排队路径的取消分桶 ──
+#
+# 只有带 timeout 的 chat 走 `wait_for(sem.acquire(), ...)`，那里超时/取消都有显式
+# except；其余三条无界路径（chat 的不限时分支、rag_chat、embed 的每批 chunk）此前
+# 直接等许可，排队时被取消既不算发送（正确）也不进排队桶（漏了）。漏掉之后
+# 「一直排队直到被取消」与「根本没有调用」在读数上完全一样。
+
+
+class _HangingChatClient:
+    """create 永不返回的 chat 客户端桩：把请求固定在「已拿到许可、正在发送」。"""
+
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+        self.calls = 0
+        self.chat = SimpleNamespace(completions=SimpleNamespace(create=self._create))
+
+    async def _create(self, **_kwargs: Any) -> Any:
+        self.calls += 1
+        self.started.set()
+        await asyncio.Event().wait()  # pragma: no cover — 只能被取消结束
+        raise AssertionError("unreachable")  # pragma: no cover
+
+
+class TestQueueCancellation:
+    """排队阶段被取消要留下证据，且只能落在排队桶——不能顺手记一次发送。"""
+
+    async def test_chat_without_timeout_records_queue_cancelled(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        client, create = _stub_chat_client()
+        sem = _BlockingSemaphore()
+        ai_ports.set_ai(Provider())
+        monkeypatch.setattr(engine, "get_ai_client", lambda: client)
+
+        with patch.object(engine, "get_ai_semaphore", return_value=sem):
+            task = asyncio.create_task(
+                ai_ports.chat([{"role": "user", "content": "x"}])
+            )
+            await sem.entered.wait()
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        assert create.await_count == 0
+        # 没拿到许可就没有 release：多 release 会把并发预算悄悄放大
+        assert sem.released == 0
+        assert _egress_counters() == {"ai.queue.cancelled.chat.main|": 1}
+
+    async def test_rag_chat_records_queue_cancelled_on_its_own_port(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        client, create = _stub_chat_client()
+        sem = _BlockingSemaphore()
+        ai_ports.set_ai(Provider())
+        monkeypatch.setattr(engine, "get_alt_client", lambda *_a, **_k: client)
+
+        with patch.object(engine, "get_ai_semaphore", return_value=sem):
+            task = asyncio.create_task(
+                ai_ports.rag_chat([{"role": "user", "content": "q"}])
+            )
+            await sem.entered.wait()
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        assert create.await_count == 0
+        assert sem.released == 0
+        # 端口归属取调用点常量：rag 的排队失败不能记进 chat 桶
+        assert _egress_counters() == {"ai.queue.cancelled.rag.main|": 1}
+
+    async def test_embed_texts_records_queue_cancelled_per_batch(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        create = AsyncMock()
+        client = SimpleNamespace(embeddings=SimpleNamespace(create=create))
+        sem = _BlockingSemaphore()
+        monkeypatch.setattr(engine, "get_embed_client", lambda: client)
+        ai_ports.set_ai(Provider())
+
+        with patch.object(engine, "get_ai_semaphore", return_value=sem):
+            task = asyncio.create_task(ai_ports.embed_texts(["a", "b"]))
+            await sem.entered.wait()
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        assert create.await_count == 0
+        assert sem.released == 0
+        # 一次端口调用按批出境：排队失败同样按批记，且不记发送桶
+        assert _egress_counters() == {"ai.queue.cancelled.embed.main|": 1}
+
+    async def test_cancel_after_permit_is_not_a_queue_failure(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """许可到手之后的取消属于发送阶段：不能记排队桶，许可必须归还。"""
+        client = _HangingChatClient()
+        sem = asyncio.Semaphore(1)
+        ai_ports.set_ai(Provider())
+        monkeypatch.setattr(engine, "get_ai_client", lambda: client)
+
+        with patch.object(engine, "get_ai_semaphore", return_value=sem):
+            task = asyncio.create_task(
+                ai_ports.chat([{"role": "user", "content": "x"}])
+            )
+            await client.started.wait()
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        # create 已经进入：发送尝试必须为 1；排队桶一个键都不能出现
+        assert client.calls == 1
+        assert _egress_counters() == {"ai.egress.remote_attempt.chat.main|": 1}
+        assert sem.locked() is False
+
+    async def test_no_limit_records_no_queue_bucket(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """AI_MAX_CONCURRENCY<=0 没有排队阶段：取消时不能凭空记排队桶。"""
+        client = _HangingChatClient()
+        ai_ports.set_ai(Provider())
+        monkeypatch.setattr(engine, "get_ai_client", lambda: client)
+        assert engine.get_ai_semaphore() is None  # 夹具的 ai_max_concurrency=0
+
+        task = asyncio.create_task(ai_ports.chat([{"role": "user", "content": "x"}]))
+        await client.started.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert client.calls == 1
+        assert _egress_counters() == {"ai.egress.remote_attempt.chat.main|": 1}
+
+
+# ── 端口元数据接线 ──
+#
+# 只断言「chat 记 chat.main、rag 记 rag.main」证明不了接线：端口是引擎调用点的常量，
+# 元数据被完全拆掉时 role 的默认值恰好也是 main，键长得一模一样。要证明 use_metadata
+# 真的接上了，必须在 create 时刻读元数据，并断言只有端口层能提供的维度（source、
+# kind，以及 rag/embed 的 port）——拆掉接线后这些字段会退回默认值。
+
+
+class TestPortMetadataWiring:
+    """经 ai_ports 端口函数调用时，引擎看到的元数据必须来自端口层。"""
+
+    async def test_chat_port_passes_source_and_kind_metadata(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        seen: list[ai_egress.EgressMetadata] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen.append(ai_egress.current_metadata())
+            return httpx.Response(200, json=_chat_body())
+
+        _install_transport(monkeypatch, handler)
+        ai_ports.set_ai(Provider())
+
+        await ai_ports.chat(
+            [{"role": "user", "content": "hi"}],
+            temperature=0.1,
+            max_tokens=16,
+            telemetry_kind="judge",
+            telemetry_source="weflow",
+        )
+
+        assert seen == [
+            ai_egress.EgressMetadata(
+                port=ai_egress.PORT_CHAT,
+                role=ai_egress.ROLE_MAIN,
+                kind="judge",
+                source="weflow",
+            )
+        ]
+        # source 维度进计数键：端口层不设元数据时这里会变成不带 |weflow 的键
+        assert _egress_counters() == {"ai.egress.remote_attempt.chat.main|weflow": 1}
+
+    async def test_rag_port_metadata_reaches_the_send_boundary(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        seen: list[ai_egress.EgressMetadata] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen.append(ai_egress.current_metadata())
+            return httpx.Response(200, json=_chat_body("answer"))
+
+        _install_transport(monkeypatch, handler)
+        ai_ports.set_ai(Provider())
+
+        await ai_ports.rag_chat(
+            [{"role": "user", "content": "q"}],
+            model="rag-model",
+            api_base="https://rag.example.invalid/v1",
+            api_key="rag-key",
+        )
+
+        # 拆掉端口层的 use_metadata 后，这里读到的是默认元数据（port=chat）
+        assert seen == [
+            ai_egress.EgressMetadata(
+                port=ai_egress.PORT_RAG,
+                role=ai_egress.ROLE_MAIN,
+                kind="",
+                source="",
+            )
+        ]
+        assert _egress_counters() == {"ai.egress.remote_attempt.rag.main|": 1}
+
+    async def test_embed_port_metadata_reaches_the_send_boundary(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        seen: list[ai_egress.EgressMetadata] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen.append(ai_egress.current_metadata())
+            batch = len(json.loads(request.content)["input"])
+            return httpx.Response(200, json=_embeddings_body(batch))
+
+        _install_transport(monkeypatch, handler)
+        monkeypatch.setattr(config, "embed_api_base", REMOTE_BASE)
+        ai_ports.set_ai(Provider())
+
+        await ai_ports.embed_texts(["a", "b"])
+
+        assert seen == [
+            ai_egress.EgressMetadata(
+                port=ai_egress.PORT_EMBED,
+                role=ai_egress.ROLE_MAIN,
+                kind="",
+                source="",
+            )
+        ]
+        assert _egress_counters() == {"ai.egress.remote_attempt.embed.main|": 1}
+
+
+async def test_call_site_port_wins_over_metadata_port(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """端口归属取调用点常量，不读元数据的 port。
+
+    直接调引擎并把元数据的 port 故意设成 rag：若实现改成
+    `record_send_attempt(current_metadata().port, ...)`，这次 chat 会被记进 rag 桶，
+    按端口拆分的读数整族错位，而且错位方向是「把主通道流量算成 RAG」——看不出
+    是代码写错，只会以为 RAG 用得很多。
+    """
+    _install_transport(
+        monkeypatch, lambda request: httpx.Response(200, json=_chat_body())
+    )
+
+    with ai_egress.use_metadata(port=ai_egress.PORT_RAG, role=ai_egress.ROLE_MAIN):
+        await engine.chat(
+            [{"role": "user", "content": "hi"}], temperature=0.1, max_tokens=16
+        )
+
+    assert _egress_counters() == {"ai.egress.remote_attempt.chat.main|": 1}
+    assert "ai.egress.remote_attempt.rag.main|" not in _counters()
+
+
+def _retry_request(retries: int) -> httpx.Request:
+    return httpx.Request(
+        "POST",
+        f"{REMOTE_BASE}/chat/completions",
+        headers={"x-stainless-retry-count": str(retries)},
+    )
+
+
+async def test_sdk_retry_hook_records_each_ordinal_once() -> None:
+    """同一 create 内同一重试序号只记一次。
+
+    httpx 跟随重定向时同一个请求会再次经过请求钩子：没有 `seen` 去重，一次内部
+    重试会被读成两次，把「重试 1 次」放大成「重试 2 次」。序号 0 是首次请求，本来
+    就不是重试，也不能记。
+    """
+    tracker = engine._SdkRetryTracker(
+        ai_egress.PORT_CHAT, ai_egress.ROLE_MAIN, is_local=False
+    )
+    token = engine._RETRY_TRACKER.set(tracker)
+    try:
+        await engine._on_sdk_request(_retry_request(0))
+        await engine._on_sdk_request(_retry_request(1))
+        await engine._on_sdk_request(_retry_request(1))  # 重定向再经过一次
+        await engine._on_sdk_request(_retry_request(2))
+    finally:
+        engine._RETRY_TRACKER.reset(token)
+
+    assert _egress_counters() == {"ai.egress.sdk_retry.chat.main|": 2}
+
+    # create 之外（没有 tracker）的请求包不计数：钩子挂在共享 http 客户端上，
+    # 生命周期外仍会跑到，不能把重定向/复用连接算成某次 create 的重试。
+    await engine._on_sdk_request(_retry_request(3))
+    assert _egress_counters() == {"ai.egress.sdk_retry.chat.main|": 2}
+
+
+class _CountingWrappedClient:
+    """真实 SDK 客户端外的薄包装：create 委托前先读一次当前计数。
+
+    用来钉住「逻辑尝试在进入 create 之前就已落账」。把计数搬进 HTTP 请求钩子或挪到
+    create 返回之后，这里读到的都是 0；而「请求到达传输层时计数是否为 1」区分不出来
+    ——httpx 的请求钩子本身就在传输层之前执行，两种实现在那里都已经是 1。
+    """
+
+    def __init__(self, inner: Any, observed: list[int], key: str) -> None:
+        self._inner = inner
+        self._observed = observed
+        self._key = key
+        self.with_options_calls = 0
+        self.chat = SimpleNamespace(completions=SimpleNamespace(create=self._create))
+
+    def with_options(self, **_kwargs: Any) -> _CountingWrappedClient:
+        self.with_options_calls += 1
+        return self
+
+    async def _create(self, **kwargs: Any) -> Any:
+        self._observed.append(_counters().get(self._key, 0))
+        return await self._inner.chat.completions.create(**kwargs)
+
+
+async def test_logical_attempt_is_counted_before_sdk_create(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    at_create: list[int] = []
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json=_chat_body())
+
+    _install_transport(monkeypatch, handler)
+    # 真实 AsyncOpenAI（传输层是 MockTransport），外面再包一层读计数
+    inner = engine.get_ai_client()
+    wrapper = _CountingWrappedClient(
+        inner, at_create, "ai.egress.remote_attempt.chat.main|weflow"
+    )
+    monkeypatch.setattr(engine, "get_ai_client", lambda: wrapper)
+    ai_ports.set_ai(Provider())
+
+    await ai_ports.chat(
+        [{"role": "user", "content": "hi"}],
+        temperature=0.1,
+        max_tokens=16,
+        max_retries=0,
+        telemetry_source="weflow",
+    )
+
+    # max_retries 覆盖走 with_options：包装必须被复用而不是绕过
+    assert wrapper.with_options_calls == 1
+    assert at_create == [1]
+    assert len(requests) == 1
+
+
+async def test_serialization_failure_inside_create_counts_one_attempt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """create 进了 SDK 之后的序列化失败仍算一次显式尝试。
+
+    `temperature=nan` 过不了严格 JSON 编码（httpx 用 allow_nan=False），请求连
+    transport 都没到。这里的口径是「进入 create 之前」而不是「拿到响应之前」，所以
+    逻辑尝试必须是 1、HTTP 请求必须是 0：否则「发过但失败」会从出境读数里消失，
+    和对端完全没被触碰看起来一样。
+    """
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json=_chat_body())
+
+    _install_transport(monkeypatch, handler)
+    ai_ports.set_ai(Provider())
+
+    with pytest.raises(ValueError, match="JSON compliant"):
+        await ai_ports.chat(
+            [{"role": "user", "content": "hi"}],
+            temperature=float("nan"),
+            max_tokens=16,
+        )
+
+    assert requests == []
+    assert _egress_counters() == {"ai.egress.remote_attempt.chat.main|": 1}

@@ -244,9 +244,12 @@ def is_local_endpoint(base: str) -> bool:
 def record_send_attempt(port: str, role: str, base: str) -> bool:
     """在真正发出一次逻辑发送之前计数；返回该端点是否本地。
 
-    调用点必须是「已经拿到许可、即将 create」的位置：排队失败、替身短路、参数
-    校验失败都不该走到这里。返回本地判定是为了让调用方复用同一次解析结果，
-    避免判定与计数各算一遍而给出不一致的结论。
+    调用点必须是「已经拿到许可、即将 create」的位置：排队失败与替身短路都不该
+    走到这里；**create 之前**的入参校验失败同样不计（没有发起请求）。判定边界是
+    「有没有发起 create」而不是「有没有拿到响应」——create 进 SDK 之后的序列化
+    失败（例如非法温度值）、SDK 侧校验失败与 4xx/5xx 都算一次显式尝试，否则
+    「发过但失败」会被读成「没发」。返回本地判定是为了让调用方复用同一次解析
+    结果，避免判定与计数各算一遍而给出不一致的结论。
     """
     dimensions = _dimensions(port, role)
     source = _current_source()

@@ -6,14 +6,15 @@ import 本模块，统一经 core 的 briefdesk.ai_ports 端口函数调用。�
 ——需要它们的一方直接 import 端口模块，避免同一符号两处来源。
 
 出境观测也在这里接线：每次显式 create 之前计一次发送尝试（本地/远端分桶），
-并用 httpx 请求钩子把 SDK 内部重试单独计数——口径说明见下方 `_sending` 与
-`_on_sdk_request`。
+并用 httpx 请求钩子把 SDK 内部重试单独计数；等并发许可（排队）阶段的超时与
+取消单独进 `ai.queue.*`，不占发送桶——口径说明见下方 `_sending`、
+`_queue_permit` 与 `_on_sdk_request`。
 """
 
 import asyncio
 import logging
-from collections.abc import Iterator
-from contextlib import contextmanager
+from collections.abc import AsyncIterator, Iterator
+from contextlib import asynccontextmanager, contextmanager
 from contextvars import ContextVar
 from typing import Any, cast
 
@@ -53,9 +54,15 @@ _REQUEST_MAX_RETRIES = 2
 # ── 出境观测：发送边界计数与 SDK 重试分桶 ──
 #
 # 口径：计数落在「已拿到并发许可、即将 create」这一刻，而不是端口调用或网络包。
-# 端口调用会多记（排队失败、替身短路、参数校验失败都没把请求发出去），网络包会
-# 少记（SDK 内部重试被当成新的逻辑发送）。前者会让「没发出去」看起来像出境，
-# 后者会把一次被重试两次的 create 读成三次请求。
+# 端口调用会多记（排队失败、替身短路、进入 create 之前的入参检查失败都没把请求
+# 发出去），网络包会少记（SDK 内部重试被当成新的逻辑发送）。前者会让「没发出去」
+# 看起来像出境，后者会把一次被重试两次的 create 读成三次请求。
+#
+# 「进入 create 之前」才是这条边界的准确划法，不是「拿到 HTTP 响应之前」：create
+# 一旦进了 SDK，之后的请求序列化失败（如 `temperature=nan` 过不了严格 JSON）、SDK
+# 侧校验失败、4xx/5xx 都算这一次显式尝试——那些请求可能已经到达对端，把它们从
+# 读数里抹掉会让「发过但失败」读成「没发」。排队阶段的失败另走 `ai.queue.*`
+# （见 `_queue_permit`），与发送桶分家。
 
 
 class _SdkRetryTracker:
@@ -134,10 +141,13 @@ def _sending(port: str, base: str) -> Iterator[None]:
     """一次显式 create 的观测窗口：先记发送尝试，再装本地的重试观测状态。
 
     必须在「已拿到并发许可、即将 create」处进入。排队失败（超时/取消）、替身
-    短路、参数校验失败都不经过这里，否则「没发出去」会被记成出境尝试。
+    短路、以及**进入 create 之前**的入参检查失败都不经过这里，否则「没发出去」
+    会被记成出境尝试。
 
-    `record_send_attempt` 的返回值（是否本地）直接交给重试观测状态复用，避免
-    发送与重试各判一次端点而给出互相矛盾的结论。
+    反过来，create 已经进了 SDK 才失败（例如 `temperature=nan` 让请求序列化在
+    提交前就抛错）仍算一次显式尝试：本层的边界是「有没有发起 create」，不是
+    「有没有拿到 HTTP 响应」。若按后者划线，上游 4xx/5xx 与本地序列化错误都会
+    从出境读数里消失，「发过但失败」看起来就成了「没发」。
 
     角色由端口层写入的元数据决定（目前只有主通道，即 `main`）；直接调用引擎时
     拿到安全默认值，不会因为没有元数据就丢计数。端口取调用点自己的，不由元数据
@@ -150,6 +160,45 @@ def _sending(port: str, base: str) -> Iterator[None]:
         yield
     finally:
         _RETRY_TRACKER.reset(token)
+
+
+@asynccontextmanager
+async def _queue_permit(
+    sem: asyncio.Semaphore | None, port: str
+) -> AsyncIterator[None]:
+    """等一个并发许可；只把**排队阶段**的取消记进排队桶（不限流时什么都不记）。
+
+    为什么需要这个窗口：带 timeout 的 chat 用 `wait_for(sem.acquire(), ...)`，超时
+    与取消都落在显式 except 里；其余三处（chat 的不限时分支、rag_chat、embed 的
+    每批 chunk）都直接等许可，排队时被取消既不记发送尝试（正确）也不记排队桶
+    （漏了）——读数上「一直排队直到被取消」与「根本没有调用」完全一样，排查时
+    分不清是上游堵住了还是调用方没跑。
+
+    只认 acquire 的失败：`acquired` 为真之后的取消发生在发送阶段，那时 create 可能
+    已经发出，按排队失败记会把「发过」记成「没发」。release 同样只看这个标志——
+    没拿到许可就 release 会凭空放大信号量，并发预算静默变宽且不会报错。
+
+    sem 为 None 表示不限制并发（AI_MAX_CONCURRENCY<=0）：没有排队阶段，任何桶都
+    不记，否则「本就不限流」的配置会被读成一串排队失败。
+    """
+    if sem is None:
+        yield
+        return
+    # 角色在入口读一次：排队失败时发送边界还没到，没有别处能给出这次的端口归属。
+    role = ai_egress.current_metadata().role
+    acquired = False
+    try:
+        try:
+            await sem.acquire()
+        except asyncio.CancelledError:
+            # 排队被取消：请求没发出去，只进排队桶（与带 timeout 分支的超时同口径）。
+            ai_egress.record_queue_cancelled(port, role)
+            raise
+        acquired = True
+        yield
+    finally:
+        if acquired:
+            sem.release()
 
 
 def _build_http_client() -> httpx.AsyncClient:
@@ -370,11 +419,14 @@ async def chat(
         return await _create_with_effort_fallback(key, _send)
 
     sem = get_ai_semaphore()
-    if sem is None:
-        return await _create()
     if timeout is None:
-        async with sem:
+        # 不限时排队：取消只进排队桶、不记发送尝试（见 _queue_permit）；sem 为 None
+        # 时没有排队阶段，什么桶都不记。
+        async with _queue_permit(sem, ai_egress.PORT_CHAT):
             return await _create()
+    if sem is None:
+        # 不限流 + 有 timeout：没有排队阶段可超时，timeout 只作用于请求本身。
+        return await _create()
     # 判官类调用：许可等待也计入 timeout，锁内最坏持有 = timeout（请求）+ timeout（排队）。
     # 此前 async with sem 的排队等待不在任何超时之内。
     role = ai_egress.current_metadata().role
@@ -456,9 +508,9 @@ async def rag_chat(
         return await _create_with_effort_fallback(key, _send)
 
     sem = get_ai_semaphore()
-    if sem is None:
-        return await _create()
-    async with sem:
+    # 不限时排队：取消只进排队桶、不记发送尝试（见 _queue_permit）；sem 为 None
+    # （不限流）时没有排队阶段，什么桶都不记。
+    async with _queue_permit(sem, ai_egress.PORT_RAG):
         return await _create()
 
 
@@ -560,11 +612,10 @@ async def embed_texts(texts: list[str]) -> list[list[float]]:
         results: list[list[float]] = []
         for i in range(0, len(texts), batch_size):
             chunk = texts[i : i + batch_size]
-            if sem is None:
+            # 每批都要过一次并发许可：排队期间被取消按批记一次排队桶（见
+            # _queue_permit），发送桶仍只在真正 create 时记。
+            async with _queue_permit(sem, ai_egress.PORT_EMBED):
                 resp = await _create(chunk)
-            else:
-                async with sem:
-                    resp = await _create(chunk)
             # 按 index 排序保证与输入同序（防御性）
             ordered = sorted(resp.data, key=lambda d: d.index)
             if len(ordered) != len(chunk):
