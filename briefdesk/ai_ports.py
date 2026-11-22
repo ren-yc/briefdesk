@@ -5,6 +5,9 @@
   转发到已注册的 AIProvider 实例（未注册时 chat/embed 抛 RuntimeError 明示
   配置错误，启用性检查安全返回 False）；`rag_chat` 额外接受 model/api_base/
   api_key override，由调用方从自己的配置域下传（见该函数 docstring）；
+- 三个转发端口在转发期间用 `ai_egress.use_metadata` 标注出境元数据（端口、
+  角色、任务标签、消息源标签），本身**不计数**：端口调用不等于出境，计数在
+  供应商引擎的发送边界（排队失败/替身短路都不该算作发送尝试）；
 - loads_json / top_k_similar：供应商无关的纯工具（JSON 修复解析、
   余弦 Top-K 候选选择）。
 
@@ -21,6 +24,7 @@ from typing import Any
 import numpy as np
 from json_repair import loads as json_repair_loads
 
+from briefdesk import ai_egress
 from briefdesk.plugin.base import AIProvider, ChatResponse
 
 _ai: AIProvider | None = None
@@ -83,24 +87,34 @@ async def chat(
     }
     if max_retries is not None:
         kwargs["max_retries"] = max_retries
-    try:
-        resp = await _require_ai().chat(messages, **kwargs)
-    except asyncio.CancelledError:
-        telemetry.record(f"{telemetry_kind or 'chat'}.cancelled", telemetry_source)
-        raise
-    except Exception:
-        elapsed = (time.perf_counter() - start) * 1000.0
-        telemetry.record(f"{telemetry_kind or 'chat'}.error", telemetry_source)
+    # 端口层只设元数据、不计数：真正的出境计数在供应商引擎「即将 create」处。
+    # 在这里计数会把排队失败、替身短路、参数校验失败一并算成发送尝试。用 with
+    # 而不是手动 set/reset：这两步之间隔着 await，入口处抛异常也必须恢复，
+    # 否则同一个任务后续的调用会沿用错误的端口/源标签。
+    with ai_egress.use_metadata(
+        port=ai_egress.PORT_CHAT,
+        role=ai_egress.ROLE_MAIN,
+        kind=telemetry_kind,
+        source=telemetry_source,
+    ):
+        try:
+            resp = await _require_ai().chat(messages, **kwargs)
+        except asyncio.CancelledError:
+            telemetry.record(f"{telemetry_kind or 'chat'}.cancelled", telemetry_source)
+            raise
+        except Exception:
+            elapsed = (time.perf_counter() - start) * 1000.0
+            telemetry.record(f"{telemetry_kind or 'chat'}.error", telemetry_source)
+            telemetry.observe(
+                f"{telemetry_kind or 'chat'}.latency", elapsed, telemetry_source
+            )
+            raise
+        telemetry.record(f"{telemetry_kind or 'chat'}.call", telemetry_source)
         telemetry.observe(
-            f"{telemetry_kind or 'chat'}.latency", elapsed, telemetry_source
+            f"{telemetry_kind or 'chat'}.latency",
+            (time.perf_counter() - start) * 1000.0,
+            telemetry_source,
         )
-        raise
-    telemetry.record(f"{telemetry_kind or 'chat'}.call", telemetry_source)
-    telemetry.observe(
-        f"{telemetry_kind or 'chat'}.latency",
-        (time.perf_counter() - start) * 1000.0,
-        telemetry_source,
-    )
     return resp
 
 
@@ -127,29 +141,34 @@ async def rag_chat(
     ——用户配了 RAG_MODEL 却没被用上，只能从这里看出来。
     """
     ai = _require_ai()
-    # 类级检测：Mock/旧实现等实例级动态属性（__getattr__）不视为实现了 rag_chat，
-    # 只有真正声明该方法的供应商类才走专用通道，否则回退复用 chat。
-    if hasattr(type(ai), "rag_chat"):
-        # 运行时防御性检测仍有意义：测试经 set_ai 注入的桩可能未声明 rag_chat
-        # （mypy 对函数体内构造的对象不做协议校验）；静态层面 AIProvider 协议
-        # 已含 rag_chat 成员（plugin/base.py），无需 ignore。
-        return await ai.rag_chat(
-            messages,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            model=model,
-            api_base=api_base,
-            api_key=api_key,
-        )
-    from briefdesk import telemetry
+    # 端口层只标注「这次是 rag 端口」，计数留给引擎的发送边界（见 engine 的
+    # _sending）：rag 的 prompt 准备失败时根本没发送，端口调用次数不等于出境次数。
+    with ai_egress.use_metadata(port=ai_egress.PORT_RAG, role=ai_egress.ROLE_MAIN):
+        # 类级检测：Mock/旧实现等实例级动态属性（__getattr__）不视为实现了 rag_chat，
+        # 只有真正声明该方法的供应商类才走专用通道，否则回退复用 chat。
+        if hasattr(type(ai), "rag_chat"):
+            # 运行时防御性检测仍有意义：测试经 set_ai 注入的桩可能未声明 rag_chat
+            # （mypy 对函数体内构造的对象不做协议校验）；静态层面 AIProvider 协议
+            # 已含 rag_chat 成员（plugin/base.py），无需 ignore。
+            return await ai.rag_chat(
+                messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                model=model,
+                api_base=api_base,
+                api_key=api_key,
+            )
+        from briefdesk import telemetry
 
-    telemetry.record("rag.chat_fallback")
-    return await ai.chat(messages, temperature=temperature, max_tokens=max_tokens)
+        telemetry.record("rag.chat_fallback")
+        return await ai.chat(messages, temperature=temperature, max_tokens=max_tokens)
 
 
 async def embed_texts(texts: list[str]) -> list[list[float]]:
     """批量嵌入端口。"""
-    return await _require_ai().embed_texts(texts)
+    # 嵌入同样只设元数据：一次端口调用会分成多批创建，出境次数以批为单位在引擎侧计。
+    with ai_egress.use_metadata(port=ai_egress.PORT_EMBED, role=ai_egress.ROLE_MAIN):
+        return await _require_ai().embed_texts(texts)
 
 
 def is_embedding_enabled() -> bool:
