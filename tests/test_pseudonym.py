@@ -1366,10 +1366,18 @@ async def test_restore_is_idempotent_within_one_request(tmp_path: Path) -> None:
     )
     assert one != other
 
-    once = ctx.restore(f"由{one}发布", field="subject")
+    original = f"由{one}发布"
+    once = ctx.restore(original, field="subject")
     assert once == f"由{other}发布"
-    # 同一字段、同一输入：直接复用上次输出（真正的幂等）
-    assert ctx.restore(once, field="subject") == once
+    # 同一字段、同一输入（最初输入，不是上次输出）：直接复用上次输出（真正的幂等）
+    assert ctx.restore(original, field="subject") == once
+    assert ctx.restore_failures == 0
+
+    # 幂等不只靠输入缓存：清掉本字段的缓存后重放最初输入，结果仍是同一份输出。
+    # 这一条钉住「替换本身可重放」——缓存丢失（例如换字段、重建上下文）后不能
+    # 把已产出的显示名再拆回别名。
+    ctx._last_io.clear()
+    assert ctx.restore(original, field="subject") == once
     assert ctx.restore_failures == 0
 
     # 另一个字段拿到同样文本：输入与它自己的上次输入不同，按新输入处理；
@@ -1382,3 +1390,126 @@ async def test_restore_is_idempotent_within_one_request(tmp_path: Path) -> None:
     fresh = f"{once} 和 同学ZZZZZZ"
     assert ctx.restore(fresh, field="quote") == fresh
     assert ctx.restore_failures == 1
+
+
+# ── 已产出显示名的保护区间 ──
+
+
+async def _produced_name_scene(
+    tmp_path: Path,
+) -> tuple[pseudonym.NameContext, str, str]:
+    """构造「一个人的显示名里含另一个人的别名形态」的场景。
+
+    乙先登记，拿到短码 `ABCDEF`；甲因短码碰撞拿到 `ABCDEF-1`，而甲的显示名恰好
+    以乙的别名开头。两个别名来自两个不同的摘要，不是同一个别名的两种写法——
+    只按匹配到的 token 查成员关系，第二次还原就会把甲的名字拆成「乙 + 残渣」。
+    """
+    ctx = pseudonym.NameContext(
+        _make(tmp_path / "reg", digest_fn=_forced_digest("ABCDEF"))
+    )
+    other = await ctx.person_alias(
+        source="weflow",
+        sender_id="member-0002",
+        session_id="会话-0001",
+        display_name="示例乙",
+    )
+    target = await ctx.person_alias(
+        source="weflow",
+        sender_id="member-0001",
+        session_id="会话-0001",
+        display_name="同学ABCDEF老师",
+    )
+    assert other == "同学ABCDEF"
+    assert target == "同学ABCDEF-1"
+    return ctx, other, target
+
+
+async def test_produced_display_name_is_never_reinterpreted(tmp_path: Path) -> None:
+    """写回过的显示名整体受保护：里面的别名形态不能被二次替换成另一个人。"""
+    ctx, _other, target = await _produced_name_scene(tmp_path)
+    assert ctx.restore(target, field="subject") == "同学ABCDEF老师"
+    assert ctx.restore_failures == 0
+
+    # 同字段再还原一次（输入是上次输出，不是输入缓存命中）：`同学ABCDEF` 确实是
+    # 乙的别名，但它现在只是甲显示名的一部分，替换它会把甲拆成乙 + 残渣
+    assert ctx.restore("同学ABCDEF老师", field="subject") == "同学ABCDEF老师"
+    assert ctx.restore_failures == 0
+    assert not _counters().get("ai.pseudonym.restore_failed|")
+
+
+async def test_protected_display_name_survives_inside_sentence(
+    tmp_path: Path,
+) -> None:
+    """保护按文本范围生效：前后夹中文与标点时不把显示名里的片段当别名。"""
+    ctx, _other, target = await _produced_name_scene(tmp_path)
+    original = f"（前情）据{target}透露，稍后还有更新；"
+    once = ctx.restore(original, field="subject")
+    assert once == "（前情）据同学ABCDEF老师透露，稍后还有更新；"
+
+    # 同一字段、输入换成上次输出：仍必须整体保留
+    assert ctx.restore(once, field="subject") == once
+    assert ctx.restore_failures == 0
+
+
+async def test_protected_display_name_survives_in_another_field(
+    tmp_path: Path,
+) -> None:
+    """保护范围按请求累计而不是按字段：换字段再还原也不得二次替换。"""
+    ctx, _other, target = await _produced_name_scene(tmp_path)
+    produced = ctx.restore(target, field="subject")
+    assert produced == "同学ABCDEF老师"
+
+    text = f"{produced} 在群里发言"
+    assert ctx.restore(text, field="summary") == text
+    assert ctx.restore_failures == 0
+
+
+async def test_alias_outside_protected_range_still_restores(tmp_path: Path) -> None:
+    """保护只覆盖已产出的显示名：保护范围之外的已知别名照常还原。"""
+    ctx, _other, target = await _produced_name_scene(tmp_path)
+    third = await ctx.person_alias(
+        source="weflow",
+        sender_id="member-0003",
+        session_id="会话-0001",
+        display_name="示例甲",
+    )
+    assert third == "同学ABCDEF-2"
+    assert ctx.restore(target, field="subject") == "同学ABCDEF老师"
+
+    text = f"由{third}转述：同学ABCDEF老师 已确认，另见 同学ZZZZZZ"
+    assert (
+        ctx.restore(text, field="quote")
+        == "由示例甲转述：同学ABCDEF老师 已确认，另见 同学ZZZZZZ"
+    )
+    # 计数只按真实失败增加：抄错的那个别名计一次，受保护的显示名不计
+    assert ctx.restore_failures == 1
+    assert _counters().get("ai.pseudonym.restore_failed|") == 1
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "同学ID",  # 两个大写字母，自然行文里像缩写
+        "同学OK",  # 同上
+        "同学A座",  # 一个字母 + 中文量词
+        "同学234567人",  # 六位数字刚好落在 base32 字母表里
+    ],
+)
+async def test_natural_prefix_phrases_keep_heuristic_failure_count(
+    tmp_path: Path, text: str
+) -> None:
+    """自然行文里的前缀形态：原样保留并计一次失败——这是既定启发式，不是回归。
+
+    这些片段不是模型抄错的别名，但形状与「被改写的别名」一致。这里把「原样保留 +
+    每字段计一次」钉住：改判定时若把计数改成 0 或开始改写文本，这条用例会红。
+    """
+    ctx = pseudonym.NameContext(_make(tmp_path / "reg"))
+    await ctx.person_alias(
+        source="weflow",
+        sender_id="member-0001",
+        session_id="会话-0001",
+        display_name="示例甲",
+    )
+    assert ctx.restore(text, field="subject") == text
+    assert ctx.restore_failures == 1
+    assert _counters().get("ai.pseudonym.restore_failed|") == 1

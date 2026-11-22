@@ -34,7 +34,7 @@ import re
 import sys
 import tempfile
 import time
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Collection, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -887,6 +887,38 @@ def _is_rewritten_candidate(run: str) -> bool:
     return all(char in _CANDIDATE_CHARS for char in head)
 
 
+def _mark_protected_spans(
+    mask: bytearray, text: str, names: Collection[str]
+) -> None:
+    """把 `names` 在 `text` 里的**全部出现位置**标进保护掩码（可重叠）。
+
+    保护对象是「本请求写回过的显示名」的完整文本范围，不是 token 比较：显示名
+    本身可能包含另一个别名的形态（有人就叫 `同学ABCDEF老师`），只按 token 比较
+    会让第二次还原把显示名里的片段当成别名再换一次，把这个人换成另一个人。
+    按长度降序只为让长名字先落位，掩码本身与顺序无关；从下一个字符继续找，是
+    因为显示名可以自重叠出现（`同学AB同学AB`）。
+
+    只做精确子串匹配：不模糊匹配、不做全文实体识别——把「看起来像人名」的文本
+    都保护起来，等于让别名还原在这段文本上整体失效。
+    """
+    for name in sorted(names, key=len, reverse=True):
+        if not name:
+            continue
+        start = text.find(name)
+        while start != -1:
+            mask[start : start + len(name)] = b"\x01" * len(name)
+            start = text.find(name, start + 1)
+
+
+def _overlaps_protected(mask: bytearray, start: int, end: int) -> bool:
+    """区间 `[start, end)` 是否与受保护区间有任何重叠（含部分重叠）。
+
+    部分重叠同样要跳：匹配到的 token 只要有一半落在显示名里面，它就不是一个
+    独立的别名，替换它会把显示名切成「别人的名字 + 残渣」。
+    """
+    return mask.find(b"\x01", start, end) != -1
+
+
 class NameContext:
     """请求级姓名上下文：准备别名、查逆映射、标记还原失败。
 
@@ -993,6 +1025,11 @@ class NameContext:
 
         每请求每字段只记一次：同一次还原失败会被多个兜底步骤看到，按次计会把
         「一个字段没还原出来」放大成多条遥测，掩盖真实规模。
+
+        这个计数是**启发式信号，不是精确覆盖率**：识别靠「前缀 + 后面那段 ASCII
+        够不够像短码」，自然行文里的 `同学ID`、`同学OK`、`同学A座`、`同学234567人`
+        都会各计一次。宁可在这些无害处多计，也不放过真的被模型抄错的别名；
+        读数时按「有失败」而不是「失败几次 = 几个身份没还原」理解。
         """
         if field in self._failed_fields:
             return
@@ -1013,12 +1050,16 @@ class NameContext:
         模型输出——同一字段的新一轮文本可能恰好等于上一轮的还原结果。
 
         替换时还看本请求已产出的显示名：它们是我们自己写回去的文本，再次出现时
-        原样保留、不计失败。真实显示名可能恰好和别名同形（有人就叫
-        `同学ABCDEF`），把它当别名再换一次会把这个人换成另一个人的名字；这里
-        有意选择「宁可留下化名，也不换成另一个人」的隐私取舍。代价是：如果模型
-        真的输出了与某个已产出显示名完全相同的别名，这一次不会还原，也不记失败
-        ——宁可少还原一次，也不把一个人错认成另一个人。失败计数按字段去重，重复
-        调用不会把一次失败放大成多条遥测。
+        原样保留、不计失败。保护范围是**本请求写回过的显示名的完整文本范围**：
+        先把它们在输入里的全部出现位置标成受保护区间（可重叠），别名替换与失败
+        识别都跳过与这些区间有任何重叠的匹配。只按匹配到的 token 比较不够——
+        显示名本身可能包含另一个别名的形态（有人就叫 `同学ABCDEF老师`），第二次
+        还原会把里面的片段当成别名再换一次，把这个人换成另一个人。保护范围之外
+        的文本仍按别名规则处理：已知别名照常还原，抄错的别名照常计失败。
+
+        代价是：如果模型真的输出了与某个已产出显示名完全相同的别名，这一次不会
+        还原，也不记失败——宁可少还原一次，也不把一个人错认成另一个人。失败计数
+        按字段去重，重复调用不会把一次失败放大成多条遥测。
         """
         if not text or not self._enabled or not self._by_alias:
             return text
@@ -1026,40 +1067,53 @@ class NameContext:
         if cached is not None and cached[0] == text:
             return cached[1]
 
+        protected = bytearray(len(text))
+        _mark_protected_spans(protected, text, self._produced)
+
         def _substitute(match: re.Match[str]) -> str:
             token = match.group(0)
-            if token in self._produced:
-                # 我们自己写回去的显示名：不能再换成另一个人
+            if _overlaps_protected(protected, match.start(), match.end()):
+                # 落在已产出显示名内部：这里的片段不是独立别名，不能再换一次
                 return token
             name = self._by_alias.get(token)
             if name is None:
                 self.mark_restore_failed(field)
                 return token
             self._produced.add(name)
+            # 写回后同一遍替换里还可能遇到这段显示名：立刻保护起来，避免把刚
+            # 补好的名字在同一字段的后续位置又拆回别名
+            _mark_protected_spans(protected, text, (name,))
             return name
 
         restored = _ALIAS_TOKEN_RE.sub(_substitute, text)
-        if field not in self._failed_fields and self._looks_like_broken_alias(text):
+        if field not in self._failed_fields and self._looks_like_broken_alias(
+            text, protected=protected
+        ):
             self.mark_restore_failed(field)
         self._last_io[field] = (text, restored)
         return restored
 
-    def _looks_like_broken_alias(self, text: str) -> bool:
+    def _looks_like_broken_alias(self, text: str, *, protected: bytearray) -> bool:
         """文本里是否存在「形似别名但不合法」的片段（只判定，不改写）。
 
         逐个前缀判断它后面跟的是什么：
 
         - 完整且本请求已知的别名由替换路径处理，不算失败；
-        - 本请求已产出的显示名不算失败：那是我们自己写回去的文本；
+        - 落在受保护区间（本请求已写回的显示名）里的片段不算失败：那是我们自己
+          写回去的文本，里面的别名形态只是显示名的一部分；
         - 1–6 个候选字符且含 ASCII 字母（`同学A`、`同学ABC`、`同学abcd`）：
           短截断或大小写改写；
         - 合法短码形状后面还接着 ASCII（`同学ABCDEFG`、`同学ABCDEF-1x`）：
           被拼长或后缀不是纯数字；
         - 形态合法但不在本请求已知别名里：模型抄了一个不存在的别名。
 
-        另外丢了前缀但在本请求里已知的裸短码同样算「没还原出来」。纯数字串
-        （`同学3人`、`同学2345人`）是自然中文，不按候选计。任何一项命中都说明
-        模型抄错了别名，调用方按「没还原出来」处理。
+        另外丢了前缀但在本请求里已知的裸短码同样算「没还原出来」，同样跳过受
+        保护区间。纯数字串（`同学3人`、`同学2345人`）是自然中文，不按候选计。
+        任何一项命中都说明模型抄错了别名，调用方按「没还原出来」处理。
+
+        判定是启发式的：只看「前缀 + 紧跟的 ASCII 段」形状，不做语义判断，因此
+        自然行文里的 `同学ID`、`同学OK`、`同学A座`、`同学234567人` 也会命中。
+        这个信号用来发现「模型抄错了别名」，不是还原覆盖率的精确分母。
         """
         for match in _ALIAS_PREFIX_SEARCH_RE.finditer(text):
             start = match.start()
@@ -1070,8 +1124,11 @@ class NameContext:
             if tail is None:
                 # 前缀后面直接是汉字/标点：自然行文，不是别名
                 continue
+            if _overlaps_protected(protected, start, tail.end()):
+                # 这段落在已写回的显示名里：不是模型抄错，是我们自己写回去的
+                continue
             span = text[start : tail.end()]
-            if span in self._by_alias or span in self._produced:
+            if span in self._by_alias:
                 continue
             if _ALIAS_SHAPE_RE.fullmatch(span):
                 # 形态合法却查不到：模型抄了一个不存在的别名
@@ -1079,6 +1136,8 @@ class NameContext:
             if _is_rewritten_candidate(tail.group(0)):
                 return True
         for match in _BARE_CODE_RE.finditer(text):
+            if _overlaps_protected(protected, match.start(1), match.end(1)):
+                continue
             if match.group(1) in self._codes:
                 # 化了名却丢了前缀：同样是没还原出来，原样保留
                 return True
