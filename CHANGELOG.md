@@ -6,9 +6,32 @@
 
 本节收录尚未发布的行为变化，发布时归入对应版本号并注明日期。
 
+### 新增
+
+- 出站展示名替换开关 `AI_PSEUDONYMIZE_NAMES`（`auto` / `on` / `off`，默认 `auto`，留空等同 `auto`）：`auto` 只在生效端点为远端时替换群名与发送者名，本地端点不改写输入；非法值启动期报错。回归：`test_remote_auto_replaces_names_and_keeps_pii_out`、`test_evidence_names_kept_for_local_endpoint`。
+- 安装级别名注册表 `briefdesk/pseudonym.py`：盐与「完整哈希 → 别名」同文件原子提交，文件里只有盐与哈希；注册表损坏、缺盐、加锁超时或写盘失败一律拒绝出站，不自动换盐也不退回真名；还原只替换完整 token，失败保留原值并按字段计数。回归：`test_corrupt_salt_never_auto_rotates`、`test_replace_failure_keeps_old_map_and_prevents_send`、`test_restore_requires_whole_token`。
+- 出境与排队计数 `briefdesk/ai_egress.py`：按端口与角色分桶记录远端/本地发送尝试、排队超时与取消、SDK 内部重试（读 `x-stainless-retry-count`）。回归：`test_queue_failures_never_count_remote_attempt`、`test_sdk_retry_separate_from_logical_attempt`、`test_disabled_telemetry_writes_no_zero_keys`。
+- rag 派生索引新增 `rag_chunks.sender_id` 并从 `raw_messages` 回填：迁移先查表结构、缺列才 `ALTER`，回填只填空串，缺行或缺 ID 保持空串。回归：`test_sender_id_migration_is_idempotent`、`test_missing_raw_id_stays_empty`。
+
+### 变更
+
+- 远端端点的分类与问答请求默认替换展示名，模型输出里的别名在落库前还原为真名；本地端点输入保持不变。回归：`test_same_sender_id_uses_same_alias_in_sysb_and_sysc`、`test_quote_and_key_alias_restored_at_parse`。
+- RAG 证据行的群名与发送者名改按「实际派发端点」判定是否替换：供应商没有专用问答通道、override 被丢弃并回退主端点时，按主端点判定。回归：`test_rag_fallback_pseudonymizes_for_actual_main_endpoint`。
+- 分类批的展示名准备改为请求级一次并发准备，sysb / sysc / 摘要三次请求共用同一份请求内逆映射；准备失败整批进 failed 回填，不发明文。回归：`test_prepare_failure_fails_batch_without_sending`。
+- `quote` 在字面漂移守卫之前还原：守卫按原文（真名）比对，带别名的引文不再被判成索引漂移。回归：`test_quote_and_key_alias_restored_at_parse`、`tests/test_classify_alignment_guard.py`。
+
+### 破坏性变更
+
+- `build_answer_prompt` 的 `names` 改为必填：不再回退 chunk 上的显示名，调用方必须为每条证据准备展示名，长度与命中条数不符直接报错。回归：`test_evidence_pseudonymized_for_remote_endpoint`、`test_evidence_names_kept_for_local_endpoint`。
+- rag 表新增 `rag_chunks.sender_id`：回滚必须保留字段投影读取器与新增列，直接退到旧代码会因 `SELECT c.*` 多出一列而 `TypeError`，检索两条腿同时哑掉。回归：`test_rollback_reader_ignores_unknown_columns`。
+
 ### 修复
 
 - 源侧透传的异常时间戳不再进入前端属性插值：`InternalMessage` 构造即把非 int（含 bool）时间戳归 0，堵住字符串时间戳经 SQLite 宽类型落库、再被分组模板插进 `data-msgtime` 属性的路径；三处分组模板的时间戳属性与单卡口径统一走 `escAttr`。回归：`InternalMessageTimestampCoercionTest`。
+- 别名还原不再把一个人换成另一个人：本请求已写回过的显示名整体受保护，落在其中的片段不再被当成别名二次替换。回归：`test_produced_display_name_is_never_reinterpreted`、`test_protected_display_name_survives_inside_sentence`。
+- 注册表读取失败不再被当成「文件不存在」而静默重建：损坏、缺盐与版本不支持一律拒绝出站，避免一次重盐让历史化名永久失效。回归：`test_read_registry_rejects_non_alias_values`、`test_version_error_does_not_echo_value`。
+- 本地端点判定的绕过路径收口：带凭据段或空 userinfo、控制字符、非法端口与近似域名一律按远端处理，畸形 URL 不再被判成本地。回归：`test_local_endpoint_matrix_fail_closed`、`test_remote_endpoint_matrix_fail_closed`。
+- 空串不再覆盖 rag 里已有的 `sender_id`：回填与 upsert 都只补空值。回归：`test_upsert_preserves_known_sender_id`。
 
 ## [0.2.0] - 2026-11-14
 

@@ -13,6 +13,7 @@
 - [数据库](#数据库)
 - [前端](#前端)
 - [配置](#配置)
+- [出站假名化与还原](#出站假名化与还原)
 - [设计要点与陷阱](#设计要点与陷阱)
 
 ## 定位
@@ -72,10 +73,12 @@ weflow-server :5033        WeFlow(legacy) :5031        qqflow-server :5032
 - **`briefdesk/poll_cycle.py`** — 轮询周期业务编排（应用层控制流，不属源包）：`run_poll_cycle` 拉取→管道→水位推进。[详见下文](#briefdeskpoll_cyclepy)
 - **`briefdesk/types.py`** — Cross-module base types：`InternalMessage`/`BatchContext`/`ClassifyOutcome` 等跨模块 dataclass。[详见下文](#briefdesktypespy)
 - **`briefdesk/masking.py`** — 共享文本净化（纯函数）：`mask_content` 把手机号/身份证/邮箱/银行卡替换为占位符（幂等）。[详见下文](#briefdeskmaskingpy)
+- **`briefdesk/pseudonym.py`** — 出站显示名假名化：安装级别名注册表（盐 + 「完整哈希 → 别名」）与请求级还原上下文。[详见下文](#briefdeskpseudonympy)
 - **`briefdesk/imaging.py`** — 图片字节归一化（vision 路由的 classify 输入预处理，Pillow 为直接依赖）：`downscale_image` 把任意可解码图片归一为受限 JPEG。
   - EXIF 转正、透明通道平铺白底（防透明区落黑底干扰识别）、超 1568px 等比缩放（LANCZOS）、超 `max_bytes` 先降质量再降边长各一次（仍超尽力而为返回最后一次结果）。
   - 任何解码/处理失败返回 None，由调用方逐图跳过；**输出恒为 JPEG** → classify 侧 data URL 无需格式嗅探。
 - **`briefdesk/ai_ports.py`** — AI 供应商端口：引擎经 `chat`/`embed_texts`/`rag_chat` 等端口函数调用，不直接依赖供应商插件。[详见下文](#briefdeskai_portspy)
+- **`briefdesk/ai_egress.py`** — 出境可观测性：本地端点纯 URL/IP 判定（`is_local_endpoint`，不解析 DNS）与发送/排队/SDK 重试计数助手。[详见下文](#briefdeskai_egresspy)
 - **`briefdesk/plugins/ai_provider/engine.py`** — OpenAI 兼容供应商实现：共享 `AsyncOpenAI` 客户端、`chat`（thinking 开关）与嵌入端点封装。[详见下文](#briefdeskpluginsai_providerenginepy)
 - **`briefdesk/plugins/ai_provider/plugin.py`** — `AiProviderPlugin`（显式实现 Plugin + AIProvider）：setup 构造 `Provider` 并注册到 `ctx.ai` 与 `briefdesk.ai_ports`；teardown 清除注册（幂等）。classify/dedup/merge 依赖本插件（拓扑序保证其先就绪）。
 - **`briefdesk/plugins/classify/engine.py`** — AI 分类引擎：sysb/sysc 两阶段 prompt、截断与边界、解析容错。[详见下文](#briefdeskpluginsclassifyenginepy)
@@ -220,9 +223,17 @@ Cross-module base types: `InternalMessage` dataclass (msg_id, content, sender_na
 
 **已知盲区（有意保留）**：其它分隔符写法不在覆盖面内——`+86 (138) 0013-8000`（括号分组）这类写法两个扫描都命中不了。不扩面是有意取舍：分隔符表每多一类（点号/冒号/括号），IP、时间、版本号与普通分组的误伤面就同步增大，现有守卫（`SeparatorAggregationGuardTest` 的日期范围/数字列表/房间号链样本）只锚定了当前分隔符表。脱敏因此只是概率性缓解而非全面保证，文本外发风险按「数据与隐私」口径自行评估。命中面以 `tests/test_masking.py`（`MaskContentTest` / `SeparatorRunEdgeTest` / `MixedSeparatorTest` / `CountryCodePrefixTest`）与 `SeparatorAggregationGuardTest` 的误伤守卫为准。
 
+#### briefdesk/pseudonym.py
+
+出站显示名的安装级别名注册表与请求级还原上下文：`Pseudonymizer` 负责盐、哈希与别名的原子提交，`NameContext` 负责一次请求内的别名准备与逆映射，身份键与策略判定同在本模块单源。注册表在用户数据目录 `pseudonym/mapping.json`，同文件存安装级盐与「HMAC-SHA256 完整哈希 → 别名」映射——分开存会在两次写入之间出现「映射已更新、盐还是旧的」半发布态，重启后同一身份算出另一个别名。文件里只有盐与哈希，不写人名、群名、`sender_id` 与会话 ID；盐与哈希同处一文件意味着拿到文件即可穷举常见昵称，它是不出明文的下限，不是不可逆的安全边界。新别名先落盘再出境（合并窗口只减少写盘次数，不改变这个顺序），因此进程崩溃后模型见过的别名仍然可还原；已提交身份命中内存缓存，零 I/O。任何一步失败都停：注册表损坏、版本不支持、盐缺失或与进程内盐不一致、加锁超时、写盘失败一律抛 `PseudonymError`，不自动重盐、不退回真名。`NameContext` 不落盘、不进日志，`__repr__` 只暴露计数。回归见 `tests/test_pseudonym.py`（注册表校验、锁竞争、还原边界）与 `tests/test_classify.py` 的 `TestPseudonymOutbound`/`TestPseudonymRestore`。
+
 #### briefdesk/ai_ports.py
 
 AI 供应商端口：ai_provider 插件在 setup 阶段把实例注册到 `ctx.ai` 与本模块（`set_ai`），引擎（classify/dedup/merge）经端口函数 `chat`/`embed_texts`/`is_embedding_enabled`/`embed_model_name` 调用，核心不依赖具体供应商。`rag_chat` 为问答专用端口：模型/端点/Key 以 override 参数由调用方传入（端口不认识 `RAG_` 前缀），供应商未实现时回退复用 `chat`（**静默丢弃 override**），并记一次 `rag.chat_fallback`（专用通道没生效只能从读数看出来）。端口层的遥测维度有两个：`telemetry_kind`（任务，如 `judge.dedup`/`classify.sysb`）与 `telemetry_source`（消息源），两者都只进遥测、**绝不进传给供应商的 kwargs**——旧测试桩零感知，供应商参数集不因遥测变化。未注册时 chat/embed 抛 RuntimeError（配置错误明示），`embed_model_name` 回退 config、`is_embedding_enabled` 安全返回 False（引擎/实验离线可用）。`loads_json`（JSON 修复解析）与 `top_k_similar`（余弦 Top-K）为供应商无关工具，亦收于本模块。模块级单例，测试用 `set_ai(None)` 复位。判官类调用额外传 `max_retries=0` 且许可等待纳入 `timeout`：锁内单次判官最坏持有 ≈ 2×45s（排队 + 请求），此前 SDK 默认 2 次重试且排队不计时，最坏可达数分钟。`AIProvider.chat` 的 `max_retries` 为可选参数，第三方供应商可忽略。
+
+#### briefdesk/ai_egress.py
+
+出境可观测性与本地端点判定：`is_local_endpoint` 是纯 URL/IP 函数（不建连接、不解析 DNS），端口与角色的固定词表、`EgressMetadata` 上下文与 `ai.*` 指标名同在本模块单源。本地判定只认 `localhost`（大小写无关）、127.0.0.0/8、`::1` 与 `0.0.0.0`；空串、畸形 URL、含控制字符、带凭据段或空 userinfo、非法端口、私网地址与近似域名一律按远端处理——判错方向时多假名化一次，远好过多发一次真名。`use_metadata` 用 ContextVar 而不是全局变量：并发请求各自携带端口与源标签，共享全局值会把一个请求的计数记到另一个请求的源上；`kind`/`source` 标签过形态过滤，不承诺挡住所有身份信息，接线的调用方须自己传固定词。指标口径与全部指标名见[出境与排队指标](#出境与排队指标)；回归见 `tests/test_ai_egress.py`。
 
 #### briefdesk/plugins/ai_provider/engine.py
 
@@ -528,6 +539,8 @@ SQLite file: `<user data dir>/data/briefdesk.sqlite` (configurable via `DB_PATH`
 
 > **插件自管表**（不在 EXPECTED_SCHEMA 内，`validate_schema` 取交集校验不受影响；建表随插件惰性执行）：calendar 无自有表；reminders 见其插件行；rag 五表（`rag_chunks`/`rag_chunk_embeddings`/`rag_fts`/`rag_meta`/`rag_skipped`）为 raw_messages 的派生检索索引。
 
+派生索引里只有 `rag_chunks` 带自己的列演进：新增 `sender_id TEXT NOT NULL DEFAULT ''`，`ensure_rag_schema` 先查 `PRAGMA table_info` 再按需 `ALTER TABLE`（`ADD COLUMN` 没有 `IF NOT EXISTS` 形态，重复执行会抛「duplicate column name」，而建表函数每次启动都跑），随后在同一事务里按 `(source, msg_id)` 从 `raw_messages` 回填缺值——缺行或缺 ID 保持空串，不拿显示名猜 ID（猜出来的 ID 会把同名两人并成同一个身份，随后把一个人的化名贴到另一个人的证据行上）。写入时空串不覆盖已有非空值：非空值可能是回填之后原始消息已被删除、现在查不到的那一份，覆盖等于用「现在没有」擦掉「当时有」。读取一律走 dataclass 字段投影（`chunk_from_row`：未知列丢弃、缺列取默认），这让回滚兼容有了前提——另一半是保留追加列本身，直接退到更早的基线仍会因 `SELECT c.*` 多出一列而 `TypeError`，FTS 腿与向量腿会同时哑掉（回归见 `tests/test_rag_plugin.py` 的 `test_rollback_reader_ignores_unknown_columns` 与 `test_sender_id_migration_is_idempotent`）。
+
 ## 前端
 
 前端是无构建步骤的原生 JS SPA，`app.js` 以同源 classic script 与插件共享全局作用域，插件前端随插件包分发。
@@ -667,6 +680,8 @@ All via `.env` file, with an additional UI-staged overlay layer (see 「配置�
   - 请求级失败（异常/空 choices）自动同批降级纯文本重试并置 `vision_fallback` 公告。
 - **`AI_VISION_MAX_IMAGES`**：默认 `4`。单条消息随分类请求附图上限（多图超出只发 OCR 文本）；单次请求另有总量预算兜底（classify 引擎内 `_MAX_IMAGES_PER_REQUEST=12`）。
 - **`MAX_CLASSIFY_TOKENS`**：默认 `8192`。Max output tokens per classify call (DeepSeek cap 8192; truncation breaks JSON)。
+- **`AI_PSEUDONYMIZE_NAMES`**：默认 `auto`。出站展示名替换开关：`auto`（默认，只在**生效端点**为远端时替换，本地端点不改写输入）/ `on`（强制替换）/ `off`（强制关闭）；留空等同 `auto`，非法值启动期报错（`config.PSEUDONYMIZE_NAMES_VALUES` 是取值的唯一来源，设置页下拉与校验共用）。
+  - 只换展示名（分类 prompt 的群头与发送者、时间提取的发送者、RAG 证据行的人名与群名），正文、类别、编号与 citation 原样外发；这是展示名的形态替换而不是全字段匿名，也不取代手机号/邮箱脱敏。机制与已知边界见[出站假名化与还原](#出站假名化与还原)。
 
 ### 去重与嵌入
 
@@ -786,6 +801,50 @@ All via `.env` file, with an additional UI-staged overlay layer (see 「配置�
   - `KeyringSource._key_for_field` 按别名输出键规避此陷阱（守卫测试：`tests/test_secrets_store.py` 的优先级链用例）。
 - **预提交密钥扫描**：`scripts/secret_scan.py` 只扫描 staged 新增行中的密钥形态（`sk-`/`AKIA`/PEM 私钥块/本项目密钥环境变量非空赋值），命中即拒绝提交；经 `scripts/install-hooks.ps1` 安装为 pre-commit 钩子（守卫测试：`tests/test_secret_scan.py`；Windows 控制台 cp1252 下 stdout 重配 utf-8/replace，中文输出不再 UnicodeEncodeError）。
   - git diff 失败以退出码 2 拒绝放行（不是静默通过——空 diff 不等于干净）；命中输出只含行号/规则名与脱敏片段（首 4 字符 + 总长），CI 日志不回显密钥。
+
+## 出站假名化与还原
+
+远端请求只带展示名的稳定别名，真名在模型输出落库前换回；本地端点默认不改写输入，别名注册表不可用时整批拒绝出站而不是退回真名。
+
+开关是 `AI_PSEUDONYMIZE_NAMES`（`auto` / `on` / `off`，默认 `auto`，留空等同 `auto`）：`auto` 只在**生效端点**为远端时替换，`on` 强制替换，`off` 强制关闭，非法值启动期报错。判断「是否远端」只看这次请求真正会发往的 base URL——RAG 在供应商没有专用问答通道、override 被丢弃回退主端点时按主端点判定，拿一个不会被使用的本地 override 判定会把真名送出去。
+
+替换面只有展示名：分类 prompt 的群头与发送者、时间提取的发送者、RAG 证据行的群名与人名。正文、类别、编号与 citation 原样外发；它是展示名的形态替换，不是全字段匿名，也不取代 `mask_content` 的手机号/邮箱脱敏——两者叠加生效。
+
+- **别名形态**：人用 `同学` 前缀加 6 位 base32 短码（30 bit），群用 `群` 前缀加短码；域前缀让人与群各自成域，还原时不必只靠短码反查另一个域。
+- **身份键**：人优先 `(source, sender_id)`，缺 ID 时退化为 `(source, session_id, 已掩码显示名)`；群优先 `(source, session_id)`，缺会话 ID 才用群名。同一个人改名、换会话仍是同一别名，同名不同群不合并。
+- **维护位置**：安装级注册表在用户数据目录 `pseudonym/mapping.json`（盐与「完整哈希 → 别名」同文件原子提交），请求级逆映射只在 `NameContext` 内存里，不落盘、不进日志。
+- **准备序**：分类分批判的展示名在**任何 AI 调用之前**一次性并发准备，sysb / sysc / 摘要三次请求共用同一份请求内逆映射；准备失败整批进 failed 回填，不发明文也不重试明文。
+- **还原序**：模型输出里的已知别名换回真名，只替换完整 token；本请求已写回过的显示名整体受保护，不会被当成别名再换一次。抄错形态的别名保留原样并按字段计一次失败，不猜测替换。
+
+已知边界按影响面列在下面，读数与排障前先看这些前提。
+
+- 真实跨进程锁竞争（Windows 多进程同时登记）尚未实测，锁超时按失败处理。
+- 大库每次启动都会执行回填语句 `UPDATE ... WHERE sender_id = ''`，全表扫描，启动期耗时随 `rag_chunks` 行数增长。
+- 幂等只在单次请求内保证（`NameContext` 用完即弃），跨请求不做去重或缓存复用。
+- 保护范围是「本请求写回过的显示名」的完整文本区间，不是实体识别：显示名之外与被改写过的别名仍按启发式处理。
+
+### 出境与排队指标
+
+指标名由固定词表拼成（端口与角色），标签里不出现 URL、密钥、人名、群名、别名或各类 ID；口径以「逻辑发送」为界，改计数点前先读这一节。
+
+| 指标形态 | 递增时机 |
+|---|---|
+| `ai.egress.remote_attempt.<port>.<role>` | 生效端点为远端时，一次显式 create 之前 |
+| `ai.local.attempt.<port>.<role>` | 生效端点为本地时，同上 |
+| `ai.queue.timeout.<port>.<role>` | 并发许可排队超时（未发生发送） |
+| `ai.queue.cancelled.<port>.<role>` | 排队阶段被取消（未发生发送） |
+| `ai.egress.sdk_retry.<port>.<role>` | 远端请求被 SDK 内部重试一次 |
+| `ai.local.sdk_retry.<port>.<role>` | 本地请求被 SDK 内部重试一次 |
+| `ai.pseudonym.prepare_failed` | 别名准备失败一次（按准备次数计，不按消息条数计） |
+| `ai.pseudonym.restore_failed` | 还原失败一次（按字段去重，同一字段不重复计） |
+| `ai.egress.blocked.<port>.<role>` | 仅保留指标名，本版没有递增路径 |
+
+`<port>` 取 `chat` / `rag` / `embed`，`<role>` 取 `main` / `judge` / `gen` / `classify`（当前接线只发 `main`）。四个口径要点：
+
+- 发送尝试按「调用方发起几次显式 create」计：排队失败、替身短路与 create 之前的入参校验都不计，进了 SDK 之后失败（序列化错误、4xx/5xx）照常计一次。
+- SDK 内部重试单列（读请求头 `x-stainless-retry-count`，兼容不带前缀的 `retry-count`），与逻辑尝试分开：一次 create 被重试两次不会读成三次出境。
+- 排队超时与排队取消只进 `ai.queue.*`，不占发送桶——否则「一直排队到被取消」与「真发出去了」在读数上没法区分。
+- 关闭遥测（`TELEMETRY_ENABLED=false`）时不写零值键：读数为空表示未知，不能当成「零出境」。
 
 ## 设计要点与陷阱
 
@@ -908,6 +967,33 @@ All via `.env` file, with an additional UI-staged overlay layer (see 「配置�
 - 不符抛 `*AccountMismatchError(SourceError)`，**刻意不继承 `*NotReadyError`**——后者是启动期瞬态、poller/runtime 会静默跳过本轮；不符是稳态故障（要人改配置或注销占用方），必须冒泡到 lastError。SSE 自愈块（`ensure_ready(force=True)`）也为它单开一个 `except ... : raise`，绕过「自愈尽力而为」的宽口兜底：继续读流就是在收他人的消息。
 - **不做自动接管/注销**：占用期的探测碰不到密钥校验（冲突判定在前），所以「先探测再注销」拿不到「本地密钥是对的」这个前提，等于用不可逆操作换无法验证的假设。注销留作运维动作。
 - 两源错钥的**可知时机**不同，别误以为是实现不一致：weflow 的 WCDB 有逐页 HMAC，`start_account` 内 `verify_page1` 能同步判错 → HTTP 400；SQLCipher 无等价的轻量页校验，qqflow 只能校验密钥**格式**（16 字节可打印 ASCII），真解密推迟到后台建索引 → 数分钟后异步转 `error`。各自都是在「能真正知道」的最早时刻报错。故格式合法但错的密钥在 qqflow 侧会先返回 `accepted`。回归位置：`tests/test_sdk_base.py` 的 `test_identity_mismatch_propagates_instead_of_falling_back` 与 `test_accounts_unavailable_falls_through_to_register`。
+
+### 别名注册表 fail-closed 且不自动换盐
+
+注册表不可用时出站直接失败，不重建、不换盐、不退回真名——三条捷径各自对应一种「看起来恢复了」的静默泄漏。
+
+- **不自动换盐**：盐缺失或损坏时重建注册表等于让历史别名永久失效（同一身份换一个化名），而模型侧无从得知这次换名，历史别名在还原时只会被当成未知 token 保留。损坏、版本不支持、盐缺失一律抛 `PseudonymRegistryError`；只有「文件不存在」这一种状态允许在锁内新建初始表，读失败与解码失败都不算「不存在」。
+- **不退回真名**：准备失败在分类侧整批进 failed 回填，在 RAG 侧让这次回答的请求根本不发生；既不发送明文也不重试明文——把失败降级成真名等于用一次故障换一次出境。
+- **加锁失败与写盘失败同样算失败**：跨进程锁超时说明另一个写者卡住，此时继续写盘或出站都可能让两个进程为同一身份发出不同别名；原子写失败时旧文件保持不变、新别名不发布。
+- 回归：`tests/test_pseudonym.py` 的 `test_corrupt_salt_never_auto_rotates`、`test_replace_failure_keeps_old_map_and_prevents_send`、`test_lock_contention_fails_closed`；分类侧见 `tests/test_classify.py` 的 `test_prepare_failure_fails_batch_without_sending`，RAG 侧见 `tests/test_rag_plugin.py` 的 `test_prepare_failure_skips_answer_request`。
+
+### RAG 派生索引的回滚前提：投影读取器 + 追加列
+
+`rag_chunks` 的读取必须先过字段投影，回滚也只有保留这两样才成立——只做一半会在启动后立刻 `TypeError`。
+
+- **为什么必须投影**：`SELECT c.*` 的列集合随表结构变化，`ChunkRow(**dict(row))` 在表多一列时直接 `TypeError`；投影按 dataclass 字段取值，旧 shape（列少，取默认值）与新 shape（列多，多余列丢弃）都能读。
+- **回滚必须同时保留追加列**：直接退到更早的基线会重新假设「列恰好等于 dataclass 字段」，库里的 `sender_id` 立刻让 FTS 腿与向量腿同时哑掉，检索静默变成空结果；保留投影读取器的版本不受影响。
+- **回填只填空串**：非空值可能是回填之后原始消息被删除、现在查不到的那一份，覆盖等于用「现在没有」擦掉「当时有」。
+- 回归：`tests/test_rag_plugin.py` 的 `test_rollback_reader_ignores_unknown_columns`、`test_sender_id_migration_is_idempotent`、`test_upsert_preserves_known_sender_id`、`test_fts_and_vector_share_sender_id`。
+
+### quote 先还原再走字面漂移守卫
+
+`quote` 必须在字面漂移守卫之前还原成真名，顺序反了会让守卫拿别名与原文逐字比对，把正常条目判成索引漂移。
+
+- **机制**：sysb 解析出条目后先 `NameContext.restore(quote)`，再做 `_char_quote_verdict` 的字面包含率比较与语义复核；守卫的比对基准是全批原文（真名），带别名的引文会凭空掉字符。
+- **失败模式**：顺序反了不报错，表现是多消息批被整条判「quote 与内容不对齐」进重试，重试仍带别名，形成空转；单条批没有「标到别人头上」的对象，这类漂移反而发现不了。
+- **还原失败不阻断守卫**：抄错形态的别名原样保留、只计一次失败，守卫照常按真名基准工作，不因还原问题改判。
+- 回归：`tests/test_classify.py` 的 `test_quote_and_key_alias_restored_at_parse` 锚定「还原发生在解析阶段」，`tests/test_classify_alignment_guard.py` 锚定漂移判定本身；先后顺序没有单独的自动化守卫，改动这段时按源码注释的契约复核。
 
 ### 冒烟命令的进程所有权（scripts/smoke_process.py）
 

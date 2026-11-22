@@ -17,7 +17,8 @@ wheel，不强制就永远测不到源码分发那条路（sdist 少带运行时
    只发 GET 证明不了写入隔离；
 5. 结束校验 site-packages 无新增库/配置/报告，且临时 data/cache 目录确实被使用；
 6. 真实用户缓存目录按**前后快照对比**（相对路径 → size + mtime_ns）判泄漏——存在性断言
-   在任何用过的机器上都会必然失败，只有干净 runner 才碰巧成立。
+   在任何用过的机器上都会必然失败，只有干净 runner 才碰巧成立；
+7. 安装级别名注册表用虚构身份真登记一次：落点必须是注入的用户数据目录，安装目录零产物。
 """
 
 import argparse
@@ -123,6 +124,38 @@ VERSION_PROBE = INSTALLED_GUARD + "import importlib.metadata as m; print(m.versi
 #: （文本守卫：钉住「只 import paths」这一形态，行为由冒烟主链路覆盖）。
 RUNTIME_DIR_PROBE = (
     INSTALLED_GUARD + "import briefdesk.paths as _p; print(_p.benchmark_runs_dir())"
+)
+
+#: 安装态别名注册表探针：显式导入两个新模块，用虚构身份真登记一次，再报告
+#: 注册表落点与安装目录内的泄漏文件。输出带 `PSEUDONYM-OK ` 前缀的 JSON 行，
+#: 由 assert_pseudonym_isolation 判定——只认标记，不把一次性 `-c` 进程的
+#: stderr 噪音（ResourceWarning 等）当失败信号。
+PSEUDONYM_PROBE = (
+    INSTALLED_GUARD
+    + "import asyncio, json, pathlib\n"
+    "import briefdesk\n"
+    "from briefdesk import ai_egress, pseudonym\n"
+    "assert ai_egress.is_local_endpoint('http://127.0.0.1:9/v1') is True\n"
+    "assert ai_egress.is_local_endpoint('https://api.example.invalid/v1') is False\n"
+    "p = pseudonym.get_pseudonymizer()\n"
+    "key = pseudonym.person_identity_key(source='smoke', sender_id='smoke-sender', "
+    "session_id='smoke-session', display_name='smoke-name')\n"
+    "alias = asyncio.run(p.alias_for('person', key, 'smoke-name'))\n"
+    "assert alias.startswith(pseudonym.ALIAS_PERSON_PREFIX), alias\n"
+    "pkg_root = pathlib.Path(briefdesk.__file__).resolve().parent\n"
+    "leaks = sorted(\n"
+    "    str(path.relative_to(pkg_root))\n"
+    "    for path in pkg_root.rglob('*')\n"
+    "    if path.is_file()\n"
+    "    and (path.parent.name == 'pseudonym'\n"
+    "         or path.name in {'mapping.json', 'mapping.lock'}\n"
+    "         or path.suffix == '.tmp')\n"
+    ")\n"
+    "print('PSEUDONYM-OK ' + json.dumps({\n"
+    "    'registry': str(p.registry_file),\n"
+    "    'exists': p.registry_file.is_file(),\n"
+    "    'installed': leaks,\n"
+    "}))\n"
 )
 
 
@@ -546,6 +579,55 @@ def assert_vendor_importable(python: Path, cwd: Path) -> None:
     log("vendor 消费者断言通过：两包可导入、拒绝词表/事件形状/spec 齐全")
 
 
+def assert_pseudonym_isolation(python: Path, cwd: Path, data_dir: Path) -> None:
+    """安装态守卫：两个新模块可导入、别名登记落在注入的数据目录、安装目录零泄漏。
+
+    为什么单列一步：别名注册表是**安装级**状态，它的失败模式恰好绕过其余断言——
+    写进 site-packages 时资源清单（只比非 `.py` 数据文件）与应用启动都看不出来，
+    写进真实用户数据目录时冒烟自身就成了污染源。所以用虚构身份真登记一次，落点
+    才算有证据：注册表路径必须等于注入目录下的 `pseudonym/mapping.json`，安装目录
+    里不得出现任何 `pseudonym/` 产物、锁文件或写盘临时文件。
+
+    环境取宿主白名单 + 三个注入项：`BRIEFDESK_DATA_DIR` 指向本次临时目录，
+    `BRIEFDESK_KEYRING=0` 不碰当前用户的系统凭据（`telemetry.record` 经 config 读
+    开关，构造 Settings 会访问钥匙串）。cwd 必须是非仓库目录，理由同其余探针：
+    `python -c` 会把 cwd 放到 `sys.path` 首位，仓库根会让导入落到源码树。
+    """
+    env = {key: value for key, value in os.environ.items() if key in ENV_ALLOWLIST}
+    env.update(
+        {
+            "BRIEFDESK_DATA_DIR": str(data_dir),
+            "BRIEFDESK_KEYRING": "0",
+            "PYTHONIOENCODING": "utf-8",
+        }
+    )
+    out = run([str(python), "-c", PSEUDONYM_PROBE], env=env, timeout=180, cwd=cwd)
+    marker = next(
+        (line for line in reversed(out.splitlines()) if line.startswith("PSEUDONYM-OK ")),
+        None,
+    )
+    if marker is None:
+        raise SmokeFailure(f"别名注册表探针未输出标记（导入或登记失败）: {out[-300:]}")
+    try:
+        payload = json.loads(marker[len("PSEUDONYM-OK ") :])
+    except ValueError as error:
+        raise SmokeFailure(f"别名注册表探针标记后的 JSON 非法: {marker[-300:]}") from error
+    expected = data_dir / "pseudonym" / "mapping.json"
+    registry = Path(str(payload.get("registry", "")))
+    if registry != expected:
+        raise SmokeFailure(
+            f"别名注册表落点不符：期望 {expected}，实际 {registry}（BRIEFDESK_DATA_DIR 未生效？）"
+        )
+    if payload.get("exists") is not True:
+        raise SmokeFailure(f"别名注册表未落盘：{registry}")
+    installed = payload.get("installed") or []
+    if installed:
+        raise SmokeFailure(
+            f"安装目录出现别名注册表产物: {installed[:5]}（应写用户数据目录，不是 site-packages）"
+        )
+    log(f"安装态守卫通过：别名登记落在 {registry.parent}，安装目录零泄漏")
+
+
 def wait_ready(base: str, log_path: Path, timeout: float = 60.0, *, app: Any = None) -> None:
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -808,7 +890,7 @@ def assert_no_leaks(
     real_runs_root: Path,
     real_runs_before: dict[str, tuple[int, int]],
 ) -> None:
-    """site-packages 不得新增库/配置/报告；真实用户缓存目录不得被本次冒烟改动。
+    """site-packages 不得新增库/配置/报告/别名注册表；真实用户缓存目录不得被本次冒烟改动。
 
     真实目录用**前后快照对比**而不是「必须不存在」：开发机上本来就有历史运行记录，
     存在性断言会在任何用过的机器上必然失败（CI 的干净 runner 掩盖了这一点）。快照
@@ -819,13 +901,24 @@ def assert_no_leaks(
         raise SmokeFailure("找不到 venv 的 site-packages")
     leaks = [
         str(path.relative_to(site_packages))
-        for pattern in ("**/*.sqlite", "**/settings.env", "**/benchmark/runs/**")
+        for pattern in (
+            "**/*.sqlite",
+            "**/settings.env",
+            "**/benchmark/runs/**",
+            "**/pseudonym/**",
+            "**/mapping.lock",
+            "**/*.tmp",
+        )
         for path in site_packages.glob(pattern)
     ]
     if leaks:
         raise SmokeFailure(f"site-packages 出现运行期产物: {leaks[:10]}")
     if not (data_dir / "data" / "briefdesk.sqlite").exists():
         raise SmokeFailure(f"默认库未落在 {data_dir}/data（DB_PATH 被继承？）")
+    if not (data_dir / "pseudonym" / "mapping.json").exists():
+        raise SmokeFailure(
+            f"别名注册表未落在 {data_dir}/pseudonym（BRIEFDESK_DATA_DIR 被绕过？）"
+        )
     if not settings_file.exists():
         raise SmokeFailure("临时 settings 文件未被写入")
     if not cache_dir.exists():
@@ -835,7 +928,7 @@ def assert_no_leaks(
         real_runs_before,
         why="真实用户缓存目录被本次冒烟写入（BRIEFDESK_CACHE_DIR 未生效？）",
     )
-    log("隔离断言通过：site-packages 无产物、真实用户缓存目录与冒烟前一致")
+    log("隔离断言通过：site-packages 无产物、别名注册表落在注入目录、真实用户缓存目录与冒烟前一致")
 
 
 def main() -> int:
@@ -897,6 +990,9 @@ def main() -> int:
             install_wheel(venv, wheel)
             python = venv_python(venv)
         assert_vendor_importable(python, tmp)
+        # 安装态守卫：别名注册表写到注入的数据目录、安装目录零泄漏。放在应用启动前，
+        # 失败时报错指向「装坏的新模块 / 落点不对」，而不是后面的 wait_ready 超时。
+        assert_pseudonym_isolation(python, tmp, data_dir)
         port = free_port()
         base = f"http://127.0.0.1:{port}"
         env = app_env(data_dir=data_dir, cache_dir=cache_dir, settings_file=settings_file, port=port)

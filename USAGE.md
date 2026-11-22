@@ -193,13 +193,13 @@ A: 需同时满足：`AI_VISION_ENABLED=true`、`ocr` 插件已启用、模型�
 
 - 所有数据存于本地 SQLite，默认落在平台用户数据目录（Windows `%LOCALAPPDATA%\briefdesk\data\briefdesk.sqlite`，可经 `DB_PATH` 覆盖）。
 - **本地运行指标不外发**：应用在本机记录 AI 调用次数、各阶段耗时与合并判定的余弦-真值（**不含消息正文**），写入用户数据目录 `telemetry/`，不上传任何地方。可在设置页关闭（`TELEMETRY_ENABLED`，重启生效）：关闭后不再写入，已生成的文件保留；快照保留 14 天，余弦-真值明细保留 180 天（清理随同步执行，关闭期间不清理）。
-- **文本会发送给 AI 供应商**：AI 分类请求包含群名、发送者名与消息文本（正文语义内容原样外发）。文本脱敏（手机号/身份证/邮箱/银行卡替换为占位符）只覆盖常见写法，**不是全面保证**——带括号等不常见分隔符的手机号（如 `+86 (138) 0013-8000`）不会被替换、会原样外发，敏感文本请按此自行评估。不用外部 AI 端点（本地模型）时不存在该外发。
+- **文本与展示名会发送给 AI 供应商**：AI 分类请求包含群名、发送者名与消息文本（正文语义内容原样外发）。群名与发送者名默认在**远端端点**上替换为稳定化名（`AI_PSEUDONYMIZE_NAMES=auto`），模型输出里的化名在落库前换回真名；**本地端点**（同机 ollama 等，按 URL 与 IP 判定，不解析 DNS）不改写输入。把该项设为 `on` 可对本地端点也强制替换，设为 `off` 则一律不替换；留空等同 `auto`，非法值启动时报错。这是展示名的形态替换而不是全字段匿名：正文、类别与引用编号原样外发。文本脱敏（手机号/身份证/邮箱/银行卡替换为占位符）只覆盖常见写法，**不是全面保证**——带括号等不常见分隔符的手机号（如 `+86 (138) 0013-8000`）不会被替换、会原样外发，敏感文本请按此自行评估。不用外部 AI 端点（本地模型）时不存在该外发。
 - **文本脱敏不遮盖图片内容**：开启视觉输入（`AI_VISION_ENABLED`，需 `ocr` 插件）时，消息图片会经归一化后 **连同图片像素一并发送给所选模型供应商**——OCR 识别出的文字会被掩码，但图片里的文字、人脸等内容不经过任何脱敏。是否开启视觉输入，请按你与所选供应商之间的数据约定自行决定。
 - **密钥存储分两条路**：系统钥匙串（`briefdesk secrets set` / UI 密钥区，Windows 为凭据管理器/DPAPI）中的密钥随用户账号加密、不落明文；写在 `.env` 里的密钥是**明文文件**——含密钥的 `.env` 不要提交版本库（已在 `.gitignore` 排除）、不要随网盘/备份/截图连带分享。
 - 暂存配置（UI「启动配置」）按**字面量**保存：值里写 `${VAR}` 不会被展开、保存时直接拒绝（提示改为写在项目 `.env` 或环境变量层）；跨层引用属项目 `.env`（dotenv 语义）的能力。
 - 配置文件（UI 暂存）在 `%LOCALAPPDATA%\briefdesk\settings.env`；基准用例/报告在 `…\briefdesk\benchmark\`、运行目录在 `…\briefdesk\Cache\benchmark\runs\`（可用 `BRIEFDESK_DATA_DIR` / `BRIEFDESK_CACHE_DIR` /`BRIEFDESK_SETTINGS_FILE` 重定向，这三个变量只读进程环境变量）。
 - **旧版本的数据不会被自动发现或迁移**：默认库路径与配置文件位置都变了，旧位置的文件保持原样、不再被读取；本版本不提供旧库的迁移、导入或兼容转换指引。
-- 导出与备份：`GET /api/export/items`（CSV）、`GET /api/backup`（SQLite 备份下载）、`POST /api/restore`（上传恢复，重启生效）。恢复时原库会保留为 `{DB_PATH}.pre-restore`（只留最近一代，含隐私数据，已在 `.gitignore` 中排除），替换失败会自动回滚并保留待恢复文件。
+- 导出与备份：`GET /api/export/items`（CSV）、`GET /api/backup`（SQLite 备份下载）、`POST /api/restore`（上传恢复，重启生效）。恢复时原库会保留为 `{DB_PATH}.pre-restore`（只留最近一代，含隐私数据，已在 `.gitignore` 中排除），替换失败会自动回滚并保留待恢复文件。这些入口只覆盖数据库，**不含别名注册表**：注册表丢失或损坏后重新生成会换一套盐，同一身份在之后的请求里换成另一个化名（化名漂移），本地消息、卡片与正文不受影响，也不等同于数据损坏；要把化名保持一致，把 `pseudonym/` 目录与数据库一起备份。
 
 ### 数据与配置文件位置
 
@@ -210,6 +210,7 @@ A: 需同时满足：`AI_VISION_ENABLED=true`、`ocr` 插件已启用、模型�
 - 内容：基准用例与报告 — 位置（Windows）：`%LOCALAPPDATA%\briefdesk\benchmark\{cases,reports}\`；覆盖入口：`BRIEFDESK_DATA_DIR`
 - 内容：基准运行目录 — 位置（Windows）：`%LOCALAPPDATA%\briefdesk\Cache\benchmark\runs\`；覆盖入口：`BRIEFDESK_CACHE_DIR`
 - 内容：本地运行指标（快照与余弦-真值明细） — 位置（Windows）：`%LOCALAPPDATA%\briefdesk\telemetry\`；覆盖入口：`BRIEFDESK_DATA_DIR`
+- 内容：别名注册表（出站展示名的盐与「哈希 → 别名」映射，不含姓名明文；盐与哈希同文件，拿到后仍可穷举常见昵称，请按私密文件对待） — 位置（Windows）：`%LOCALAPPDATA%\briefdesk\pseudonym\mapping.json`；覆盖入口：`BRIEFDESK_DATA_DIR`
 
 `BRIEFDESK_DATA_DIR` / `BRIEFDESK_CACHE_DIR` / `BRIEFDESK_SETTINGS_FILE` **只读进程环境变量**
 （写进 `.env` 无效）；macOS / Linux 走各自平台约定目录（platformdirs）。
