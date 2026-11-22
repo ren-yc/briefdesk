@@ -23,6 +23,7 @@
 from __future__ import annotations
 
 import ipaddress
+import re
 from collections.abc import Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -47,6 +48,19 @@ _LOCAL_HOSTNAME = "localhost"
 _LOCAL_SCHEMES = frozenset({"http", "https"})
 # 0.0.0.0 不是环回（is_loopback 为假），但本机监听常以它作绑定地址，按本地处理。
 _UNSPECIFIED_V4 = ipaddress.IPv4Address("0.0.0.0")
+# C0 控制字符与 DEL：`urlsplit` 会把这些字符直接删掉（RFC 3986 的清理要求），
+# 于是 `http://local\nhost` 清理后变成另一个 host，判定结果取决于「清理后是
+# 什么」而不是「调用方写了什么」。必须在解析前就拒。
+_C0_LIMIT = 0x20
+_DEL_ORD = 0x7F
+
+# 标签形态：`kind`/`source` 会进遥测键，只接受短小的、无空白的受控词。
+# 下划线不在白名单里：`u_12345` 这类「前缀_数字」正是用户 ID 的常见写法，
+# 放行它等于把 ID 原样写进遥测键。
+_LABEL_RE = re.compile(r"[A-Za-z0-9.:-]{0,64}")
+# 形态不符时 `kind` 归到这里，而不是清洗/截断：截断仍会留下可识别片段
+# （姓名、ID 前缀），而清洗后恰好等于某个真实标签会把两个不同来源混进一个桶。
+_FALLBACK_KIND = "other"
 
 # 政策阻断的指标名形态：本模块不实现阻断，阶段性的策略决策落地之前这里没有
 # 递增路径；保留字符串是为了让报告侧按同一个形状展示零值，避免两边各写一份。
@@ -56,9 +70,10 @@ BLOCKED_METRIC_TEMPLATE = "ai.egress.blocked.{port}.{role}"
 class EgressMetadata(NamedTuple):
     """一次出站调用携带的遥测元数据（由端口层设置，引擎读取）。
 
-    全部字段都在固定词表内：port/role 参与指标名，kind 是任务标签，source 是
-    消息源标签（遥测的唯一维度）。默认值让「直接调用引擎」这类路径也有安全值，
-    不会因为没设元数据就丢失计数。
+    port/role 参与指标名，kind 是任务标签，source 是消息源标签（遥测的维度）。
+    两个标签都会过 `_sanitize_label` 收敛到受控词形态：调用方拿到的是业务对象
+    时可能把姓名或 ID 直接传进来，原样进键就是高基数标签加敏感数据外泄。
+    默认值让「直接调用引擎」这类路径也有安全值，不会因为没设元数据就丢计数。
     """
 
     port: str = PORT_CHAT
@@ -94,6 +109,15 @@ def _dimensions(port: str, role: str) -> str:
     return f"{_validate_port(port)}.{_validate_role(role)}"
 
 
+def _sanitize_label(value: str, *, fallback: str) -> str:
+    """把 `kind`/`source` 收敛成受控词：形态不符就整值换成默认桶。"""
+    if not isinstance(value, str):
+        return fallback
+    if _LABEL_RE.fullmatch(value):
+        return value
+    return fallback
+
+
 def _current_source() -> str:
     """当前上下文的遥测维度（未设元数据时为空串，与既有遥测口径一致）。"""
     return _METADATA.get().source
@@ -108,12 +132,16 @@ def use_metadata(
     ContextVar 而不是全局变量：并发请求各自携带不同的端口/源标签，共享一个
     全局值会让一个请求的计数记到另一个请求的源上；恢复用 reset(token) 而不是
     重设旧值，才能正确回到外层的原始上下文。
+
+    `kind`/`source` 在这里收敛：调用方偶尔会把姓名、群名或 ID 当标签传进来，
+    而它们最终会出现在遥测键里。不合形态的整值归到默认桶（`kind` → `other`、
+    `source` → 空串），不做截断或字符替换。
     """
     metadata = EgressMetadata(
         port=_validate_port(port),
         role=_validate_role(role),
-        kind=kind or "",
-        source=source or "",
+        kind=_sanitize_label(kind, fallback=_FALLBACK_KIND),
+        source=_sanitize_label(source, fallback=""),
     )
     token = _METADATA.set(metadata)
     try:
@@ -130,19 +158,37 @@ def current_metadata() -> EgressMetadata:
 # ── 本地端点判定 ──
 
 
+def _has_control_chars(text: str) -> bool:
+    """是否含 C0 控制字符或 DEL（含 `\\n`/`\\r`/`\\t` 与 NUL）。"""
+    return any(ord(char) < _C0_LIMIT or ord(char) == _DEL_ORD for char in text)
+
+
 def _host_from_base(base: str) -> str | None:
     """从 base URL 取出小写 host；不合法的 base 返回 None（由调用方按远端处理）。"""
-    raw = (base or "").strip()
+    raw = base if isinstance(base, str) else ""
     if not raw:
         return None
+    if _has_control_chars(raw):
+        # 解析前拒：`urlsplit` 会删掉这些字符，`http://local\nhost` 清理后是
+        # `localhost`，按清理结果判本地等于让调用方用一个「看得见的畸形串」换
+        # 一个「判成本地」的结论。
+        return None
+    candidate = raw.strip()
+    if not candidate:
+        return None
     try:
-        parts = urlsplit(raw)
+        parts = urlsplit(candidate)
     except ValueError:
         # 畸形方括号 IPv6 等在这里就抛；不能靠宽松解析把它当成本地
         return None
     if parts.scheme.lower() not in _LOCAL_SCHEMES:
         return None
     try:
+        # 凭据段一律按远端：`http://user:pass@localhost` 的 host 虽然也是
+        # localhost，但这类写法只会是手工构造，不猜它想连哪里；`http://@127.0.0.1`
+        # 的空 userinfo 同样可疑，用 `is not None` 连空串一起拒。
+        if parts.username is not None or parts.password is not None:
+            return None
         # 访问 port 才会真正解析端口：越界或非数字都会抛 ValueError。
         # 非法端口不猜（如 `:99999` 可能被截断成别的端口），一律按远端。
         _ = parts.port
@@ -172,8 +218,10 @@ def is_local_endpoint(base: str) -> bool:
     """判定 base 是否本机端点（纯 URL/IP 解析，无网络、无 DNS）。
 
     本地：`localhost`（大小写无关）、127.0.0.0/8、`::1`、`0.0.0.0`，且必须是
-    合法 http(s) 且端口合法。其余全部按远端：空串、畸形 URL、非法端口、私网
-    地址（10/8、172.16-31、192.168/16 不等于本机）、`localhost.example.invalid`
+    合法 http(s) 且端口合法。其余全部按远端：空串、畸形 URL、含控制字符（解析
+    器会把它们删掉，清理后的 host 不能代表调用方写的 URL）、带凭据段或空
+    userinfo（`http://user:pass@localhost`、`http://@127.0.0.1`）、非法端口、
+    私网地址（10/8、172.16-31、192.168/16 不等于本机）、`localhost.example.invalid`
     这类近似域名、`localhost@remote` 这类把主机藏在凭据段里的写法。
     """
     host = _host_from_base(base)

@@ -52,6 +52,10 @@ REMOTE_BASES = [
     "localhost:11434",  # 没有 scheme
     "ftp://localhost",
     "http://localhost@remote.example.invalid",  # 主机藏在凭据段
+    "http://user:pass@localhost",  # 带凭据段：不猜它想连哪里
+    "http://@127.0.0.1",  # 空 userinfo 同样可疑（username 是空串而不是 None）
+    "http://local\nhost",  # 控制字符被解析器删掉后才是 localhost
+    "http://localhost\r/v1",  # 同上：CR 会让解析结果与字面不一致
     "http://localhost.example.invalid",  # 近似域名
     "http://localhost.",  # 带点写法不猜，按远端
     "http://10.0.0.5",
@@ -181,6 +185,55 @@ def test_source_label_stays_out_of_metric_name() -> None:
         )
     # 指标名只由固定词表拼成；源标签只进遥测维度
     assert _counters() == {"ai.egress.remote_attempt.chat.classify|weflow": 1}
+
+
+def test_metadata_labels_converge_to_controlled_vocabulary() -> None:
+    """陌生人名与 ID 不能原样进遥测键：形态不符整值归到默认桶。"""
+    with ai_egress.use_metadata(
+        port=ai_egress.PORT_CHAT,
+        role=ai_egress.ROLE_MAIN,
+        kind="张三",
+        source="u_12345",
+    ):
+        metadata = ai_egress.current_metadata()
+        assert metadata.kind == "other"
+        assert metadata.source == ""
+        ai_egress.record_send_attempt(
+            ai_egress.PORT_CHAT, ai_egress.ROLE_MAIN, REMOTE_BASE
+        )
+
+    counters = _counters()
+    assert counters == {"ai.egress.remote_attempt.chat.main|": 1}
+    for key in counters:
+        assert "张三" not in key
+        assert "u_12345" not in key
+
+
+def test_metadata_labels_keep_well_formed_values() -> None:
+    with ai_egress.use_metadata(
+        port=ai_egress.PORT_CHAT,
+        role=ai_egress.ROLE_CLASSIFY,
+        kind="judge",
+        source="weflow",
+    ):
+        metadata = ai_egress.current_metadata()
+        assert metadata.kind == "judge"
+        assert metadata.source == "weflow"
+
+    # 空标签是默认值，不算「形态不符」：不能被改写成 other
+    with ai_egress.use_metadata(port=ai_egress.PORT_CHAT, role=ai_egress.ROLE_MAIN):
+        assert ai_egress.current_metadata().kind == ""
+        assert ai_egress.current_metadata().source == ""
+
+    # 超长标签同样按形态不符处理（受控词不含 64 字符以上的值）
+    with ai_egress.use_metadata(
+        port=ai_egress.PORT_CHAT,
+        role=ai_egress.ROLE_MAIN,
+        kind="k" * 65,
+        source="s" * 65,
+    ):
+        assert ai_egress.current_metadata().kind == "other"
+        assert ai_egress.current_metadata().source == ""
 
 
 def test_unknown_port_or_role_is_rejected() -> None:

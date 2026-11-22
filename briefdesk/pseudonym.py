@@ -28,6 +28,7 @@ import binascii
 import hashlib
 import hmac
 import json
+import math
 import os
 import re
 import sys
@@ -37,7 +38,7 @@ from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import NamedTuple
+from typing import Any, NamedTuple
 
 from briefdesk import paths, telemetry
 
@@ -57,8 +58,24 @@ ALIAS_CODE_LENGTH = 6
 _SALT_SIZE = 32
 REGISTRY_VERSION = 1
 
+# base32 字母表（RFC 4648，去掉 0/1/8/9）：短码与别名 token 只由这些字符构成。
+_BASE32_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567"
+_CODE_PATTERN = rf"[{_BASE32_CHARS}]{{{ALIAS_CODE_LENGTH}}}"
+_ALIAS_SHAPE_PATTERN = (
+    rf"(?:{ALIAS_PERSON_PREFIX}|{ALIAS_GROUP_PREFIX}){_CODE_PATTERN}(?:-\d+)?"
+)
+# 注册表里的别名必须整体符合这个形态：文件被改写（塞进明文姓名、半截短码或
+# 任意字符串）时在读取阶段就停，绝不把文件里的内容当别名发给远端。判定一律用
+# `fullmatch`：带 `$` 的 `match` 会放过末尾换行。
+_ALIAS_SHAPE_RE = re.compile(_ALIAS_SHAPE_PATTERN)
+# 注册表键是完整 HMAC 摘要：只接受 64 位小写十六进制，长度或大小写不对即损坏。
+_DIGEST_RE = re.compile(r"[0-9a-f]{64}")
+
 # 新身份默认合并窗口（秒）：窗口内的新身份并进同一次落盘；首次初始化立即提交。
 DEFAULT_FLUSH_WINDOW = 5.0
+# 合并窗口上限（秒）：窗口过长会让新别名迟迟不能出境，等待的调用方跟着排队；
+# 非有限值（nan/inf）会让 `asyncio.sleep` 永远醒不来。
+MAX_FLUSH_WINDOW = 30.0
 # 跨进程锁等待上限（秒）。超时即失败，不无限等（等不到锁说明另一个写者卡住）。
 LOCK_TIMEOUT_SECONDS = 10.0
 _LOCK_RETRY_INTERVAL = 0.02
@@ -79,6 +96,14 @@ class PseudonymError(Exception):
 
 class PseudonymRegistryError(PseudonymError):
     """注册表不可用：缺失、损坏、版本不支持、盐异常或与进程内盐不一致。"""
+
+
+class _RegistryMissing(PseudonymRegistryError):
+    """注册表文件不存在——唯一允许在锁内新建初始表的状态。
+
+    读取失败、解码失败、内容损坏都是别的异常类型：把它们也当「不存在」会直接
+    覆盖掉既有映射，等于一次静默重盐。对外仍按注册表错误处理（fail-closed）。
+    """
 
 
 class PseudonymLockError(PseudonymError):
@@ -169,6 +194,10 @@ class _Registry:
     salt: bytes
     aliases: dict[str, str]
 
+    def __repr__(self) -> str:
+        """只暴露条目数量：盐与别名同样敏感，不能随异常栈或调试输出扩散。"""
+        return f"<_Registry entries={len(self.aliases)}>"
+
 
 class _AliasCode(NamedTuple):
     """待分配别名的形态：前缀随 kind 固定，短码由完整哈希派生。"""
@@ -203,15 +232,27 @@ def _serialize_registry(registry: _Registry) -> bytes:
 def _read_registry(path: Path) -> _Registry:
     """读取并校验注册表；任何异常形态都转成 PseudonymRegistryError。
 
-    错误信息只带路径、版本值与长度，绝不带文件里的取值：异常信息会进日志，
-    把盐或别名片段写进日志等于扩散敏感数据。
+    错误信息只带路径与「哪一项不对」，绝不带文件里的取值：异常信息会进日志，
+    把盐、别名片段或版本原文写进日志等于扩散敏感数据（版本字段已被改写成敏感
+    内容的场景同样按此处理）。
+
+    校验是逐层收紧的：顶层对象 → 版本 → 盐 → aliases 是否存在 → 每个键值的
+    形态 → 别名唯一性。缺一层就会出现「文件被改写成明文也能当别名发出去」的
+    缝，本功能尚无历史文件，因此不为任何缺字段形态留向后兼容。
     """
     try:
-        raw = path.read_text(encoding="utf-8")
+        raw_bytes = path.read_bytes()
     except FileNotFoundError:
-        raise PseudonymRegistryError(f"别名注册表不存在: {path}") from None
+        raise _RegistryMissing(f"别名注册表不存在: {path}") from None
     except OSError as error:
-        raise PseudonymRegistryError(f"别名注册表读取失败: {path}（{error}）") from error
+        raise PseudonymRegistryError(
+            f"别名注册表读取失败: {path}（{type(error).__name__}）"
+        ) from error
+    try:
+        raw = raw_bytes.decode("utf-8")
+    except UnicodeDecodeError:
+        # 非法 UTF-8 与「内容损坏」同性质：不能当成空表，也不能重写覆盖
+        raise PseudonymRegistryError(f"别名注册表不是合法 UTF-8: {path}") from None
     try:
         decoded: object = json.loads(raw)
     except json.JSONDecodeError as error:
@@ -222,9 +263,11 @@ def _read_registry(path: Path) -> _Registry:
         raise PseudonymRegistryError(f"别名注册表顶层不是对象: {path}")
     data: dict[object, object] = decoded
     version = data.get("version")
-    if version != REGISTRY_VERSION:
+    # bool 是 int 的子类：`version: true` 用 `!=` 比较会刚好等于 1 而混过去；
+    # 消息里不回显原值——版本字段可能被改写成敏感内容。
+    if isinstance(version, bool) or version != REGISTRY_VERSION:
         raise PseudonymRegistryError(
-            f"别名注册表版本不受支持: {version!r}（期望 {REGISTRY_VERSION}）: {path}"
+            f"别名注册表版本不受支持（期望 {REGISTRY_VERSION}）: {path}"
         )
     salt_b64 = data.get("salt")
     if not isinstance(salt_b64, str) or not salt_b64:
@@ -233,22 +276,32 @@ def _read_registry(path: Path) -> _Registry:
         salt = base64.b64decode(salt_b64, validate=True)
     except (binascii.Error, ValueError) as error:
         raise PseudonymRegistryError(
-            f"别名注册表的盐不是合法 base64: {path}（{error}）"
+            f"别名注册表的盐不是合法 base64: {path}（{type(error).__name__}）"
         ) from error
     if len(salt) != _SALT_SIZE:
         raise PseudonymRegistryError(
             f"别名注册表的盐长度异常: {len(salt)} 字节（期望 {_SALT_SIZE}）: {path}"
         )
-    aliases_raw = data.get("aliases")
-    if aliases_raw is None:
-        aliases_raw = {}
+    if "aliases" not in data:
+        # 缺字段按空表处理会让「被清空的注册表」静默通过：已发出的别名全部失效
+        raise PseudonymRegistryError(f"别名注册表缺少 aliases 映射: {path}")
+    aliases_raw = data["aliases"]
     if not isinstance(aliases_raw, dict):
         raise PseudonymRegistryError(f"别名注册表的 aliases 不是对象: {path}")
     aliases: dict[str, str] = {}
+    alias_owners: dict[str, str] = {}
     entries: dict[object, object] = aliases_raw
     for key, value in entries.items():
-        if not isinstance(key, str) or not isinstance(value, str):
-            raise PseudonymRegistryError(f"别名注册表含非字符串条目: {path}")
+        if not isinstance(key, str) or not _DIGEST_RE.fullmatch(key):
+            raise PseudonymRegistryError(f"别名注册表含形态异常的摘要键: {path}")
+        if not isinstance(value, str) or not _ALIAS_SHAPE_RE.fullmatch(value):
+            raise PseudonymRegistryError(f"别名注册表含形态异常的别名条目: {path}")
+        if value in alias_owners:
+            # 一个别名指向两个身份：还原时无法判断该写回哪个名字，必须停
+            raise PseudonymRegistryError(
+                f"别名注册表同一个别名对应多个摘要: {path}"
+            )
+        alias_owners[value] = key
         aliases[key] = value
     return _Registry(salt=salt, aliases=aliases)
 
@@ -313,8 +366,15 @@ def _acquire_windows_lock(fd: int, timeout: float) -> None:  # pragma: no cover
     """
     import msvcrt
 
-    if os.fstat(fd).st_size == 0:
-        os.write(fd, b"\0")
+    try:
+        if os.fstat(fd).st_size == 0:
+            os.write(fd, b"\0")
+    except OSError as error:
+        # 初始化锁文件失败与「等待超时」同性质：都拿不到跨进程互斥，调用方必须
+        # 走准备失败，而不是在无锁状态下继续写注册表。
+        raise PseudonymLockError(
+            f"别名注册锁文件初始化失败（{type(error).__name__}）"
+        ) from error
     # 类型忽略：typeshed 在 POSIX 平台下把 msvcrt 当空模块，只有 Windows 才有这些成员
     lock_nb = msvcrt.LK_NBLCK  # type: ignore[attr-defined]
     deadline = time.monotonic() + timeout
@@ -429,12 +489,21 @@ class Pseudonymizer:
         # 目录在构造期定稿（而不是每次调用求值）：同一实例的读与写必须落在
         # 同一处，运行期改 `BRIEFDESK_DATA_DIR` 只影响此后新建的实例。
         self._directory = Path(directory) if directory is not None else registry_dir()
-        self._flush_window = max(0.0, float(flush_window))
+        window = float(flush_window)
+        # nan/inf 会让合并窗口的 sleep 永不醒来，超过上限则让新别名迟迟不能出境；
+        # 两种都当配置错误直接抛，而不是夹到边界值上悄悄放行。
+        if not math.isfinite(window) or not 0.0 <= window <= MAX_FLUSH_WINDOW:
+            raise ValueError(
+                f"合并窗口必须是 0 到 {MAX_FLUSH_WINDOW:g} 秒之间的有限值: {flush_window!r}"
+            )
+        self._flush_window = window
         self._lock_timeout = max(0.0, float(lock_timeout))
         self._digest_fn = digest_fn
         self._registry: _Registry | None = None
         self._committed: dict[str, str] = {}
         self._pending: dict[str, _AliasCode] = {}
+        self._init_future: asyncio.Future[_Registry] | None = None
+        self._init_task: asyncio.Task[None] | None = None
         self._flush_future: asyncio.Future[None] | None = None
         self._flush_task: asyncio.Task[None] | None = None
         self._commit_count = 0
@@ -459,6 +528,9 @@ class Pseudonymizer:
 
         新身份返回前一定已经提交成功：失败抛 PseudonymError，调用方必须把它当
         准备失败处理（不发送真名、不重试明文）。
+
+        注册表加载走 `_ensure_registry`（写线程 + 共享初始化 future），不在协程
+        线程里读盘或抢锁；已注册身份命中 `_committed` 时零 I/O。
         """
         if not display_name:
             return ""
@@ -467,10 +539,11 @@ class Pseudonymizer:
         key = identity_key.strip()
         if not key:
             raise ValueError("身份键为空：调用方必须先生成身份键再取别名")
-        registry = self._load()
+        registry = await self._ensure_registry()
         digest = self._digest(kind, key, registry.salt)
         cached = self._committed.get(digest)
         if cached is not None:
+            self._verify_alias_kind(cached, _ALIAS_PREFIXES[kind])
             return cached
         prefix = _ALIAS_PREFIXES[kind]
         code = _AliasCode(prefix, _short_code(digest))
@@ -486,26 +559,93 @@ class Pseudonymizer:
 
     # ── 注册表加载 ──
 
+    async def _ensure_registry(self) -> _Registry:
+        """取注册表；首次加载在写线程里跑，并发调用共享同一个初始化 future。
+
+        为什么不能直接在协程里 `_load()`：它会读盘，首次启动还要抢跨进程锁
+        （最长等 10 秒）。同步执行会把整个事件循环连同其它请求一起卡住，而
+        `alias_for` 正处在出境前的准备路径上，卡住的代价是整条管道停摆。
+        共享 future 是为了让并发首启只建一次表：各自建表会互相覆盖盐。
+        """
+        if self._registry is not None:
+            return self._registry
+        loop = asyncio.get_running_loop()
+        future = self._init_future
+        if future is None or future.get_loop() is not loop or future.done():
+            # 没有在飞的初始化，或上一轮绑在已关闭的 loop 上（客户端缓存被清、
+            # 测试换 loop）：按当前 loop 重新发起。失败不会被缓存，故可重试。
+            future = loop.create_future()
+            # 所有等待者都被取消时没人取异常，事件循环回收时会告警；先消费掉。
+            future.add_done_callback(_consume_future_exception)
+            self._init_future = future
+            self._init_task = loop.create_task(self._init_registry(future))
+        # shield：本调用被取消不应该连带取消别人共享的初始化。
+        return await asyncio.shield(future)
+
+    async def _init_registry(self, future: asyncio.Future[_Registry]) -> None:
+        """在写线程里加载注册表，把结果或异常交给所有等待者。
+
+        失败只落到 future 上，不写进 `_registry` 也不留半成品：半成品（有盐、
+        缺映射）会让后续请求拿着不完整的表算出与历史不一致的别名。
+        """
+        try:
+            registry = await asyncio.to_thread(self._load)
+        except asyncio.CancelledError:
+            if not future.done():
+                future.cancel()
+            raise
+        except PseudonymError as error:
+            if not future.done():
+                future.set_exception(error)
+        except Exception as error:  # noqa: BLE001 — 等待者必须都收到失败
+            if not future.done():
+                future.set_exception(
+                    PseudonymError(f"别名注册表初始化失败（{type(error).__name__}）")
+                )
+        else:
+            if not future.done():
+                future.set_result(registry)
+        finally:
+            # 只清自己那一轮：新一轮已经换上新 future 时不能把人家清掉
+            if self._init_future is future:
+                self._init_future = None
+                self._init_task = None
+
     def _load(self) -> _Registry:
-        """读取注册表（每进程一次）；文件缺失时在锁内创建含新盐的初始表。
+        """读取注册表（每进程一次）；文件不存在时在锁内创建含新盐的初始表。
 
         盐必须在任何哈希计算之前落定。两个进程同时首次启动时若各自生成盐再各自
         提交，两边的映射会互相覆盖——先提交的一方别名在重启后全部失效。因此
         「创建初始表」也在锁内完成，且创建后立刻原子写盘。
+
+        区分「文件不存在」与「读取失败」靠异常类型，不用 `Path.exists()` 预判：
+        预判与真正的读取之间有窗口，文件在这期间被写坏会被当成「不存在」而直接
+        被新表覆盖，等于一次静默重盐。读到的既有映射同时填进内存缓存。
         """
         if self._registry is not None:
             return self._registry
         path = self.registry_file
-        if path.exists():
-            self._registry = _read_registry(path)
-            return self._registry
+        try:
+            return self._adopt(_read_registry(path))
+        except _RegistryMissing:
+            pass
         with _registry_lock(self.lock_file, timeout=self._lock_timeout):
-            if path.exists():
-                self._registry = _read_registry(path)
-                return self._registry
-            registry = _Registry(salt=os.urandom(_SALT_SIZE), aliases={})
-            _atomic_write(path, _serialize_registry(registry))
+            try:
+                return self._adopt(_read_registry(path))
+            except _RegistryMissing:
+                registry = _Registry(salt=os.urandom(_SALT_SIZE), aliases={})
+                _atomic_write(path, _serialize_registry(registry))
+                return self._adopt(registry)
+
+    def _adopt(self, registry: _Registry) -> _Registry:
+        """把读到的注册表定为进程内快照，并把已有映射填进内存缓存。
+
+        已注册身份（盘上已有 digest）此后命中 `_committed` 纯内存，不再读盘、
+        不再抢锁；不填这一步，重启后每个已知身份都要走一遍完整提交路径。
+        """
         self._registry = registry
+        for digest, alias in registry.aliases.items():
+            self._committed.setdefault(digest, alias)
         return registry
 
     # ── 批量提交 ──
@@ -564,10 +704,16 @@ class Pseudonymizer:
         except Exception as error:  # noqa: BLE001 — 任何异常都必须落到 future 上
             self._pending.clear()
             if not future.done():
-                future.set_exception(PseudonymError(f"别名提交失败: {error}"))
+                # 只带异常类型：原始错误文本可能夹带真名、路径或 SDK 请求片段
+                future.set_exception(
+                    PseudonymError(f"别名提交失败（{type(error).__name__}）")
+                )
         finally:
-            self._flush_future = None
-            self._flush_task = None
+            # 只清自己那一轮：窗口内新批次可能已经换上新的 future，旧批次结束
+            # 时无条件清空会把新批次的 future 丢掉，等待它的调用方永远等不到。
+            if self._flush_future is future:
+                self._flush_future = None
+                self._flush_task = None
 
     def _commit_sync(self, batch: dict[str, _AliasCode]) -> dict[str, str]:
         """在写线程里：持锁重读磁盘 → 合并分配 → 原子写 → 返回本批别名。"""
@@ -590,9 +736,13 @@ class Pseudonymizer:
             for digest, code in batch.items():
                 known = merged.get(digest)
                 if known is not None:
+                    # 既有别名必须与本次请求的实体类型同前缀，否则是篡改或串域
+                    self._verify_alias_kind(known, code.prefix)
                     produced[digest] = known
                     continue
                 alias = self._committed.get(digest)
+                if alias is not None:
+                    self._verify_alias_kind(alias, code.prefix)
                 if alias is None or owner.get(alias, digest) != digest:
                     alias = _allocate_alias(code, owner)
                 merged[digest] = alias
@@ -606,14 +756,33 @@ class Pseudonymizer:
                 )
         return produced
 
+    def _verify_alias_kind(self, alias: str, prefix: str) -> None:
+        """既有别名必须与本次请求的实体类型同前缀，否则按注册表损坏处理。
+
+        注册表只存 digest → 别名，kind 不在文件里；不复核前缀的话，被篡改或
+        串域的条目会把「群」别名当成某个人的名字发出去，还原时还会互相串域。
+        """
+        if not _ALIAS_SHAPE_RE.fullmatch(alias) or not alias.startswith(prefix):
+            raise PseudonymRegistryError(
+                f"别名注册表含与实体类型不符的别名条目: {self.registry_file}"
+            )
+
     def _digest(self, kind: str, identity_key: str, salt: bytes) -> str:
-        """摘要：默认 HMAC-SHA256；测试可注入以强制短码碰撞。"""
+        """摘要：默认 HMAC-SHA256；测试可注入以强制短码碰撞。
+
+        注入的摘要也要复核形态：注册表键按 64 位小写十六进制校验，形态不对的
+        摘要一旦写盘，下次启动就读不进来（等于把整个安装锁死）。
+        """
         if self._digest_fn is not None:
-            return self._digest_fn(salt, kind, identity_key)
-        return _default_digest(salt, kind, identity_key)
+            digest = self._digest_fn(salt, kind, identity_key)
+        else:
+            digest = _default_digest(salt, kind, identity_key)
+        if not _DIGEST_RE.fullmatch(digest):
+            raise PseudonymError("别名摘要形态不合法，已停止出站")
+        return digest
 
 
-def _consume_future_exception(future: asyncio.Future[None]) -> None:
+def _consume_future_exception(future: asyncio.Future[Any]) -> None:
     """消费 future 的异常（等待者全被取消时没人取，会打未取回告警）。"""
     if not future.cancelled():
         future.exception()
@@ -645,18 +814,32 @@ def reset_for_tests() -> None:
 
 # ── 请求级上下文 ──
 
-# base32 字母表（RFC 4648，去掉 0/1/8/9）：别名短码与还原 token 只由这些字符构成。
-_BASE32_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567"
-_CODE_PATTERN = rf"[{_BASE32_CHARS}]{{{ALIAS_CODE_LENGTH}}}"
+# 完整 token 的两侧必须是「非 ASCII 词字符」边界。被拼长的 `同学ABCDEFG` 若只在
+# 中间匹配，会把 `同学ABCDEF` 单独还原、留下孤零零的 `G`，既改了模型输出又
+# 不计失败。不能用 `\w`：它把汉字也算单词字符，中文紧邻时（`由同学ABCDEF发布`）
+# 就再也匹配不到。
+_TOKEN_LEFT_BOUNDARY = r"(?<![A-Za-z0-9_-])"
+_TOKEN_RIGHT_BOUNDARY = r"(?![A-Za-z0-9_-])"
 _ALIAS_TOKEN_RE = re.compile(
-    rf"(?:{ALIAS_PERSON_PREFIX}|{ALIAS_GROUP_PREFIX}){_CODE_PATTERN}(?:-\d+)?"
+    rf"{_TOKEN_LEFT_BOUNDARY}{_ALIAS_SHAPE_PATTERN}{_TOKEN_RIGHT_BOUNDARY}"
 )
-# 缺前缀的裸短码：模型有时会把「同学ABCDEF」抄成「ABCDEF」。只用来判「被改写
-# 过」并计数，不参与替换——凭一段裸码反查身份会把同码的另一个人也认进来。
+# 缺前缀的裸短码：模型有时会把「同学ABCDEF」抄成「ABCDEF」或「ABCDEF-1」。只用来
+# 判「被改写过」并计数，不参与替换——凭一段裸码反查身份会把同码的另一个人也认进来。
+# 右侧允许 `-`：带后缀的裸码同样是被改写，旧口径的 `(?![A-Za-z0-9_-])` 会把它漏掉。
 _BARE_CODE_RE = re.compile(
     rf"(?<!{ALIAS_PERSON_PREFIX})(?<!{ALIAS_GROUP_PREFIX})"
-    rf"(?<![A-Za-z0-9_-])({_CODE_PATTERN})(?![A-Za-z0-9_-])"
+    rf"(?<![A-Za-z0-9_-])({_CODE_PATTERN})(?![A-Za-z0-9_])"
 )
+# 前缀出现位置：用来逐个判断「前缀后面跟的是什么」，比一条大正则更容易说明
+# 每一种被改写的方式。
+_ALIAS_PREFIX_SEARCH_RE = re.compile(rf"{ALIAS_PERSON_PREFIX}|{ALIAS_GROUP_PREFIX}")
+# 前缀后紧跟的 ASCII 串：用于判断「长得像别名但不合法」。4 是下限——`同学3人`
+# 这类自然行文只有 1 个字符，按候选计会把遥测淹没在普通中文里。
+_CANDIDATE_TAIL_RE = re.compile(r"[A-Za-z0-9_-]{4,}")
+# 纯 base32 的 4~5 位串：像被截断的短码（`同学ABCD`）。含小写或 0/1/8/9 的串由
+# 「长度 ≥ 短码长度才算候选」那条覆盖，不必在这里逐类穷举。
+_TRUNCATED_CODE_RE = re.compile(rf"[{_BASE32_CHARS}]{{4,5}}")
+_ASCII_TOKEN_CHAR_RE = re.compile(r"[A-Za-z0-9_-]")
 
 
 class NameContext:
@@ -679,6 +862,8 @@ class NameContext:
         self._person_cache: dict[str, str] = {}
         self._group_cache: dict[str, str] = {}
         self._failed_fields: set[str] = set()
+        # 字段 → 上次还原输出：同一字段重复调用时据此短路，避免二次替换
+        self._last_output: dict[str, str] = {}
         self._restore_failures = 0
 
     def __repr__(self) -> str:
@@ -768,13 +953,22 @@ class NameContext:
         telemetry.record("ai.pseudonym.restore_failed")
 
     def restore(self, text: str, *, field: str) -> str:
-        """把自由文本中的已知别名替换回显示名。
+        """把自由文本中的已知别名替换回显示名（单次请求内幂等）。
 
-        只做完整 token 的精确替换（按 token 形状一次扫描，长后缀优先），不模糊
-        猜测：模型改写过的别名原样保留并计失败——改错了还能看见问题，凭猜测
-        替换会把无关文本改成某个人名。
+        只做完整 token 的精确替换：token 两侧必须是 ASCII 词字符之外的边界，
+        中文紧邻照常匹配；出现「长得像别名但不合法」的片段（被拼长、被改成
+        小写、后缀不是纯数字、缺前缀的裸码）时原样保留并计一次失败。不模糊
+        猜测——凭猜测替换会把无关文本改成某个人名，而原样保留至少看得见问题。
+
+        幂等只在单次请求内成立（`restore(restore(x)) == restore(x)`）：每字段
+        记住上次输出，输入与它相同就直接返回。真实显示名可能本身形似别名（有人
+        就叫「同学ABCDEF」），没有这层记忆时第二次还原会把刚写回去的真名当成
+        别名再换一次，字段在多次兜底之间就漂了。失败计数按字段去重，重复调用
+        不会把一次失败放大成多条遥测。
         """
         if not text or not self._enabled or not self._by_alias:
+            return text
+        if self._last_output.get(field) == text:
             return text
 
         def _substitute(match: re.Match[str]) -> str:
@@ -786,14 +980,38 @@ class NameContext:
             return name
 
         restored = _ALIAS_TOKEN_RE.sub(_substitute, text)
-        if field in self._failed_fields:
-            return restored
+        if field not in self._failed_fields and self._looks_like_broken_alias(text):
+            self.mark_restore_failed(field)
+        self._last_output[field] = restored
+        return restored
+
+    def _looks_like_broken_alias(self, text: str) -> bool:
+        """文本里是否存在「形似别名但不合法」的片段（只判定，不改写）。
+
+        逐项列出被改写的方式：前缀后的 ASCII 串长度不对（被拼长或截断）、含有
+        小写或 base32 之外的字符、带非数字后缀，以及丢了前缀但在本请求里已知的
+        裸短码。任何一项命中都说明模型抄错了别名，调用方按「没还原出来」处理。
+        """
+        for match in _ALIAS_PREFIX_SEARCH_RE.finditer(text):
+            start = match.start()
+            if start > 0 and _ASCII_TOKEN_CHAR_RE.match(text[start - 1]):
+                # 前缀被粘在 ASCII 词中间（`X同学...`）：不是别名起点
+                continue
+            tail = _CANDIDATE_TAIL_RE.match(text, match.end())
+            if tail is None:
+                continue
+            span = text[start : tail.end()]
+            if span in self._by_alias:
+                # 完整且已知的别名由替换路径处理，不算失败
+                continue
+            run = tail.group(0)
+            if len(run) >= ALIAS_CODE_LENGTH or _TRUNCATED_CODE_RE.fullmatch(run):
+                return True
         for match in _BARE_CODE_RE.finditer(text):
             if match.group(1) in self._codes:
-                # 化了名却丢了前缀：同样是没还原出来，计失败并原样保留
-                self.mark_restore_failed(field)
-                break
-        return restored
+                # 化了名却丢了前缀：同样是没还原出来，原样保留
+                return True
+        return False
 
     # ── 内部 ──
 

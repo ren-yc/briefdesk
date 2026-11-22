@@ -8,8 +8,12 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import copy
 import hashlib
+import hmac
 import json
+import os
+import sys
 import threading
 import time
 from collections.abc import Callable
@@ -73,9 +77,15 @@ async def _group(
 
 
 def _collision_digest(salt: bytes, kind: str, identity_key: str) -> str:
-    """强制短码碰撞的摘要：前 4 字节固定 → 前 6 位 base32 一定相同。"""
+    """强制短码碰撞的摘要：前 4 字节固定 → 前 6 位 base32 一定相同。
+
+    形态必须与注册表键校验一致（64 位小写十六进制）：长度不对的摘要写进注册表
+    后会让下次启动直接读不进来。
+    """
     tail = hashlib.sha256(f"{kind}:{identity_key}".encode()).hexdigest()
-    return "00000000" + tail
+    digest = "00000000" + tail[:56]
+    assert len(digest) == 64
+    return digest
 
 
 def _registry_payload(base: Path) -> dict[str, object]:
@@ -284,6 +294,146 @@ def test_survives_event_loop_rebuild(tmp_path: Path) -> None:
     assert {first, second} <= set(_aliases(tmp_path / "reg").values())
 
 
+# ── 初始化：写线程、单次建表与失败传播 ──
+
+
+def test_fixed_salt_golden_vector() -> None:
+    """固定盐的独立金向量：摘要与别名由标准库单独算一遍，不复用实现内部函数。"""
+    salt = bytes(range(32))
+    identity_key = '["person","weflow","sender_id","member-0001"]'
+    assert (
+        pseudonym.person_identity_key(
+            source="weflow",
+            sender_id="member-0001",
+            session_id="会话-0001",
+            display_name="示例甲",
+        )
+        == identity_key
+    )
+
+    payload = json.dumps(
+        [1, "person", identity_key],
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    expected_digest = hmac.new(salt, payload, hashlib.sha256).hexdigest()
+    # 钉住字面量：实现与测试同时改错时，独立计算那条断言才会失效
+    assert expected_digest == (
+        "35b91c565ae9935fce4ce960a7a63f10eb77df2e0fa5a6b586cbeaf66e277d7d"
+    )
+    assert pseudonym._default_digest(salt, "person", identity_key) == expected_digest
+
+    expected_code = base64.b32encode(bytes.fromhex(expected_digest)).decode("ascii")[:6]
+    assert expected_code == "GW4RYV"
+    assert pseudonym._short_code(expected_digest) == expected_code
+    assert pseudonym.ALIAS_PERSON_PREFIX + expected_code == "同学GW4RYV"
+
+
+async def test_first_load_runs_off_the_event_loop_thread(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """注册表加载必须在写线程里跑：同步读盘 + 抢锁会把事件循环整个卡住。"""
+    seen: list[bool] = []
+    original_load = pseudonym.Pseudonymizer._load
+
+    def _spy(self: pseudonym.Pseudonymizer) -> pseudonym._Registry:
+        seen.append(threading.current_thread() is threading.main_thread())
+        return original_load(self)
+
+    monkeypatch.setattr(pseudonym.Pseudonymizer, "_load", _spy)
+    pz = _make(tmp_path / "reg")
+    assert await _person(pz, sender_id="member-0001", name="示例甲")
+    assert seen and seen[0] is False
+
+
+async def test_concurrent_first_start_creates_table_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """并发首启只建一次表：各建各的盐会互相覆盖，先提交的那批别名全部失效。"""
+    salt_draws: list[int] = []
+    real_urandom = os.urandom
+
+    def _counting_urandom(size: int) -> bytes:
+        if size == pseudonym._SALT_SIZE:
+            salt_draws.append(size)
+        return real_urandom(size)
+
+    load_calls: list[int] = []
+    original_load = pseudonym.Pseudonymizer._load
+
+    def _spy_load(self: pseudonym.Pseudonymizer) -> pseudonym._Registry:
+        # 只数「真的要读一次」的调用：已加载后 `_commit_sync` 里的调用是纯缓存命中
+        if self._registry is None:
+            load_calls.append(1)
+        return original_load(self)
+
+    monkeypatch.setattr(pseudonym.os, "urandom", _counting_urandom)
+    monkeypatch.setattr(pseudonym.Pseudonymizer, "_load", _spy_load)
+    base = tmp_path / "reg"
+    pz = _make(base)
+    aliases = await asyncio.gather(
+        *(
+            _person(pz, sender_id=f"member-{index:04d}", name=f"示例{index}")
+            for index in range(8)
+        )
+    )
+    # 共享初始化 future：8 个并发首启合并成一次加载、一次建表
+    assert len(load_calls) == 1
+    assert len(salt_draws) == 1
+    assert len(set(aliases)) == 8
+    assert set(aliases) <= set(_aliases(base).values())
+
+
+async def test_initialization_failure_reaches_every_waiter(tmp_path: Path) -> None:
+    """初始化失败时所有等待者都拿到异常，且不缓存半成品。"""
+    base = tmp_path / "reg"
+    base.mkdir(parents=True)
+    # 注册表位置是目录：读取必然失败（不是「文件不存在」，不能建表覆盖）
+    (base / pseudonym.REGISTRY_FILE_NAME).mkdir()
+
+    pz = _make(base)
+    results = await asyncio.gather(
+        *(
+            _person(pz, sender_id=f"member-{index:04d}", name="示例甲")
+            for index in range(5)
+        ),
+        return_exceptions=True,
+    )
+    assert len(results) == 5
+    assert all(
+        isinstance(item, pseudonym.PseudonymRegistryError) for item in results
+    )
+    assert pz.commit_count == 0
+    # 失败不被缓存：下一次调用仍重新尝试并同样失败
+    with pytest.raises(pseudonym.PseudonymRegistryError):
+        await _person(pz, sender_id="member-0001", name="示例甲")
+
+
+async def test_loaded_registry_serves_known_identities_from_memory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """重启后盘上已有映射进内存缓存：已知身份命中纯内存，不读盘、不加锁。"""
+    base = tmp_path / "reg"
+    pz = _make(base)
+    first = await _person(pz, sender_id="member-0001", name="示例甲")
+
+    restarted = _make(base)
+    # 先让新实例加载注册表（顺带登记一个陌生身份），再验证旧身份零 I/O
+    await _person(restarted, sender_id="member-0009", name="示例壬")
+
+    def _forbidden(*args: object, **kwargs: object) -> None:
+        raise AssertionError("已注册身份不应再读盘、加锁或写盘")
+
+    with monkeypatch.context() as patched:
+        patched.setattr(pseudonym, "_read_registry", _forbidden)
+        patched.setattr(pseudonym, "_registry_lock", _forbidden)
+        patched.setattr(pseudonym, "_atomic_write", _forbidden)
+        assert (
+            await _person(restarted, sender_id="member-0001", name="示例甲") == first
+        )
+
+
 # ── 失败红线 ──
 
 
@@ -312,6 +462,88 @@ async def test_replace_failure_keeps_old_map_and_prevents_send(
     second = await _person(pz, sender_id="member-0002", name="示例乙")
     assert second != first
     assert {first, second} <= set(_aliases(base).values())
+
+
+async def test_unexpected_commit_error_hides_original_message(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """意外异常只暴露类型：原始错误文本可能夹带真名、路径或 SDK 请求片段。"""
+    pz = _make(tmp_path / "reg")
+
+    def _failing_commit(
+        self: pseudonym.Pseudonymizer, batch: dict[str, pseudonym._AliasCode]
+    ) -> dict[str, str]:
+        raise RuntimeError("模拟失败：示例甲 的真实姓名")
+
+    with monkeypatch.context() as patched:
+        patched.setattr(pseudonym.Pseudonymizer, "_commit_sync", _failing_commit)
+        with pytest.raises(pseudonym.PseudonymError) as excinfo:
+            await _person(pz, sender_id="member-0001", name="示例甲")
+    message = str(excinfo.value)
+    assert "RuntimeError" in message
+    assert "示例甲" not in message
+    assert pz.commit_count == 0
+
+
+def test_flush_window_must_be_finite_and_bounded(tmp_path: Path) -> None:
+    """合并窗口非法值直接抛：nan/inf 会让 sleep 永不醒来。"""
+    for window in (-0.001, 30.001, float("nan"), float("inf"), float("-inf")):
+        with pytest.raises(ValueError):
+            pseudonym.Pseudonymizer(tmp_path / "bad", flush_window=window)
+    pseudonym.Pseudonymizer(tmp_path / "low", flush_window=0.0)
+    pseudonym.Pseudonymizer(tmp_path / "high", flush_window=pseudonym.MAX_FLUSH_WINDOW)
+
+
+async def test_stale_flush_batch_keeps_newer_batch_future(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """旧批次收尾时不能清掉新批次的 future：否则等它的调用方永远醒不来。"""
+    pz = _make(tmp_path / "reg")
+    loop = asyncio.get_running_loop()
+    stale: asyncio.Future[None] = loop.create_future()
+    newer: asyncio.Future[None] = loop.create_future()
+    pz._flush_future = stale
+    pz._pending = {"0" * 64: pseudonym._AliasCode("同学", "ABCDEF")}
+
+    started = threading.Event()
+    release = threading.Event()
+
+    def _blocking_commit(batch: dict[str, pseudonym._AliasCode]) -> dict[str, str]:
+        started.set()
+        release.wait(5.0)
+        return {digest: "同学ABCDEF" for digest in batch}
+
+    pz._commit_sync = _blocking_commit  # type: ignore[method-assign]
+    task = loop.create_task(pz._flush_batch(immediate=True))
+    assert await asyncio.to_thread(started.wait, 5.0)
+
+    # 旧批次还在线程里跑，此时新批次已经换上新 future
+    pz._flush_future = newer
+    release.set()
+    await task
+    assert pz._flush_future is newer
+    assert not newer.done()
+
+
+@pytest.mark.skipif(
+    sys.platform != "win32", reason="锁文件初始化只在 Windows 分支里读写字节"
+)
+def test_lock_file_init_os_error_is_lock_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """fstat/write 失败必须归一成锁错误：否则调用方会当成别的异常继续往下走。"""
+    lock_path = tmp_path / "mapping.lock"
+    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+
+        def _failing_fstat(*args: object, **kwargs: object) -> object:
+            raise OSError("模拟 fstat 失败")
+
+        monkeypatch.setattr(pseudonym.os, "fstat", _failing_fstat)
+        with pytest.raises(pseudonym.PseudonymLockError):
+            pseudonym._acquire_lock(fd, 0.05)
+    finally:
+        os.close(fd)
 
 
 def test_lock_contention_fails_closed(tmp_path: Path) -> None:
@@ -344,48 +576,130 @@ def test_lock_contention_fails_closed(tmp_path: Path) -> None:
     assert recovered.startswith(pseudonym.ALIAS_PERSON_PREFIX)
 
 
-def _corrupt_json(payload: dict[str, object]) -> str:
-    return "{not-valid-json"
+def _dump(payload: dict[str, object]) -> bytes:
+    return json.dumps(payload, ensure_ascii=False).encode("utf-8")
 
 
-def _corrupt_version(payload: dict[str, object]) -> str:
+def _only_alias(payload: dict[str, object]) -> tuple[dict[str, object], str]:
+    """取出注册表里唯一的条目（键与值都是文件里的原样内容）。"""
+    aliases = payload["aliases"]
+    assert isinstance(aliases, dict) and len(aliases) == 1
+    key = next(iter(aliases))
+    assert isinstance(key, str)
+    return aliases, key
+
+
+def _corrupt_json(payload: dict[str, object]) -> bytes:
+    return b"{not-valid-json"
+
+
+def _corrupt_version_number(payload: dict[str, object]) -> bytes:
     payload["version"] = 99
-    return json.dumps(payload, ensure_ascii=False)
+    return _dump(payload)
 
 
-def _corrupt_missing_salt(payload: dict[str, object]) -> str:
+def _corrupt_version_bool(payload: dict[str, object]) -> bytes:
+    # bool 是 int 的子类：`version: true` 用 `!=` 比较会等于 1 而混过版本校验
+    payload["version"] = True
+    return _dump(payload)
+
+
+def _corrupt_missing_salt(payload: dict[str, object]) -> bytes:
     payload.pop("salt", None)
-    return json.dumps(payload, ensure_ascii=False)
+    return _dump(payload)
 
 
-def _corrupt_bad_base64(payload: dict[str, object]) -> str:
+def _corrupt_bad_base64(payload: dict[str, object]) -> bytes:
     payload["salt"] = "!!!不是合法 base64!!!"
-    return json.dumps(payload, ensure_ascii=False)
+    return _dump(payload)
 
 
-def _corrupt_short_salt(payload: dict[str, object]) -> str:
+def _corrupt_short_salt(payload: dict[str, object]) -> bytes:
     payload["salt"] = base64.b64encode(b"too-short").decode("ascii")
-    return json.dumps(payload, ensure_ascii=False)
+    return _dump(payload)
 
 
-def _corrupt_aliases(payload: dict[str, object]) -> str:
+def _corrupt_aliases_not_object(payload: dict[str, object]) -> bytes:
     payload["aliases"] = ["不是对象"]
-    return json.dumps(payload, ensure_ascii=False)
+    return _dump(payload)
+
+
+def _corrupt_aliases_missing(payload: dict[str, object]) -> bytes:
+    # 缺字段当空表处理等于「注册表被清空也放行」：历史别名全部失效却没人报错
+    payload.pop("aliases", None)
+    return _dump(payload)
+
+
+def _corrupt_aliases_null(payload: dict[str, object]) -> bytes:
+    payload["aliases"] = None
+    return _dump(payload)
+
+
+def _corrupt_plaintext_alias(payload: dict[str, object]) -> bytes:
+    aliases, key = _only_alias(payload)
+    aliases[key] = "示例甲"
+    return _dump(payload)
+
+
+def _corrupt_digest_uppercase(payload: dict[str, object]) -> bytes:
+    aliases, key = _only_alias(payload)
+    value = aliases.pop(key)
+    aliases[key.upper()] = value
+    return _dump(payload)
+
+
+def _corrupt_digest_short(payload: dict[str, object]) -> bytes:
+    aliases, key = _only_alias(payload)
+    value = aliases.pop(key)
+    aliases[key[:62]] = value
+    return _dump(payload)
+
+
+def _corrupt_duplicate_alias(payload: dict[str, object]) -> bytes:
+    aliases, key = _only_alias(payload)
+    value = aliases[key]
+    spare = "0" * 64 if "0" * 64 not in aliases else "1" * 64
+    aliases[spare] = value
+    return _dump(payload)
+
+
+def _corrupt_kind_prefix_mismatch(payload: dict[str, object]) -> bytes:
+    """把人的别名改成群的合法别名：形态没问题，但与人这个 kind 不同域。"""
+    aliases, key = _only_alias(payload)
+    alias = aliases[key]
+    assert isinstance(alias, str)
+    aliases[key] = pseudonym.ALIAS_GROUP_PREFIX + alias[
+        len(pseudonym.ALIAS_PERSON_PREFIX) :
+    ]
+    return _dump(payload)
+
+
+def _corrupt_invalid_utf8(payload: dict[str, object]) -> bytes:
+    return b'{"version": 1, "salt": "\xff\xfe", "aliases": {}}'
 
 
 @pytest.mark.parametrize(
     "corrupt",
     [
         _corrupt_json,
-        _corrupt_version,
+        _corrupt_version_number,
+        _corrupt_version_bool,
         _corrupt_missing_salt,
         _corrupt_bad_base64,
         _corrupt_short_salt,
-        _corrupt_aliases,
+        _corrupt_aliases_not_object,
+        _corrupt_aliases_missing,
+        _corrupt_aliases_null,
+        _corrupt_plaintext_alias,
+        _corrupt_digest_uppercase,
+        _corrupt_digest_short,
+        _corrupt_duplicate_alias,
+        _corrupt_kind_prefix_mismatch,
+        _corrupt_invalid_utf8,
     ],
 )
 async def test_corrupt_salt_never_auto_rotates(
-    tmp_path: Path, corrupt: Callable[[dict[str, object]], str]
+    tmp_path: Path, corrupt: Callable[[dict[str, object]], bytes]
 ) -> None:
     base = tmp_path / "reg"
     pz = _make(base)
@@ -393,11 +707,13 @@ async def test_corrupt_salt_never_auto_rotates(
     registry_path = base / pseudonym.REGISTRY_FILE_NAME
     original = _registry_payload(base)
 
-    registry_path.write_text(corrupt(dict(original)), encoding="utf-8")
+    registry_path.write_bytes(corrupt(copy.deepcopy(original)))
     broken_bytes = registry_path.read_bytes()
 
-    with pytest.raises(pseudonym.PseudonymRegistryError):
+    with pytest.raises(pseudonym.PseudonymRegistryError) as excinfo:
         await _person(_make(base), sender_id="member-0001", name="示例甲")
+    # 错误文本只描述「哪一项不对」，不回显文件内容（明文姓名同样不能进日志）
+    assert "示例甲" not in str(excinfo.value)
     # 没有自动重盐：坏文件原样留在盘上，等人按规程恢复
     assert registry_path.read_bytes() == broken_bytes
 
@@ -406,6 +722,55 @@ async def test_corrupt_salt_never_auto_rotates(
         json.dumps(original, ensure_ascii=False, indent=1), encoding="utf-8"
     )
     assert await _person(_make(base), sender_id="member-0001", name="示例甲") == good
+
+
+def test_read_registry_rejects_non_alias_values(tmp_path: Path) -> None:
+    """读取层自己就要拒掉非别名值：不能只靠使用时的前缀复核兜底。"""
+    base = tmp_path / "reg"
+    pz = _make(base)
+    asyncio.run(_person(pz, sender_id="member-0001", name="示例甲"))
+    payload = _registry_payload(base)
+    aliases, key = _only_alias(payload)
+    aliases[key] = "示例甲"
+    registry_path = base / pseudonym.REGISTRY_FILE_NAME
+    registry_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+    with pytest.raises(pseudonym.PseudonymRegistryError) as excinfo:
+        pseudonym._read_registry(registry_path)
+    assert "形态异常的别名条目" in str(excinfo.value)
+    assert "示例甲" not in str(excinfo.value)
+
+
+async def test_version_error_does_not_echo_value(tmp_path: Path) -> None:
+    """版本字段可能被改写成敏感内容：错误里只能出现「不受支持」与路径。"""
+    base = tmp_path / "reg"
+    pz = _make(base)
+    await _person(pz, sender_id="member-0001", name="示例甲")
+    payload = _registry_payload(base)
+    marker = "敏感版本标记-DO-NOT-ECHO"
+    payload["version"] = marker
+    registry_path = base / pseudonym.REGISTRY_FILE_NAME
+    registry_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+    with pytest.raises(pseudonym.PseudonymRegistryError) as excinfo:
+        await _person(_make(base), sender_id="member-0001", name="示例甲")
+    message = str(excinfo.value)
+    assert marker not in message
+    assert "版本不受支持" in message
+    assert str(registry_path) in message
+
+
+async def test_registry_repr_exposes_only_entry_count(tmp_path: Path) -> None:
+    base = tmp_path / "reg"
+    pz = _make(base)
+    alias = await _person(pz, sender_id="member-0001", name="示例甲")
+    registry = pseudonym._read_registry(base / pseudonym.REGISTRY_FILE_NAME)
+
+    text = repr(registry)
+    assert text == f"<_Registry entries={len(registry.aliases)}>"
+    assert alias not in text
+    salt_b64 = base64.b64encode(registry.salt).decode("ascii")
+    assert salt_b64 not in text
 
 
 async def test_prepare_failure_counts_and_never_returns_plaintext(
@@ -610,3 +975,82 @@ async def test_last_display_name_wins_for_restore(tmp_path: Path) -> None:
     assert ctx.display_name_for(first, kind=pseudonym.KIND_PERSON) == "示例甲-改名"
     assert ctx.display_name_for(first, kind=pseudonym.KIND_GROUP) is None
     assert ctx.display_name_for("同学ZZZZZZ") is None
+
+
+async def test_restore_requires_whole_token(tmp_path: Path) -> None:
+    """只还原完整 token：被拼长、改小写、带杂后缀或丢前缀的片段原样保留并计失败。"""
+    pz = _make(tmp_path / "reg")
+    ctx = pseudonym.NameContext(pz)
+    known = await ctx.person_alias(
+        source="weflow",
+        sender_id="member-0001",
+        session_id="会话-0001",
+        display_name="示例甲",
+    )
+    code = known[len(pseudonym.ALIAS_PERSON_PREFIX) :]
+
+    # 中文紧邻照常还原：边界只排除 ASCII 词字符，汉字不算词字符
+    assert ctx.restore(f"由{known}发布", field="adjacent") == "由示例甲发布"
+    assert ctx.restore_failures == 0
+
+    rewritten = {
+        "extended": f"{known}G",  # 被拼长：不能只还原前半段
+        "lowercase": pseudonym.ALIAS_PERSON_PREFIX + "abcdef",  # 模型改成小写
+        "suffix_junk": f"{known}-1x",  # 后缀不是纯数字
+        "bare_suffix": f"{code}-1",  # 裸码带后缀
+    }
+    for field, text in rewritten.items():
+        assert ctx.restore(text, field=field) == text
+    assert ctx.restore_failures == len(rewritten)
+    assert _counters().get("ai.pseudonym.restore_failed|") == len(rewritten)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "同学ABCDEFG",  # 被拼长：只还原前半段会把后面的 G 留在原地
+        "同学abcdef",  # 模型改成小写
+        "同学ABCDEF-1x",  # 后缀不是纯数字
+    ],
+)
+async def test_restore_preserves_rewritten_alias_shapes(
+    tmp_path: Path, text: str
+) -> None:
+    """改写形态一律原样保留并计一次失败：不猜、不改写、不静默吞掉。"""
+    ctx = pseudonym.NameContext(_make(tmp_path / "reg"))
+    await ctx.person_alias(
+        source="weflow",
+        sender_id="member-0001",
+        session_id="会话-0001",
+        display_name="示例甲",
+    )
+    assert ctx.restore(text, field="subject") == text
+    assert ctx.restore_failures == 1
+    assert _counters().get("ai.pseudonym.restore_failed|") == 1
+
+
+async def test_restore_is_idempotent_within_one_request(tmp_path: Path) -> None:
+    """真实显示名可能形似别名：同一字段重复还原不得二次替换。"""
+    pz = _make(tmp_path / "reg")
+    ctx = pseudonym.NameContext(pz)
+    other = await ctx.person_alias(
+        source="weflow",
+        sender_id="member-0002",
+        session_id="会话-0001",
+        display_name="示例乙",
+    )
+    # 甲的显示名刚好是乙的别名：一次还原后的输出里仍含一个「已知别名」
+    one = await ctx.person_alias(
+        source="weflow",
+        sender_id="member-0001",
+        session_id="会话-0001",
+        display_name=other,
+    )
+    assert one != other
+
+    once = ctx.restore(f"由{one}发布", field="subject")
+    assert once == f"由{other}发布"
+    assert ctx.restore(once, field="subject") == once
+    assert ctx.restore_failures == 0
+    # 幂等判定按字段隔离：另一个字段拿到同样文本仍按首次处理
+    assert ctx.restore(once, field="quote") == "由示例乙发布"
