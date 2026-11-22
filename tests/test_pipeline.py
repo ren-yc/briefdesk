@@ -1678,5 +1678,174 @@ class TestEnrichStagesSingleFetch(_StageTestBase):
         assert calls.count("enrich") == 1, f"enrich 应仅获取一次: {calls}"
 
 
+class TestPseudonymRestoreReachesItems(_StageTestBase):
+    """还原后的展示字段真的进了 items 插入，原始消息的身份列仍是真名。
+
+    为什么在管道层再验一次：classify 单测只能证明 outcome 里的字段已还原，
+    下游 dedup 用的是自己的 title 回退与 build_item_input 口径——若还原发生在
+    入库之后（或只改了内部副本），卡片标题与关键词会长期停在化名上。
+
+    内存库 + 真实 insert_item：断言读回的行，而不是替身收到的参数。
+    """
+
+    async def test_restored_fields_land_in_inserted_item(self, tmp_path, monkeypatch):
+        import json as _json
+        from types import SimpleNamespace
+
+        from briefdesk import pseudonym
+        from briefdesk.db import insert_item as real_insert_item
+        from briefdesk.plugins.classify import engine as classify_engine
+
+        registry = pseudonym.Pseudonymizer(tmp_path / "pseudonym", flush_window=0.0)
+        monkeypatch.setattr(pseudonym, "get_pseudonymizer", lambda: registry)
+        monkeypatch.setattr(config, "ai_pseudonymize_names", "on")
+        monkeypatch.setattr(config, "ai_api_base", "https://api.example.invalid/v1")
+
+        msg = InternalMessage(
+            msg_id="m1",
+            content="活动通知：周五截止报名",
+            sender_name="张三",
+            sender_id="u1",
+            session_id="s",
+            group_name="社团群",
+            timestamp=1750000000,
+            source="weflow-legacy",
+        )
+        names = await classify_engine.prepare_name_context([msg])
+        sender_alias = names.senders[("id", "weflow-legacy", "u1")]
+
+        def _resp(content: str):
+            return SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        finish_reason="stop",
+                        message=SimpleNamespace(content=content),
+                    )
+                ]
+            )
+
+        async def fake_chat(*, messages, telemetry_kind, **_kwargs):
+            if telemetry_kind == "classify.sysb":
+                return _resp(
+                    _json.dumps(
+                        {
+                            "task": "classify",
+                            "data": [
+                                {
+                                    "index": 0,
+                                    "category": "活动通知",
+                                    "time": True,
+                                    "quote": f"{sender_alias}发布活动通知",
+                                    "key": [sender_alias],
+                                }
+                            ],
+                        }
+                    )
+                )
+            if telemetry_kind == "classify.sysc":
+                return _resp(
+                    _json.dumps(
+                        {
+                            "task": "times",
+                            "data": [
+                                {
+                                    "index": 0,
+                                    "times": [
+                                        {
+                                            "type": "end",
+                                            "time": "2026-08-15",
+                                            "label": sender_alias,
+                                        },
+                                        {
+                                            "type": "end",
+                                            "time": "2026-08-20",
+                                            "label": f"{sender_alias}二批",
+                                        },
+                                    ],
+                                }
+                            ],
+                        }
+                    )
+                )
+            return _resp(
+                _json.dumps(
+                    {
+                        "task": "summarize",
+                        "data": [
+                            {
+                                "index": 0,
+                                "summary": f"{sender_alias}招新",
+                                "subject": sender_alias,
+                            }
+                        ],
+                    }
+                )
+            )
+
+        _install_dedup_stage(_dedup_engine_mock())
+        _install_merge_stage()
+        stages.register_stage(
+            _classify_stage(lambda msgs: classify_engine.classify_batch(msgs))
+        )
+        raw_insert = AsyncMock()
+
+        db = await aiosqlite.connect(":memory:")
+        db.row_factory = aiosqlite.Row
+        await init_schema(db)
+        try:
+            with _pipeline_patches(
+                raw_insert=raw_insert, insert_item=real_insert_item
+            ), patch(
+                "briefdesk.plugins.classify.engine.chat",
+                new=AsyncMock(side_effect=fake_chat),
+            ), patch(
+                "briefdesk.plugins.classify.engine.get_enabled_categories",
+                new=AsyncMock(
+                    return_value=[
+                        {
+                            "name": "活动通知",
+                            "prompt": "",
+                            "color": "",
+                            "enabled": 1,
+                        }
+                    ]
+                ),
+            ), patch("briefdesk.db.get_db", new=AsyncMock(return_value=db)):
+                ok = await process_all_batches(
+                    [msg], _pipeline_client(), batch_size=10, origin="test"
+                )
+            cursor = await db.execute(
+                "SELECT title, key_info, subject, sender_name, source_group,"
+                " source_msg_id, extra_times FROM items"
+            )
+            rows = await cursor.fetchall()
+        finally:
+            await db.close()
+
+        assert ok
+        assert len(rows) == 1
+        item = rows[0]
+        # 展示字段：真名，且没有化名残留
+        assert item["title"] == "张三招新"
+        assert item["key_info"] == "张三"
+        assert item["subject"] == "张三"
+        assert _json.loads(item["extra_times"]) == [
+            {"type": "end", "time": "2026-08-20", "label": "张三二批"}
+        ]
+        assert sender_alias not in _json.dumps(dict(item), ensure_ascii=False)
+        # 身份列仍是真名（假名只改出站副本）
+        assert item["sender_name"] == "张三"
+        assert item["source_group"] == "社团群"
+        assert item["source_msg_id"] == "m1"
+        # raw 落库与内存里的消息对象都没有被化名覆盖
+        raw_rows = raw_insert.await_args.args[0]
+        assert [r["sender_name"] for r in raw_rows] == ["张三"]
+        assert [r["group_name"] for r in raw_rows] == ["社团群"]
+        assert msg.sender_name == "张三"
+        assert msg.group_name == "社团群"
+        assert msg.sender_id == "u1"
+        assert msg.session_id == "s"
+
+
 if __name__ == "__main__":
     unittest.main()

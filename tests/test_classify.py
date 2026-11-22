@@ -8,6 +8,7 @@
 
 import io
 import json
+import re
 import time
 import unittest
 from types import SimpleNamespace
@@ -17,6 +18,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 from PIL import Image
 
+from briefdesk import pseudonym
 from briefdesk.announcements import (
     announce,
     get_announcements,
@@ -44,6 +46,7 @@ from briefdesk.plugins.classify.engine import (
     build_system_prompt,
     classify_batch,
     extract_times,
+    prepare_name_context,
     summarize_results,
 )
 from briefdesk.types import ClassifyResult, InternalMessage
@@ -789,7 +792,7 @@ class ApplyTimesTest(unittest.TestCase):
         assert r.extra_times == []
 
 
-class SendDateAnchorTest(unittest.TestCase):
+class SendDateAnchorTest(unittest.IsolatedAsyncioTestCase):
     """消息发送时刻锚定：分类输入按每条消息的发送时刻（精确到分钟）标注。"""
 
     @staticmethod
@@ -817,11 +820,15 @@ class SendDateAnchorTest(unittest.TestCase):
         expected_at = time.strftime("%Y-%m-%d %H:%M", time.localtime(1750000000))
         assert f" [{expected_at}]: 明天下午3点" in msg
 
-    def test_missing_timestamp_omits_bracket(self):
-        groups = _group_messages([self._msg(0)])
-        msg = _build_user_message(groups)
-        assert "[" not in msg.split(":", 1)[1]  # 冒号后无时刻标注
-        assert "张三: 明天下午3点" in msg
+    async def test_missing_timestamp_omits_bracket(self):
+        # 显式关闭出站改名：这条断言钉的是「不改名时 prompt 文本逐字节不变」，
+        # 不能靠默认配置碰巧是本地端点/off 才成立。
+        msg = self._msg(0)
+        with patch.object(config, "ai_pseudonymize_names", "off"):
+            groups = _group_messages([msg], names=await prepare_name_context([msg]))
+        built = _build_user_message(groups)
+        assert "[" not in built.split(":", 1)[1]  # 冒号后无时刻标注
+        assert "张三: 明天下午3点" in built
 
     def test_hand_built_groups_without_sent_at_still_work(self):
         # 直接构造的 group（无 sentAt 字段）不崩溃、不加括号
@@ -1190,12 +1197,16 @@ class TestExtractTimes:
             ]
         )
 
-    def test_build_user_message_filters_by_time_indexes(self):
+    async def test_build_user_message_filters_by_time_indexes(self):
         results = [
             ClassifyResult(msg_index=0, category="活动通知"),
             ClassifyResult(msg_index=1, category="交易"),
         ]
-        msg = _build_time_user_message(results, [0], [self._msg("讲座")])
+        # 显式关闭出站改名：断言钉的是「不改名时发送者原样进 prompt」。
+        msg = self._msg("讲座")
+        with patch.object(config, "ai_pseudonymize_names", "off"):
+            names = await prepare_name_context([msg])
+        msg = _build_time_user_message(results, [0], [msg], names)
         assert "0: 张三" in msg
         assert "1:" not in msg  # time=true 才进
 
@@ -1332,7 +1343,7 @@ class TestExtractTimes:
         assert results[1].start == "2026-03-15 14:00"
 
 
-class BatchBudgetTruncationTest(unittest.TestCase):
+class BatchBudgetTruncationTest(unittest.IsolatedAsyncioTestCase):
     """整批字符预算超限时整条剔除并报告被截 index（防静默丢失）。"""
 
     @staticmethod
@@ -1371,11 +1382,12 @@ class BatchBudgetTruncationTest(unittest.TestCase):
         msg = _build_user_message(self._groups(["你好"]))
         assert "0: A: 你好" in msg
 
-    def test_sender_and_group_names_masked_in_user_message(self):
+    async def test_sender_and_group_names_masked_in_user_message(self):
         """分类 user prompt 的昵称/群名不得携带明文 PII（构造层已统一脱敏）。
 
         消息走 InternalMessage 构造（生产同源），群头与发送者名以掩码形态
-        进入最终 user 消息——合成邮箱不再经分类输入外发。
+        进入最终 user 消息——合成邮箱不再经分类输入外发。出站改名显式关闭：
+        这条断言描述的是「替换关掉时的掩码口径」。
         """
         from briefdesk.types import InternalMessage
 
@@ -1388,17 +1400,20 @@ class BatchBudgetTruncationTest(unittest.TestCase):
             group_name="群group-review@example.invalid",
             timestamp=1750000000,
         )
-        built, truncated = _build_user_message_ex(_group_messages([msg]))
+        with patch.object(config, "ai_pseudonymize_names", "off"):
+            groups = _group_messages([msg], names=await prepare_name_context([msg]))
+        built, truncated = _build_user_message_ex(groups)
         assert truncated == []
         assert "sender-review@example.invalid" not in built
         assert "group-review@example.invalid" not in built
         assert "[EMAIL]" in built
 
-    def test_same_masked_group_names_stay_separate_groups(self):
+    async def test_same_masked_group_names_stay_separate_groups(self):
         """分组键是会话身份而非群名：掩码后同形的两个会话不得并组。
 
         两个群名嵌不同邮箱时掩码后同形；分组若按群名，同批的两个会话会被
-        放进同一群头，模型收到混淆的会话上下文。
+        放进同一群头，模型收到混淆的会话上下文。出站改名显式关闭：这里要
+        看的是掩码值，不是化名。
         """
         from briefdesk.types import InternalMessage
 
@@ -1422,7 +1437,10 @@ class BatchBudgetTruncationTest(unittest.TestCase):
                 timestamp=1750000001,
             ),
         ]
-        groups = _group_messages(messages)
+        with patch.object(config, "ai_pseudonymize_names", "off"):
+            groups = _group_messages(
+                messages, names=await prepare_name_context(messages)
+            )
         assert len(groups) == 2
         # 群头显示掩码后的群名（两处都掩成同一占位符），而非 source:session_id 组合键
         assert all(g["groupName"] == "群[EMAIL]" for g in groups)
@@ -1465,6 +1483,7 @@ class TestClassifyBatchTruncationFailed:
             ]
         )
         with (
+            patch.object(config, "ai_pseudonymize_names", "off"),
             patch(
                 "briefdesk.plugins.classify.engine.chat",
                 new=AsyncMock(return_value=resp),
@@ -1556,7 +1575,11 @@ class TestVisionClassify:
 
     def _run(self, msgs, chat_side_effect, vision_images=None):
         chat = AsyncMock(side_effect=chat_side_effect)
-        with patch("briefdesk.plugins.classify.engine.chat", new=chat), patch(
+        # 出站改名关掉：本类断言的是 vision 请求形状，不是姓名形态；开着会让
+        # prompt 文本随安装级注册表漂移，也把准备阶段的落盘带进这些用例。
+        with patch.object(config, "ai_pseudonymize_names", "off"), patch(
+            "briefdesk.plugins.classify.engine.chat", new=chat
+        ), patch(
             "briefdesk.plugins.classify.engine.summarize_results", new=AsyncMock()
         ), patch(
             "briefdesk.plugins.classify.engine.extract_times", new=AsyncMock()
@@ -1604,7 +1627,9 @@ class TestVisionClassify:
     def test_per_message_cap_truncates_images(self):
         imgs = [self._jpeg() for _ in range(3)]
         chat = AsyncMock(return_value=self._resp("stop", self._json(0)))
-        with patch("briefdesk.plugins.classify.engine.chat", new=chat), patch(
+        with patch.object(config, "ai_pseudonymize_names", "off"), patch(
+            "briefdesk.plugins.classify.engine.chat", new=chat
+        ), patch(
             "briefdesk.plugins.classify.engine.summarize_results", new=AsyncMock()
         ), patch(
             "briefdesk.plugins.classify.engine.extract_times", new=AsyncMock()
@@ -1722,3 +1747,378 @@ class CosineSharedImplementationTest(unittest.TestCase):
 
         assert cosine_similarity([0.0, 0.0], [1.0, 2.0]) == 0.0
         assert cosine_similarity([1.0, 2.0], [0.0, 0.0]) == 0.0
+
+
+# ── 出站姓名假名化与入站还原 ──
+# 远端 auto 下 sysb 的群头/发送者与 sysc 的发送者都是化名；模型把这套化名抄回
+# quote/key/summary/subject/label 时，落库前必须还原成真名。本地端点或 off 时
+# prompt 文本与未接入假名化时逐字节一致。
+
+_ALIAS_SHAPE_RE = re.compile(r"(?:同学|群)[A-Z2-7]{6}(?:-\d+)?")
+
+
+@pytest.fixture
+def pseudo_registry(tmp_path, monkeypatch):
+    """远端 auto + 用例独立注册表（0 秒合并窗口）。
+
+    注册表按安装级盐派生化名：共用会话级注册表会让断言依赖用例执行顺序，而
+    合并窗口会把新身份的落盘等待带进每个用例，所以这里按用例新建一个实例。
+    """
+    instance = pseudonym.Pseudonymizer(tmp_path / "pseudonym", flush_window=0.0)
+    monkeypatch.setattr(pseudonym, "get_pseudonymizer", lambda: instance)
+    monkeypatch.setattr(config, "ai_pseudonymize_names", "auto")
+    monkeypatch.setattr(config, "ai_api_base", "https://api.example.invalid/v1")
+    return instance
+
+
+def _chat_response(content: str):
+    return SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                finish_reason="stop", message=SimpleNamespace(content=content)
+            )
+        ]
+    )
+
+
+def _pseudo_msg(
+    *,
+    msg_id: str = "m1",
+    sender_name: str = "张三",
+    sender_id: str = "u1",
+    session_id: str = "s1",
+    group_name: str = "社团群",
+    content: str = "活动通知：周五截止报名",
+    timestamp: int = 1750000000,
+) -> InternalMessage:
+    return InternalMessage(
+        msg_id=msg_id,
+        content=content,
+        sender_name=sender_name,
+        sender_id=sender_id,
+        session_id=session_id,
+        group_name=group_name,
+        timestamp=timestamp,
+        source="weflow-legacy",
+    )
+
+
+class TestPseudonymOutbound:
+    """出站两处落点（sysb 群头/发送者、sysc 发送者）只消费已准备映射。"""
+
+    async def test_remote_auto_replaces_names_and_keeps_pii_out(self, pseudo_registry):
+        msg = _pseudo_msg(
+            sender_name="张sender-review@example.invalid",
+            group_name="群group-review@example.invalid",
+        )
+        names = await prepare_name_context([msg])
+        assert names.ctx.enabled
+        sender_alias = names.senders[("id", "weflow-legacy", "u1")]
+        group_alias = names.groups[("weflow-legacy", "s1")]
+        assert _ALIAS_SHAPE_RE.fullmatch(sender_alias), sender_alias
+        assert _ALIAS_SHAPE_RE.fullmatch(group_alias), group_alias
+        assert sender_alias.startswith("同学")
+        assert group_alias.startswith("群")
+
+        built = _build_user_message(_group_messages([msg], names=names))
+        assert f"群 0: {group_alias}" in built
+        assert f"0: {sender_alias} [" in built
+        # 原展示名（含掩码前的 PII）一个字符都不再进 prompt
+        assert "sender-review@example.invalid" not in built
+        assert "group-review@example.invalid" not in built
+        assert "[EMAIL]" not in built
+
+    async def test_same_sender_id_uses_same_alias_in_sysb_and_sysc(
+        self, pseudo_registry
+    ):
+        # 同一 sender_id 跨两个会话：身份键不含 session，化名必须是同一个；
+        # sysb 与 sysc 复用同一份映射，模型才能把两次请求里的人对上号。
+        first = _pseudo_msg(msg_id="m1", session_id="sess-a")
+        second = _pseudo_msg(msg_id="m2", session_id="sess-b")
+        names = await prepare_name_context([first, second])
+        sender_alias = names.senders[("id", "weflow-legacy", "u1")]
+
+        sysb = _build_user_message(_group_messages([first, second], names=names))
+        results = [
+            ClassifyResult(msg_index=0, category="活动通知"),
+            ClassifyResult(msg_index=1, category="活动通知"),
+        ]
+        sysc = _build_time_user_message(results, [0, 1], [first, second], names)
+        assert sysb.count(sender_alias) == 2
+        assert sysc.count(sender_alias) == 2
+        assert "张三" not in sysb
+        assert "张三" not in sysc
+
+    async def test_same_group_name_in_two_sessions_keeps_distinct_aliases(
+        self, pseudo_registry
+    ):
+        # 群身份键有 session_id 时不以群名为主键：同名的两个会话不得共用一个
+        # 化名（合并会让模型把一个群的通知当成另一个群的上下文）。
+        first = _pseudo_msg(msg_id="m1", session_id="sess-a", group_name="同名群")
+        second = _pseudo_msg(
+            msg_id="m2", session_id="sess-b", group_name="同名群", sender_id="u2"
+        )
+        names = await prepare_name_context([first, second])
+        alias_a = names.groups[("weflow-legacy", "sess-a")]
+        alias_b = names.groups[("weflow-legacy", "sess-b")]
+        assert alias_a != alias_b
+        groups = _group_messages([first, second], names=names)
+        assert len(groups) == 2
+        assert [g["groupName"] for g in groups] == [alias_a, alias_b]
+
+    async def test_local_endpoint_keeps_prompt_byte_identical(self):
+        # 本地端点（auto 的关闭分支）：映射返回原值，两处 prompt 与不传映射时
+        # 逐字节一致——本机不出网，改名只会让本地输入无谓漂移。
+        msg = _pseudo_msg()
+        with patch.object(config, "ai_api_base", "http://127.0.0.1:11434/v1"):
+            names = await prepare_name_context([msg])
+        assert not names.ctx.enabled
+        assert names.groups[("weflow-legacy", "s1")] == "社团群"
+        assert names.senders[("id", "weflow-legacy", "u1")] == "张三"
+        assert _build_user_message(_group_messages([msg], names=names)) == (
+            _build_user_message(_group_messages([msg]))
+        )
+        results = [ClassifyResult(msg_index=0, category="活动通知")]
+        assert _build_time_user_message(results, [0], [msg], names) == (
+            _build_time_user_message(results, [0], [msg])
+        )
+        assert names.ctx.restore("同学ABCDEF 通知", field="x") == "同学ABCDEF 通知"
+
+    async def test_off_policy_with_remote_endpoint_keeps_prompt_byte_identical(self):
+        # 强制 off + 远端：与本地端点同一分支，prompt 不变、不产生落盘。
+        msg = _pseudo_msg()
+        with patch.object(config, "ai_pseudonymize_names", "off"):
+            names = await prepare_name_context([msg])
+        assert not names.ctx.enabled
+        assert _build_user_message(_group_messages([msg], names=names)) == (
+            _build_user_message(_group_messages([msg]))
+        )
+
+
+class TestPseudonymRestore:
+    """入站还原：只改自由文本字段，结构化字段与原始消息不动。"""
+
+    async def test_summary_and_subject_with_alias_are_restored(self, pseudo_registry):
+        msg = _pseudo_msg()
+        names = await prepare_name_context([msg])
+        sender_alias = names.senders[("id", "weflow-legacy", "u1")]
+        results = [ClassifyResult(msg_index=0, category="活动通知")]
+        payload = json.dumps(
+            {
+                "task": "summarize",
+                "data": [
+                    {
+                        "index": 0,
+                        "summary": f"{sender_alias}招新",
+                        "subject": sender_alias,
+                    }
+                ],
+            }
+        )
+        with patch(
+            "briefdesk.plugins.classify.engine.chat",
+            new=AsyncMock(return_value=_chat_response(payload)),
+        ):
+            await summarize_results(results, [msg], names)
+        assert results[0].summary == "张三招新"
+        assert results[0].subject == "张三"
+        assert names.ctx.restore_failures == 0
+
+    async def test_quote_and_key_alias_restored_at_parse(self, pseudo_registry):
+        msg = _pseudo_msg()
+        names = await prepare_name_context([msg])
+        sender_alias = names.senders[("id", "weflow-legacy", "u1")]
+        payload = json.dumps(
+            {
+                "task": "classify",
+                "data": [
+                    {
+                        "index": 0,
+                        "category": "活动通知",
+                        "quote": f"{sender_alias}发布活动通知",
+                        "key": [sender_alias, "活动"],
+                    }
+                ],
+            }
+        )
+        results, retry, _times, _obs = _parse_response(
+            payload, {"活动通知"}, 1, contents=None, ctx=names.ctx
+        )
+        assert retry == []
+        assert results[0].quote == "张三发布活动通知"
+        assert results[0].key_info == "张三, 活动"
+        # 结构化字段不动
+        assert results[0].category == "活动通知"
+        assert results[0].msg_index == 0
+
+    async def test_rewritten_alias_kept_and_counted_once(self, pseudo_registry):
+        # 模型把化名抄成小写：冻结模块不模糊猜测，原样保留并计一次失败；
+        # 同一字段重复兜底不重复计数，失败也不会退化成真名。
+        msg = _pseudo_msg()
+        names = await prepare_name_context([msg])
+        sender_alias = names.senders[("id", "weflow-legacy", "u1")]
+        rewritten = sender_alias.lower()
+        payload = json.dumps(
+            {
+                "task": "classify",
+                "data": [
+                    {
+                        "index": 0,
+                        "category": "活动通知",
+                        "quote": f"{rewritten}发布",
+                    }
+                ],
+            }
+        )
+        results, _retry, _times, _obs = _parse_response(
+            payload, {"活动通知"}, 1, contents=None, ctx=names.ctx
+        )
+        assert results[0].quote == f"{rewritten}发布"
+        assert "张三" not in results[0].quote
+        assert names.ctx.restore_failures == 1
+        # 幂等兜底再跑一遍：不重复计数
+        again = names.ctx.restore(results[0].quote, field="sysb.quote[0]")
+        assert again == results[0].quote
+        assert names.ctx.restore_failures == 1
+
+    async def test_classify_batch_restores_every_display_field(self, pseudo_registry):
+        msg = _pseudo_msg()
+        names = await prepare_name_context([msg])
+        sender_alias = names.senders[("id", "weflow-legacy", "u1")]
+        group_alias = names.groups[("weflow-legacy", "s1")]
+        prompts: dict[str, str] = {}
+
+        async def fake_chat(*, messages, telemetry_kind, **_kwargs):
+            prompts[telemetry_kind] = messages[1]["content"]
+            if telemetry_kind == "classify.sysb":
+                return _chat_response(
+                    json.dumps(
+                        {
+                            "task": "classify",
+                            "data": [
+                                {
+                                    "index": 0,
+                                    "category": "活动通知",
+                                    "time": True,
+                                    "quote": f"{sender_alias}发布活动通知",
+                                    "key": [sender_alias],
+                                }
+                            ],
+                        }
+                    )
+                )
+            if telemetry_kind == "classify.sysc":
+                return _chat_response(
+                    json.dumps(
+                        {
+                            "task": "times",
+                            "data": [
+                                {
+                                    "index": 0,
+                                    "times": [
+                                        {
+                                            "type": "end",
+                                            "time": "2026-08-15",
+                                            "label": sender_alias,
+                                        },
+                                        {
+                                            "type": "end",
+                                            "time": "2026-08-20",
+                                            "label": f"{sender_alias}二批",
+                                        },
+                                    ],
+                                }
+                            ],
+                        }
+                    )
+                )
+            return _chat_response(
+                json.dumps(
+                    {
+                        "task": "summarize",
+                        "data": [
+                            {
+                                "index": 0,
+                                "summary": f"{sender_alias}招新",
+                                "subject": sender_alias,
+                            }
+                        ],
+                    }
+                )
+            )
+
+        with patch(
+            "briefdesk.plugins.classify.engine.chat",
+            new=AsyncMock(side_effect=fake_chat),
+        ), patch(
+            "briefdesk.plugins.classify.engine.get_enabled_categories",
+            new=AsyncMock(
+                return_value=[
+                    {"name": "活动通知", "prompt": "", "color": "", "enabled": 1}
+                ]
+            ),
+        ):
+            outcome = await classify_batch([msg])
+
+        # 出站：三次请求都只见化名
+        assert sender_alias in prompts["classify.sysb"]
+        assert group_alias in prompts["classify.sysb"]
+        assert "张三" not in prompts["classify.sysb"]
+        assert "社团群" not in prompts["classify.sysb"]
+        assert sender_alias in prompts["classify.sysc"]
+        assert "张三" not in prompts["classify.sysc"]
+        assert "张三" not in prompts["summarize.classify"]
+
+        result = outcome.results[0]
+        assert result.quote == "张三发布活动通知"
+        assert result.key_info == "张三"
+        assert result.summary == "张三招新"
+        assert result.subject == "张三"
+        assert result.end == "2026-08-15"
+        assert result.extra_times == [
+            {"type": "end", "time": "2026-08-20", "label": "张三二批"}
+        ]
+        # 原始消息对象不被改写
+        assert msg.sender_name == "张三"
+        assert msg.group_name == "社团群"
+        assert msg.sender_id == "u1"
+        assert msg.session_id == "s1"
+
+    async def test_prepare_failure_fails_batch_without_sending(self, monkeypatch):
+        # 准备失败＝这批不能出境：整批进 failed 回填重试，一次 AI 调用都不发，
+        # 绝不退回真名；prepare_failed 只记一次（失败点在冻结模块里）。
+        from briefdesk import telemetry
+        from briefdesk.pseudonym import PseudonymError
+
+        class _Broken:
+            async def alias_for(self, *_args, **_kwargs):
+                raise PseudonymError("registry unavailable")
+
+        telemetry.reset_for_tests()
+        monkeypatch.setattr(pseudonym, "get_pseudonymizer", lambda: _Broken())
+        monkeypatch.setattr(config, "ai_pseudonymize_names", "on")
+        chat = AsyncMock()
+        with patch(
+            "briefdesk.plugins.classify.engine.chat", new=chat
+        ), patch(
+            "briefdesk.plugins.classify.engine.get_enabled_categories",
+            new=AsyncMock(
+                return_value=[
+                    {"name": "活动通知", "prompt": "", "color": "", "enabled": 1}
+                ]
+            ),
+        ):
+            outcome = await classify_batch([_pseudo_msg(), _pseudo_msg(msg_id="m2")])
+        assert outcome.results == []
+        assert outcome.failed == [0, 1]
+        chat.assert_not_awaited()
+        counters = telemetry.snapshot()["counters"]
+        # 群名与发送者各失败一次（两处准备），classify 不再补记——补记会变成 3。
+        assert (
+            sum(
+                v
+                for k, v in counters.items()
+                if k.startswith("ai.pseudonym.prepare_failed")
+            )
+            == 2
+        )

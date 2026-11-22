@@ -9,10 +9,11 @@ import base64
 import logging
 import re
 import time
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from difflib import SequenceMatcher
 
 from briefdesk import announcements
+from briefdesk.ai_egress import is_local_endpoint
 from briefdesk.ai_ports import (
     chat,
     cosine_similarity,
@@ -23,6 +24,11 @@ from briefdesk.ai_ports import (
 from briefdesk.config import config
 from briefdesk.db import CategoryRow, get_enabled_categories
 from briefdesk.plugin.base import ChatResponse
+from briefdesk.pseudonym import (
+    NameContext,
+    PseudonymError,
+    pseudonymize_enabled,
+)
 from briefdesk.types import (
     ClassifyObservation,
     ClassifyOutcome,
@@ -132,9 +138,124 @@ def _local_datetime(ts: object) -> str:
         return ""
 
 
+def _sender_identity_key(msg: InternalMessage) -> tuple[str, ...]:
+    """发送者在批内的展示名映射键。
+
+    有 sender_id 时键里只有 `(source, sender_id)`：同一个人改名或换会话仍是同一
+    化名，与冻结模块的人身份键口径一致。没有 ID 时退回 `(source, session_id,
+    显示名)`——这是 best-effort，仅保证同一批内同源同会话同名的人用同一化名。
+    """
+    sender_id = (msg.sender_id or "").strip()
+    if sender_id:
+        return ("id", msg.source or "", sender_id)
+    return ("name", msg.source or "", msg.session_id, msg.sender_name or "")
+
+
+@dataclass(frozen=True)
+class PreparedNames:
+    """一次分类请求的出站展示名（化名）与请求级逆映射上下文。
+
+    `ctx` 带别名 → 显示名的逆映射，两个映射是同步 builder 的唯一输入：builder
+    因此不做 I/O、不 await，也不会在构建 prompt 时把新别名卡在半登记状态。
+
+    映射键刻意不是消息下标：`length` 截断会把同一批拆成子请求，子请求只拿到
+    切片后的消息列表，按下标索引的映射会整体错位。
+    """
+
+    ctx: NameContext
+    groups: dict[tuple[str, str], str]
+    senders: dict[tuple[str, ...], str]
+
+    def group_name(self, msg: InternalMessage) -> str:
+        """该消息所属会话在 prompt 里的群名（未准备时回退原值）。"""
+        return self.groups.get((msg.source or "", msg.session_id), msg.group_name)
+
+    def sender_name(self, msg: InternalMessage) -> str:
+        """该消息发送者在 prompt 里的显示名（未准备时回退原值）。"""
+        return self.senders.get(_sender_identity_key(msg), msg.sender_name)
+
+
+async def prepare_name_context(messages: list[InternalMessage]) -> PreparedNames:
+    """准备本批出站展示名与请求级逆映射上下文（在任何 AI 调用之前）。
+
+    为什么必须在发送前一次性准备：新别名要先落盘才允许出境（否则进程崩溃后
+    模型见过的别名再也对不上号），而 sysb/sysc/摘要三次请求必须共用同一份请求内
+    逆映射——各自准备时，一次请求见过的别名在另一次请求里就是未知 token，还原
+    会静默留下化名。
+
+    并发 gather 而不是逐条 await：冻结模块对新身份有不超过数秒的合并落盘窗口，
+    串行 await 会让每个新身份各等一个窗口，批越大准备阶段越慢；同批身份共享
+    一次落盘才有「一次窗口」的延迟。gather 之后按输入顺序再走一遍（此时全是
+    内存缓存命中）以钉住「同身份多个显示名取最后一个」这个还原目标口径——并发
+    完成顺序不确定，靠它自己做不到。
+
+    判定只看主通道端点：classify 只走 `config.ai_api_base`，按备用通道或其它
+    代理条件判定会得出与真实发送目标相反的结论。
+
+    失败抛 `PseudonymError`：调用方按整批失败处理，绝不退回真名或重试明文。
+    """
+    enabled = pseudonymize_enabled(
+        config.ai_pseudonymize_names,
+        remote_endpoint=not is_local_endpoint(config.ai_api_base),
+    )
+    ctx = NameContext(enabled=enabled)
+
+    group_names: dict[tuple[str, str], str] = {}
+    sender_names: dict[tuple[str, ...], str] = {}
+    sender_msgs: dict[tuple[str, ...], InternalMessage] = {}
+    for msg in messages:
+        group_names.setdefault((msg.source or "", msg.session_id), msg.group_name)
+        sender_key = _sender_identity_key(msg)
+        sender_msgs.setdefault(sender_key, msg)
+        sender_names.setdefault(sender_key, msg.sender_name)
+
+    if not enabled:
+        # 关闭时不做任何准备：映射值就是原值（含未清洗的空白），builder 产出的
+        # prompt 文本与未接入假名化时逐字节一致，也不产生任何读盘或 await。
+        return PreparedNames(ctx=ctx, groups=group_names, senders=sender_names)
+
+    group_aliases, sender_aliases = await asyncio.gather(
+        asyncio.gather(
+            *(
+                ctx.group_alias(
+                    source=source, session_id=session_id, group_name=group_name
+                )
+                for (source, session_id), group_name in group_names.items()
+            )
+        ),
+        asyncio.gather(
+            *(
+                ctx.person_alias(
+                    source=msg.source or "",
+                    sender_id=msg.sender_id or "",
+                    session_id=msg.session_id,
+                    display_name=msg.sender_name or "",
+                )
+                for msg in sender_msgs.values()
+            )
+        ),
+    )
+    groups = dict(zip(group_names, group_aliases, strict=True))
+    senders = dict(zip(sender_msgs, sender_aliases, strict=True))
+
+    # 同身份多个显示名：按输入顺序再走一遍（全是缓存命中），把还原目标钉在
+    # 最后一个非空显示名上。并发完成顺序不确定，这一遍不能省。
+    for msg in messages:
+        if not senders.get(_sender_identity_key(msg)):
+            continue
+        await ctx.person_alias(
+            source=msg.source or "",
+            sender_id=msg.sender_id or "",
+            session_id=msg.session_id,
+            display_name=msg.sender_name or "",
+        )
+    return PreparedNames(ctx=ctx, groups=groups, senders=senders)
+
+
 def _group_messages(
     messages: list[InternalMessage],
     vision_images: dict[tuple[str, str], list[bytes]] | None = None,
+    names: PreparedNames | None = None,
 ) -> list[dict]:
     groups: dict[tuple[str, str], dict] = {}
     images_by_msg = vision_images or {}
@@ -144,11 +265,17 @@ def _group_messages(
         # 错误并进同一群头，模型收到混淆的会话上下文。群名只作群头显示。
         key = (msg.source or "", msg.session_id)
         if key not in groups:
-            groups[key] = {"groupName": msg.group_name, "messages": []}
+            groups[key] = {
+                "groupName": names.group_name(msg) if names is not None else msg.group_name,
+                "messages": [],
+            }
         groups[key]["messages"].append(
             {
                 "index": i,
-                "senderName": msg.sender_name or "未知",
+                # 展示名只从已准备好的映射取值：本函数是同步的，不能在这里
+                # await 别名准备，也不能读盘（否则首次出站前落盘承诺会被绕过）。
+                "senderName": (names.sender_name(msg) if names is not None else msg.sender_name)
+                or "未知",
                 "content": msg.content,
                 "sentAt": _local_datetime(msg.timestamp),
                 # vision 路由：enrich 阶段暂存的归一化图片字节（vision 关闭
@@ -544,6 +671,7 @@ def _parse_response(
     count: int,
     contents: list[str] | None = None,
     ambiguous_out: list[int] | None = None,
+    ctx: NameContext | None = None,
 ) -> tuple[
     list[ClassifyResult], list[int], list[int], list[ClassifyObservation]
 ]:
@@ -560,6 +688,9 @@ def _parse_response(
     - observations：per-instance 判定观察记录（include/exclude/uncertain），
       供观察型阶段插件（benchmark recorder）在真实处理时点采集微调数据。
     结构错误/越界 index 仍会抛异常，由调用方按整批失败处理。
+
+    `ctx` 非空时只还原自由文本（quote/key）里的别名，category/msg_index 等
+    结构化字段原样保留：改结构化字段会破坏分类校验与回填定位。
     """
     json_text = content.strip()
     if json_text.startswith("```"):
@@ -660,17 +791,23 @@ def _parse_response(
             )
             continue
 
+        # quote 是自由文本：先还原别名，再做索引漂移守卫。顺序不能反——守卫
+        # 拿模型引文与原文（真名）逐字比对，带着别名的引文会凭空掉字符，多消息
+        # 批会被判成「标到别人头上」而白跑一轮重试。
+        quote_val = item.get("quote", "")
+        if not isinstance(quote_val, str):
+            # AI 脏输出可能给数字/dict 型 quote，直接传给
+            # _norm_align_text（re.sub）会抛 TypeError → 整批本轮抛弃，
+            # 模型持续脏输出时会话陷入重试循环。收敛为 str 后走正常判定。
+            quote_val = "" if quote_val is None else str(quote_val)
+        if ctx is not None:
+            quote_val = ctx.restore(quote_val, field=f"sysb.quote[{msg_index}]")
+
         # 索引漂移守卫（第一关·字面）：quote 与自己内容明显不符而与
         # 其他消息更吻合 → 转重试；平票模糊条目记入 ambiguous_out，
         # 由 _classify_once 调第二关（语义裁判）复核
         if contents is not None:
-            quote_raw = item.get("quote", "") or ""
-            if not isinstance(quote_raw, str):
-                # AI 脏输出可能给数字/dict 型 quote，直接传给
-                # _norm_align_text（re.sub）会抛 TypeError → 整批本轮抛弃，
-                # 模型持续脏输出时会话陷入重试循环。收敛为 str 后走正常判定。
-                quote_raw = str(quote_raw)
-            verdict = _char_quote_verdict(quote_raw, msg_index, contents)
+            verdict = _char_quote_verdict(quote_val, msg_index, contents)
             if verdict is False:
                 logger.warning(
                     "quote 与内容不对齐（疑似 index 漂移，index %s），"
@@ -697,7 +834,10 @@ def _parse_response(
             key_info = key_raw.strip()
         else:
             key_info = ""
-        quote_val = item.get("quote", "")
+        if ctx is not None:
+            # 关键词同样是模型产出的自由文本：join 之后再还原，别名是完整
+            # token，分隔符不会切开它。
+            key_info = ctx.restore(key_info, field=f"sysb.key[{msg_index}]")
         results.append(
             ClassifyResult(
                 msg_index=msg_index,
@@ -807,11 +947,16 @@ def _build_summary_user_message(
     return "\n".join(parts)
 
 
-def _parse_summary_response(content: str) -> dict[int, dict[str, str]]:
+def _parse_summary_response(
+    content: str, ctx: NameContext | None = None
+) -> dict[int, dict[str, str]]:
     """解析概括 JSON → {index: {"summary": ..., "subject": ...}}；整体非法返回空 dict。
 
     容错从宽：单条缺失/非法只跳过该条，不因个别脏项丢弃整批；
     summary 与 subject 任一非空即记录（缺省字段留空，调用方按需回退）。
+
+    `ctx` 非空时把标题与主体里的别名还原成显示名：模型会把 prompt 里的化名抄进
+    标题/主体，不还原就会把化名写进卡片标题。
     """
     text = content.strip()
     if text.startswith("```"):
@@ -835,18 +980,26 @@ def _parse_summary_response(content: str) -> dict[int, dict[str, str]]:
         summary = " ".join(s.strip().split()) if isinstance(s, str) and s.strip() else ""
         subject = subj.strip() if isinstance(subj, str) else ""
         if summary or subject:
+            if ctx is not None:
+                summary = ctx.restore(summary, field=f"summary.summary[{idx}]")
+                subject = ctx.restore(subject, field=f"summary.subject[{idx}]")
             out[idx] = {"summary": summary, "subject": subject}
     return out
 
 
 async def summarize_results(
-    results: list[ClassifyResult], messages: list[InternalMessage]
+    results: list[ClassifyResult],
+    messages: list[InternalMessage],
+    names: PreparedNames | None = None,
 ) -> None:
     """对分类结果批量生成简洁标题与主体（subject），填充 result.summary / result.subject
     （尽力而为）。
 
     失败只记 WARNING 并保持 summary/subject 为空（dedup 阶段回退
     msg.content[:50] 作标题），不阻塞入库，也不影响消息的 processed 标记。
+
+    `names` 携带本批的请求级逆映射：摘要回填的标题/主体必须还原成真名再交给
+    下游入库，否则化名会随卡片标题长期留在本地库里。
     """
     if not results:
         return
@@ -873,7 +1026,7 @@ async def summarize_results(
     if resp.choices[0].finish_reason == "length":
         logger.warning("标题概括输出被截断（回退默认标题）")
         return
-    parsed = _parse_summary_response(content)
+    parsed = _parse_summary_response(content, names.ctx if names is not None else None)
     filled = 0
     for r in results:
         got = parsed.get(r.msg_index)
@@ -930,10 +1083,13 @@ def _build_time_user_message(
     results: list[ClassifyResult],
     time_indexes: list[int],
     messages: list[InternalMessage],
+    names: PreparedNames | None = None,
 ) -> str:
     """构建时间提取 user 消息：只含 time=true 的消息行（index/发送者/时刻/内容）。
 
     与分类输入同构（行首 index + [发送时刻] 标注），sysc 据此做相对时间锚定。
+    发送者取同一份已准备映射：与 sysb 对同一 sender_id 得到同一化名，模型才能
+    把两次请求里的同一个人对上号。
     """
     parts: list[str] = []
     for r in results:
@@ -949,19 +1105,29 @@ def _build_time_user_message(
         if len(content) > _TIME_MAX_MSG_CHARS:
             content = content[:_TIME_MAX_MSG_CHARS] + "…"
         sent_at = _local_datetime(msg.timestamp) if msg is not None else ""
-        sender = (msg.sender_name if msg is not None else "未知") or "未知"
+        if msg is None:
+            sender = "未知"
+        elif names is not None:
+            sender = names.sender_name(msg) or "未知"
+        else:
+            sender = msg.sender_name or "未知"
         anchor = f" [{sent_at}]" if sent_at else ""
         parts.append(f"{r.msg_index}: {sender}{anchor}: {content}")
     return "\n".join(parts)
 
 
-def _parse_times_response(content: str) -> dict[int, list[dict]] | None:
+def _parse_times_response(
+    content: str, ctx: NameContext | None = None
+) -> dict[int, list[dict]] | None:
     """解析时间提取 JSON → {index: [{"type","time","label"}, ...]}。
 
     解析失败返回 None，合法空产出返回 {}：`{"task":"times","data":[]}` 是
     「模型答了、但没有时间点」，而纯文本、错 task 外壳、`data` 不是列表都是
     「输出不可解析」——两者混成同一个 {} 会让影子汇总把解析失败记成「模型确实
     没给时间」，系统性低估规则解析器的替换收益。单条脏项只跳过该条。
+
+    `ctx` 非空时还原 label：label 是自由文本（任务名），时间点本身是结构化
+    字段，不参与还原。
     """
     text = content.strip()
     if text.startswith("```"):
@@ -1003,6 +1169,10 @@ def _parse_times_response(content: str) -> dict[int, list[dict]] | None:
             elif not isinstance(label, str):
                 label = str(label)
             label = " ".join(label.split())[:_MAX_TIME_LABEL_LEN]
+            if ctx is not None and label:
+                # 先截断再还原：截断可能切掉别名 token，那种情况还原不了，
+                # 冻结模块会按「抄错了别名」计一次失败，原样保留截断后的文本。
+                label = ctx.restore(label, field=f"sysc.label[{idx}]")
             cleaned.append({"type": ttype, "time": time_val, "label": label})
         out[idx] = cleaned
     return out
@@ -1041,13 +1211,14 @@ async def _extract_times_core(
     time_indexes: list[int],
     messages: list[InternalMessage],
     depth: int,
+    names: PreparedNames | None = None,
 ) -> None:
     """时间提取单次尝试；length 截断时按时间索引拆半递归重试（尽力而为）。
 
     影子采集覆盖全部出口（成功/异常/空响应/截断到底）：sysc 失败样本正是
     解析器最该顶上的分母，只采成功路径会系统性高估解析器的替换收益。
     """
-    user_message = _build_time_user_message(results, time_indexes, messages)
+    user_message = _build_time_user_message(results, time_indexes, messages, names)
     if not user_message.strip():
         return
     try:
@@ -1087,10 +1258,14 @@ async def _extract_times_core(
             )
             return
         mid = len(time_indexes) // 2
-        await _extract_times_core(results, time_indexes[:mid], messages, depth - 1)
-        await _extract_times_core(results, time_indexes[mid:], messages, depth - 1)
+        await _extract_times_core(
+            results, time_indexes[:mid], messages, depth - 1, names
+        )
+        await _extract_times_core(
+            results, time_indexes[mid:], messages, depth - 1, names
+        )
         return
-    times_map = _parse_times_response(content)
+    times_map = _parse_times_response(content, names.ctx if names is not None else None)
     if times_map is None:
         # 必须提前 return：_apply_times_to_results 会直接 .get()，None 会在下一行
         # 抛 AttributeError——而这条路径本该是「留空继续」，不是整批失败。
@@ -1175,15 +1350,45 @@ async def extract_times(
     results: list[ClassifyResult],
     time_indexes: list[int],
     messages: list[InternalMessage],
+    names: PreparedNames | None = None,
 ) -> None:
     """对分类标记 time=true 的消息批量提取 start/end/times（sysc，尽力而为）。
 
     独立 max_tokens 预算（_TIME_MAX_TOKENS）+ 截断拆半重试；
     最终失败只记 WARNING 并保持 start/end/extra_times 为空，不阻塞入库。
+    `names` 与 sysb 共用同一份已准备映射与逆映射上下文。
     """
     if not results or not time_indexes:
         return
-    await _extract_times_core(results, time_indexes, messages, _TIME_SPLIT_DEPTH)
+    await _extract_times_core(
+        results, time_indexes, messages, _TIME_SPLIT_DEPTH, names
+    )
+
+
+def _restore_result_text(results: list[ClassifyResult], ctx: NameContext) -> None:
+    """入站兜底还原：只碰自由文本字段，同一字段幂等。
+
+    白名单兜底存在的理由：解析点已经各还原过一次（sysb quote/key、摘要
+    summary/subject、时间 label），但拆半重试的子请求、摘要回填等路径可能漏掉
+    某次还原，而下游 dedup 一旦把化名写进 items，卡片标题与关键词就会长期停在
+    化名上。这里按字段路径再跑一遍：同一字段同一输入直接复用上次输出，重复
+    还原不会二次改写，也不会重复计失败（冻结模块按字段去重）。
+
+    结构化字段（category/msg_index/start/end）与身份列一律不动：模型改不动
+    msg_index 与身份列，把这些字段纳入还原只会制造「回填定位错乱」。
+    """
+    if not ctx.enabled:
+        return
+    for r in results:
+        idx = r.msg_index
+        r.key_info = ctx.restore(r.key_info, field=f"sysb.key[{idx}]")
+        r.quote = ctx.restore(r.quote, field=f"sysb.quote[{idx}]")
+        r.summary = ctx.restore(r.summary, field=f"summary.summary[{idx}]")
+        r.subject = ctx.restore(r.subject, field=f"summary.subject[{idx}]")
+        for t in r.extra_times:
+            label = t.get("label")
+            if isinstance(label, str) and label:
+                t["label"] = ctx.restore(label, field=f"sysc.label[{idx}]")
 
 
 async def classify_batch(
@@ -1202,21 +1407,45 @@ async def classify_batch(
         # 整批标记 processed，即使重新启用类别也无法回填（永久丢失）。
         raise RuntimeError("没有启用的类别，拒绝空分类（避免整批误标记 processed）")
 
+    # 出站姓名准备一次、在三次请求（sysb/sysc/摘要）之间共用：失败即这批不能
+    # 出境——按既有整批失败路径返回（结果空 + 全部进 failed，下轮回填），绝不
+    # 退回真名、也不重试明文。准备失败的遥测由冻结模块在失败点记一次，这里
+    # 不重复记（重复记会把一次失败放大成两条）。
+    try:
+        names = await prepare_name_context(messages)
+    except PseudonymError as e:
+        logger.warning(
+            "姓名假名化准备失败，本批保留待回填（不发送明文）: %s", e
+        )
+        return ClassifyOutcome(
+            [],
+            list(range(len(messages))),
+            observations=_error_observations(messages, 0),
+        )
+
     outcome = await _classify_once(
-        messages, cats, offset=0, depth=_MAX_SPLIT_DEPTH, vision_images=vision_images
+        messages,
+        cats,
+        offset=0,
+        depth=_MAX_SPLIT_DEPTH,
+        vision_images=vision_images,
+        names=names,
     )
 
     # 第二步与第三步并行：时间提取（sysc，写 start/end/extra_times）与
     # 标题概括（写 summary/subject）字段互不重叠、均为尽力而为（各自内部
     # 吞异常回退默认），gather 并发执行把分类后延迟从两次往返压到 max(两次)。
+    # 两者都与 sysb 共用同一份请求级逆映射：别名是在 sysb 请求里见到的，只有
+    # 同一上下文才能把它们还原回真名。
     if outcome.results:
         tasks: list = []
         if outcome.time_indexes:
             tasks.append(
-                extract_times(outcome.results, outcome.time_indexes, messages)
+                extract_times(outcome.results, outcome.time_indexes, messages, names)
             )
-        tasks.append(summarize_results(outcome.results, messages))
+        tasks.append(summarize_results(outcome.results, messages, names))
         await asyncio.gather(*tasks)
+        _restore_result_text(outcome.results, names.ctx)
     return outcome
 
 
@@ -1226,8 +1455,9 @@ async def _classify_once(
     offset: int,
     depth: int,
     vision_images: dict[tuple[str, str], list[bytes]] | None = None,
+    names: PreparedNames | None = None,
 ) -> ClassifyOutcome:
-    groups = _group_messages(messages, vision_images)
+    groups = _group_messages(messages, vision_images, names)
     user_message, budget_dropped = _build_user_message_ex(groups)
     image_parts = _build_image_parts(groups, set(budget_dropped))
     had_images = bool(image_parts)
@@ -1314,7 +1544,9 @@ async def _classify_once(
     # finish_reason == "length" 表示输出触达 max_tokens 上限被硬截断，
     # 生成的 JSON 大概率不完整：拆半后作为两个独立请求递归重试。
     if resp.choices[0].finish_reason == "length":
-        return await _split_retry(messages, cats, offset, depth, vision_images)
+        return await _split_retry(
+            messages, cats, offset, depth, vision_images, names
+        )
 
     if not content:
         logger.warning("AI 返回空响应（本轮抛弃，下轮回填）")
@@ -1329,6 +1561,7 @@ async def _classify_once(
         results, retry_indexes, time_indexes, observations = _parse_response(
             content, {c["name"] for c in cats}, len(messages),
             [m.content for m in messages], ambiguous,
+            names.ctx if names is not None else None,
         )
     except (RuntimeError, TypeError) as e:
         # 结构错误/越界 index 等：拆半无益，本轮抛弃，下轮回填
@@ -1395,12 +1628,15 @@ async def _split_retry(
     offset: int,
     depth: int,
     vision_images: dict[tuple[str, str], list[bytes]] | None = None,
+    names: PreparedNames | None = None,
 ) -> ClassifyOutcome:
     """length 截断：按数量对半，作为两个独立请求顺序递归重试。
 
     不可再拆（单条消息 / 达深度上限）时本轮抛弃（返回 failed），
     由 pipeline 跳过 processed 标记、回填窗口内自动重试。
     vision_images 按消息身份作键，切片递归无需搬移，整 dict 透传即可。
+    已准备的姓名映射同样整份透传：它的键是会话/发送者身份而不是消息下标，
+    切片后仍然指得对。
     """
     if depth <= 0 or len(messages) <= 1:
         logger.warning(
@@ -1420,9 +1656,11 @@ async def _split_retry(
         mid,
         len(messages) - mid,
     )
-    left = await _classify_once(messages[:mid], cats, offset, depth - 1, vision_images)
+    left = await _classify_once(
+        messages[:mid], cats, offset, depth - 1, vision_images, names
+    )
     right = await _classify_once(
-        messages[mid:], cats, offset + mid, depth - 1, vision_images
+        messages[mid:], cats, offset + mid, depth - 1, vision_images, names
     )
     return ClassifyOutcome(
         left.results + right.results,
