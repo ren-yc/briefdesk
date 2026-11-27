@@ -435,6 +435,8 @@ SSE 实时监听，指数退避 + 抖动自动重连（退避参数由 `WeFlowLe
 
 **回填 SELECT 以既有 chunk 内容优先**（`COALESCE(c.content, r.content)`）：raw_messages 在管道入口（OCR 之前）落库，实时索引写入的是 OCR 增强文本；换模型重嵌入时若用原文覆盖会抹掉 OCR 文本，纯图片消息的原文还是占位符（`_indexable` 为假 → 登记 `rag_skipped`），旧向量永不更新。**落库单一出口 `_persist_chunks`**：实时批次（`run`）与历史回填（`backfill_step`）共用同一串「`upsert_chunks` → `_fts_enabled` 时 `sync_fts` → 向量走专用连接 `upsert_embeddings`」，令「入了 chunks 却漏同步 FTS」在结构上不可能发生——那种漏同步不报任何错，只让 FTS 索引与 chunks 静默分叉、检索少一条腿，且维护循环的反连接补不回来（它只看向量缺失，不看 FTS）。`model` 由调用方传入而非在方法内现取：回填的反连接谓词已按某个 model 值筛过行，落库必须写同一个值，否则下轮又把这批选回来空转；返回「是否写入了向量」供 `run` 决定要不要触发自愈回填。
 
+回填经 `_persist_chunks` 向 `upsert_chunks` 传入 `sender_id_fill_only=True`，冲突时仅填空身份；实时路径保留非空新身份覆盖旧值的语义，两条路径都不让空输入擦掉已知身份。嵌入等待在锁外，回填快照的非空身份也可能落后于实时重索引，单纯保护空输入仍会把较新的身份换回旧值（回归：`test_backfill_only_fills_identity_after_realtime_reindex`、`test_upsert_preserves_known_sender_id`、`test_backfill_preserves_ocr_item_and_watermark`）。
+
 回填/维护循环写路径（chunks/FTS/skipped 落主连接、GC）**持 pipeline 存储锁**（嵌入等网络调用在锁外），共享 embed 连接的读写统一持 `db.get_embed_lock()`——与 dedup 的向量落库共用同一条连接，防一方 commit 把另一方未完成的批量写提前提交；向量缓存刷新对**维度漂移**做对账（以缓存维度为基准，不一致行按脏行删除、由回填按当前维度重嵌入收敛；批内自洽但整体与缓存不同 = 供应商全局换维度，视同模型切换整表重建）——否则矩阵重组抛 inhomogeneous shape、ask 持续 500。维护循环休眠期可被 reindex/降级自愈经 `_kick_event` 唤醒立即执行回填（而非等满一个维护间隔）。守卫：`tests/test_rag_plugin.py` 的 `RagBackfillTest` 断言回填后 FTS 与 chunks 等同且关键词检索真能命中、占位符行不阻塞预算窗口。
 
 检索=向量缓存（created_at 水位增量填充、解析在工作线程、模型切换/GC 行数回退整表重建）+FTS 双路 RRF 融合→拒答门（无 FTS 命中且 top1 余弦 < min_score 即 None）；**查询嵌入失败降级**：嵌入端点故障时不再整体拒答，降级 FTS-only（关键词可命中的问题仍可回答，日志 WARNING 标注）；回答强制 `[n]` 引用（未标注回退全部证据）并按 JSON 契约输出（`ask` 的引用语义：JSON 契约给出 `citations` 列表即以其为准——空列表 = 无依据，不回退；仅无 JSON 契约的纯文本回答才回退 `[n]` 正则、再回退全部证据，此为有意的兼容行为；空 choices/空答案按拒答返回而非伪装成正常回答；编号只收 int（排除 bool）、整数值浮点（JSON 模式下部分供应商把整数输出为 1.0）与纯数字字符串）（`{"answer","citations"}`——deepseek 系 `json_object` 强制模式的兼容契约，引擎双态解析，纯文本供应商回退正则），证据块压平换行防伪造、单条超长截断（`RAG_EVIDENCE_CHARS`，默认 600，截断以「…」标注），system prompt 含防指令注入条款。
@@ -810,9 +812,9 @@ All via `.env` file, with an additional UI-staged overlay layer (see 「配置�
 
 ## 出站假名化与还原
 
-展示名假名化（name pseudonymization，`AI_PSEUDONYMIZE_NAMES`）只替换指定 prompt 位置的群名与发送者名，别名注册表不可用时整批拒绝出站而不退回真名。
+展示名假名化（name pseudonymization，`AI_PSEUDONYMIZE_NAMES`）只替换指定 prompt 位置的群名与发送者名，需要读写的别名注册表不可用时整批拒绝出站而不退回真名。
 
-开关默认 `auto` 且留空等同 `auto`，本地或远端由供应商声明的目的地决定（内置供应商按生效端点的 URL 判定），请求与注册表契约如下。
+开关默认 `auto` 且显式留空等同 `auto`，省略键仍沿配置解析链取值，项目 `.env` 优先于暂存层，删键不等于重置为 `auto`。本地或远端由供应商声明的目的地决定（内置供应商按生效端点的 URL 判定），请求与注册表契约如下。
 
 - `auto` 仅在生效端点为远端时替换（回归：`test_remote_auto_replaces_names_and_keeps_pii_out`、`test_evidence_names_kept_for_local_endpoint`）。
 - `on` 强制替换，包括本地端点（回归：`test_restored_history_round_trip_respects_pseudonymization`）。
@@ -826,7 +828,7 @@ All via `.env` file, with an additional UI-staged overlay layer (see 「配置�
 - RAG 在假名化生效时丢弃客户端回传的非空历史并记录 `rag.history_dropped`，历史只用于页面展示，防止上一轮还原出的真名再次外发；本地 `auto` 或 `off` 沿用原有的裁剪规则传递历史，注入 prompt 前仅保留最近 6 条，每条内容最多 200 字符（回归：`test_restored_history_round_trip_respects_pseudonymization`、`test_history_trimmed_over_cap`）。
 - 注册表读入拒绝重复 JSON 键、顶层键集合不恰为 `version` / `salt` / `aliases`、非整数或布尔版本，任一不满足即整批拒绝出站（回归：`test_read_registry_rejects_duplicate_keys`、`test_read_registry_requires_exact_fields`、`test_read_registry_requires_integer_version`）。
 - 注册表用 `os.replace` 原子替换，POSIX 随后对父目录执行 `fsync`，目录同步失败仍按写盘失败拒绝出站；失败后同一实例上的重试会强制重写一次并重新同步，确认持久后才发布别名——否则「盘上已有该摘要」会让重试跳过同步、把从未确认持久的别名发出去，崩溃后别名与映射对不上。该确认状态只是实例内存里的旗标，新实例无法继承（生产入口按目录复用实例，正常重试路径走同一实例）；Windows 只承诺原子可见性，不承诺目录项在崩溃后的持久性（回归：`test_atomic_write_directory_fsync_failure_is_write_error`、`test_atomic_write_windows_skips_directory_fsync`、`test_directory_fsync_failure_retry_rewrites_before_publishing`）。
-- 网络路由按目标收口：内置供应商的本地端点客户端设置 `trust_env=False` 与 `follow_redirects=False`，防止未假名化的本地请求经环境代理或重定向转发至远端；远端端点保留 SDK 默认的环境代理、`SSL_CERT_FILE` 自定义 CA 与重定向行为（回归：`test_http_clients_ignore_proxy_env`、`test_http_clients_never_follow_local_to_remote_redirects`、`test_http_clients_preserve_remote_sdk_defaults`）。
+- 网络路由按目标收口：内置供应商的本地端点客户端设置 `trust_env=False` 与 `follow_redirects=False`，防止未假名化的本地请求经环境代理或重定向转发至远端；显式传入 `verify=httpx.create_ssl_context(trust_env=True)` 仅继承 `SSL_CERT_FILE` / `SSL_CERT_DIR` 的 CA，避免禁代理同时破坏本地 HTTPS 验证。远端端点保留 SDK 默认的环境代理、环境 CA 与重定向行为（回归：`test_http_clients_local_https_uses_env_ca_without_proxy`、`test_http_clients_ignore_proxy_env`、`test_http_clients_never_follow_local_to_remote_redirects`、`test_http_clients_preserve_remote_sdk_defaults`）。
 - **维护位置**：安装级注册表在用户数据目录 `pseudonym/mapping.json`（盐与「完整哈希 → 别名」同文件原子提交），请求级逆映射只在 `NameContext` 内存里，不落盘、不进日志。
 - **准备序**：分类分批判的展示名在**任何 AI 调用之前**一次性并发准备，sysb / sysc / 摘要三次请求共用同一份请求内逆映射；准备失败整批进 failed 回填，不发明文也不重试明文。
 - RAG 证据中的新身份并发准备，共享一次注册表提交，避免逐个等待新身份的落盘窗口（回归：`test_new_identities_share_exactly_one_commit_increment`）。
@@ -839,7 +841,7 @@ All via `.env` file, with an additional UI-staged overlay layer (see 「配置�
 - 幂等只在单次请求内保证（`NameContext` 用完即弃），跨请求不做去重或缓存复用。
 - 保护范围是「本请求写回过的显示名」的完整文本区间，不是实体识别：显示名之外与被改写过的别名仍按启发式处理。
 - 假名化生效时，展示名的还原目标统一为「该身份在本请求内最后一次非空显示名」，人与群同规则；空显示名不作为还原目标，同名多条消息按最终名字还原（回归：`test_same_sender_id_uses_same_alias_in_sysb_and_sysc`）。
-- 还原后的引用、标题与摘要可能含真名，随后续嵌入或判官请求原样出站；判官 prompt 本就包含原文，属于「正文原样外发」的既有暴露面，不是本机制新增的暴露面（还原回归：`test_quote_and_key_alias_restored_at_parse`；后续发送路径见 `briefdesk/plugins/dedup/engine.py` 与 `briefdesk/plugins/merge/engine.py`）。
+- 还原后的标题与摘要会作为后续判官与重排的输入出站（dedup 传正文与标题、merge 传标题与摘要），与「正文原样外发」同面；引用（quote）不在此列——远端语义对齐的嵌入请求只收模型原始摘录与正文，还原值仅用于本地字面对齐与展示，否则只在群头出现的姓名会被本地映射「补」进远端嵌入请求，构成新增暴露（回归：`test_semantic_judge_embeds_raw_alias_quote`、`test_quote_and_key_alias_restored_at_parse`；后续发送路径见 `briefdesk/plugins/dedup/plugin.py` 与 `briefdesk/plugins/merge/plugin.py`）。
 - 消息源采集客户端遵循环境代理属于部署面行为，不在 AI 出站网络收口范围内，客户端构造见 `briefdesk/plugins/weflow_legacy/client.py`、`briefdesk/plugins/weflow/runtime.py` 与 `briefdesk/plugins/qqflow/runtime.py`；AI 收口回归为 `test_http_clients_ignore_proxy_env`。
 
 ### 出境与排队指标
