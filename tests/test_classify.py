@@ -315,16 +315,6 @@ class ParseResponseTest(unittest.TestCase):
         assert [r.msg_index for r in results] == [0]
         assert retry == []
 
-    def test_quote_empty_skips_guard(self):
-        # 字面关：无 quote（未提供）不触发守卫，避免过度拒收
-        results, retry, _times, _obs = _parse_response(
-            '[{"index":0,"include":true,"category":"活动通知","quote":""}]',
-            self.ALLOWED, 1,
-            contents=["摄影社下周三下午3点面试"],
-        )
-        assert [r.msg_index for r in results] == [0]
-        assert retry == []
-
     def test_quote_non_string_tolerated(self):
         # AI 脏输出给数字/dict 型 quote，此前 _norm_align_text
         # （re.sub）抛 TypeError → 整批本轮抛弃；现收敛为 str 走正常判定。
@@ -361,6 +351,30 @@ class ParseResponseTest(unittest.TestCase):
         assert [r.msg_index for r in results] == [0]
         assert 1 in retry
         assert 2 in retry
+
+
+@pytest.mark.parametrize(
+    "quote",
+    [False, 0, 0.0, {}, None, "", []],
+    ids=[
+        "false", "zero", "zero-float", "empty-dict", "none",
+        "empty-string", "empty-list",
+    ],
+)
+def test_quote_empty_skips_guard(quote, monkeypatch):
+    # 空引文按缺省值跳过字面关；先字符串化会把 False/0/空容器当成内容，
+    # 反复误判漂移，阻塞正常卡片。0.0 也属假值：按空串处理而不是 "0.0"。
+    monkeypatch.setattr(config, "ai_pseudonymize_names", "off")
+    results, retry, _times, _obs = _parse_response(
+        json.dumps(
+            [{"index": 0, "include": True, "category": "活动通知", "quote": quote}]
+        ),
+        ParseResponseTest.ALLOWED, 1,
+        contents=["摄影社下周三下午3点面试"],
+    )
+    assert [result.msg_index for result in results] == [0]
+    assert results[0].quote == ""
+    assert retry == []
 
 
 class BuildSystemPromptTest(unittest.TestCase):
@@ -721,6 +735,37 @@ class TimesResponseTest(unittest.TestCase):
             '{"task":"times","data":[{"index":0,"times":[{"type":"start","time":"2026-08-15 10:00:30","label":""}]}]}'
         )
         assert parsed == {0: []}
+
+
+async def test_time_label_restored_before_length_cap(pseudo_registry):
+    # 完整别名跨过原始长度上限时，先截断会切碎 token；还原成短真名后
+    # 本可完整展示，不能留下半截化名或误计模型还原失败。
+    msg = _pseudo_msg()
+    names = await prepare_name_context([msg])
+    sender_alias = names.sender_name(msg)
+    prefix = "活动" * 18
+    labels = [f"{prefix}{sender_alias}", f"{prefix}{sender_alias}" + "长" * 10]
+    payload = json.dumps(
+        {
+            "task": "times",
+            "data": [
+                {
+                    "index": 0,
+                    "times": [
+                        {"type": "end", "time": "2026-08-15", "label": label}
+                        for label in labels
+                    ],
+                }
+            ],
+        }
+    )
+    parsed = _parse_times_response(payload, names.ctx)
+    assert parsed is not None
+    assert parsed[0][0]["label"] == prefix + "张三"
+    assert len(parsed[0][0]["label"]) == 38
+    assert parsed[0][1]["label"] == (prefix + "张三" + "长" * 10)[:40]
+    assert len(parsed[0][1]["label"]) == 40
+    assert names.ctx.restore_failures == 0
 
 
 class ApplyTimesTest(unittest.TestCase):
@@ -2096,7 +2141,10 @@ class TestPseudonymOutbound:
         # 本地端点（auto 的关闭分支）：映射返回原值，两处 prompt 与不传映射时
         # 逐字节一致——本机不出网，改名只会让本地输入无谓漂移。
         msg = _pseudo_msg()
-        with patch.object(config, "ai_api_base", "http://127.0.0.1:11434/v1"):
+        # 同时固定 auto，避免宿主的 on 误报失败、off 绕过端点策略判断。
+        with patch.object(
+            config, "ai_api_base", "http://127.0.0.1:11434/v1"
+        ), patch.object(config, "ai_pseudonymize_names", "auto"):
             names = await prepare_name_context([msg])
         assert not names.ctx.enabled
         assert names.groups == {}
@@ -2179,13 +2227,71 @@ class TestPseudonymRestore:
         assert results[0].category == "活动通知"
         assert results[0].msg_index == 0
 
-    async def test_rewritten_alias_kept_and_counted_once(self, pseudo_registry):
+    async def test_semantic_judge_embeds_raw_alias_quote(self, pseudo_registry):
+        # 两条正文无姓名且字面平票，必须实际走语义裁判；若读取已还原的
+        # 展示引文，就会把仅在群头出现的真名补进远端嵌入请求。
+        messages = [
+            _pseudo_msg(content="活动通知"),
+            _pseudo_msg(msg_id="m2", content="活动通知"),
+        ]
+        contents = [message.content for message in messages]
+        names = await prepare_name_context(messages)
+        sender_alias = names.sender_name(messages[0])
+        display_name = names.ctx.display_name_for(sender_alias, kind="person")
+        assert display_name == "张三"
+        raw_quote = f"{sender_alias}发布活动通知"
+        payload = json.dumps(
+            {
+                "task": "classify",
+                "data": [
+                    {"index": 0, "category": "活动通知", "quote": raw_quote},
+                    {"index": 1, "include": False},
+                ],
+            }
+        )
+        embeddings = AsyncMock(return_value=[[1.0, 0.0]] * 3)
+        with patch(
+            "briefdesk.plugins.classify.engine.chat",
+            new=AsyncMock(
+                side_effect=[
+                    _chat_response(payload),
+                    _chat_response('{"task":"summarize","data":[]}'),
+                ]
+            ),
+        ), patch(
+            "briefdesk.plugins.classify.engine.get_enabled_categories",
+            new=AsyncMock(
+                return_value=[
+                    {"name": "活动通知", "prompt": "", "color": "", "enabled": 1}
+                ]
+            ),
+        ), patch(
+            "briefdesk.plugins.classify.engine.is_embedding_enabled", return_value=True
+        ), patch("briefdesk.plugins.classify.engine.embed_texts", new=embeddings):
+            outcome = await classify_batch(messages)
+
+        embeddings.assert_awaited_once_with([raw_quote, *contents])
+        embedding_payload = embeddings.await_args.args[0]
+        assert sender_alias in embedding_payload[0]
+        assert all(display_name not in text for text in embedding_payload)
+        assert embedding_payload[1:] == contents == ["活动通知", "活动通知"]
+        assert [message.content for message in messages] == contents
+        assert [result.msg_index for result in outcome.results] == [0]
+        assert outcome.results[0].quote == f"{display_name}发布活动通知"
+        assert outcome.failed == []
+
+    async def test_rewritten_alias_kept_and_counted_once(
+        self, pseudo_registry, monkeypatch
+    ):
         # 模型把化名抄成小写：冻结模块不模糊猜测，原样保留并计一次失败；
         # 同一字段重复兜底不重复计数，失败也不会退化成真名。
+        # 固定含字母的短码；随机纯数字短码 lower() 不变，会漏测模型改写。
+        monkeypatch.setattr(pseudonym, "_short_code", lambda _digest: "ABCDEF")
         msg = _pseudo_msg()
         names = await prepare_name_context([msg])
         sender_alias = names.senders[("id", "weflow-legacy", "u1")]
         rewritten = sender_alias.lower()
+        assert rewritten != sender_alias
         payload = json.dumps(
             {
                 "task": "classify",
@@ -2323,6 +2429,8 @@ class TestPseudonymRestore:
                 raise PseudonymError("registry unavailable")
 
         telemetry.reset_for_tests()
+        # 计数断言主动开启遥测，避免宿主关闭遥测时将正确失败路径误报为漏计。
+        monkeypatch.setattr(config, "telemetry_enabled", True)
         monkeypatch.setattr(pseudonym, "get_pseudonymizer", lambda: _Broken())
         monkeypatch.setattr(config, "ai_pseudonymize_names", "on")
         chat = AsyncMock()

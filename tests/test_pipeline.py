@@ -1791,8 +1791,8 @@ class TestPseudonymRestoreReachesItems(_StageTestBase):
 
         db = await aiosqlite.connect(":memory:")
         db.row_factory = aiosqlite.Row
-        await init_schema(db)
         try:
+            await init_schema(db)
             with _pipeline_patches(
                 raw_insert=raw_insert, insert_item=real_insert_item
             ), patch(

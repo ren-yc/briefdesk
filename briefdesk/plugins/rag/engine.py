@@ -233,6 +233,8 @@ class RagEngine:
         emb_items: list[tuple[str, str]],
         emb_vecs: list[list[float]],
         model: str,
+        *,
+        sender_id_fill_only: bool = False,
     ) -> bool:
         """落库唯一出口：chunks → FTS 同步 → 向量（专用连接）。
 
@@ -248,7 +250,7 @@ class RagEngine:
         db.get_embed_lock()——dedup 的向量落库共用同一条连接，语句级互斥
         防止一方的 commit 把另一方未完成的批量写入提前提交。
         """
-        await upsert_chunks(db, rows)
+        await upsert_chunks(db, rows, sender_id_fill_only=sender_id_fill_only)
         # 元数据更新不推进向量水位，旧身份会一直留在缓存；与刷新共锁，
         # 防止进行中的刷新清掉刚置位的脏标志。
         async with self._refresh_lock:
@@ -441,6 +443,7 @@ class RagEngine:
                 [(r.source, r.msg_id) for r in rows[:paired]],
                 vectors[:paired],
                 model,
+                sender_id_fill_only=True,
             )
         self.last_cycle_embed_failed = failed
         logger.info("rag: 回填本轮处理 %d 条（含向量 %d 条）", len(rows), paired)

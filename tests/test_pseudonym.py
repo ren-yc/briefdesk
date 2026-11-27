@@ -15,10 +15,10 @@ import json
 import os
 import sys
 import threading
-import time
 from collections.abc import Callable
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -270,11 +270,12 @@ async def test_batched_flush_commits_before_first_send(
 ) -> None:
     base = tmp_path / "reg"
     pz = pseudonym.Pseudonymizer(base, flush_window=0.3)
+    merge_sleep = AsyncMock(wraps=asyncio.sleep)
+    monkeypatch.setattr(pseudonym.asyncio, "sleep", merge_sleep)
 
     # 首次初始化立即提交：不等合并窗口，别名返回时已经在盘上
-    started = time.monotonic()
     first = await _person(pz, sender_id="member-0001", name="示例甲")
-    assert time.monotonic() - started < 0.3
+    merge_sleep.assert_not_awaited()
     assert pz.commit_count == 1
     assert first in _aliases(base).values()
 
@@ -285,6 +286,7 @@ async def test_batched_flush_commits_before_first_send(
     with monkeypatch.context() as patched:
         patched.setattr(pseudonym, "_registry_lock", _forbidden_lock)
         assert await _person(pz, sender_id="member-0001", name="示例甲") == first
+    merge_sleep.assert_not_awaited()
 
     # 同一合并窗口内的新身份并进一次落盘；返回时都已在盘上
     before = pz.commit_count
@@ -292,6 +294,7 @@ async def test_batched_flush_commits_before_first_send(
         _person(pz, sender_id="member-0002", name="示例乙"),
         _person(pz, sender_id="member-0003", name="示例丙"),
     )
+    merge_sleep.assert_awaited_once_with(0.3)
     assert pz.commit_count == before + 1
     aliases = _aliases(base)
     assert set(pair) <= set(aliases.values())
@@ -1215,6 +1218,8 @@ async def test_corrupt_salt_never_auto_rotates(
 
     registry_path.write_bytes(corrupt(copy.deepcopy(original)))
     broken_bytes = registry_path.read_bytes()
+
+    assert await _person(pz, sender_id="member-0001", name="示例甲") == good
 
     with pytest.raises(pseudonym.PseudonymRegistryError) as excinfo:
         await _person(_make(base), sender_id="member-0001", name="示例甲")

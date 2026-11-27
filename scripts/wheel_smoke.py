@@ -142,6 +142,8 @@ PSEUDONYM_PROBE = (
     "session_id='smoke-session', display_name='smoke-name')\n"
     "alias = asyncio.run(p.alias_for('person', key, 'smoke-name'))\n"
     "assert alias.startswith(pseudonym.ALIAS_PERSON_PREFIX), alias\n"
+    "registry = json.loads(p.registry_file.read_text(encoding='utf-8'))\n"
+    "assert alias in registry['aliases'].values(), alias\n"
     "pkg_root = pathlib.Path(briefdesk.__file__).resolve().parent\n"
     "leaks = sorted(\n"
     "    str(path.relative_to(pkg_root))\n"

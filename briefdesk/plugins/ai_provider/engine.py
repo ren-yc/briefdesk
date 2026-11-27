@@ -238,13 +238,21 @@ def _build_http_client(base: str) -> httpx.AsyncClient:
     """给 SDK 客户端装请求钩子，并仅收口本地端点的网络路由。
 
     本地端点经环境代理或 307/308 跳转到远端会携带未假名化的姓名，必须禁用两者。
-    远端请求已假名化，统一禁用只会破坏代理部署与 SSL_CERT_FILE 自定义 CA。
+    本地仅继承环境 CA：否则禁代理会连带禁用私有 CA，令本地 HTTPS 验证失败。
+    远端请求已假名化，统一禁用只会破坏代理部署与自定义 CA。
     """
     local = ai_egress.is_local_endpoint(base)
+    if local:
+        return DefaultAsyncHttpxClient(
+            event_hooks={"request": [_on_sdk_request]},
+            trust_env=False,
+            follow_redirects=False,
+            verify=httpx.create_ssl_context(trust_env=True),
+        )
     return DefaultAsyncHttpxClient(
         event_hooks={"request": [_on_sdk_request]},
-        trust_env=not local,
-        follow_redirects=not local,
+        trust_env=True,
+        follow_redirects=True,
     )
 
 

@@ -413,8 +413,13 @@ async def fts_search(
 # ---------------------------------------------------------------- 写入侧 --
 
 
-async def upsert_chunks(db: aiosqlite.Connection, rows: list[ChunkRow]) -> None:
-    """批量 upsert 索引行（消息重处理时以最新内容覆盖）。"""
+async def upsert_chunks(
+    db: aiosqlite.Connection,
+    rows: list[ChunkRow],
+    *,
+    sender_id_fill_only: bool = False,
+) -> None:
+    """批量 upsert 索引行；回填仅补空身份，实时重处理仍覆盖为最新身份。"""
 
     if not rows:
         return
@@ -431,15 +436,17 @@ async def upsert_chunks(db: aiosqlite.Connection, rows: list[ChunkRow]) -> None:
         # 空串时保留既有值，非空时（消息重处理）才覆盖。
         "item_id=CASE WHEN excluded.item_id='' THEN rag_chunks.item_id "
         "ELSE excluded.item_id END, "
-        # sender_id 同一思路：回填只从事实源读，事实源那一行可能已被删除
-        # （raw 缺行时回填给出空串）。空串覆盖会把已知身份擦成未知，
-        # 随后的假名化只能退化为按会话 + 显示名猜测。
-        "sender_id=CASE WHEN excluded.sender_id='' THEN rag_chunks.sender_id "
+        # 回填在锁外等待嵌入，快照中的非空身份也可能落后于实时重索引；
+        # 只补空值才能保住实时身份，实时写入则仍允许非空新值覆盖旧值。
+        # 两种模式都不让空输入擦掉已知身份，避免假名化退化为显示名猜测。
+        "sender_id=CASE WHEN excluded.sender_id='' "
+        "OR (? AND rag_chunks.sender_id<>'') THEN rag_chunks.sender_id "
         "ELSE excluded.sender_id END",
         [
             (
                 r.source, r.msg_id, r.session_id, r.group_name,
                 r.sender_name, r.msg_time, r.content, r.item_id, r.sender_id,
+                sender_id_fill_only,
             )
             for r in rows
         ],

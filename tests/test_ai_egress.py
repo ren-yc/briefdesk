@@ -10,9 +10,12 @@ from __future__ import annotations
 
 import asyncio
 import json
+import shutil
+import ssl
+import subprocess
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 from unittest.mock import AsyncMock, patch
 
 import httpx
@@ -355,7 +358,10 @@ def _engine_isolation(monkeypatch: pytest.MonkeyPatch) -> Any:
     客户端按 base_url + api_key 惰性缓存：不清掉就会把上一个用例的 transport
     （以及 MockTransport 的响应序列）带进下一个用例，让计数看起来出现在无关的
     调用上。能力记忆（effort 拒收）同理，会跨用例改变实际发出的参数。
+    环境 CA 也先清空，避免宿主证书路径让离线客户端构造随机器变化；CA 用例再显式注入。
     """
+    for name in ("SSL_CERT_FILE", "SSL_CERT_DIR"):
+        monkeypatch.delenv(name, raising=False)
     for name, value in _ENGINE_DEFAULTS.items():
         monkeypatch.setattr(config, name, value)
     engine._client = None
@@ -423,15 +429,56 @@ def _embeddings_body(count: int) -> dict[str, Any]:
     }
 
 
-@pytest.mark.parametrize(
-    ("channel", "remote_main"),
-    [
-        ("main", False), ("rag", False), ("embed", False),
-        ("rag", True), ("embed", True),
-    ],
-)
-async def test_http_clients_ignore_proxy_env(
+@pytest.fixture(scope="module")
+def _local_test_ca(
+    tmp_path_factory: pytest.TempPathFactory,
+) -> tuple[ssl.SSLContext, Path, Path]:
+    """临时自签 CA 只用于回环 HTTPS，避免依赖公网证书或把私钥写入仓库。"""
+    openssl = shutil.which("openssl")
+    if openssl is None:
+        pytest.skip("离线 HTTPS 回归需要 OpenSSL 生成临时测试证书")
+    base = tmp_path_factory.mktemp("ai-egress-ca")
+    cert_file = base / "ca.pem"
+    key_file = base / "key.pem"
+    config_file = base / "openssl.cnf"
+    config_file.write_text(
+        "[req]\ndistinguished_name=subject\n[subject]\n", encoding="utf-8"
+    )
+    subprocess.run(
+        [
+            openssl, "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "2",
+            "-config", str(config_file), "-subj", "/CN=briefdesk-offline-test",
+            "-addext", "basicConstraints=critical,CA:TRUE",
+            "-addext", "keyUsage=critical,digitalSignature,keyEncipherment,keyCertSign",
+            "-addext", "subjectKeyIdentifier=hash",
+            "-addext", "authorityKeyIdentifier=keyid:always",
+            "-addext", "extendedKeyUsage=serverAuth",
+            "-addext", "subjectAltName=IP:127.0.0.1",
+            "-keyout", str(key_file), "-out", str(cert_file),
+        ],
+        check=True, capture_output=True, timeout=20,
+    )
+    cert_hash = subprocess.run(
+        [openssl, "x509", "-in", str(cert_file), "-hash", "-noout"],
+        check=True,
+        capture_output=True,
+        text=True,
+        # 文本模式必须显式钉编码：解码线程一旦抛错会静默死掉，stdout 变 None
+        encoding="utf-8",
+        errors="replace",
+        timeout=10,
+    ).stdout.strip()
+    cert_dir = base / "certs"
+    cert_dir.mkdir()
+    shutil.copyfile(cert_file, cert_dir / f"{cert_hash}.0")
+    server_ssl = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    server_ssl.load_cert_chain(cert_file, key_file)
+    return server_ssl, cert_file, cert_dir
+
+
+async def _assert_local_endpoint_request(
     monkeypatch: pytest.MonkeyPatch, channel: str, remote_main: bool,
+    server_ssl: ssl.SSLContext | None = None,
 ) -> None:
     """仅按实际端点禁代理与跳转，主端点远端不能让本地备用请求明文出境。"""
     requests: list[bytes] = []
@@ -468,9 +515,10 @@ async def test_http_clients_ignore_proxy_env(
         monkeypatch.setenv(name, "http://proxy.example.invalid:8080")
     monkeypatch.setenv("NO_PROXY", "")
     monkeypatch.setenv("no_proxy", "")
-    server = await asyncio.start_server(_serve, "127.0.0.1", 0)
+    server = await asyncio.start_server(_serve, "127.0.0.1", 0, ssl=server_ssl)
     async with server:
-        base = f"http://127.0.0.1:{server.sockets[0].getsockname()[1]}/v1"
+        scheme = "https" if server_ssl is not None else "http"
+        base = f"{scheme}://127.0.0.1:{server.sockets[0].getsockname()[1]}/v1"
         monkeypatch.setattr(config, "ai_api_base", REMOTE_BASE if remote_main else base)
         monkeypatch.setattr(config, "embed_api_base", base)
         client = {
@@ -481,6 +529,10 @@ async def test_http_clients_ignore_proxy_env(
         try:
             assert client._client._trust_env is False
             assert client._client.follow_redirects is False
+            if server_ssl is not None:
+                context = cast(Any, client._client._transport)._pool._ssl_context
+                assert context.verify_mode == ssl.CERT_REQUIRED
+                assert context.check_hostname is True
             if channel == "embed":
                 embedding_response = await asyncio.wait_for(
                     client.embeddings.create(model="demo-embed", input=["虚构内容"]),
@@ -501,12 +553,48 @@ async def test_http_clients_ignore_proxy_env(
     assert len(requests) == 1
 
 
+@pytest.mark.parametrize(
+    ("channel", "remote_main"),
+    [
+        ("main", False), ("rag", False), ("embed", False),
+        ("rag", True), ("embed", True),
+    ],
+)
+async def test_http_clients_ignore_proxy_env(
+    monkeypatch: pytest.MonkeyPatch, channel: str, remote_main: bool,
+) -> None:
+    await _assert_local_endpoint_request(monkeypatch, channel, remote_main)
+
+
+@pytest.mark.parametrize("ca_env", ["SSL_CERT_FILE", "SSL_CERT_DIR"])
+@pytest.mark.parametrize(
+    ("channel", "remote_main"),
+    [
+        ("main", False), ("rag", False), ("embed", False),
+        ("rag", True), ("embed", True),
+    ],
+)
+async def test_http_clients_local_https_uses_env_ca_without_proxy(
+    monkeypatch: pytest.MonkeyPatch,
+    _local_test_ca: tuple[ssl.SSLContext, Path, Path],
+    channel: str,
+    remote_main: bool,
+    ca_env: str,
+) -> None:
+    """本地私有 CA 必须可验证，但继承 CA 不能连带启用代理或跳转外发。"""
+    server_ssl, cert_file, cert_dir = _local_test_ca
+    monkeypatch.delenv("SSL_CERT_FILE", raising=False)
+    monkeypatch.delenv("SSL_CERT_DIR", raising=False)
+    monkeypatch.setenv(ca_env, str(cert_file if ca_env == "SSL_CERT_FILE" else cert_dir))
+    await _assert_local_endpoint_request(monkeypatch, channel, remote_main, server_ssl)
+
+
 @pytest.mark.parametrize("channel", ["main", "rag", "embed"])
 @pytest.mark.parametrize("invalid_ca", [False, True])
 async def test_http_clients_preserve_remote_sdk_defaults(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, channel: str, invalid_ca: bool,
 ) -> None:
-    """远端保留 SDK 默认值与环境 CA，本地必须忽略环境 CA。
+    """远端保留 SDK 默认值，本地也读取环境 CA，但不继承环境代理与跳转。
 
     不存在的 CA 文件在构造时确定性报错，无需联网；只检查布尔属性会漏掉
     显式传入 certifi 路径绕过 SSL_CERT_FILE 的实现。
@@ -530,6 +618,9 @@ async def test_http_clients_preserve_remote_sdk_defaults(
         base = LOCAL_BASE
         monkeypatch.setattr(config, "ai_api_base", LOCAL_BASE)
         monkeypatch.setattr(config, "embed_api_base", LOCAL_BASE)
+        with pytest.raises(FileNotFoundError):
+            client_factory()
+        monkeypatch.delenv("SSL_CERT_FILE")
     client = client_factory()
     try:
         assert client._client._trust_env is (not invalid_ca)
@@ -980,10 +1071,13 @@ class TestQueueCancellation:
             task = asyncio.create_task(
                 ai_ports.chat([{"role": "user", "content": "x"}])
             )
-            await sem.entered.wait()
-            task.cancel()
-            with pytest.raises(asyncio.CancelledError):
-                await task
+            try:
+                await asyncio.wait_for(sem.entered.wait(), timeout=10)
+                assert sem.entered.is_set()
+            finally:
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
 
         assert create.await_count == 0
         # 没拿到许可就没有 release：多 release 会把并发预算悄悄放大
@@ -1002,10 +1096,13 @@ class TestQueueCancellation:
             task = asyncio.create_task(
                 ai_ports.rag_chat([{"role": "user", "content": "q"}])
             )
-            await sem.entered.wait()
-            task.cancel()
-            with pytest.raises(asyncio.CancelledError):
-                await task
+            try:
+                await asyncio.wait_for(sem.entered.wait(), timeout=10)
+                assert sem.entered.is_set()
+            finally:
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
 
         assert create.await_count == 0
         assert sem.released == 0
@@ -1023,10 +1120,13 @@ class TestQueueCancellation:
 
         with patch.object(engine, "get_ai_semaphore", return_value=sem):
             task = asyncio.create_task(ai_ports.embed_texts(["a", "b"]))
-            await sem.entered.wait()
-            task.cancel()
-            with pytest.raises(asyncio.CancelledError):
-                await task
+            try:
+                await asyncio.wait_for(sem.entered.wait(), timeout=10)
+                assert sem.entered.is_set()
+            finally:
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
 
         assert create.await_count == 0
         assert sem.released == 0
@@ -1046,10 +1146,13 @@ class TestQueueCancellation:
             task = asyncio.create_task(
                 ai_ports.chat([{"role": "user", "content": "x"}])
             )
-            await client.started.wait()
-            task.cancel()
-            with pytest.raises(asyncio.CancelledError):
-                await task
+            try:
+                await asyncio.wait_for(client.started.wait(), timeout=10)
+                assert client.started.is_set()
+            finally:
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
 
         # create 已经进入：发送尝试必须为 1；排队桶一个键都不能出现
         assert client.calls == 1
@@ -1066,10 +1169,13 @@ class TestQueueCancellation:
         assert engine.get_ai_semaphore() is None  # 夹具的 ai_max_concurrency=0
 
         task = asyncio.create_task(ai_ports.chat([{"role": "user", "content": "x"}]))
-        await client.started.wait()
-        task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await task
+        try:
+            await asyncio.wait_for(client.started.wait(), timeout=10)
+            assert client.started.is_set()
+        finally:
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
 
         assert client.calls == 1
         assert _egress_counters() == {"ai.egress.remote_attempt.chat.main|": 1}

@@ -5,6 +5,8 @@
 早有历史记录」解耦，这组用例守住三个方向：新增、改动、删除都要能判出来。
 """
 
+import ast
+import runpy
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -426,7 +428,17 @@ class TestPseudonymProbeContract:
         assert seen["cmd"][1] == "-c", "探针走 python -c 内联片段"
         probe = seen["cmd"][2]
         assert probe.startswith(wheel_smoke.INSTALLED_GUARD), "探针必须带 site-packages 导入守卫"
-        assert "pseudonym" in probe and "ai_egress" in probe, "两个新模块都须显式导入"
+        imports = {
+            (imported.name, imported.asname or imported.name)
+            for node in ast.walk(ast.parse(probe))
+            if isinstance(node, ast.ImportFrom)
+            and node.module == "briefdesk"
+            and node.level == 0
+            for imported in node.names
+        }
+        assert {("pseudonym", "pseudonym"), ("ai_egress", "ai_egress")} <= imports, (
+            "两个新模块都须显式导入并绑定为探针使用的名称"
+        )
         assert "PSEUDONYM-OK" in probe, "成功路径必须打标记"
         assert seen["cwd"] == cwd, "cwd 必须真传给子进程——落仓库根会让导入命中源码树"
         assert seen["env"]["BRIEFDESK_DATA_DIR"] == str(data_dir), "数据目录必须注入，否则会写真实用户目录"
@@ -438,6 +450,42 @@ class TestPseudonymProbeContract:
         data_dir = tmp_path / "data"
         self._stub(monkeypatch, self._output(data_dir / "pseudonym" / "mapping.json"))
         wheel_smoke.assert_pseudonym_isolation(tmp_path / "python", tmp_path / "scene", data_dir)
+
+    @pytest.mark.parametrize("committed", [False, True])
+    def test_probe_requires_returned_alias_in_registry(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys, committed: bool
+    ) -> None:
+        """仅有文件与合法前缀不证明提交成功，必须在打成功标记前核对落盘映射。"""
+        import json
+        from types import SimpleNamespace
+        from unittest.mock import AsyncMock
+
+        import briefdesk
+        from briefdesk import pseudonym
+
+        alias = "同学ABCDEF"
+        registry = tmp_path / "data" / "pseudonym" / "mapping.json"
+        registry.parent.mkdir(parents=True)
+        registry.write_text(
+            json.dumps({"aliases": {"test-digest": alias if committed else "同学BCDEFG"}}),
+            encoding="utf-8",
+        )
+        registrar = SimpleNamespace(
+            registry_file=registry, alias_for=AsyncMock(return_value=alias)
+        )
+        monkeypatch.setattr(pseudonym, "get_pseudonymizer", lambda: registrar)
+        installed = tmp_path / "site-packages" / "briefdesk" / "__init__.py"
+        installed.parent.mkdir(parents=True)
+        monkeypatch.setattr(briefdesk, "__file__", str(installed))
+        probe_file = tmp_path / "pseudonym_probe.py"
+        probe_file.write_text(wheel_smoke.PSEUDONYM_PROBE, encoding="utf-8")
+        if committed:
+            runpy.run_path(str(probe_file))
+            assert "PSEUDONYM-OK " in capsys.readouterr().out
+        else:
+            with pytest.raises(AssertionError):
+                runpy.run_path(str(probe_file))
+            assert "PSEUDONYM-OK " not in capsys.readouterr().out
 
     def test_wrong_registry_location_fails(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch

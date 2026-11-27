@@ -1003,6 +1003,50 @@ class TestRagBackfill(_MemoryEngineBase):
             await cursor.close()
         return out
 
+    @pytest.mark.parametrize("realtime_sender_id", ["", "u-new"])
+    async def test_backfill_only_fills_identity_after_realtime_reindex(
+        self, realtime_sender_id
+    ):
+        """嵌入等待期间的实时身份优先，回填只能填空，不能把新身份换回旧快照。"""
+        from briefdesk.plugins.rag.config import RagSettings as RS
+        from briefdesk.plugins.rag.db import fetch_one
+
+        self.engine.settings = RS(backfill_days=-1)
+        await self._seed("m1", 1)
+        embedding_entered = asyncio.Event()
+        release_embedding = asyncio.Event()
+
+        async def paused_embedding(texts):
+            if not embedding_entered.is_set():
+                embedding_entered.set()
+                await release_embedding.wait()
+            return _dynamic_embed(texts)
+
+        self.provider.embed_texts = AsyncMock(side_effect=paused_embedding)
+        task = asyncio.create_task(self.engine.backfill_step(self.now))
+        try:
+            await asyncio.wait_for(embedding_entered.wait(), timeout=10)
+            assert embedding_entered.is_set()
+            msg = _msg("m1", "历史消息m1")
+            msg.sender_id = realtime_sender_id
+            await self._index([msg])
+            row = await fetch_one(
+                self.db, "SELECT sender_id FROM rag_chunks WHERE msg_id='m1'"
+            )
+            assert row["sender_id"] == realtime_sender_id
+            release_embedding.set()
+            assert await asyncio.wait_for(task, timeout=10) == 1
+        finally:
+            release_embedding.set()
+            if not task.done():
+                task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+        row = await fetch_one(
+            self.db, "SELECT sender_id FROM rag_chunks WHERE msg_id='m1'"
+        )
+        assert row["sender_id"] == (realtime_sender_id or "u1")
+
     async def test_scope_excludes_disabled_session_at_backfill(self):
         """回填侧作用域（隐私边界）：停用会话的历史消息不得进索引。
 
@@ -1217,7 +1261,15 @@ class TestRagBackfill(_MemoryEngineBase):
         await self._seed("m1", 1, content="通知正文")  # raw 行带 sender_id u1
         await self._seed("old", 30, content="窗口外的旧消息")
         msg = _msg("m1", "通知正文\n[OCR]\n海报文字")
+        msg.sender_id = ""
         await self._index([msg], [(msg, "i1")])  # 运行期：OCR 文本 + 卡片引用
+        cursor = await self.db.execute(
+            "SELECT sender_id FROM rag_chunks WHERE msg_id='m1'"
+        )
+        try:
+            assert (await cursor.fetchone())["sender_id"] == ""
+        finally:
+            await cursor.close()
         self.provider.embed_model_name = Mock(return_value="model-b")
         self.engine.settings = RS(backfill_days=7)  # 窗口只含 m1
         self.engine._vec_watermark = "keep-watermark"
@@ -1323,7 +1375,10 @@ class TestRagAsk(_MemoryEngineBase):
     VECTORS = TestRagRetrieve.VECTORS
 
     @pytest.fixture(autouse=True)
-    async def _sub_setup(self):
+    async def _sub_setup(self, monkeypatch: pytest.MonkeyPatch):
+        from briefdesk.config import config
+
+        monkeypatch.setattr(config, "ai_pseudonymize_names", "auto")
         self.provider.chat = AsyncMock(
             return_value=_chat_response("活动在周六6点举行 [1]。")
         )
@@ -1692,10 +1747,12 @@ class TestRagAsk(_MemoryEngineBase):
         monkeypatch.setattr(
             pseudonym, "get_pseudonymizer", lambda: _BrokenPseudonymizer()
         )
+        query = "周六6点开会有通知"
+        self.provider.embed_texts.reset_mock()
         with pytest.raises(pseudonym.PseudonymError):
-            await self.engine.ask("周六6点开会有通知")
+            await self.engine.ask(query)
         self.provider.chat.assert_not_awaited()  # 对应回答的 create 没发生
-        self.provider.embed_texts.assert_awaited()  # 查询嵌入真的发生过
+        self.provider.embed_texts.assert_awaited_once_with([query])
         counters = telemetry.snapshot()["counters"]
         # 并发准备下人与群各走一次 alias_for，按准备次数计：1 个群 + 1 个人 = 2
         assert counters["ai.pseudonym.prepare_failed|"] == 2
@@ -2283,8 +2340,8 @@ class TestRagWarmVectorsForceFull(_MemoryEngineBase):
                 await release_refresh.wait()
                 return result
 
-            async def observed_upsert(db, rows):
-                await real_upsert(db, rows)
+            async def observed_upsert(db, rows, **kwargs):
+                await real_upsert(db, rows, **kwargs)
                 metadata_written.set()
 
             monkeypatch.setattr(rag_engine, "fetch_new_embeddings", paused_fetch)

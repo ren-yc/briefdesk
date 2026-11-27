@@ -629,14 +629,20 @@ async def _semantic_refine(
     retry_indexes: list[int],
     time_indexes: list[int],
     contents: list[str],
+    raw_quotes: dict[int, str] | None = None,
 ) -> tuple[list[ClassifyResult], list[int], list[int]]:
     """对字面模糊条目跑语义裁判：漂移条目移出 results/time 并入 retry。
 
     quotes 与 contents 一次性批量嵌入（每批最多一次嵌入调用）。
     """
+    # 未还原的调用保留兼容；分类主链传入模型原始引文，避免展示字段中的
+    # 真名再次出站（回归见 test_semantic_judge_embeds_raw_alias_quote）。
+    quotes = raw_quotes if raw_quotes is not None else {
+        result.msg_index: result.quote for result in results
+    }
     pairs: list[tuple[int, str]] = []
     for idx in ambiguous:
-        quote = next((r.quote for r in results if r.msg_index == idx), "")
+        quote = quotes.get(idx, "")
         if quote:
             pairs.append((idx, quote))
     if not pairs:
@@ -699,6 +705,7 @@ def _parse_response(
     contents: list[str] | None = None,
     ambiguous_out: list[int] | None = None,
     ctx: NameContext | None = None,
+    raw_quotes_out: dict[int, str] | None = None,
 ) -> tuple[
     list[ClassifyResult], list[int], list[int], list[ClassifyObservation]
 ]:
@@ -718,6 +725,7 @@ def _parse_response(
 
     `ctx` 非空时只还原自由文本（quote/key）里的别名，category/msg_index 等
     结构化字段原样保留：改结构化字段会破坏分类校验与回填定位。
+    `raw_quotes_out` 收集还原前的引文供语义裁判使用，避免真名再次出站。
     """
     json_text = content.strip()
     if json_text.startswith("```"):
@@ -818,15 +826,21 @@ def _parse_response(
             )
             continue
 
-        # quote 是自由文本：先还原别名，再做索引漂移守卫。顺序不能反——守卫
+        # quote 是自由文本：先还原别名，再做本地字面漂移守卫。顺序不能反——守卫
         # 拿模型引文与原文（真名）逐字比对，带着别名的引文会凭空掉字符，多消息
         # 批会被判成「标到别人头上」而白跑一轮重试。
-        quote_val = item.get("quote", "")
+        # 空值先归一为空串：False/0/空容器若先转成文字会触发漂移重试、
+        # 阻塞卡片（回归见 test_quote_empty_skips_guard）。
+        quote_val = item.get("quote", "") or ""
         if not isinstance(quote_val, str):
             # AI 脏输出可能给数字/dict 型 quote，直接传给
             # _norm_align_text（re.sub）会抛 TypeError → 整批本轮抛弃，
             # 模型持续脏输出时会话陷入重试循环。收敛为 str 后走正常判定。
-            quote_val = "" if quote_val is None else str(quote_val)
+            quote_val = str(quote_val)
+        # 远端嵌入保留模型引文；还原只供本地字面对齐与展示，否则群头中的
+        # 发送者别名会把正文没有的真名补进出站请求。
+        if raw_quotes_out is not None:
+            raw_quotes_out[msg_index] = quote_val
         if ctx is not None:
             quote_val = ctx.restore(quote_val, field=f"sysb.quote[{msg_index}]")
 
@@ -1195,11 +1209,11 @@ def _parse_times_response(
                 label = ""
             elif not isinstance(label, str):
                 label = str(label)
-            label = " ".join(label.split())[:_MAX_TIME_LABEL_LEN]
             if ctx is not None and label:
-                # 先截断再还原：截断可能切掉别名 token，那种情况还原不了，
-                # 冻结模块会按「抄错了别名」计一次失败，原样保留截断后的文本。
+                # 先还原完整别名再折叠截断，否则会留下半截化名并误计失败
+                # （回归见 test_time_label_restored_before_length_cap）。
                 label = ctx.restore(label, field=f"sysc.label[{idx}]")
+            label = " ".join(label.split())[:_MAX_TIME_LABEL_LEN]
             cleaned.append({"type": ttype, "time": time_val, "label": label})
         out[idx] = cleaned
     return out
@@ -1584,11 +1598,13 @@ async def _classify_once(
         )
 
     ambiguous: list[int] = []
+    raw_quotes: dict[int, str] = {}
     try:
         results, retry_indexes, time_indexes, observations = _parse_response(
             content, {c["name"] for c in cats}, len(messages),
             [m.content for m in messages], ambiguous,
             names.ctx if names is not None else None,
+            raw_quotes_out=raw_quotes,
         )
     except (RuntimeError, TypeError) as e:
         # 结构错误/越界 index 等：拆半无益，本轮抛弃，下轮回填
@@ -1606,6 +1622,7 @@ async def _classify_once(
         results, retry_indexes, time_indexes = await _semantic_refine(
             ambiguous, results, retry_indexes, time_indexes,
             [m.content for m in messages],
+            raw_quotes=raw_quotes,
         )
         # 语义裁判否决的条目（字面模糊、进 _semantic_refine 前已记 include）
         # 观察必须改记 uncertain——这批恰是行内错位最严重的样本（quote 标到
