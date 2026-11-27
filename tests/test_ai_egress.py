@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, patch
@@ -130,7 +131,9 @@ def test_sdk_retry_separate_from_logical_attempt() -> None:
         ai_egress.PORT_CHAT, ai_egress.ROLE_MAIN, REMOTE_BASE
     )
     assert is_local is False
-    ai_egress.record_sdk_retry(ai_egress.PORT_CHAT, ai_egress.ROLE_MAIN, is_local)
+    assert ai_egress.record_sdk_retry(
+        ai_egress.PORT_CHAT, ai_egress.ROLE_MAIN, is_local
+    ) is True
     counters = _counters()
     assert counters["ai.egress.remote_attempt.chat.main|"] == 1
     assert counters["ai.egress.sdk_retry.chat.main|"] == 1
@@ -140,7 +143,9 @@ def test_sdk_retry_separate_from_logical_attempt() -> None:
         ai_egress.PORT_EMBED, ai_egress.ROLE_MAIN, LOCAL_BASE
     )
     assert local_flag is True
-    ai_egress.record_sdk_retry(ai_egress.PORT_EMBED, ai_egress.ROLE_MAIN, local_flag)
+    assert ai_egress.record_sdk_retry(
+        ai_egress.PORT_EMBED, ai_egress.ROLE_MAIN, local_flag
+    ) is True
     counters = _counters()
     assert counters["ai.local.attempt.embed.main|"] == 1
     assert counters["ai.local.sdk_retry.embed.main|"] == 1
@@ -304,6 +309,9 @@ def test_disabled_telemetry_is_unknown_not_zero(monkeypatch: pytest.MonkeyPatch)
     ai_egress.record_send_attempt(ai_egress.PORT_CHAT, ai_egress.ROLE_MAIN, REMOTE_BASE)
     ai_egress.record_send_attempt(ai_egress.PORT_EMBED, ai_egress.ROLE_MAIN, LOCAL_BASE)
     ai_egress.record_queue_cancelled(ai_egress.PORT_CHAT, ai_egress.ROLE_MAIN)
+    assert ai_egress.record_sdk_retry(
+        ai_egress.PORT_CHAT, ai_egress.ROLE_MAIN, False
+    ) is False
     # 关闭期间既不累加也不落零值：读数只能表达「未知」，不能伪装成零出境
     assert _counters() == {"ai.egress.remote_attempt.chat.main|": 1}
     assert all(value > 0 for value in _counters().values())
@@ -381,7 +389,6 @@ def _install_transport(
         event_hooks = kwargs.pop("event_hooks")
         return httpx.AsyncClient(
             transport=httpx.MockTransport(handler),
-            follow_redirects=True,
             event_hooks=event_hooks,
             **kwargs,
         )
@@ -414,6 +421,171 @@ def _embeddings_body(count: int) -> dict[str, Any]:
             for index in range(count)
         ],
     }
+
+
+@pytest.mark.parametrize(
+    ("channel", "remote_main"),
+    [
+        ("main", False), ("rag", False), ("embed", False),
+        ("rag", True), ("embed", True),
+    ],
+)
+async def test_http_clients_ignore_proxy_env(
+    monkeypatch: pytest.MonkeyPatch, channel: str, remote_main: bool,
+) -> None:
+    """仅按实际端点禁代理与跳转，主端点远端不能让本地备用请求明文出境。"""
+    requests: list[bytes] = []
+
+    async def _serve(
+        reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
+    ) -> None:
+        try:
+            headers = await reader.readuntil(b"\r\n\r\n")
+            content_length = int(next(
+                line.split(b":", 1)[1]
+                for line in headers.split(b"\r\n")
+                if line.lower().startswith(b"content-length:")
+            ))
+            requests.append(await reader.readexactly(content_length))
+            body = json.dumps(
+                _embeddings_body(1) if channel == "embed" else _chat_body()
+            ).encode("utf-8")
+            writer.write(
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                b"Connection: close\r\n"
+                + f"Content-Length: {len(body)}\r\n\r\n".encode("ascii")
+                + body
+            )
+            await writer.drain()
+        finally:
+            writer.close()
+            await writer.wait_closed()
+
+    for name in (
+        "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
+        "http_proxy", "https_proxy", "all_proxy",
+    ):
+        monkeypatch.setenv(name, "http://proxy.example.invalid:8080")
+    monkeypatch.setenv("NO_PROXY", "")
+    monkeypatch.setenv("no_proxy", "")
+    server = await asyncio.start_server(_serve, "127.0.0.1", 0)
+    async with server:
+        base = f"http://127.0.0.1:{server.sockets[0].getsockname()[1]}/v1"
+        monkeypatch.setattr(config, "ai_api_base", REMOTE_BASE if remote_main else base)
+        monkeypatch.setattr(config, "embed_api_base", base)
+        client = {
+            "main": engine.get_ai_client,
+            "rag": lambda: engine.get_alt_client(base, "demo-rag-key"),
+            "embed": engine.get_embed_client,
+        }[channel]()
+        try:
+            assert client._client._trust_env is False
+            assert client._client.follow_redirects is False
+            if channel == "embed":
+                embedding_response = await asyncio.wait_for(
+                    client.embeddings.create(model="demo-embed", input=["虚构内容"]),
+                    timeout=5,
+                )
+                assert embedding_response.data[0].embedding == [0.1, 0.2]
+            else:
+                chat_response = await asyncio.wait_for(
+                    client.chat.completions.create(
+                        model="demo-model",
+                        messages=[{"role": "user", "content": "虚构内容"}],
+                    ),
+                    timeout=5,
+                )
+                assert chat_response.choices[0].message.content == "ok"
+        finally:
+            await client.close()
+    assert len(requests) == 1
+
+
+@pytest.mark.parametrize("channel", ["main", "rag", "embed"])
+@pytest.mark.parametrize("invalid_ca", [False, True])
+async def test_http_clients_preserve_remote_sdk_defaults(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, channel: str, invalid_ca: bool,
+) -> None:
+    """远端保留 SDK 默认值与环境 CA，本地必须忽略环境 CA。
+
+    不存在的 CA 文件在构造时确定性报错，无需联网；只检查布尔属性会漏掉
+    显式传入 certifi 路径绕过 SSL_CERT_FILE 的实现。
+    """
+    base = REMOTE_BASE
+    monkeypatch.setattr(
+        config, "ai_api_base", REMOTE_BASE if channel == "main" else LOCAL_BASE,
+    )
+    monkeypatch.setattr(
+        config, "embed_api_base", REMOTE_BASE if channel == "embed" else LOCAL_BASE,
+    )
+    client_factory = {
+        "main": engine.get_ai_client,
+        "rag": lambda: engine.get_alt_client(base, "demo-rag-key"),
+        "embed": engine.get_embed_client,
+    }[channel]
+    if invalid_ca:
+        monkeypatch.setenv("SSL_CERT_FILE", str(tmp_path / "missing-ca.pem"))
+        with pytest.raises(FileNotFoundError):
+            client_factory()
+        base = LOCAL_BASE
+        monkeypatch.setattr(config, "ai_api_base", LOCAL_BASE)
+        monkeypatch.setattr(config, "embed_api_base", LOCAL_BASE)
+    client = client_factory()
+    try:
+        assert client._client._trust_env is (not invalid_ca)
+        assert client._client.follow_redirects is (not invalid_ca)
+    finally:
+        await client.close()
+
+
+@pytest.mark.parametrize(
+    ("channel", "remote_main"),
+    [
+        ("main", False), ("rag", False), ("embed", False),
+        ("rag", True), ("embed", True),
+    ],
+)
+@pytest.mark.parametrize("status_code", [307, 308])
+async def test_http_clients_never_follow_local_to_remote_redirects(
+    monkeypatch: pytest.MonkeyPatch, channel: str, remote_main: bool, status_code: int,
+) -> None:
+    """本地跳转必须报错，主端点远端不能让备用端点的原始请求跟随跳转。"""
+    requests: list[httpx.Request] = []
+    path = "embeddings" if channel == "embed" else "chat/completions"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.host == "localhost":
+            return httpx.Response(
+                status_code,
+                headers={"location": f"{REMOTE_BASE}/{path}"},
+            )
+        return httpx.Response(
+            200, json=_embeddings_body(1) if channel == "embed" else _chat_body(),
+        )
+
+    _install_transport(monkeypatch, handler)
+    monkeypatch.setattr(config, "ai_api_base", REMOTE_BASE if remote_main else LOCAL_BASE)
+    monkeypatch.setattr(config, "embed_api_base", LOCAL_BASE)
+    client = {
+        "main": engine.get_ai_client,
+        "rag": lambda: engine.get_alt_client(LOCAL_BASE, "demo-rag-key"),
+        "embed": engine.get_embed_client,
+    }[channel]()
+    try:
+        assert client._client._trust_env is False
+        assert client._client.follow_redirects is False
+        with pytest.raises(engine.APIStatusError):
+            if channel == "embed":
+                await client.embeddings.create(model="demo-embed", input=["虚构内容"])
+            else:
+                await client.chat.completions.create(
+                    model="demo-model",
+                    messages=[{"role": "user", "content": "虚构内容"}],
+                )
+    finally:
+        await client.close()
+    assert [str(request.url) for request in requests] == [f"{LOCAL_BASE}/{path}"]
 
 
 def _stub_chat_client() -> tuple[SimpleNamespace, AsyncMock]:
@@ -722,9 +894,52 @@ class TestSendBoundary:
 
         assert resp.choices[0].message.content == "survived"
         assert len(requests) == 2
+        assert [engine._retry_ordinal(request.headers) for request in requests] == [0, 1]
         # 钩子确实走到了记账、并在那里抛错：异常被吞掉，请求照常完成
         assert attempted == [True]
         assert "ai.egress.sdk_retry.chat.main|" not in _counters()
+        assert "ai.egress.retry_observed.chat.main|" not in _counters()
+
+    async def test_swallowed_counter_write_failure_never_claims_retry_observed(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """杀死「只包住包装函数异常、底层吞错仍宣称观测可用」的实现。"""
+        requests: list[httpx.Request] = []
+        failed_writes: list[str] = []
+
+        class _FailingRetryCounters(dict[str, int]):
+            def __missing__(self, key: str) -> int:
+                return 0
+
+            def __setitem__(self, key: str, value: int) -> None:
+                if key.startswith("ai.egress.sdk_retry."):
+                    failed_writes.append(key)
+                    raise RuntimeError("模拟 SDK 重试计数写入失败")
+                super().__setitem__(key, value)
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            if len(requests) == 1:
+                return httpx.Response(
+                    500,
+                    json={"error": {"message": "upstream hiccup"}},
+                    headers={"retry-after-ms": "1"},
+                )
+            return httpx.Response(200, json=_chat_body("survived"))
+
+        monkeypatch.setattr(telemetry, "_counters", _FailingRetryCounters())
+        _install_transport(monkeypatch, handler)
+        ai_ports.set_ai(Provider())
+
+        resp = await ai_ports.chat(
+            [{"role": "user", "content": "hi"}], temperature=0.1, max_tokens=16
+        )
+
+        assert resp.choices[0].message.content == "survived"
+        assert len(requests) == 2
+        assert [engine._retry_ordinal(request.headers) for request in requests] == [0, 1]
+        assert failed_writes == ["ai.egress.sdk_retry.chat.main|"]
+        assert _egress_counters() == {"ai.egress.remote_attempt.chat.main|": 1}
 
 
 # ── 无界排队路径的取消分桶 ──
@@ -1082,6 +1297,38 @@ async def test_retry_observed_absent_when_header_never_parsed() -> None:
     assert _egress_counters() == {}
 
 
+async def test_retry_record_failure_latches_observation_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """读到头与计数成功是独立事实，后续补记成功也不能掩盖观测故障。"""
+    calls = 0
+    record_retry = ai_egress.record_sdk_retry
+
+    def _fail_once(port: str, role: str, is_local: bool) -> bool:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("遥测后端故障")
+        return record_retry(port, role, is_local)
+
+    monkeypatch.setattr(ai_egress, "record_sdk_retry", _fail_once)
+    with engine._sending(ai_egress.PORT_CHAT, REMOTE_BASE):
+        tracker = engine._RETRY_TRACKER.get()
+        assert tracker is not None
+        await engine._on_sdk_request(_retry_request(1))
+        assert tracker.header_seen is True
+        assert tracker.record_failed is True
+        assert tracker.seen == set()
+        await engine._on_sdk_request(_retry_request(1))
+        assert tracker.record_failed is True
+        assert tracker.seen == {1}
+    assert calls == 2
+    assert _egress_counters() == {
+        "ai.egress.remote_attempt.chat.main|": 1,
+        "ai.egress.sdk_retry.chat.main|": 1,
+    }
+
+
 class _CountingWrappedClient:
     """真实 SDK 客户端外的薄包装：create 委托前先读一次当前计数。
 
@@ -1218,21 +1465,21 @@ def test_egress_summary_uses_header_observation_not_telemetry_switch() -> None:
     `observed = attempts > 0` 的错误实现——发送尝试在先、观测未落账的窗口里
     （钩子没挂上、头不可读都是真实形态）报告必须明确 observed=false。
     """
-    summary = bench_engine._egress_summary()
+    summary = bench_engine._egress_summary({})
     assert summary == {
         "attempt_total": 0, "sdk_retry_total": 0, "sdk_retry_observed": False,
     }
 
     # 阶段一：只有发送尝试，观测计数未落账 → false（未知不是可观测）
     ai_egress.record_send_attempt(ai_egress.PORT_CHAT, ai_egress.ROLE_MAIN, REMOTE_BASE)
-    summary = bench_engine._egress_summary()
+    summary = bench_engine._egress_summary({})
     assert summary == {
         "attempt_total": 1, "sdk_retry_total": 0, "sdk_retry_observed": False,
     }
 
     # 阶段二：观测计数落账 → true，零重试成为可信读数
     ai_egress.record_retry_observed(ai_egress.PORT_CHAT, ai_egress.ROLE_MAIN, False)
-    summary = bench_engine._egress_summary()
+    summary = bench_engine._egress_summary({})
     assert summary == {
         "attempt_total": 1, "sdk_retry_total": 0, "sdk_retry_observed": True,
     }
@@ -1258,7 +1505,7 @@ async def test_report_observed_false_when_hook_never_sees_header(
     def _hookless_client(**kwargs: Any) -> httpx.AsyncClient:
         kwargs.pop("event_hooks", None)  # 钩子没挂上：观测链路断开
         return httpx.AsyncClient(
-            transport=httpx.MockTransport(handler), follow_redirects=True, **kwargs
+            transport=httpx.MockTransport(handler), **kwargs
         )
 
     monkeypatch.setattr(engine, "DefaultAsyncHttpxClient", _hookless_client)
@@ -1269,7 +1516,7 @@ async def test_report_observed_false_when_hook_never_sees_header(
     )
 
     assert len(requests) == 1
-    summary = bench_engine._egress_summary()
+    summary = bench_engine._egress_summary({})
     assert summary["attempt_total"] == 1
     assert summary["sdk_retry_total"] == 0
     assert summary["sdk_retry_observed"] is False

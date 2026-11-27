@@ -248,7 +248,7 @@ def _read_registry(path: Path) -> _Registry:
     把盐、别名片段或版本原文写进日志等于扩散敏感数据（版本字段已被改写成敏感
     内容的场景同样按此处理）。
 
-    校验是逐层收紧的：顶层对象 → 版本 → 盐 → aliases 是否存在 → 每个键值的
+    校验是逐层收紧的：重复键 → 顶层字段集合 → 版本 → 盐 → 每个键值的
     形态 → 别名唯一性。缺一层就会出现「文件被改写成明文也能当别名发出去」的
     缝，本功能尚无历史文件，因此不为任何缺字段形态留向后兼容。
     """
@@ -265,8 +265,17 @@ def _read_registry(path: Path) -> _Registry:
     except UnicodeDecodeError:
         # 非法 UTF-8 与「内容损坏」同性质：不能当成空表，也不能重写覆盖
         raise PseudonymRegistryError(f"别名注册表不是合法 UTF-8: {path}") from None
+    def _unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        values: dict[str, object] = {}
+        for key, value in pairs:
+            # 默认解析会静默保留最后一个值，重复键即使同值也可能掩盖文件损坏。
+            if key in values:
+                raise PseudonymRegistryError(f"别名注册表包含重复键: {path}")
+            values[key] = value
+        return values
+
     try:
-        decoded: object = json.loads(raw)
+        decoded: object = json.loads(raw, object_pairs_hook=_unique_object)
     except json.JSONDecodeError as error:
         raise PseudonymRegistryError(
             f"别名注册表不是合法 JSON: {path}（{error.msg}）"
@@ -274,10 +283,16 @@ def _read_registry(path: Path) -> _Registry:
     if not isinstance(decoded, dict):
         raise PseudonymRegistryError(f"别名注册表顶层不是对象: {path}")
     data: dict[object, object] = decoded
+    if set(data) != {"version", "salt", "aliases"}:
+        raise PseudonymRegistryError(f"别名注册表顶层字段集合异常: {path}")
     version = data.get("version")
     # bool 是 int 的子类：`version: true` 用 `!=` 比较会刚好等于 1 而混过去；
     # 消息里不回显原值——版本字段可能被改写成敏感内容。
-    if isinstance(version, bool) or version != REGISTRY_VERSION:
+    if (
+        not isinstance(version, int)
+        or isinstance(version, bool)
+        or version != REGISTRY_VERSION
+    ):
         raise PseudonymRegistryError(
             f"别名注册表版本不受支持（期望 {REGISTRY_VERSION}）: {path}"
         )
@@ -294,9 +309,6 @@ def _read_registry(path: Path) -> _Registry:
         raise PseudonymRegistryError(
             f"别名注册表的盐长度异常: {len(salt)} 字节（期望 {_SALT_SIZE}）: {path}"
         )
-    if "aliases" not in data:
-        # 缺字段按空表处理会让「被清空的注册表」静默通过：已发出的别名全部失效
-        raise PseudonymRegistryError(f"别名注册表缺少 aliases 映射: {path}")
     aliases_raw = data["aliases"]
     if not isinstance(aliases_raw, dict):
         raise PseudonymRegistryError(f"别名注册表的 aliases 不是对象: {path}")
@@ -324,11 +336,10 @@ def _replace_file(tmp: str, path: Path) -> None:
 
 
 def _atomic_write(path: Path, payload: bytes) -> None:
-    """同目录临时文件 + flush + fsync + 关闭后 `os.replace` 发布。
+    """同目录临时文件同步后原子替换，POSIX 再同步父目录。
 
-    失败模式：任何一步失败都清理临时文件并抛 PseudonymWriteError，原文件保持
-    原样。`os.replace` 之前写入的内容对新读者不可见——半个文件不会成为新注册表，
-    于是「写失败」与「没开始写」对调用方是同一种结果：旧别名继续有效。
+    替换前失败保留原文件；替换后目录同步失败时，新文件已可见但持久性未确认，
+    仍抛 PseudonymWriteError 阻断出站，不能把可见性当成落盘成功。
     """
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -347,6 +358,13 @@ def _atomic_write(path: Path, payload: bytes) -> None:
             os.fsync(handle.fileno())
         _replace_file(tmp_name, path)
         tmp_name = None
+        # Windows 跳过目录 fsync，只承诺原子可见性，不承诺目录项崩溃后持久。
+        if sys.platform != "win32":
+            directory_fd = os.open(path.parent, os.O_RDONLY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
     except OSError as error:
         raise PseudonymWriteError(
             f"别名注册表写入失败: {path}（{error}）"
@@ -519,6 +537,7 @@ class Pseudonymizer:
         self._flush_future: asyncio.Future[None] | None = None
         self._flush_task: asyncio.Task[None] | None = None
         self._commit_count = 0
+        self._durable: bool = True
 
     @property
     def registry_file(self) -> Path:
@@ -772,11 +791,17 @@ class Pseudonymizer:
                 owner[alias] = digest
                 produced[digest] = alias
                 changed = True
-            if changed:
-                _atomic_write(
-                    path,
-                    _serialize_registry(_Registry(salt=disk.salt, aliases=merged)),
-                )
+            # 目录同步失败后文件已可见，重试若只认「盘上有这个摘要」就会在从未确认持久的情况下把别名发出去。
+            if changed or not self._durable:
+                try:
+                    _atomic_write(
+                        path,
+                        _serialize_registry(_Registry(salt=disk.salt, aliases=merged)),
+                    )
+                except PseudonymWriteError:
+                    self._durable = False
+                    raise
+                self._durable = True
         return produced
 
     def _verify_alias_kind(self, alias: str, prefix: str) -> None:

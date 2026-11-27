@@ -1814,7 +1814,7 @@ class TestPseudonymOutbound:
         names = await prepare_name_context([msg])
         assert names.ctx.enabled
         sender_alias = names.senders[("id", "weflow-legacy", "u1")]
-        group_alias = names.groups[("weflow-legacy", "s1")]
+        group_alias = names.group_name(msg)
         assert _ALIAS_SHAPE_RE.fullmatch(sender_alias), sender_alias
         assert _ALIAS_SHAPE_RE.fullmatch(group_alias), group_alias
         assert sender_alias.startswith("同学")
@@ -1924,7 +1924,7 @@ class TestPseudonymOutbound:
         real = _pseudo_msg(msg_id="m1", group_name="社团群")
         empty = _pseudo_msg(msg_id="m2", group_name="")
         names = await prepare_name_context([real, empty])
-        alias = names.groups[("weflow-legacy", "s1")]
+        alias = names.group_name(real)
         assert alias.startswith("群")
         assert names.ctx.display_name_for(alias, kind="group") == "社团群"
 
@@ -1935,7 +1935,9 @@ class TestPseudonymOutbound:
         first = _pseudo_msg(msg_id="m1", group_name="旧群名")
         second = _pseudo_msg(msg_id="m2", group_name="新群名")
         names = await prepare_name_context([first, second])
-        gkey = ("weflow-legacy", "s1")
+        gkey = pseudonym.group_identity_key(
+            source=first.source, session_id=first.session_id, group_name=first.group_name
+        )
         alias = names.groups[gkey]
         assert alias.startswith("群")
         assert names.ctx.display_name_for(alias, kind="group") == "新群名"
@@ -1953,12 +1955,142 @@ class TestPseudonymOutbound:
             msg_id="m2", session_id="sess-b", group_name="同名群", sender_id="u2"
         )
         names = await prepare_name_context([first, second])
-        alias_a = names.groups[("weflow-legacy", "sess-a")]
-        alias_b = names.groups[("weflow-legacy", "sess-b")]
+        alias_a = names.group_name(first)
+        alias_b = names.group_name(second)
         assert alias_a != alias_b
         groups = _group_messages([first, second], names=names)
         assert len(groups) == 2
         assert [g["groupName"] for g in groups] == [alias_a, alias_b]
+
+    @pytest.mark.parametrize(
+        ("mode", "endpoint", "enabled"),
+        [
+            ("on", "https://api.example.invalid/v1", True),
+            ("off", "https://api.example.invalid/v1", False),
+            ("auto", "http://127.0.0.1:11434/v1", False),
+        ],
+        ids=["on", "off", "local"],
+    )
+    async def test_idless_groups_split_only_when_pseudonymizing(
+        self, pseudo_registry, monkeypatch, mode, endpoint, enabled
+    ):
+        """空会话群名只在启用时分组，关闭时额外群头会改变旧 prompt 字节。"""
+        monkeypatch.setattr(config, "ai_pseudonymize_names", mode)
+        monkeypatch.setattr(config, "ai_api_base", endpoint)
+        first = _pseudo_msg(
+            msg_id="example-a", session_id="", group_name="示例甲群",
+            sender_id="member-example-a", sender_name="示例甲",
+            content="示例活动甲", timestamp=0,
+        )
+        second = _pseudo_msg(
+            msg_id="example-b", session_id="", group_name="示例乙群",
+            sender_id="member-example-b", sender_name="示例乙",
+            content="示例活动乙", timestamp=0,
+        )
+        messages = [first, second]
+        names = await prepare_name_context(messages)
+        assert names.ctx.enabled is enabled
+        groups = _group_messages(messages, names=names)
+        built = _build_user_message(groups)
+
+        if enabled:
+            expected_keys = {
+                pseudonym.group_identity_key(
+                    source=msg.source, session_id=msg.session_id, group_name=msg.group_name
+                )
+                for msg in messages
+            }
+            assert set(names.groups) == expected_keys
+            aliases = [names.group_name(msg) for msg in messages]
+            assert aliases[0] != aliases[1]
+            assert len(groups) == 2
+            assert [group["groupName"] for group in groups] == aliases
+            assert [[msg["index"] for msg in group["messages"]] for group in groups] == [[0], [1]]
+            for index, (alias, msg) in enumerate(zip(aliases, messages, strict=True)):
+                assert alias.startswith("群") and _ALIAS_SHAPE_RE.fullmatch(alias)
+                assert f"群 {index}: {alias}" in built
+                assert names.ctx.restore(alias, field=f"group[{index}]") == msg.group_name
+                assert msg.group_name not in built
+        else:
+            assert len(groups) == 1
+            assert groups[0]["groupName"] == "示例甲群"
+            assert [msg["index"] for msg in groups[0]["messages"]] == [0, 1]
+            expected = (
+                f"{_BATCH_DELIMITER}\n群聊消息开始\n{_BATCH_DELIMITER}\n"
+                "群 0: 示例甲群\n0: 示例甲: 示例活动甲\n1: 示例乙: 示例活动乙\n"
+                f"{_BATCH_DELIMITER}\n群聊消息结束\n{_BATCH_DELIMITER}"
+            )
+            assert built.encode("utf-8") == expected.encode("utf-8")
+
+    @pytest.mark.parametrize("mode", ["off", "local"])
+    async def test_disabled_sender_renames_keep_each_original_prompt_bytes(
+        self, pseudo_registry, monkeypatch, mode
+    ):
+        """关闭时同身份的旧名、新名和空名必须逐条透传，收敛映射会覆盖原字段。"""
+        monkeypatch.setattr(config, "ai_pseudonymize_names", "off" if mode == "off" else "auto")
+        monkeypatch.setattr(
+            config, "ai_api_base",
+            "https://api.example.invalid/v1" if mode == "off" else "http://127.0.0.1:11434/v1",
+        )
+        access_count = 0
+
+        def _forbidden_registry(*args, **kwargs):
+            nonlocal access_count
+            access_count += 1
+            raise AssertionError("关闭假名化不得访问注册表")
+
+        for function in ("get_pseudonymizer", "_read_registry", "_registry_lock", "_atomic_write"):
+            monkeypatch.setattr(pseudonym, function, _forbidden_registry)
+        messages = [
+            _pseudo_msg(
+                msg_id=f"example-{index}", sender_id="member-example",
+                sender_name=sender, group_name="示例群", timestamp=0, content=content,
+            )
+            for index, (sender, content) in enumerate(
+                [("旧名", "示例活动甲"), ("新名", "示例活动乙"), ("", "示例活动丙")]
+            )
+        ]
+        names = await prepare_name_context(messages)
+        assert not names.ctx.enabled
+        assert names.groups == {}
+        assert names.senders == {}
+        assert [names.group_name(msg) for msg in messages] == ["示例群"] * 3
+        assert [names.sender_name(msg) for msg in messages] == ["旧名", "新名", ""]
+        expected_lines = "0: 旧名: 示例活动甲\n1: 新名: 示例活动乙\n2: 未知: 示例活动丙"
+        expected_classify = (
+            f"{_BATCH_DELIMITER}\n群聊消息开始\n{_BATCH_DELIMITER}\n"
+            f"群 0: 示例群\n{expected_lines}\n"
+            f"{_BATCH_DELIMITER}\n群聊消息结束\n{_BATCH_DELIMITER}"
+        )
+        sysb = _build_user_message(_group_messages(messages, names=names))
+        results = [ClassifyResult(msg_index=index, category="活动通知") for index in range(3)]
+        sysc = _build_time_user_message(results, [0, 1, 2], messages, names)
+        assert sysb.encode("utf-8") == expected_classify.encode("utf-8")
+        assert sysc.encode("utf-8") == expected_lines.encode("utf-8")
+        assert access_count == 0
+
+    async def test_undeclared_provider_does_not_trust_local_endpoint(
+        self, pseudo_registry, monkeypatch
+    ):
+        """供应商不声明目的地时 localhost 不能免于化名：它可能把请求改路由到远端。
+
+        失败模式：只看配置 URL 判本地，第三方供应商却把请求发往别处，真名原样出境。
+        """
+        from unittest.mock import Mock
+
+        from briefdesk import ai_ports
+
+        monkeypatch.setattr(config, "ai_api_base", "http://127.0.0.1:11434/v1")
+        monkeypatch.setattr(config, "ai_pseudonymize_names", "auto")
+        # 桩不声明 effective_remote：按远端处理
+        ai_ports.set_ai(Mock())
+        try:
+            names = await prepare_name_context([_pseudo_msg()])
+        finally:
+            ai_ports.set_ai(None)
+        assert names.ctx.enabled
+        alias = names.sender_name(_pseudo_msg())
+        assert _ALIAS_SHAPE_RE.fullmatch(alias), alias
 
     async def test_local_endpoint_keeps_prompt_byte_identical(self):
         # 本地端点（auto 的关闭分支）：映射返回原值，两处 prompt 与不传映射时
@@ -1967,8 +2099,10 @@ class TestPseudonymOutbound:
         with patch.object(config, "ai_api_base", "http://127.0.0.1:11434/v1"):
             names = await prepare_name_context([msg])
         assert not names.ctx.enabled
-        assert names.groups[("weflow-legacy", "s1")] == "社团群"
-        assert names.senders[("id", "weflow-legacy", "u1")] == "张三"
+        assert names.groups == {}
+        assert names.senders == {}
+        assert names.group_name(msg) == "社团群"
+        assert names.sender_name(msg) == "张三"
         assert _build_user_message(_group_messages([msg], names=names)) == (
             _build_user_message(_group_messages([msg]))
         )
@@ -2079,7 +2213,7 @@ class TestPseudonymRestore:
         msg = _pseudo_msg()
         names = await prepare_name_context([msg])
         sender_alias = names.senders[("id", "weflow-legacy", "u1")]
-        group_alias = names.groups[("weflow-legacy", "s1")]
+        group_alias = names.group_name(msg)
         prompts: dict[str, str] = {}
 
         async def fake_chat(*, messages, telemetry_kind, **_kwargs):

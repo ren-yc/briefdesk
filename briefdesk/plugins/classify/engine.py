@@ -13,10 +13,10 @@ from dataclasses import dataclass, replace
 from difflib import SequenceMatcher
 
 from briefdesk import announcements
-from briefdesk.ai_egress import is_local_endpoint
 from briefdesk.ai_ports import (
     chat,
     cosine_similarity,
+    effective_remote,
     embed_texts,
     is_embedding_enabled,
     loads_json,
@@ -27,6 +27,7 @@ from briefdesk.plugin.base import ChatResponse
 from briefdesk.pseudonym import (
     NameContext,
     PseudonymError,
+    group_identity_key,
     pseudonymize_enabled,
 )
 from briefdesk.types import (
@@ -163,12 +164,15 @@ class PreparedNames:
     """
 
     ctx: NameContext
-    groups: dict[tuple[str, str], str]
+    groups: dict[str, str]
     senders: dict[tuple[str, ...], str]
 
     def group_name(self, msg: InternalMessage) -> str:
         """该消息所属会话在 prompt 里的群名（未准备时回退原值）。"""
-        return self.groups.get((msg.source or "", msg.session_id), msg.group_name)
+        key = group_identity_key(
+            source=msg.source or "", session_id=msg.session_id, group_name=msg.group_name
+        )
+        return self.groups.get(key, msg.group_name)
 
     def sender_name(self, msg: InternalMessage) -> str:
         """该消息发送者在 prompt 里的显示名（未准备时回退原值）。"""
@@ -196,15 +200,23 @@ async def prepare_name_context(messages: list[InternalMessage]) -> PreparedNames
     """
     enabled = pseudonymize_enabled(
         config.ai_pseudonymize_names,
-        remote_endpoint=not is_local_endpoint(config.ai_api_base),
+        remote_endpoint=effective_remote(config.ai_api_base),
     )
     ctx = NameContext(enabled=enabled)
 
-    group_names: dict[tuple[str, str], str] = {}
+    if not enabled:
+        # 空映射让 accessor 逐条回退原字段；收敛映射会把旧名与空名覆盖成新名。
+        return PreparedNames(ctx=ctx, groups={}, senders={})
+
+    group_names: dict[str, str] = {}
+    group_msgs: dict[str, InternalMessage] = {}
     sender_names: dict[tuple[str, ...], str] = {}
     sender_msgs: dict[tuple[str, ...], InternalMessage] = {}
     for msg in messages:
-        gkey = (msg.source or "", msg.session_id)
+        gkey = group_identity_key(
+            source=msg.source or "", session_id=msg.session_id, group_name=msg.group_name
+        )
+        group_msgs.setdefault(gkey, msg)
         # 还原目标口径（人与群同一规则）：本请求内最后一个非空显示名。空显示名
         # 跳过、不锁定空串，先空后真名的人拿真名出站、也拿真名还原。首个非空
         # 出现者参与并发准备；最终映射值由这一遍按输入顺序决定。
@@ -215,22 +227,19 @@ async def prepare_name_context(messages: list[InternalMessage]) -> PreparedNames
         if (msg.sender_name or "").strip() or sender_key not in sender_names:
             sender_names[sender_key] = msg.sender_name
 
-    if not enabled:
-        # 关闭时不做任何准备：映射值就是原值（含未清洗的空白），builder 产出的
-        # prompt 文本与未接入假名化时逐字节一致，也不产生任何读盘或 await。
-        return PreparedNames(ctx=ctx, groups=group_names, senders=sender_names)
-
     # 只对「首个非空显示名」并发取别名（新身份在此共享一次落盘窗口）；同名多
     # 显示名的最终映射值在下面按输入顺序覆盖，别名按身份键复用、不重复提交。
-    first_group_alias: dict[tuple[str, str], str] = {}
+    first_group_alias: dict[str, str] = {}
     first_sender_alias: dict[tuple[str, ...], str] = {}
     group_aliases, sender_aliases = await asyncio.gather(
         asyncio.gather(
             *(
                 ctx.group_alias(
-                    source=source, session_id=session_id, group_name=group_name
+                    source=group_msgs[key].source or "",
+                    session_id=group_msgs[key].session_id,
+                    group_name=group_name,
                 )
-                for (source, session_id), group_name in group_names.items()
+                for key, group_name in group_names.items()
             )
         ),
         asyncio.gather(
@@ -253,7 +262,9 @@ async def prepare_name_context(messages: list[InternalMessage]) -> PreparedNames
     # 同身份多个显示名：按输入顺序把映射值钉在最后一个非空显示名对应的别名上。
     # 逆映射（别名 → 显示名）在冻结模块内部按「最后登记」更新，无需这里重放。
     for msg in messages:
-        gkey = (msg.source or "", msg.session_id)
+        gkey = group_identity_key(
+            source=msg.source or "", session_id=msg.session_id, group_name=msg.group_name
+        )
         if (msg.group_name or "").strip() and first_group_alias.get(gkey):
             groups[gkey] = first_group_alias[gkey]
         sender_key = _sender_identity_key(msg)
@@ -267,13 +278,19 @@ def _group_messages(
     vision_images: dict[tuple[str, str], list[bytes]] | None = None,
     names: PreparedNames | None = None,
 ) -> list[dict]:
-    groups: dict[tuple[str, str], dict] = {}
+    groups: dict[str | tuple[str, str], dict] = {}
     images_by_msg = vision_images or {}
     for i, msg in enumerate(messages):
-        # 分组键是会话身份 (source, session_id)，不是群名：不同会话可能同名，
-        # 掩码后同形（群名嵌 PII 掩成同一占位符）或上游重名都会把两个会话
-        # 错误并进同一群头，模型收到混淆的会话上下文。群名只作群头显示。
-        key = (msg.source or "", msg.session_id)
+        # 启用时与注册表共用身份键，缺会话 ID 的不同群名不能合并；关闭时保留
+        # 旧会话分组，否则本地与 off 的 prompt 会出现额外群头、发生字节漂移。
+        key: str | tuple[str, str]
+        if names is not None and names.ctx.enabled:
+            key = group_identity_key(
+                source=msg.source or "", session_id=msg.session_id,
+                group_name=msg.group_name,
+            )
+        else:
+            key = (msg.source or "", msg.session_id)
         if key not in groups:
             groups[key] = {
                 "groupName": names.group_name(msg) if names is not None else msg.group_name,

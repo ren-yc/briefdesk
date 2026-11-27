@@ -111,14 +111,19 @@ def _enabled() -> bool:
 # ── 记录入口 ──
 
 
-def record(kind: str, source: str = "") -> None:
-    """计数 +1（kind 如 "judge.call"；source 为消息源标识，无维度时空串）。"""
+def record(kind: str, source: str = "") -> bool:
+    """计数 +1（kind 如 "judge.call"；source 为消息源标识，无维度时空串）。
+
+    成功返回 True，关闭或写入失败返回 False。
+    """
     if not _enabled():
-        return
+        return False
     try:
         _counters[f"{kind}|{source}"] += 1
     except Exception:  # noqa: BLE001 — 遥测永不连坐业务路径
         logger.debug("telemetry record 失败（忽略）: %s/%s", kind, source)
+        return False
+    return True
 
 
 def observe(kind: str, ms: float, source: str = "") -> None:

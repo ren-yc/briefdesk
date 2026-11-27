@@ -74,10 +74,11 @@ class _SdkRetryTracker:
 
     `header_seen` 记录「本次 create 至少一个请求真的读到了重试序号头」：遥测开着
     不代表钩子挂上了、更不代表头可读——三者缺一，重试次数就只能是未知。收尾时
-    按这个旗标记观测可用，报告侧才能把「零次重试」当成可信读数。
+    还须确认重试计数没有失败，报告侧才能把「零次重试」当成可信读数。
+    `record_failed` 锁存计数异常，避免后续成功掩盖此前漏记的重试。
     """
 
-    __slots__ = ("header_seen", "is_local", "port", "role", "seen")
+    __slots__ = ("header_seen", "is_local", "port", "record_failed", "role", "seen")
 
     def __init__(self, port: str, role: str, *, is_local: bool) -> None:
         self.port = port
@@ -85,6 +86,7 @@ class _SdkRetryTracker:
         self.is_local = is_local
         self.seen: set[int] = set()
         self.header_seen = False
+        self.record_failed: bool = False
 
 
 # 当前任务正在进行的 create 的观测状态；未处于任何 create 内时为 None（钩子直接
@@ -144,7 +146,16 @@ async def _on_sdk_request(request: httpx.Request) -> None:
         tracker.header_seen = True
         if ordinal <= 0 or ordinal in tracker.seen:
             return
-        ai_egress.record_sdk_retry(tracker.port, tracker.role, tracker.is_local)
+        try:
+            # 计数是否真的落账只有计数入口知道，吞掉的写失败不能当成「记过了」。
+            if not ai_egress.record_sdk_retry(
+                tracker.port, tracker.role, tracker.is_local
+            ):
+                tracker.record_failed = True
+                return
+        except Exception:
+            tracker.record_failed = True
+            raise
         tracker.seen.add(ordinal)
     except Exception:  # 钩子异常绝不连坐请求
         logger.debug("SDK 重试计数失败（忽略）", exc_info=True)
@@ -167,7 +178,7 @@ def _sending(port: str, base: str) -> Iterator[None]:
     拿到安全默认值，不会因为没有元数据就丢计数。端口取调用点自己的，不由元数据
     决定：端口是代码路径的属性，一次误设的元数据不该把 rag 的发送记进 chat 桶。
 
-    收尾时若本次 create 至少一个请求读到了重试序号头，单独记一次观测可用：
+    收尾时若本次 create 读到了重试序号头且计数从未失败，才记一次观测可用：
     该计数与发送尝试同口径（按 create 计），报告侧用它判断「SDK 重试读数」
     是可信的零还是未知——遥测开关替代不了这个判断，钩子没挂上或头不可读时
     一次重试都不会被记，把零当可信会静默丢掉全部内部重试。
@@ -180,7 +191,7 @@ def _sending(port: str, base: str) -> Iterator[None]:
         yield
     finally:
         _RETRY_TRACKER.reset(token)
-        if tracker.header_seen:
+        if tracker.header_seen and not tracker.record_failed:
             ai_egress.record_retry_observed(port, role, is_local)
 
 
@@ -223,14 +234,18 @@ async def _queue_permit(
             sem.release()
 
 
-def _build_http_client() -> httpx.AsyncClient:
-    """给 SDK 客户端装请求钩子，其余参数沿用 SDK 自己的默认值。
+def _build_http_client(base: str) -> httpx.AsyncClient:
+    """给 SDK 客户端装请求钩子，并仅收口本地端点的网络路由。
 
-    用 SDK 的 `DefaultAsyncHttpxClient` 而不是裸 `httpx.AsyncClient`：后者会丢掉
-    连接池上限与 `follow_redirects` 默认值，让一次「只加观测」的改动改变真实请求
-    行为（重定向不再跟随、并发连接数变化）。
+    本地端点经环境代理或 307/308 跳转到远端会携带未假名化的姓名，必须禁用两者。
+    远端请求已假名化，统一禁用只会破坏代理部署与 SSL_CERT_FILE 自定义 CA。
     """
-    return DefaultAsyncHttpxClient(event_hooks={"request": [_on_sdk_request]})
+    local = ai_egress.is_local_endpoint(base)
+    return DefaultAsyncHttpxClient(
+        event_hooks={"request": [_on_sdk_request]},
+        trust_env=not local,
+        follow_redirects=not local,
+    )
 
 
 def get_ai_client() -> AsyncOpenAI:
@@ -242,7 +257,7 @@ def get_ai_client() -> AsyncOpenAI:
             base_url=config.ai_api_base,
             timeout=_REQUEST_TIMEOUT,
             max_retries=_REQUEST_MAX_RETRIES,
-            http_client=_build_http_client(),
+            http_client=_build_http_client(config.ai_api_base),
         )
     return _client
 
@@ -265,7 +280,7 @@ def get_alt_client(api_base: str = "", api_key: str = "") -> AsyncOpenAI:
             base_url=base,
             timeout=_REQUEST_TIMEOUT,
             max_retries=_REQUEST_MAX_RETRIES,
-            http_client=_build_http_client(),
+            http_client=_build_http_client(base),
         )
         _alt_clients[(base, key)] = cached
     return cached
@@ -565,7 +580,7 @@ def get_embed_client() -> AsyncOpenAI:
             base_url=embed_api_base(),
             timeout=_REQUEST_TIMEOUT,
             max_retries=_REQUEST_MAX_RETRIES,
-            http_client=_build_http_client(),
+            http_client=_build_http_client(embed_api_base()),
         )
     return _embed_client
 
@@ -667,6 +682,15 @@ class Provider(AIProvider):
 
     薄封装：chat / 嵌入直接委托本模块的共享客户端实现。
     """
+
+    def effective_remote(self, base: str) -> bool:
+        """本供应商把该 base 的请求发往哪里：内置实现只发往 base 指向的端点。
+
+        这是提供给假名化策略的可选能力声明。第三方供应商若不声明，策略会按远端
+        处理（见 `briefdesk.ai_ports.effective_remote`）：它可能把请求路由到配置
+        里没写的地址，`localhost` 不代表真名没出门。
+        """
+        return not ai_egress.is_local_endpoint(base)
 
     async def chat(
         self,

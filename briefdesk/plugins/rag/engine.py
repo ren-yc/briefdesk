@@ -29,7 +29,7 @@ from typing import Any
 import aiosqlite
 import numpy as np
 
-from briefdesk import ai_egress, ai_ports
+from briefdesk import ai_ports
 from briefdesk.config import config
 from briefdesk.db import get_db, get_embed_db, get_embed_lock, storage_lock
 from briefdesk.masking import PLACEHOLDER_ONLY_RE
@@ -152,10 +152,12 @@ class RagEngine:
         # FTS 可用性惰性探测结果（None=未探测；False=纯向量模式）
         self._fts_enabled: bool | None = None
         self._schema_ready = False
+        self._schema_lock = asyncio.Lock()
         # 向量缓存：created_at 水位增量填充；模型切换/行数回退全量重建
         self._vec_model: str | None = None
         self._vec_watermark = ""
         self._vec_count_seen = 0
+        self._vec_cache_dirty = False
         self._vec_entries: dict[tuple[str, str], tuple[ChunkRow, np.ndarray]] = {}
         # 预组 float32 矩阵（缓存变更时重组，ask 路径零转换零拷贝直用）
         self._matrix: np.ndarray | None = None
@@ -182,11 +184,14 @@ class RagEngine:
     async def _ensure_db_ready(self) -> aiosqlite.Connection:
         db = await self._db_factory()
         if not self._schema_ready:
-            await ensure_rag_schema(db)
-            self._fts_enabled = await ensure_fts(db)
-            if not self._fts_enabled:
-                logger.warning("rag: FTS 不可用，降级纯向量检索")
-            self._schema_ready = True
+            # 并发首次调用会交错迁移与提交；锁内复查，避免等待者重复迁移。
+            async with self._schema_lock:
+                if not self._schema_ready:
+                    await ensure_rag_schema(db)
+                    self._fts_enabled = await ensure_fts(db)
+                    if not self._fts_enabled:
+                        logger.warning("rag: FTS 不可用，降级纯向量检索")
+                    self._schema_ready = True
         return db
 
     async def prepare(self) -> None:
@@ -244,6 +249,11 @@ class RagEngine:
         防止一方的 commit 把另一方未完成的批量写入提前提交。
         """
         await upsert_chunks(db, rows)
+        # 元数据更新不推进向量水位，旧身份会一直留在缓存；与刷新共锁，
+        # 防止进行中的刷新清掉刚置位的脏标志。
+        async with self._refresh_lock:
+            if any((row.source, row.msg_id) in self._vec_entries for row in rows):
+                self._vec_cache_dirty = True
         if self._fts_enabled:
             await sync_fts(db, rows)
         if not emb_items:
@@ -504,6 +514,7 @@ class RagEngine:
         )
 
     async def _refresh_vector_cache(self, *, force_full: bool = False) -> None:
+        force_full = force_full or self._vec_cache_dirty
         model = ai_ports.embed_model_name()
         if self._vec_model != model:
             logger.info("rag: 嵌入模型切换 %s -> %s，重建向量缓存", self._vec_model, model)
@@ -540,6 +551,7 @@ class RagEngine:
                 # 全表已空（全部删除）：差集剔除已清空 _vec_entries，须重建
                 # 矩阵，否则旧的 float32 矩阵残留已删向量继续参与检索。
                 self._rebuild_matrix()
+            self._vec_cache_dirty = False
             return
         entries, bad_keys = await asyncio.to_thread(parse_embedding_rows, raw_rows)
         # 维度对账：同模型名下供应商原地换维度或历史脏行会让
@@ -596,6 +608,7 @@ class RagEngine:
             # 收进缓存；递归至多一层——缓存基准已更新，不会再触发重建分支
             self._vec_watermark = ""
             await self._refresh_vector_cache()
+        self._vec_cache_dirty = False
 
     @staticmethod
     async def _delete_bad_embeddings(
@@ -732,7 +745,7 @@ class RagEngine:
         """
         enabled = pseudonymize_enabled(
             config.ai_pseudonymize_names,
-            remote_endpoint=not ai_egress.is_local_endpoint(dispatch.api_base),
+            remote_endpoint=ai_ports.effective_remote(dispatch.api_base),
         )
         return NameContext(enabled=enabled)
 
@@ -957,8 +970,14 @@ class RagEngine:
             dispatch = ai_ports.resolve_rag_dispatch(**override)
             context = self._name_context(dispatch)
             names = await self._prepare_evidence_names(context, hits)
+            prompt_history = history or []
+            if context.enabled and prompt_history:
+                # 历史含上轮还原的真名，当前证据映射无法覆盖已离开命中集的人；
+                # 启用时整段丢弃，避免还原结果再次出境。
+                prompt_history = []
+                telemetry.record("rag.history_dropped")
             messages = build_answer_prompt(
-                datetime.now(UTC).astimezone(), question.strip(), hits, history or [],
+                datetime.now(UTC).astimezone(), question.strip(), hits, prompt_history,
                 self.settings.evidence_chars, names=names,
             )
             resp = await ai_ports.rag_chat(

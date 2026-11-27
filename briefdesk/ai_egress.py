@@ -272,14 +272,15 @@ def record_queue_cancelled(port: str, role: str) -> None:
     )
 
 
-def record_sdk_retry(port: str, role: str, is_local: bool) -> None:
+def record_sdk_retry(port: str, role: str, is_local: bool) -> bool:
     """SDK 内部重试一次：与逻辑发送尝试分桶，不改动尝试计数。
 
     逻辑尝试是「调用方发起了几次 create」，SDK 重试是「SDK 内部又发了几次」；
     两者混在一起会让「一次 create 被重试两次」看起来像三次出境请求。
+    返回计数入口的真实落账结果。
     """
     prefix = "ai.local.sdk_retry" if is_local else "ai.egress.sdk_retry"
-    telemetry.record(f"{prefix}.{_dimensions(port, role)}", _current_source())
+    return telemetry.record(f"{prefix}.{_dimensions(port, role)}", _current_source())
 
 
 def record_retry_observed(port: str, role: str, is_local: bool) -> None:

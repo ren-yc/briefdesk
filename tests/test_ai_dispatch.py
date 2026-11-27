@@ -232,3 +232,111 @@ async def test_rag_chat_sends_where_plan_says_for_legacy_provider(
     assert provider.used == "chat"
     assert (plan.model, plan.api_base) == (config.ai_model, config.ai_api_base)
     assert plan.api_base == _MAIN_BASE
+
+
+# ── 出站目的地声明（假名化的「远端」判据） ──
+#
+# 路由由供应商实现决定，配置 URL 只能描述内置实现：第三方插件可以把请求发到任何
+# 地方，而配置里写着 localhost。策略因此先问供应商有没有声明目的地，没声明就按
+# 远端处理——判定失败要往隐私这侧倒。
+
+_LOCAL_BASE = "http://127.0.0.1:11434/v1"
+
+
+class _DeclaresLocal:
+    """声明「请求留在本机」的供应商：策略应采信它的声明。"""
+
+    def effective_remote(self, base: str) -> bool:
+        return False
+
+
+class _DeclaresNothing:
+    """漏写 return 的声明（返回 None）：不能因此被读成本地。"""
+
+    def effective_remote(self, base: str) -> Any:
+        return None
+
+
+class _DeclaresZero:
+    """返回 0 的声明：`0 == False` 但 `0 is not False`，不能因此被读成本地。"""
+
+    def effective_remote(self, base: str) -> Any:
+        return 0
+
+
+class _BrokenDeclaration:
+    """声明过程失败：不可信，按远端处理。"""
+
+    def effective_remote(self, base: str) -> bool:
+        raise RuntimeError("声明失败")
+
+
+class _InstanceOnlyRemote(_LegacyProvider):
+    """实例级动态 effective_remote（Mock 的常见形状）：类上没声明就不算声明。"""
+
+    def __getattr__(self, name: str) -> Any:
+        if name == "effective_remote":
+            return lambda base: False
+        raise AttributeError(name)
+
+
+def test_effective_remote_falls_back_to_url_without_provider() -> None:
+    """未注册供应商（配置解析、纯函数路径）：URL 是唯一线索。"""
+    ai_ports.set_ai(None)
+    assert ai_ports.effective_remote(_LOCAL_BASE) is False
+    assert ai_ports.effective_remote(_MAIN_BASE) is True
+
+
+def test_unregistered_declaration_treats_local_url_as_remote() -> None:
+    """不声明目的地的供应商不能靠 localhost 免于假名化（回归：按 URL 判定一切）。"""
+    _use(_LegacyProvider())
+    try:
+        assert ai_ports.effective_remote(_LOCAL_BASE) is True
+    finally:
+        ai_ports.set_ai(None)
+
+
+def test_declared_local_destination_is_honoured() -> None:
+    """供应商声明请求留在本机时采信声明（回归：忽略声明一律按 URL）。"""
+    _use(_DeclaresLocal())
+    try:
+        assert ai_ports.effective_remote(_MAIN_BASE) is False
+    finally:
+        ai_ports.set_ai(None)
+
+
+def test_declaration_failure_falls_back_to_remote() -> None:
+    """声明抛错按远端（回归：失败降级成本地，把真名交给未知接收方）。"""
+    _use(_BrokenDeclaration())
+    try:
+        assert ai_ports.effective_remote(_LOCAL_BASE) is True
+    finally:
+        ai_ports.set_ai(None)
+
+
+def test_instance_only_declaration_is_not_trusted() -> None:
+    """按类查声明（回归：按实例查会把 Mock 凭空生成的属性当真实声明）。"""
+    _use(_InstanceOnlyRemote())
+    try:
+        assert ai_ports.effective_remote(_LOCAL_BASE) is True
+    finally:
+        ai_ports.set_ai(None)
+
+
+@pytest.mark.parametrize("provider_type", [_DeclaresNothing, _DeclaresZero])
+def test_non_boolean_declaration_falls_back_to_remote(provider_type: Any) -> None:
+    """声明返回 None／0 这类非布尔值按远端（回归：漏写 return 或 `!= False` 被读成本地）。"""
+    _use(provider_type())
+    try:
+        assert ai_ports.effective_remote(_LOCAL_BASE) is True
+    finally:
+        ai_ports.set_ai(None)
+
+
+def test_builtin_provider_declares_url_based_destination() -> None:
+    """内置供应商发往配置端点，声明结果与 URL 判定一致（行为不变的基线）。"""
+    from briefdesk.plugins.ai_provider.engine import Provider
+
+    provider = Provider()
+    assert provider.effective_remote(_LOCAL_BASE) is False
+    assert provider.effective_remote(_MAIN_BASE) is True

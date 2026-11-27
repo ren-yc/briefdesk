@@ -18,6 +18,7 @@ import threading
 import time
 from collections.abc import Callable
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -679,6 +680,7 @@ async def test_replace_failure_keeps_old_map_and_prevents_send(
         patched.setattr(pseudonym, "_replace_file", _fail_replace)
         with pytest.raises(pseudonym.PseudonymWriteError):
             await _person(pz, sender_id="member-0002", name="示例乙")
+        assert pz._durable is False
         # 旧表原样保留、没留下临时文件、旧别名照常可用
         assert registry_path.read_bytes() == before_bytes
         assert not list(base.glob("*.tmp"))
@@ -686,8 +688,175 @@ async def test_replace_failure_keeps_old_map_and_prevents_send(
 
     # 写路径恢复后可以继续登记，且不污染已提交的旧别名
     second = await _person(pz, sender_id="member-0002", name="示例乙")
+    assert pz._durable is True
     assert second != first
     assert {first, second} <= set(_aliases(base).values())
+
+
+def test_atomic_write_directory_fsync_failure_is_write_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """替换后目录同步失败也必须阻断出站，不能把已可见的新文件当成持久提交。"""
+    registry_path = tmp_path / pseudonym.REGISTRY_FILE_NAME
+    registry_path.write_bytes(b"old-registry")
+    payload = b"new-registry"
+    syncs: list[int] = []
+    directory_fds: list[int] = []
+    closed: list[int] = []
+    original_open = os.open
+    original_fsync = os.fsync
+    original_close = os.close
+
+    def _open(path_arg, flags, *args, **kwargs):
+        if os.fspath(path_arg) == os.fspath(registry_path.parent):
+            assert flags == os.O_RDONLY
+            assert registry_path.read_bytes() == payload
+            assert len(syncs) == 1
+            # Windows 不能按 POSIX 方式打开目录，用已替换文件的句柄模拟目录句柄。
+            descriptor = original_open(registry_path, flags)
+            directory_fds.append(descriptor)
+            return descriptor
+        return original_open(path_arg, flags, *args, **kwargs)
+
+    def _sync(descriptor: int) -> None:
+        syncs.append(descriptor)
+        if len(syncs) == 2:
+            raise OSError("模拟目录同步失败")
+        original_fsync(descriptor)
+
+    def _close(descriptor: int) -> None:
+        closed.append(descriptor)
+        original_close(descriptor)
+
+    with monkeypatch.context() as patched:
+        patched.setattr(pseudonym.sys, "platform", "linux")
+        patched.setattr(pseudonym.os, "open", _open)
+        patched.setattr(pseudonym.os, "fsync", _sync)
+        patched.setattr(pseudonym.os, "close", _close)
+        with pytest.raises(pseudonym.PseudonymWriteError):
+            pseudonym._atomic_write(registry_path, payload)
+
+    assert len(syncs) == 2
+    assert len(directory_fds) == 1
+    assert closed == directory_fds
+    assert registry_path.read_bytes() == payload
+    assert not list(tmp_path.glob("*.tmp"))
+
+
+@pytest.mark.parametrize(
+    "retry_fails", [False, True], ids=["retry_succeeds", "retry_fails_closed"]
+)
+async def test_directory_fsync_failure_retry_rewrites_before_publishing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, retry_fails: bool
+) -> None:
+    """杀死「重试只认盘上摘要、跳过写盘」：同步成功前不得发布别名。
+
+    用文件句柄模拟 POSIX 目录句柄，让 Windows 也能验证替换后的同步故障。
+    """
+    base = tmp_path / "reg"
+    pz = _make(base)
+    await pz._ensure_registry()
+    registry_path = pz.registry_file
+    events: list[str] = []
+    directory_fds: set[int] = set()
+    original_write = pseudonym._atomic_write
+    original_replace = pseudonym._replace_file
+    original_open = os.open
+    original_fsync = os.fsync
+    original_close = os.close
+
+    def _write(path: Path, payload: bytes) -> None:
+        events.append("write")
+        with monkeypatch.context() as patched:
+            patched.setattr(pseudonym, "sys", SimpleNamespace(platform="linux"))
+            original_write(path, payload)
+
+    def _replace(tmp: str, path: Path) -> None:
+        original_replace(tmp, path)
+        events.append("replace")
+
+    def _open(path_arg, flags, *args, **kwargs):
+        if os.fspath(path_arg) == os.fspath(base):
+            assert flags == os.O_RDONLY
+            descriptor = original_open(registry_path, flags)
+            directory_fds.add(descriptor)
+            return descriptor
+        return original_open(path_arg, flags, *args, **kwargs)
+
+    def _sync(descriptor: int) -> None:
+        if descriptor in directory_fds:
+            if events.count("write") == 1 or retry_fails:
+                events.append("directory_fsync_failed")
+                raise OSError("模拟目录同步失败")
+            events.append("directory_fsynced")
+            return
+        original_fsync(descriptor)
+        events.append("file_fsynced")
+
+    def _close(descriptor: int) -> None:
+        directory_fds.discard(descriptor)
+        original_close(descriptor)
+
+    failed_write = ["write", "file_fsynced", "replace", "directory_fsync_failed"]
+    with monkeypatch.context() as patched:
+        patched.setattr(pseudonym, "_atomic_write", _write)
+        patched.setattr(pseudonym, "_replace_file", _replace)
+        patched.setattr(pseudonym.os, "open", _open)
+        patched.setattr(pseudonym.os, "fsync", _sync)
+        patched.setattr(pseudonym.os, "close", _close)
+        with pytest.raises(pseudonym.PseudonymWriteError):
+            await _person(pz, sender_id="member-0001", name="示例甲")
+        assert events == failed_write
+        assert pz._durable is False
+        assert pz._committed == {}
+        visible_bytes = registry_path.read_bytes()
+        visible_aliases = _aliases(base)
+        assert len(visible_aliases) == 1
+        visible_alias = next(iter(visible_aliases.values()))
+
+        if retry_fails:
+            with pytest.raises(pseudonym.PseudonymWriteError):
+                await _person(pz, sender_id="member-0001", name="示例甲")
+            assert events == failed_write * 2
+            assert pz._durable is False
+            assert pz._committed == {}
+        else:
+            alias = await _person(pz, sender_id="member-0001", name="示例甲")
+            events.append("alias_returned")
+            assert alias == visible_alias
+            assert events == failed_write + [
+                "write",
+                "file_fsynced",
+                "replace",
+                "directory_fsynced",
+                "alias_returned",
+            ]
+            assert pz._durable is True
+        assert events.count("write") == 2
+        assert events.count("replace") == 2
+        assert not directory_fds
+        assert registry_path.read_bytes() == visible_bytes
+
+
+def test_atomic_write_windows_skips_directory_fsync(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Windows 只同步文件；无条件同步目录会把该平台的原子写入误报为失败。"""
+    registry_path = tmp_path / pseudonym.REGISTRY_FILE_NAME
+    syncs: list[int] = []
+    original_fsync = os.fsync
+
+    def _sync(descriptor: int) -> None:
+        syncs.append(descriptor)
+        original_fsync(descriptor)
+
+    with monkeypatch.context() as patched:
+        patched.setattr(pseudonym.sys, "platform", "win32")
+        patched.setattr(pseudonym.os, "fsync", _sync)
+        pseudonym._atomic_write(registry_path, b"new-registry")
+
+    assert len(syncs) == 1
+    assert registry_path.read_bytes() == b"new-registry"
 
 
 async def test_unexpected_commit_error_hides_original_message(
@@ -806,6 +975,106 @@ def test_lock_contention_fails_closed(tmp_path: Path) -> None:
 
 def _dump(payload: dict[str, object]) -> bytes:
     return json.dumps(payload, ensure_ascii=False).encode("utf-8")
+
+
+def _valid_registry_payload() -> dict[str, object]:
+    return {
+        "version": pseudonym.REGISTRY_VERSION,
+        "salt": base64.b64encode(b"s" * 32).decode("ascii"),
+        "aliases": {"a" * 64: "同学ABCDEF"},
+    }
+
+
+@pytest.mark.parametrize("duplicate", ["version", "aliases", "digest", "salt"])
+def test_read_registry_rejects_duplicate_keys(
+    tmp_path: Path, duplicate: str
+) -> None:
+    """原始 JSON 的同值或异值重复键都要拒绝，按值比较会漏掉两份有效的盐。"""
+    salt = base64.b64encode(b"s" * 32).decode("ascii")
+    other_salt = base64.b64encode(b"t" * 32).decode("ascii")
+    digest = "a" * 64
+    alias = "同学ABCDEF"
+    aliases_json = f'{{"{digest}":"{alias}"}}'
+    if duplicate == "version":
+        raw = (
+            f'{{"version":1,"version":1,"salt":"{salt}",'
+            f'"aliases":{aliases_json}}}'
+        )
+    elif duplicate == "aliases":
+        raw = (
+            f'{{"version":1,"salt":"{salt}","aliases":{aliases_json},'
+            f'"aliases":{aliases_json}}}'
+        )
+    elif duplicate == "salt":
+        raw = (
+            f'{{"version":1,"salt":"{salt}","salt":"{other_salt}",'
+            f'"aliases":{aliases_json}}}'
+        )
+    else:
+        raw = (
+            f'{{"version":1,"salt":"{salt}","aliases":'
+            f'{{"{digest}":"{alias}","{digest}":"{alias}"}}}}'
+        )
+    registry_path = tmp_path / pseudonym.REGISTRY_FILE_NAME
+    original = raw.encode("utf-8")
+    registry_path.write_bytes(original)
+
+    with pytest.raises(pseudonym.PseudonymRegistryError) as excinfo:
+        pseudonym._read_registry(registry_path)
+
+    message = str(excinfo.value)
+    assert "重复键" in message
+    for marker in ("version", "aliases", digest, salt, other_salt, alias, raw):
+        assert marker not in message
+    assert registry_path.read_bytes() == original
+
+
+@pytest.mark.parametrize(
+    "field", ["unknown", "version", "salt", "aliases", "aliases-swapped"]
+)
+def test_read_registry_requires_exact_fields(tmp_path: Path, field: str) -> None:
+    """未知或缺失字段都要拒绝，等量替换不能绕过集合校验后泄漏 KeyError。"""
+    payload = _valid_registry_payload()
+    if field == "unknown":
+        payload[field] = "示例额外值"
+    elif field == "aliases-swapped":
+        payload.pop("aliases")
+        payload["unknown"] = "示例额外值"
+    else:
+        payload.pop(field)
+    registry_path = tmp_path / pseudonym.REGISTRY_FILE_NAME
+    original = _dump(payload)
+    registry_path.write_bytes(original)
+
+    with pytest.raises(pseudonym.PseudonymRegistryError):
+        pseudonym._read_registry(registry_path)
+    assert registry_path.read_bytes() == original
+
+
+@pytest.mark.parametrize("version", [1.0, True, "1"], ids=["float", "bool", "string"])
+def test_read_registry_requires_integer_version(tmp_path: Path, version: object) -> None:
+    """数值相等不代表格式正确，浮点数与 bool 不能冒充注册表整数版本。"""
+    payload = _valid_registry_payload()
+    payload["version"] = version
+    registry_path = tmp_path / pseudonym.REGISTRY_FILE_NAME
+    original = _dump(payload)
+    registry_path.write_bytes(original)
+
+    with pytest.raises(pseudonym.PseudonymRegistryError):
+        pseudonym._read_registry(registry_path)
+    assert registry_path.read_bytes() == original
+
+
+def test_read_registry_accepts_current_version(tmp_path: Path) -> None:
+    """严格校验不能拒绝本安装已有的合法注册表，否则正常重启也会阻断出站。"""
+    registry_path = tmp_path / pseudonym.REGISTRY_FILE_NAME
+    original = _dump(_valid_registry_payload())
+    registry_path.write_bytes(original)
+
+    registry = pseudonym._read_registry(registry_path)
+    assert registry.salt == b"s" * 32
+    assert registry.aliases == {"a" * 64: "同学ABCDEF"}
+    assert registry_path.read_bytes() == original
 
 
 def _only_alias(payload: dict[str, object]) -> tuple[dict[str, object], str]:

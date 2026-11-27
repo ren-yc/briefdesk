@@ -50,6 +50,37 @@ def _require_ai() -> AIProvider:
     return _ai
 
 
+def effective_remote(base: str) -> bool:
+    """这次出站的展示名是否可能离开本机——假名化策略的「远端」判据。
+
+    路由由供应商实现决定，配置 URL 只能描述内置实现：第三方插件可以把请求发往
+    任何地方，而配置里写的是 `localhost`。因此先问供应商自己有没有声明目的地
+    （可选能力 `effective_remote(base) -> bool`，内置实现按 URL 判定）。
+
+    没声明、或声明过程抛错，一律按远端：判定失败要往隐私这侧倒——对本地端点多
+    做一次化名只是让输入换个稳定别名（还能还原），把真名发给不知去向的接收方则
+    收不回来。未注册供应商（配置解析、纯函数路径）退回 URL 判定：没有发送者时
+    URL 是唯一线索，且这条路不经过任何外发。
+
+    声明能力按**类**查而不是按实例查：测试桩常是会自动生成属性的 `Mock`，按实例
+    查会把「凭空出现的可调用属性」当成真声明。声明写成实例方法
+    `def effective_remote(self, base)`；写成静态方法会因为多传一个 provider 参数
+    抛 TypeError，落进下面的「声明失败」分支——保守判远端，不会放行明文。
+    """
+    provider = _ai
+    if provider is None:
+        return not ai_egress.is_local_endpoint(base)
+    try:
+        declared = getattr(type(provider), "effective_remote", None)
+        if declared is None:
+            return True
+        # 只有明确返回 False 才算「留在本机」：漏写 return 的 None、0 之类一律按
+        # 远端，否则「声明写坏了」会静默变成「本地」，正是这里要堵的方向。
+        return declared(provider, base) is not False
+    except Exception:  # noqa: BLE001 — 声明失败（含描述符查询失败）按远端，见上
+        return True
+
+
 async def chat(
     messages: list[dict],
     *,

@@ -768,6 +768,19 @@ def _dynamic_embed(texts):
     return [[min(float(len(t)), 100.0), 0.0] for t in texts]
 
 
+class _LocalAwareProvider(Mock):
+    """测试桩：声明「请求发往配置的端点」，镜像内置供应商的声明能力。
+
+    未声明目的地的供应商会被假名化策略按远端处理（第三方插件可能改路由），
+    这里显式声明，才能让「本地端点不改写输入」的用例验证的是本地分支本身。
+    """
+
+    def effective_remote(self, base: str) -> bool:
+        from briefdesk.ai_egress import is_local_endpoint
+
+        return not is_local_endpoint(base)
+
+
 class _MemoryEngineBase:
     """公共基座：内存库 + 动态假嵌入供应商 + 会话白名单种子。"""
 
@@ -782,7 +795,7 @@ class _MemoryEngineBase:
         self.db.row_factory = aiosqlite.Row
         await init_schema(self.db)
 
-        self.provider = Mock()
+        self.provider = _LocalAwareProvider()
         self.provider.is_embedding_enabled = Mock(return_value=True)
         self.provider.embed_model_name = Mock(return_value="test-model")
         self.provider.embed_texts = AsyncMock(side_effect=_dynamic_embed)
@@ -811,6 +824,60 @@ class _MemoryEngineBase:
         await self.engine.before_run(batch)
         await self.engine.run(batch)
         return batch
+
+
+class TestRagSchemaReady(_MemoryEngineBase):
+    async def test_concurrent_ensure_db_ready_migrates_once(self, monkeypatch):
+        """迁移中途的并发调用必须等待同一次初始化，不能重复迁移或提交。"""
+        from briefdesk.plugins.rag import db as rag_db
+        from briefdesk.plugins.rag import engine as rag_engine
+
+        migration_entered = asyncio.Event()
+        release_migration = asyncio.Event()
+        second_factory_entered = asyncio.Event()
+        factory_calls = 0
+        real_migrate = rag_db._migrate_sender_id
+        ensure_schema = AsyncMock(wraps=rag_engine.ensure_rag_schema)
+        ensure_fts = AsyncMock(wraps=rag_engine.ensure_fts)
+
+        async def counted_factory():
+            nonlocal factory_calls
+            factory_calls += 1
+            if factory_calls == 2:
+                second_factory_entered.set()
+            return self.db
+
+        async def paused_migration(db):
+            migration_entered.set()
+            await release_migration.wait()
+            await real_migrate(db)
+
+        monkeypatch.setattr(self.engine, "_db_factory", counted_factory)
+        monkeypatch.setattr(rag_db, "_migrate_sender_id", paused_migration)
+        monkeypatch.setattr(rag_engine, "ensure_rag_schema", ensure_schema)
+        monkeypatch.setattr(rag_engine, "ensure_fts", ensure_fts)
+        tasks = []
+        try:
+            tasks.append(asyncio.create_task(self.engine._ensure_db_ready()))
+            await asyncio.wait_for(migration_entered.wait(), timeout=5)
+            tasks.append(asyncio.create_task(self.engine._ensure_db_ready()))
+            await asyncio.wait_for(second_factory_entered.wait(), timeout=5)
+            assert ensure_schema.await_count == 1
+            assert not tasks[1].done()
+            release_migration.set()
+            results = await asyncio.wait_for(asyncio.gather(*tasks), timeout=5)
+            assert results == [self.db, self.db]
+            assert ensure_schema.await_count == 1
+            assert ensure_fts.await_count == 1
+            assert self.engine._schema_ready
+            assert await self.engine._ensure_db_ready() is self.db
+            assert ensure_schema.await_count == 1
+        finally:
+            release_migration.set()
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
 
 
 class TestRagIndex(_MemoryEngineBase):
@@ -1377,6 +1444,41 @@ class TestRagAsk(_MemoryEngineBase):
 
         return prompt_messages[1]["content"].split("证据：\n")[1]
 
+    async def test_undeclared_provider_pseudonymizes_local_dispatch(self, monkeypatch):
+        """供应商不声明目的地时本地端点也要化名：它可能把请求改路由到远端。
+
+        失败模式：RAG 只看 dispatch 的 URL 判本地，第三方供应商却发往别处，
+        证据行的真名原样出境。断言落在真实证据名上，而不是只比一个布尔。
+        """
+        from unittest.mock import Mock
+
+        from briefdesk import ai_ports
+        from briefdesk.config import config
+        from briefdesk.plugins.rag import engine as rag_engine
+        from briefdesk.plugins.rag.db import ChunkRow
+
+        monkeypatch.setattr(config, "ai_api_base", "http://127.0.0.1:11434/v1")
+        monkeypatch.setattr(config, "ai_pseudonymize_names", "auto")
+        ai_ports.set_ai(Mock())  # 类上没有 effective_remote：按远端处理
+        chunk = ChunkRow(
+            source="weflow-legacy", msg_id="undeclared-one", session_id="s1",
+            group_name="测试群", sender_name="小明", sender_id="u-undeclared",
+            msg_time=1700000000, content="虚构活动安排", item_id="",
+        )
+        try:
+            dispatch = ai_ports.resolve_rag_dispatch(
+                model="", api_base="", api_key=""
+            )
+            ctx = rag_engine.RagEngine._name_context(dispatch)
+            assert ctx.enabled
+            names = await rag_engine.RagEngine._prepare_evidence_names(
+                ctx, [rag_engine.Hit(chunk=chunk, cos=0.9, rrf=1.0, has_fts=True)]
+            )
+        finally:
+            ai_ports.set_ai(self.provider)
+        assert names[0].sender != "小明"
+        assert re.fullmatch(r"同学[A-Z2-7]{6}", names[0].sender), names[0].sender
+
     async def test_evidence_pseudonymized_for_remote_endpoint(self, monkeypatch):
         """远端主端点 + auto：证据行的人名/群名换成化名形态，原显示名不出境。"""
         from briefdesk.config import config
@@ -1400,6 +1502,116 @@ class TestRagAsk(_MemoryEngineBase):
         assert "测试群" in evidence
         assert not re.search(r"同学[A-Z2-7]{6}", evidence)
         assert not re.search(r"群[A-Z2-7]{6}", evidence)
+
+    @pytest.mark.parametrize(
+        ("mode", "api_base", "drop_history"),
+        [
+            pytest.param("auto", "https://remote.invalid/v1", True, id="remote-auto"),
+            pytest.param("off", "https://remote.invalid/v1", False, id="remote-off"),
+            pytest.param(
+                "auto", "http://127.0.0.1:11434/v1", False, id="local-auto"
+            ),
+            pytest.param("on", "http://127.0.0.1:11434/v1", True, id="local-on"),
+        ],
+    )
+    async def test_restored_history_round_trip_respects_pseudonymization(
+        self, tmp_path, monkeypatch, mode, api_base, drop_history
+    ):
+        """历史中的虚构姓名已离开第二轮证据，局部替换会让还原结果再次出境。
+
+        字面历史块独立约束顺序，避免复用生产 builder 让历史颠倒同时污染实际值与期望值。
+        """
+        import json
+        from datetime import datetime
+
+        from briefdesk import pseudonym, telemetry
+        from briefdesk.config import config
+        from briefdesk.plugins.rag import engine as rag_engine
+        from briefdesk.plugins.rag.db import ChunkRow
+        from briefdesk.plugins.rag.prompts import EvidenceNames, build_answer_prompt
+
+        monkeypatch.setattr(config, "ai_pseudonymize_names", mode)
+        monkeypatch.setattr(config, "ai_api_base", api_base)
+        pseudonymizer = pseudonym.Pseudonymizer(
+            tmp_path / "pseudonym", flush_window=0.0
+        )
+        monkeypatch.setattr(pseudonym, "get_pseudonymizer", lambda: pseudonymizer)
+        now = datetime(2026, 1, 1, 12, 0, tzinfo=UTC)
+        clock = Mock(wraps=datetime)
+        clock.now.return_value = now
+        monkeypatch.setattr(rag_engine, "datetime", clock)
+        chunks = [
+            ChunkRow(
+                source="weflow-legacy", msg_id="round-one", session_id="s1",
+                group_name="虚构活动群", sender_name="张三", sender_id="fictional-one",
+                msg_time=1700000000, content="虚构活动安排", item_id="",
+            ),
+            ChunkRow(
+                source="weflow-legacy", msg_id="round-two", session_id="s1",
+                group_name="虚构活动群", sender_name="虚构成员乙",
+                sender_id="fictional-two", msg_time=1700000001,
+                content="虚构活动补充安排", item_id="",
+            ),
+        ]
+        hits = [
+            [rag_engine.Hit(chunk=chunk, cos=0.9, rrf=1.0, has_fts=True)]
+            for chunk in chunks
+        ]
+        monkeypatch.setattr(self.engine, "retrieve", AsyncMock(side_effect=hits))
+        prompts = []
+
+        async def answer(messages, **kwargs):
+            prompts.append(messages)
+            if drop_history:
+                alias = re.search(r"同学[A-Z2-7]{6}", messages[1]["content"])
+                assert alias is not None
+                sender = alias.group(0)
+            else:
+                sender = chunks[len(prompts) - 1].sender_name
+            return _chat_response(json.dumps(
+                {"answer": f"{sender}安排活动 [1]。", "citations": [1]},
+                ensure_ascii=False,
+            ))
+
+        self.provider.chat = AsyncMock(side_effect=answer)
+        question = "虚构活动如何安排？"
+        first = await self.engine.ask(question)
+        assert first.answer == "张三安排活动 [1]。"
+        history = [
+            {"role": "user", "content": question},
+            {"role": "assistant", "content": first.answer},
+        ]
+        history_before = [dict(message) for message in history]
+        second = await self.engine.ask(question, history=history)
+        assert second.answer == "虚构成员乙安排活动 [1]。"
+        assert len(prompts) == 2
+        assert history == history_before
+        full_prompt = "\n".join(message["content"] for message in prompts[1])
+        counters = telemetry.snapshot()["counters"]
+        if drop_history:
+            assert "张三" not in "\n".join(
+                message["content"] for message in prompts[0]
+            )
+            assert "张三" not in full_prompt
+            assert "对话历史：" not in full_prompt
+            assert counters["rag.history_dropped|"] == 1
+        else:
+            expected = build_answer_prompt(
+                now.astimezone(), question, hits[1], history,
+                self.engine.settings.evidence_chars,
+                names=[EvidenceNames(
+                    group=chunks[1].group_name, sender=chunks[1].sender_name
+                )],
+            )
+            assert json.dumps(prompts[1], ensure_ascii=False).encode("utf-8") == (
+                json.dumps(expected, ensure_ascii=False).encode("utf-8")
+            )
+            assert first.answer in full_prompt
+            assert (
+                f"对话历史：\nuser: {question}\nassistant: {first.answer}\n\n"
+                in full_prompt
+            )
+            assert counters.get("rag.history_dropped|", 0) == 0
 
     async def test_rag_fallback_pseudonymizes_for_actual_main_endpoint(
         self, monkeypatch
@@ -1712,21 +1924,25 @@ class TestPromptFlatten:
         assert "周六6点 [1]。" in user
 
     def test_history_trimmed_over_cap(self):
-        # 长历史裁剪——只保留最近 6 轮，并标注省略条数
+        # 长历史裁剪——只保留最近 6 轮、每条最多 200 字符，并标注省略条数。
+        # 单条上限单独断言：只验条数时，「整段历史不截断」的实现照样通过。
         from datetime import UTC, datetime
 
         from briefdesk.plugins.rag.prompts import build_answer_prompt
 
         history = [{"role": "user", "content": f"第{i}轮的历史消息内容"}
                    for i in range(10)]
+        history.append({"role": "user", "content": "长" * 260})
         messages = build_answer_prompt(
             datetime(2026, 1, 1, 12, 0, tzinfo=UTC), "问题？", [], history,
             names=[],
         )
         user = messages[1]["content"]
-        assert "更早的 4 条对话已省略" in user
+        assert "更早的 5 条对话已省略" in user
         assert "第0轮" not in user
         assert "第9轮" in user
+        assert "长" * 200 in user
+        assert "长" * 201 not in user
 
 
     def test_evidence_truncated_over_cap(self):
@@ -2011,6 +2227,109 @@ class TestRagWarmVectorsForceFull(_MemoryEngineBase):
         await self.engine.warm_vectors(force_full=True)
         assert ("weflow-legacy", "m1") not in self.engine._vec_entries, "force_full 后已删向量 key 必须从内存缓存剔除"
         assert len(self.engine._matrix_keys) == 0, "矩阵须同步清空"
+
+    @pytest.mark.parametrize(
+        "refresh_in_flight", [False, True], ids=["idle", "refresh-in-flight"]
+    )
+    async def test_cached_identity_update_without_embedding_refreshes_retrieval(
+        self, monkeypatch, refresh_in_flight
+    ):
+        """旧水位前的身份更新必须重读；并发刷新不得吞掉更新的脏标志。"""
+        from dataclasses import replace
+
+        from briefdesk.plugins.rag import engine as rag_engine
+        from briefdesk.plugins.rag.db import (
+            ChunkRow,
+            fetch_all,
+            fetch_one,
+            upsert_chunks,
+            upsert_embeddings,
+        )
+
+        await self.engine._ensure_db_ready()
+        self.engine._fts_enabled = False
+        first = ChunkRow(
+            source="weflow-legacy", msg_id="older", session_id="s1",
+            group_name="旧群", sender_name="旧成员", sender_id="old-identity",
+            msg_time=1700000000, content="虚构活动安排", item_id="",
+        )
+        second = replace(first, msg_id="newer", sender_id="other-identity")
+        await upsert_chunks(self.db, [first, second])
+        key = (first.source, first.msg_id)
+        await upsert_embeddings(self.db, [key], [[1.0, 0.0]], "test-model", "t1")
+        await upsert_embeddings(
+            self.db, [(second.source, second.msg_id)], [[0.0, 1.0]],
+            "test-model", "t2",
+        )
+        await self.engine.warm_vectors()
+        assert self.engine._vec_watermark == "t2"
+        assert self.engine._vec_entries[key][0].sender_id == first.sender_id
+        embeddings_before = await fetch_all(
+            self.db, "SELECT * FROM rag_chunk_embeddings ORDER BY msg_id"
+        )
+        updated = replace(
+            first, sender_id="new-identity", sender_name="新成员", group_name="新群"
+        )
+        if refresh_in_flight:
+            snapshot_read = asyncio.Event()
+            release_refresh = asyncio.Event()
+            metadata_written = asyncio.Event()
+            real_fetch = rag_engine.fetch_new_embeddings
+            real_upsert = rag_engine.upsert_chunks
+
+            async def paused_fetch(*args, **kwargs):
+                result = await real_fetch(*args, **kwargs)
+                snapshot_read.set()
+                await release_refresh.wait()
+                return result
+
+            async def observed_upsert(db, rows):
+                await real_upsert(db, rows)
+                metadata_written.set()
+
+            monkeypatch.setattr(rag_engine, "fetch_new_embeddings", paused_fetch)
+            monkeypatch.setattr(rag_engine, "upsert_chunks", observed_upsert)
+            tasks = []
+            try:
+                tasks.append(asyncio.create_task(
+                    self.engine.warm_vectors(force_full=True)
+                ))
+                await asyncio.wait_for(snapshot_read.wait(), timeout=5)
+                tasks.append(asyncio.create_task(self.engine._persist_chunks(
+                    self.db, [updated], [], [], "test-model"
+                )))
+                await asyncio.wait_for(metadata_written.wait(), timeout=5)
+                release_refresh.set()
+                results = await asyncio.wait_for(asyncio.gather(*tasks), timeout=5)
+                assert results[1] is False
+            finally:
+                release_refresh.set()
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+        else:
+            assert not await self.engine._persist_chunks(
+                self.db, [updated], [], [], "test-model"
+            )
+        row = await fetch_one(
+            self.db, "SELECT * FROM rag_chunks WHERE source = ? AND msg_id = ?", key
+        )
+        assert row["sender_id"] == updated.sender_id
+        assert row["sender_name"] == updated.sender_name
+        assert row["group_name"] == updated.group_name
+        assert await fetch_all(
+            self.db, "SELECT * FROM rag_chunk_embeddings ORDER BY msg_id"
+        ) == embeddings_before
+        assert self.engine._vec_cache_dirty
+        hits = await self.engine.retrieve("虚构活动")
+        assert hits and hits[0].chunk == updated
+        assert self.engine._vec_entries[key][0] == updated
+        matrix_index = self.engine._matrix_keys.index(key)
+        assert self.engine._matrix_chunks[matrix_index] == updated
+        assert self.engine._matrix[matrix_index].tolist() == [1.0, 0.0]
+        assert self.engine._vec_watermark == "t2"
+        assert not self.engine._vec_cache_dirty
 
 
 class TestRagFreshDbDays0:
@@ -2364,57 +2683,6 @@ class TestRagEvidenceNamePreparation(_MemoryEngineBase):
 
         return Hit(chunk=chunk, cos=0.9, rrf=1.0, has_fts=True)
 
-    async def test_new_identities_share_one_commit_window(self, monkeypatch):
-        """多个新身份并发准备只等一个合并窗口：逐条 await 会各等一次。
-
-        失败模式：串行准备让 N 条新证据等 N 个窗口，证据越多问答越慢；并发后
-        同批身份共享同一次落盘提交。
-        """
-        import asyncio
-
-        from briefdesk import pseudonym
-        from briefdesk.config import config
-
-        monkeypatch.setattr(config, "ai_pseudonymize_names", "on")
-
-        commit_count = {"n": 0}
-        sleeps = {"n": 0}
-
-        real_commit = pseudonym.Pseudonymizer._commit_sync
-
-        def _counting_commit(self_p, batch):
-            commit_count["n"] += 1
-            return real_commit(self_p, batch)
-
-        real_sleep = asyncio.sleep
-
-        async def _counting_sleep(delay, *args, **kwargs):
-            if delay > 0:
-                sleeps["n"] += 1
-            return await real_sleep(0)
-
-        monkeypatch.setattr(pseudonym.Pseudonymizer, "_commit_sync", _counting_commit)
-        # 只统计「合并窗口的等待次数」：直接包住 flush 的 sleep。不替换 pseudonym
-        # 的 asyncio（模块内部用 get_running_loop，替换会缺成员）。
-        monkeypatch.setattr(asyncio, "sleep", _counting_sleep)
-
-        context = pseudonym.NameContext(
-            enabled=True, pseudonymizer=pseudonym.Pseudonymizer(
-                pseudonym.registry_dir(), flush_window=0.05,
-            )
-        )
-        hits = [
-            self._hit(self._chunk(f"m{i}", f"u{i}", f"成员{i}"))
-            for i in range(3)
-        ]
-        names = await type(self.engine)._prepare_evidence_names(context, hits)
-        assert len(names) == 3
-        assert all(n.sender.startswith("同学") for n in names)
-        assert all(n.group.startswith("群") for n in names)
-        # 全部新身份一次提交：串行实现会各等一个窗口（sleeps ≥ 3）
-        assert sleeps["n"] <= 1, sleeps
-        assert commit_count["n"] >= 1
-
     async def test_last_non_empty_display_name_wins(self):
         """同一身份先空名后真名：还原目标取最后的非空显示名。
 
@@ -2719,6 +2987,7 @@ class TestRagEvidenceNamePreparation(_MemoryEngineBase):
         names = await type(self.engine)._prepare_evidence_names(context, hits)
         assert len(names) == 5
         assert all(n.sender.startswith("同学") for n in names)
+        assert all(n.group.startswith("群") for n in names)
         assert names[0].sender == names[3].sender
         # 本批全部新身份一次提交：串行或分两轮 gather 都会多等窗口（sleeps ≥ 2）
         assert sleeps["n"] <= 1, sleeps
