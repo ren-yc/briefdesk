@@ -375,6 +375,8 @@ Routes: `GET /api/items`, `POST /api/items/:id/verify`, `POST /api/items/:id/rec
 
 **指标口径的三条解释规则**（报告与 JSON 同时体现）：classify 主指标剔除纯占位符用例（正文全是 `[图片]` 一类占位符，生产里进不了分类阶段；`placeholder_only_*` 单独计数、另给 `category_recall_incl_placeholder` 供历史对比）并按 `mode` 切片（`by_mode`，验收按切片读数）；误报按用例形态拆 `false_positives_noise`（全噪声用例）/`false_positives_partial`；时间点区分**回声点**（期望值就是该消息自己的发送时间，非正文抽取；`*_ex_echo` 系列才是解析能力读数，旧键保留作历史口径）；title 撤除精确匹配率（开放生成任务里逐字相等衡量抄写不是质量），改给字符相似度均值/中位数与「仅标题期望」用例的软通过线 `TITLE_SOFT_RATIO`。新增字段一律带默认值，历史报告 payload 必须仍能渲染（缺字段显示「-」）。
 
+出境摘要（egress summary，`egress_summary`）按运行开始时的计数快照逐键取差量，只汇总本轮的发送尝试、SDK 重试与观测状态，不继承同进程历史计数，也不清空共享遥测（回归：`test_empty_run_excludes_historical_egress`、`test_consecutive_runs_report_per_key_egress_deltas`）。
+
 #### briefdesk/sources_base.py
 
 消息源抽象（核心契约模块，无 sources 包）：`SourceClient` Protocol（`name`/`connection_status`/`download_media`/`close` 客户端能力契约）——pipeline 与 server 只依赖该协议，新消息源实现它即可被消费；`RealtimeListener[S]`（`start`/`stop`/`invalidate_session_cache` 监听器生命周期契约，泛型参数绑定监听器所服务的客户端类型；本仓库监听器另实现可选 `aclose()`——等待关停冲刷（残余缓冲 + in-flight 批任务）收尾，runtime 经 getattr 探测调用）——server 只依赖它；`SourceRuntime`（`client`/`listener`/`fetch_history(enabled_sessions, is_processed)`/`refresh_sessions() -> list[SessionInfo]`/`start`/`close` 已装配源单元，**源只产出源无关数据、不触碰 DB**，`is_processed` 为应用层注入的已处理查询端口 `ProcessedQuery`）——main 依赖它编排启动/关闭，**新增源 = 实现 `SourceRuntime` 并以插件发布（`briefdesk/plugins/*`，entry point 组 `briefdesk.plugins`，启用走 `PLUGINS`）**。
@@ -427,7 +429,7 @@ SSE 实时监听，指数退避 + 抖动自动重连（退避参数由 `WeFlowLe
 
 #### briefdesk/plugins/rag/*
 
-`RagPlugin`（**双能力插件先例**：显式继承 StagePlugin + WebPlugin）：**装配期预热建表（入锁）**——`activate` 先持 `storage_lock` 调 `engine.prepare()`（唯一预热入口，建 rag 表 + FTS 探测；`prepare` 不承担连接关闭责任，生产 `_db_factory` 即 `get_db()` 共享单例），首次建表 + set_meta 的 commit 不再发生在锁外，也早于维护循环首个 `backfill_step`；slot=post_insert（priority=10，恒排 merge 之后）做批次索引——`before_run` 锁外预嵌入、`run` 锁内纯 SQLite 落库（骨架对两存储槽统一探测可选钩子；post_insert 全程持 `_storage_lock`，run 内严禁网络调用）；路由 `/api/rag/ask|status|reindex`（ask 支持 `history` 多轮上下文：仅接受 user/assistant 角色、逐条截断 2000 字、至多 20 条；注入 prompt 前再裁剪——仅保留最近 6 轮、单条 200 字并注明省略条数）与「问一问」右侧聊天侧边栏（侧边栏 `#nav-top` 工具容器入口——搜索框正下方、日历之后，打开才显示——布局内第三列推开列表而非覆盖、sticky 顶栏下沿与左侧栏同款行为；纯状态开合；**不注册插件视图、不触碰头部按钮区**，与 calendar 视图零耦合；引用芯片复用核心上下文浮层）。遥测：`rag.ask` 在检索**之前**计数，恒等式 `ask = refused + answered + retrieve_error + answer_error + cancelled`（取消单列：CancelledError 是 BaseException 子类、`except Exception` 兜不住，漏桶会让「ask 已计、终态桶全空」）；两种回退各记一桶——`rag.chat_fallback`（供应商无专用通道、override 被丢弃，端口层记）与 `rag.citation_fallback`（JSON 引用契约没生效、正文 `[n]` 正则捡回且命中才记）。
+`RagPlugin`（**双能力插件先例**：显式继承 StagePlugin + WebPlugin）：**装配期预热建表（入锁）**——`activate` 先持 `storage_lock` 调 `engine.prepare()`（唯一预热入口，建 rag 表 + FTS 探测；`prepare` 不承担连接关闭责任，生产 `_db_factory` 即 `get_db()` 共享单例），首次建表 + set_meta 的 commit 不再发生在锁外，也早于维护循环首个 `backfill_step`；slot=post_insert（priority=10，恒排 merge 之后）做批次索引——`before_run` 锁外预嵌入、`run` 锁内纯 SQLite 落库（骨架对两存储槽统一探测可选钩子；post_insert 全程持 `_storage_lock`，run 内严禁网络调用）；路由 `/api/rag/ask|status|reindex`（ask 支持 `history` 多轮上下文：仅接受 user/assistant 角色、逐条截断 2000 字、至多 20 条；注入 prompt 前再裁剪——仅保留最近 6 条消息、单条 200 字并注明省略条数）与「问一问」右侧聊天侧边栏（侧边栏 `#nav-top` 工具容器入口——搜索框正下方、日历之后，打开才显示——布局内第三列推开列表而非覆盖、sticky 顶栏下沿与左侧栏同款行为；纯状态开合；**不注册插件视图、不触碰头部按钮区**，与 calendar 视图零耦合；引用芯片复用核心上下文浮层）。遥测：`rag.ask` 在检索**之前**计数，恒等式 `ask = refused + answered + retrieve_error + answer_error + cancelled`（取消单列：CancelledError 是 BaseException 子类、`except Exception` 兜不住，漏桶会让「ask 已计、终态桶全空」）；两种回退各记一桶——`rag.chat_fallback`（供应商无专用通道、override 被丢弃，端口层记）与 `rag.citation_fallback`（JSON 引用契约没生效、正文 `[n]` 正则捡回且命中才记）。
 
 库层 `db.py` 自管五表：`rag_chunks`/`rag_chunk_embeddings`/`rag_fts`(FTS5 trigram——逐词 ≥3 字符才走 MATCH，含短词走 LIKE 兜底；切词口径由 `_tokens` 单源提供，MATCH 构建/trigram 路由判据/LIKE 兜底三处共用，防「按 A 切分路由、按 B 切分检索」错配) +`rag_meta`+`rag_skipped`（「永不入索引」记账：纯占位符行永远满足回填反连接却永远不被消费，登记后出队——否则它们每轮占满 LIMIT 预算窗口，令更早的真实消息饿死；raw 内容不可变故登记恒成立，GC 随宿主 raw 行消失一并对账）。**入索引门槛**：纯占位符消息不入索引，判定复用 pipeline 入口同一单源 `masking.PLACEHOLDER_ONLY_RE`（吃原始 content，`[图片][图片]` 多片段与白名单外词条一并挡下；占位符+真实文字的混合消息照常入索引）。**作用域语义**：启用会话恒为前提（查询期现取，停用即时失效）；`RAG_GROUP_ONLY` 默认仅群聊；作用域 SQL 谓词由 `db.scope_sql(alias=...)` 单源提供——检索侧过滤 chunks（别名 c）、回填侧过滤 raw_messages（别名 r），隐私边界只有一处定义。
 
@@ -438,6 +440,10 @@ SSE 实时监听，指数退避 + 抖动自动重连（退避参数由 `WeFlowLe
 检索=向量缓存（created_at 水位增量填充、解析在工作线程、模型切换/GC 行数回退整表重建）+FTS 双路 RRF 融合→拒答门（无 FTS 命中且 top1 余弦 < min_score 即 None）；**查询嵌入失败降级**：嵌入端点故障时不再整体拒答，降级 FTS-only（关键词可命中的问题仍可回答，日志 WARNING 标注）；回答强制 `[n]` 引用（未标注回退全部证据）并按 JSON 契约输出（`ask` 的引用语义：JSON 契约给出 `citations` 列表即以其为准——空列表 = 无依据，不回退；仅无 JSON 契约的纯文本回答才回退 `[n]` 正则、再回退全部证据，此为有意的兼容行为；空 choices/空答案按拒答返回而非伪装成正常回答；编号只收 int（排除 bool）、整数值浮点（JSON 模式下部分供应商把整数输出为 1.0）与纯数字字符串）（`{"answer","citations"}`——deepseek 系 `json_object` 强制模式的兼容契约，引擎双态解析，纯文本供应商回退正则），证据块压平换行防伪造、单条超长截断（`RAG_EVIDENCE_CHARS`，默认 600，截断以「…」标注），system prompt 含防指令注入条款。
 
 向量表走专用连接（get_embed_db 同款隔离）；常驻维护循环=排空回填（逐批数量守卫、失败指数退避）→ GC 孤儿对账 → 缓存预热 → 休眠。嵌入硬依赖 EMBED_*（缺失 setup 抛 PluginDisabledError 自禁用）。**问答独立 AI 通道**：`RagSettings`（`env_prefix="RAG_"`）除检索参数外还持有 `model`/`api_base`/`api_key` 三项模型通道配置（`api_key` 为 `SecretStr` 且自带 `KeyringSource`，`RAG_API_KEY` 已登记进 `secrets_store.SECRET_NAMES`），留空即回退主链路；引擎按 override 参数传给 `ai_ports.rag_chat`，`ai_provider` 只按 `(base_url, api_key)` 缓存备用客户端，不读 `RAG_*`——保持 rag → ai_provider 的单向依赖。隐私口径：索引/嵌入/问答内容会发送至所配置的第三方 AI API（与 classify/dedup 同口径），mask_content 不覆盖 Token/Key 形态
+
+`_ensure_db_ready` 使用单飞锁（single-flight lock，`_schema_lock`）串行化首次 schema 初始化，并在锁内二次检查 `_schema_ready`，避免并发首次调用重复迁移与提交（回归：`test_concurrent_ensure_db_ready_migrates_once`）。
+
+已缓存 chunk 的元数据更新即使没有新 embedding，也会置位缓存脏标志（cache dirty flag，`_vec_cache_dirty`），使下次刷新强制全量重读，避免向量命中仍携带旧身份（回归：`test_cached_identity_update_without_embedding_refreshes_retrieval`）。
 
 #### briefdesk/plugins/weflow_legacy/poller.py
 
@@ -804,16 +810,26 @@ All via `.env` file, with an additional UI-staged overlay layer (see 「配置�
 
 ## 出站假名化与还原
 
-远端请求只带展示名的稳定别名，真名在模型输出落库前换回；本地端点默认不改写输入，别名注册表不可用时整批拒绝出站而不是退回真名。
+展示名假名化（name pseudonymization，`AI_PSEUDONYMIZE_NAMES`）只替换指定 prompt 位置的群名与发送者名，别名注册表不可用时整批拒绝出站而不退回真名。
 
-开关是 `AI_PSEUDONYMIZE_NAMES`（`auto` / `on` / `off`，默认 `auto`，留空等同 `auto`）：`auto` 只在**生效端点**为远端时替换，`on` 强制替换，`off` 强制关闭，非法值启动期报错。判断「是否远端」只看这次请求真正会发往的 base URL——RAG 在供应商没有专用问答通道、override 被丢弃回退主端点时按主端点判定，拿一个不会被使用的本地 override 判定会把真名送出去。
+开关默认 `auto` 且留空等同 `auto`，本地或远端由供应商声明的目的地决定（内置供应商按生效端点的 URL 判定），请求与注册表契约如下。
 
-替换面只有展示名：分类 prompt 的群头与发送者、时间提取的发送者、RAG 证据行的群名与人名。正文、类别、编号与 citation 原样外发；它是展示名的形态替换，不是全字段匿名，也不取代 `mask_content` 的手机号/邮箱脱敏——两者叠加生效。
+- `auto` 仅在生效端点为远端时替换（回归：`test_remote_auto_replaces_names_and_keeps_pii_out`、`test_evidence_names_kept_for_local_endpoint`）。
+- `on` 强制替换，包括本地端点（回归：`test_restored_history_round_trip_respects_pseudonymization`）。
+- `off` 强制关闭，非法值启动期报错（回归：`test_disabled_sender_renames_keep_each_original_prompt_bytes`；配置解析见 `briefdesk/config.py`）。
+- 端点的「远端/本地」判定问供应商，不问配置：`ai_ports.effective_remote(base)` 采信供应商声明的目的地（可选能力 `effective_remote(base) -> bool`，内置实现按 URL 判定），供应商没声明或声明抛错时一律按远端——第三方插件可能把请求改路由到配置没写的地址，`localhost` 不代表真名没出门；判定失败往隐私侧倒，代价只是本地输入多做一次可还原的化名。声明能力按类查而非按实例查，避免 `Mock` 一类会自动生成属性的桩被误当成真声明。RAG 的回退路径仍按实际派发端点传参（回归：`test_rag_fallback_pseudonymizes_for_actual_main_endpoint`、`test_unregistered_declaration_treats_local_url_as_remote`、`test_declared_local_destination_is_honoured`、`test_declaration_failure_falls_back_to_remote`、`test_instance_only_declaration_is_not_trusted`、`test_builtin_provider_declares_url_based_destination`，集成侧见 `test_undeclared_provider_does_not_trust_local_endpoint`、`test_undeclared_provider_pseudonymizes_local_dispatch`）。
+- 替换面只有展示名：分类 prompt 的群头与发送者、时间提取的发送者、RAG 证据行的群名与人名，正文、类别、编号与 citation 原样外发；它不是全字段匿名，也不取代 `mask_content` 的文本脱敏（回归：`test_remote_auto_replaces_names_and_keeps_pii_out`、`test_evidence_pseudonymized_for_remote_endpoint`）。
 
 - **别名形态**：人用 `同学` 前缀加 6 位 base32 短码（30 bit），群用 `群` 前缀加短码；域前缀让人与群各自成域，还原时不必只靠短码反查另一个域。
-- **身份键**：人优先 `(source, sender_id)`，缺 ID 时退化为 `(source, session_id, 已掩码显示名)`；群优先 `(source, session_id)`，缺会话 ID 才用群名。同一个人改名、换会话仍是同一别名，同名不同群不合并。
+- **身份键**：人优先 `(source, sender_id)`，缺 ID 时退化为 `(source, session_id, 已掩码显示名)`；群身份键（group identity key，`group_identity_key`）优先 `(source, session_id)`，缺会话 ID 才用群名，同一个人改名、换会话仍是同一别名，同名不同群不合并（回归：`test_same_sender_id_uses_same_alias_in_sysb_and_sysc`、`test_group_without_session_id_uses_name_key`）。
+- 群头与分组在假名化生效时统一按 `group_identity_key`，缺会话 ID 的不同群名不再被合并；本地 `auto` 或 `off` 保留旧会话分组并逐条使用原显示名，保持 prompt 字节一致（回归：`test_idless_groups_split_only_when_pseudonymizing`、`test_disabled_sender_renames_keep_each_original_prompt_bytes`）。
+- RAG 在假名化生效时丢弃客户端回传的非空历史并记录 `rag.history_dropped`，历史只用于页面展示，防止上一轮还原出的真名再次外发；本地 `auto` 或 `off` 沿用原有的裁剪规则传递历史，注入 prompt 前仅保留最近 6 条，每条内容最多 200 字符（回归：`test_restored_history_round_trip_respects_pseudonymization`、`test_history_trimmed_over_cap`）。
+- 注册表读入拒绝重复 JSON 键、顶层键集合不恰为 `version` / `salt` / `aliases`、非整数或布尔版本，任一不满足即整批拒绝出站（回归：`test_read_registry_rejects_duplicate_keys`、`test_read_registry_requires_exact_fields`、`test_read_registry_requires_integer_version`）。
+- 注册表用 `os.replace` 原子替换，POSIX 随后对父目录执行 `fsync`，目录同步失败仍按写盘失败拒绝出站；失败后同一实例上的重试会强制重写一次并重新同步，确认持久后才发布别名——否则「盘上已有该摘要」会让重试跳过同步、把从未确认持久的别名发出去，崩溃后别名与映射对不上。该确认状态只是实例内存里的旗标，新实例无法继承（生产入口按目录复用实例，正常重试路径走同一实例）；Windows 只承诺原子可见性，不承诺目录项在崩溃后的持久性（回归：`test_atomic_write_directory_fsync_failure_is_write_error`、`test_atomic_write_windows_skips_directory_fsync`、`test_directory_fsync_failure_retry_rewrites_before_publishing`）。
+- 网络路由按目标收口：内置供应商的本地端点客户端设置 `trust_env=False` 与 `follow_redirects=False`，防止未假名化的本地请求经环境代理或重定向转发至远端；远端端点保留 SDK 默认的环境代理、`SSL_CERT_FILE` 自定义 CA 与重定向行为（回归：`test_http_clients_ignore_proxy_env`、`test_http_clients_never_follow_local_to_remote_redirects`、`test_http_clients_preserve_remote_sdk_defaults`）。
 - **维护位置**：安装级注册表在用户数据目录 `pseudonym/mapping.json`（盐与「完整哈希 → 别名」同文件原子提交），请求级逆映射只在 `NameContext` 内存里，不落盘、不进日志。
 - **准备序**：分类分批判的展示名在**任何 AI 调用之前**一次性并发准备，sysb / sysc / 摘要三次请求共用同一份请求内逆映射；准备失败整批进 failed 回填，不发明文也不重试明文。
+- RAG 证据中的新身份并发准备，共享一次注册表提交，避免逐个等待新身份的落盘窗口（回归：`test_new_identities_share_exactly_one_commit_increment`）。
 - **还原序**：模型输出里的已知别名换回真名，只替换完整 token；本请求已写回过的显示名整体受保护，不会被当成别名再换一次。抄错形态的别名保留原样并按字段计一次失败，不猜测替换。
 
 已知边界按影响面列在下面，读数与排障前先看这些前提。
@@ -822,7 +838,9 @@ All via `.env` file, with an additional UI-staged overlay layer (see 「配置�
 - 大库每次启动都会执行回填语句 `UPDATE ... WHERE sender_id = ''`，全表扫描，启动期耗时随 `rag_chunks` 行数增长。
 - 幂等只在单次请求内保证（`NameContext` 用完即弃），跨请求不做去重或缓存复用。
 - 保护范围是「本请求写回过的显示名」的完整文本区间，不是实体识别：显示名之外与被改写过的别名仍按启发式处理。
-- 展示名的还原目标统一为「该身份在本请求内最后一次非空显示名」，人与群同规则；空显示名不作为还原目标，同名多条消息按最终名字还原。
+- 假名化生效时，展示名的还原目标统一为「该身份在本请求内最后一次非空显示名」，人与群同规则；空显示名不作为还原目标，同名多条消息按最终名字还原（回归：`test_same_sender_id_uses_same_alias_in_sysb_and_sysc`）。
+- 还原后的引用、标题与摘要可能含真名，随后续嵌入或判官请求原样出站；判官 prompt 本就包含原文，属于「正文原样外发」的既有暴露面，不是本机制新增的暴露面（还原回归：`test_quote_and_key_alias_restored_at_parse`；后续发送路径见 `briefdesk/plugins/dedup/engine.py` 与 `briefdesk/plugins/merge/engine.py`）。
+- 消息源采集客户端遵循环境代理属于部署面行为，不在 AI 出站网络收口范围内，客户端构造见 `briefdesk/plugins/weflow_legacy/client.py`、`briefdesk/plugins/weflow/runtime.py` 与 `briefdesk/plugins/qqflow/runtime.py`；AI 收口回归为 `test_http_clients_ignore_proxy_env`。
 
 ### 出境与排队指标
 
@@ -836,18 +854,21 @@ All via `.env` file, with an additional UI-staged overlay layer (see 「配置�
 | `ai.queue.cancelled.<port>.<role>` | 排队阶段被取消（未发生发送） |
 | `ai.egress.sdk_retry.<port>.<role>` | 远端请求被 SDK 内部重试一次 |
 | `ai.local.sdk_retry.<port>.<role>` | 本地请求被 SDK 内部重试一次 |
-| `ai.egress.retry_observed.<port>.<role>` | 远端一次 create 中至少一个请求读到了重试序号头（观测可用性旗标，按 create 计） |
-| `ai.local.retry_observed.<port>.<role>` | 本地同上 |
+| `ai.egress.retry_observed.*` | 读重试头且计数从未失败 |
+| `ai.local.retry_observed.*` | 同上 |
+| `rag.history_dropped` | 因假名化丢弃非空历史 |
 | `ai.pseudonym.prepare_failed` | 别名准备失败一次（按准备次数计，不按消息条数计） |
 | `ai.pseudonym.restore_failed` | 还原失败一次（启发式信号：按字段去重，同一字段不重复计；不代表精确还原覆盖率，前缀后少量 ASCII 字母的自然行文会各计一次） |
 | `ai.egress.blocked.<port>.<role>` | 仅保留指标名，本版没有递增路径 |
 
-`<port>` 取 `chat` / `rag` / `embed`，`<role>` 取 `main` / `judge` / `gen` / `classify`（当前接线只发 `main`）。四个口径要点：
+`<port>` 取 `chat` / `rag` / `embed`，`<role>` 取 `main` / `judge` / `gen` / `classify`（当前接线只发 `main`），`retry_observed.*` 的通配部分同样为 `<port>.<role>`，口径要点如下。
 
 - 发送尝试按「调用方发起几次显式 create」计：排队失败、替身短路与 create 之前的入参校验都不计，进了 SDK 之后失败（序列化错误、4xx/5xx）照常计一次。
-- SDK 内部重试单列（读请求头 `x-stainless-retry-count`，兼容不带前缀的 `retry-count`），与逻辑尝试分开：一次 create 被重试两次不会读成三次出境。该指标依赖 SDK 重试头可读；观测钩子不可用时该值未知，不得解读为零。`ai.egress.retry_observed.<port>.<role>`（本地为 `ai.local.retry_observed.*`）按 create 记录「本请求头里真的读到了重试序号」：只有它非零时，`sdk_retry` 桶的零才是可信读数；遥测开关、钩子挂载与否都不能替代这个判定。
+- SDK 内部重试单列，读请求头 `x-stainless-retry-count` 并兼容不带前缀的 `retry-count`，与逻辑尝试分开，不把内部重试当成新的显式 create（回归：`test_sdk_retry_separate_from_logical_attempt`）。
+- `ai.egress.retry_observed.*` 与 `ai.local.retry_observed.*` 仅在本次 create 读到重试序号头且重试计数从未失败时递增；计数失败既包括包装函数抛错，也包括计数入口自身吞掉的写失败（计数入口返回是否真的落账），失败会锁存，即使后续计数成功也不恢复本次观测可用状态；未完整观测的 create 不递增观测计数，其重试次数可能未完整计入报告（回归：`test_retry_record_failure_latches_observation_unavailable`、`TestSendBoundary::test_hook_failure_never_breaks_the_request`、`TestSendBoundary::test_swallowed_counter_write_failure_never_claims_retry_observed`）。
+- `rag.history_dropped` 按因假名化丢弃非空客户端历史的问答请求计次，本地 `auto` 或 `off` 不递增（回归：`test_restored_history_round_trip_respects_pseudonymization`）。
 - 排队超时与排队取消只进 `ai.queue.*`，不占发送桶——否则「一直排队到被取消」与「真发出去了」在读数上没法区分。
-- 关闭遥测（`TELEMETRY_ENABLED=false`）时不写零值键：读数为空表示未知，不能当成「零出境」；基准报告带 `telemetry_enabled` 与 `sdk_retry_observed` 两个显式状态位，后者只由 `retry_observed` 计数推出，报告消费方按状态位判断读数可信度。
+- 关闭遥测（`TELEMETRY_ENABLED=false`）时不写零值键，读数为空表示未知，不能当成「零出境」；基准报告的 `sdk_retry_observed` 仅表示本轮 `retry_observed` 逐键差量之和大于零，即至少一次 create 的重试观测完整可用；即使其他 create 观测失败，该标志仍可能为 `true`，不保证整轮重试总数完整（回归：`test_disabled_telemetry_writes_no_zero_keys`、`test_egress_summary_uses_header_observation_not_telemetry_switch`、`test_empty_run_excludes_historical_egress`）。
 
 ## 设计要点与陷阱
 
@@ -977,7 +998,7 @@ All via `.env` file, with an additional UI-staged overlay layer (see 「配置�
 
 - **不自动换盐**：盐缺失或损坏时重建注册表等于让历史别名永久失效（同一身份换一个化名），而模型侧无从得知这次换名，历史别名在还原时只会被当成未知 token 保留。损坏、版本不支持、盐缺失一律抛 `PseudonymRegistryError`；只有「文件不存在」这一种状态允许在锁内新建初始表，读失败与解码失败都不算「不存在」。
 - **不退回真名**：准备失败在分类侧整批进 failed 回填，在 RAG 侧让这次回答的请求根本不发生；既不发送明文也不重试明文——把失败降级成真名等于用一次故障换一次出境。
-- **加锁失败与写盘失败同样算失败**：跨进程锁超时说明另一个写者卡住，此时继续写盘或出站都可能让两个进程为同一身份发出不同别名；原子写失败时旧文件保持不变、新别名不发布。
+- **加锁失败与写盘失败同样算失败**：跨进程锁超时说明另一个写者卡住，此时继续写盘或出站都可能让两个进程为同一身份发出不同别名；替换前失败保留旧文件，POSIX 替换后的目录同步失败可能让新文件已可见，但仍拒绝出站、不发布新别名（回归：`test_atomic_write_directory_fsync_failure_is_write_error`）。
 - 回归：`tests/test_pseudonym.py` 的 `test_corrupt_salt_never_auto_rotates`、`test_replace_failure_keeps_old_map_and_prevents_send`、`test_lock_contention_fails_closed`；分类侧见 `tests/test_classify.py` 的 `test_prepare_failure_fails_batch_without_sending`，RAG 侧见 `tests/test_rag_plugin.py` 的 `test_prepare_failure_skips_answer_request`。
 
 ### RAG 派生索引的回滚前提：投影读取器 + 追加列

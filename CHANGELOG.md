@@ -11,6 +11,7 @@
 - 出站展示名替换开关 `AI_PSEUDONYMIZE_NAMES`（`auto` / `on` / `off`，默认 `auto`，留空等同 `auto`）：`auto` 只在生效端点为远端时替换群名与发送者名，本地端点不改写输入；非法值启动期报错。回归：`test_remote_auto_replaces_names_and_keeps_pii_out`、`test_evidence_names_kept_for_local_endpoint`。
 - 安装级别名注册表 `briefdesk/pseudonym.py`：盐与「完整哈希 → 别名」同文件原子提交，文件里只有盐与哈希；注册表损坏、缺盐、加锁超时或写盘失败一律拒绝出站，不自动换盐也不退回真名；还原只替换完整 token，失败保留原值并按字段计数。回归：`test_corrupt_salt_never_auto_rotates`、`test_replace_failure_keeps_old_map_and_prevents_send`、`test_restore_requires_whole_token`。
 - 出境与排队计数 `briefdesk/ai_egress.py`：按端口与角色分桶记录远端/本地发送尝试、排队超时与取消、SDK 内部重试（读 `x-stainless-retry-count`）。回归：`test_queue_failures_never_count_remote_attempt`、`test_sdk_retry_separate_from_logical_attempt`、`test_disabled_telemetry_writes_no_zero_keys`。
+- RAG 历史丢弃计数 `rag.history_dropped`：记录假名化生效时丢弃非空客户端历史的问答请求。回归：`test_restored_history_round_trip_respects_pseudonymization`。
 - rag 派生索引新增 `rag_chunks.sender_id` 并从 `raw_messages` 回填：迁移先查表结构、缺列才 `ALTER`，回填只填空串，缺行或缺 ID 保持空串。回归：`test_sender_id_migration_is_idempotent`、`test_missing_raw_id_stays_empty`。
 
 ### 变更
@@ -30,14 +31,24 @@
 - 源侧透传的异常时间戳不再进入前端属性插值：`InternalMessage` 构造即把非 int（含 bool）时间戳归 0，堵住字符串时间戳经 SQLite 宽类型落库、再被分组模板插进 `data-msgtime` 属性的路径；三处分组模板的时间戳属性与单卡口径统一走 `escAttr`。回归：`InternalMessageTimestampCoercionTest`。
 - 别名还原不再把一个人换成另一个人：本请求已写回过的显示名整体受保护，落在其中的片段不再被当成别名二次替换。回归：`test_produced_display_name_is_never_reinterpreted`、`test_protected_display_name_survives_inside_sentence`。
 - 注册表读取失败不再被当成「文件不存在」而静默重建：损坏、缺盐与版本不支持一律拒绝出站，避免一次重盐让历史化名永久失效。回归：`test_read_registry_rejects_non_alias_values`、`test_version_error_does_not_echo_value`。
+- 注册表拒绝重复 JSON 键、顶层多余或缺失字段、非整数及布尔版本，异常时整批拒绝出站。回归：`test_read_registry_rejects_duplicate_keys`、`test_read_registry_requires_exact_fields`、`test_read_registry_requires_integer_version`。
+- POSIX 在注册表原子替换后同步父目录，目录同步失败仍拒绝出站；失败后同一实例上的重试会强制重写并重新同步，确认持久后才放行；Windows 跳过目录同步，只承诺原子可见性。回归：`test_atomic_write_directory_fsync_failure_is_write_error`、`test_atomic_write_windows_skips_directory_fsync`、`test_directory_fsync_failure_retry_rewrites_before_publishing`。
 - 本地端点判定的绕过路径收口：带凭据段或空 userinfo、控制字符、非法端口与近似域名一律按远端处理，畸形 URL 不再被判成本地。回归：`test_local_endpoint_matrix_fail_closed`、`test_remote_endpoint_matrix_fail_closed`。
 - rag 里已有的 `sender_id` 不再被空串覆盖：回填与 upsert 都只保留旧值，新写入的非空值仍可更新。回归：`test_upsert_preserves_known_sender_id`。
 - RAG 证据名的身份键、出站映射与还原目标统一走 pseudonym 模块的身份键单源：缺 ID 的发送者不再被错并成同一个人（同会话异名者各得化名、还原各还原到本人），跨会话缺 ID 的发送者不再因映射查不到而把真名送进远端证据行。回归：`test_idless_senders_in_same_session_keep_distinct_aliases`、`test_idless_senders_in_different_sessions_stay_separate`、`test_group_without_session_id_uses_name_key`。
+- 假名化生效时，缺会话 ID 的不同群名不再共用群头与别名；本地 `auto` 或 `off` 保留旧会话分组。回归：`test_idless_groups_split_only_when_pseudonymizing`。
+- 本地 `auto` 或 `off` 逐条保留原显示名，不再把同身份的旧名或空名覆盖成后续名字，保持 prompt 字节一致。回归：`test_disabled_sender_renames_keep_each_original_prompt_bytes`。
+- 假名化的「远端/本地」判定改为询问供应商的目的地声明：内置实现按 URL 判定，第三方供应商未声明或声明失败时一律按远端处理，配置写 `localhost` 不再让第三方路由把真名带出去。回归：`test_unregistered_declaration_treats_local_url_as_remote`、`test_declared_local_destination_is_honoured`、`test_declaration_failure_falls_back_to_remote`、`test_instance_only_declaration_is_not_trusted`、`test_builtin_provider_declares_url_based_destination`、`test_undeclared_provider_does_not_trust_local_endpoint`、`test_undeclared_provider_pseudonymizes_local_dispatch`。
+- RAG 历史中的已还原真名不再随假名化请求外发，客户端历史仅用于页面展示；本地 `auto` 或 `off` 仍沿用原有的裁剪规则传递历史。回归：`test_restored_history_round_trip_respects_pseudonymization`。
+- 本地 AI 端点默认不走环境代理、不跟随重定向，防止本地请求被转发至远端；远端端点保留 SDK 默认的代理、自定义 CA 与重定向行为。回归：`test_http_clients_ignore_proxy_env`、`test_http_clients_never_follow_local_to_remote_redirects`、`test_http_clients_preserve_remote_sdk_defaults`。
+- 基准报告的 `egress_summary` 相对运行起点基线取逐键差量，不继承同进程历史计数，也不清空共享遥测。回归：`test_empty_run_excludes_historical_egress`、`test_consecutive_runs_report_per_key_egress_deltas`。
+- RAG 元数据更新即使没有新 embedding，也会使下次向量缓存刷新全量重读，避免检索结果继续使用旧身份。回归：`test_cached_identity_update_without_embedding_refreshes_retrieval`。
+- RAG 并发首次初始化只迁移一次，避免迁移及提交交错。回归：`test_concurrent_ensure_db_ready_migrates_once`。
 - 证据行与分类批的「最后非空显示名」口径内建于收集阶段：先空后真名、真名后空名、群名先空后真与先真后空都不再出现空名覆盖有效别名或锁定首个空串。回归：`test_empty_name_after_real_name_never_wipes_alias`、`test_group_empty_then_real_name_resolves_to_real`、`test_group_real_then_empty_keeps_alias_and_restore`、`test_trailing_empty_name_does_not_wipe_earlier_real_name`、`test_multiple_real_names_take_the_last_one`。
-- RAG 证据名的全部身份（人与群）共享一次并发准备：分两轮 gather 或逐条 await 会让每个合并落盘窗口各等一次，证据越多准备越慢。回归：`test_new_identities_share_exactly_one_commit_increment`。
+- RAG 证据名中的人与群身份共享一次并发准备，新身份只需一次注册表落盘，避免分开准备或逐条等待导致重复提交。回归：`test_new_identities_share_exactly_one_commit_increment`。
 - 启用假名化时证据名的出站映射查不到即按准备失败处理，不再静默回退真名。回归：`test_prepare_failure_skips_answer_request`。
 - `rag_chunks.sender_id` 迁移的回填失败或被取消时整体回滚：不再留下「列已加、值全空、下次启动不再回填」的死状态。回归：`test_sender_id_backfill_failure_rolls_back_whole_migration`。
-- SDK 重试观测状态独立计数：`sdk_retry_observed` 只由「请求头里真的读到了重试序号」推出（新指标 `ai.egress.retry_observed.*` / `ai.local.retry_observed.*`），不再把遥测开关当成观测可用——钩子未挂或头不可读时报告不再把「零次重试」伪装成可信读数。回归：`test_retry_observed_true_with_zero_retries`、`test_egress_summary_uses_header_observation_not_telemetry_switch`。
+- SDK 重试观测仅在本次 create 读到重试序号头且重试计数从未失败时记为可用，计数失败会锁存，计数入口自身吞掉的写失败同样算失败；基准报告的 `sdk_retry_observed` 仅表示本轮至少一次 create 的重试观测完整可用，不用遥测开关替代观测状态；其他 create 观测失败时该标志仍可能为 `true`，不保证整轮重试总数完整。回归：`test_retry_observed_true_with_zero_retries`、`test_egress_summary_uses_header_observation_not_telemetry_switch`、`test_retry_record_failure_latches_observation_unavailable`、`TestSendBoundary::test_hook_failure_never_breaks_the_request`、`TestSendBoundary::test_swallowed_counter_write_failure_never_claims_retry_observed`。
 
 ## [0.2.0] - 2026-11-14
 
