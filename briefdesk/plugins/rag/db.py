@@ -413,46 +413,75 @@ async def fts_search(
 # ---------------------------------------------------------------- 写入侧 --
 
 
+class ChunkWriteOutcomeUnknownError(RuntimeError):
+    """chunk 回滚未获确认且事务仍打开，写入仍可能晚发布。
+
+    此时收尾会让提交前快照确认失效世代；事务随后发布身份更新时，增量
+    刷新不再重读该行，缓存会永久保留旧身份。
+    """
+
+
 async def upsert_chunks(
     db: aiosqlite.Connection,
     rows: list[ChunkRow],
     *,
     sender_id_fill_only: bool = False,
 ) -> None:
-    """批量 upsert 索引行；回填仅补空身份，实时重处理仍覆盖为最新身份。"""
+    """批量 upsert 索引行；回填仅补空身份，实时重处理仍覆盖为最新身份。
+
+    失败或取消只回滚本批保存点，保留此前未提交工作，避免无关提交发布半批身份。
+    ROLLBACK TO 成功即已丢弃本批，RELEASE 失败也不改变命运；回滚失败但事务
+    已结束时，COMMIT 等终态操作已释放保存点，本批也不再可能晚发布。
+    只有回滚未获确认且事务仍打开时才报告未决，因为后续提交仍可能发布本批。
+    """
 
     if not rows:
         return
-    cursor = await db.executemany(
-        "INSERT INTO rag_chunks(source, msg_id, session_id, group_name, "
-        "sender_name, msg_time, content, item_id, sender_id) "
-        "VALUES(?,?,?,?,?,?,?,?,?) "
-        "ON CONFLICT(source, msg_id) DO UPDATE SET "
-        "session_id=excluded.session_id, group_name=excluded.group_name, "
-        "sender_name=excluded.sender_name, msg_time=excluded.msg_time, "
-        "content=excluded.content, "
-        # item_id 条件覆盖：回填（backfill）重建的 ChunkRow 不携带 item_id
-        # （空串），无条件覆盖会把运行期已写入的「消息→卡片」引用永久清空
-        # 空串时保留既有值，非空时（消息重处理）才覆盖。
-        "item_id=CASE WHEN excluded.item_id='' THEN rag_chunks.item_id "
-        "ELSE excluded.item_id END, "
-        # 回填在锁外等待嵌入，快照中的非空身份也可能落后于实时重索引；
-        # 只补空值才能保住实时身份，实时写入则仍允许非空新值覆盖旧值。
-        # 两种模式都不让空输入擦掉已知身份，避免假名化退化为显示名猜测。
-        "sender_id=CASE WHEN excluded.sender_id='' "
-        "OR (? AND rag_chunks.sender_id<>'') THEN rag_chunks.sender_id "
-        "ELSE excluded.sender_id END",
-        [
-            (
-                r.source, r.msg_id, r.session_id, r.group_name,
-                r.sender_name, r.msg_time, r.content, r.item_id, r.sender_id,
-                sender_id_fill_only,
-            )
-            for r in rows
-        ],
-    )
-    await cursor.close()
-    await db.commit()
+    cursor = await db.execute("SAVEPOINT rag_chunks_upsert")
+    try:
+        await cursor.close()
+        cursor = await db.executemany(
+            "INSERT INTO rag_chunks(source, msg_id, session_id, group_name, "
+            "sender_name, msg_time, content, item_id, sender_id) "
+            "VALUES(?,?,?,?,?,?,?,?,?) "
+            "ON CONFLICT(source, msg_id) DO UPDATE SET "
+            "session_id=excluded.session_id, group_name=excluded.group_name, "
+            "sender_name=excluded.sender_name, msg_time=excluded.msg_time, "
+            "content=excluded.content, "
+            # item_id 条件覆盖：回填（backfill）重建的 ChunkRow 不携带 item_id
+            # （空串），无条件覆盖会把运行期已写入的「消息→卡片」引用永久清空
+            # 空串时保留既有值，非空时（消息重处理）才覆盖。
+            "item_id=CASE WHEN excluded.item_id='' THEN rag_chunks.item_id "
+            "ELSE excluded.item_id END, "
+            # 回填在锁外等待嵌入，快照中的非空身份也可能落后于实时重索引；
+            # 只补空值才能保住实时身份，实时写入则仍允许非空新值覆盖旧值。
+            # 两种模式都不让空输入擦掉已知身份，避免假名化退化为显示名猜测。
+            "sender_id=CASE WHEN excluded.sender_id='' "
+            "OR (? AND rag_chunks.sender_id<>'') THEN rag_chunks.sender_id "
+            "ELSE excluded.sender_id END",
+            [
+                (
+                    r.source, r.msg_id, r.session_id, r.group_name,
+                    r.sender_name, r.msg_time, r.content, r.item_id, r.sender_id,
+                    sender_id_fill_only,
+                )
+                for r in rows
+            ],
+        )
+        await cursor.close()
+        await db.commit()
+    except BaseException as error:
+        rolled_back = False
+        try:
+            cursor = await db.execute("ROLLBACK TO SAVEPOINT rag_chunks_upsert")
+            rolled_back = True
+            await cursor.close()
+            cursor = await db.execute("RELEASE SAVEPOINT rag_chunks_upsert")
+            await cursor.close()
+        except BaseException:  # noqa: BLE001 — 回滚未确认且事务仍打开才未决，保留原始异常为因
+            if not rolled_back and db.in_transaction:
+                raise ChunkWriteOutcomeUnknownError("chunk 写入保存点清理未完成") from error
+        raise
 
 
 async def upsert_embeddings(

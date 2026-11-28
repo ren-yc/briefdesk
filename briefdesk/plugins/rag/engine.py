@@ -36,6 +36,7 @@ from briefdesk.masking import PLACEHOLDER_ONLY_RE
 from briefdesk.plugins.rag.config import RagSettings
 from briefdesk.plugins.rag.db import (
     ChunkRow,
+    ChunkWriteOutcomeUnknownError,
     ensure_fts,
     ensure_rag_schema,
     fetch_all,
@@ -157,6 +158,7 @@ class RagEngine:
         self._vec_model: str | None = None
         self._vec_watermark = ""
         self._vec_count_seen = 0
+        self._vec_full_retry = False
         self._vec_invalidations = 0
         self._vec_applied_invalidations = 0
         self._vec_unsettled_writes = 0
@@ -183,6 +185,7 @@ class RagEngine:
         self._vec_entries.clear()
         self._vec_count_seen = 0
         self._vec_watermark = ""
+        self._vec_full_retry = False
         self._matrix = None
         self._matrix_keys = []
         self._matrix_chunks = []
@@ -252,6 +255,9 @@ class RagEngine:
         行，落库必须写同一个值，否则下一轮又把这批选回来（空转死循环）。
         返回是否写入了向量，供调用方决定要不要触发自愈回填。
 
+        chunk 写入成功、本批回滚已确认或事务已结束时才收尾；回滚未获确认且
+        事务仍打开时保留登记，否则提交前快照会确认随后才发布的身份更新。
+
         连接纪律：调用方持有 storage_lock 与否由调用路径决定（run 在管道锁内、
         backfill_step 自行持锁）；本方法对共享 embed 连接的写统一持
         db.get_embed_lock()——dedup 的向量落库共用同一条连接，语句级互斥
@@ -263,15 +269,21 @@ class RagEngine:
         # 让刷新安装提交前身份并越过其水位，后续增量读取永不再访该行。
         # 所有非空批次都在提交前登记世代及未收尾写入，不等刷新锁。
         # 写入活跃时，每个后续刷新都全量重读；脏状态合并为每次刷新一次，
-        # 而非每个批次一次，以此换取正常提交收尾后的下次刷新不再服务旧身份。
+        # 而非每个批次一次，以此换取写入命运确定后的下次刷新不再服务旧身份。
+        # 回滚成功即已丢弃本批，RELEASE 失败不改命运；事务已结束也不能再晚发布。
+        # 回滚失败且事务仍打开才保留登记，否则提交前快照可能确认尚未发布的世代。
         registered = bool(rows)
         if registered:
             self._vec_invalidations += 1
             self._vec_unsettled_writes += 1
+        outcome_known = True
         try:
             await upsert_chunks(db, rows, sender_id_fill_only=sender_id_fill_only)
+        except ChunkWriteOutcomeUnknownError:
+            outcome_known = False
+            raise
         finally:
-            if registered:
+            if registered and outcome_known:
                 self._vec_unsettled_writes -= 1
         if self._fts_enabled:
             await sync_fts(db, rows)
@@ -493,14 +505,9 @@ class RagEngine:
         水位/整表重建不交错（交错当前是良性的，但锁纪律名存实亡会诱使
         后续在 _refresh_vector_cache 中加入非幂等步骤）。
 
-        force_full 语义：整表重建 = 拉全表后按 key 差集剔除
-        缓存内本次未 fetch 到的条目——否则「删除信号」被归零计数吞掉，
-        已删内容持续可被检索。
+        force_full 只给查询传空水位，未切换模型时成功前保留原水位与计数；模型切换会在读取前清空缓存，切换后失败不保留原缓存内容。删除检测由全表 key 差集承担，失败后必须全量重试，不能退回不会裁剪旧 key 的增量读取。
 
-        水位归零发生在 _refresh_vector_cache 内、行数回退守卫之前：force_full
-        轮次守卫恒不触发（count_seen 已归零），删除检测由 fetch 后的 key
-        差集剔除承担；解析与脏行删除成功后才裁剪缓存并重组矩阵，raw_rows
-        为空则直接清空两者，全表删光也能收敛。矩阵构造失败的一致性不在保证内。
+        维度决策只看原水位闭区间内的解析行，空批才退回全表；安装仍用全表，避免旧维度左右新批决策或旧行身份漏更新。维度漂移在脏行删除成功后逐出旧缓存，全量读取不再递归。解析与脏行删除成功后才裁剪并重组矩阵，空表同步清空两者并更新水位与计数。矩阵构造失败的一致性不在保证内。
         """
 
         async with self._refresh_lock:
@@ -539,16 +546,18 @@ class RagEngine:
         # 不能随旧快照消账；退出时不重读收尾计数。
         invalidations = self._vec_invalidations
         settled = self._vec_unsettled_writes == 0
-        force_full = force_full or self._vec_cache_dirty
+        previous_watermark = self._vec_watermark
+        force_full = force_full or self._vec_cache_dirty or self._vec_full_retry
+        if force_full:
+            # 全量失败后必须整表重试：清缓存可能已使行数回退检测失效，
+            # 普通增量读取又不裁剪 key 差集，否则已删内容会静默留在检索中。
+            self._vec_full_retry = True
         model = ai_ports.embed_model_name()
         if self._vec_model != model:
             logger.info("rag: 嵌入模型切换 %s -> %s，重建向量缓存", self._vec_model, model)
             self._vec_cache_clear()
             self._vec_model = model
         edb = await self._embed_factory()
-        if force_full:
-            self._vec_watermark = ""
-            self._vec_count_seen = 0
         # 共享 embed 连接上的读也持互斥锁：本方法结尾的 bad-key 删除会 commit，
         # 不持锁的 commit 可能把 dedup 未完成的批量向量写入提前提交
         async with get_embed_lock():
@@ -556,10 +565,11 @@ class RagEngine:
                 edb, "SELECT COUNT(*) AS c FROM rag_chunk_embeddings"
             )
             total = int(row["c"]) if row is not None else 0
-            if total < self._vec_count_seen:
+            if not force_full and total < self._vec_count_seen:
                 self._vec_cache_clear()  # 有删除（GC），水位失效，整表重建
             raw_rows, max_created = await fetch_new_embeddings(
-                edb, model, self._vec_watermark, self.settings.group_only
+                edb, model, "" if force_full else self._vec_watermark,
+                self.settings.group_only,
             )
         if force_full:
             # 先记录整表 key 差集，解析与脏行删除成功后才裁剪缓存并重组矩阵；
@@ -570,6 +580,9 @@ class RagEngine:
                 # 全表已空：同步清空缓存与矩阵，否则旧向量仍可参与检索。
                 self._vec_entries.clear()
                 self._rebuild_matrix()
+                self._vec_watermark = max_created
+                self._vec_count_seen = total
+                self._vec_full_retry = False
             if settled:
                 self._vec_applied_invalidations = max(
                     self._vec_applied_invalidations, invalidations
@@ -584,7 +597,17 @@ class RagEngine:
         # 整表重建。不一致向量绝不进矩阵。
         full_rebuild = False
         if entries:
-            batch_dims = {v.shape[0] for _, v in entries}
+            decision_entries = entries
+            if force_full and previous_watermark:
+                recent_keys = {
+                    (row["source"], row["msg_id"]) for row in raw_rows
+                    if row["created_at"] >= previous_watermark
+                }
+                decision_entries = [
+                    (chunk, vec) for chunk, vec in entries
+                    if (chunk.source, chunk.msg_id) in recent_keys
+                ] or entries
+            batch_dims = {vec.shape[0] for _, vec in decision_entries}
             cached_dim = (
                 next(iter(self._vec_entries.values()))[1].shape[0]
                 if self._vec_entries
@@ -595,9 +618,11 @@ class RagEngine:
                     ref_dim = next(iter(batch_dims))
                 else:
                     counts: dict[int, int] = {}
-                    for _, v in entries:
-                        counts[v.shape[0]] = counts.get(v.shape[0], 0) + 1
-                    ref_dim = max(counts, key=lambda d: (counts[d], d))
+                    for _, vec in decision_entries:
+                        counts[vec.shape[0]] = counts.get(vec.shape[0], 0) + 1
+                    ref_dim = max(
+                        counts, key=lambda dimension: (counts[dimension], dimension)
+                    )
             elif batch_dims == {cached_dim}:
                 ref_dim = cached_dim
             elif len(batch_dims) == 1:
@@ -606,7 +631,6 @@ class RagEngine:
                     "整表重建缓存；旧行由回填按当前维度重嵌入",
                     cached_dim, next(iter(batch_dims)),
                 )
-                self._vec_cache_clear()
                 ref_dim = next(iter(batch_dims))
                 full_rebuild = True
             else:
@@ -620,18 +644,24 @@ class RagEngine:
             entries = kept
         if bad_keys:
             await self._delete_bad_embeddings(edb, bad_keys)
+        if full_rebuild:
+            # 已删的旧维度 key 仍在 fetched_keys，差集裁剪不会逐出其缓存；
+            # 删除成功后必须清缓存，否则新旧维度混装会让矩阵重组报形状不齐。
+            self._vec_cache_clear()
         if force_full:
             for key in list(self._vec_entries):
                 if key not in fetched_keys:
                     del self._vec_entries[key]
         for chunk, vec in entries:
             self._vec_entries[(chunk.source, chunk.msg_id)] = (chunk, vec)
+        self._rebuild_matrix()
         self._vec_watermark = max_created
         self._vec_count_seen = total
-        self._rebuild_matrix()
-        if full_rebuild:
-            # 整表重建：水位归零再拉一次全表，把本批之前写入的当前维度行
-            # 收进缓存；递归至多一层——缓存基准已更新，不会再触发重建分支
+        if force_full:
+            self._vec_full_retry = False
+        if full_rebuild and not force_full:
+            # 增量漂移才再拉全表，把水位之前的当前维度行收进缓存；全量读取
+            # 已安装全批，再递归会让原水位边界丢失，旧维度重新左右决策。
             self._vec_watermark = ""
             await self._refresh_vector_cache()
         # 递归重建可能已确认更新的世代，外层不能把确认计数倒退。
