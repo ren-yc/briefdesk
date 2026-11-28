@@ -507,7 +507,7 @@ class RagEngine:
 
         force_full 只给查询传空水位，未切换模型时成功前保留原水位与计数；模型切换会在读取前清空缓存，切换后失败不保留原缓存内容。删除检测由全表 key 差集承担，失败后必须全量重试，不能退回不会裁剪旧 key 的增量读取。
 
-        维度决策只看原水位闭区间内的解析行，空批才退回全表；安装仍用全表，避免旧维度左右新批决策或旧行身份漏更新。维度漂移在脏行删除成功后逐出旧缓存，全量读取不再递归。解析与脏行删除成功后才裁剪并重组矩阵，空表同步清空两者并更新水位与计数。矩阵构造失败的一致性不在保证内。
+        维度决策在未切换模型时只看原水位闭区间内的解析行，空批才退回全表；模型切换时用全批，安装始终用全表，避免旧维度左右新批决策或旧行身份漏更新。脏行删除成功后逐出对应缓存，维度漂移仍清空旧缓存，全量读取不再递归。解析与脏行删除成功后才裁剪并重组矩阵，空表同步清空两者并更新水位与计数。矩阵构造失败的一致性不在保证内。
         """
 
         async with self._refresh_lock:
@@ -553,7 +553,8 @@ class RagEngine:
             # 普通增量读取又不裁剪 key 差集，否则已删内容会静默留在检索中。
             self._vec_full_retry = True
         model = ai_ports.embed_model_name()
-        if self._vec_model != model:
+        model_switched = self._vec_model != model
+        if model_switched:
             logger.info("rag: 嵌入模型切换 %s -> %s，重建向量缓存", self._vec_model, model)
             self._vec_cache_clear()
             self._vec_model = model
@@ -598,7 +599,9 @@ class RagEngine:
         full_rebuild = False
         if entries:
             decision_entries = entries
-            if force_full and previous_watermark:
+            # 模型切换后原水位属于旧模型，不能界定新模型的数据；否则较早
+            # 的有效向量被排除，较新的脏向量主导维度决策并误删有效行。
+            if force_full and not model_switched and previous_watermark:
                 recent_keys = {
                     (row["source"], row["msg_id"]) for row in raw_rows
                     if row["created_at"] >= previous_watermark
@@ -644,6 +647,11 @@ class RagEngine:
             entries = kept
         if bad_keys:
             await self._delete_bad_embeddings(edb, bad_keys)
+            # 删除成功后才逐出，且到矩阵重组之间不再 await，保证删除失败
+            # 或取消时保留原缓存与矩阵；坏 key 仍在 fetched_keys 中，
+            # 仅差集裁剪会让已删除向量继续检索，补行抵消计数回退也不会自愈。
+            for key in bad_keys:
+                self._vec_entries.pop(key, None)
         if full_rebuild:
             # 已删的旧维度 key 仍在 fetched_keys，差集裁剪不会逐出其缓存；
             # 删除成功后必须清缓存，否则新旧维度混装会让矩阵重组报形状不齐。

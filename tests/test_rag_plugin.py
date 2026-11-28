@@ -2390,6 +2390,54 @@ class TestRagWarmVectorsForceFull(_MemoryEngineBase):
         assert not self.engine._vec_cache_dirty
 
 
+    async def test_dimension_decision_ignores_previous_watermark_after_model_switch(self):
+        from briefdesk.plugins.rag.db import (
+            ChunkRow,
+            fetch_all,
+            upsert_chunks,
+            upsert_embeddings,
+        )
+
+        await self.engine._ensure_db_ready()
+        first = ChunkRow(
+            source="weflow-legacy", msg_id="target-older-one", session_id="s1",
+            group_name="虚构群", sender_name="虚构成员", sender_id="fictional-identity",
+            msg_time=1700000000, content="虚构维度测试", item_id="",
+        )
+        second = replace(first, msg_id="target-older-two")
+        dirty = replace(first, msg_id="target-newer-bad")
+        good_keys = [(chunk.source, chunk.msg_id) for chunk in (first, second)]
+        dirty_key = (dirty.source, dirty.msg_id)
+        await upsert_chunks(self.db, [first, second, dirty])
+        await upsert_embeddings(
+            self.db, [dirty_key], [[1.0, 0.0]], "test-model", "t2"
+        )
+        await asyncio.wait_for(self.engine.warm_vectors(), timeout=5)
+        assert self.engine._vec_watermark == "t2"
+        await upsert_embeddings(
+            self.db, good_keys, [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+            "next-model", "t1",
+        )
+        await upsert_embeddings(
+            self.db, [dirty_key], [[1.0, 0.0]], "next-model", "t3"
+        )
+        self.provider.embed_model_name.return_value = "next-model"
+        assert self.engine._vec_model != self.provider.embed_model_name()
+
+        await asyncio.wait_for(self.engine.warm_vectors(force_full=True), timeout=5)
+        rows = await fetch_all(
+            self.db, "SELECT source, msg_id FROM rag_chunk_embeddings"
+        )
+        assert {(row["source"], row["msg_id"]) for row in rows} == set(good_keys)
+        assert set(self.engine._vec_entries) == set(good_keys)
+        assert set(self.engine._matrix_keys) == set(good_keys)
+        assert self.engine._matrix.shape == (2, 3)
+        assert {vector.shape[0] for _, vector in self.engine._vec_entries.values()} == {3}
+        for chunk in (first, second):
+            matrix_index = self.engine._matrix_keys.index((chunk.source, chunk.msg_id))
+            assert self.engine._matrix_chunks[matrix_index] == chunk
+
+
 class TestRagIdentityCacheInvalidation(_MemoryEngineBase):
     @pytest.fixture(autouse=True)
     async def _cached_identity(self, _autouse_setup):
@@ -2438,6 +2486,125 @@ class TestRagIdentityCacheInvalidation(_MemoryEngineBase):
             monkeypatch.setattr(self.engine, "_db_factory", factory)
             monkeypatch.setattr(self.engine, "_embed_factory", factory)
             yield reader, write_db
+
+    async def test_bad_vector_evicted_from_cache_after_successful_delete(self):
+        from briefdesk.plugins.rag.db import (
+            fetch_all,
+            fetch_one,
+            upsert_chunks,
+            upsert_embeddings,
+        )
+
+        second_key = (self.second.source, self.second.msg_id)
+        second_entry_before = self.engine._vec_entries[second_key]
+        cursor = await self.db.execute(
+            "UPDATE rag_chunk_embeddings SET embedding = ? WHERE source = ? AND msg_id = ?",
+            ("not-json", *self.key),
+        )
+        await cursor.close()
+        await self.db.commit()
+
+        await asyncio.wait_for(self.engine.warm_vectors(force_full=True), timeout=5)
+        assert self.key not in self.engine._vec_entries
+        assert self.engine._matrix_keys == [second_key]
+        assert self.engine._matrix_chunks == [self.second]
+        assert self.engine._vec_entries[second_key][0] == second_entry_before[0]
+        assert self.engine._vec_entries[second_key][1].tolist() == second_entry_before[1].tolist()
+        assert self.engine._matrix.tolist() == [second_entry_before[1].tolist()]
+        assert await fetch_one(
+            self.db, "SELECT 1 FROM rag_chunk_embeddings WHERE source = ? AND msg_id = ?",
+            self.key,
+        ) is None
+
+        replacement = replace(self.first, msg_id="restore-row-count")
+        replacement_key = (replacement.source, replacement.msg_id)
+        await upsert_chunks(self.db, [replacement])
+        await upsert_embeddings(
+            self.db, [replacement_key], [[1.0, 0.0]], "test-model", "t3"
+        )
+        rows = await fetch_all(self.db, "SELECT source, msg_id FROM rag_chunk_embeddings")
+        assert len(rows) == self.engine._vec_count_seen
+        self.provider.embed_texts = AsyncMock(return_value=[[1.0, 1.0]])
+        hits = await asyncio.wait_for(self.engine.retrieve("虚构活动"), timeout=5)
+        assert hits is not None
+        assert {(hit.chunk.source, hit.chunk.msg_id) for hit in hits} == {
+            second_key, replacement_key,
+        }
+
+    @pytest.mark.parametrize("failure", ["error", "cancelled"])
+    async def test_bad_vector_delete_failure_keeps_cached_entry(self, monkeypatch, failure):
+        from briefdesk.plugins.rag import engine as rag_engine
+        from briefdesk.plugins.rag.db import fetch_one
+
+        cursor = await self.db.execute(
+            "UPDATE rag_chunk_embeddings SET embedding = ? WHERE source = ? AND msg_id = ?",
+            ("not-json", *self.key),
+        )
+        await cursor.close()
+        await self.db.commit()
+        entries_before = dict(self.engine._vec_entries)
+        matrix_before = self.engine._matrix
+        keys_before = list(self.engine._matrix_keys)
+        chunks_before = list(self.engine._matrix_chunks)
+        sessions_before = list(self.engine._matrix_sessions)
+        watermark_before = self.engine._vec_watermark
+        count_before = self.engine._vec_count_seen
+        deletion_entered = asyncio.Event()
+        release_deletion = asyncio.Event()
+
+        async def failed_delete(db, keys):
+            assert db is self.db
+            assert keys == [self.key]
+            deletion_entered.set()
+            await asyncio.wait_for(release_deletion.wait(), timeout=5)
+            raise RuntimeError("injected bad vector deletion failure")
+
+        with monkeypatch.context() as patcher:
+            patcher.setattr(self.engine, "_delete_bad_embeddings", failed_delete)
+            refresh = asyncio.create_task(self.engine.warm_vectors(force_full=True))
+            try:
+                await asyncio.wait_for(deletion_entered.wait(), timeout=5)
+                assert self.engine._vec_entries == entries_before
+                assert self.engine._matrix is matrix_before
+                if failure == "error":
+                    release_deletion.set()
+                    with pytest.raises(RuntimeError, match="injected bad vector deletion failure"):
+                        await asyncio.wait_for(refresh, timeout=5)
+                else:
+                    refresh.cancel()
+                    with pytest.raises(asyncio.CancelledError):
+                        await asyncio.wait_for(refresh, timeout=5)
+            finally:
+                release_deletion.set()
+                refresh.cancel()
+                await asyncio.wait_for(
+                    asyncio.gather(refresh, return_exceptions=True), timeout=5
+                )
+        assert self.engine._vec_entries == entries_before
+        assert self.engine._matrix is matrix_before
+        assert self.engine._matrix_keys == keys_before
+        assert self.engine._matrix_chunks == chunks_before
+        assert self.engine._matrix_sessions == sessions_before
+        assert self.engine._vec_watermark == watermark_before
+        assert self.engine._vec_count_seen == count_before
+        assert self.engine._vec_full_retry
+        fetch = AsyncMock(wraps=rag_engine.fetch_new_embeddings)
+        monkeypatch.setattr(rag_engine, "fetch_new_embeddings", fetch)
+        await asyncio.wait_for(self.engine.warm_vectors(), timeout=5)
+        fetch.assert_awaited_once()
+        assert fetch.await_args.args[2] == ""
+        second_key = (self.second.source, self.second.msg_id)
+        assert set(self.engine._vec_entries) == {second_key}
+        assert self.engine._vec_entries[second_key][0] == self.second
+        assert self.engine._vec_entries[second_key][1].tolist() == [0.0, 1.0]
+        assert self.engine._matrix_keys == [second_key]
+        assert self.engine._matrix_chunks == [self.second]
+        assert self.engine._matrix.tolist() == [[0.0, 1.0]]
+        assert not self.engine._vec_full_retry
+        assert await fetch_one(
+            self.db, "SELECT 1 FROM rag_chunk_embeddings WHERE source = ? AND msg_id = ?",
+            self.key,
+        ) is None
 
     @pytest.mark.parametrize("force_full", [True, False], ids=["explicit-full", "dirty-full"])
     @pytest.mark.parametrize("old_majority", [False, True], ids=["old-minority", "old-majority"])
@@ -2710,6 +2877,8 @@ class TestRagIdentityCacheInvalidation(_MemoryEngineBase):
         self, monkeypatch, _wal_connections
     ):
         """取消 COMMIT 等待不会撤销工作线程队列，清理尚未执行时不能提前收尾。"""
+        from queue import SimpleQueue
+
         from briefdesk.plugins.rag.db import fetch_one
 
         reader, write_db = _wal_connections
@@ -2725,9 +2894,15 @@ class TestRagIdentityCacheInvalidation(_MemoryEngineBase):
         blockers = []
 
         class ObservedQueue:
+            def __init__(self, wrapped_queue):
+                self._queue = wrapped_queue
+
+            def __getattr__(self, name):
+                return getattr(self._queue, name)
+
             def put_nowait(self, item):
-                real_queue.put_nowait(item)
-                function = item[1]
+                self._queue.put_nowait(item)
+                function = item[1] if isinstance(item, tuple) else None
                 operation = getattr(function, "func", None)
                 if operation == commit_function:
                     commit_queued.set()
@@ -2745,7 +2920,15 @@ class TestRagIdentityCacheInvalidation(_MemoryEngineBase):
             await asyncio.wait_for(worker_blocked.wait(), timeout=5)
             await real_commit()
 
-        monkeypatch.setattr(write_db, "_tx", ObservedQueue())
+        probe_queue = SimpleQueue()
+        probe_observer = ObservedQueue(probe_queue)
+        assert probe_observer.get == probe_queue.get
+        for probe in ((None, None), object()):
+            probe_observer.put_nowait(probe)
+            assert probe_observer.get_nowait() is probe
+        observed_queue = ObservedQueue(real_queue)
+        assert observed_queue.get == real_queue.get
+        monkeypatch.setattr(write_db, "_tx", observed_queue)
         monkeypatch.setattr(write_db, "commit", paused_commit)
         writer = asyncio.create_task(self.engine._persist_chunks(
             write_db, [self.updated], [], [], "test-model"
