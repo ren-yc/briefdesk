@@ -30,7 +30,7 @@
 
 - 源侧透传的异常时间戳不再进入前端属性插值：`InternalMessage` 构造即把非 int（含 bool）时间戳归 0，堵住字符串时间戳经 SQLite 宽类型落库、再被分组模板插进 `data-msgtime` 属性的路径；三处分组模板的时间戳属性与单卡口径统一走 `escAttr`。回归：`InternalMessageTimestampCoercionTest`。
 - 别名还原不再把一个人换成另一个人：本请求已写回过的显示名整体受保护，落在其中的片段不再被当成别名二次替换。回归：`test_produced_display_name_is_never_reinterpreted`、`test_protected_display_name_survives_inside_sentence`。
-- 注册表读取失败不再被当成「文件不存在」而静默重建：损坏、缺盐与版本不支持一律拒绝出站，避免一次重盐让历史化名永久失效。回归：`test_read_registry_rejects_non_alias_values`、`test_version_error_does_not_echo_value`。
+- 注册表读取失败不再被当成「文件不存在」而静默重建：需要读写注册表时，损坏、缺盐与版本不支持会拒绝出站，避免一次重盐让历史化名永久失效。回归：`test_read_registry_rejects_non_alias_values`、`test_version_error_does_not_echo_value`。
 - 注册表拒绝重复 JSON 键、顶层多余或缺失字段、非整数及布尔版本，异常时整批拒绝出站。回归：`test_read_registry_rejects_duplicate_keys`、`test_read_registry_requires_exact_fields`、`test_read_registry_requires_integer_version`。
 - POSIX 在注册表原子替换后同步父目录，目录同步失败仍拒绝出站；失败后同一实例上的重试会强制重写并重新同步，确认持久后才放行；Windows 跳过目录同步，只承诺原子可见性。回归：`test_atomic_write_directory_fsync_failure_is_write_error`、`test_atomic_write_windows_skips_directory_fsync`、`test_directory_fsync_failure_retry_rewrites_before_publishing`。
 - 本地端点判定的绕过路径收口：带凭据段或空 userinfo、控制字符、非法端口与近似域名一律按远端处理，畸形 URL 不再被判成本地。回归：`test_local_endpoint_matrix_fail_closed`、`test_remote_endpoint_matrix_fail_closed`。
@@ -45,7 +45,7 @@
 - RAG 历史中的已还原真名不再随假名化请求外发，客户端历史仅用于页面展示；本地 `auto` 或 `off` 仍沿用原有的裁剪规则传递历史。回归：`test_restored_history_round_trip_respects_pseudonymization`。
 - 本地 AI 端点默认不走环境代理、不跟随重定向，防止本地请求被转发至远端；远端端点保留 SDK 默认的代理、自定义 CA 与重定向行为。回归：`test_http_clients_ignore_proxy_env`、`test_http_clients_never_follow_local_to_remote_redirects`、`test_http_clients_preserve_remote_sdk_defaults`。
 - 基准报告的 `egress_summary` 相对运行起点基线取逐键差量，不继承同进程历史计数，也不清空共享遥测。回归：`test_empty_run_excludes_historical_egress`、`test_consecutive_runs_report_per_key_egress_deltas`。
-- RAG 元数据更新即使没有新 embedding，也会使下次向量缓存刷新全量重读，避免检索结果继续使用旧身份。回归：`test_cached_identity_update_without_embedding_refreshes_retrieval`。
+- RAG 对所有非空 chunk 批次无条件预登记提交前失效，避免已入 SQL 但尚未缓存的行在元数据更新后永久携带旧身份，FTS 同步取消也不丢失已登记通知。刷新只确认快照点之前已收尾的世代，快照后才提交或收尾的写入留待下次刷新确认。写入活跃时，每个后续刷新都全量重读，脏状态合并为每次刷新一次而非每个批次一次，以此换取正常提交收尾后的下次刷新不再服务旧身份。进行中的刷新仍可服务提交前快照，`upsert_chunks` 内失败或取消（含 COMMIT 之前）后隐式事务晚发布及 COMMIT 工作线程晚提交只由维护周期全量扫描覆盖，失败一致性仅覆盖解析或坏向量删除而不包括矩阵构造，GC 与坏向量删除不显式登记失效。回归：`test_cached_identity_update_without_embedding_refreshes_retrieval`、`test_identity_new_rows_register_invalidation`、`test_identity_existing_uncached_row_receives_invalidation`、`test_identity_refresh_does_not_acknowledge_unsettled_write`、`test_identity_settlement_after_snapshot_before_exit_keeps_invalidation`、`test_identity_cold_cache_registers_invalidation`、`test_identity_invalidation_survives_cancelled_fts_sync`、`test_identity_invalidation_survives_cancelled_commit`、`test_identity_failed_full_refresh_keeps_cache_and_matrix_coherent`。
 - RAG 并发首次初始化只迁移一次，避免迁移及提交交错。回归：`test_concurrent_ensure_db_ready_migrates_once`。
 - 证据行与分类批的「最后非空显示名」口径内建于收集阶段：先空后真名、真名后空名、群名先空后真与先真后空都不再出现空名覆盖有效别名或锁定首个空串。回归：`test_empty_name_after_real_name_never_wipes_alias`、`test_group_empty_then_real_name_resolves_to_real`、`test_group_real_then_empty_keeps_alias_and_restore`、`test_trailing_empty_name_does_not_wipe_earlier_real_name`、`test_multiple_real_names_take_the_last_one`。
 - RAG 证据名中的人与群身份共享一次并发准备，新身份只需一次注册表落盘，避免分开准备或逐条等待导致重复提交。回归：`test_new_identities_share_exactly_one_commit_increment`。
