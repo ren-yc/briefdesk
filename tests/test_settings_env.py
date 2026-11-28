@@ -220,6 +220,47 @@ class ReasoningEffortConfigTest(unittest.TestCase):
             Settings(_env_file=[], AI_REASONING_EFFORT="bogus")
 
 
+class PseudonymizeNamesConfigTest(unittest.TestCase):
+    """出站化名开关的取值校验：空白与默认同义，非法值在启动期报错。
+
+    空串必须被接受：设置页把该项清空后暂存文件里就是 `AI_PSEUDONYMIZE_NAMES=`，
+    若启动期把它当非法值，"保存成功、重启失败" 就会出现在一个只是清空了输入的
+    配置上。反过来 `AUTO`/`maybe` 必须响亮失败——静默按 auto 处理会让用户以为
+    off 已生效，而真名仍会被改写后送出（或反之）。
+    """
+
+    def test_blank_value_means_auto(self) -> None:
+        from briefdesk.config import Settings
+
+        self.assertEqual(
+            Settings(_env_file=[], AI_PSEUDONYMIZE_NAMES="").ai_pseudonymize_names,
+            "auto",
+        )
+        # 默认值直接读模型声明：零参构造会叠加宿主环境/暂存层，断言它等于
+        # auto 只是在断言本机没有配过这一项。
+        field = Settings.model_fields["ai_pseudonymize_names"]
+        self.assertEqual(field.default, "auto")
+
+    def test_explicit_values_pass_through(self) -> None:
+        from briefdesk.config import Settings
+
+        for value in ("auto", "on", "off"):
+            self.assertEqual(
+                Settings(_env_file=[], AI_PSEUDONYMIZE_NAMES=value).ai_pseudonymize_names,
+                value,
+            )
+
+    def test_invalid_value_rejected_at_load(self) -> None:
+        from pydantic import ValidationError
+
+        from briefdesk.config import Settings
+
+        # 不做大小写归一：AUTO 与拼错同属一类，静默接受会掩盖真实意图
+        for value in ("AUTO", "maybe"):
+            with self.assertRaises(ValidationError):
+                Settings(_env_file=[], AI_PSEUDONYMIZE_NAMES=value)
+
+
 class EnvRoutesTest(StagedFileTestCase):
     def setUp(self) -> None:
         super().setUp()
@@ -534,6 +575,38 @@ class EnvRoutesTest(StagedFileTestCase):
             "/api/settings/env", json={"items": {"AI_REASONING_EFFORT": "bogus"}}
         )
         self.assertEqual(res.status_code, 422)
+
+    def test_ai_pseudonymize_names_rejects_unknown_value(self) -> None:
+        """非法枚举必须在暂存阶段就被拒：放行等于「保存成功、重启失败」。
+
+        该项是下拉（options 已在 _core_schema 登记），未登记 options 时它会渲染成
+        文本框且 PUT 放行任意字符串，非法值要等到下次启动才由 validator 拦下。
+        """
+        res = self.client.put(
+            "/api/settings/env", json={"items": {"AI_PSEUDONYMIZE_NAMES": "maybe"}}
+        )
+        self.assertEqual(res.status_code, 422)
+        self.assertEqual(read_staged(), {})
+
+    def test_ai_pseudonymize_names_blank_stages_and_means_auto(self) -> None:
+        """清空输入存成空串，下次启动解析为 auto（不是非法值、不是删除键）。
+
+        空串与「恢复默认」（PUT null 删键）是两件事：前者是用户显式选择「按自动
+        判断」并留下草稿，后者是把该项交还给默认层。两者最终语义相同，但暂存态
+        与来源展示不同，前端行级贴片依赖这个差别。
+        """
+        with _env_without("AI_PSEUDONYMIZE_NAMES"):
+            res = self.client.put(
+                "/api/settings/env",
+                json={"items": {"AI_PSEUDONYMIZE_NAMES": ""}},
+            )
+            self.assertEqual(res.status_code, 200)
+            self.assertEqual(read_staged(), {"AI_PSEUDONYMIZE_NAMES": ""})
+            item = res.json()["items"]["AI_PSEUDONYMIZE_NAMES"]
+            self.assertEqual(item["staged"], "")
+            # 下次启动值走真实解析链：空串 → auto
+            self.assertEqual(item["expected_value"], "auto")
+            self.assertEqual(item["expected_source"], SOURCE_OVERRIDE)
 
     def test_put_rejects_unknown_key(self) -> None:
         res = self.client.put(

@@ -17,6 +17,7 @@ from unittest.mock import patch
 import pytest
 from pydantic import ValidationError
 
+from briefdesk import telemetry
 from briefdesk.config import config
 from briefdesk.plugins.benchmark import cli, engine
 from briefdesk.plugins.benchmark.metrics import (
@@ -39,6 +40,7 @@ from briefdesk.plugins.benchmark.schema import (
     MessageIn,
     SameExpected,
     TimePoint,
+    TitleCase,
     TitleExpected,
     card_fields,
     load_dataset_file,
@@ -541,6 +543,87 @@ class TestScratchPreparation:
         assert "ai_api_base" not in payload
         assert "api_base" not in payload["config"]
         assert "api_key" not in json.dumps(payload)
+
+
+class TestEgressSummary:
+    @pytest.fixture
+    def egress_history(self, monkeypatch, tmp_path):
+        telemetry.reset_for_tests()
+        monkeypatch.setattr(config, "telemetry_enabled", True)
+        monkeypatch.setattr(telemetry, "telemetry_dir", lambda: tmp_path / "tel")
+        history = {
+            "ai.egress.remote_attempt.chat.main": 5,
+            "ai.egress.sdk_retry.chat.main": 3,
+            "ai.egress.retry_observed.chat.main": 2,
+            "ai.local.attempt.embed.main": 4,
+            "ai.local.sdk_retry.embed.main": 2,
+            "ai.local.retry_observed.embed.main": 1,
+            "pipeline.kept": 2,
+        }
+        for metric, count in history.items():
+            for _index in range(count):
+                telemetry.record(metric)
+        yield telemetry.snapshot()["counters"]
+        telemetry.reset_for_tests()
+
+    async def test_empty_run_excludes_historical_egress(self, egress_history):
+        """空基准不能继承历史发送与观测状态，也不能清空共享遥测来伪造差量。"""
+        payload, evals = await engine.run_benchmark_cases({})
+        assert payload["egress_summary"] == {
+            "attempt_total": 0,
+            "sdk_retry_total": 0,
+            "sdk_retry_observed": False,
+        }
+        assert evals == {}
+        assert telemetry.snapshot()["counters"] == egress_history
+
+    async def test_consecutive_runs_report_per_key_egress_deltas(
+        self, monkeypatch, egress_history,
+    ):
+        """每轮重取基线；只遍历基线会漏掉新键，历史观测也不能补齐本轮重试。"""
+        assert "ai.egress.remote_attempt.rag.main|" not in egress_history
+        round_index = 0
+
+        async def _run_feature(*_args, **_kwargs):
+            nonlocal round_index
+            round_index += 1
+            telemetry.record("ai.egress.remote_attempt.chat.main")
+            if round_index == 1:
+                telemetry.record("ai.egress.sdk_retry.chat.main")
+                telemetry.record("ai.egress.retry_observed.chat.main")
+            else:
+                telemetry.record("ai.egress.remote_attempt.rag.main")
+                for _index in range(2):
+                    telemetry.record("ai.local.attempt.embed.main")
+                    telemetry.record("ai.local.sdk_retry.embed.main")
+            return []
+
+        monkeypatch.setattr(engine, "_run_feature", _run_feature)
+        case = TitleCase(
+            id="demo-title",
+            message=MessageIn(msg_id="demo-message", content="虚构活动"),
+            expected=TitleExpected(title="虚构活动"),
+        )
+        first, _first_evals = await engine.run_benchmark_cases({"title": [case]})
+        second, _second_evals = await engine.run_benchmark_cases({"title": [case]})
+        assert first["egress_summary"] == {
+            "attempt_total": 1,
+            "sdk_retry_total": 1,
+            "sdk_retry_observed": True,
+        }
+        assert second["egress_summary"] == {
+            "attempt_total": 4,
+            "sdk_retry_total": 2,
+            "sdk_retry_observed": False,
+        }
+        expected = egress_history.copy()
+        expected["ai.egress.remote_attempt.chat.main|"] += 2
+        expected["ai.egress.remote_attempt.rag.main|"] = 1
+        expected["ai.egress.sdk_retry.chat.main|"] += 1
+        expected["ai.egress.retry_observed.chat.main|"] += 1
+        expected["ai.local.attempt.embed.main|"] += 2
+        expected["ai.local.sdk_retry.embed.main|"] += 2
+        assert telemetry.snapshot()["counters"] == expected
 
 
 class TestProgress:

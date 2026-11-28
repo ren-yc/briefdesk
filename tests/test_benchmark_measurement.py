@@ -644,9 +644,12 @@ class TestProviderLabel:
             cfg.dedup_embed_fallback_threshold = 0.65
             cfg.dedup_strong_threshold = 0.99
             cfg.merge_prefilter_threshold = -1.0
+            cfg.ai_pseudonymize_names = "auto"
             snap = bench_engine.benchmark_config_snapshot()
         assert snap["chat_provider"] == "deepseek"
         assert snap["embed_provider"] == "ollama"
+        assert snap["pseudonymize_names"] == "auto"
+        assert isinstance(snap["telemetry_enabled"], bool)
         assert "://" not in json.dumps(snap, ensure_ascii=False)
 
 

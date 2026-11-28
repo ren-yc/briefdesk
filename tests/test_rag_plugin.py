@@ -1,7 +1,10 @@
 """RAG 插件测试：装配自禁用、库层、索引、回填、检索与问答路由。"""
 
 import asyncio
+import re
+import sqlite3
 import unittest
+from dataclasses import replace
 from datetime import UTC
 from types import SimpleNamespace
 from typing import ClassVar
@@ -149,12 +152,16 @@ class TestRagDb:
         yield
         await self.db.close()
     @staticmethod
-    def _row(msg_id="m1", content="周六6点开会有通知，别迟到", item_id="", ts=1700000000):
+    def _row(
+        msg_id="m1", content="周六6点开会有通知，别迟到", item_id="", ts=1700000000,
+        sender_id="",
+    ):
         from briefdesk.plugins.rag.db import ChunkRow
 
         return ChunkRow(
             source="weflow-legacy", msg_id=msg_id, session_id="s1", group_name="测试群",
             sender_name="小明", msg_time=ts, content=content, item_id=item_id,
+            sender_id=sender_id,
         )
 
     async def _seed_raw(self, msg_id, ts=1700000000, content=None):
@@ -354,6 +361,397 @@ class TestRagDb:
         assert status["rag_chunks"] == 1
         assert status["fts_tokenizer"] == "trigram"
 
+    async def test_sender_id_migration_is_idempotent(self):
+        """旧库补列 + 回填只能发生一次：重复 ensure 不得再 ALTER。
+
+        失败模式：`ALTER TABLE ... ADD COLUMN` 没有 IF NOT EXISTS，重复执行抛
+        "duplicate column name"，而 ensure_schema 每次启动都跑——不幂等的迁移
+        会让第二次启动永久起不来。同时复核「只回填空值」：已经把 sender_id 写
+        进去的行不能被下一次启动用（此刻可能已不存在的）事实源覆盖。
+        """
+        from briefdesk.plugins.rag.db import ensure_rag_schema, fts_search
+
+        db = await aiosqlite.connect(":memory:")
+        db.row_factory = aiosqlite.Row
+        try:
+            await init_schema(db)
+            # 改造前的建表语句（没有 sender_id）：模拟升级前的既有库
+            cursor = await db.execute(
+                "CREATE TABLE rag_chunks ("
+                "source TEXT NOT NULL, msg_id TEXT NOT NULL,"
+                " session_id TEXT NOT NULL, group_name TEXT NOT NULL DEFAULT '',"
+                " sender_name TEXT NOT NULL DEFAULT '',"
+                " msg_time INTEGER NOT NULL DEFAULT 0, content TEXT NOT NULL,"
+                " item_id TEXT NOT NULL DEFAULT '',"
+                " PRIMARY KEY (source, msg_id))"
+            )
+            await cursor.close()
+            cursor = await db.execute(
+                "INSERT INTO raw_messages(source,msg_id,session_id,group_name,"
+                "sender_id,sender_name,content,timestamp) VALUES(?,?,?,?,?,?,?,?)",
+                ("weflow-legacy", "m1", "s1", "测试群", "u1", "小明", "内容", 1700000000),
+            )
+            await cursor.close()
+            cursor = await db.execute(
+                "INSERT INTO rag_chunks(source,msg_id,session_id,group_name,"
+                "sender_name,msg_time,content,item_id) VALUES(?,?,?,?,?,?,?,?)",
+                ("weflow-legacy", "m1", "s1", "测试群", "小明", 1700000000, "内容", ""),
+            )
+            await cursor.close()
+            await db.commit()
+
+            statements: list[str] = []
+            await db.set_trace_callback(statements.append)
+            await ensure_rag_schema(db)
+            await ensure_rag_schema(db)  # 重复启动：不得再 ALTER
+            alters = [
+                s for s in statements
+                if "ALTER TABLE rag_chunks ADD COLUMN sender_id" in s
+            ]
+            assert len(alters) == 1, statements
+            cursor = await db.execute(
+                "SELECT sender_id FROM rag_chunks WHERE msg_id='m1'"
+            )
+            try:
+                assert (await cursor.fetchone())["sender_id"] == "u1"
+            finally:
+                await cursor.close()
+
+            # 回填只填空值：模拟事实源已被删除后再次启动，已知身份不得被擦掉
+            cursor = await db.execute("DELETE FROM raw_messages")
+            await cursor.close()
+            await db.commit()
+            await ensure_rag_schema(db)
+            cursor = await db.execute(
+                "SELECT sender_id FROM rag_chunks WHERE msg_id='m1'"
+            )
+            try:
+                assert (await cursor.fetchone())["sender_id"] == "u1"
+            finally:
+                await cursor.close()
+
+            # 回滚视角（旧代码 + 新库）：表上多出后来追加的列时，行读取器仍要能读
+            cursor = await db.execute(
+                "ALTER TABLE rag_chunks ADD COLUMN column_added_later TEXT NOT NULL DEFAULT ''"
+            )
+            await cursor.close()
+            await db.commit()
+            await _seed_session(db, "weflow-legacy", "s1", enabled=1, is_group=1)
+            hits = await fts_search(db, "内容", limit=10)
+            assert [(h.msg_id, h.sender_id) for h in hits] == [("m1", "u1")]
+        finally:
+            await db.close()
+
+    async def test_sender_id_backfill_failure_rolls_back_whole_migration(self):
+        """回填 UPDATE 失败或被取消：迁移整体回滚，不留「列在值空」的死状态。
+
+        失败模式：ALTER 在 SAVEPOINT 外先行生效时，回填失败会让库停在「列已加、
+        值全空、下次启动因列存在而永远不再回填」的死状态——假名化随后把所有
+        缺 ID 的证据行并成一个身份。CancelledError 同为 BaseException，必须走
+        同一回滚路径；列已存在的幂等重跑分支同样受保护。
+        """
+        from briefdesk.plugins.rag import db as rag_db
+        from briefdesk.plugins.rag.db import ensure_rag_schema
+
+        async def _build_old_shape_db() -> aiosqlite.Connection:
+            db = await aiosqlite.connect(":memory:")
+            db.row_factory = aiosqlite.Row
+            await init_schema(db)
+            cursor = await db.execute(
+                "CREATE TABLE rag_chunks ("
+                "source TEXT NOT NULL, msg_id TEXT NOT NULL,"
+                " session_id TEXT NOT NULL, group_name TEXT NOT NULL DEFAULT '',"
+                " sender_name TEXT NOT NULL DEFAULT '',"
+                " msg_time INTEGER NOT NULL DEFAULT 0, content TEXT NOT NULL,"
+                " item_id TEXT NOT NULL DEFAULT '',"
+                " PRIMARY KEY (source, msg_id))"
+            )
+            await cursor.close()
+            cursor = await db.execute(
+                "INSERT INTO raw_messages(source,msg_id,session_id,group_name,"
+                "sender_id,sender_name,content,timestamp) VALUES(?,?,?,?,?,?,?,?)",
+                ("weflow-legacy", "m1", "s1", "测试群", "u1", "小明", "内容", 1700000000),
+            )
+            await cursor.close()
+            cursor = await db.execute(
+                "INSERT INTO rag_chunks(source,msg_id,session_id,group_name,"
+                "sender_name,msg_time,content,item_id) VALUES(?,?,?,?,?,?,?,?)",
+                ("weflow-legacy", "m1", "s1", "测试群", "小明", 1700000000, "内容", ""),
+            )
+            await cursor.close()
+            await db.commit()
+            return db
+
+        async def _columns(db: aiosqlite.Connection) -> set[str]:
+            cursor = await db.execute("PRAGMA table_info(rag_chunks)")
+            try:
+                return {row["name"] for row in await cursor.fetchall()}
+            finally:
+                await cursor.close()
+
+        # 场景一：缺列 + ALTER 成功 + 回填抛错 → 列消失、行数据原样，可重跑
+        db = await _build_old_shape_db()
+        try:
+            with (
+                patch.object(
+                    rag_db,
+                    "_SENDER_ID_BACKFILL_SQL",
+                    "UPDATE rag_chunks SET sender_id = (SELECT no_such_col FROM x)",
+                ),
+                pytest.raises(sqlite3.OperationalError),
+            ):
+                await ensure_rag_schema(db)
+            assert "sender_id" not in await _columns(db)
+            cursor = await db.execute("SELECT msg_id FROM rag_chunks")
+            try:
+                assert [r["msg_id"] for r in await cursor.fetchall()] == ["m1"]
+            finally:
+                await cursor.close()
+            # 同一连接重跑（SQL 已恢复）：迁移成功、回填正确
+            await ensure_rag_schema(db)
+            assert "sender_id" in await _columns(db)
+            cursor = await db.execute(
+                "SELECT sender_id FROM rag_chunks WHERE msg_id='m1'"
+            )
+            try:
+                assert (await cursor.fetchone())["sender_id"] == "u1"
+            finally:
+                await cursor.close()
+        finally:
+            await db.close()
+
+        # 场景二：缺列 + 回填被取消 → 与失败同一回滚路径（列消失）
+        db = await _build_old_shape_db()
+        try:
+            original_execute = db.execute
+
+            async def _cancel_on_backfill(sql, *args, **kwargs):
+                if "UPDATE rag_chunks SET sender_id" in sql:
+                    raise asyncio.CancelledError()
+                return await original_execute(sql, *args, **kwargs)
+
+            with (
+                patch.object(
+                    db, "execute", side_effect=_cancel_on_backfill, create=True
+                ),
+                pytest.raises(asyncio.CancelledError),
+            ):
+                await ensure_rag_schema(db)
+            assert "sender_id" not in await _columns(db)
+        finally:
+            await db.close()
+
+        # 场景三：列已存在（幂等重跑分支）+ 回填真实写入**之后**才失败
+        # → 部分写入被 SAVEPOINT 回滚，已有值与全部行数据保持原样。
+        # 三层缺一不可：失败点必须在 UPDATE 真实写入之后（写入前抛错钉不住
+        # 「回滚已写入的部分」）；必须有被实际更新的行（无匹配 raw 行时
+        # WHERE EXISTS 让 rowcount=0，「执行过语句」不等于「发生过写入」）；
+        # 抛错前必须先断言写入确实发生（否则守卫可能在验证一条没写任何东西
+        # 的语句）。删除 ROLLBACK 只留 RELEASE 的错误实现会在 m2 残留 u2，
+        # 被回滚状态断言抓红。
+        db = await _build_old_shape_db()
+        try:
+            cursor = await db.execute(
+                "ALTER TABLE rag_chunks ADD COLUMN sender_id TEXT NOT NULL DEFAULT ''"
+            )
+            await cursor.close()
+            # 先手工写入非空已知值：回滚后它必须原样保留（不被回填语句改动、
+            # 也不被错误的部分写入覆盖）
+            cursor = await db.execute(
+                "UPDATE rag_chunks SET sender_id = 'known' WHERE msg_id = 'm1'"
+            )
+            await cursor.close()
+            # 再造一行缺值，且 raw 里有匹配行（sender_id='u2'）：回填会真实
+            # 写入它——这是「部分写入」的载体
+            cursor = await db.execute(
+                "INSERT INTO rag_chunks(source,msg_id,session_id,group_name,"
+                "sender_name,msg_time,content,item_id) VALUES(?,?,?,?,?,?,?,?)",
+                ("weflow-legacy", "m2", "s1", "测试群", "小红", 1700000100, "内容二", ""),
+            )
+            await cursor.close()
+            cursor = await db.execute(
+                "INSERT INTO raw_messages(source,msg_id,session_id,group_name,"
+                "sender_id,sender_name,content,timestamp) VALUES(?,?,?,?,?,?,?,?)",
+                ("weflow-legacy", "m2", "s1", "测试群", "u2", "小红", "内容二", 1700000100),
+            )
+            await cursor.close()
+            await db.commit()
+
+            original_execute = db.execute
+            wrote = {"rowcount": None, "verified": False}
+
+            async def _fail_after_real_write(sql, *args, **kwargs):
+                cursor = await original_execute(sql, *args, **kwargs)
+                if "UPDATE rag_chunks SET sender_id" in sql and wrote["rowcount"] is None:
+                    # UPDATE 已真实执行：先采集写入证据（rowcount 与 m2 当前值），
+                    # 异常捕获后再严格断言——否则守卫可能在验证一条没写任何
+                    # 东西的语句
+                    wrote["rowcount"] = cursor.rowcount
+                    check = await original_execute(
+                        "SELECT sender_id FROM rag_chunks WHERE msg_id='m2'"
+                    )
+                    try:
+                        row = await check.fetchone()
+                    finally:
+                        await check.close()
+                    wrote["verified"] = row is not None and row["sender_id"] == "u2"
+                    raise RuntimeError("回填后的维护步骤失败")
+                return cursor
+
+            with (
+                patch.object(
+                    db, "execute", side_effect=_fail_after_real_write, create=True
+                ),
+                pytest.raises(RuntimeError),
+            ):
+                await ensure_rag_schema(db)
+            assert wrote["rowcount"] == 1, wrote
+            assert wrote["verified"], "抛错前 m2 必须已真实写入 u2"
+            # 回滚完整：已知值原样、缺值行回空、显示名等其余列不变
+            cursor = await db.execute(
+                "SELECT msg_id, sender_id, sender_name, group_name FROM rag_chunks "
+                "ORDER BY msg_id"
+            )
+            try:
+                rows = [dict(r) for r in await cursor.fetchall()]
+            finally:
+                await cursor.close()
+            assert rows == [
+                {"msg_id": "m1", "sender_id": "known", "sender_name": "小明",
+                 "group_name": "测试群"},
+                {"msg_id": "m2", "sender_id": "", "sender_name": "小红",
+                 "group_name": "测试群"},
+            ]
+            # 事务不残留：SAVEPOINT 已 RELEASE，重跑迁移必须严格得到 known/u2
+            await ensure_rag_schema(db)
+            cursor = await db.execute(
+                "SELECT msg_id, sender_id FROM rag_chunks ORDER BY msg_id"
+            )
+            try:
+                rows = [tuple(r) for r in await cursor.fetchall()]
+            finally:
+                await cursor.close()
+            assert rows == [("m1", "known"), ("m2", "u2")]
+        finally:
+            await db.close()
+
+    async def test_missing_raw_id_stays_empty(self):
+        """raw 缺行或 raw 自身缺 ID 时保持空串，不得用 sender_name 猜身份。
+
+        猜出来的 ID 会把两个同名的人并成一个身份，假名化随后把 A 的化名贴到 B
+        的证据行上——比没有身份更糟，因为它看起来是对的。
+        """
+        from briefdesk.plugins.rag.db import ensure_rag_schema, upsert_chunks
+
+        # m1：raw 有这一行但 sender_id 为空；m2：raw 里根本没有这一行
+        cursor = await self.db.execute(
+            "INSERT INTO raw_messages(source,msg_id,session_id,group_name,"
+            "sender_id,sender_name,content,timestamp) VALUES(?,?,?,?,?,?,?,?)",
+            ("weflow-legacy", "m1", "s1", "测试群", "", "小明", "内容", 1700000000),
+        )
+        await cursor.close()
+        await self.db.commit()
+        await upsert_chunks(self.db, [self._row("m1"), self._row("m2")])
+
+        await ensure_rag_schema(self.db)  # 重复迁移：只回填缺失值
+        cursor = await self.db.execute(
+            "SELECT msg_id, sender_id, sender_name FROM rag_chunks ORDER BY msg_id"
+        )
+        try:
+            rows = [dict(r) for r in await cursor.fetchall()]
+        finally:
+            await cursor.close()
+        assert [(r["msg_id"], r["sender_id"]) for r in rows] == [
+            ("m1", ""), ("m2", ""),
+        ]
+        # 显示名照旧入库：空 ID 不等于丢名字
+        assert {r["sender_name"] for r in rows} == {"小明"}
+
+    async def test_upsert_preserves_known_sender_id(self):
+        """空 sender_id 不得覆盖既有非空值（回填在事实源删除后给出的就是空串）。"""
+        from briefdesk.plugins.rag.db import upsert_chunks
+
+        async def _sender_id() -> str:
+            cursor = await self.db.execute(
+                "SELECT sender_id FROM rag_chunks WHERE msg_id='m1'"
+            )
+            try:
+                return (await cursor.fetchone())["sender_id"]
+            finally:
+                await cursor.close()
+
+        await upsert_chunks(self.db, [self._row(sender_id="u1")])
+        assert await _sender_id() == "u1"
+        await upsert_chunks(self.db, [self._row(sender_id="")])  # 回填重建（空 ID）
+        assert await _sender_id() == "u1"  # 保留已知身份
+        await upsert_chunks(self.db, [self._row(sender_id="u2")])  # 消息重处理
+        assert await _sender_id() == "u2"
+
+    async def test_fts_and_vector_share_sender_id(self):
+        """两条召回腿都得带上同形身份字段：只有一侧生效时向量命中无法假名化。
+
+        FTS 表的列固定为 content/sender_name/group_name/source/msg_id（不重建），
+        身份来自 join 回来的 rag_chunks；向量腿走显式投影 + 同一投影读取器。
+        两条腿都要给出一致的 sender_id，否则「远端化名」只在关键词命中时成立。
+        """
+        from briefdesk.plugins.rag.db import (
+            ensure_fts,
+            fetch_new_embeddings,
+            fts_search,
+            parse_embedding_rows,
+            sync_fts,
+            upsert_chunks,
+            upsert_embeddings,
+        )
+
+        await _seed_session(self.db, "weflow-legacy", "s1", enabled=1, is_group=1)
+        await ensure_fts(self.db)
+        row = self._row(sender_id="u1")
+        await upsert_chunks(self.db, [row])
+        await sync_fts(self.db, [row])
+        await upsert_embeddings(
+            self.db, [("weflow-legacy", "m1")], [[1.0, 0.0]], "test-model", "t0"
+        )
+
+        fts_hits = await fts_search(self.db, "有通知", limit=10)  # ≥3 字符 → MATCH
+        assert [(h.msg_id, h.sender_id) for h in fts_hits] == [("m1", "u1")]
+        like_hits = await fts_search(self.db, "开会", limit=10)  # 2 字符 → LIKE 兜底
+        assert [(h.msg_id, h.sender_id) for h in like_hits] == [("m1", "u1")]
+
+        raw_rows, _ = await fetch_new_embeddings(self.db, "test-model", "")
+        entries, _bad = parse_embedding_rows(raw_rows)
+        assert [(c.msg_id, c.sender_id) for c, _ in entries] == [("m1", "u1")]
+
+    async def test_rollback_reader_ignores_unknown_columns(self):
+        """旧 shape / 新 shape 的行都能读成 ChunkRow：多余列丢弃、缺列走默认。
+
+        回滚兼容的取证：`SELECT c.*` 的列集合随表结构变化，直接
+        `ChunkRow(**dict(row))` 在「新库 + 多一列」时 TypeError（FTS 腿与向量腿
+        同时哑），所以走投影读取器。回滚必须带它 + 保留追加列，直接退到旧基线
+        仍会炸。
+        """
+        from briefdesk.plugins.rag.db import ChunkRow, chunk_from_row
+
+        newer_shape = {
+            "source": "weflow-legacy", "msg_id": "m1", "session_id": "s1",
+            "group_name": "测试群", "sender_name": "小明", "msg_time": 1700000000,
+            "content": "周六6点开会有通知", "item_id": "i1", "sender_id": "u1",
+            "column_added_later": "x",
+        }
+        # 前置：改造前的写法在「多一列」时确实炸——读取器存在的理由
+        with pytest.raises(TypeError):
+            ChunkRow(**newer_shape)
+        chunk = chunk_from_row(newer_shape)
+        assert (chunk.msg_id, chunk.sender_id, chunk.item_id) == ("m1", "u1", "i1")
+
+        older_shape = {
+            k: v for k, v in newer_shape.items()
+            if k not in ("sender_id", "column_added_later")
+        }
+        old_chunk = chunk_from_row(older_shape)
+        assert old_chunk.sender_id == ""  # 缺列走默认空串，不炸
+        assert old_chunk.msg_id == "m1"
+
     async def test_ensure_fts_reconciles_existing_table_tokenizer(self):
         # 历史 unicode61 表 + meta 缺失：不得误报 trigram（IF NOT EXISTS 短路）
         cursor = await self.db.execute(
@@ -371,6 +769,19 @@ def _dynamic_embed(texts):
     return [[min(float(len(t)), 100.0), 0.0] for t in texts]
 
 
+class _LocalAwareProvider(Mock):
+    """测试桩：声明「请求发往配置的端点」，镜像内置供应商的声明能力。
+
+    未声明目的地的供应商会被假名化策略按远端处理（第三方插件可能改路由），
+    这里显式声明，才能让「本地端点不改写输入」的用例验证的是本地分支本身。
+    """
+
+    def effective_remote(self, base: str) -> bool:
+        from briefdesk.ai_egress import is_local_endpoint
+
+        return not is_local_endpoint(base)
+
+
 class _MemoryEngineBase:
     """公共基座：内存库 + 动态假嵌入供应商 + 会话白名单种子。"""
 
@@ -385,7 +796,7 @@ class _MemoryEngineBase:
         self.db.row_factory = aiosqlite.Row
         await init_schema(self.db)
 
-        self.provider = Mock()
+        self.provider = _LocalAwareProvider()
         self.provider.is_embedding_enabled = Mock(return_value=True)
         self.provider.embed_model_name = Mock(return_value="test-model")
         self.provider.embed_texts = AsyncMock(side_effect=_dynamic_embed)
@@ -414,6 +825,60 @@ class _MemoryEngineBase:
         await self.engine.before_run(batch)
         await self.engine.run(batch)
         return batch
+
+
+class TestRagSchemaReady(_MemoryEngineBase):
+    async def test_concurrent_ensure_db_ready_migrates_once(self, monkeypatch):
+        """迁移中途的并发调用必须等待同一次初始化，不能重复迁移或提交。"""
+        from briefdesk.plugins.rag import db as rag_db
+        from briefdesk.plugins.rag import engine as rag_engine
+
+        migration_entered = asyncio.Event()
+        release_migration = asyncio.Event()
+        second_factory_entered = asyncio.Event()
+        factory_calls = 0
+        real_migrate = rag_db._migrate_sender_id
+        ensure_schema = AsyncMock(wraps=rag_engine.ensure_rag_schema)
+        ensure_fts = AsyncMock(wraps=rag_engine.ensure_fts)
+
+        async def counted_factory():
+            nonlocal factory_calls
+            factory_calls += 1
+            if factory_calls == 2:
+                second_factory_entered.set()
+            return self.db
+
+        async def paused_migration(db):
+            migration_entered.set()
+            await release_migration.wait()
+            await real_migrate(db)
+
+        monkeypatch.setattr(self.engine, "_db_factory", counted_factory)
+        monkeypatch.setattr(rag_db, "_migrate_sender_id", paused_migration)
+        monkeypatch.setattr(rag_engine, "ensure_rag_schema", ensure_schema)
+        monkeypatch.setattr(rag_engine, "ensure_fts", ensure_fts)
+        tasks = []
+        try:
+            tasks.append(asyncio.create_task(self.engine._ensure_db_ready()))
+            await asyncio.wait_for(migration_entered.wait(), timeout=5)
+            tasks.append(asyncio.create_task(self.engine._ensure_db_ready()))
+            await asyncio.wait_for(second_factory_entered.wait(), timeout=5)
+            assert ensure_schema.await_count == 1
+            assert not tasks[1].done()
+            release_migration.set()
+            results = await asyncio.wait_for(asyncio.gather(*tasks), timeout=5)
+            assert results == [self.db, self.db]
+            assert ensure_schema.await_count == 1
+            assert ensure_fts.await_count == 1
+            assert self.engine._schema_ready
+            assert await self.engine._ensure_db_ready() is self.db
+            assert ensure_schema.await_count == 1
+        finally:
+            release_migration.set()
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
 
 
 class TestRagIndex(_MemoryEngineBase):
@@ -538,6 +1003,50 @@ class TestRagBackfill(_MemoryEngineBase):
         finally:
             await cursor.close()
         return out
+
+    @pytest.mark.parametrize("realtime_sender_id", ["", "u-new"])
+    async def test_backfill_only_fills_identity_after_realtime_reindex(
+        self, realtime_sender_id
+    ):
+        """嵌入等待期间的实时身份优先，回填只能填空，不能把新身份换回旧快照。"""
+        from briefdesk.plugins.rag.config import RagSettings as RS
+        from briefdesk.plugins.rag.db import fetch_one
+
+        self.engine.settings = RS(backfill_days=-1)
+        await self._seed("m1", 1)
+        embedding_entered = asyncio.Event()
+        release_embedding = asyncio.Event()
+
+        async def paused_embedding(texts):
+            if not embedding_entered.is_set():
+                embedding_entered.set()
+                await release_embedding.wait()
+            return _dynamic_embed(texts)
+
+        self.provider.embed_texts = AsyncMock(side_effect=paused_embedding)
+        task = asyncio.create_task(self.engine.backfill_step(self.now))
+        try:
+            await asyncio.wait_for(embedding_entered.wait(), timeout=10)
+            assert embedding_entered.is_set()
+            msg = _msg("m1", "历史消息m1")
+            msg.sender_id = realtime_sender_id
+            await self._index([msg])
+            row = await fetch_one(
+                self.db, "SELECT sender_id FROM rag_chunks WHERE msg_id='m1'"
+            )
+            assert row["sender_id"] == realtime_sender_id
+            release_embedding.set()
+            assert await asyncio.wait_for(task, timeout=10) == 1
+        finally:
+            release_embedding.set()
+            if not task.done():
+                task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+        row = await fetch_one(
+            self.db, "SELECT sender_id FROM rag_chunks WHERE msg_id='m1'"
+        )
+        assert row["sender_id"] == (realtime_sender_id or "u1")
 
     async def test_scope_excludes_disabled_session_at_backfill(self):
         """回填侧作用域（隐私边界）：停用会话的历史消息不得进索引。
@@ -740,6 +1249,46 @@ class TestRagBackfill(_MemoryEngineBase):
         counts = await self._embed_count_by_model()
         assert counts.get("model-b") == 2
 
+    async def test_backfill_preserves_ocr_item_and_watermark(self):
+        """回填补身份字段时不得动到 OCR 文本、卡片引用与检索水位/窗口。
+
+        失败模式：回填重建 ChunkRow 时顺手用 raw 原文/空 item_id 覆盖，会把 OCR
+        文本与「消息→卡片」引用永久抹掉；把 sender_id 一并重置则让下一次假名化
+        退化为按会话+显示名猜测。水位与窗口是增量消费的游标，回填只该推进自己的
+        预算，不该改动它们。
+        """
+        from briefdesk.plugins.rag.config import RagSettings as RS
+
+        await self._seed("m1", 1, content="通知正文")  # raw 行带 sender_id u1
+        await self._seed("old", 30, content="窗口外的旧消息")
+        msg = _msg("m1", "通知正文\n[OCR]\n海报文字")
+        msg.sender_id = ""
+        await self._index([msg], [(msg, "i1")])  # 运行期：OCR 文本 + 卡片引用
+        cursor = await self.db.execute(
+            "SELECT sender_id FROM rag_chunks WHERE msg_id='m1'"
+        )
+        try:
+            assert (await cursor.fetchone())["sender_id"] == ""
+        finally:
+            await cursor.close()
+        self.provider.embed_model_name = Mock(return_value="model-b")
+        self.engine.settings = RS(backfill_days=7)  # 窗口只含 m1
+        self.engine._vec_watermark = "keep-watermark"
+
+        assert await self.engine.backfill_step(self.now) == 1
+        cursor = await self.db.execute(
+            "SELECT content, item_id, sender_id FROM rag_chunks WHERE msg_id='m1'"
+        )
+        try:
+            row = dict(await cursor.fetchone())
+        finally:
+            await cursor.close()
+        assert "[OCR]" in row["content"], "回填不得以原文覆盖 OCR 增强文本"
+        assert row["item_id"] == "i1", "回填的空 item_id 不得清掉卡片引用"
+        assert row["sender_id"] == "u1", "回填须从事实源补上身份字段"
+        assert await self._chunk_ids() == ["m1"], "窗口外的行不得被本轮选中"
+        assert self.engine._vec_watermark == "keep-watermark"
+
 
 class TestRagRetrieve(_MemoryEngineBase):
     """混合检索：RRF 融合、会话白名单、拒答门。"""
@@ -827,7 +1376,10 @@ class TestRagAsk(_MemoryEngineBase):
     VECTORS = TestRagRetrieve.VECTORS
 
     @pytest.fixture(autouse=True)
-    async def _sub_setup(self):
+    async def _sub_setup(self, monkeypatch: pytest.MonkeyPatch):
+        from briefdesk.config import config
+
+        monkeypatch.setattr(config, "ai_pseudonymize_names", "auto")
         self.provider.chat = AsyncMock(
             return_value=_chat_response("活动在周六6点举行 [1]。")
         )
@@ -942,6 +1494,271 @@ class TestRagAsk(_MemoryEngineBase):
         result = await self.engine.ask("周六6点开会有通知")
         assert [c["msg_id"] for c in result.citations] == ["m1"]
 
+    @staticmethod
+    def _evidence_block(prompt_messages: list[dict]) -> str:
+        """取 prompt 里的证据块（展示名是否化名只看这一段）。"""
+
+        return prompt_messages[1]["content"].split("证据：\n")[1]
+
+    async def test_undeclared_provider_pseudonymizes_local_dispatch(self, monkeypatch):
+        """供应商不声明目的地时本地端点也要化名：它可能把请求改路由到远端。
+
+        失败模式：RAG 只看 dispatch 的 URL 判本地，第三方供应商却发往别处，
+        证据行的真名原样出境。断言落在真实证据名上，而不是只比一个布尔。
+        """
+        from unittest.mock import Mock
+
+        from briefdesk import ai_ports
+        from briefdesk.config import config
+        from briefdesk.plugins.rag import engine as rag_engine
+        from briefdesk.plugins.rag.db import ChunkRow
+
+        monkeypatch.setattr(config, "ai_api_base", "http://127.0.0.1:11434/v1")
+        monkeypatch.setattr(config, "ai_pseudonymize_names", "auto")
+        ai_ports.set_ai(Mock())  # 类上没有 effective_remote：按远端处理
+        chunk = ChunkRow(
+            source="weflow-legacy", msg_id="undeclared-one", session_id="s1",
+            group_name="测试群", sender_name="小明", sender_id="u-undeclared",
+            msg_time=1700000000, content="虚构活动安排", item_id="",
+        )
+        try:
+            dispatch = ai_ports.resolve_rag_dispatch(
+                model="", api_base="", api_key=""
+            )
+            ctx = rag_engine.RagEngine._name_context(dispatch)
+            assert ctx.enabled
+            names = await rag_engine.RagEngine._prepare_evidence_names(
+                ctx, [rag_engine.Hit(chunk=chunk, cos=0.9, rrf=1.0, has_fts=True)]
+            )
+        finally:
+            ai_ports.set_ai(self.provider)
+        assert names[0].sender != "小明"
+        assert re.fullmatch(r"同学[A-Z2-7]{6}", names[0].sender), names[0].sender
+
+    async def test_evidence_pseudonymized_for_remote_endpoint(self, monkeypatch):
+        """远端主端点 + auto：证据行的人名/群名换成化名形态，原显示名不出境。"""
+        from briefdesk.config import config
+
+        monkeypatch.setattr(config, "ai_api_base", "https://api.deepseek.com")
+        await self.engine.ask("周六6点开会有通知")
+        evidence = self._evidence_block(self.provider.chat.call_args.args[0])
+        assert "小明" not in evidence
+        assert "测试群" not in evidence
+        assert re.search(r"同学[A-Z2-7]{6}", evidence)
+        assert re.search(r"群[A-Z2-7]{6}", evidence)
+
+    async def test_evidence_names_kept_for_local_endpoint(self, monkeypatch):
+        """本地端点 + auto：不改写输入——本地进程不出境，改名只会让输入漂移。"""
+        from briefdesk.config import config
+
+        monkeypatch.setattr(config, "ai_api_base", "http://127.0.0.1:11434/v1")
+        await self.engine.ask("周六6点开会有通知")
+        evidence = self._evidence_block(self.provider.chat.call_args.args[0])
+        assert "小明" in evidence
+        assert "测试群" in evidence
+        assert not re.search(r"同学[A-Z2-7]{6}", evidence)
+        assert not re.search(r"群[A-Z2-7]{6}", evidence)
+
+    @pytest.mark.parametrize(
+        ("mode", "api_base", "drop_history"),
+        [
+            pytest.param("auto", "https://remote.invalid/v1", True, id="remote-auto"),
+            pytest.param("off", "https://remote.invalid/v1", False, id="remote-off"),
+            pytest.param(
+                "auto", "http://127.0.0.1:11434/v1", False, id="local-auto"
+            ),
+            pytest.param("on", "http://127.0.0.1:11434/v1", True, id="local-on"),
+        ],
+    )
+    async def test_restored_history_round_trip_respects_pseudonymization(
+        self, tmp_path, monkeypatch, mode, api_base, drop_history
+    ):
+        """历史中的虚构姓名已离开第二轮证据，局部替换会让还原结果再次出境。
+
+        字面历史块独立约束顺序，避免复用生产 builder 让历史颠倒同时污染实际值与期望值。
+        """
+        import json
+        from datetime import datetime
+
+        from briefdesk import pseudonym, telemetry
+        from briefdesk.config import config
+        from briefdesk.plugins.rag import engine as rag_engine
+        from briefdesk.plugins.rag.db import ChunkRow
+        from briefdesk.plugins.rag.prompts import EvidenceNames, build_answer_prompt
+
+        monkeypatch.setattr(config, "ai_pseudonymize_names", mode)
+        monkeypatch.setattr(config, "ai_api_base", api_base)
+        pseudonymizer = pseudonym.Pseudonymizer(
+            tmp_path / "pseudonym", flush_window=0.0
+        )
+        monkeypatch.setattr(pseudonym, "get_pseudonymizer", lambda: pseudonymizer)
+        now = datetime(2026, 1, 1, 12, 0, tzinfo=UTC)
+        clock = Mock(wraps=datetime)
+        clock.now.return_value = now
+        monkeypatch.setattr(rag_engine, "datetime", clock)
+        chunks = [
+            ChunkRow(
+                source="weflow-legacy", msg_id="round-one", session_id="s1",
+                group_name="虚构活动群", sender_name="张三", sender_id="fictional-one",
+                msg_time=1700000000, content="虚构活动安排", item_id="",
+            ),
+            ChunkRow(
+                source="weflow-legacy", msg_id="round-two", session_id="s1",
+                group_name="虚构活动群", sender_name="虚构成员乙",
+                sender_id="fictional-two", msg_time=1700000001,
+                content="虚构活动补充安排", item_id="",
+            ),
+        ]
+        hits = [
+            [rag_engine.Hit(chunk=chunk, cos=0.9, rrf=1.0, has_fts=True)]
+            for chunk in chunks
+        ]
+        monkeypatch.setattr(self.engine, "retrieve", AsyncMock(side_effect=hits))
+        prompts = []
+
+        async def answer(messages, **kwargs):
+            prompts.append(messages)
+            if drop_history:
+                alias = re.search(r"同学[A-Z2-7]{6}", messages[1]["content"])
+                assert alias is not None
+                sender = alias.group(0)
+            else:
+                sender = chunks[len(prompts) - 1].sender_name
+            return _chat_response(json.dumps(
+                {"answer": f"{sender}安排活动 [1]。", "citations": [1]},
+                ensure_ascii=False,
+            ))
+
+        self.provider.chat = AsyncMock(side_effect=answer)
+        question = "虚构活动如何安排？"
+        first = await self.engine.ask(question)
+        assert first.answer == "张三安排活动 [1]。"
+        history = [
+            {"role": "user", "content": question},
+            {"role": "assistant", "content": first.answer},
+        ]
+        history_before = [dict(message) for message in history]
+        second = await self.engine.ask(question, history=history)
+        assert second.answer == "虚构成员乙安排活动 [1]。"
+        assert len(prompts) == 2
+        assert history == history_before
+        full_prompt = "\n".join(message["content"] for message in prompts[1])
+        counters = telemetry.snapshot()["counters"]
+        if drop_history:
+            assert "张三" not in "\n".join(
+                message["content"] for message in prompts[0]
+            )
+            assert "张三" not in full_prompt
+            assert "对话历史：" not in full_prompt
+            assert counters["rag.history_dropped|"] == 1
+        else:
+            expected = build_answer_prompt(
+                now.astimezone(), question, hits[1], history,
+                self.engine.settings.evidence_chars,
+                names=[EvidenceNames(
+                    group=chunks[1].group_name, sender=chunks[1].sender_name
+                )],
+            )
+            assert json.dumps(prompts[1], ensure_ascii=False).encode("utf-8") == (
+                json.dumps(expected, ensure_ascii=False).encode("utf-8")
+            )
+            assert first.answer in full_prompt
+            assert (
+                f"对话历史：\nuser: {question}\nassistant: {first.answer}\n\n"
+                in full_prompt
+            )
+            assert counters.get("rag.history_dropped|", 0) == 0
+
+    async def test_rag_fallback_pseudonymizes_for_actual_main_endpoint(
+        self, monkeypatch
+    ):
+        """旧供应商丢弃 RAG override：按**实际主端点**判远端，仍须假名化。
+
+        失败模式：拿本插件的 override（本地）判成本地 → 请求被 ai_ports 回退到
+        chat 后打到远端主端点，姓名原样出境且没有任何报错。这里用「本地 RAG
+        override + 旧供应商 + 远端主端点」钉住「计划驱动」这一点。
+        """
+        from briefdesk.config import config
+        from briefdesk.plugins.rag.config import RagSettings as RS
+
+        monkeypatch.setattr(config, "ai_api_base", "https://api.deepseek.com")
+        self.engine.settings = RS(
+            model="qwen-plus", api_base="http://127.0.0.1:11434/v1"
+        )
+        await self.engine.ask("周六6点开会有通知")
+        # 前置：旧供应商没有专用通道，实际发送走 chat（override 被丢弃）
+        self.provider.chat.assert_awaited()
+        evidence = self._evidence_block(self.provider.chat.call_args.args[0])
+        assert "小明" not in evidence
+        assert re.search(r"同学[A-Z2-7]{6}", evidence)
+
+    async def test_answer_restore_preserves_citations_and_plain_output(self, monkeypatch):
+        """入库前按请求内逆映射还原答案；引用编号与 source/msg_id 原样保留。
+
+        JSON 契约与纯文本两种形态都在解析之后还原：要还原的是给人看的文字，
+        编号不是身份。引用元数据（sender_name/source/msg_id）来自库里的原始行，
+        不因出站化名而改变。主端点显式钉成远端：宿主 shell 里可能配着本地 ollama，
+        不钉就会静默跑到「auto 不启用」那条分支上，用例变成什么都没验证。
+        """
+        from briefdesk.config import config
+
+        monkeypatch.setattr(config, "ai_api_base", "https://api.deepseek.com")
+        await self.engine.ask("周六6点开会有通知")  # 先取到这次请求用过的化名
+        evidence = self._evidence_block(self.provider.chat.call_args.args[0])
+        matched = re.search(r"同学[A-Z2-7]{6}", evidence)
+        assert matched is not None, evidence
+        alias = matched.group(0)
+
+        # 纯文本形态（模型没走 JSON 契约）
+        self.provider.chat = AsyncMock(
+            return_value=_chat_response(f"{alias}说活动在周六6点举行 [1]。")
+        )
+        result = await self.engine.ask("周六6点开会有通知")
+        assert result.answer == "小明说活动在周六6点举行 [1]。"
+        assert [c["msg_id"] for c in result.citations] == ["m1"]
+
+        # JSON 契约形态
+        self.provider.chat = AsyncMock(
+            return_value=_chat_response(
+                f'{{"answer": "{alias}通知活动在周六6点 [1]。", "citations": [1]}}'
+            )
+        )
+        result = await self.engine.ask("周六6点开会有通知")
+        assert result.answer == "小明通知活动在周六6点 [1]。"
+        assert result.citations[0]["n"] == 1
+        assert result.citations[0]["sender_name"] == "小明"  # 引用元数据仍是真名
+        assert alias not in result.answer
+
+    async def test_prepare_failure_skips_answer_request(self, monkeypatch):
+        """假名化准备失败：这次回答的 create 不发生，查询嵌入的计数照旧留下。
+
+        失败模式：准备失败后「退回真名照样发」——那会把一次可观测的失败升级成
+        静默泄露；反过来把整次 ask 记成零也不对，查询嵌入已经真的发生过，那是
+        另一个端口，无法随本次失败回滚。错误必须上抛（不吞、不重试明文）。
+        """
+        from briefdesk import pseudonym, telemetry
+        from briefdesk.config import config
+
+        monkeypatch.setattr(config, "ai_api_base", "https://api.deepseek.com")
+
+        class _BrokenPseudonymizer:
+            async def alias_for(self, kind, identity_key, display_name):
+                raise pseudonym.PseudonymError("注册表不可用")
+
+        monkeypatch.setattr(
+            pseudonym, "get_pseudonymizer", lambda: _BrokenPseudonymizer()
+        )
+        query = "周六6点开会有通知"
+        self.provider.embed_texts.reset_mock()
+        with pytest.raises(pseudonym.PseudonymError):
+            await self.engine.ask(query)
+        self.provider.chat.assert_not_awaited()  # 对应回答的 create 没发生
+        self.provider.embed_texts.assert_awaited_once_with([query])
+        counters = telemetry.snapshot()["counters"]
+        # 并发准备下人与群各走一次 alias_for，按准备次数计：1 个群 + 1 个人 = 2
+        assert counters["ai.pseudonym.prepare_failed|"] == 2
+        assert counters["rag.answer_error|"] == 1
+
 
     async def test_telemetry_identity_across_terminal_buckets(self):
         """五桶恒等式：ask = refused + answered + retrieve_error + answer_error + cancelled。
@@ -1031,8 +1848,16 @@ class TestRagAsk(_MemoryEngineBase):
         assert "独特结尾句" not in ev
 
 
-class TestPromptFlatten(unittest.TestCase):
+class TestPromptFlatten:
     """证据块压平换行：多行原文无法伪造新的「[n] 发送者:」证据行。"""
+
+    @staticmethod
+    def _names(group: str = "测试群", sender: str = "小明") -> list:
+        """单条证据的展示名（prompt 构造只消费调用方准备好的值）。"""
+
+        from briefdesk.plugins.rag.prompts import EvidenceNames
+
+        return [EvidenceNames(group=group, sender=sender)]
 
     def test_multiline_content_flattened(self):
         from datetime import datetime
@@ -1049,22 +1874,30 @@ class TestPromptFlatten(unittest.TestCase):
         messages = build_answer_prompt(
             datetime(2026, 1, 1, 12, 0, tzinfo=UTC), "问题？",
             [Hit(chunk=chunk, cos=1.0, rrf=1.0, has_fts=False)],
+            names=self._names(),
         )
         user = messages[1]["content"]
         evidence_line = user.split("证据：\n")[1]
         assert "\n" not in evidence_line  # 单条证据恒为单行
 
-    def test_evidence_sender_and_group_names_masked_in_prompt(self):
-        """RAG 证据行的昵称/群名不得携带明文 PII（构造层已统一脱敏）。
+    async def test_evidence_sender_and_group_names_masked_in_prompt(self, tmp_path):
+        """RAG 证据行的昵称/群名不得携带明文 PII；远端换化名，本地端点不变。
 
-        合成消息走 InternalMessage 构造（生产同源），随后按入库形态
-        ChunkRow 喂给 prompt 构造——验证掩码确实随数据进入 AI 边界。
+        合成消息走 InternalMessage 构造（生产同源），随后按入库形态 ChunkRow 喂给
+        prompt 构造——验证掩码与假名化确实随数据进入 AI 边界。本地端点保持原样
+        是策略的一部分：本地进程不出境，改写只会让输入无谓漂移；判定本身由
+        `pseudonymize_enabled(mode, remote_endpoint=...)` 单源给出。
         """
         from datetime import datetime
 
         from briefdesk.plugins.rag.db import ChunkRow
         from briefdesk.plugins.rag.engine import Hit
-        from briefdesk.plugins.rag.prompts import build_answer_prompt
+        from briefdesk.plugins.rag.prompts import EvidenceNames, build_answer_prompt
+        from briefdesk.pseudonym import (
+            NameContext,
+            Pseudonymizer,
+            pseudonymize_enabled,
+        )
         from briefdesk.types import InternalMessage
 
         msg = InternalMessage(
@@ -1079,16 +1912,49 @@ class TestPromptFlatten(unittest.TestCase):
         chunk = ChunkRow(
             source="weflow-legacy", msg_id=msg.msg_id, session_id=msg.session_id,
             group_name=msg.group_name, sender_name=msg.sender_name,
-            msg_time=msg.timestamp, content=msg.content,
+            msg_time=msg.timestamp, content=msg.content, sender_id=msg.sender_id,
         )
-        messages = build_answer_prompt(
-            datetime(2026, 1, 1, 12, 0, tzinfo=UTC), "问题？",
-            [Hit(chunk=chunk, cos=1.0, rrf=1.0, has_fts=False)],
-        )
-        user = messages[1]["content"]
-        assert "sender-review@example.invalid" not in user
-        assert "group-review@example.invalid" not in user
-        assert "[EMAIL]" in user
+        hit = Hit(chunk=chunk, cos=1.0, rrf=1.0, has_fts=False)
+
+        async def _prompt(*, remote: bool) -> str:
+            context = NameContext(
+                Pseudonymizer(tmp_path / ("remote" if remote else "local")),
+                enabled=pseudonymize_enabled("auto", remote_endpoint=remote),
+            )
+            names = [
+                EvidenceNames(
+                    group=await context.group_alias(
+                        source=chunk.source,
+                        session_id=chunk.session_id,
+                        group_name=chunk.group_name,
+                    ),
+                    sender=await context.person_alias(
+                        source=chunk.source,
+                        sender_id=chunk.sender_id,
+                        session_id=chunk.session_id,
+                        display_name=chunk.sender_name,
+                    ),
+                )
+            ]
+            messages = build_answer_prompt(
+                datetime(2026, 1, 1, 12, 0, tzinfo=UTC), "问题？", [hit], names=names,
+            )
+            return messages[1]["content"]
+
+        remote_user = await _prompt(remote=True)
+        local_user = await _prompt(remote=False)
+
+        for user in (remote_user, local_user):
+            assert "sender-review@example.invalid" not in user
+            assert "group-review@example.invalid" not in user
+        # 远端 auto：展示名换成化名形态，连掩码后的原显示名也不再出现
+        assert re.search(r"同学[A-Z2-7]{6}", remote_user)
+        assert re.search(r"群[A-Z2-7]{6}", remote_user)
+        assert "[EMAIL]" not in remote_user
+        # 本地端点：不生成化名，展示名保持既有掩码形态
+        assert "[EMAIL]" in local_user
+        assert "同学" not in local_user
+        assert not re.search(r"群[A-Z2-7]{6}", local_user)
 
     def test_history_included_in_prompt_within_cap(self):
         from datetime import datetime
@@ -1108,6 +1974,7 @@ class TestPromptFlatten(unittest.TestCase):
                 {"role": "user", "content": "xx活动周六吗"},
                 {"role": "assistant", "content": "周六6点 [1]。"},
             ],
+            names=self._names(),
         )
         user = messages[1]["content"]
         assert "对话历史：" in user
@@ -1115,20 +1982,25 @@ class TestPromptFlatten(unittest.TestCase):
         assert "周六6点 [1]。" in user
 
     def test_history_trimmed_over_cap(self):
-        # 长历史裁剪——只保留最近 6 轮，并标注省略条数
+        # 长历史裁剪——只保留最近 6 轮、每条最多 200 字符，并标注省略条数。
+        # 单条上限单独断言：只验条数时，「整段历史不截断」的实现照样通过。
         from datetime import UTC, datetime
 
         from briefdesk.plugins.rag.prompts import build_answer_prompt
 
         history = [{"role": "user", "content": f"第{i}轮的历史消息内容"}
                    for i in range(10)]
+        history.append({"role": "user", "content": "长" * 260})
         messages = build_answer_prompt(
             datetime(2026, 1, 1, 12, 0, tzinfo=UTC), "问题？", [], history,
+            names=[],
         )
         user = messages[1]["content"]
-        assert "更早的 4 条对话已省略" in user
+        assert "更早的 5 条对话已省略" in user
         assert "第0轮" not in user
         assert "第9轮" in user
+        assert "长" * 200 in user
+        assert "长" * 201 not in user
 
 
     def test_evidence_truncated_over_cap(self):
@@ -1146,6 +2018,7 @@ class TestPromptFlatten(unittest.TestCase):
         messages = build_answer_prompt(
             datetime(2026, 1, 1, 12, 0, tzinfo=UTC), "问题？",
             [Hit(chunk=chunk, cos=1.0, rrf=1.0, has_fts=False)],
+            names=self._names(),
         )
         ev = messages[1]["content"].split("证据：\n")[1]
         assert ev.endswith("…")
@@ -1167,6 +2040,7 @@ class TestPromptFlatten(unittest.TestCase):
         messages = build_answer_prompt(
             datetime(2026, 1, 1, 12, 0, tzinfo=UTC), "问题？",
             [Hit(chunk=chunk, cos=1.0, rrf=1.0, has_fts=False)],
+            names=self._names(),
         )
         ev = messages[1]["content"].split("证据：\n")[1]
         assert "…" not in ev
@@ -1411,6 +2285,1632 @@ class TestRagWarmVectorsForceFull(_MemoryEngineBase):
         await self.engine.warm_vectors(force_full=True)
         assert ("weflow-legacy", "m1") not in self.engine._vec_entries, "force_full 后已删向量 key 必须从内存缓存剔除"
         assert len(self.engine._matrix_keys) == 0, "矩阵须同步清空"
+
+    @pytest.mark.parametrize(
+        "refresh_in_flight", [False, True], ids=["idle", "refresh-in-flight"]
+    )
+    async def test_cached_identity_update_without_embedding_refreshes_retrieval(
+        self, monkeypatch, refresh_in_flight
+    ):
+        """旧水位前的身份更新必须重读；并发刷新不得吞掉更新的脏标志。"""
+        from dataclasses import replace
+
+        from briefdesk.plugins.rag import engine as rag_engine
+        from briefdesk.plugins.rag.db import (
+            ChunkRow,
+            fetch_all,
+            fetch_one,
+            upsert_chunks,
+            upsert_embeddings,
+        )
+
+        await self.engine._ensure_db_ready()
+        self.engine._fts_enabled = False
+        first = ChunkRow(
+            source="weflow-legacy", msg_id="older", session_id="s1",
+            group_name="旧群", sender_name="旧成员", sender_id="old-identity",
+            msg_time=1700000000, content="虚构活动安排", item_id="",
+        )
+        second = replace(first, msg_id="newer", sender_id="other-identity")
+        await upsert_chunks(self.db, [first, second])
+        key = (first.source, first.msg_id)
+        await upsert_embeddings(self.db, [key], [[1.0, 0.0]], "test-model", "t1")
+        await upsert_embeddings(
+            self.db, [(second.source, second.msg_id)], [[0.0, 1.0]],
+            "test-model", "t2",
+        )
+        await self.engine.warm_vectors()
+        assert self.engine._vec_watermark == "t2"
+        assert self.engine._vec_entries[key][0].sender_id == first.sender_id
+        embeddings_before = await fetch_all(
+            self.db, "SELECT * FROM rag_chunk_embeddings ORDER BY msg_id"
+        )
+        updated = replace(
+            first, sender_id="new-identity", sender_name="新成员", group_name="新群"
+        )
+        if refresh_in_flight:
+            snapshot_read = asyncio.Event()
+            release_refresh = asyncio.Event()
+            metadata_written = asyncio.Event()
+            real_fetch = rag_engine.fetch_new_embeddings
+            real_upsert = rag_engine.upsert_chunks
+
+            async def paused_fetch(*args, **kwargs):
+                result = await real_fetch(*args, **kwargs)
+                snapshot_read.set()
+                await release_refresh.wait()
+                return result
+
+            async def observed_upsert(db, rows, **kwargs):
+                await real_upsert(db, rows, **kwargs)
+                metadata_written.set()
+
+            monkeypatch.setattr(rag_engine, "fetch_new_embeddings", paused_fetch)
+            monkeypatch.setattr(rag_engine, "upsert_chunks", observed_upsert)
+            tasks = []
+            try:
+                tasks.append(asyncio.create_task(
+                    self.engine.warm_vectors(force_full=True)
+                ))
+                await asyncio.wait_for(snapshot_read.wait(), timeout=5)
+                tasks.append(asyncio.create_task(self.engine._persist_chunks(
+                    self.db, [updated], [], [], "test-model"
+                )))
+                await asyncio.wait_for(metadata_written.wait(), timeout=5)
+                release_refresh.set()
+                results = await asyncio.wait_for(asyncio.gather(*tasks), timeout=5)
+                assert results[1] is False
+            finally:
+                release_refresh.set()
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+        else:
+            assert not await self.engine._persist_chunks(
+                self.db, [updated], [], [], "test-model"
+            )
+        row = await fetch_one(
+            self.db, "SELECT * FROM rag_chunks WHERE source = ? AND msg_id = ?", key
+        )
+        assert row["sender_id"] == updated.sender_id
+        assert row["sender_name"] == updated.sender_name
+        assert row["group_name"] == updated.group_name
+        assert await fetch_all(
+            self.db, "SELECT * FROM rag_chunk_embeddings ORDER BY msg_id"
+        ) == embeddings_before
+        assert self.engine._vec_cache_dirty
+        hits = await self.engine.retrieve("虚构活动")
+        assert hits and hits[0].chunk == updated
+        assert self.engine._vec_entries[key][0] == updated
+        matrix_index = self.engine._matrix_keys.index(key)
+        assert self.engine._matrix_chunks[matrix_index] == updated
+        assert self.engine._matrix[matrix_index].tolist() == [1.0, 0.0]
+        assert self.engine._vec_watermark == "t2"
+        assert not self.engine._vec_cache_dirty
+
+
+    async def test_dimension_decision_ignores_previous_watermark_after_model_switch(self):
+        from briefdesk.plugins.rag.db import (
+            ChunkRow,
+            fetch_all,
+            upsert_chunks,
+            upsert_embeddings,
+        )
+
+        await self.engine._ensure_db_ready()
+        first = ChunkRow(
+            source="weflow-legacy", msg_id="target-older-one", session_id="s1",
+            group_name="虚构群", sender_name="虚构成员", sender_id="fictional-identity",
+            msg_time=1700000000, content="虚构维度测试", item_id="",
+        )
+        second = replace(first, msg_id="target-older-two")
+        dirty = replace(first, msg_id="target-newer-bad")
+        good_keys = [(chunk.source, chunk.msg_id) for chunk in (first, second)]
+        dirty_key = (dirty.source, dirty.msg_id)
+        await upsert_chunks(self.db, [first, second, dirty])
+        await upsert_embeddings(
+            self.db, [dirty_key], [[1.0, 0.0]], "test-model", "t2"
+        )
+        await asyncio.wait_for(self.engine.warm_vectors(), timeout=5)
+        assert self.engine._vec_watermark == "t2"
+        await upsert_embeddings(
+            self.db, good_keys, [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+            "next-model", "t1",
+        )
+        await upsert_embeddings(
+            self.db, [dirty_key], [[1.0, 0.0]], "next-model", "t3"
+        )
+        self.provider.embed_model_name.return_value = "next-model"
+        assert self.engine._vec_model != self.provider.embed_model_name()
+
+        await asyncio.wait_for(self.engine.warm_vectors(force_full=True), timeout=5)
+        rows = await fetch_all(
+            self.db, "SELECT source, msg_id FROM rag_chunk_embeddings"
+        )
+        assert {(row["source"], row["msg_id"]) for row in rows} == set(good_keys)
+        assert set(self.engine._vec_entries) == set(good_keys)
+        assert set(self.engine._matrix_keys) == set(good_keys)
+        assert self.engine._matrix.shape == (2, 3)
+        assert {vector.shape[0] for _, vector in self.engine._vec_entries.values()} == {3}
+        for chunk in (first, second):
+            matrix_index = self.engine._matrix_keys.index((chunk.source, chunk.msg_id))
+            assert self.engine._matrix_chunks[matrix_index] == chunk
+
+
+class TestRagIdentityCacheInvalidation(_MemoryEngineBase):
+    @pytest.fixture(autouse=True)
+    async def _cached_identity(self, _autouse_setup):
+        from briefdesk.plugins.rag.db import ChunkRow, upsert_chunks, upsert_embeddings
+
+        await self.engine._ensure_db_ready()
+        self.engine._fts_enabled = False
+        self.first = ChunkRow(
+            source="weflow-legacy", msg_id="older", session_id="s1",
+            group_name="旧群", sender_name="旧成员", sender_id="old-identity",
+            msg_time=1700000000, content="虚构活动安排", item_id="",
+        )
+        self.second = replace(self.first, msg_id="newer", sender_id="other-identity")
+        self.key = (self.first.source, self.first.msg_id)
+        self.updated = replace(
+            self.first, sender_id="new-identity", sender_name="新成员", group_name="新群"
+        )
+        await upsert_chunks(self.db, [self.first, self.second])
+        await upsert_embeddings(self.db, [self.key], [[1.0, 0.0]], "test-model", "t1")
+        await upsert_embeddings(
+            self.db, [(self.second.source, self.second.msg_id)], [[0.0, 1.0]],
+            "test-model", "t2",
+        )
+        await asyncio.wait_for(self.engine.warm_vectors(), timeout=5)
+        assert self.engine._vec_watermark == "t2"
+        assert self.engine._vec_entries[self.key][0] == self.first
+        assert not self.engine._vec_cache_dirty
+
+    @pytest.fixture
+    async def _wal_connections(self, _cached_identity, tmp_path, monkeypatch):
+        database_path = tmp_path / "chunk-outcome.sqlite"
+        async with (
+            aiosqlite.connect(database_path) as reader,
+            aiosqlite.connect(database_path) as write_db,
+        ):
+            await self.db.backup(reader)
+            for connection in (reader, write_db):
+                connection.row_factory = aiosqlite.Row
+                cursor = await connection.execute("PRAGMA journal_mode = WAL")
+                assert (await cursor.fetchone())[0] == "wal"
+                await cursor.close()
+
+            async def factory():
+                return reader
+
+            monkeypatch.setattr(self.engine, "_db_factory", factory)
+            monkeypatch.setattr(self.engine, "_embed_factory", factory)
+            yield reader, write_db
+
+    async def test_bad_vector_evicted_from_cache_after_successful_delete(self):
+        from briefdesk.plugins.rag.db import (
+            fetch_all,
+            fetch_one,
+            upsert_chunks,
+            upsert_embeddings,
+        )
+
+        second_key = (self.second.source, self.second.msg_id)
+        second_entry_before = self.engine._vec_entries[second_key]
+        cursor = await self.db.execute(
+            "UPDATE rag_chunk_embeddings SET embedding = ? WHERE source = ? AND msg_id = ?",
+            ("not-json", *self.key),
+        )
+        await cursor.close()
+        await self.db.commit()
+
+        await asyncio.wait_for(self.engine.warm_vectors(force_full=True), timeout=5)
+        assert self.key not in self.engine._vec_entries
+        assert self.engine._matrix_keys == [second_key]
+        assert self.engine._matrix_chunks == [self.second]
+        assert self.engine._vec_entries[second_key][0] == second_entry_before[0]
+        assert self.engine._vec_entries[second_key][1].tolist() == second_entry_before[1].tolist()
+        assert self.engine._matrix.tolist() == [second_entry_before[1].tolist()]
+        assert await fetch_one(
+            self.db, "SELECT 1 FROM rag_chunk_embeddings WHERE source = ? AND msg_id = ?",
+            self.key,
+        ) is None
+
+        replacement = replace(self.first, msg_id="restore-row-count")
+        replacement_key = (replacement.source, replacement.msg_id)
+        await upsert_chunks(self.db, [replacement])
+        await upsert_embeddings(
+            self.db, [replacement_key], [[1.0, 0.0]], "test-model", "t3"
+        )
+        rows = await fetch_all(self.db, "SELECT source, msg_id FROM rag_chunk_embeddings")
+        assert len(rows) == self.engine._vec_count_seen
+        self.provider.embed_texts = AsyncMock(return_value=[[1.0, 1.0]])
+        hits = await asyncio.wait_for(self.engine.retrieve("虚构活动"), timeout=5)
+        assert hits is not None
+        assert {(hit.chunk.source, hit.chunk.msg_id) for hit in hits} == {
+            second_key, replacement_key,
+        }
+
+    @pytest.mark.parametrize("failure", ["error", "cancelled"])
+    async def test_bad_vector_delete_failure_keeps_cached_entry(self, monkeypatch, failure):
+        from briefdesk.plugins.rag import engine as rag_engine
+        from briefdesk.plugins.rag.db import fetch_one
+
+        cursor = await self.db.execute(
+            "UPDATE rag_chunk_embeddings SET embedding = ? WHERE source = ? AND msg_id = ?",
+            ("not-json", *self.key),
+        )
+        await cursor.close()
+        await self.db.commit()
+        entries_before = dict(self.engine._vec_entries)
+        matrix_before = self.engine._matrix
+        keys_before = list(self.engine._matrix_keys)
+        chunks_before = list(self.engine._matrix_chunks)
+        sessions_before = list(self.engine._matrix_sessions)
+        watermark_before = self.engine._vec_watermark
+        count_before = self.engine._vec_count_seen
+        deletion_entered = asyncio.Event()
+        release_deletion = asyncio.Event()
+
+        async def failed_delete(db, keys):
+            assert db is self.db
+            assert keys == [self.key]
+            deletion_entered.set()
+            await asyncio.wait_for(release_deletion.wait(), timeout=5)
+            raise RuntimeError("injected bad vector deletion failure")
+
+        with monkeypatch.context() as patcher:
+            patcher.setattr(self.engine, "_delete_bad_embeddings", failed_delete)
+            refresh = asyncio.create_task(self.engine.warm_vectors(force_full=True))
+            try:
+                await asyncio.wait_for(deletion_entered.wait(), timeout=5)
+                assert self.engine._vec_entries == entries_before
+                assert self.engine._matrix is matrix_before
+                if failure == "error":
+                    release_deletion.set()
+                    with pytest.raises(RuntimeError, match="injected bad vector deletion failure"):
+                        await asyncio.wait_for(refresh, timeout=5)
+                else:
+                    refresh.cancel()
+                    with pytest.raises(asyncio.CancelledError):
+                        await asyncio.wait_for(refresh, timeout=5)
+            finally:
+                release_deletion.set()
+                refresh.cancel()
+                await asyncio.wait_for(
+                    asyncio.gather(refresh, return_exceptions=True), timeout=5
+                )
+        assert self.engine._vec_entries == entries_before
+        assert self.engine._matrix is matrix_before
+        assert self.engine._matrix_keys == keys_before
+        assert self.engine._matrix_chunks == chunks_before
+        assert self.engine._matrix_sessions == sessions_before
+        assert self.engine._vec_watermark == watermark_before
+        assert self.engine._vec_count_seen == count_before
+        assert self.engine._vec_full_retry
+        fetch = AsyncMock(wraps=rag_engine.fetch_new_embeddings)
+        monkeypatch.setattr(rag_engine, "fetch_new_embeddings", fetch)
+        await asyncio.wait_for(self.engine.warm_vectors(), timeout=5)
+        fetch.assert_awaited_once()
+        assert fetch.await_args.args[2] == ""
+        second_key = (self.second.source, self.second.msg_id)
+        assert set(self.engine._vec_entries) == {second_key}
+        assert self.engine._vec_entries[second_key][0] == self.second
+        assert self.engine._vec_entries[second_key][1].tolist() == [0.0, 1.0]
+        assert self.engine._matrix_keys == [second_key]
+        assert self.engine._matrix_chunks == [self.second]
+        assert self.engine._matrix.tolist() == [[0.0, 1.0]]
+        assert not self.engine._vec_full_retry
+        assert await fetch_one(
+            self.db, "SELECT 1 FROM rag_chunk_embeddings WHERE source = ? AND msg_id = ?",
+            self.key,
+        ) is None
+
+    @pytest.mark.parametrize("force_full", [True, False], ids=["explicit-full", "dirty-full"])
+    @pytest.mark.parametrize("old_majority", [False, True], ids=["old-minority", "old-majority"])
+    async def test_identity_full_refresh_uses_pre_full_batch_dimension(
+        self, monkeypatch, force_full, old_majority
+    ):
+        """旧行占比不能左右漂移批的维度，否则删除新向量与回填会无限循环。"""
+        from briefdesk.plugins.rag import engine as rag_engine
+        from briefdesk.plugins.rag.db import fetch_all, upsert_chunks, upsert_embeddings
+
+        old_chunks = [self.first]
+        if old_majority:
+            old_chunks.extend(
+                replace(self.first, msg_id=f"older-{index}", sender_id=f"old-{index}")
+                for index in range(2)
+            )
+        old_keys = [(chunk.source, chunk.msg_id) for chunk in old_chunks]
+        await upsert_chunks(self.db, old_chunks)
+        await upsert_embeddings(
+            self.db, old_keys, [[1.0, 0.0]] * len(old_keys), "test-model", "t1"
+        )
+        await asyncio.wait_for(self.engine.warm_vectors(force_full=True), timeout=5)
+        assert self.engine._vec_watermark == "t2"
+        cursor = await self.db.executemany(
+            "INSERT INTO raw_messages(source,msg_id,session_id,group_name,"
+            "sender_id,sender_name,content,timestamp) VALUES(?,?,?,?,?,?,?,?)",
+            [
+                (chunk.source, chunk.msg_id, chunk.session_id, chunk.group_name,
+                 chunk.sender_id, chunk.sender_name, chunk.content, chunk.msg_time)
+                for chunk in old_chunks
+            ],
+        )
+        await cursor.close()
+        await self.db.commit()
+        changed = replace(self.second, sender_id="changed-identity", sender_name="新成员")
+        inserted = replace(self.second, msg_id="third", sender_id="third-identity")
+        new_chunks = [changed, inserted]
+        new_keys = [(chunk.source, chunk.msg_id) for chunk in new_chunks]
+        new_vectors = [[0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
+        if force_full:
+            await upsert_chunks(self.db, new_chunks)
+            assert not self.engine._vec_cache_dirty
+        else:
+            assert not await asyncio.wait_for(self.engine._persist_chunks(
+                self.db, new_chunks, [], [], "test-model"
+            ), timeout=5)
+            assert self.engine._vec_cache_dirty
+        await upsert_embeddings(self.db, new_keys, new_vectors, "test-model", "t2")
+        fetch = AsyncMock(wraps=rag_engine.fetch_new_embeddings)
+        delete = AsyncMock(wraps=self.engine._delete_bad_embeddings)
+        monkeypatch.setattr(rag_engine, "fetch_new_embeddings", fetch)
+        monkeypatch.setattr(self.engine, "_delete_bad_embeddings", delete)
+
+        await asyncio.wait_for(self.engine.warm_vectors(force_full=force_full), timeout=5)
+        fetch.assert_awaited_once()
+        assert fetch.await_args.args[2] == ""
+        delete.assert_awaited_once()
+        assert set(delete.await_args.args[1]) == set(old_keys)
+        assert set(self.engine._vec_entries) == set(new_keys)
+        assert set(self.engine._matrix_keys) == set(new_keys)
+        assert self.engine._matrix.shape == (2, 3)
+        for chunk, vector in zip(new_chunks, new_vectors, strict=True):
+            key = (chunk.source, chunk.msg_id)
+            assert self.engine._vec_entries[key][0] == chunk
+            assert self.engine._vec_entries[key][1].tolist() == vector
+            matrix_index = self.engine._matrix_keys.index(key)
+            assert self.engine._matrix_chunks[matrix_index] == chunk
+            assert self.engine._matrix[matrix_index].tolist() == vector
+        assert {
+            (row["source"], row["msg_id"]) for row in await fetch_all(
+                self.db, "SELECT source, msg_id FROM rag_chunk_embeddings"
+            )
+        } == set(new_keys)
+
+        self.engine.settings.backfill_days = -1
+        self.provider.embed_texts = AsyncMock(
+            side_effect=lambda texts: [[1.0, 0.0, 0.0]] * len(texts)
+        )
+        assert await asyncio.wait_for(
+            self.engine.backfill_step(self.first.msg_time + 1), timeout=5
+        ) == len(old_keys)
+        fetch.reset_mock()
+        await asyncio.wait_for(self.engine.warm_vectors(), timeout=5)
+        fetch.assert_awaited_once()
+        assert delete.await_count == 1
+        assert set(self.engine._vec_entries) == set(old_keys + new_keys)
+        assert set(self.engine._matrix_keys) == set(old_keys + new_keys)
+        assert self.engine._matrix.shape == (len(old_keys) + 2, 3)
+        assert {vector.shape[0] for _, vector in self.engine._vec_entries.values()} == {3}
+        assert not self.engine._vec_cache_dirty
+        assert not self.engine._vec_full_retry
+        assert await asyncio.wait_for(
+            self.engine.backfill_step(self.first.msg_time + 1), timeout=5
+        ) == 0
+        await asyncio.wait_for(self.engine.warm_vectors(), timeout=5)
+        assert delete.await_count == 1
+        assert self.engine._matrix.shape == (len(old_keys) + 2, 3)
+
+    async def test_full_refresh_installs_old_row_identity_outside_decision_batch(self):
+        """维度决策子批不含旧水位身份，全批安装才能避免身份更新永远漏读。"""
+        from briefdesk.plugins.rag.db import fetch_one
+
+        assert not await asyncio.wait_for(self.engine._persist_chunks(
+            self.db, [self.updated], [], [], "test-model"
+        ), timeout=5)
+        await asyncio.wait_for(self.engine.warm_vectors(), timeout=5)
+        assert self.engine._vec_entries[self.key][0] == self.updated
+        assert self.engine._vec_entries[self.key][1].tolist() == [1.0, 0.0]
+        matrix_index = self.engine._matrix_keys.index(self.key)
+        assert self.engine._matrix_chunks[matrix_index] == self.updated
+        assert self.engine._matrix[matrix_index].tolist() == [1.0, 0.0]
+        row = await fetch_one(
+            self.db, "SELECT created_at FROM rag_chunk_embeddings "
+            "WHERE source = ? AND msg_id = ?", self.key,
+        )
+        assert row["created_at"] == "t1"
+        assert self.engine._vec_watermark == "t2"
+        assert not self.engine._vec_cache_dirty
+
+    @pytest.mark.parametrize("failure", ["error", "cancelled"])
+    async def test_dimension_delete_failure_preserves_retry_basis(self, monkeypatch, failure):
+        """删旧维度行失败时必须保住缓存基准，否则重试会丢失维度漂移依据。"""
+        from briefdesk.plugins.rag import engine as rag_engine
+        from briefdesk.plugins.rag.db import upsert_embeddings
+
+        second_key = (self.second.source, self.second.msg_id)
+        await upsert_embeddings(
+            self.db, [second_key], [[0.0, 1.0, 0.0]], "test-model", "t3"
+        )
+        entries_before = dict(self.engine._vec_entries)
+        matrix_before = self.engine._matrix
+        keys_before = list(self.engine._matrix_keys)
+        chunks_before = list(self.engine._matrix_chunks)
+        sessions_before = list(self.engine._matrix_sessions)
+        watermark_before = self.engine._vec_watermark
+        count_before = self.engine._vec_count_seen
+        deletion_entered = asyncio.Event()
+        release_deletion = asyncio.Event()
+
+        async def failed_delete(db, keys):
+            assert db is self.db
+            assert keys == [self.key]
+            deletion_entered.set()
+            await asyncio.wait_for(release_deletion.wait(), timeout=5)
+            raise RuntimeError("injected dimension deletion failure")
+
+        with monkeypatch.context() as patcher:
+            patcher.setattr(self.engine, "_delete_bad_embeddings", failed_delete)
+            refresh = asyncio.create_task(self.engine.warm_vectors(force_full=True))
+            try:
+                await asyncio.wait_for(deletion_entered.wait(), timeout=5)
+                if failure == "error":
+                    release_deletion.set()
+                    with pytest.raises(RuntimeError, match="injected dimension deletion failure"):
+                        await asyncio.wait_for(refresh, timeout=5)
+                else:
+                    refresh.cancel()
+                    with pytest.raises(asyncio.CancelledError):
+                        await asyncio.wait_for(refresh, timeout=5)
+            finally:
+                release_deletion.set()
+                refresh.cancel()
+                await asyncio.wait_for(
+                    asyncio.gather(refresh, return_exceptions=True), timeout=5
+                )
+        assert self.engine._vec_entries == entries_before
+        assert self.engine._matrix is matrix_before
+        assert self.engine._matrix_keys == keys_before
+        assert self.engine._matrix_chunks == chunks_before
+        assert self.engine._matrix_sessions == sessions_before
+        assert self.engine._vec_watermark == watermark_before
+        assert self.engine._vec_count_seen == count_before
+        assert self.engine._vec_full_retry
+        fetch = AsyncMock(wraps=rag_engine.fetch_new_embeddings)
+        monkeypatch.setattr(rag_engine, "fetch_new_embeddings", fetch)
+        await asyncio.wait_for(self.engine.warm_vectors(), timeout=5)
+        fetch.assert_awaited_once()
+        assert fetch.await_args.args[2] == ""
+        assert set(self.engine._vec_entries) == {second_key}
+        assert self.engine._matrix_keys == [second_key]
+        assert self.engine._matrix.shape == (1, 3)
+        assert self.engine._vec_watermark == "t3"
+        assert not self.engine._vec_full_retry
+        await upsert_embeddings(
+            self.db, [self.key], [[1.0, 0.0, 0.0]], "test-model", "t4"
+        )
+        await asyncio.wait_for(self.engine.warm_vectors(), timeout=5)
+        assert set(self.engine._vec_entries) == {self.key, second_key}
+        assert self.engine._matrix.shape == (2, 3)
+
+    @pytest.mark.parametrize("release_failure", ["none", "error", "cancelled"])
+    async def test_failed_chunk_batch_cannot_publish_via_later_meta_commit(
+        self, monkeypatch, _wal_connections, release_failure
+    ):
+        """回滚成功即已丢弃半批身份，RELEASE 失败也不能让无关元数据提交晚发布。"""
+        from briefdesk.plugins.rag.db import fetch_one, get_meta, set_meta
+
+        reader, write_db = _wal_connections
+        cursor = await write_db.execute(
+            "CREATE TRIGGER fail_second_chunk BEFORE UPDATE ON rag_chunks "
+            "WHEN NEW.msg_id = 'newer' BEGIN "
+            "SELECT RAISE(ABORT, 'injected second-row failure'); END"
+        )
+        await cursor.close()
+        await write_db.commit()
+        cursor = await write_db.execute(
+            "INSERT INTO rag_meta(key,value) VALUES(?,?)", ("prior-work", "kept")
+        )
+        await cursor.close()
+        first_mutated = asyncio.Event()
+        real_executemany = write_db.executemany
+        real_execute = write_db.execute
+
+        async def failed_release(sql, *args, **kwargs):
+            if sql.startswith("RELEASE SAVEPOINT"):
+                if release_failure == "error":
+                    raise sqlite3.OperationalError("injected release failure")
+                if release_failure == "cancelled":
+                    raise asyncio.CancelledError
+            return await real_execute(sql, *args, **kwargs)
+
+        async def observed_failure(*args, **kwargs):
+            try:
+                return await real_executemany(*args, **kwargs)
+            except sqlite3.IntegrityError:
+                row = await fetch_one(
+                    write_db, "SELECT sender_id, sender_name, group_name FROM rag_chunks "
+                    "WHERE source = ? AND msg_id = ?", self.key,
+                )
+                assert row["sender_id"] == self.updated.sender_id
+                assert row["sender_name"] == self.updated.sender_name
+                assert row["group_name"] == self.updated.group_name
+                first_mutated.set()
+                raise
+
+        with monkeypatch.context() as patcher:
+            patcher.setattr(write_db, "executemany", observed_failure)
+            patcher.setattr(write_db, "execute", failed_release)
+            with pytest.raises(sqlite3.IntegrityError, match="injected second-row failure"):
+                await asyncio.wait_for(self.engine._persist_chunks(
+                    write_db, [self.updated, self.second], [], [], "test-model"
+                ), timeout=5)
+        await asyncio.wait_for(first_mutated.wait(), timeout=5)
+        assert write_db.in_transaction
+        assert self.engine._vec_unsettled_writes == 0
+        assert self.engine._vec_cache_dirty
+        assert await get_meta(reader, "prior-work") is None
+        await asyncio.wait_for(self.engine.warm_vectors(), timeout=5)
+        assert self.engine._vec_entries[self.key][0] == self.first
+        assert not self.engine._vec_cache_dirty
+        await asyncio.wait_for(set_meta(write_db, "unrelated", "committed"), timeout=5)
+        assert await get_meta(reader, "prior-work") == "kept"
+        assert await get_meta(reader, "unrelated") == "committed"
+        await asyncio.wait_for(self.engine.warm_vectors(), timeout=5)
+        row = await fetch_one(
+            reader, "SELECT sender_id, sender_name, group_name FROM rag_chunks "
+            "WHERE source = ? AND msg_id = ?", self.key,
+        )
+        assert row["sender_id"] == self.first.sender_id
+        assert row["sender_name"] == self.first.sender_name
+        assert row["group_name"] == self.first.group_name
+        assert self.engine._vec_entries[self.key][0] == self.first
+        matrix_index = self.engine._matrix_keys.index(self.key)
+        assert self.engine._matrix_chunks[matrix_index] == self.first
+        assert self.engine._vec_unsettled_writes == 0
+        assert self.engine._vec_applied_invalidations == self.engine._vec_invalidations
+        assert not self.engine._vec_cache_dirty
+
+    async def test_cancelled_queued_commit_waits_for_outcome_before_settlement(
+        self, monkeypatch, _wal_connections
+    ):
+        """取消 COMMIT 等待不会撤销工作线程队列，清理尚未执行时不能提前收尾。"""
+        from queue import SimpleQueue
+
+        from briefdesk.plugins.rag.db import fetch_one
+
+        reader, write_db = _wal_connections
+        loop = asyncio.get_running_loop()
+        worker_blocked = asyncio.Event()
+        release_worker = asyncio.Event()
+        commit_queued = asyncio.Event()
+        cleanup_queued = asyncio.Event()
+        real_queue = write_db._tx
+        commit_function = write_db._conn.commit
+        execute_function = write_db._conn.execute
+        real_commit = write_db.commit
+        blockers = []
+
+        class ObservedQueue:
+            def __init__(self, wrapped_queue):
+                self._queue = wrapped_queue
+
+            def __getattr__(self, name):
+                return getattr(self._queue, name)
+
+            def put_nowait(self, item):
+                self._queue.put_nowait(item)
+                function = item[1] if isinstance(item, tuple) else None
+                operation = getattr(function, "func", None)
+                if operation == commit_function:
+                    commit_queued.set()
+                elif operation == execute_function and function.args[0].startswith(
+                    "ROLLBACK TO SAVEPOINT"
+                ):
+                    cleanup_queued.set()
+
+        def block_worker():
+            loop.call_soon_threadsafe(worker_blocked.set)
+            asyncio.run_coroutine_threadsafe(release_worker.wait(), loop).result(timeout=5)
+
+        async def paused_commit():
+            blockers.append(asyncio.create_task(write_db._execute(block_worker)))
+            await asyncio.wait_for(worker_blocked.wait(), timeout=5)
+            await real_commit()
+
+        probe_queue = SimpleQueue()
+        probe_observer = ObservedQueue(probe_queue)
+        assert probe_observer.get == probe_queue.get
+        for probe in ((None, None), object()):
+            probe_observer.put_nowait(probe)
+            assert probe_observer.get_nowait() is probe
+        observed_queue = ObservedQueue(real_queue)
+        assert observed_queue.get == real_queue.get
+        monkeypatch.setattr(write_db, "_tx", observed_queue)
+        monkeypatch.setattr(write_db, "commit", paused_commit)
+        writer = asyncio.create_task(self.engine._persist_chunks(
+            write_db, [self.updated], [], [], "test-model"
+        ))
+        try:
+            await asyncio.wait_for(commit_queued.wait(), timeout=5)
+            writer.cancel()
+            await asyncio.wait_for(cleanup_queued.wait(), timeout=5)
+            assert not writer.done()
+            assert self.engine._vec_unsettled_writes == 1
+            applied_before = self.engine._vec_applied_invalidations
+            await asyncio.wait_for(self.engine.warm_vectors(), timeout=5)
+            assert not release_worker.is_set()
+            assert self.engine._vec_entries[self.key][0] == self.first
+            assert self.engine._vec_unsettled_writes == 1
+            assert self.engine._vec_applied_invalidations == applied_before
+            assert self.engine._vec_cache_dirty
+            release_worker.set()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(writer, timeout=5)
+            await asyncio.wait_for(asyncio.gather(*blockers), timeout=5)
+            assert not write_db.in_transaction
+            assert self.engine._vec_unsettled_writes == 0
+            assert self.engine._vec_applied_invalidations == applied_before
+            assert self.engine._vec_cache_dirty
+            row = await fetch_one(
+                reader, "SELECT sender_id FROM rag_chunks WHERE source = ? AND msg_id = ?",
+                self.key,
+            )
+            assert row["sender_id"] == self.updated.sender_id
+            await asyncio.wait_for(self.engine.warm_vectors(), timeout=5)
+            assert self.engine._vec_entries[self.key][0] == self.updated
+            matrix_index = self.engine._matrix_keys.index(self.key)
+            assert self.engine._matrix_chunks[matrix_index] == self.updated
+            assert self.engine._vec_unsettled_writes == 0
+            assert self.engine._vec_applied_invalidations == self.engine._vec_invalidations
+            assert not self.engine._vec_cache_dirty
+        finally:
+            release_worker.set()
+            if not writer.done():
+                writer.cancel()
+            await asyncio.wait_for(
+                asyncio.gather(writer, *blockers, return_exceptions=True), timeout=5
+            )
+
+    async def test_cancelled_commit_that_published_settles_registration(
+        self, monkeypatch, _wal_connections
+    ):
+        """COMMIT 已发布后保存点必然消失，把清理异常一概当作未决会永久泄漏登记。"""
+        from briefdesk.plugins.rag import engine as rag_engine
+
+        _, write_db = _wal_connections
+        loop = asyncio.get_running_loop()
+        commit_in_flight = asyncio.Event()
+        release_commit = asyncio.Event()
+        cleanup_queued = asyncio.Event()
+        real_execute = write_db._execute
+        commit_function = write_db._conn.commit
+        execute_function = write_db._conn.execute
+
+        def blocked_commit():
+            loop.call_soon_threadsafe(commit_in_flight.set)
+            asyncio.run_coroutine_threadsafe(release_commit.wait(), loop).result(timeout=5)
+            commit_function()
+
+        async def controlled_execute(function, *args, **kwargs):
+            if function == commit_function:
+                return await real_execute(blocked_commit)
+            if function == execute_function and args[0].startswith("ROLLBACK TO SAVEPOINT"):
+                cleanup_queued.set()
+            return await real_execute(function, *args, **kwargs)
+
+        monkeypatch.setattr(write_db, "_execute", controlled_execute)
+        writer = asyncio.create_task(self.engine._persist_chunks(
+            write_db, [self.updated], [], [], "test-model"
+        ))
+        applied_before = self.engine._vec_applied_invalidations
+        try:
+            await asyncio.wait_for(commit_in_flight.wait(), timeout=5)
+            assert write_db.in_transaction
+            writer.cancel()
+            await asyncio.wait_for(cleanup_queued.wait(), timeout=5)
+            assert not writer.done()
+            assert self.engine._vec_unsettled_writes == 1
+            await asyncio.wait_for(self.engine.warm_vectors(), timeout=5)
+            assert self.engine._vec_entries[self.key][0] == self.first
+            assert self.engine._vec_applied_invalidations == applied_before
+            assert self.engine._vec_cache_dirty
+            release_commit.set()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(writer, timeout=5)
+            assert not write_db.in_transaction
+            assert self.engine._vec_unsettled_writes == 0
+            assert self.engine._vec_applied_invalidations == applied_before
+            assert self.engine._vec_cache_dirty
+            real_fetch = rag_engine.fetch_new_embeddings
+
+            async def observed_fetch(*args, **kwargs):
+                result = await real_fetch(*args, **kwargs)
+                rows, _ = result
+                row = next(
+                    row for row in rows if (row["source"], row["msg_id"]) == self.key
+                )
+                assert row["sender_id"] == self.updated.sender_id
+                assert self.engine._vec_applied_invalidations == applied_before
+                return result
+
+            fetch = AsyncMock(wraps=observed_fetch)
+            monkeypatch.setattr(rag_engine, "fetch_new_embeddings", fetch)
+            await asyncio.wait_for(self.engine.warm_vectors(), timeout=5)
+            fetch.assert_awaited_once()
+            assert fetch.await_args.args[2] == ""
+            assert self.engine._vec_entries[self.key][0] == self.updated
+            matrix_index = self.engine._matrix_keys.index(self.key)
+            assert self.engine._matrix_chunks[matrix_index] == self.updated
+            assert self.engine._vec_applied_invalidations == self.engine._vec_invalidations
+            assert not self.engine._vec_cache_dirty
+        finally:
+            release_commit.set()
+            if not writer.done():
+                writer.cancel()
+            await asyncio.wait_for(
+                asyncio.gather(writer, return_exceptions=True), timeout=5
+            )
+
+    async def test_savepoint_cleanup_failure_with_open_transaction_is_unknown(
+        self, monkeypatch, _wal_connections
+    ):
+        """事务未结束时消失的保存点不能证明回滚，否则旧快照会确认随后晚发布的身份。"""
+        from briefdesk.plugins.rag.db import ChunkWriteOutcomeUnknownError
+
+        _, write_db = _wal_connections
+        cursor = await write_db.execute("BEGIN IMMEDIATE")
+        await cursor.close()
+        original_error = RuntimeError("injected chunk failure after savepoint release")
+        write_prepared = asyncio.Event()
+        release_write = asyncio.Event()
+        real_executemany = write_db.executemany
+
+        async def released_savepoint(*args, **kwargs):
+            cursor = await real_executemany(*args, **kwargs)
+            await cursor.close()
+            cursor = await write_db.execute("RELEASE SAVEPOINT rag_chunks_upsert")
+            await cursor.close()
+            write_prepared.set()
+            await asyncio.wait_for(release_write.wait(), timeout=5)
+            raise original_error
+
+        monkeypatch.setattr(write_db, "executemany", released_savepoint)
+        writer = asyncio.create_task(self.engine._persist_chunks(
+            write_db, [self.updated], [], [], "test-model"
+        ))
+        applied_before = self.engine._vec_applied_invalidations
+        try:
+            await asyncio.wait_for(write_prepared.wait(), timeout=5)
+            assert write_db.in_transaction
+            assert self.engine._vec_unsettled_writes == 1
+            release_write.set()
+            with pytest.raises(ChunkWriteOutcomeUnknownError) as unknown:
+                await asyncio.wait_for(writer, timeout=5)
+            assert unknown.value.__cause__ is original_error
+            assert write_db.in_transaction
+            assert self.engine._vec_unsettled_writes == 1
+            await asyncio.wait_for(self.engine.warm_vectors(), timeout=5)
+            assert self.engine._vec_entries[self.key][0] == self.first
+            assert self.engine._vec_applied_invalidations == applied_before
+            assert self.engine._vec_cache_dirty
+            await asyncio.wait_for(write_db.commit(), timeout=5)
+            await asyncio.wait_for(self.engine.warm_vectors(), timeout=5)
+            assert self.engine._vec_entries[self.key][0] == self.updated
+            assert self.engine._vec_unsettled_writes == 1
+            assert self.engine._vec_applied_invalidations == applied_before
+            assert self.engine._vec_cache_dirty
+        finally:
+            release_write.set()
+            if not writer.done():
+                writer.cancel()
+            await asyncio.wait_for(
+                asyncio.gather(writer, return_exceptions=True), timeout=5
+            )
+            await asyncio.wait_for(write_db.rollback(), timeout=5)
+
+    @pytest.mark.parametrize("failure", ["error", "cancelled"])
+    async def test_unknown_outcome_keeps_write_unsettled(
+        self, monkeypatch, _wal_connections, failure
+    ):
+        """回滚未获确认且事务仍打开时可能晚发布，必须保留未收尾登记而不是猜终态。"""
+        from briefdesk.plugins.rag.db import ChunkWriteOutcomeUnknownError, fetch_one
+
+        reader, write_db = _wal_connections
+        original_error = RuntimeError("injected chunk failure")
+        real_executemany = write_db.executemany
+        real_execute = write_db.execute
+        cleanup_entered = asyncio.Event()
+        release_cleanup = asyncio.Event()
+
+        async def failed_write(*args, **kwargs):
+            cursor = await real_executemany(*args, **kwargs)
+            await cursor.close()
+            raise original_error
+
+        async def failed_cleanup(sql, *args, **kwargs):
+            if sql.startswith("ROLLBACK TO SAVEPOINT"):
+                cleanup_entered.set()
+                await asyncio.wait_for(release_cleanup.wait(), timeout=5)
+                raise sqlite3.OperationalError("injected rollback failure")
+            return await real_execute(sql, *args, **kwargs)
+
+        with monkeypatch.context() as patcher:
+            patcher.setattr(write_db, "executemany", failed_write)
+            patcher.setattr(write_db, "execute", failed_cleanup)
+            writer = asyncio.create_task(self.engine._persist_chunks(
+                write_db, [self.updated], [], [], "test-model"
+            ))
+            try:
+                await asyncio.wait_for(cleanup_entered.wait(), timeout=5)
+                if failure == "error":
+                    release_cleanup.set()
+                else:
+                    writer.cancel()
+                with pytest.raises(ChunkWriteOutcomeUnknownError) as unknown:
+                    await asyncio.wait_for(writer, timeout=5)
+                assert unknown.value.__cause__ is original_error
+            finally:
+                release_cleanup.set()
+                writer.cancel()
+                await asyncio.wait_for(
+                    asyncio.gather(writer, return_exceptions=True), timeout=5
+                )
+        assert write_db.in_transaction
+        assert self.engine._vec_unsettled_writes == 1
+        assert self.engine._vec_cache_dirty
+        row = await fetch_one(
+            write_db, "SELECT sender_id FROM rag_chunks WHERE source = ? AND msg_id = ?",
+            self.key,
+        )
+        assert row["sender_id"] == self.updated.sender_id
+        row = await fetch_one(
+            reader, "SELECT sender_id FROM rag_chunks WHERE source = ? AND msg_id = ?",
+            self.key,
+        )
+        assert row["sender_id"] == self.first.sender_id
+        applied_before = self.engine._vec_applied_invalidations
+        await asyncio.wait_for(self.engine.warm_vectors(), timeout=5)
+        assert self.engine._vec_entries[self.key][0] == self.first
+        assert self.engine._vec_unsettled_writes == 1
+        assert self.engine._vec_applied_invalidations == applied_before
+        assert self.engine._vec_cache_dirty
+        await write_db.rollback()
+
+    async def test_identity_refresh_does_not_acknowledge_unsettled_write(
+        self, monkeypatch, tmp_path
+    ):
+        from briefdesk.plugins.rag import engine as rag_engine
+
+        database_path = tmp_path / "identity.sqlite"
+        async with (
+            aiosqlite.connect(database_path) as reader,
+            aiosqlite.connect(database_path) as write_db,
+        ):
+            await self.db.backup(reader)
+            reader.row_factory = aiosqlite.Row
+            cursor = await reader.execute("PRAGMA journal_mode = WAL")
+            assert (await cursor.fetchone())[0] == "wal"
+            await cursor.close()
+
+            async def factory():
+                return reader
+
+            monkeypatch.setattr(self.engine, "_db_factory", factory)
+            monkeypatch.setattr(self.engine, "_embed_factory", factory)
+            chunk_written = asyncio.Event()
+            release_commit = asyncio.Event()
+
+            async def paused_upsert(db, rows, *, sender_id_fill_only=False):
+                assert db is reader
+                assert rows == [self.updated]
+                assert not sender_id_fill_only
+                try:
+                    cursor = await write_db.execute("BEGIN IMMEDIATE")
+                    await cursor.close()
+                    cursor = await write_db.execute(
+                        "UPDATE rag_chunks SET sender_id = ?, sender_name = ?, "
+                        "group_name = ? WHERE source = ? AND msg_id = ?",
+                        (self.updated.sender_id, self.updated.sender_name,
+                         self.updated.group_name, *self.key),
+                    )
+                    await cursor.close()
+                    chunk_written.set()
+                    await asyncio.wait_for(release_commit.wait(), timeout=5)
+                    await write_db.commit()
+                finally:
+                    await write_db.rollback()
+
+            monkeypatch.setattr(rag_engine, "upsert_chunks", paused_upsert)
+            writer = asyncio.create_task(self.engine._persist_chunks(
+                reader, [self.updated], [], [], "test-model"
+            ))
+            try:
+                await asyncio.wait_for(chunk_written.wait(), timeout=5)
+                assert self.engine._vec_unsettled_writes == 1
+                await asyncio.wait_for(self.engine.warm_vectors(), timeout=5)
+                assert write_db.in_transaction
+                assert not writer.done()
+                assert self.engine._vec_cache_dirty
+                assert self.engine._vec_entries[self.key][0] == self.first
+                release_commit.set()
+                assert not await asyncio.wait_for(writer, timeout=5)
+                assert self.engine._vec_unsettled_writes == 0
+                assert self.engine._vec_cache_dirty
+                await asyncio.wait_for(self.engine.warm_vectors(), timeout=5)
+                hits = await asyncio.wait_for(
+                    self.engine.retrieve(self.first.content), timeout=5
+                )
+                assert hits
+                assert hits[0].chunk == self.updated
+                assert not self.engine._vec_cache_dirty
+            finally:
+                release_commit.set()
+                writer.cancel()
+                await asyncio.wait_for(
+                    asyncio.gather(writer, return_exceptions=True), timeout=5
+                )
+
+    async def test_identity_existing_uncached_row_receives_invalidation(
+        self, monkeypatch, tmp_path
+    ):
+        from briefdesk.plugins.rag import engine as rag_engine
+        from briefdesk.plugins.rag.db import upsert_chunks, upsert_embeddings
+
+        uncached = replace(
+            self.first, msg_id="uncached-older", sender_id="uncached-identity"
+        )
+        newer = replace(self.second, msg_id="uncached-newer")
+        key = (uncached.source, uncached.msg_id)
+        updated = replace(
+            uncached, sender_id="updated-identity", sender_name="新成员", group_name="新群"
+        )
+        database_path = tmp_path / "uncached-identity.sqlite"
+        async with (
+            aiosqlite.connect(database_path) as reader,
+            aiosqlite.connect(database_path) as write_db,
+        ):
+            await self.db.backup(reader)
+            reader.row_factory = aiosqlite.Row
+            for connection in (reader, write_db):
+                cursor = await connection.execute("PRAGMA journal_mode = WAL")
+                assert (await cursor.fetchone())[0] == "wal"
+                await cursor.close()
+            await upsert_chunks(write_db, [uncached, newer])
+            await upsert_embeddings(write_db, [key], [[1.0, 0.0]], "test-model", "t3")
+            await upsert_embeddings(
+                write_db, [(newer.source, newer.msg_id)], [[0.0, 1.0]],
+                "test-model", "t4",
+            )
+            assert self.engine._vec_entries
+            assert key not in self.engine._vec_entries
+            assert (newer.source, newer.msg_id) not in self.engine._vec_entries
+            assert self.engine._vec_watermark == "t2"
+            assert not self.engine._refresh_lock.locked()
+
+            async def factory():
+                return reader
+
+            monkeypatch.setattr(self.engine, "_db_factory", factory)
+            monkeypatch.setattr(self.engine, "_embed_factory", factory)
+            chunk_written = asyncio.Event()
+            release_commit = asyncio.Event()
+
+            async def paused_upsert(db, rows, *, sender_id_fill_only=False):
+                assert db is reader
+                assert rows == [updated]
+                assert not sender_id_fill_only
+                try:
+                    cursor = await write_db.execute("BEGIN IMMEDIATE")
+                    await cursor.close()
+                    cursor = await write_db.execute(
+                        "UPDATE rag_chunks SET sender_id = ?, sender_name = ?, "
+                        "group_name = ? WHERE source = ? AND msg_id = ?",
+                        (updated.sender_id, updated.sender_name, updated.group_name, *key),
+                    )
+                    await cursor.close()
+                    chunk_written.set()
+                    await asyncio.wait_for(release_commit.wait(), timeout=5)
+                    await write_db.commit()
+                finally:
+                    await write_db.rollback()
+
+            monkeypatch.setattr(rag_engine, "upsert_chunks", paused_upsert)
+            writer = asyncio.create_task(self.engine._persist_chunks(
+                reader, [updated], [], [], "test-model"
+            ))
+            try:
+                await asyncio.wait_for(chunk_written.wait(), timeout=5)
+                await asyncio.wait_for(self.engine.warm_vectors(), timeout=5)
+                assert write_db.in_transaction
+                assert not writer.done()
+                assert self.engine._vec_entries[key][0] == uncached
+                assert self.engine._vec_watermark == "t4"
+                assert self.engine._vec_cache_dirty
+                release_commit.set()
+                assert not await asyncio.wait_for(writer, timeout=5)
+                assert self.engine._vec_unsettled_writes == 0
+                assert not write_db.in_transaction
+                hits = await asyncio.wait_for(
+                    self.engine.retrieve(uncached.content), timeout=5
+                )
+                assert hits
+                assert [
+                    hit.chunk for hit in hits
+                    if (hit.chunk.source, hit.chunk.msg_id) == key
+                ] == [updated]
+                assert not self.engine._vec_cache_dirty
+            finally:
+                release_commit.set()
+                writer.cancel()
+                await asyncio.wait_for(
+                    asyncio.gather(writer, return_exceptions=True), timeout=5
+                )
+
+    async def test_identity_settlement_after_snapshot_before_exit_keeps_invalidation(
+        self, monkeypatch, tmp_path
+    ):
+        from briefdesk.plugins.rag import engine as rag_engine
+
+        database_path = tmp_path / "snapshot-settlement.sqlite"
+        async with (
+            aiosqlite.connect(database_path) as reader,
+            aiosqlite.connect(database_path) as write_db,
+        ):
+            await self.db.backup(reader)
+            reader.row_factory = aiosqlite.Row
+            for connection in (reader, write_db):
+                cursor = await connection.execute("PRAGMA journal_mode = WAL")
+                assert (await cursor.fetchone())[0] == "wal"
+                await cursor.close()
+
+            async def factory():
+                return reader
+
+            monkeypatch.setattr(self.engine, "_db_factory", factory)
+            monkeypatch.setattr(self.engine, "_embed_factory", factory)
+            chunk_written = asyncio.Event()
+            release_commit = asyncio.Event()
+            parse_started = asyncio.Event()
+            release_parse = asyncio.Event()
+            loop = asyncio.get_running_loop()
+            real_parse = rag_engine.parse_embedding_rows
+
+            async def paused_upsert(db, rows, *, sender_id_fill_only=False):
+                assert db is reader
+                assert rows == [self.updated]
+                assert not sender_id_fill_only
+                try:
+                    cursor = await write_db.execute("BEGIN IMMEDIATE")
+                    await cursor.close()
+                    cursor = await write_db.execute(
+                        "UPDATE rag_chunks SET sender_id = ?, sender_name = ?, "
+                        "group_name = ? WHERE source = ? AND msg_id = ?",
+                        (self.updated.sender_id, self.updated.sender_name,
+                         self.updated.group_name, *self.key),
+                    )
+                    await cursor.close()
+                    chunk_written.set()
+                    await asyncio.wait_for(release_commit.wait(), timeout=5)
+                    await write_db.commit()
+                finally:
+                    await write_db.rollback()
+
+            def paused_parse(raw_rows):
+                result = real_parse(raw_rows)
+                if not parse_started.is_set():
+                    loop.call_soon_threadsafe(parse_started.set)
+                    asyncio.run_coroutine_threadsafe(
+                        asyncio.wait_for(release_parse.wait(), timeout=5), loop
+                    ).result(timeout=5)
+                return result
+
+            monkeypatch.setattr(rag_engine, "upsert_chunks", paused_upsert)
+            monkeypatch.setattr(rag_engine, "parse_embedding_rows", paused_parse)
+            writer = asyncio.create_task(self.engine._persist_chunks(
+                reader, [self.updated], [], [], "test-model"
+            ))
+            refresh = None
+            try:
+                await asyncio.wait_for(chunk_written.wait(), timeout=5)
+                assert self.engine._vec_unsettled_writes == 1
+                refresh = asyncio.create_task(self.engine.warm_vectors())
+                await asyncio.wait_for(parse_started.wait(), timeout=5)
+                assert write_db.in_transaction
+                assert not refresh.done()
+                release_commit.set()
+                assert not await asyncio.wait_for(writer, timeout=5)
+                assert self.engine._vec_unsettled_writes == 0
+                assert not write_db.in_transaction
+                assert not refresh.done()
+                release_parse.set()
+                await asyncio.wait_for(refresh, timeout=5)
+                assert self.engine._vec_entries[self.key][0] == self.first
+                assert self.engine._vec_cache_dirty
+                hits = await asyncio.wait_for(
+                    self.engine.retrieve(self.first.content), timeout=5
+                )
+                assert hits
+                assert hits[0].chunk == self.updated
+                assert not self.engine._vec_cache_dirty
+            finally:
+                release_commit.set()
+                release_parse.set()
+                writer.cancel()
+                tasks = [writer]
+                if refresh is not None:
+                    refresh.cancel()
+                    tasks.append(refresh)
+                await asyncio.wait_for(
+                    asyncio.gather(*tasks, return_exceptions=True), timeout=5
+                )
+
+    async def test_identity_cold_cache_registers_invalidation(self, monkeypatch):
+        from briefdesk.plugins.rag import engine as rag_engine
+
+        async def factory():
+            return self.db
+
+        engine = rag_engine.RagEngine(
+            self.engine.settings, db_factory=factory, embed_factory=factory
+        )
+        await engine._ensure_db_ready()
+        engine._fts_enabled = False
+        assert engine._vec_model is None
+        assert not engine._vec_entries
+        assert not engine._refresh_lock.locked()
+        upsert_entered = asyncio.Event()
+        release_upsert = asyncio.Event()
+        real_upsert = rag_engine.upsert_chunks
+
+        async def paused_upsert(*args, **kwargs):
+            upsert_entered.set()
+            await asyncio.wait_for(release_upsert.wait(), timeout=5)
+            await real_upsert(*args, **kwargs)
+
+        monkeypatch.setattr(rag_engine, "upsert_chunks", paused_upsert)
+        writer = asyncio.create_task(engine._persist_chunks(
+            self.db, [self.updated], [], [], "test-model"
+        ))
+        try:
+            await asyncio.wait_for(upsert_entered.wait(), timeout=5)
+            await asyncio.wait_for(engine.warm_vectors(), timeout=5)
+            assert engine._vec_entries[self.key][0] == self.first
+            assert engine._vec_cache_dirty
+            release_upsert.set()
+            assert not await asyncio.wait_for(writer, timeout=5)
+            assert engine._vec_unsettled_writes == 0
+            await asyncio.wait_for(engine.warm_vectors(), timeout=5)
+            hits = await asyncio.wait_for(engine.retrieve(self.first.content), timeout=5)
+            assert hits
+            assert hits[0].chunk == self.updated
+            assert not engine._vec_cache_dirty
+        finally:
+            release_upsert.set()
+            writer.cancel()
+            await asyncio.wait_for(
+                asyncio.gather(writer, return_exceptions=True), timeout=5
+            )
+            await engine.teardown()
+
+    async def test_identity_new_rows_register_invalidation(self):
+        from briefdesk.plugins.rag.db import upsert_embeddings
+
+        new_row = replace(
+            self.first, msg_id="brand-new", sender_id="brand-new-identity"
+        )
+        new_key = (new_row.source, new_row.msg_id)
+        invalidations = self.engine._vec_invalidations
+        assert self.engine._vec_entries
+        assert new_key not in self.engine._vec_entries
+        assert not self.engine._refresh_lock.locked()
+        assert not await asyncio.wait_for(self.engine._persist_chunks(
+            self.db, [new_row], [], [], "test-model"
+        ), timeout=5)
+        assert self.engine._vec_invalidations == invalidations + 1
+        assert self.engine._vec_unsettled_writes == 0
+        assert self.engine._vec_cache_dirty
+        assert self.engine._vec_watermark == "t2"
+        await upsert_embeddings(
+            self.db, [new_key], [[1.0, 0.0]], "test-model", "t3"
+        )
+        await asyncio.wait_for(self.engine.warm_vectors(), timeout=5)
+        assert self.engine._vec_entries[new_key][0] == new_row
+        assert self.engine._vec_watermark == "t3"
+        assert self.engine._vec_invalidations == invalidations + 1
+        assert not self.engine._vec_cache_dirty
+
+    async def test_identity_invalidation_survives_cancelled_commit(self, monkeypatch):
+        """拦截 await upsert_chunks 后才登记失效的实现：提交已落地仍可被取消。"""
+        from briefdesk.plugins.rag import engine as rag_engine
+
+        chunk_committed = asyncio.Event()
+        release_upsert = asyncio.Event()
+        real_upsert = rag_engine.upsert_chunks
+
+        async def paused_upsert(*args, **kwargs):
+            await real_upsert(*args, **kwargs)
+            chunk_committed.set()
+            await asyncio.wait_for(release_upsert.wait(), timeout=5)
+
+        with monkeypatch.context() as patcher:
+            patcher.setattr(rag_engine, "upsert_chunks", paused_upsert)
+            writer = asyncio.create_task(self.engine._persist_chunks(
+                self.db, [self.updated], [], [], "test-model"
+            ))
+            try:
+                await asyncio.wait_for(chunk_committed.wait(), timeout=5)
+                writer.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await asyncio.wait_for(writer, timeout=5)
+                assert self.engine._vec_cache_dirty
+            finally:
+                release_upsert.set()
+                writer.cancel()
+                await asyncio.wait_for(
+                    asyncio.gather(writer, return_exceptions=True), timeout=5
+                )
+        await asyncio.wait_for(self.engine.warm_vectors(), timeout=5)
+        hits = await asyncio.wait_for(self.engine.retrieve(self.first.content), timeout=5)
+        assert hits
+        assert hits[0].chunk == self.updated
+        assert not self.engine._vec_cache_dirty
+
+    async def test_failed_full_refresh_retries_without_chunk_write(self, monkeypatch):
+        """全量解析失败后没有新写入也必须全量重试，否则已删向量仍留在检索中。"""
+        from briefdesk.plugins.rag import engine as rag_engine
+
+        second_key = (self.second.source, self.second.msg_id)
+        cursor = await self.db.execute(
+            "DELETE FROM rag_chunk_embeddings WHERE source = ? AND msg_id = ?", second_key
+        )
+        await cursor.close()
+        await self.db.commit()
+        with monkeypatch.context() as patcher:
+            patcher.setattr(
+                rag_engine, "parse_embedding_rows",
+                Mock(side_effect=RuntimeError("injected full parse failure")),
+            )
+            with pytest.raises(RuntimeError, match="injected full parse failure"):
+                await asyncio.wait_for(self.engine.warm_vectors(force_full=True), timeout=5)
+        assert self.engine._vec_full_retry
+        assert not self.engine._vec_cache_dirty
+        assert self.engine._vec_unsettled_writes == 0
+        assert self.engine._vec_watermark == "t2"
+        assert self.engine._vec_count_seen == 2
+        assert set(self.engine._vec_entries) == {self.key, second_key}
+        fetch = AsyncMock(wraps=rag_engine.fetch_new_embeddings)
+        monkeypatch.setattr(rag_engine, "fetch_new_embeddings", fetch)
+        await asyncio.wait_for(self.engine.warm_vectors(), timeout=5)
+        fetch.assert_awaited_once()
+        assert fetch.await_args.args[2] == ""
+        assert set(self.engine._vec_entries) == {self.key}
+        assert self.engine._matrix_keys == [self.key]
+        assert self.engine._matrix_chunks == [self.first]
+        assert self.engine._matrix.shape == (1, 2)
+        assert self.engine._vec_watermark == "t1"
+        assert self.engine._vec_count_seen == 1
+        assert not self.engine._vec_full_retry
+        self.provider.embed_texts = AsyncMock(return_value=[[1.0, 1.0]])
+        hits = await asyncio.wait_for(self.engine.retrieve(self.first.content), timeout=5)
+        assert [hit.chunk for hit in hits] == [self.first]
+        assert second_key not in self.engine._vec_entries
+        cursor = await self.db.execute("DELETE FROM rag_chunk_embeddings")
+        await cursor.close()
+        await self.db.commit()
+        await asyncio.wait_for(self.engine.warm_vectors(force_full=True), timeout=5)
+        assert not self.engine._vec_entries
+        assert self.engine._matrix is None
+        assert self.engine._matrix_keys == []
+        assert self.engine._matrix_chunks == []
+        assert self.engine._matrix_sessions == []
+        assert self.engine._vec_watermark == ""
+        assert self.engine._vec_count_seen == 0
+        assert not self.engine._vec_full_retry
+
+    async def test_failed_full_refresh_retries_with_unchanged_total(self, monkeypatch):
+        """删旧键补新键不降低总数，失败后的普通刷新不能只依赖行数回退守卫。"""
+        from briefdesk.plugins.rag import engine as rag_engine
+        from briefdesk.plugins.rag.db import fetch_one, upsert_chunks, upsert_embeddings
+
+        second_key = (self.second.source, self.second.msg_id)
+        replacement = replace(
+            self.second, msg_id="replacement", sender_id="replacement-identity"
+        )
+        replacement_key = (replacement.source, replacement.msg_id)
+        await upsert_chunks(self.db, [replacement])
+        cursor = await self.db.execute(
+            "DELETE FROM rag_chunk_embeddings WHERE source = ? AND msg_id = ?", second_key
+        )
+        await cursor.close()
+        await upsert_embeddings(
+            self.db, [replacement_key], [[1.0, 1.0]], "test-model", "t3"
+        )
+        row = await fetch_one(self.db, "SELECT COUNT(*) AS c FROM rag_chunk_embeddings")
+        assert row["c"] == self.engine._vec_count_seen == 2
+        with monkeypatch.context() as patcher:
+            patcher.setattr(
+                rag_engine, "parse_embedding_rows",
+                Mock(side_effect=RuntimeError("injected full parse failure")),
+            )
+            with pytest.raises(RuntimeError, match="injected full parse failure"):
+                await asyncio.wait_for(self.engine.warm_vectors(force_full=True), timeout=5)
+        assert self.engine._vec_full_retry
+        assert not self.engine._vec_cache_dirty
+        assert self.engine._vec_watermark == "t2"
+        assert self.engine._vec_count_seen == 2
+        fetch = AsyncMock(wraps=rag_engine.fetch_new_embeddings)
+        monkeypatch.setattr(rag_engine, "fetch_new_embeddings", fetch)
+        await asyncio.wait_for(self.engine.warm_vectors(), timeout=5)
+        fetch.assert_awaited_once()
+        assert fetch.await_args.args[2] == ""
+        expected_keys = {self.key, replacement_key}
+        assert set(self.engine._vec_entries) == expected_keys
+        assert set(self.engine._matrix_keys) == expected_keys
+        assert {
+            (chunk.source, chunk.msg_id) for chunk in self.engine._matrix_chunks
+        } == expected_keys
+        assert self.engine._vec_entries[replacement_key][0] == replacement
+        assert self.engine._vec_entries[replacement_key][1].tolist() == [1.0, 1.0]
+        assert self.engine._matrix.shape == (2, 2)
+        assert self.engine._vec_watermark == "t3"
+        assert self.engine._vec_count_seen == 2
+        assert not self.engine._vec_full_retry
+        self.provider.embed_texts = AsyncMock(return_value=[[1.0, 1.0]])
+        hits = await asyncio.wait_for(self.engine.retrieve(self.first.content), timeout=5)
+        assert {(hit.chunk.source, hit.chunk.msg_id) for hit in hits} == expected_keys
+        assert second_key not in self.engine._vec_entries
+
+    async def test_identity_failed_full_refresh_keeps_cache_and_matrix_coherent(
+        self, monkeypatch
+    ):
+        """拦截解析前裁剪缓存的实现：解析失败不得留下旧矩阵与新字典。"""
+        from briefdesk.plugins.rag import engine as rag_engine
+
+        second_key = (self.second.source, self.second.msg_id)
+        cursor = await self.db.execute(
+            "DELETE FROM rag_chunk_embeddings WHERE source = ? AND msg_id = ?",
+            second_key,
+        )
+        await cursor.close()
+        await self.db.commit()
+        with monkeypatch.context() as patcher:
+            patcher.setattr(
+                rag_engine, "parse_embedding_rows",
+                Mock(side_effect=RuntimeError("injected parse failure")),
+            )
+            with pytest.raises(RuntimeError, match="injected parse failure"):
+                await asyncio.wait_for(
+                    self.engine.warm_vectors(force_full=True), timeout=5
+                )
+        assert self.engine._vec_entries
+        assert self.engine._matrix_chunks
+        cached_keys = set(self.engine._vec_entries)
+        matrix_chunk_keys = {
+            (chunk.source, chunk.msg_id) for chunk in self.engine._matrix_chunks
+        }
+        assert cached_keys == matrix_chunk_keys == set(self.engine._matrix_keys)
+        assert cached_keys == {self.key, second_key}
+        assert not await asyncio.wait_for(self.engine._persist_chunks(
+            self.db, [self.updated], [], [], "test-model"
+        ), timeout=5)
+        assert self.engine._vec_cache_dirty
+        await asyncio.wait_for(self.engine.warm_vectors(), timeout=5)
+        assert second_key not in self.engine._vec_entries
+        hits = await asyncio.wait_for(self.engine.retrieve(self.first.content), timeout=5)
+        assert hits
+        assert hits[0].chunk == self.updated
+        assert not self.engine._vec_cache_dirty
+
+    async def test_identity_invalidation_registered_while_factory_suspended(
+        self, monkeypatch
+    ):
+        """拦截首个 await 后才捕获世代的实现：工厂等待期间的更新须保留。"""
+        factory_suspended = asyncio.Event()
+        release_factory = asyncio.Event()
+        real_factory = self.engine._embed_factory
+
+        async def paused_factory():
+            if not factory_suspended.is_set():
+                factory_suspended.set()
+                await asyncio.wait_for(release_factory.wait(), timeout=5)
+            return await real_factory()
+
+        monkeypatch.setattr(self.engine, "_embed_factory", paused_factory)
+        refresh = asyncio.create_task(self.engine.warm_vectors())
+        try:
+            await asyncio.wait_for(factory_suspended.wait(), timeout=5)
+            assert self.engine._refresh_lock.locked()
+            assert not await asyncio.wait_for(self.engine._persist_chunks(
+                self.db, [self.updated], [], [], "test-model"
+            ), timeout=5)
+            assert self.engine._vec_cache_dirty
+            release_factory.set()
+            await asyncio.wait_for(refresh, timeout=5)
+            assert self.engine._vec_cache_dirty
+            assert self.engine._vec_entries[self.key][0] == self.first
+        finally:
+            release_factory.set()
+            refresh.cancel()
+            await asyncio.wait_for(
+                asyncio.gather(refresh, return_exceptions=True), timeout=5
+            )
+        await asyncio.wait_for(self.engine.warm_vectors(), timeout=5)
+        hits = await asyncio.wait_for(self.engine.retrieve(self.first.content), timeout=5)
+        assert hits
+        assert hits[0].chunk == self.updated
+        assert not self.engine._vec_cache_dirty
+
+    async def test_identity_invalidation_survives_cancelled_fts_sync(self, monkeypatch):
+        from briefdesk.plugins.rag import engine as rag_engine
+
+        chunk_committed = asyncio.Event()
+        release_fts = asyncio.Event()
+
+        async def paused_sync(*args, **kwargs):
+            chunk_committed.set()
+            await asyncio.wait_for(release_fts.wait(), timeout=5)
+
+        monkeypatch.setattr(rag_engine, "sync_fts", paused_sync)
+        self.engine._fts_enabled = True
+        async with self.engine._refresh_lock:
+            writer = asyncio.create_task(self.engine._persist_chunks(
+                self.db, [self.updated], [], [], "test-model"
+            ))
+            try:
+                await asyncio.wait_for(chunk_committed.wait(), timeout=5)
+                writer.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await asyncio.wait_for(writer, timeout=5)
+                assert self.engine._vec_cache_dirty
+            finally:
+                release_fts.set()
+                writer.cancel()
+                await asyncio.wait_for(
+                    asyncio.gather(writer, return_exceptions=True), timeout=5
+                )
+        await asyncio.wait_for(self.engine.warm_vectors(), timeout=5)
+        assert self.engine._vec_entries[self.key][0] == self.updated
+        assert not self.engine._vec_cache_dirty
+
+    @pytest.mark.parametrize("snapshot_kind", ["rows", "empty", "model-switch"])
+    async def test_identity_invalidation_survives_inflight_refresh(
+        self, monkeypatch, snapshot_kind
+    ):
+        from briefdesk.plugins.rag import engine as rag_engine
+
+        snapshot_read = asyncio.Event()
+        release_refresh = asyncio.Event()
+        real_fetch = rag_engine.fetch_new_embeddings
+
+        async def paused_fetch(*args, **kwargs):
+            result = await real_fetch(*args, **kwargs)
+            snapshot_read.set()
+            await asyncio.wait_for(release_refresh.wait(), timeout=5)
+            return result
+
+        monkeypatch.setattr(rag_engine, "fetch_new_embeddings", paused_fetch)
+        if snapshot_kind == "empty":
+            self.engine._vec_watermark = "t3"
+        elif snapshot_kind == "model-switch":
+            self.engine._vec_model = "previous-model"
+        refresh = asyncio.create_task(
+            self.engine.warm_vectors(force_full=snapshot_kind == "rows")
+        )
+        try:
+            await asyncio.wait_for(snapshot_read.wait(), timeout=5)
+            if snapshot_kind == "model-switch":
+                assert not self.engine._vec_entries
+            assert not await asyncio.wait_for(self.engine._persist_chunks(
+                self.db, [self.updated], [], [], "test-model"
+            ), timeout=5)
+            assert self.engine._vec_cache_dirty
+            release_refresh.set()
+            await asyncio.wait_for(refresh, timeout=5)
+            assert self.engine._vec_cache_dirty
+            assert self.engine._vec_entries[self.key][0] == self.first
+        finally:
+            release_refresh.set()
+            refresh.cancel()
+            await asyncio.wait_for(
+                asyncio.gather(refresh, return_exceptions=True), timeout=5
+            )
+        await asyncio.wait_for(self.engine.warm_vectors(), timeout=5)
+        assert self.engine._vec_entries[self.key][0] == self.updated
+        assert not self.engine._vec_cache_dirty
+
+    async def test_identity_recursive_refresh_does_not_regress_applied_generation(
+        self, monkeypatch
+    ):
+        from briefdesk.plugins.rag import engine as rag_engine
+        from briefdesk.plugins.rag.db import upsert_embeddings
+
+        await upsert_embeddings(
+            self.db, [self.key, (self.second.source, self.second.msg_id)],
+            [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], "test-model", "t3",
+        )
+        snapshot_read = asyncio.Event()
+        release_refresh = asyncio.Event()
+        real_fetch = rag_engine.fetch_new_embeddings
+
+        async def paused_fetch(*args, **kwargs):
+            result = await real_fetch(*args, **kwargs)
+            if not snapshot_read.is_set():
+                snapshot_read.set()
+                await asyncio.wait_for(release_refresh.wait(), timeout=5)
+            return result
+
+        fetch = AsyncMock(side_effect=paused_fetch)
+        monkeypatch.setattr(rag_engine, "fetch_new_embeddings", fetch)
+        refresh = asyncio.create_task(self.engine.warm_vectors())
+        try:
+            await asyncio.wait_for(snapshot_read.wait(), timeout=5)
+            assert not await asyncio.wait_for(self.engine._persist_chunks(
+                self.db, [self.updated], [], [], "test-model"
+            ), timeout=5)
+            assert self.engine._vec_cache_dirty
+            release_refresh.set()
+            await asyncio.wait_for(refresh, timeout=5)
+        finally:
+            release_refresh.set()
+            refresh.cancel()
+            await asyncio.wait_for(
+                asyncio.gather(refresh, return_exceptions=True), timeout=5
+            )
+        assert fetch.await_count == 2
+        assert not self.engine._vec_cache_dirty
+        assert self.engine._vec_entries[self.key][0] == self.updated
+        assert self.engine._matrix.shape == (2, 3)
+        matrix_index = self.engine._matrix_keys.index(self.key)
+        assert self.engine._matrix_chunks[matrix_index] == self.updated
+        assert self.engine._matrix[matrix_index].tolist() == [1.0, 0.0, 0.0]
+
+    @pytest.mark.parametrize("failure", ["error", "cancelled"])
+    async def test_identity_failed_refresh_keeps_invalidation(self, monkeypatch, failure):
+        from briefdesk.plugins.rag import engine as rag_engine
+
+        assert not await asyncio.wait_for(self.engine._persist_chunks(
+            self.db, [self.updated], [], [], "test-model"
+        ), timeout=5)
+        assert self.engine._vec_cache_dirty
+        snapshot_read = asyncio.Event()
+        release_refresh = asyncio.Event()
+        real_fetch = rag_engine.fetch_new_embeddings
+
+        async def failed_fetch(*args, **kwargs):
+            result = await real_fetch(*args, **kwargs)
+            snapshot_read.set()
+            await asyncio.wait_for(release_refresh.wait(), timeout=5)
+            if failure == "error":
+                raise RuntimeError("injected refresh failure")
+            return result
+
+        with monkeypatch.context() as patcher:
+            patcher.setattr(rag_engine, "fetch_new_embeddings", failed_fetch)
+            refresh = asyncio.create_task(self.engine.warm_vectors())
+            try:
+                await asyncio.wait_for(snapshot_read.wait(), timeout=5)
+                if failure == "error":
+                    release_refresh.set()
+                    with pytest.raises(RuntimeError, match="injected refresh failure"):
+                        await asyncio.wait_for(refresh, timeout=5)
+                else:
+                    refresh.cancel()
+                    with pytest.raises(asyncio.CancelledError):
+                        await asyncio.wait_for(refresh, timeout=5)
+                assert self.engine._vec_cache_dirty
+                assert self.engine._vec_entries[self.key][0] == self.first
+            finally:
+                release_refresh.set()
+                refresh.cancel()
+                await asyncio.wait_for(
+                    asyncio.gather(refresh, return_exceptions=True), timeout=5
+                )
+        await asyncio.wait_for(self.engine.warm_vectors(), timeout=5)
+        assert self.engine._vec_entries[self.key][0] == self.updated
+        assert not self.engine._vec_cache_dirty
 
 
 class TestRagFreshDbDays0:
@@ -1741,3 +4241,335 @@ class TestActivatePrepareUnderLock:
         finally:
             await memory_db.close()
             await plugin.teardown()
+
+
+class TestRagEvidenceNamePreparation(_MemoryEngineBase):
+    """证据名准备的并发与还原目标口径（PR 复核补项的守卫）。"""
+
+    @staticmethod
+    def _chunk(msg_id, sender_id, sender_name, group_name="测试群",
+               session_id="s1", ts=1700000000):
+        from briefdesk.plugins.rag.db import ChunkRow
+
+        return ChunkRow(
+            source="weflow-legacy", msg_id=msg_id, session_id=session_id,
+            group_name=group_name, sender_name=sender_name,
+            msg_time=ts, content="内容", item_id="",
+            sender_id=sender_id,
+        )
+
+    @staticmethod
+    def _hit(chunk):
+        from briefdesk.plugins.rag.engine import Hit
+
+        return Hit(chunk=chunk, cos=0.9, rrf=1.0, has_fts=True)
+
+    async def test_last_non_empty_display_name_wins(self):
+        """同一身份先空名后真名：还原目标取最后的非空显示名。
+
+        失败模式：首次出现者锁定映射后，先空后真名的人拿空串出站、还原也
+        找不到目标。
+        """
+        from briefdesk import pseudonym
+
+        context = pseudonym.NameContext(
+            enabled=True, pseudonymizer=pseudonym.Pseudonymizer(
+                pseudonym.registry_dir(), flush_window=0.0,
+            )
+        )
+        hits = [
+            self._hit(self._chunk("m1", "u9", "")),
+            self._hit(self._chunk("m2", "u9", "真名甲")),
+        ]
+        names = await type(self.engine)._prepare_evidence_names(context, hits)
+        assert names[0].sender == names[1].sender
+        assert names[1].sender.startswith("同学")
+        assert context.display_name_for(names[1].sender) == "真名甲"
+
+    async def test_group_rename_uses_final_name(self):
+        """同群两次改名：出站与还原目标都用最终群名（与分类批同口径）。"""
+        from briefdesk import pseudonym
+
+        context = pseudonym.NameContext(
+            enabled=True, pseudonymizer=pseudonym.Pseudonymizer(
+                pseudonym.registry_dir(), flush_window=0.0,
+            )
+        )
+        hits = [
+            self._hit(self._chunk("m1", "u1", "小明", group_name="旧群名")),
+            self._hit(self._chunk("m2", "u1", "小明", group_name="新群名")),
+        ]
+        names = await type(self.engine)._prepare_evidence_names(context, hits)
+        assert names[0].group == names[1].group
+        assert names[0].group.startswith("群")
+        assert context.display_name_for(names[1].group, kind="group") == "新群名"
+
+    async def test_idless_senders_in_same_session_keep_distinct_aliases(self):
+        """同会话两个缺 ID 的发送者：各得独立别名，不得并成一个人。
+
+        失败模式：出站映射按 (source, sender_id) 收敛且 sender_id='' 时，同源
+        全部无 ID 发送者共用一个键——成员甲的证据贴上成员乙的化名，还原时全部
+        还原成乙。身份键必须走 pseudonym 单源（含会话与显示名维度）。
+        """
+        from briefdesk import pseudonym
+
+        context = pseudonym.NameContext(
+            enabled=True, pseudonymizer=pseudonym.Pseudonymizer(
+                pseudonym.registry_dir(), flush_window=0.0,
+            )
+        )
+        hits = [
+            self._hit(self._chunk("m1", "", "成员甲")),
+            self._hit(self._chunk("m2", "", "成员乙")),
+        ]
+        names = await type(self.engine)._prepare_evidence_names(context, hits)
+        assert names[0].sender.startswith("同学")
+        assert names[1].sender.startswith("同学")
+        assert names[0].sender != names[1].sender
+        assert context.display_name_for(names[0].sender) == "成员甲"
+        assert context.display_name_for(names[1].sender) == "成员乙"
+
+    async def test_idless_senders_in_different_sessions_stay_separate(self):
+        """不同会话、缺 ID、异名：不得共用键，更不得回退真名。
+
+        失败模式：按 (source, sender_id) 查映射时键与准备阶段不一致，查不到就
+        静默回退原始 sender_name——真名直接进远端证据行。
+        """
+        from briefdesk import pseudonym
+
+        context = pseudonym.NameContext(
+            enabled=True, pseudonymizer=pseudonym.Pseudonymizer(
+                pseudonym.registry_dir(), flush_window=0.0,
+            )
+        )
+        hits = [
+            self._hit(self._chunk("m1", "", "成员甲", session_id="s1")),
+            self._hit(self._chunk("m2", "", "成员乙", session_id="s2")),
+        ]
+        names = await type(self.engine)._prepare_evidence_names(context, hits)
+        assert all(n.sender.startswith("同学") for n in names)
+        assert names[0].sender != names[1].sender
+        assert context.display_name_for(names[0].sender) == "成员甲"
+        assert context.display_name_for(names[1].sender) == "成员乙"
+
+    async def test_idless_same_name_session_dimension_and_cross_session_split(self):
+        """缺 ID 同名三输入（s1/s1/s2）：同会话复用同一别名，跨会话分离。
+
+        失败模式：删掉缺 ID 身份键的会话维度后，跨会话同名者被并成同一身份——
+        s1 与 s2 的「同名人」各拿到对方会话的化名。只有同会话输入的旧用例钉不住
+        这个维度，异名跨会话的另案又测不到「同名」分支。
+        """
+        from briefdesk import pseudonym
+
+        context = pseudonym.NameContext(
+            enabled=True, pseudonymizer=pseudonym.Pseudonymizer(
+                pseudonym.registry_dir(), flush_window=0.0,
+            )
+        )
+        hits = [
+            self._hit(self._chunk("m1", "", "同名人", session_id="s1")),
+            self._hit(self._chunk("m2", "", "同名人", session_id="s1")),
+            self._hit(self._chunk("m3", "", "同名人", session_id="s2")),
+        ]
+        names = await type(self.engine)._prepare_evidence_names(context, hits)
+        # 同会话同名：一个身份、一个别名
+        assert names[0].sender == names[1].sender
+        assert names[0].sender.startswith("同学")
+        # 跨会话同名：会话维度参与身份键，不得共用别名
+        assert names[2].sender != names[0].sender
+        assert names[2].sender.startswith("同学")
+        assert context.display_name_for(names[0].sender) == "同名人"
+        assert context.display_name_for(names[2].sender) == "同名人"
+
+    async def test_group_without_session_id_uses_name_key(self):
+        """群缺会话 ID：按群名分键，两个无会话群的证据不得共用第一个群名。"""
+        from briefdesk import pseudonym
+
+        context = pseudonym.NameContext(
+            enabled=True, pseudonymizer=pseudonym.Pseudonymizer(
+                pseudonym.registry_dir(), flush_window=0.0,
+            )
+        )
+        hits = [
+            self._hit(self._chunk("m1", "u1", "小明", group_name="甲群", session_id="")),
+            self._hit(self._chunk("m2", "u2", "小红", group_name="乙群", session_id="")),
+        ]
+        names = await type(self.engine)._prepare_evidence_names(context, hits)
+        assert names[0].group.startswith("群")
+        assert names[1].group.startswith("群")
+        assert names[0].group != names[1].group
+        assert context.display_name_for(names[0].group, kind="group") == "甲群"
+        assert context.display_name_for(names[1].group, kind="group") == "乙群"
+
+    async def test_empty_name_after_real_name_never_wipes_alias(self):
+        """同一发送者先真名后空名：空调用不得覆盖已收敛的最终名。
+
+        失败模式：映射被空调用的返回值覆盖后，整批发送者名全空、还原无目标——
+        「最后非空显示名」口径必须内建于收集阶段，而不是靠事后登记补救。
+        """
+        from briefdesk import pseudonym
+
+        context = pseudonym.NameContext(
+            enabled=True, pseudonymizer=pseudonym.Pseudonymizer(
+                pseudonym.registry_dir(), flush_window=0.0,
+            )
+        )
+        hits = [
+            self._hit(self._chunk("m1", "u9", "真名甲")),
+            self._hit(self._chunk("m2", "u9", "")),
+        ]
+        names = await type(self.engine)._prepare_evidence_names(context, hits)
+        # 空名消息与真名消息共用同一化名（同身份），整批不出现空名
+        assert names[0].sender == names[1].sender
+        assert names[1].sender.startswith("同学")
+        assert context.display_name_for(names[1].sender) == "真名甲"
+
+    async def test_group_empty_then_real_name_resolves_to_real(self):
+        """同一群先空名后真名：还原目标取真名，首个空名不锁定。"""
+        from briefdesk import pseudonym
+
+        context = pseudonym.NameContext(
+            enabled=True, pseudonymizer=pseudonym.Pseudonymizer(
+                pseudonym.registry_dir(), flush_window=0.0,
+            )
+        )
+        hits = [
+            self._hit(self._chunk("m1", "u1", "小明", group_name="")),
+            self._hit(self._chunk("m2", "u1", "小明", group_name="真群名")),
+        ]
+        names = await type(self.engine)._prepare_evidence_names(context, hits)
+        assert names[0].group == names[1].group
+        assert names[1].group.startswith("群")
+        assert context.display_name_for(names[1].group, kind="group") == "真群名"
+
+    async def test_group_real_then_empty_keeps_alias_and_restore(self):
+        """同一群先真名后空名：尾部空名不得擦掉已收敛的有效群名。
+
+        失败模式：空调用返回空串覆盖映射后，整批证据群名全空、还原无目标。
+        反向时序（真名在前）与空→真是两条独立路径，classify 的反向用例覆盖
+        不到这段独立的 RAG 实现。
+        """
+        from briefdesk import pseudonym
+
+        context = pseudonym.NameContext(
+            enabled=True, pseudonymizer=pseudonym.Pseudonymizer(
+                pseudonym.registry_dir(), flush_window=0.0,
+            )
+        )
+        hits = [
+            self._hit(self._chunk("m1", "u1", "小明", group_name="真群名")),
+            self._hit(self._chunk("m2", "u1", "小明", group_name="")),
+        ]
+        names = await type(self.engine)._prepare_evidence_names(context, hits)
+        # 两条证据同会话：群只有一个，空名消息随会话身份拿同一个化名
+        assert names[0].group == names[1].group
+        assert names[0].group.startswith("群")
+        # 出站别名与逆映射都在：还原目标仍是真名
+        assert context.display_name_for(names[0].group, kind="group") == "真群名"
+
+    async def test_all_blank_names_stay_blank_without_alias_error(self):
+        """整批显示名为空：不登记身份、不误报别名缺失，出站保持空串。"""
+        from briefdesk import pseudonym
+
+        context = pseudonym.NameContext(
+            enabled=True, pseudonymizer=pseudonym.Pseudonymizer(
+                pseudonym.registry_dir(), flush_window=0.0,
+            )
+        )
+        hits = [
+            self._hit(self._chunk("m1", "", "", group_name="")),
+            self._hit(self._chunk("m2", "u1", "", group_name="")),
+        ]
+        names = await type(self.engine)._prepare_evidence_names(context, hits)
+        assert [n.sender for n in names] == ["", ""]
+        assert [n.group for n in names] == ["", ""]
+
+    async def test_blank_group_name_joins_session_identity(self):
+        """同会话群名一空一真：空名消息的群随会话身份拿同一个化名。
+
+        群身份键按会话收敛：会话里哪怕只有一条证据带真实群名，同一会话的空名
+        消息也用它（群只有一个，空名只是缺失而不是另一个群）。
+        """
+        from briefdesk import pseudonym
+
+        context = pseudonym.NameContext(
+            enabled=True, pseudonymizer=pseudonym.Pseudonymizer(
+                pseudonym.registry_dir(), flush_window=0.0,
+            )
+        )
+        hits = [
+            self._hit(self._chunk("m1", "u1", "小明", group_name="")),
+            self._hit(self._chunk("m2", "u2", "小红", group_name="真群名")),
+        ]
+        names = await type(self.engine)._prepare_evidence_names(context, hits)
+        assert names[0].group == names[1].group
+        assert names[0].group.startswith("群")
+        assert context.display_name_for(names[0].group, kind="group") == "真群名"
+
+    async def test_new_identities_share_exactly_one_commit_increment(
+        self, tmp_path, monkeypatch
+    ):
+        """预热后一批新身份只增加一次落盘提交：分两轮 gather 会多出一个窗口。
+
+        上一版守卫只断言 `commit_count >= 1` 且未预热：「群 gather → 人 gather」
+        的错误实现同样通过。这里先提交预热身份，再断言本批增量**恰好为 1**，
+        并把人与群、缺 ID 回放身份混进同一批。注册表用例独立（tmp_path）：共享
+        会话级注册表时前序用例可能已登记本批身份，「预热后」就不再等于「本批
+        全新」，两轮 gather 的错误实现在整组里照样 12 passed。
+        """
+        import asyncio
+
+        from briefdesk import pseudonym
+        from briefdesk.config import config
+
+        monkeypatch.setattr(config, "ai_pseudonymize_names", "on")
+
+        commit_count = {"n": 0}
+        sleeps = {"n": 0}
+
+        real_commit = pseudonym.Pseudonymizer._commit_sync
+
+        def _counting_commit(self_p, batch):
+            commit_count["n"] += 1
+            return real_commit(self_p, batch)
+
+        real_sleep = asyncio.sleep
+
+        async def _counting_sleep(delay, *args, **kwargs):
+            if delay > 0:
+                sleeps["n"] += 1
+            return await real_sleep(0)
+
+        monkeypatch.setattr(pseudonym.Pseudonymizer, "_commit_sync", _counting_commit)
+        monkeypatch.setattr(asyncio, "sleep", _counting_sleep)
+
+        pseudonymizer = pseudonym.Pseudonymizer(
+            tmp_path / "pseudonym", flush_window=0.05,
+        )
+        # 预热：先提交一个与本批身份无关的身份，让后续批次落在「非首次提交」
+        # 区间（首次初始化跳过合并窗口，计不出「共享一次窗口」）
+        warm = pseudonym.NameContext(enabled=True, pseudonymizer=pseudonymizer)
+        await warm.person_alias(
+            source="weflow-legacy", sender_id="warm",
+            session_id="warm-sess", display_name="预热者",
+        )
+        assert commit_count["n"] >= 1
+        baseline = commit_count["n"]
+
+        context = pseudonym.NameContext(enabled=True, pseudonymizer=pseudonymizer)
+        hits = [
+            # 三个新有 ID 身份 + 一个缺 ID 新身份（全部未在注册表出现过）
+            self._hit(self._chunk("m1", "u1", "成员一")),
+            self._hit(self._chunk("m2", "u2", "成员二")),
+            self._hit(self._chunk("m3", "u3", "成员三")),
+            self._hit(self._chunk("m4", "u1", "成员一")),  # 已在批内，键复用
+            self._hit(self._chunk("m5", "", "无身份者")),
+        ]
+        names = await type(self.engine)._prepare_evidence_names(context, hits)
+        assert len(names) == 5
+        assert all(n.sender.startswith("同学") for n in names)
+        assert all(n.group.startswith("群") for n in names)
+        assert names[0].sender == names[3].sender
+        # 本批全部新身份一次提交：串行或分两轮 gather 都会多等窗口（sleeps ≥ 2）
+        assert sleeps["n"] <= 1, sleeps
+        assert commit_count["n"] == baseline + 1, commit_count

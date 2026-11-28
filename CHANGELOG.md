@@ -6,9 +6,52 @@
 
 本节收录尚未发布的行为变化，发布时归入对应版本号并注明日期。
 
+### 新增
+
+- 出站展示名替换开关 `AI_PSEUDONYMIZE_NAMES`（`auto` / `on` / `off`，默认 `auto`，留空等同 `auto`）：`auto` 只在生效端点为远端时替换群名与发送者名，本地端点不改写输入；非法值启动期报错。回归：`test_remote_auto_replaces_names_and_keeps_pii_out`、`test_evidence_names_kept_for_local_endpoint`。
+- 安装级别名注册表 `briefdesk/pseudonym.py`：盐与「完整哈希 → 别名」同文件原子提交，文件里只有盐与哈希；需要读写注册表时，损坏、缺盐、加锁超时或写盘失败会拒绝出站，不自动换盐也不退回真名；还原只替换完整 token，失败保留原值并按字段计数。回归：`test_corrupt_salt_never_auto_rotates`、`test_replace_failure_keeps_old_map_and_prevents_send`、`test_restore_requires_whole_token`。
+- 出境与排队计数 `briefdesk/ai_egress.py`：按端口与角色分桶记录远端/本地发送尝试、排队超时与取消、SDK 内部重试（读 `x-stainless-retry-count`）。回归：`test_queue_failures_never_count_remote_attempt`、`test_sdk_retry_separate_from_logical_attempt`、`test_disabled_telemetry_writes_no_zero_keys`。
+- RAG 历史丢弃计数 `rag.history_dropped`：记录假名化生效时丢弃非空客户端历史的问答请求。回归：`test_restored_history_round_trip_respects_pseudonymization`。
+- rag 派生索引新增 `rag_chunks.sender_id` 并从 `raw_messages` 回填：迁移先查表结构、缺列才 `ALTER`，回填只填空串，缺行或缺 ID 保持空串。回归：`test_sender_id_migration_is_idempotent`、`test_missing_raw_id_stays_empty`。
+
+### 变更
+
+- 远端端点的分类与问答请求默认替换展示名，模型输出里的别名在落库前还原为真名；本地端点输入保持不变。回归：`test_same_sender_id_uses_same_alias_in_sysb_and_sysc`、`test_quote_and_key_alias_restored_at_parse`。
+- RAG 证据行的群名与发送者名改按「实际派发端点」判定是否替换：供应商没有专用问答通道、override 被丢弃并回退主端点时，按主端点判定。回归：`test_rag_fallback_pseudonymizes_for_actual_main_endpoint`。
+- 分类批的展示名准备改为请求级一次并发准备，sysb / sysc / 摘要三次请求共用同一份请求内逆映射；准备失败整批进 failed 回填，不发明文。回归：`test_prepare_failure_fails_batch_without_sending`。
+- `quote` 在字面漂移守卫之前还原：守卫按原文（真名）比对，带别名的引文不再被判成索引漂移；语义对齐裁判改用模型原始摘录，还原值只留在展示与本地字面比对。回归：`test_quote_and_key_alias_restored_at_parse`、`test_semantic_judge_embeds_raw_alias_quote`。
+
+### 破坏性变更
+
+- `build_answer_prompt` 的 `names` 改为必填：不再回退 chunk 上的显示名，调用方必须为每条证据准备展示名，长度与命中条数不符直接报错。回归：`test_evidence_pseudonymized_for_remote_endpoint`、`test_evidence_names_kept_for_local_endpoint`。
+- rag 表新增 `rag_chunks.sender_id`：回滚必须保留字段投影读取器与新增列，直接退到旧代码会因 `SELECT c.*` 多出一列而 `TypeError`，FTS 关键词腿在读取时抛错并中止整次检索，向量腿虽不经过该读取器、实际也取不到结果。回归：`test_rollback_reader_ignores_unknown_columns`。
+
 ### 修复
 
 - 源侧透传的异常时间戳不再进入前端属性插值：`InternalMessage` 构造即把非 int（含 bool）时间戳归 0，堵住字符串时间戳经 SQLite 宽类型落库、再被分组模板插进 `data-msgtime` 属性的路径；三处分组模板的时间戳属性与单卡口径统一走 `escAttr`。回归：`InternalMessageTimestampCoercionTest`。
+- 别名还原不再把一个人换成另一个人：本请求已写回过的显示名整体受保护，落在其中的片段不再被当成别名二次替换。回归：`test_produced_display_name_is_never_reinterpreted`、`test_protected_display_name_survives_inside_sentence`。
+- 注册表读取失败不再被当成「文件不存在」而静默重建：需要读写注册表时，损坏、缺盐与版本不支持会拒绝出站，避免一次重盐让历史化名永久失效。回归：`test_read_registry_rejects_non_alias_values`、`test_version_error_does_not_echo_value`。
+- 注册表拒绝重复 JSON 键、顶层多余或缺失字段、非整数及布尔版本，异常时整批拒绝出站。回归：`test_read_registry_rejects_duplicate_keys`、`test_read_registry_requires_exact_fields`、`test_read_registry_requires_integer_version`。
+- POSIX 在注册表原子替换后同步父目录，目录同步失败仍拒绝出站；失败后同一实例上的重试会强制重写并重新同步，确认持久后才放行；Windows 跳过目录同步，只承诺原子可见性。回归：`test_atomic_write_directory_fsync_failure_is_write_error`、`test_atomic_write_windows_skips_directory_fsync`、`test_directory_fsync_failure_retry_rewrites_before_publishing`。
+- 本地端点判定的绕过路径收口：带凭据段或空 userinfo、控制字符、非法端口与近似域名一律按远端处理，畸形 URL 不再被判成本地。回归：`test_local_endpoint_matrix_fail_closed`、`test_remote_endpoint_matrix_fail_closed`。
+- RAG 的 `sender_id` 空输入不再擦掉已知身份；历史回填仅补空值，避免锁外嵌入期间的旧快照覆盖实时重索引得到的身份，实时写入仍允许非空新值覆盖。回归：`test_backfill_only_fills_identity_after_realtime_reindex`、`test_upsert_preserves_known_sender_id`。
+- 本地 HTTPS 模型端点继续读取 `SSL_CERT_FILE` / `SSL_CERT_DIR` 的自定义 CA，同时仍忽略环境代理、不跟随重定向；远端客户端保持原有行为。回归：`test_http_clients_local_https_uses_env_ca_without_proxy`、`test_http_clients_preserve_remote_sdk_defaults`、`test_http_clients_never_follow_local_to_remote_redirects`。
+- RAG 证据名的身份键、出站映射与还原目标统一走 pseudonym 模块的身份键单源：缺 ID 的发送者不再被错并成同一个人（同会话异名者各得化名、还原各还原到本人），跨会话缺 ID 的发送者不再因映射查不到而把真名送进远端证据行。回归：`test_idless_senders_in_same_session_keep_distinct_aliases`、`test_idless_senders_in_different_sessions_stay_separate`、`test_group_without_session_id_uses_name_key`。
+- 假名化生效时，缺会话 ID 的不同群名不再共用群头与别名；本地 `auto` 或 `off` 保留旧会话分组。回归：`test_idless_groups_split_only_when_pseudonymizing`。
+- 本地 `auto` 或 `off` 逐条保留原显示名，不再把同身份的旧名或空名覆盖成后续名字，保持 prompt 字节一致。回归：`test_disabled_sender_renames_keep_each_original_prompt_bytes`。
+- 假名化的「远端/本地」判定改为询问供应商的目的地声明：内置实现按 URL 判定，第三方供应商未声明或声明失败时一律按远端处理，配置写 `localhost` 不再让第三方路由把真名带出去。回归：`test_unregistered_declaration_treats_local_url_as_remote`、`test_declared_local_destination_is_honoured`、`test_declaration_failure_falls_back_to_remote`、`test_instance_only_declaration_is_not_trusted`、`test_builtin_provider_declares_url_based_destination`、`test_undeclared_provider_does_not_trust_local_endpoint`、`test_undeclared_provider_pseudonymizes_local_dispatch`。
+- 分类摘录的假值（`False`、`0`、空对象/列表）先归为空串再转字符串：此前会被转成 `"False"` 一类文本，字面对齐判不过就让该条目反复重试、卡片出不来。回归：`test_quote_empty_skips_guard`。
+- 时间标签先还原再套最终长度上限：先截断会让跨边界的别名永远换不回来，还会白记一次还原失败。回归：`test_time_label_restored_before_length_cap`。
+- RAG 历史中的已还原真名不再随假名化请求外发，客户端历史仅用于页面展示；本地 `auto` 或 `off` 仍沿用原有的裁剪规则传递历史。回归：`test_restored_history_round_trip_respects_pseudonymization`。
+- 本地 AI 端点默认不走环境代理、不跟随重定向，防止本地请求被转发至远端；远端端点保留 SDK 默认的代理、自定义 CA 与重定向行为。回归：`test_http_clients_ignore_proxy_env`、`test_http_clients_never_follow_local_to_remote_redirects`、`test_http_clients_preserve_remote_sdk_defaults`。
+- 基准报告的 `egress_summary` 相对运行起点基线取逐键差量，不继承同进程历史计数，也不清空共享遥测。回归：`test_empty_run_excludes_historical_egress`、`test_consecutive_runs_report_per_key_egress_deltas`。
+- RAG 对所有非空 chunk 批次无条件预登记提交前失效，避免已入 SQL 但尚未缓存的行在元数据更新后永久携带旧身份，FTS 同步取消也不丢失已登记通知。刷新只确认快照点之前已收尾的世代，快照后才提交或收尾的写入留待下次刷新确认；写入活跃时每次刷新都全量重读，失效按刷新合并。强制全量刷新在未切换模型时保留原水位，以原增量子批决定维度、全批安装身份，旧维度向量删除成功后才逐出缓存，不再递归重读已读全表。chunk 批次失败或取消时仅回滚保存点，保留此前未提交工作，避免无关元数据提交发布半批身份；写入正常返回、本批保存点回滚已确认或事务已经结束时收尾，`RELEASE SAVEPOINT` 失败或取消不改变已知命运的判断，只有回滚无法确认且事务仍打开时才显式报告未决写入并保留登记。全量刷新失败后即使没有新写入也必须全量重试，空表成功同步更新缓存、矩阵、水位与计数。进行中的刷新仍可服务提交前快照，未决事务需恢复连接，矩阵构造失败不在一致性保证内，GC 与坏向量删除不显式登记失效。回归：`test_cached_identity_update_without_embedding_refreshes_retrieval`、`test_identity_new_rows_register_invalidation`、`test_identity_existing_uncached_row_receives_invalidation`、`test_identity_refresh_does_not_acknowledge_unsettled_write`、`test_identity_settlement_after_snapshot_before_exit_keeps_invalidation`、`test_identity_cold_cache_registers_invalidation`、`test_identity_invalidation_survives_cancelled_fts_sync`、`test_identity_invalidation_survives_cancelled_commit`、`test_identity_failed_full_refresh_keeps_cache_and_matrix_coherent`、`test_identity_full_refresh_uses_pre_full_batch_dimension`、`test_full_refresh_installs_old_row_identity_outside_decision_batch`、`test_dimension_delete_failure_preserves_retry_basis`、`test_failed_chunk_batch_cannot_publish_via_later_meta_commit`、`test_cancelled_queued_commit_waits_for_outcome_before_settlement`、`test_unknown_outcome_keeps_write_unsettled`、`test_failed_full_refresh_retries_without_chunk_write`、`test_failed_full_refresh_retries_with_unchanged_total`。
+- RAG 并发首次初始化只迁移一次，避免迁移及提交交错。回归：`test_concurrent_ensure_db_ready_migrates_once`。
+- 证据行与分类批的「最后非空显示名」口径内建于收集阶段：先空后真名、真名后空名、群名先空后真与先真后空都不再出现空名覆盖有效别名或锁定首个空串。回归：`test_empty_name_after_real_name_never_wipes_alias`、`test_group_empty_then_real_name_resolves_to_real`、`test_group_real_then_empty_keeps_alias_and_restore`、`test_trailing_empty_name_does_not_wipe_earlier_real_name`、`test_multiple_real_names_take_the_last_one`。
+- RAG 证据名中的人与群身份共享一次并发准备，新身份只需一次注册表落盘，避免分开准备或逐条等待导致重复提交。回归：`test_new_identities_share_exactly_one_commit_increment`。
+- 启用假名化时证据名的出站映射查不到即按准备失败处理，不再静默回退真名。回归：`test_prepare_failure_skips_answer_request`。
+- `rag_chunks.sender_id` 迁移的回填失败或被取消时整体回滚：不再留下「列已加、值全空、下次启动不再回填」的死状态。回归：`test_sender_id_backfill_failure_rolls_back_whole_migration`。
+- SDK 重试观测仅在本次 create 读到重试序号头且重试计数从未失败时记为可用，计数失败会锁存，计数入口自身吞掉的写失败同样算失败；基准报告的 `sdk_retry_observed` 仅表示本轮至少一次 create 的重试观测完整可用，不用遥测开关替代观测状态；其他 create 观测失败时该标志仍可能为 `true`，不保证整轮重试总数完整。回归：`test_retry_observed_true_with_zero_retries`、`test_egress_summary_uses_header_observation_not_telemetry_switch`、`test_retry_record_failure_latches_observation_unavailable`、`TestSendBoundary::test_hook_failure_never_breaks_the_request`、`TestSendBoundary::test_swallowed_counter_write_failure_never_claims_retry_observed`。
 
 ## [0.2.0] - 2026-11-14
 

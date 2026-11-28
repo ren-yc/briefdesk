@@ -308,6 +308,34 @@ class SettingsSchemaTest(unittest.TestCase):
         self.assertEqual(item["label"], "启用本地运行指标")
         self.assertIn("正文", item["hint"])
 
+    def test_core_settings_expose_pseudonymize_switch(self) -> None:
+        """出站化名开关必须渲染成下拉，且空选项是合法暂存值。
+
+        失败模式：只在 config 里加字段、忘了在 `_core_schema` 的 options 登记，
+        设置页会渲染成文本框且 PUT 放行任意字符串——非法值要到下次启动才炸，
+        用户看到的是「保存成功、重启失败」。空选项同样必须登记：暂存层把「未
+        填写」存成空串，启动期按 auto 消费，下拉里没有空选项时清空输入会得到
+        422，两条路径对同一份文件给出不同答案。
+        """
+        from briefdesk.config import PSEUDONYMIZE_NAMES_VALUES
+        from briefdesk.server.routes_settings_env import _core_schema
+
+        by_key = {item["key"]: item for item in _core_schema()}
+        item = by_key["AI_PSEUDONYMIZE_NAMES"]
+        self.assertEqual(item["type"], "select")
+        self.assertEqual(item["options"], ["", *PSEUDONYMIZE_NAMES_VALUES])
+        self.assertEqual(item["default"], "auto")
+        # 中文文案来自 _CORE_UI 覆盖层（按环境键名合入）
+        self.assertEqual(item["label"], "出站姓名/群名替换为化名")
+        self.assertIn("远端", item["hint"])
+        self.assertIn("本地", item["hint"])
+        # 语义边界要写在文案里：它不是全字段匿名
+        self.assertIn("展示名", item["hint"])
+        self.assertEqual(normalize_setting(item, ""), "")
+        self.assertEqual(normalize_setting(item, "off"), "off")
+        with self.assertRaises(ValueError):
+            normalize_setting(item, "maybe")
+
     def test_every_core_field_has_curated_copy(self) -> None:
         """核心字段必须有中文文案，且 _CORE_UI 不得含未知键。
 

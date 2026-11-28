@@ -5,6 +5,10 @@
 读路径（/api/rag/ask）：向量缓存（created_at 水位增量填充，解析放工作线程）
 → FTS 双路召回 → RRF 融合 → 拒答门 → AI 引用式回答。
 
+出站假名化：证据行里的姓名/群名先看**实际派发端点**（供应商没有专用 rag_chat
+时 override 会被丢弃、请求走主端点），远端才换成化名，本地原样；回答文本按请求
+内逆映射还原。准备失败时这次回答的请求根本不发生——绝不回退成真名重发。
+
 作用域语义（隐私边界，见 architecture.md）：启用会话恒为前提；
 RAG_GROUP_ONLY（默认开）进一步限定群聊——停用会话即时不可问出。
 rag 五表（chunks/embeddings/fts/meta/skipped）是 raw_messages 的派生索引；向量表
@@ -20,16 +24,19 @@ import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from typing import Any
 
 import aiosqlite
 import numpy as np
 
 from briefdesk import ai_ports
+from briefdesk.config import config
 from briefdesk.db import get_db, get_embed_db, get_embed_lock, storage_lock
 from briefdesk.masking import PLACEHOLDER_ONLY_RE
 from briefdesk.plugins.rag.config import RagSettings
 from briefdesk.plugins.rag.db import (
     ChunkRow,
+    ChunkWriteOutcomeUnknownError,
     ensure_fts,
     ensure_rag_schema,
     fetch_all,
@@ -43,6 +50,14 @@ from briefdesk.plugins.rag.db import (
     sync_fts,
     upsert_chunks,
     upsert_embeddings,
+)
+from briefdesk.plugins.rag.prompts import EvidenceNames, build_answer_prompt
+from briefdesk.pseudonym import (
+    NameContext,
+    PseudonymError,
+    group_identity_key,
+    person_identity_key,
+    pseudonymize_enabled,
 )
 from briefdesk.types import BatchContext
 
@@ -138,10 +153,15 @@ class RagEngine:
         # FTS 可用性惰性探测结果（None=未探测；False=纯向量模式）
         self._fts_enabled: bool | None = None
         self._schema_ready = False
+        self._schema_lock = asyncio.Lock()
         # 向量缓存：created_at 水位增量填充；模型切换/行数回退全量重建
         self._vec_model: str | None = None
         self._vec_watermark = ""
         self._vec_count_seen = 0
+        self._vec_full_retry = False
+        self._vec_invalidations = 0
+        self._vec_applied_invalidations = 0
+        self._vec_unsettled_writes = 0
         self._vec_entries: dict[tuple[str, str], tuple[ChunkRow, np.ndarray]] = {}
         # 预组 float32 矩阵（缓存变更时重组，ask 路径零转换零拷贝直用）
         self._matrix: np.ndarray | None = None
@@ -157,10 +177,15 @@ class RagEngine:
         # 维护循环拉起钩子（plugin.activate 注入；reindex 经此重启循环）
         self.on_backfill_kick: Callable[[], None] | None = None
 
+    @property
+    def _vec_cache_dirty(self) -> bool:
+        return self._vec_applied_invalidations != self._vec_invalidations
+
     async def teardown(self) -> None:
         self._vec_entries.clear()
         self._vec_count_seen = 0
         self._vec_watermark = ""
+        self._vec_full_retry = False
         self._matrix = None
         self._matrix_keys = []
         self._matrix_chunks = []
@@ -168,11 +193,14 @@ class RagEngine:
     async def _ensure_db_ready(self) -> aiosqlite.Connection:
         db = await self._db_factory()
         if not self._schema_ready:
-            await ensure_rag_schema(db)
-            self._fts_enabled = await ensure_fts(db)
-            if not self._fts_enabled:
-                logger.warning("rag: FTS 不可用，降级纯向量检索")
-            self._schema_ready = True
+            # 并发首次调用会交错迁移与提交；锁内复查，避免等待者重复迁移。
+            async with self._schema_lock:
+                if not self._schema_ready:
+                    await ensure_rag_schema(db)
+                    self._fts_enabled = await ensure_fts(db)
+                    if not self._fts_enabled:
+                        logger.warning("rag: FTS 不可用，降级纯向量检索")
+                    self._schema_ready = True
         return db
 
     async def prepare(self) -> None:
@@ -214,22 +242,49 @@ class RagEngine:
         emb_items: list[tuple[str, str]],
         emb_vecs: list[list[float]],
         model: str,
+        *,
+        sender_id_fill_only: bool = False,
     ) -> bool:
         """落库唯一出口：chunks → FTS 同步 → 向量（专用连接）。
 
-        实时批次与历史回填共用本方法，令「入了 chunks 却漏同步 FTS」在结构上
-        不可能发生——那种漏同步不会报错，只会让检索静默少一条腿（FTS 索引与
-        rag_chunks 分叉，且反连接补不回来，它只看向量缺失）。
+        实时批次与历史回填共用本方法，令「入了 chunks 却漏同步 FTS」在成功
+        路径上不可能发生；chunk 写入与 FTS 同步之间被取消仍可能缺 FTS 行。
+        缺少当前模型 embedding 的行会被反连接选中回填并同步 FTS；已有当前
+        模型 embedding 却缺 FTS 的行不会被选中，仍可能让检索静默少一条腿。
         model 由调用方传入而非在此现取：回填的反连接谓词已按某个 model 值筛过
         行，落库必须写同一个值，否则下一轮又把这批选回来（空转死循环）。
         返回是否写入了向量，供调用方决定要不要触发自愈回填。
+
+        chunk 写入成功、本批回滚已确认或事务已结束时才收尾；回滚未获确认且
+        事务仍打开时保留登记，否则提交前快照会确认随后才发布的身份更新。
 
         连接纪律：调用方持有 storage_lock 与否由调用路径决定（run 在管道锁内、
         backfill_step 自行持锁）；本方法对共享 embed 连接的写统一持
         db.get_embed_lock()——dedup 的向量落库共用同一条连接，语句级互斥
         防止一方的 commit 把另一方未完成的批量写入提前提交。
         """
-        await upsert_chunks(db, rows)
+        # 缓存成员关系既不能证明行是全新的，也不能证明 SQL 中尚无此行；
+        # 按缓存状态筛选只是猜缓存没有的答案，每种猜法都会留下缺口。
+        # 水位之上的 embedding 已提交但尚未缓存时，元数据更新可与刷新交错，
+        # 让刷新安装提交前身份并越过其水位，后续增量读取永不再访该行。
+        # 所有非空批次都在提交前登记世代及未收尾写入，不等刷新锁。
+        # 写入活跃时，每个后续刷新都全量重读；脏状态合并为每次刷新一次，
+        # 而非每个批次一次，以此换取写入命运确定后的下次刷新不再服务旧身份。
+        # 回滚成功即已丢弃本批，RELEASE 失败不改命运；事务已结束也不能再晚发布。
+        # 回滚失败且事务仍打开才保留登记，否则提交前快照可能确认尚未发布的世代。
+        registered = bool(rows)
+        if registered:
+            self._vec_invalidations += 1
+            self._vec_unsettled_writes += 1
+        outcome_known = True
+        try:
+            await upsert_chunks(db, rows, sender_id_fill_only=sender_id_fill_only)
+        except ChunkWriteOutcomeUnknownError:
+            outcome_known = False
+            raise
+        finally:
+            if registered and outcome_known:
+                self._vec_unsettled_writes -= 1
         if self._fts_enabled:
             await sync_fts(db, rows)
         if not emb_items:
@@ -290,6 +345,7 @@ class RagEngine:
                 msg_time=msg.timestamp,
                 content=msg.content,
                 item_id=item_map.get((msg.source, msg.msg_id), ""),
+                sender_id=msg.sender_id,
             )
             rows.append(row)
             vec = batch.preembeddings.pop((row.source, row.msg_id), None)
@@ -342,7 +398,7 @@ class RagEngine:
         # rag_skipped），旧向量永不更新。
         sql = (
             "SELECT r.source, r.msg_id, r.session_id, r.group_name, "
-            "r.sender_name, r.timestamp AS msg_time, "
+            "r.sender_name, r.sender_id, r.timestamp AS msg_time, "
             "COALESCE(c.content, r.content) AS content "
             "FROM raw_messages r "
             "LEFT JOIN rag_chunks c ON c.source = r.source AND c.msg_id = r.msg_id "
@@ -367,7 +423,7 @@ class RagEngine:
                 source=r["source"], msg_id=r["msg_id"],
                 session_id=r["session_id"], group_name=r["group_name"],
                 sender_name=r["sender_name"], msg_time=r["msg_time"],
-                content=r["content"],
+                content=r["content"], sender_id=r["sender_id"],
             )
             for r in raw_rows
             if _indexable(r["content"])
@@ -416,6 +472,7 @@ class RagEngine:
                 [(r.source, r.msg_id) for r in rows[:paired]],
                 vectors[:paired],
                 model,
+                sender_id_fill_only=True,
             )
         self.last_cycle_embed_failed = failed
         logger.info("rag: 回填本轮处理 %d 条（含向量 %d 条）", len(rows), paired)
@@ -448,13 +505,9 @@ class RagEngine:
         水位/整表重建不交错（交错当前是良性的，但锁纪律名存实亡会诱使
         后续在 _refresh_vector_cache 中加入非幂等步骤）。
 
-        force_full 语义：整表重建 = 拉全表后按 key 差集剔除
-        缓存内本次未 fetch 到的条目——否则「删除信号」被归零计数吞掉，
-        已删内容持续可被检索。
+        force_full 只给查询传空水位，未切换模型时成功前保留原水位与计数；模型切换会在读取前清空缓存，切换后失败不保留原缓存内容。删除检测由全表 key 差集承担，失败后必须全量重试，不能退回不会裁剪旧 key 的增量读取。
 
-        水位归零发生在 _refresh_vector_cache 内、行数回退守卫之前：force_full
-        轮次守卫恒不触发（count_seen 已归零），删除检测完全由 fetch 后的 key
-        差集剔除承担——该剔除位于 raw_rows 判空之前，全表删光也收敛。
+        维度决策在未切换模型时只看原水位闭区间内的解析行，空批才退回全表；模型切换时用全批，安装始终用全表，避免旧维度左右新批决策或旧行身份漏更新。脏行删除成功后逐出对应缓存，维度漂移仍清空旧缓存，全量读取不再递归。解析与脏行删除成功后才裁剪并重组矩阵，空表同步清空两者并更新水位与计数。矩阵构造失败的一致性不在保证内。
         """
 
         async with self._refresh_lock:
@@ -489,15 +542,23 @@ class RagEngine:
         )
 
     async def _refresh_vector_cache(self, *, force_full: bool = False) -> None:
+        # 首个 await 前同时捕获世代与收尾状态，未收尾写入及刷新中的新登记
+        # 不能随旧快照消账；退出时不重读收尾计数。
+        invalidations = self._vec_invalidations
+        settled = self._vec_unsettled_writes == 0
+        previous_watermark = self._vec_watermark
+        force_full = force_full or self._vec_cache_dirty or self._vec_full_retry
+        if force_full:
+            # 全量失败后必须整表重试：清缓存可能已使行数回退检测失效，
+            # 普通增量读取又不裁剪 key 差集，否则已删内容会静默留在检索中。
+            self._vec_full_retry = True
         model = ai_ports.embed_model_name()
-        if self._vec_model != model:
+        model_switched = self._vec_model != model
+        if model_switched:
             logger.info("rag: 嵌入模型切换 %s -> %s，重建向量缓存", self._vec_model, model)
             self._vec_cache_clear()
             self._vec_model = model
         edb = await self._embed_factory()
-        if force_full:
-            self._vec_watermark = ""
-            self._vec_count_seen = 0
         # 共享 embed 连接上的读也持互斥锁：本方法结尾的 bad-key 删除会 commit，
         # 不持锁的 commit 可能把 dedup 未完成的批量向量写入提前提交
         async with get_embed_lock():
@@ -505,26 +566,28 @@ class RagEngine:
                 edb, "SELECT COUNT(*) AS c FROM rag_chunk_embeddings"
             )
             total = int(row["c"]) if row is not None else 0
-            if total < self._vec_count_seen:
+            if not force_full and total < self._vec_count_seen:
                 self._vec_cache_clear()  # 有删除（GC），水位失效，整表重建
             raw_rows, max_created = await fetch_new_embeddings(
-                edb, model, self._vec_watermark, self.settings.group_only
+                edb, model, "" if force_full else self._vec_watermark,
+                self.settings.group_only,
             )
         if force_full:
-            # 整表重建：本次 fetch 到的 key 集合之外，缓存内其余
-            # key 一律剔除——等价整表重建但省一次全量重嵌，且空表（全删）时
-            # 也能清空残留。放在 raw_rows 判空之前，保证「删光了」也能收敛。
-            # _vec_count_seen 由本方法末尾 self._vec_count_seen = total 统一
-            # 更新为全表行数（收缩检测语义保持不变）。
+            # 先记录整表 key 差集，解析与脏行删除成功后才裁剪缓存并重组矩阵；
+            # 解析或脏行删除失败、取消时不能留下已裁剪字典与旧矩阵。
             fetched_keys = {(r["source"], r["msg_id"]) for r in raw_rows}
-            for key in list(self._vec_entries):
-                if key not in fetched_keys:
-                    del self._vec_entries[key]
         if not raw_rows:
             if force_full:
-                # 全表已空（全部删除）：差集剔除已清空 _vec_entries，须重建
-                # 矩阵，否则旧的 float32 矩阵残留已删向量继续参与检索。
+                # 全表已空：同步清空缓存与矩阵，否则旧向量仍可参与检索。
+                self._vec_entries.clear()
                 self._rebuild_matrix()
+                self._vec_watermark = max_created
+                self._vec_count_seen = total
+                self._vec_full_retry = False
+            if settled:
+                self._vec_applied_invalidations = max(
+                    self._vec_applied_invalidations, invalidations
+                )
             return
         entries, bad_keys = await asyncio.to_thread(parse_embedding_rows, raw_rows)
         # 维度对账：同模型名下供应商原地换维度或历史脏行会让
@@ -535,7 +598,19 @@ class RagEngine:
         # 整表重建。不一致向量绝不进矩阵。
         full_rebuild = False
         if entries:
-            batch_dims = {v.shape[0] for _, v in entries}
+            decision_entries = entries
+            # 模型切换后原水位属于旧模型，不能界定新模型的数据；否则较早
+            # 的有效向量被排除，较新的脏向量主导维度决策并误删有效行。
+            if force_full and not model_switched and previous_watermark:
+                recent_keys = {
+                    (row["source"], row["msg_id"]) for row in raw_rows
+                    if row["created_at"] >= previous_watermark
+                }
+                decision_entries = [
+                    (chunk, vec) for chunk, vec in entries
+                    if (chunk.source, chunk.msg_id) in recent_keys
+                ] or entries
+            batch_dims = {vec.shape[0] for _, vec in decision_entries}
             cached_dim = (
                 next(iter(self._vec_entries.values()))[1].shape[0]
                 if self._vec_entries
@@ -546,9 +621,11 @@ class RagEngine:
                     ref_dim = next(iter(batch_dims))
                 else:
                     counts: dict[int, int] = {}
-                    for _, v in entries:
-                        counts[v.shape[0]] = counts.get(v.shape[0], 0) + 1
-                    ref_dim = max(counts, key=lambda d: (counts[d], d))
+                    for _, vec in decision_entries:
+                        counts[vec.shape[0]] = counts.get(vec.shape[0], 0) + 1
+                    ref_dim = max(
+                        counts, key=lambda dimension: (counts[dimension], dimension)
+                    )
             elif batch_dims == {cached_dim}:
                 ref_dim = cached_dim
             elif len(batch_dims) == 1:
@@ -557,7 +634,6 @@ class RagEngine:
                     "整表重建缓存；旧行由回填按当前维度重嵌入",
                     cached_dim, next(iter(batch_dims)),
                 )
-                self._vec_cache_clear()
                 ref_dim = next(iter(batch_dims))
                 full_rebuild = True
             else:
@@ -571,16 +647,36 @@ class RagEngine:
             entries = kept
         if bad_keys:
             await self._delete_bad_embeddings(edb, bad_keys)
+            # 删除成功后才逐出，且到矩阵重组之间不再 await，保证删除失败
+            # 或取消时保留原缓存与矩阵；坏 key 仍在 fetched_keys 中，
+            # 仅差集裁剪会让已删除向量继续检索，补行抵消计数回退也不会自愈。
+            for key in bad_keys:
+                self._vec_entries.pop(key, None)
+        if full_rebuild:
+            # 已删的旧维度 key 仍在 fetched_keys，差集裁剪不会逐出其缓存；
+            # 删除成功后必须清缓存，否则新旧维度混装会让矩阵重组报形状不齐。
+            self._vec_cache_clear()
+        if force_full:
+            for key in list(self._vec_entries):
+                if key not in fetched_keys:
+                    del self._vec_entries[key]
         for chunk, vec in entries:
             self._vec_entries[(chunk.source, chunk.msg_id)] = (chunk, vec)
+        self._rebuild_matrix()
         self._vec_watermark = max_created
         self._vec_count_seen = total
-        self._rebuild_matrix()
-        if full_rebuild:
-            # 整表重建：水位归零再拉一次全表，把本批之前写入的当前维度行
-            # 收进缓存；递归至多一层——缓存基准已更新，不会再触发重建分支
+        if force_full:
+            self._vec_full_retry = False
+        if full_rebuild and not force_full:
+            # 增量漂移才再拉全表，把水位之前的当前维度行收进缓存；全量读取
+            # 已安装全批，再递归会让原水位边界丢失，旧维度重新左右决策。
             self._vec_watermark = ""
             await self._refresh_vector_cache()
+        # 递归重建可能已确认更新的世代，外层不能把确认计数倒退。
+        if settled:
+            self._vec_applied_invalidations = max(
+                self._vec_applied_invalidations, invalidations
+            )
 
     @staticmethod
     async def _delete_bad_embeddings(
@@ -703,6 +799,184 @@ class RagEngine:
     _CITE_RE = re.compile(r"\[(\d{1,2})\]")
 
     @staticmethod
+    def _name_context(dispatch: ai_ports.RagDispatch) -> NameContext:
+        """按**实际派发端点**决定这次请求要不要假名化。
+
+        判定只看 `dispatch.api_base`，绝不拿本插件的 `settings.api_base`
+        （override）代替：供应商没有专用 rag_chat 时，`ai_ports.rag_chat` 回退
+        复用 `chat`，override 被静默丢弃、请求落到主端点。按 override 判成本地、
+        请求却发往远端主机，姓名就被原样送出去了——这是静默泄露，不是报错
+        （回归见 tests/test_rag_plugin.py 的
+        test_rag_fallback_pseudonymizes_for_actual_main_endpoint）。
+
+        本地端点给 disabled 上下文：名字原样透传，也不碰磁盘上的别名注册表。
+        """
+        enabled = pseudonymize_enabled(
+            config.ai_pseudonymize_names,
+            remote_endpoint=ai_ports.effective_remote(dispatch.api_base),
+        )
+        return NameContext(enabled=enabled)
+
+    @staticmethod
+    async def _prepare_evidence_names(
+        context: NameContext, hits: list[Hit]
+    ) -> list[EvidenceNames]:
+        """准备每条证据行的展示名（按身份键复用同一化名）。
+
+        收集与出站全部复用 pseudonym 模块的身份键单源（`person_identity_key` /
+        `group_identity_key`）：本层另写一套键规则，就会出现「准备用的键」与
+        「还原目标用的键」口径分叉——缺 ID 的发送者被错并成同一人（同会话两条
+        证据共用一个化名、还原都还原成同一个人），或按残缺键查不到映射而静默
+        回退真名出境。
+
+        先按输入顺序收敛每个身份的最终显示名（空显示名跳过、不锁定空串：先空
+        后真名的人拿真名出站，也拿真名还原）；再用最终显示名重算身份键并发取
+        别名。缺 ID 时显示名参与身份键，最终名替换后键随名收敛——同一身份的
+        每条证据从此只有一个键、一个化名、一个还原目标（别名调用发生在最终名
+        上，逆映射登记的正是最终名）。人与群共享**一次** gather：冻结模块对新
+        身份有合并落盘窗口，逐条 await 或分两轮 gather 会让每个窗口各等一次，
+        证据越多准备越慢。
+
+        启用假名化时出站映射只查身份键，查不到（映射遗漏）按准备失败处理，
+        绝不静默回退真名；准备失败（注册表损坏、锁超时、写盘失败）同样向上抛，
+        调用方据此让这次回答的请求根本不发生。不要捕获后回退原名——那等于把
+        假名化失败悄悄升级成一次明文出境。
+        """
+        if not context.enabled:
+            # 关闭时不做任何准备：每条证据用原值（含未清洗的空白），与未接入
+            # 假名化时逐字节一致，也不产生任何读盘或 await。
+            return [
+                EvidenceNames(group=hit.chunk.group_name, sender=hit.chunk.sender_name)
+                for hit in hits
+            ]
+
+        person_final: dict[str, str] = {}
+        group_final: dict[str, str] = {}
+        for hit in hits:
+            chunk = hit.chunk
+            if (chunk.sender_name or "").strip():
+                pkey0 = person_identity_key(
+                    source=chunk.source,
+                    sender_id=chunk.sender_id,
+                    session_id=chunk.session_id,
+                    display_name=chunk.sender_name,
+                )
+                person_final[pkey0] = chunk.sender_name.strip()
+            if (chunk.group_name or "").strip():
+                gkey0 = group_identity_key(
+                    source=chunk.source,
+                    session_id=chunk.session_id,
+                    group_name=chunk.group_name,
+                )
+                group_final[gkey0] = chunk.group_name.strip()
+
+        # 第二轮：用最终显示名重算身份键。缺 ID 时最终名正是键的一部分，键随
+        # 名收敛；同一身份的每条证据由此拿到同一个键。
+        person_jobs: dict[str, tuple[str, str, str, str]] = {}
+        group_jobs: dict[str, tuple[str, str, str]] = {}
+        plans: list[tuple[str | None, str | None]] = []
+        for hit in hits:
+            chunk = hit.chunk
+            pkey0 = person_identity_key(
+                source=chunk.source,
+                sender_id=chunk.sender_id,
+                session_id=chunk.session_id,
+                display_name=chunk.sender_name,
+            )
+            final_name = person_final.get(pkey0, "")
+            if final_name:
+                pkey = person_identity_key(
+                    source=chunk.source,
+                    sender_id=chunk.sender_id,
+                    session_id=chunk.session_id,
+                    display_name=final_name,
+                )
+                person_jobs.setdefault(
+                    pkey,
+                    (chunk.source, chunk.sender_id, chunk.session_id, final_name),
+                )
+            else:
+                pkey = None
+            gkey0 = group_identity_key(
+                source=chunk.source,
+                session_id=chunk.session_id,
+                group_name=chunk.group_name,
+            )
+            final_group = group_final.get(gkey0, "")
+            if final_group:
+                gkey = group_identity_key(
+                    source=chunk.source,
+                    session_id=chunk.session_id,
+                    group_name=final_group,
+                )
+                group_jobs.setdefault(
+                    gkey, (chunk.source, chunk.session_id, final_group)
+                )
+            else:
+                gkey = None
+            plans.append((pkey, gkey))
+
+        # 人与群一起进同一次 gather：窗口按「登记到提交」计时，分两轮 gather
+        # 会让后一轮的新身份再各等一个窗口。别名结果按身份键归还。
+        async def _person(job: tuple[str, str, str, str]) -> str:
+            source, sender_id, session_id, name = job
+            return await context.person_alias(
+                source=source, sender_id=sender_id,
+                session_id=session_id, display_name=name,
+            )
+
+        async def _group(job: tuple[str, str, str]) -> str:
+            source, session_id, name = job
+            return await context.group_alias(
+                source=source, session_id=session_id, group_name=name,
+            )
+
+        jobs: list[tuple[str, Any]] = [
+            *(("person", job) for job in person_jobs.values()),
+            *(("group", job) for job in group_jobs.values()),
+        ]
+        aliases = (
+            await asyncio.gather(
+                *(_person(job) if kind == "person" else _group(job) for kind, job in jobs)
+            )
+            if jobs
+            else []
+        )
+        alias_by_key: dict[str, str] = {}
+        for (kind, job), alias in zip(jobs, aliases, strict=True):
+            key = (
+                person_identity_key(
+                    source=job[0], sender_id=job[1],
+                    session_id=job[2], display_name=job[3],
+                )
+                if kind == "person"
+                else group_identity_key(
+                    source=job[0], session_id=job[1], group_name=job[2]
+                )
+            )
+            alias_by_key[key] = alias
+
+        # 出站映射按预先算好的键投影；启用假名化后查不到映射（映射遗漏）按
+        # 准备失败处理，绝不静默回退真名。整批无显示名的身份没有注册键，
+        # 出站保持空串——空名不是身份，也不构成出境风险。
+        names: list[EvidenceNames] = []
+        for hit, (pkey, gkey) in zip(hits, plans, strict=True):
+            if pkey is None:
+                sender = ""
+            else:
+                sender = alias_by_key.get(pkey, "")
+                if not sender:
+                    raise PseudonymError("证据发送者别名缺失：出站映射不回退真名")
+            if gkey is None:
+                group = ""
+            else:
+                group = alias_by_key.get(gkey, "")
+                if not group:
+                    raise PseudonymError("证据群名别名缺失：出站映射不回退真名")
+            names.append(EvidenceNames(group=group, sender=sender))
+        return names
+
+    @staticmethod
     def _citation(n: int, hit: Hit) -> dict:
         chunk = hit.chunk
         return {
@@ -731,10 +1005,13 @@ class RagEngine:
         永远看着「零失败」。取消单列：CancelledError 是 BaseException 子类，
         `except Exception` 兜不到它，而取消路径上「ask 已计、终态桶全空」会让
         恒等式失效。
+
+        假名化准备失败落在 answer_error：这次回答的 create 没发生，与「请求发出
+        但失败」在「没有答案」上同类；已发生的查询嵌入仍如实留在 embed 桶里
+        （那是另一个端口，无法随本次失败回滚）。
         """
 
         from briefdesk import telemetry
-        from briefdesk.plugins.rag.prompts import build_answer_prompt
 
         telemetry.record("rag.ask")
         try:
@@ -748,19 +1025,34 @@ class RagEngine:
         if not hits:
             telemetry.record("rag.refused")
             return AskResult(refused=True, answer="没有在群聊记录里找到相关消息。")
-        messages = build_answer_prompt(
-            datetime.now(UTC).astimezone(), question.strip(), hits, history or [],
-            self.settings.evidence_chars,
-        )
+        # 问答模型通道 override 来自本插件配置域（三项留空 = 复用主链路 AI）。
+        # 先按同一三元组取一次**实际派发计划**，再用它决定要不要假名化、并用
+        # 完全相同的值发送：计划与发送描述同一件事，否则回退到主端点的请求会
+        # 按 override 判成本地而带上真名。
+        override = {
+            "model": self.settings.model,
+            "api_base": self.settings.api_base,
+            "api_key": self.settings.api_key.get_secret_value(),
+        }
         try:
-            # 问答模型通道 override 来自本插件配置域（三项留空 = 复用主链路 AI）
+            dispatch = ai_ports.resolve_rag_dispatch(**override)
+            context = self._name_context(dispatch)
+            names = await self._prepare_evidence_names(context, hits)
+            prompt_history = history or []
+            if context.enabled and prompt_history:
+                # 历史含上轮还原的真名，当前证据映射无法覆盖已离开命中集的人；
+                # 启用时整段丢弃，避免还原结果再次出境。
+                prompt_history = []
+                telemetry.record("rag.history_dropped")
+            messages = build_answer_prompt(
+                datetime.now(UTC).astimezone(), question.strip(), hits, prompt_history,
+                self.settings.evidence_chars, names=names,
+            )
             resp = await ai_ports.rag_chat(
                 messages,
                 temperature=0.2,
                 max_tokens=1024,
-                model=self.settings.model,
-                api_base=self.settings.api_base,
-                api_key=self.settings.api_key.get_secret_value(),
+                **override,
             )
             content = ""
             choices = getattr(resp, "choices", None) or []
@@ -808,6 +1100,11 @@ class RagEngine:
                 nums = sorted(cited)
             else:
                 nums = sorted(cited) if cited else list(range(1, len(hits) + 1))
+            # 入站还原只作用在答案自由文本上：此时两种输出形态（JSON 契约与纯文本）
+            # 都已经解析完，剩下的是要给人看的文字。引用编号、source/msg_id 与证据
+            # 下标原样保留——化名只替换显示了身份的那部分文字，编号不是身份。
+            # 还原失败（模型把化名抄错）保留化名并计遥测，不改发真名、不重试明文。
+            answer = context.restore(answer, field="answer")
             citations = [self._citation(n, hits[n - 1]) for n in nums]
         except asyncio.CancelledError:
             telemetry.record("rag.cancelled")

@@ -17,6 +17,10 @@ REASONING_EFFORT_VALUES: tuple[str, ...] = (
     "minimal", "low", "medium", "high", "xhigh", "max",   # 固定强度
 )
 
+# 出站展示名形态替换的取值：启动期校验与设置页下拉共用这一份清单——
+# 两处各手抄一份，加一个取值时必然有一处漏改，表现是「保存成功、重启失败」。
+PSEUDONYMIZE_NAMES_VALUES: tuple[str, ...] = ("auto", "on", "off")
+
 
 class Settings(KeyringSettingsBase):
     """应用配置，从 .env 读取，密钥字段支持系统密钥环。"""
@@ -85,6 +89,39 @@ class Settings(KeyringSettingsBase):
     )
     """单条消息随分类请求附图的上限：多图消息超出部分只发 OCR 文本；
     单次请求另有图片总量预算兜底（classify 引擎内 _MAX_IMAGES_PER_REQUEST）。"""
+
+    ai_pseudonymize_names: str = Field(
+        default="auto", alias="AI_PSEUDONYMIZE_NAMES"
+    )
+    """出站展示名形态替换开关（取值见 PSEUDONYMIZE_NAMES_VALUES）。
+
+    auto（默认）：只在**生效端点**为远端时启用——本地端点（同机 ollama 等）不改写
+    输入，本地进程不出境，改写只会让分类结果与本机库里的原值对不上；on：强制启用；
+    off：强制关闭。空串与未设置一样按 auto：设置页/暂存层把「未填写」存成空值，
+    把空串当非法值会让「清空输入」变成下次启动失败。
+
+    语义边界：它是**出站展示名的形态替换**，把姓名/群名这类自由文本标识换成稳定
+    化名再送出去，不是全字段匿名——正文内容、编号、结构化字段都不动，也不覆盖
+    既有的手机号/邮箱脱敏。
+
+    非法值在启动期报错（响亮失败，避免拼错后静默按 auto 处理）。"""
+
+    @field_validator("ai_pseudonymize_names")
+    @classmethod
+    def _validate_pseudonymize_names(cls, value: str) -> str:
+        normalized = value.strip()
+        # 空白（含空串）按「未填写」处理：暂存文件里 `KEY=` 读回的就是空串，
+        # 那是设置页把该项清空后的正常形态，不是拼错。
+        if not normalized:
+            return "auto"
+        # 不做大小写归一：`AUTO` 在这里是拼错的强信号，静默接受会让用户以为
+        # off 已经生效。
+        if normalized not in PSEUDONYMIZE_NAMES_VALUES:
+            raise ValueError(
+                f"非法取值 {value!r}；可选：{'、'.join(PSEUDONYMIZE_NAMES_VALUES)}"
+                "（留空等于 auto）"
+            )
+        return normalized
 
     # RAG 问答专用模型通道（RAG_MODEL/RAG_API_BASE/RAG_API_KEY）不在此声明：
     # `RAG_` 前缀归 rag 插件所有，三项由 briefdesk/plugins/rag/config.py 承载，

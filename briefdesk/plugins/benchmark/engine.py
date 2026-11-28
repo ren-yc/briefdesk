@@ -101,6 +101,40 @@ def provider_label(api_base: str) -> str:
     return "custom"
 
 
+def _egress_summary(baseline: dict[str, int]) -> dict[str, Any]:
+    """出境观测摘要（脱敏）：只落汇总数字与可用性状态位。
+
+    各桶逐键减去运行开始时的基线，避免历史调用混进本轮报告；不清空共享遥测。
+    `sdk_retry_observed` 表示本轮至少一次 create 的重试观测完整可用；为 false 时
+    重试次数未知——遥测关闭、钩子没挂上、头不可读或每次读到头时计数都失败，都会
+    落到这个状态，消费方不得把总数读成零。它为 true 只说明「观测链路至少转通过
+    一次」，不保证每个 create 都完整：另有 create 计数失败时，其重试未计入总数，
+    状态位仍为 true，读总数时按「可能偏小」理解。遥测关闭时其余数字为空同样按
+    未知理解。
+    """
+    counters = telemetry.snapshot().get("counters") or {}
+    attempts = sum(
+        value - baseline.get(key, 0)
+        for key, value in counters.items()
+        if key.startswith(("ai.egress.remote_attempt.", "ai.local.attempt."))
+    )
+    retries = sum(
+        value - baseline.get(key, 0)
+        for key, value in counters.items()
+        if key.startswith(("ai.egress.sdk_retry.", "ai.local.sdk_retry."))
+    )
+    observed = sum(
+        value - baseline.get(key, 0)
+        for key, value in counters.items()
+        if key.startswith(("ai.egress.retry_observed.", "ai.local.retry_observed."))
+    )
+    return {
+        "attempt_total": attempts,
+        "sdk_retry_total": retries,
+        "sdk_retry_observed": observed > 0,
+    }
+
+
 def benchmark_config_snapshot() -> dict[str, Any]:
     """返回不含密钥和 API 地址的实验配置快照。"""
     return {
@@ -123,6 +157,10 @@ def benchmark_config_snapshot() -> dict[str, Any]:
         "dedup_embed_fallback_threshold": config.dedup_embed_fallback_threshold,
         "dedup_strong_threshold": config.dedup_strong_threshold,
         "merge_prefilter_threshold": config.merge_prefilter_threshold,
+        # 隐私与观测状态位：报告消费方按它们判断出境读数可信度——遥测关闭时
+        # 计数为空表示未知，不是零；SDK 重试钩子不可用时重试值同样未知。
+        "pseudonymize_names": config.ai_pseudonymize_names or "auto",
+        "telemetry_enabled": telemetry._enabled(),
     }
 
 
@@ -507,6 +545,8 @@ async def run_benchmark_cases(
     """
     started = time.monotonic()
 
+    egress_baseline = telemetry.snapshot().get("counters") or {}
+
     async def _run_all() -> tuple[
         dict[str, dict[str, Any]], dict[str, list[Any]], dict[str, float]
     ]:
@@ -533,6 +573,7 @@ async def run_benchmark_cases(
         elapsed=elapsed,
         total_elapsed=round(time.monotonic() - started, 3),
         run_id=run_id,
+        egress_baseline=egress_baseline,
     )
     return payload, evals_by_feature
 
@@ -546,6 +587,7 @@ def _build_payload(
     elapsed: dict[str, float] | None = None,
     total_elapsed: float | None = None,
     run_id: str | None = None,
+    egress_baseline: dict[str, int] | None = None,
 ) -> dict[str, Any]:
     """结果 payload（run_id/模型信息/配置快照/逐功能明细/测试用时）。
 
@@ -568,6 +610,9 @@ def _build_payload(
         # 报告必须自带这一项，否则事后无法判断某次运行到底发了什么参数
         "reasoning_effort": config.ai_reasoning_effort,
         "config": benchmark_config_snapshot(),
+        # 出境观测摘要：只落汇总数字与状态位，不带端点、密钥或身份值。
+        # sdk_retry_observed=false 表示「重试值未知」，消费方不得把它读成零。
+        "egress_summary": _egress_summary(egress_baseline or {}),
         "concurrency": max(1, concurrency),
         "elapsed_sec": total_elapsed,
         "features": {

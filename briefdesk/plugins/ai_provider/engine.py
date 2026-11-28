@@ -4,22 +4,32 @@
 import 本模块，统一经 core 的 briefdesk.ai_ports 端口函数调用。供应商无关的
 工具（JSON 修复解析、余弦相似度）定义在 briefdesk.ai_ports，本模块不 re-export
 ——需要它们的一方直接 import 端口模块，避免同一符号两处来源。
+
+出境观测也在这里接线：每次显式 create 之前计一次发送尝试（本地/远端分桶），
+并用 httpx 请求钩子把 SDK 内部重试单独计数；等并发许可（排队）阶段的超时与
+取消单独进 `ai.queue.*`，不占发送桶——口径说明见下方 `_sending`、
+`_queue_permit` 与 `_on_sdk_request`。
 """
 
 import asyncio
 import logging
+from collections.abc import AsyncIterator, Iterator
+from contextlib import asynccontextmanager, contextmanager
+from contextvars import ContextVar
 from typing import Any, cast
 
+import httpx
 from openai import (
     APIStatusError,
     AsyncOpenAI,
     BadRequestError,
+    DefaultAsyncHttpxClient,
     UnprocessableEntityError,
 )
 from openai.types import CreateEmbeddingResponse
 from openai.types.chat import ChatCompletion, ChatCompletionMessageParam
 
-from briefdesk import announcements
+from briefdesk import ai_egress, announcements
 from briefdesk.config import config
 from briefdesk.plugin.base import AIProvider, ChatResponse
 
@@ -41,6 +51,211 @@ _REQUEST_TIMEOUT = 120.0
 _REQUEST_MAX_RETRIES = 2
 
 
+# ── 出境观测：发送边界计数与 SDK 重试分桶 ──
+#
+# 口径：计数落在「已拿到并发许可、即将 create」这一刻，而不是端口调用或网络包。
+# 端口调用会多记（排队失败、替身短路、进入 create 之前的入参检查失败都没把请求
+# 发出去），网络包会少记（SDK 内部重试被当成新的逻辑发送）。前者会让「没发出去」
+# 看起来像出境，后者会把一次被重试两次的 create 读成三次请求。
+#
+# 「进入 create 之前」才是这条边界的准确划法，不是「拿到 HTTP 响应之前」：create
+# 一旦进了 SDK，之后的请求序列化失败（如 `temperature=nan` 过不了严格 JSON）、SDK
+# 侧校验失败、4xx/5xx 都算这一次显式尝试——那些请求可能已经到达对端，把它们从
+# 读数里抹掉会让「发过但失败」读成「没发」。排队阶段的失败另走 `ai.queue.*`
+# （见 `_queue_permit`），与发送桶分家。
+
+
+class _SdkRetryTracker:
+    """一次显式 create 期间的重试观测状态（请求局部，create 结束即丢弃）。
+
+    每次 create 各建一份：同一序号在重定向时会再次经过请求钩子，靠 `seen` 去重
+    才能保证一次内部重试只 +1；effort 降级会重新 create，因此也用新集合，
+    不把两次逻辑发送的重试序号混在一起。
+
+    `header_seen` 记录「本次 create 至少一个请求真的读到了重试序号头」：遥测开着
+    不代表钩子挂上了、更不代表头可读——三者缺一，重试次数就只能是未知。收尾时
+    还须确认重试计数没有失败，报告侧才能把「零次重试」当成可信读数。
+    `record_failed` 锁存计数异常，避免后续成功掩盖此前漏记的重试。
+    """
+
+    __slots__ = ("header_seen", "is_local", "port", "record_failed", "role", "seen")
+
+    def __init__(self, port: str, role: str, *, is_local: bool) -> None:
+        self.port = port
+        self.role = role
+        self.is_local = is_local
+        self.seen: set[int] = set()
+        self.header_seen = False
+        self.record_failed: bool = False
+
+
+# 当前任务正在进行的 create 的观测状态；未处于任何 create 内时为 None（钩子直接
+# 返回）。用 ContextVar 而不是模块级变量：并发的多个 create 分属不同任务，
+# 共享一份状态会把 A 的重试记到 B 的端口上。
+_RETRY_TRACKER: ContextVar[_SdkRetryTracker | None] = ContextVar(
+    "briefdesk_ai_sdk_retry_tracker", default=None
+)
+
+# SDK 把已用的重试次数写在请求头里（首次为 0，每次重试 +1）。本仓锁定的 openai
+# 客户端写的是带前缀的 `x-stainless-retry-count`；同时接受不带前缀的短名，避免换
+# SDK 或换兼容客户端后重试观测静默归零——「真的没重试」与「没读到头」在读数上
+# 长得一模一样，看不出区别就只能靠猜。
+_RETRY_HEADER_NAMES = ("x-stainless-retry-count", "retry-count")
+
+
+def _retry_ordinal(headers: httpx.Headers) -> int | None:
+    """从请求头读重试序号；头缺失或非数字返回 None。
+
+    None 与 0 必须分开：SDK 把每次请求的序号都写进头（首次为 0），「读到 0」
+    才是重试观测真正生效的证据；「头根本没出现」只说明钩子没挂上或客户端不写
+    这个头——这两种形态在读数上必须可区分，否则「真的没重试」与「没读到头」
+    长得一模一样，零次就成了不可信读数。
+    """
+    for name in _RETRY_HEADER_NAMES:
+        raw = headers.get(name)
+        if raw is None:
+            continue
+        try:
+            return int(raw)
+        except ValueError:
+            return None
+    return None
+
+
+async def _on_sdk_request(request: httpx.Request) -> None:
+    """httpx 异步请求钩子：读重试序号头，把 SDK 内部重试记进独立桶。
+
+    为什么在钩子里读头：重试发生在 SDK 内部，只包 transport 只能看到「又发了一次
+    请求」，分不清是内部重试还是调用方的新一次发送；SDK 自己写的序号头是二者之间
+    唯一的信号。
+
+    钩子跑在真实请求路径上，因此**任何异常都必须吞掉**：抛出去会让一次本来能成功
+    的调用失败。吞掉后仍尽力完成计数——先记数再把序号标为已见，这样计数本身失败
+    时下一次重试还有机会补上。
+
+    只读重试头，不读也不记 URL、header 全文或 body：钩子经过每一个请求，把请求
+    细节写进日志等于把端点与内容一起带出去。
+    """
+    try:
+        tracker = _RETRY_TRACKER.get()
+        if tracker is None:
+            return
+        ordinal = _retry_ordinal(request.headers)
+        if ordinal is None:
+            return
+        tracker.header_seen = True
+        if ordinal <= 0 or ordinal in tracker.seen:
+            return
+        try:
+            # 计数是否真的落账只有计数入口知道，吞掉的写失败不能当成「记过了」。
+            if not ai_egress.record_sdk_retry(
+                tracker.port, tracker.role, tracker.is_local
+            ):
+                tracker.record_failed = True
+                return
+        except Exception:
+            tracker.record_failed = True
+            raise
+        tracker.seen.add(ordinal)
+    except Exception:  # 钩子异常绝不连坐请求
+        logger.debug("SDK 重试计数失败（忽略）", exc_info=True)
+
+
+@contextmanager
+def _sending(port: str, base: str) -> Iterator[None]:
+    """一次显式 create 的观测窗口：先记发送尝试，再装本地的重试观测状态。
+
+    必须在「已拿到并发许可、即将 create」处进入。排队失败（超时/取消）、替身
+    短路、以及**进入 create 之前**的入参检查失败都不经过这里，否则「没发出去」
+    会被记成出境尝试。
+
+    反过来，create 已经进了 SDK 才失败（例如 `temperature=nan` 让请求序列化在
+    提交前就抛错）仍算一次显式尝试：本层的边界是「有没有发起 create」，不是
+    「有没有拿到 HTTP 响应」。若按后者划线，上游 4xx/5xx 与本地序列化错误都会
+    从出境读数里消失，「发过但失败」看起来就成了「没发」。
+
+    角色由端口层写入的元数据决定（目前只有主通道，即 `main`）；直接调用引擎时
+    拿到安全默认值，不会因为没有元数据就丢计数。端口取调用点自己的，不由元数据
+    决定：端口是代码路径的属性，一次误设的元数据不该把 rag 的发送记进 chat 桶。
+
+    收尾时若本次 create 读到了重试序号头且计数从未失败，才记一次观测可用：
+    该计数与发送尝试同口径（按 create 计），报告侧用它判断「SDK 重试读数」
+    是可信的零还是未知——遥测开关替代不了这个判断，钩子没挂上或头不可读时
+    一次重试都不会被记，把零当可信会静默丢掉全部内部重试。
+    """
+    role = ai_egress.current_metadata().role
+    is_local = ai_egress.record_send_attempt(port, role, base)
+    tracker = _SdkRetryTracker(port, role, is_local=is_local)
+    token = _RETRY_TRACKER.set(tracker)
+    try:
+        yield
+    finally:
+        _RETRY_TRACKER.reset(token)
+        if tracker.header_seen and not tracker.record_failed:
+            ai_egress.record_retry_observed(port, role, is_local)
+
+
+@asynccontextmanager
+async def _queue_permit(
+    sem: asyncio.Semaphore | None, port: str
+) -> AsyncIterator[None]:
+    """等一个并发许可；只把**排队阶段**的取消记进排队桶（不限流时什么都不记）。
+
+    为什么需要这个窗口：带 timeout 的 chat 用 `wait_for(sem.acquire(), ...)`，超时
+    与取消都落在显式 except 里；其余三处（chat 的不限时分支、rag_chat、embed 的
+    每批 chunk）都直接等许可，排队时被取消既不记发送尝试（正确）也不记排队桶
+    （漏了）——读数上「一直排队直到被取消」与「根本没有调用」完全一样，排查时
+    分不清是上游堵住了还是调用方没跑。
+
+    只认 acquire 的失败：`acquired` 为真之后的取消发生在发送阶段，那时 create 可能
+    已经发出，按排队失败记会把「发过」记成「没发」。release 同样只看这个标志——
+    没拿到许可就 release 会凭空放大信号量，并发预算静默变宽且不会报错。
+
+    sem 为 None 表示不限制并发（AI_MAX_CONCURRENCY<=0）：没有排队阶段，任何桶都
+    不记，否则「本就不限流」的配置会被读成一串排队失败。
+    """
+    if sem is None:
+        yield
+        return
+    # 角色在入口读一次：排队失败时发送边界还没到，没有别处能给出这次的端口归属。
+    role = ai_egress.current_metadata().role
+    acquired = False
+    try:
+        try:
+            await sem.acquire()
+        except asyncio.CancelledError:
+            # 排队被取消：请求没发出去，只进排队桶（与带 timeout 分支的超时同口径）。
+            ai_egress.record_queue_cancelled(port, role)
+            raise
+        acquired = True
+        yield
+    finally:
+        if acquired:
+            sem.release()
+
+
+def _build_http_client(base: str) -> httpx.AsyncClient:
+    """给 SDK 客户端装请求钩子，并仅收口本地端点的网络路由。
+
+    本地端点经环境代理或 307/308 跳转到远端会携带未假名化的姓名，必须禁用两者。
+    本地仅继承环境 CA：否则禁代理会连带禁用私有 CA，令本地 HTTPS 验证失败。
+    远端请求已假名化，统一禁用只会破坏代理部署与自定义 CA。
+    """
+    local = ai_egress.is_local_endpoint(base)
+    if local:
+        return DefaultAsyncHttpxClient(
+            event_hooks={"request": [_on_sdk_request]},
+            trust_env=False,
+            follow_redirects=False,
+            verify=httpx.create_ssl_context(trust_env=True),
+        )
+    return DefaultAsyncHttpxClient(
+        event_hooks={"request": [_on_sdk_request]},
+        trust_env=True,
+        follow_redirects=True,
+    )
+
+
 def get_ai_client() -> AsyncOpenAI:
     """获取共享的 AsyncOpenAI 实例（延迟初始化）。"""
     global _client
@@ -50,6 +265,7 @@ def get_ai_client() -> AsyncOpenAI:
             base_url=config.ai_api_base,
             timeout=_REQUEST_TIMEOUT,
             max_retries=_REQUEST_MAX_RETRIES,
+            http_client=_build_http_client(config.ai_api_base),
         )
     return _client
 
@@ -72,6 +288,7 @@ def get_alt_client(api_base: str = "", api_key: str = "") -> AsyncOpenAI:
             base_url=base,
             timeout=_REQUEST_TIMEOUT,
             max_retries=_REQUEST_MAX_RETRIES,
+            http_client=_build_http_client(base),
         )
         _alt_clients[(base, key)] = cached
     return cached
@@ -176,6 +393,9 @@ async def _create_with_effort_fallback(key: tuple[str, str], call: Any) -> ChatC
     其它错误原样抛出——把无关 400 也吞成重试会掩盖真配置错误。
     并发首撞时各请求都会各重试一次（可接受的启动成本），但记忆与告警只落一次：
     check 与 add 之间没有 await，事件循环内原子。
+
+    两次 `call` 都是**新的显式 create**（各经一次发送边界计数），但 SDK 内部重试
+    仍只属于各自那一次 create 的重试桶：降级重发不是「同一个请求被重试」。
     """
     effort = _reasoning_kwargs(key)
     try:
@@ -221,12 +441,14 @@ async def chat(
 
     key = _effort_key(config.ai_api_base, config.ai_model)
 
-    async def _create() -> ChatCompletion:
-        json_object = _use_json_object()
-        extra: dict = {"response_format": {"type": "json_object"}} if json_object else {}
-        return await _create_with_effort_fallback(
-            key,
-            lambda effort: client.chat.completions.create(
+    json_object = _use_json_object()
+    extra: dict = {"response_format": {"type": "json_object"}} if json_object else {}
+
+    async def _send(effort: dict[str, Any]) -> ChatCompletion:
+        # effort 降级的第二次发送也走这里：它是新的一次显式 create，应当各自计数，
+        # 而 SDK 内部重试仍归到这次 create 的重试桶里。
+        with _sending(ai_egress.PORT_CHAT, config.ai_api_base):
+            return await client.chat.completions.create(
                 model=config.ai_model,
                 messages=messages,
                 temperature=temperature,
@@ -236,18 +458,33 @@ async def chat(
                 **cast(Any, effort),
                 **extra,
                 **per_request,
-            ),
-        )
+            )
+
+    async def _create() -> ChatCompletion:
+        return await _create_with_effort_fallback(key, _send)
 
     sem = get_ai_semaphore()
-    if sem is None:
-        return await _create()
     if timeout is None:
-        async with sem:
+        # 不限时排队：取消只进排队桶、不记发送尝试（见 _queue_permit）；sem 为 None
+        # 时没有排队阶段，什么桶都不记。
+        async with _queue_permit(sem, ai_egress.PORT_CHAT):
             return await _create()
+    if sem is None:
+        # 不限流 + 有 timeout：没有排队阶段可超时，timeout 只作用于请求本身。
+        return await _create()
     # 判官类调用：许可等待也计入 timeout，锁内最坏持有 = timeout（请求）+ timeout（排队）。
     # 此前 async with sem 的排队等待不在任何超时之内。
-    await asyncio.wait_for(sem.acquire(), timeout)
+    role = ai_egress.current_metadata().role
+    try:
+        await asyncio.wait_for(sem.acquire(), timeout)
+    except TimeoutError:
+        # 排队阶段超时：请求根本没发出去，只进排队桶，不动发送桶。
+        ai_egress.record_queue_timeout(ai_egress.PORT_CHAT, role)
+        raise
+    except asyncio.CancelledError:
+        # 取消同样只证明「没轮到我」，不能算一次出境尝试。
+        ai_egress.record_queue_cancelled(ai_egress.PORT_CHAT, role)
+        raise
     try:
         return await _create()
     finally:
@@ -300,22 +537,25 @@ async def rag_chat(
 
     key = _effort_key(api_base or config.ai_api_base, chat_model)
 
-    async def _create() -> ChatCompletion:
-        return await _create_with_effort_fallback(
-            key,
-            lambda effort: client.chat.completions.create(
+    async def _send(effort: dict[str, Any]) -> ChatCompletion:
+        # 计数用的是这次真正指向的端点：override 留空时与主通道同源，按主 base 判
+        # 本地/远端，避免把「空 override」判成未知端点而一律按远端。
+        with _sending(ai_egress.PORT_RAG, api_base or config.ai_api_base):
+            return await client.chat.completions.create(
                 model=chat_model,
                 messages=messages,
                 temperature=temperature,
                 max_tokens=max_tokens,
                 **cast(Any, effort),
-            ),
-        )
+            )
+
+    async def _create() -> ChatCompletion:
+        return await _create_with_effort_fallback(key, _send)
 
     sem = get_ai_semaphore()
-    if sem is None:
-        return await _create()
-    async with sem:
+    # 不限时排队：取消只进排队桶、不记发送尝试（见 _queue_permit）；sem 为 None
+    # （不限流）时没有排队阶段，什么桶都不记。
+    async with _queue_permit(sem, ai_egress.PORT_RAG):
         return await _create()
 
 
@@ -348,6 +588,7 @@ def get_embed_client() -> AsyncOpenAI:
             base_url=embed_api_base(),
             timeout=_REQUEST_TIMEOUT,
             max_retries=_REQUEST_MAX_RETRIES,
+            http_client=_build_http_client(embed_api_base()),
         )
     return _embed_client
 
@@ -407,17 +648,19 @@ async def embed_texts(texts: list[str]) -> list[list[float]]:
     sem = get_ai_semaphore()
 
     async def _create(chunk: list[str]) -> CreateEmbeddingResponse:
-        return await client.embeddings.create(model=embed_model_name(), input=chunk)
+        # 每批 chunk 是一次显式 create：计数按批次而不是文本条数，否则同一批
+        # 20 条文本会被读成 20 次出境。
+        with _sending(ai_egress.PORT_EMBED, embed_api_base()):
+            return await client.embeddings.create(model=embed_model_name(), input=chunk)
 
     try:
         results: list[list[float]] = []
         for i in range(0, len(texts), batch_size):
             chunk = texts[i : i + batch_size]
-            if sem is None:
+            # 每批都要过一次并发许可：排队期间被取消按批记一次排队桶（见
+            # _queue_permit），发送桶仍只在真正 create 时记。
+            async with _queue_permit(sem, ai_egress.PORT_EMBED):
                 resp = await _create(chunk)
-            else:
-                async with sem:
-                    resp = await _create(chunk)
             # 按 index 排序保证与输入同序（防御性）
             ordered = sorted(resp.data, key=lambda d: d.index)
             if len(ordered) != len(chunk):
@@ -447,6 +690,15 @@ class Provider(AIProvider):
 
     薄封装：chat / 嵌入直接委托本模块的共享客户端实现。
     """
+
+    def effective_remote(self, base: str) -> bool:
+        """本供应商把该 base 的请求发往哪里：内置实现只发往 base 指向的端点。
+
+        这是提供给假名化策略的可选能力声明。第三方供应商若不声明，策略会按远端
+        处理（见 `briefdesk.ai_ports.effective_remote`）：它可能把请求路由到配置
+        里没写的地址，`localhost` 不代表真名没出门。
+        """
+        return not ai_egress.is_local_endpoint(base)
 
     async def chat(
         self,

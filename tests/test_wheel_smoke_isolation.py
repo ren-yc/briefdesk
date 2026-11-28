@@ -5,12 +5,15 @@
 早有历史记录」解耦，这组用例守住三个方向：新增、改动、删除都要能判出来。
 """
 
+import ast
+import runpy
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
 import pytest
 
+from scripts import wheel_smoke
 from scripts.wheel_smoke import SmokeFailure, assert_tree_unchanged, snapshot_tree
 
 
@@ -204,6 +207,8 @@ class TestSuccessPathExitCode:
             # master 合入的 vendor 消费者断言：成功路径桩里必须一并 no-op，
             # 否则真实断言会在桩 venv 里执行并让本组用例失败在错误步骤上
             "assert_vendor_importable",
+            # 安装态别名注册表守卫同理：桩 venv 里没有真解释器，跑真实探针必然失败
+            "assert_pseudonym_isolation",
             "console_script",
             "free_port",
             "app_env",
@@ -369,3 +374,207 @@ class TestVendorAssertCallSite:
         assert started == [], "vendor 检查失败必须在启动应用之前收口"
         assert scene.exists(), "失败路径保留现场"
         assert "vendor 消费者断言未通过" in capsys.readouterr().err
+
+class TestPseudonymProbeContract:
+    """安装态别名注册表探针（assert_pseudonym_isolation）的离线回归。
+
+    调用点只在 CI 的 wheel-smoke job 里真跑；本地没有任何防线覆盖判据形状。
+    桩掉 run() 即可拿到真实探针串与实参，不需要真建 venv。判据一旦放松（例如
+    只认「输出里有标记」却不看落点），注册表写进 site-packages 或真实用户目录
+    都会被报成通过——那正是这一步要挡的两个方向。
+    """
+
+    def _stub(self, monkeypatch: pytest.MonkeyPatch, output: str) -> dict[str, Any]:
+        seen: dict[str, Any] = {}
+
+        def _fake_run(
+            cmd: list[str],
+            *,
+            env: dict[str, str] | None = None,
+            timeout: int = 900,
+            cwd: Path | None = None,
+        ) -> str:
+            seen.update(cmd=cmd, env=env, cwd=cwd, timeout=timeout)
+            return output
+
+        monkeypatch.setattr(wheel_smoke, "run", _fake_run)
+        return seen
+
+    @staticmethod
+    def _output(registry: Path, *, exists: bool = True, installed: list[str] | None = None) -> str:
+        import json
+
+        payload = {
+            "registry": str(registry),
+            "exists": exists,
+            "installed": installed or [],
+        }
+        return "before\nPSEUDONYM-OK " + json.dumps(payload) + "\nafter\n"
+
+    def test_missing_marker_is_a_smoke_failure(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        python = tmp_path / "venv" / "Scripts" / "python.exe"
+        cwd = tmp_path / "scene"
+        data_dir = tmp_path / "data"
+        seen = self._stub(
+            monkeypatch,
+            "ModuleNotFoundError: No module named 'briefdesk.pseudonym'\n",
+        )
+        with pytest.raises(SmokeFailure, match="未输出标记"):
+            wheel_smoke.assert_pseudonym_isolation(python, cwd, data_dir)
+
+        assert seen["cmd"][0] == str(python), "必须用传入的解释器跑探针"
+        assert seen["cmd"][1] == "-c", "探针走 python -c 内联片段"
+        probe = seen["cmd"][2]
+        assert probe.startswith(wheel_smoke.INSTALLED_GUARD), "探针必须带 site-packages 导入守卫"
+        imports = {
+            (imported.name, imported.asname or imported.name)
+            for node in ast.walk(ast.parse(probe))
+            if isinstance(node, ast.ImportFrom)
+            and node.module == "briefdesk"
+            and node.level == 0
+            for imported in node.names
+        }
+        assert {("pseudonym", "pseudonym"), ("ai_egress", "ai_egress")} <= imports, (
+            "两个新模块都须显式导入并绑定为探针使用的名称"
+        )
+        assert "PSEUDONYM-OK" in probe, "成功路径必须打标记"
+        assert seen["cwd"] == cwd, "cwd 必须真传给子进程——落仓库根会让导入命中源码树"
+        assert seen["env"]["BRIEFDESK_DATA_DIR"] == str(data_dir), "数据目录必须注入，否则会写真实用户目录"
+        assert seen["env"]["BRIEFDESK_KEYRING"] == "0", "辅助进程不得访问当前用户的系统凭据"
+
+    def test_matching_registry_passes(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        data_dir = tmp_path / "data"
+        self._stub(monkeypatch, self._output(data_dir / "pseudonym" / "mapping.json"))
+        wheel_smoke.assert_pseudonym_isolation(tmp_path / "python", tmp_path / "scene", data_dir)
+
+    @pytest.mark.parametrize("committed", [False, True])
+    def test_probe_requires_returned_alias_in_registry(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys, committed: bool
+    ) -> None:
+        """仅有文件与合法前缀不证明提交成功，必须在打成功标记前核对落盘映射。"""
+        import json
+        from types import SimpleNamespace
+        from unittest.mock import AsyncMock
+
+        import briefdesk
+        from briefdesk import pseudonym
+
+        alias = "同学ABCDEF"
+        registry = tmp_path / "data" / "pseudonym" / "mapping.json"
+        registry.parent.mkdir(parents=True)
+        registry.write_text(
+            json.dumps({"aliases": {"test-digest": alias if committed else "同学BCDEFG"}}),
+            encoding="utf-8",
+        )
+        registrar = SimpleNamespace(
+            registry_file=registry, alias_for=AsyncMock(return_value=alias)
+        )
+        monkeypatch.setattr(pseudonym, "get_pseudonymizer", lambda: registrar)
+        installed = tmp_path / "site-packages" / "briefdesk" / "__init__.py"
+        installed.parent.mkdir(parents=True)
+        monkeypatch.setattr(briefdesk, "__file__", str(installed))
+        probe_file = tmp_path / "pseudonym_probe.py"
+        probe_file.write_text(wheel_smoke.PSEUDONYM_PROBE, encoding="utf-8")
+        if committed:
+            runpy.run_path(str(probe_file))
+            assert "PSEUDONYM-OK " in capsys.readouterr().out
+        else:
+            with pytest.raises(AssertionError):
+                runpy.run_path(str(probe_file))
+            assert "PSEUDONYM-OK " not in capsys.readouterr().out
+
+    def test_wrong_registry_location_fails(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """没有注入数据目录时注册表会落到真实用户目录：必须失败而不是「登记成功」。"""
+        data_dir = tmp_path / "data"
+        self._stub(monkeypatch, self._output(tmp_path / "real-user-dir" / "pseudonym" / "mapping.json"))
+        with pytest.raises(SmokeFailure, match="落点不符"):
+            wheel_smoke.assert_pseudonym_isolation(tmp_path / "python", tmp_path / "scene", data_dir)
+
+    def test_missing_registry_file_fails(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        data_dir = tmp_path / "data"
+        self._stub(
+            monkeypatch,
+            self._output(data_dir / "pseudonym" / "mapping.json", exists=False),
+        )
+        with pytest.raises(SmokeFailure, match="未落盘"):
+            wheel_smoke.assert_pseudonym_isolation(tmp_path / "python", tmp_path / "scene", data_dir)
+
+    def test_installed_leak_fails(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        data_dir = tmp_path / "data"
+        self._stub(
+            monkeypatch,
+            self._output(
+                data_dir / "pseudonym" / "mapping.json",
+                installed=["pseudonym/mapping.json"],
+            ),
+        )
+        with pytest.raises(SmokeFailure, match="安装目录出现别名注册表产物"):
+            wheel_smoke.assert_pseudonym_isolation(tmp_path / "python", tmp_path / "scene", data_dir)
+
+
+class TestNoLeaksRegistryPatterns:
+    """assert_no_leaks 对别名注册表产物的覆盖：目录、锁文件与写盘临时文件都要判出来。
+
+    这三类正是新模块在安装目录里可能留下的形态，漏一类就等于留一条静默写入路径；
+    另一个方向也要挡——注册表没落进注入的数据目录时，「隔离通过」会让后续轮次
+    悄悄读写真实用户目录里的那份。
+    """
+
+    @staticmethod
+    def _scene(tmp_path: Path) -> tuple[Path, Path, Path, Path, Path, Path]:
+        venv = tmp_path / "venv"
+        site = venv / "Lib" / "site-packages"
+        site.mkdir(parents=True)
+        data_dir = tmp_path / "data"
+        (data_dir / "data").mkdir(parents=True)
+        (data_dir / "data" / "briefdesk.sqlite").write_text("", encoding="utf-8")
+        (data_dir / "pseudonym").mkdir()
+        (data_dir / "pseudonym" / "mapping.json").write_text("{}", encoding="utf-8")
+        cache_dir = tmp_path / "cache"
+        cache_dir.mkdir()
+        settings_file = tmp_path / "settings.env"
+        settings_file.write_text("", encoding="utf-8")
+        runs_root = tmp_path / "runs"
+        runs_root.mkdir()
+        return venv, data_dir, cache_dir, settings_file, runs_root, site
+
+    @pytest.mark.parametrize(
+        "relative",
+        [
+            "briefdesk/pseudonym/mapping.json",
+            "briefdesk/mapping.lock",
+            "briefdesk/mapping.json.tmp",
+        ],
+        ids=["registry-dir", "lock-file", "tmp-file"],
+    )
+    def test_registry_artifact_in_site_packages_is_a_leak(
+        self, relative: str, tmp_path: Path
+    ) -> None:
+        venv, data_dir, cache_dir, settings_file, runs_root, site = self._scene(tmp_path)
+        target = site / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("x", encoding="utf-8")
+
+        with pytest.raises(SmokeFailure, match="site-packages 出现运行期产物"):
+            wheel_smoke.assert_no_leaks(
+                venv, data_dir, cache_dir, settings_file, runs_root, snapshot_tree(runs_root)
+            )
+
+    def test_missing_registry_in_data_dir_is_a_failure(self, tmp_path: Path) -> None:
+        venv, data_dir, cache_dir, settings_file, runs_root, _site = self._scene(tmp_path)
+        (data_dir / "pseudonym" / "mapping.json").unlink()
+
+        with pytest.raises(SmokeFailure, match="别名注册表未落在"):
+            wheel_smoke.assert_no_leaks(
+                venv, data_dir, cache_dir, settings_file, runs_root, snapshot_tree(runs_root)
+            )
