@@ -157,7 +157,9 @@ class RagEngine:
         self._vec_model: str | None = None
         self._vec_watermark = ""
         self._vec_count_seen = 0
-        self._vec_cache_dirty = False
+        self._vec_invalidations = 0
+        self._vec_applied_invalidations = 0
+        self._vec_unsettled_writes = 0
         self._vec_entries: dict[tuple[str, str], tuple[ChunkRow, np.ndarray]] = {}
         # 预组 float32 矩阵（缓存变更时重组，ask 路径零转换零拷贝直用）
         self._matrix: np.ndarray | None = None
@@ -172,6 +174,10 @@ class RagEngine:
         self.last_cycle_embed_failed = False
         # 维护循环拉起钩子（plugin.activate 注入；reindex 经此重启循环）
         self.on_backfill_kick: Callable[[], None] | None = None
+
+    @property
+    def _vec_cache_dirty(self) -> bool:
+        return self._vec_applied_invalidations != self._vec_invalidations
 
     async def teardown(self) -> None:
         self._vec_entries.clear()
@@ -238,9 +244,10 @@ class RagEngine:
     ) -> bool:
         """落库唯一出口：chunks → FTS 同步 → 向量（专用连接）。
 
-        实时批次与历史回填共用本方法，令「入了 chunks 却漏同步 FTS」在结构上
-        不可能发生——那种漏同步不会报错，只会让检索静默少一条腿（FTS 索引与
-        rag_chunks 分叉，且反连接补不回来，它只看向量缺失）。
+        实时批次与历史回填共用本方法，令「入了 chunks 却漏同步 FTS」在成功
+        路径上不可能发生；chunk 写入与 FTS 同步之间被取消仍可能缺 FTS 行。
+        缺少当前模型 embedding 的行会被反连接选中回填并同步 FTS；已有当前
+        模型 embedding 却缺 FTS 的行不会被选中，仍可能让检索静默少一条腿。
         model 由调用方传入而非在此现取：回填的反连接谓词已按某个 model 值筛过
         行，落库必须写同一个值，否则下一轮又把这批选回来（空转死循环）。
         返回是否写入了向量，供调用方决定要不要触发自愈回填。
@@ -250,12 +257,22 @@ class RagEngine:
         db.get_embed_lock()——dedup 的向量落库共用同一条连接，语句级互斥
         防止一方的 commit 把另一方未完成的批量写入提前提交。
         """
-        await upsert_chunks(db, rows, sender_id_fill_only=sender_id_fill_only)
-        # 元数据更新不推进向量水位，旧身份会一直留在缓存；与刷新共锁，
-        # 防止进行中的刷新清掉刚置位的脏标志。
-        async with self._refresh_lock:
-            if any((row.source, row.msg_id) in self._vec_entries for row in rows):
-                self._vec_cache_dirty = True
+        # 缓存成员关系既不能证明行是全新的，也不能证明 SQL 中尚无此行；
+        # 按缓存状态筛选只是猜缓存没有的答案，每种猜法都会留下缺口。
+        # 水位之上的 embedding 已提交但尚未缓存时，元数据更新可与刷新交错，
+        # 让刷新安装提交前身份并越过其水位，后续增量读取永不再访该行。
+        # 所有非空批次都在提交前登记世代及未收尾写入，不等刷新锁。
+        # 写入活跃时，每个后续刷新都全量重读；脏状态合并为每次刷新一次，
+        # 而非每个批次一次，以此换取正常提交收尾后的下次刷新不再服务旧身份。
+        registered = bool(rows)
+        if registered:
+            self._vec_invalidations += 1
+            self._vec_unsettled_writes += 1
+        try:
+            await upsert_chunks(db, rows, sender_id_fill_only=sender_id_fill_only)
+        finally:
+            if registered:
+                self._vec_unsettled_writes -= 1
         if self._fts_enabled:
             await sync_fts(db, rows)
         if not emb_items:
@@ -481,8 +498,9 @@ class RagEngine:
         已删内容持续可被检索。
 
         水位归零发生在 _refresh_vector_cache 内、行数回退守卫之前：force_full
-        轮次守卫恒不触发（count_seen 已归零），删除检测完全由 fetch 后的 key
-        差集剔除承担——该剔除位于 raw_rows 判空之前，全表删光也收敛。
+        轮次守卫恒不触发（count_seen 已归零），删除检测由 fetch 后的 key
+        差集剔除承担；解析与脏行删除成功后才裁剪缓存并重组矩阵，raw_rows
+        为空则直接清空两者，全表删光也能收敛。矩阵构造失败的一致性不在保证内。
         """
 
         async with self._refresh_lock:
@@ -517,6 +535,10 @@ class RagEngine:
         )
 
     async def _refresh_vector_cache(self, *, force_full: bool = False) -> None:
+        # 首个 await 前同时捕获世代与收尾状态，未收尾写入及刷新中的新登记
+        # 不能随旧快照消账；退出时不重读收尾计数。
+        invalidations = self._vec_invalidations
+        settled = self._vec_unsettled_writes == 0
         force_full = force_full or self._vec_cache_dirty
         model = ai_ports.embed_model_name()
         if self._vec_model != model:
@@ -540,21 +562,18 @@ class RagEngine:
                 edb, model, self._vec_watermark, self.settings.group_only
             )
         if force_full:
-            # 整表重建：本次 fetch 到的 key 集合之外，缓存内其余
-            # key 一律剔除——等价整表重建但省一次全量重嵌，且空表（全删）时
-            # 也能清空残留。放在 raw_rows 判空之前，保证「删光了」也能收敛。
-            # _vec_count_seen 由本方法末尾 self._vec_count_seen = total 统一
-            # 更新为全表行数（收缩检测语义保持不变）。
+            # 先记录整表 key 差集，解析与脏行删除成功后才裁剪缓存并重组矩阵；
+            # 解析或脏行删除失败、取消时不能留下已裁剪字典与旧矩阵。
             fetched_keys = {(r["source"], r["msg_id"]) for r in raw_rows}
-            for key in list(self._vec_entries):
-                if key not in fetched_keys:
-                    del self._vec_entries[key]
         if not raw_rows:
             if force_full:
-                # 全表已空（全部删除）：差集剔除已清空 _vec_entries，须重建
-                # 矩阵，否则旧的 float32 矩阵残留已删向量继续参与检索。
+                # 全表已空：同步清空缓存与矩阵，否则旧向量仍可参与检索。
+                self._vec_entries.clear()
                 self._rebuild_matrix()
-            self._vec_cache_dirty = False
+            if settled:
+                self._vec_applied_invalidations = max(
+                    self._vec_applied_invalidations, invalidations
+                )
             return
         entries, bad_keys = await asyncio.to_thread(parse_embedding_rows, raw_rows)
         # 维度对账：同模型名下供应商原地换维度或历史脏行会让
@@ -601,6 +620,10 @@ class RagEngine:
             entries = kept
         if bad_keys:
             await self._delete_bad_embeddings(edb, bad_keys)
+        if force_full:
+            for key in list(self._vec_entries):
+                if key not in fetched_keys:
+                    del self._vec_entries[key]
         for chunk, vec in entries:
             self._vec_entries[(chunk.source, chunk.msg_id)] = (chunk, vec)
         self._vec_watermark = max_created
@@ -611,7 +634,11 @@ class RagEngine:
             # 收进缓存；递归至多一层——缓存基准已更新，不会再触发重建分支
             self._vec_watermark = ""
             await self._refresh_vector_cache()
-        self._vec_cache_dirty = False
+        # 递归重建可能已确认更新的世代，外层不能把确认计数倒退。
+        if settled:
+            self._vec_applied_invalidations = max(
+                self._vec_applied_invalidations, invalidations
+            )
 
     @staticmethod
     async def _delete_bad_embeddings(

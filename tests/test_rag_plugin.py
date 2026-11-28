@@ -4,6 +4,7 @@ import asyncio
 import re
 import sqlite3
 import unittest
+from dataclasses import replace
 from datetime import UTC
 from types import SimpleNamespace
 from typing import ClassVar
@@ -2386,6 +2387,663 @@ class TestRagWarmVectorsForceFull(_MemoryEngineBase):
         assert self.engine._matrix_chunks[matrix_index] == updated
         assert self.engine._matrix[matrix_index].tolist() == [1.0, 0.0]
         assert self.engine._vec_watermark == "t2"
+        assert not self.engine._vec_cache_dirty
+
+
+class TestRagIdentityCacheInvalidation(_MemoryEngineBase):
+    @pytest.fixture(autouse=True)
+    async def _cached_identity(self, _autouse_setup):
+        from briefdesk.plugins.rag.db import ChunkRow, upsert_chunks, upsert_embeddings
+
+        await self.engine._ensure_db_ready()
+        self.engine._fts_enabled = False
+        self.first = ChunkRow(
+            source="weflow-legacy", msg_id="older", session_id="s1",
+            group_name="旧群", sender_name="旧成员", sender_id="old-identity",
+            msg_time=1700000000, content="虚构活动安排", item_id="",
+        )
+        self.second = replace(self.first, msg_id="newer", sender_id="other-identity")
+        self.key = (self.first.source, self.first.msg_id)
+        self.updated = replace(
+            self.first, sender_id="new-identity", sender_name="新成员", group_name="新群"
+        )
+        await upsert_chunks(self.db, [self.first, self.second])
+        await upsert_embeddings(self.db, [self.key], [[1.0, 0.0]], "test-model", "t1")
+        await upsert_embeddings(
+            self.db, [(self.second.source, self.second.msg_id)], [[0.0, 1.0]],
+            "test-model", "t2",
+        )
+        await asyncio.wait_for(self.engine.warm_vectors(), timeout=5)
+        assert self.engine._vec_watermark == "t2"
+        assert self.engine._vec_entries[self.key][0] == self.first
+        assert not self.engine._vec_cache_dirty
+
+    async def test_identity_refresh_does_not_acknowledge_unsettled_write(
+        self, monkeypatch, tmp_path
+    ):
+        from briefdesk.plugins.rag import engine as rag_engine
+
+        database_path = tmp_path / "identity.sqlite"
+        async with (
+            aiosqlite.connect(database_path) as reader,
+            aiosqlite.connect(database_path) as write_db,
+        ):
+            await self.db.backup(reader)
+            reader.row_factory = aiosqlite.Row
+            cursor = await reader.execute("PRAGMA journal_mode = WAL")
+            assert (await cursor.fetchone())[0] == "wal"
+            await cursor.close()
+
+            async def factory():
+                return reader
+
+            monkeypatch.setattr(self.engine, "_db_factory", factory)
+            monkeypatch.setattr(self.engine, "_embed_factory", factory)
+            chunk_written = asyncio.Event()
+            release_commit = asyncio.Event()
+
+            async def paused_upsert(db, rows, *, sender_id_fill_only=False):
+                assert db is reader
+                assert rows == [self.updated]
+                assert not sender_id_fill_only
+                try:
+                    cursor = await write_db.execute("BEGIN IMMEDIATE")
+                    await cursor.close()
+                    cursor = await write_db.execute(
+                        "UPDATE rag_chunks SET sender_id = ?, sender_name = ?, "
+                        "group_name = ? WHERE source = ? AND msg_id = ?",
+                        (self.updated.sender_id, self.updated.sender_name,
+                         self.updated.group_name, *self.key),
+                    )
+                    await cursor.close()
+                    chunk_written.set()
+                    await asyncio.wait_for(release_commit.wait(), timeout=5)
+                    await write_db.commit()
+                finally:
+                    await write_db.rollback()
+
+            monkeypatch.setattr(rag_engine, "upsert_chunks", paused_upsert)
+            writer = asyncio.create_task(self.engine._persist_chunks(
+                reader, [self.updated], [], [], "test-model"
+            ))
+            try:
+                await asyncio.wait_for(chunk_written.wait(), timeout=5)
+                assert self.engine._vec_unsettled_writes == 1
+                await asyncio.wait_for(self.engine.warm_vectors(), timeout=5)
+                assert write_db.in_transaction
+                assert not writer.done()
+                assert self.engine._vec_cache_dirty
+                assert self.engine._vec_entries[self.key][0] == self.first
+                release_commit.set()
+                assert not await asyncio.wait_for(writer, timeout=5)
+                assert self.engine._vec_unsettled_writes == 0
+                assert self.engine._vec_cache_dirty
+                await asyncio.wait_for(self.engine.warm_vectors(), timeout=5)
+                hits = await asyncio.wait_for(
+                    self.engine.retrieve(self.first.content), timeout=5
+                )
+                assert hits
+                assert hits[0].chunk == self.updated
+                assert not self.engine._vec_cache_dirty
+            finally:
+                release_commit.set()
+                writer.cancel()
+                await asyncio.wait_for(
+                    asyncio.gather(writer, return_exceptions=True), timeout=5
+                )
+
+    async def test_identity_existing_uncached_row_receives_invalidation(
+        self, monkeypatch, tmp_path
+    ):
+        from briefdesk.plugins.rag import engine as rag_engine
+        from briefdesk.plugins.rag.db import upsert_chunks, upsert_embeddings
+
+        uncached = replace(
+            self.first, msg_id="uncached-older", sender_id="uncached-identity"
+        )
+        newer = replace(self.second, msg_id="uncached-newer")
+        key = (uncached.source, uncached.msg_id)
+        updated = replace(
+            uncached, sender_id="updated-identity", sender_name="新成员", group_name="新群"
+        )
+        database_path = tmp_path / "uncached-identity.sqlite"
+        async with (
+            aiosqlite.connect(database_path) as reader,
+            aiosqlite.connect(database_path) as write_db,
+        ):
+            await self.db.backup(reader)
+            reader.row_factory = aiosqlite.Row
+            for connection in (reader, write_db):
+                cursor = await connection.execute("PRAGMA journal_mode = WAL")
+                assert (await cursor.fetchone())[0] == "wal"
+                await cursor.close()
+            await upsert_chunks(write_db, [uncached, newer])
+            await upsert_embeddings(write_db, [key], [[1.0, 0.0]], "test-model", "t3")
+            await upsert_embeddings(
+                write_db, [(newer.source, newer.msg_id)], [[0.0, 1.0]],
+                "test-model", "t4",
+            )
+            assert self.engine._vec_entries
+            assert key not in self.engine._vec_entries
+            assert (newer.source, newer.msg_id) not in self.engine._vec_entries
+            assert self.engine._vec_watermark == "t2"
+            assert not self.engine._refresh_lock.locked()
+
+            async def factory():
+                return reader
+
+            monkeypatch.setattr(self.engine, "_db_factory", factory)
+            monkeypatch.setattr(self.engine, "_embed_factory", factory)
+            chunk_written = asyncio.Event()
+            release_commit = asyncio.Event()
+
+            async def paused_upsert(db, rows, *, sender_id_fill_only=False):
+                assert db is reader
+                assert rows == [updated]
+                assert not sender_id_fill_only
+                try:
+                    cursor = await write_db.execute("BEGIN IMMEDIATE")
+                    await cursor.close()
+                    cursor = await write_db.execute(
+                        "UPDATE rag_chunks SET sender_id = ?, sender_name = ?, "
+                        "group_name = ? WHERE source = ? AND msg_id = ?",
+                        (updated.sender_id, updated.sender_name, updated.group_name, *key),
+                    )
+                    await cursor.close()
+                    chunk_written.set()
+                    await asyncio.wait_for(release_commit.wait(), timeout=5)
+                    await write_db.commit()
+                finally:
+                    await write_db.rollback()
+
+            monkeypatch.setattr(rag_engine, "upsert_chunks", paused_upsert)
+            writer = asyncio.create_task(self.engine._persist_chunks(
+                reader, [updated], [], [], "test-model"
+            ))
+            try:
+                await asyncio.wait_for(chunk_written.wait(), timeout=5)
+                await asyncio.wait_for(self.engine.warm_vectors(), timeout=5)
+                assert write_db.in_transaction
+                assert not writer.done()
+                assert self.engine._vec_entries[key][0] == uncached
+                assert self.engine._vec_watermark == "t4"
+                assert self.engine._vec_cache_dirty
+                release_commit.set()
+                assert not await asyncio.wait_for(writer, timeout=5)
+                assert self.engine._vec_unsettled_writes == 0
+                assert not write_db.in_transaction
+                hits = await asyncio.wait_for(
+                    self.engine.retrieve(uncached.content), timeout=5
+                )
+                assert hits
+                assert [
+                    hit.chunk for hit in hits
+                    if (hit.chunk.source, hit.chunk.msg_id) == key
+                ] == [updated]
+                assert not self.engine._vec_cache_dirty
+            finally:
+                release_commit.set()
+                writer.cancel()
+                await asyncio.wait_for(
+                    asyncio.gather(writer, return_exceptions=True), timeout=5
+                )
+
+    async def test_identity_settlement_after_snapshot_before_exit_keeps_invalidation(
+        self, monkeypatch, tmp_path
+    ):
+        from briefdesk.plugins.rag import engine as rag_engine
+
+        database_path = tmp_path / "snapshot-settlement.sqlite"
+        async with (
+            aiosqlite.connect(database_path) as reader,
+            aiosqlite.connect(database_path) as write_db,
+        ):
+            await self.db.backup(reader)
+            reader.row_factory = aiosqlite.Row
+            for connection in (reader, write_db):
+                cursor = await connection.execute("PRAGMA journal_mode = WAL")
+                assert (await cursor.fetchone())[0] == "wal"
+                await cursor.close()
+
+            async def factory():
+                return reader
+
+            monkeypatch.setattr(self.engine, "_db_factory", factory)
+            monkeypatch.setattr(self.engine, "_embed_factory", factory)
+            chunk_written = asyncio.Event()
+            release_commit = asyncio.Event()
+            parse_started = asyncio.Event()
+            release_parse = asyncio.Event()
+            loop = asyncio.get_running_loop()
+            real_parse = rag_engine.parse_embedding_rows
+
+            async def paused_upsert(db, rows, *, sender_id_fill_only=False):
+                assert db is reader
+                assert rows == [self.updated]
+                assert not sender_id_fill_only
+                try:
+                    cursor = await write_db.execute("BEGIN IMMEDIATE")
+                    await cursor.close()
+                    cursor = await write_db.execute(
+                        "UPDATE rag_chunks SET sender_id = ?, sender_name = ?, "
+                        "group_name = ? WHERE source = ? AND msg_id = ?",
+                        (self.updated.sender_id, self.updated.sender_name,
+                         self.updated.group_name, *self.key),
+                    )
+                    await cursor.close()
+                    chunk_written.set()
+                    await asyncio.wait_for(release_commit.wait(), timeout=5)
+                    await write_db.commit()
+                finally:
+                    await write_db.rollback()
+
+            def paused_parse(raw_rows):
+                result = real_parse(raw_rows)
+                if not parse_started.is_set():
+                    loop.call_soon_threadsafe(parse_started.set)
+                    asyncio.run_coroutine_threadsafe(
+                        asyncio.wait_for(release_parse.wait(), timeout=5), loop
+                    ).result(timeout=5)
+                return result
+
+            monkeypatch.setattr(rag_engine, "upsert_chunks", paused_upsert)
+            monkeypatch.setattr(rag_engine, "parse_embedding_rows", paused_parse)
+            writer = asyncio.create_task(self.engine._persist_chunks(
+                reader, [self.updated], [], [], "test-model"
+            ))
+            refresh = None
+            try:
+                await asyncio.wait_for(chunk_written.wait(), timeout=5)
+                assert self.engine._vec_unsettled_writes == 1
+                refresh = asyncio.create_task(self.engine.warm_vectors())
+                await asyncio.wait_for(parse_started.wait(), timeout=5)
+                assert write_db.in_transaction
+                assert not refresh.done()
+                release_commit.set()
+                assert not await asyncio.wait_for(writer, timeout=5)
+                assert self.engine._vec_unsettled_writes == 0
+                assert not write_db.in_transaction
+                assert not refresh.done()
+                release_parse.set()
+                await asyncio.wait_for(refresh, timeout=5)
+                assert self.engine._vec_entries[self.key][0] == self.first
+                assert self.engine._vec_cache_dirty
+                hits = await asyncio.wait_for(
+                    self.engine.retrieve(self.first.content), timeout=5
+                )
+                assert hits
+                assert hits[0].chunk == self.updated
+                assert not self.engine._vec_cache_dirty
+            finally:
+                release_commit.set()
+                release_parse.set()
+                writer.cancel()
+                tasks = [writer]
+                if refresh is not None:
+                    refresh.cancel()
+                    tasks.append(refresh)
+                await asyncio.wait_for(
+                    asyncio.gather(*tasks, return_exceptions=True), timeout=5
+                )
+
+    async def test_identity_cold_cache_registers_invalidation(self, monkeypatch):
+        from briefdesk.plugins.rag import engine as rag_engine
+
+        async def factory():
+            return self.db
+
+        engine = rag_engine.RagEngine(
+            self.engine.settings, db_factory=factory, embed_factory=factory
+        )
+        await engine._ensure_db_ready()
+        engine._fts_enabled = False
+        assert engine._vec_model is None
+        assert not engine._vec_entries
+        assert not engine._refresh_lock.locked()
+        upsert_entered = asyncio.Event()
+        release_upsert = asyncio.Event()
+        real_upsert = rag_engine.upsert_chunks
+
+        async def paused_upsert(*args, **kwargs):
+            upsert_entered.set()
+            await asyncio.wait_for(release_upsert.wait(), timeout=5)
+            await real_upsert(*args, **kwargs)
+
+        monkeypatch.setattr(rag_engine, "upsert_chunks", paused_upsert)
+        writer = asyncio.create_task(engine._persist_chunks(
+            self.db, [self.updated], [], [], "test-model"
+        ))
+        try:
+            await asyncio.wait_for(upsert_entered.wait(), timeout=5)
+            await asyncio.wait_for(engine.warm_vectors(), timeout=5)
+            assert engine._vec_entries[self.key][0] == self.first
+            assert engine._vec_cache_dirty
+            release_upsert.set()
+            assert not await asyncio.wait_for(writer, timeout=5)
+            assert engine._vec_unsettled_writes == 0
+            await asyncio.wait_for(engine.warm_vectors(), timeout=5)
+            hits = await asyncio.wait_for(engine.retrieve(self.first.content), timeout=5)
+            assert hits
+            assert hits[0].chunk == self.updated
+            assert not engine._vec_cache_dirty
+        finally:
+            release_upsert.set()
+            writer.cancel()
+            await asyncio.wait_for(
+                asyncio.gather(writer, return_exceptions=True), timeout=5
+            )
+            await engine.teardown()
+
+    async def test_identity_new_rows_register_invalidation(self):
+        from briefdesk.plugins.rag.db import upsert_embeddings
+
+        new_row = replace(
+            self.first, msg_id="brand-new", sender_id="brand-new-identity"
+        )
+        new_key = (new_row.source, new_row.msg_id)
+        invalidations = self.engine._vec_invalidations
+        assert self.engine._vec_entries
+        assert new_key not in self.engine._vec_entries
+        assert not self.engine._refresh_lock.locked()
+        assert not await asyncio.wait_for(self.engine._persist_chunks(
+            self.db, [new_row], [], [], "test-model"
+        ), timeout=5)
+        assert self.engine._vec_invalidations == invalidations + 1
+        assert self.engine._vec_unsettled_writes == 0
+        assert self.engine._vec_cache_dirty
+        assert self.engine._vec_watermark == "t2"
+        await upsert_embeddings(
+            self.db, [new_key], [[1.0, 0.0]], "test-model", "t3"
+        )
+        await asyncio.wait_for(self.engine.warm_vectors(), timeout=5)
+        assert self.engine._vec_entries[new_key][0] == new_row
+        assert self.engine._vec_watermark == "t3"
+        assert self.engine._vec_invalidations == invalidations + 1
+        assert not self.engine._vec_cache_dirty
+
+    async def test_identity_invalidation_survives_cancelled_commit(self, monkeypatch):
+        """拦截 await upsert_chunks 后才登记失效的实现：提交已落地仍可被取消。"""
+        from briefdesk.plugins.rag import engine as rag_engine
+
+        chunk_committed = asyncio.Event()
+        release_upsert = asyncio.Event()
+        real_upsert = rag_engine.upsert_chunks
+
+        async def paused_upsert(*args, **kwargs):
+            await real_upsert(*args, **kwargs)
+            chunk_committed.set()
+            await asyncio.wait_for(release_upsert.wait(), timeout=5)
+
+        with monkeypatch.context() as patcher:
+            patcher.setattr(rag_engine, "upsert_chunks", paused_upsert)
+            writer = asyncio.create_task(self.engine._persist_chunks(
+                self.db, [self.updated], [], [], "test-model"
+            ))
+            try:
+                await asyncio.wait_for(chunk_committed.wait(), timeout=5)
+                writer.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await asyncio.wait_for(writer, timeout=5)
+                assert self.engine._vec_cache_dirty
+            finally:
+                release_upsert.set()
+                writer.cancel()
+                await asyncio.wait_for(
+                    asyncio.gather(writer, return_exceptions=True), timeout=5
+                )
+        await asyncio.wait_for(self.engine.warm_vectors(), timeout=5)
+        hits = await asyncio.wait_for(self.engine.retrieve(self.first.content), timeout=5)
+        assert hits
+        assert hits[0].chunk == self.updated
+        assert not self.engine._vec_cache_dirty
+
+    async def test_identity_failed_full_refresh_keeps_cache_and_matrix_coherent(
+        self, monkeypatch
+    ):
+        """拦截解析前裁剪缓存的实现：解析失败不得留下旧矩阵与新字典。"""
+        from briefdesk.plugins.rag import engine as rag_engine
+
+        second_key = (self.second.source, self.second.msg_id)
+        cursor = await self.db.execute(
+            "DELETE FROM rag_chunk_embeddings WHERE source = ? AND msg_id = ?",
+            second_key,
+        )
+        await cursor.close()
+        await self.db.commit()
+        with monkeypatch.context() as patcher:
+            patcher.setattr(
+                rag_engine, "parse_embedding_rows",
+                Mock(side_effect=RuntimeError("injected parse failure")),
+            )
+            with pytest.raises(RuntimeError, match="injected parse failure"):
+                await asyncio.wait_for(
+                    self.engine.warm_vectors(force_full=True), timeout=5
+                )
+        assert self.engine._vec_entries
+        assert self.engine._matrix_chunks
+        cached_keys = set(self.engine._vec_entries)
+        matrix_chunk_keys = {
+            (chunk.source, chunk.msg_id) for chunk in self.engine._matrix_chunks
+        }
+        assert cached_keys == matrix_chunk_keys == set(self.engine._matrix_keys)
+        assert cached_keys == {self.key, second_key}
+        assert not await asyncio.wait_for(self.engine._persist_chunks(
+            self.db, [self.updated], [], [], "test-model"
+        ), timeout=5)
+        assert self.engine._vec_cache_dirty
+        await asyncio.wait_for(self.engine.warm_vectors(), timeout=5)
+        assert second_key not in self.engine._vec_entries
+        hits = await asyncio.wait_for(self.engine.retrieve(self.first.content), timeout=5)
+        assert hits
+        assert hits[0].chunk == self.updated
+        assert not self.engine._vec_cache_dirty
+
+    async def test_identity_invalidation_registered_while_factory_suspended(
+        self, monkeypatch
+    ):
+        """拦截首个 await 后才捕获世代的实现：工厂等待期间的更新须保留。"""
+        factory_suspended = asyncio.Event()
+        release_factory = asyncio.Event()
+        real_factory = self.engine._embed_factory
+
+        async def paused_factory():
+            if not factory_suspended.is_set():
+                factory_suspended.set()
+                await asyncio.wait_for(release_factory.wait(), timeout=5)
+            return await real_factory()
+
+        monkeypatch.setattr(self.engine, "_embed_factory", paused_factory)
+        refresh = asyncio.create_task(self.engine.warm_vectors())
+        try:
+            await asyncio.wait_for(factory_suspended.wait(), timeout=5)
+            assert self.engine._refresh_lock.locked()
+            assert not await asyncio.wait_for(self.engine._persist_chunks(
+                self.db, [self.updated], [], [], "test-model"
+            ), timeout=5)
+            assert self.engine._vec_cache_dirty
+            release_factory.set()
+            await asyncio.wait_for(refresh, timeout=5)
+            assert self.engine._vec_cache_dirty
+            assert self.engine._vec_entries[self.key][0] == self.first
+        finally:
+            release_factory.set()
+            refresh.cancel()
+            await asyncio.wait_for(
+                asyncio.gather(refresh, return_exceptions=True), timeout=5
+            )
+        await asyncio.wait_for(self.engine.warm_vectors(), timeout=5)
+        hits = await asyncio.wait_for(self.engine.retrieve(self.first.content), timeout=5)
+        assert hits
+        assert hits[0].chunk == self.updated
+        assert not self.engine._vec_cache_dirty
+
+    async def test_identity_invalidation_survives_cancelled_fts_sync(self, monkeypatch):
+        from briefdesk.plugins.rag import engine as rag_engine
+
+        chunk_committed = asyncio.Event()
+        release_fts = asyncio.Event()
+
+        async def paused_sync(*args, **kwargs):
+            chunk_committed.set()
+            await asyncio.wait_for(release_fts.wait(), timeout=5)
+
+        monkeypatch.setattr(rag_engine, "sync_fts", paused_sync)
+        self.engine._fts_enabled = True
+        async with self.engine._refresh_lock:
+            writer = asyncio.create_task(self.engine._persist_chunks(
+                self.db, [self.updated], [], [], "test-model"
+            ))
+            try:
+                await asyncio.wait_for(chunk_committed.wait(), timeout=5)
+                writer.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await asyncio.wait_for(writer, timeout=5)
+                assert self.engine._vec_cache_dirty
+            finally:
+                release_fts.set()
+                writer.cancel()
+                await asyncio.wait_for(
+                    asyncio.gather(writer, return_exceptions=True), timeout=5
+                )
+        await asyncio.wait_for(self.engine.warm_vectors(), timeout=5)
+        assert self.engine._vec_entries[self.key][0] == self.updated
+        assert not self.engine._vec_cache_dirty
+
+    @pytest.mark.parametrize("snapshot_kind", ["rows", "empty", "model-switch"])
+    async def test_identity_invalidation_survives_inflight_refresh(
+        self, monkeypatch, snapshot_kind
+    ):
+        from briefdesk.plugins.rag import engine as rag_engine
+
+        snapshot_read = asyncio.Event()
+        release_refresh = asyncio.Event()
+        real_fetch = rag_engine.fetch_new_embeddings
+
+        async def paused_fetch(*args, **kwargs):
+            result = await real_fetch(*args, **kwargs)
+            snapshot_read.set()
+            await asyncio.wait_for(release_refresh.wait(), timeout=5)
+            return result
+
+        monkeypatch.setattr(rag_engine, "fetch_new_embeddings", paused_fetch)
+        if snapshot_kind == "empty":
+            self.engine._vec_watermark = "t3"
+        elif snapshot_kind == "model-switch":
+            self.engine._vec_model = "previous-model"
+        refresh = asyncio.create_task(
+            self.engine.warm_vectors(force_full=snapshot_kind == "rows")
+        )
+        try:
+            await asyncio.wait_for(snapshot_read.wait(), timeout=5)
+            if snapshot_kind == "model-switch":
+                assert not self.engine._vec_entries
+            assert not await asyncio.wait_for(self.engine._persist_chunks(
+                self.db, [self.updated], [], [], "test-model"
+            ), timeout=5)
+            assert self.engine._vec_cache_dirty
+            release_refresh.set()
+            await asyncio.wait_for(refresh, timeout=5)
+            assert self.engine._vec_cache_dirty
+            assert self.engine._vec_entries[self.key][0] == self.first
+        finally:
+            release_refresh.set()
+            refresh.cancel()
+            await asyncio.wait_for(
+                asyncio.gather(refresh, return_exceptions=True), timeout=5
+            )
+        await asyncio.wait_for(self.engine.warm_vectors(), timeout=5)
+        assert self.engine._vec_entries[self.key][0] == self.updated
+        assert not self.engine._vec_cache_dirty
+
+    async def test_identity_recursive_refresh_does_not_regress_applied_generation(
+        self, monkeypatch
+    ):
+        from briefdesk.plugins.rag import engine as rag_engine
+        from briefdesk.plugins.rag.db import upsert_embeddings
+
+        await upsert_embeddings(
+            self.db, [self.key, (self.second.source, self.second.msg_id)],
+            [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], "test-model", "t3",
+        )
+        snapshot_read = asyncio.Event()
+        release_refresh = asyncio.Event()
+        real_fetch = rag_engine.fetch_new_embeddings
+
+        async def paused_fetch(*args, **kwargs):
+            result = await real_fetch(*args, **kwargs)
+            if not snapshot_read.is_set():
+                snapshot_read.set()
+                await asyncio.wait_for(release_refresh.wait(), timeout=5)
+            return result
+
+        fetch = AsyncMock(side_effect=paused_fetch)
+        monkeypatch.setattr(rag_engine, "fetch_new_embeddings", fetch)
+        refresh = asyncio.create_task(self.engine.warm_vectors())
+        try:
+            await asyncio.wait_for(snapshot_read.wait(), timeout=5)
+            assert not await asyncio.wait_for(self.engine._persist_chunks(
+                self.db, [self.updated], [], [], "test-model"
+            ), timeout=5)
+            assert self.engine._vec_cache_dirty
+            release_refresh.set()
+            await asyncio.wait_for(refresh, timeout=5)
+        finally:
+            release_refresh.set()
+            refresh.cancel()
+            await asyncio.wait_for(
+                asyncio.gather(refresh, return_exceptions=True), timeout=5
+            )
+        assert fetch.await_count == 2
+        assert not self.engine._vec_cache_dirty
+        assert self.engine._vec_entries[self.key][0] == self.updated
+        assert self.engine._matrix.shape == (2, 3)
+        matrix_index = self.engine._matrix_keys.index(self.key)
+        assert self.engine._matrix_chunks[matrix_index] == self.updated
+        assert self.engine._matrix[matrix_index].tolist() == [1.0, 0.0, 0.0]
+
+    @pytest.mark.parametrize("failure", ["error", "cancelled"])
+    async def test_identity_failed_refresh_keeps_invalidation(self, monkeypatch, failure):
+        from briefdesk.plugins.rag import engine as rag_engine
+
+        assert not await asyncio.wait_for(self.engine._persist_chunks(
+            self.db, [self.updated], [], [], "test-model"
+        ), timeout=5)
+        assert self.engine._vec_cache_dirty
+        snapshot_read = asyncio.Event()
+        release_refresh = asyncio.Event()
+        real_fetch = rag_engine.fetch_new_embeddings
+
+        async def failed_fetch(*args, **kwargs):
+            result = await real_fetch(*args, **kwargs)
+            snapshot_read.set()
+            await asyncio.wait_for(release_refresh.wait(), timeout=5)
+            if failure == "error":
+                raise RuntimeError("injected refresh failure")
+            return result
+
+        with monkeypatch.context() as patcher:
+            patcher.setattr(rag_engine, "fetch_new_embeddings", failed_fetch)
+            refresh = asyncio.create_task(self.engine.warm_vectors())
+            try:
+                await asyncio.wait_for(snapshot_read.wait(), timeout=5)
+                if failure == "error":
+                    release_refresh.set()
+                    with pytest.raises(RuntimeError, match="injected refresh failure"):
+                        await asyncio.wait_for(refresh, timeout=5)
+                else:
+                    refresh.cancel()
+                    with pytest.raises(asyncio.CancelledError):
+                        await asyncio.wait_for(refresh, timeout=5)
+                assert self.engine._vec_cache_dirty
+                assert self.engine._vec_entries[self.key][0] == self.first
+            finally:
+                release_refresh.set()
+                refresh.cancel()
+                await asyncio.wait_for(
+                    asyncio.gather(refresh, return_exceptions=True), timeout=5
+                )
+        await asyncio.wait_for(self.engine.warm_vectors(), timeout=5)
+        assert self.engine._vec_entries[self.key][0] == self.updated
         assert not self.engine._vec_cache_dirty
 
 
